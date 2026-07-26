@@ -7,6 +7,7 @@ season_venue_access. Fixtures live in ``hierarchy_fixtures.py`` so each test
 states only what it overrides rather than repeating full CSV strings.
 """
 
+import copy
 import json
 import os
 import threading
@@ -20,6 +21,7 @@ from helpers import BACKEND  # noqa: F401
 
 import hierarchy_fixtures as fx
 from hockey_scheduler.api import ApiService
+from hockey_scheduler.services import SetupService
 from hockey_scheduler.store import InMemoryStore, SqlStore
 
 by_ref = fx.by_ref
@@ -253,6 +255,130 @@ class HierarchyImportContract:
         self.assertEqual(len(self.store.all_clubs()), 1)
         self.assertEqual(len(self.store.all_players()), 1)
 
+    def _stale_players_snapshot(self, stale_player):
+        """Deterministic Memory/SQLite parity technique for round 15
+        finding 2's real-PostgreSQL-race coverage (see
+        PostgresHierarchyPlayerStalenessRaceTest below) -- the same
+        stale-snapshot injection already established by
+        test_import_commit.py's _stale_snapshot_all_players (patch
+        store.all_players() so ONE call returns a result the code
+        wouldn't otherwise see), adapted here to INJECT a stale entry
+        rather than exclude a fresh one: the ONLY store.all_players()
+        call commit_hierarchy_import's own top-level snapshot makes
+        (tracked via the same importbatch-reservation phase marker used
+        throughout this review, since validate_hierarchy_import's own
+        earlier all_players() calls must stay real) is made to still
+        return ``stale_player`` even though -- by the time that snapshot
+        runs -- a real, already-committed write has changed or removed
+        it. This reproduces exactly what an unlocked snapshot taken
+        before a concurrent writer's commit would see, without needing a
+        second thread or connection: both backends execute the patched
+        Python call identically, so the parity this asserts is real, not
+        an artifact of one backend's timing."""
+        real_next_id = self.store.next_id
+        real_all_players = self.store.all_players
+        phase = {"batch_reserved": False, "done": False}
+        def _tracking_next_id(prefix):
+            result = real_next_id(prefix)
+            if prefix == "importbatch":
+                phase["batch_reserved"] = True
+            return result
+        def _stale_all_players():
+            result = real_all_players()
+            if phase["batch_reserved"] and not phase["done"]:
+                phase["done"] = True
+                return result + [stale_player]
+            return result
+        self.store.next_id = _tracking_next_id
+        self.store.all_players = _stale_all_players
+
+    def test_concurrent_delete_between_snapshot_and_lock_creates_fresh_row(self):
+        """Round 15 finding 2, delete direction: a Player deleted after
+        commit_hierarchy_import's own unlocked top-level snapshot ran but
+        before its pre-lock pass locks the row must never be resurrected
+        by this import's save -- the row is gone, so the pre-lock pass's
+        id-verified re-fetch (get_player_for_update returning None) drops
+        it back to "not found" and the row is created fresh. Falsifiability-
+        verified: commenting out the pre-lock pass's lock loop in
+        hierarchy_import.py (so ``players`` keeps the stale, pre-delete
+        object) makes this test observe the DELETED id still present --
+        Memory's save_player does an unconditional dict-replace that
+        resurrects the row under its old id with the import's new fields,
+        rather than routing through upsert_imported_player's create path."""
+        # No email on the seed row (#232 review 4): delete_player is gated on
+        # dependent records, and a set contact destination is one -- this
+        # test's subject is the pre-lock pass, not that pre-existing gate.
+        self.api.commit_hierarchy_import(fx.full_payload(
+            players_csv=fx.players_csv(
+                rows=("P001,LIONS,Jane,Smith,7,forward,",))))
+        # Independent copy (see the deactivation test below for why: Memory
+        # returns live object references, not copies).
+        stale_player = copy.copy(by_ref(self.store.all_players(), "P001"))
+        setup = SetupService(self.store)
+        setup.delete_player(stale_player.id, actor_id="admin")
+
+        self._stale_players_snapshot(stale_player)
+
+        result = self.api.commit_hierarchy_import(fx.full_payload(
+            players_csv=fx.players_csv(
+                rows=("P001,LIONS,Jane,Smith,42,forward,jane@example.com",))),
+            actor_id="admin")
+        self.assertTrue(result["committed"], result.get("errors"))
+        self.assertEqual(result["summary"]["players"]["created"], 1)
+
+        fresh_players = [p for p in self.store.all_players()
+                         if p.external_ref == "P001"]
+        self.assertEqual(len(fresh_players), 1)
+        self.assertNotEqual(fresh_players[0].id, stale_player.id)
+        self.assertEqual(fresh_players[0].jersey_number, 42)
+
+    def test_concurrent_deactivation_between_snapshot_and_lock_is_not_reverted(self):
+        """Round 15 finding 2, deactivation direction: a Player deactivated
+        after the unlocked snapshot but before the pre-lock pass locks the
+        row must stay deactivated -- upsert_imported_player never touches
+        is_active, so it only survives a full-object save_player if the
+        object being saved is the FRESH (post-deactivation) one, not the
+        stale pre-deactivation snapshot. Also proves the import's own field
+        change (jersey_number) still applies against that fresh base, so
+        the fix does not trade a resurrection bug for an inert update.
+        Falsifiability-verified: reverting the pre-lock pass makes this
+        test observe is_active back to True -- the stale object's own
+        True carried through _apply_changes (which only diffs name/
+        team_id/position/jersey_number) into an unconditional save that
+        silently reverts the concurrent deactivation (Memory: dict-
+        replace; SQLite: the row still matches its own id so the UPDATE
+        does apply, just with the wrong is_active value baked into the
+        saved row). Snapshots an independent COPY before deactivating --
+        Memory's all_players()/get_player_for_update return the live
+        object by reference (no copy-on-read), so capturing the bare
+        reference here would alias the very mutation this test stages
+        against: set_player_active's own get_player_for_update would
+        return that SAME object and flip its is_active in place,
+        silently making the "stale" snapshot already reflect the post-
+        deactivation state and defeating the test even with the fix
+        reverted -- caught by this test's own falsifiability check."""
+        self.api.commit_hierarchy_import(fx.full_payload())
+        stale_player = copy.copy(by_ref(self.store.all_players(), "P001"))
+        setup = SetupService(self.store)
+        setup.set_player_active(stale_player.id, False, actor_id="admin")
+
+        self._stale_players_snapshot(stale_player)
+
+        result = self.api.commit_hierarchy_import(fx.full_payload(
+            players_csv=fx.players_csv(
+                rows=("P001,LIONS,Jane,Smith,42,forward,jane@example.com",))),
+            actor_id="admin")
+        self.assertTrue(result["committed"], result.get("errors"))
+
+        fresh_players = [p for p in self.store.all_players()
+                         if p.external_ref == "P001"]
+        self.assertEqual(len(fresh_players), 1)
+        self.assertEqual(fresh_players[0].id, stale_player.id)
+        self.assertFalse(fresh_players[0].is_active,
+                         "concurrent deactivation must not be silently "
+                         "reverted by the import's save")
+        self.assertEqual(fresh_players[0].jersey_number, 42)
+
     def test_invalid_commit_is_all_or_nothing_and_has_no_audit(self):
         bad = fx.full_payload(competition_csv=fx.competition_csv(rows=(
             "UNKNOWN,FALL26,Fall 2026,L1,Adult League,1,DIVA,Division A,Adult",)))
@@ -468,6 +594,175 @@ class HierarchyImportTransactionTest(unittest.TestCase):
         result = api.commit_hierarchy_import(fx.full_payload(), actor_id="admin")
         self.assertTrue(result["committed"], result.get("errors"))
         self.assertEqual(calls["count"], 1)
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class PostgresHierarchyPlayerStalenessRaceTest(unittest.TestCase):
+    """#331 review round 15 finding 2: commit_hierarchy_import's `players`
+    snapshot is taken once, before ANY of this batch's writes, and was
+    passed straight through to upsert_imported_player as `existing` with
+    no re-fetch or lock -- so a canonical delete/deactivate/update/team-
+    assignment landing between that snapshot and this row's own write
+    (all of which DO lock the Player row) could be silently resurrected,
+    silently reverted, or lost. Each test here forces a genuine two-
+    connection PostgreSQL race between a re-import of an existing coded
+    Player and ONE canonical operation on that exact Player, pausing the
+    import's own store.get_player_for_update (the new pre-lock call site)
+    on the target Player's id via a two-event handshake (not a bare
+    sleep), so the canonical operation runs to completion while the
+    import waits, then resumes into the now-current state."""
+
+    def setUp(self):
+        self.url = os.environ["TEST_DATABASE_URL"]
+        SqlStore(self.url).clear_all_data()
+
+    def _seed_one_player(self, seed_store, player_code, team_code="RACET"):
+        seed_api = ApiService(seed_store)
+        result = seed_api.commit_hierarchy_import(fx.full_payload(
+            permanent_teams_csv=fx.permanent_teams_csv(
+                rows=(f"OVER55,L1,{team_code},Race Team,",)),
+            players_csv=fx.players_csv(
+                rows=(f"{player_code},{team_code},Original,Player,7,forward,",)),
+            registrations_csv="", season_venue_access_csv=""))
+        self.assertTrue(result["committed"], result)
+        team = next(t for t in seed_store.all_teams() if t.external_ref == team_code)
+        player = next(p for p in seed_store.all_players()
+                     if p.external_ref == player_code)
+        return team, player
+
+    def _pausing_get_player_for_update(self, store, target_player_id,
+                                       reached_event, resume_event):
+        real = store.get_player_for_update
+        def _wrapped(player_id):
+            if player_id == target_player_id:
+                reached_event.set()
+                if not resume_event.wait(timeout=10):
+                    raise AssertionError("canonical op never signalled completion")
+            return real(player_id)
+        return _wrapped
+
+    def test_concurrent_delete_is_never_resurrected(self):
+        seed_store = SqlStore(self.url)
+        team, player = self._seed_one_player(seed_store, "RACEDEL")
+
+        store_import = SqlStore(self.url)
+        api_import = ApiService(store_import)
+        store_delete = SqlStore(self.url)
+        setup_delete = SetupService(store_delete)
+
+        reached = threading.Event()
+        resume = threading.Event()
+        store_import.get_player_for_update = self._pausing_get_player_for_update(
+            store_import, player.id, reached, resume)
+
+        results = {}
+
+        def run_import():
+            try:
+                results["import"] = api_import.commit_hierarchy_import(
+                    fx.full_payload(
+                        permanent_teams_csv=fx.permanent_teams_csv(
+                            rows=("OVER55,L1,RACET,Race Team,",)),
+                        players_csv=fx.players_csv(
+                            rows=("RACEDEL,RACET,Updated,Player,9,defense,",)),
+                        registrations_csv="", season_venue_access_csv=""),
+                    actor_id="importer")
+            except Exception as exc:
+                results["import"] = exc
+
+        t = threading.Thread(target=run_import)
+        t.start()
+        self.assertTrue(reached.wait(timeout=10),
+                        "import never reached its Player row-lock pause")
+        try:
+            results["delete"] = setup_delete.delete_player(player.id, actor_id="admin")
+        finally:
+            resume.set()
+        t.join(20)
+
+        self.assertFalse(t.is_alive(), "import thread hung")
+        self.assertNotIsInstance(results["delete"], Exception, results["delete"])
+        self.assertNotIsInstance(
+            results["import"], Exception,
+            f"import raised instead of committing cleanly: {results['import']!r}")
+        self.assertTrue(results["import"].get("committed"), results["import"])
+
+        fresh = SqlStore(self.url)
+        players = [p for p in fresh.all_players() if p.external_ref == "RACEDEL"]
+        self.assertEqual(
+            len(players), 1,
+            f"expected exactly one (freshly recreated) Player for RACEDEL, "
+            f"got {[p.id for p in players]}")
+        self.assertNotEqual(
+            players[0].id, player.id,
+            "the DELETED row must never be resurrected under its old id -- "
+            "the import must discover it is gone and create a fresh one")
+        self.assertEqual(players[0].name, "Updated Player")
+
+    def test_concurrent_deactivation_is_never_reverted(self):
+        seed_store = SqlStore(self.url)
+        team, player = self._seed_one_player(seed_store, "RACEACTIVE")
+
+        store_import = SqlStore(self.url)
+        api_import = ApiService(store_import)
+        store_deactivate = SqlStore(self.url)
+        setup_deactivate = SetupService(store_deactivate)
+
+        reached = threading.Event()
+        resume = threading.Event()
+        store_import.get_player_for_update = self._pausing_get_player_for_update(
+            store_import, player.id, reached, resume)
+
+        results = {}
+
+        def run_import():
+            try:
+                # Re-imports the SAME row with only the jersey_number changed
+                # -- is_active isn't a hierarchy import field at all, so a
+                # correct commit must leave whatever is_active it finds
+                # (True or False) alone; the OLD bug used a stale, still-
+                # active `existing` as the object saved back, silently
+                # reverting a concurrent deactivation because save_player
+                # writes the WHOLE object, not just the diffed fields.
+                results["import"] = api_import.commit_hierarchy_import(
+                    fx.full_payload(
+                        permanent_teams_csv=fx.permanent_teams_csv(
+                            rows=("OVER55,L1,RACET,Race Team,",)),
+                        players_csv=fx.players_csv(
+                            rows=("RACEACTIVE,RACET,Original,Player,11,forward,",)),
+                        registrations_csv="", season_venue_access_csv=""),
+                    actor_id="importer")
+            except Exception as exc:
+                results["import"] = exc
+
+        t = threading.Thread(target=run_import)
+        t.start()
+        self.assertTrue(reached.wait(timeout=10),
+                        "import never reached its Player row-lock pause")
+        try:
+            results["deactivate"] = setup_deactivate.set_player_active(
+                player.id, False, actor_id="admin")
+        finally:
+            resume.set()
+        t.join(20)
+
+        self.assertFalse(t.is_alive(), "import thread hung")
+        self.assertNotIsInstance(results["deactivate"], Exception, results["deactivate"])
+        self.assertNotIsInstance(
+            results["import"], Exception,
+            f"import raised instead of committing cleanly: {results['import']!r}")
+        self.assertTrue(results["import"].get("committed"), results["import"])
+
+        fresh = SqlStore(self.url)
+        fresh_player = fresh.get_player(player.id)
+        self.assertFalse(
+            fresh_player.is_active,
+            "the concurrent deactivation must survive the import's own "
+            "write -- a stale pre-deactivation object being saved back "
+            "would silently resurrect the Player as active")
+        # The import's OWN field (jersey_number) still applied correctly.
+        self.assertEqual(fresh_player.jersey_number, 11)
 
 
 class HierarchyImportHttpTest(unittest.TestCase):

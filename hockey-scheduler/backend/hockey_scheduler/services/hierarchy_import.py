@@ -1418,6 +1418,47 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
                 # — an existing player:<id> ContactDestination's value is updated in
                 # place, never duplicated; omitting the email column on a repeat row
                 # leaves a previously-set contact untouched.
+                #
+                # #331 review round 15 finding 2: `players` above is a snapshot
+                # taken before ANY of this batch's writes -- release_batch_
+                # player_jerseys just below, and the per-row upsert after it,
+                # both used to read/save that snapshot's objects directly, with
+                # no re-fetch or lock. A canonical delete/update/activation/
+                # team-assignment path (every one of which DOES lock the Player
+                # row) landing between this snapshot and the write could be
+                # silently resurrected (Memory's save replaces the dict entry
+                # unconditionally), silently no-op'd while still reporting
+                # success (SQLite's UPDATE matches zero rows but raises
+                # nothing), or lost (PostgreSQL, under real concurrent
+                # interleaving). Lock every row this sheet's OWN snapshot
+                # claims exists, in deterministic (id-sorted, not upload-row-
+                # order) order -- so two concurrent hierarchy imports touching
+                # an overlapping player set always attempt their locks in the
+                # same relative order -- and use ONLY the freshly-locked
+                # result from here on, for jersey availability, release,
+                # field apply, contact changes, counts, and audit alike. A
+                # row the lock reveals is gone (or somehow no longer carries
+                # this row's own player_code -- the SAME id-verification
+                # discipline finding 1 above and the Rink fix both use) is
+                # dropped back to "not found": the create branch's own
+                # reserve-then-recheck (#331 review round 14 finding 3)
+                # already discovers and safely adopts a concurrently
+                # recreated row instead of duplicating it, so nothing here
+                # needs to re-implement that -- dropping the stale entry is
+                # enough to route it there.
+                _stale_player_id_by_code = {}
+                for row in rows["players"]:
+                    _pcode = _clean(row.get("player_code"))
+                    _pstale = players.get(_pcode)
+                    if _pstale is not None:
+                        _stale_player_id_by_code[_pstale.id] = _pcode
+                for _pid in sorted(_stale_player_id_by_code):
+                    _pcode = _stale_player_id_by_code[_pid]
+                    _plocked = store.get_player_for_update(_pid)
+                    if _plocked is None or _plocked.external_ref != _pcode:
+                        del players[_pcode]
+                    else:
+                        players[_pcode] = _plocked
                 # Swap-safe apply (#292): release every existing player's jersey whose
                 # final slot moves, BEFORE any per-row assignment, so a valid same-team
                 # (or cross-team) swap commits without a transient uniqueness failure.

@@ -3722,6 +3722,130 @@ async function checkRoleScenarios(browser, viewport) {
   }
 }
 
+const IMPORT_CONFLICT_VIEWPORTS = [
+  { label: "desktop", width: 1440, height: 900, port: 8315 },
+  { label: "phone", width: 390, height: 844, port: 8316 },
+];
+
+// #331 review round 15 finding 1's required desktop/390px import smoke
+// coverage: the Teams & Players import wizard must show the STRUCTURED
+// incompatibility this round's own new gate produces, never a `Committed`
+// success state, when two rows in one upload each name the SAME
+// not-yet-existing Division under a DIFFERENT permanent League. A separate,
+// minimally-scoped journey (own server/port pair) rather than threading a
+// new scenario into checkRoleScenarios' already-long single flow above.
+async function checkImportLeagueConflict(browser, viewport) {
+  const base = `http://${HOST}:${viewport.port}`;
+  const server = spawn(
+    process.env.PYTHON || "python3",
+    ["-u", "-m", "hockey_scheduler.web.server", "--host", HOST, "--port", String(viewport.port)],
+    { cwd: BACKEND_DIR, stdio: ["ignore", "pipe", "pipe"] });
+  let serverOutput = "";
+  server.stdout.on("data", (d) => { serverOutput += d.toString(); });
+  server.stderr.on("data", (d) => { serverOutput += d.toString(); });
+
+  const context = await browser.newContext({
+    viewport: { width: viewport.width, height: viewport.height },
+  });
+  const page = await context.newPage();
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(`[pageerror] ${e.message}`));
+  page.on("console", (m) => { if (m.type() === "error") errors.push(`[console] ${m.text()}`); });
+
+  const fail = (msg) => { throw new Error(`[${viewport.label}] ${msg}`); };
+
+  try {
+    await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
+    await page.goto(base, { waitUntil: "domcontentloaded" });
+    await loginAs(page, "admin", "demo");
+
+    // Seed two Teams, each with an already-established but DIFFERENT
+    // permanent League, then a third Season with neither League bound yet
+    // -- the exact same-upload conflict shape the new backend gate rejects.
+    const seed = await page.evaluate(async () => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      const program = await post("/api/v2/setup/program",
+        { name: "Import Conflict Program", country: "US" });
+      const seasonX = await post("/api/v2/setup/season", { program_id: program.id,
+        name: "Season X", start_date: "2026-09-01", end_date: "2027-03-31" });
+      const leagueX = await post("/api/v2/setup/league",
+        { season_id: seasonX.id, name: "League X" });
+      const seasonY = await post("/api/v2/setup/season", { program_id: program.id,
+        name: "Season Y", start_date: "2026-09-01", end_date: "2027-03-31" });
+      const leagueY = await post("/api/v2/setup/league",
+        { season_id: seasonY.id, name: "League Y" });
+      await post("/api/import/commit/teams-players", { season_id: seasonX.id,
+        teams_csv: "team_code,team_name\nCONFX,Team X\n" });
+      await post("/api/import/commit/teams-players", { season_id: seasonY.id,
+        teams_csv: "team_code,team_name\nCONFY,Team Y\n" });
+      const seasonZ = await post("/api/v2/setup/season", { program_id: program.id,
+        name: "Season Z", start_date: "2026-09-01", end_date: "2027-03-31" });
+      return { seasonZ: seasonZ.id };
+    });
+
+    await page.goto(base, { waitUntil: "domcontentloaded" });
+    await reachDashboard(page);
+    await page.click('.tab[data-tab="import"]');
+    await page.waitForSelector("[data-import-type]", { timeout: 10000 });
+    await page.click('[data-import-type="teams_players"]');
+    await page.waitForFunction(
+      (v) => (document.getElementById("import-season") || {}).value === v,
+      seed.seasonZ, { timeout: 10000 });
+
+    const conflictCsv = "team_code,team_name,division_name\n"
+      + "CONFX,Team X,SharedDiv\nCONFY,Team Y,SharedDiv\n";
+    await page.fill("#import-teams_csv", conflictCsv);
+    const validateResp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/import/dry-run` && r.request().method() === "POST");
+    await page.click("[data-import-validate]");
+    await validateResp;
+    await page.waitForFunction(() => {
+      const btn = document.querySelector("[data-import-commit]");
+      return !!(btn && !btn.disabled);
+    }, null, { timeout: 10000 });
+
+    const commitResp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/import/commit/teams-players` && r.request().method() === "POST");
+    await page.click("[data-import-commit]");
+    const commitJson = await (await commitResp).json();
+    if (commitJson.committed) {
+      fail(`expected the same-upload League conflict to be rejected, not `
+        + `committed: ${JSON.stringify(commitJson)}`);
+    }
+    if (!(commitJson.errors || []).some(
+        (e) => e.reason === "import_new_division_league_conflict")) {
+      fail(`expected an import_new_division_league_conflict structured `
+        + `error, got: ${JSON.stringify(commitJson)}`);
+    }
+    // The UI itself must SURFACE the structured incompatibility, not just
+    // the raw network response -- no silent "Committed" success state.
+    await page.waitForFunction(() => {
+      const body = document.body.textContent || "";
+      return !/\bCommitted\b/.test(body) || /conflict|already belongs|different/i.test(body);
+    }, null, { timeout: 10000 });
+    const bodyText = await page.evaluate(() => document.body.textContent || "");
+    if (/^\s*Committed\s*$/im.test(bodyText.split("\n").find((l) => l.trim()) || "")) {
+      fail("expected the Import screen to show the structured incompatibility, "
+        + "not a bare Committed success state");
+    }
+
+    if (errors.length) {
+      fail(`unexpected browser errors: ${JSON.stringify(errors)}`);
+    }
+    console.log(`[${viewport.label}] OK — a same-upload Division/League `
+      + `conflict is rejected with a structured error, never a false `
+      + `Committed success state.`);
+  } catch (error) {
+    throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
+  } finally {
+    await context.close();
+    await stopServer(server);
+  }
+}
+
 async function main() {
   let browser;
   try {
@@ -3729,6 +3853,9 @@ async function main() {
       process.env.SMOKE_CHROMIUM_PATH ? { executablePath: process.env.SMOKE_CHROMIUM_PATH } : {});
     for (const viewport of VIEWPORTS) await checkViewport(browser, viewport);
     for (const viewport of ROLE_VIEWPORTS) await checkRoleScenarios(browser, viewport);
+    for (const viewport of IMPORT_CONFLICT_VIEWPORTS) {
+      await checkImportLeagueConflict(browser, viewport);
+    }
     console.log("Home/Tasks hub browser journey passed.");
   } catch (error) {
     console.error("Home/Tasks hub browser journey FAILED.");

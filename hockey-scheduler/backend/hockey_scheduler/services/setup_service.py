@@ -1312,33 +1312,76 @@ class SetupService:
         ls = self.store.get_league_season(reg.league_season_id)
         return ls.league_id if ls else None
 
-    def _resolve_import_target_league_id_readonly(self, season_id, division_name_raw):
+    def _resolve_import_team_target_league(self, season_id, division_name_raw,
+                                           existing_team_league_id,
+                                           divisions_by_name):
         """Read-only prediction of the permanent League
         commit_teams_players_import's per-row division resolution would bind
-        a team/registration to for THIS row (#331 review round 14 finding
-        2), without that resolution's own auto-create side effects: a
-        not-yet-existing Division or LeagueSeason can't be safely created
-        here, since gate_errors must run before any write to preserve the
-        all-or-nothing guarantee on a gate failure. Returns None when the
-        real resolution would need to auto-create -- the gate this feeds
-        then simply has nothing to compare against for that row, and defers
-        to the narrower ``not team.league_id`` guard already in the main
-        loop below, which cannot corrupt an EXISTING non-None league_id even
-        without this prediction (a documented, narrower residual gap: an
-        import that is itself the FIRST to establish a Season's LeagueSeason
-        can still silently bind a team whose league_id was already set by a
-        different, already-established League -- not exercised by the
-        review's own race fixtures, which pre-provision both Seasons'
-        permanent Leagues)."""
+        a team/registration to for THIS row (#331 review round 14 finding 2,
+        widened round 15 finding 1), without that resolution's own
+        auto-create side effects: a not-yet-existing Division or LeagueSeason
+        can't be safely created here, since gate_errors must run before any
+        write to preserve the all-or-nothing guarantee on a gate failure.
+        ``divisions_by_name`` is the ONE frozen pre-loop snapshot every row
+        this attempt processes must agree on (see its own call site) -- not a
+        fresh per-row query, so an earlier row's own not-yet-applied create
+        can't make a later row in the SAME pass see a different world.
+
+        Returns ``(target_league_id, new_division_name)``. ``new_division_
+        name`` is the cleaned division name when this row would need to
+        CREATE that division (None otherwise) -- the caller uses it to
+        detect two rows in one upload wanting the SAME not-yet-existing
+        division under DIFFERENT Leagues, which this function itself has no
+        cross-row memory to catch alone.
+
+        Round 14 returned None whenever a Division/LeagueSeason was absent
+        from the snapshot, silently skipping the gate for that row -- the
+        exact gap round 15 finding 1 reported: apply would then create the
+        target objects and preserve an EXISTING Team's league_id while
+        writing its registration under a DIFFERENT, freshly-resolved
+        LeagueSeason. Round 15 closes it: whenever the Team already has a
+        permanent League, that League is ALWAYS the predicted target for a
+        row that would need to auto-create, mirroring what apply's own
+        _bind_import_team_league_season now does -- never the ambient
+        "Season's first LeagueSeason" or "spawn a brand-new default League"
+        pick round 14 left unprotected. Only a genuinely league-less Team
+        (existing_team_league_id is None) still falls through to that
+        ambient prediction, matching the pre-round-15 bootstrap UX for a
+        team with no established identity to protect."""
         if not _blank(division_name_raw):
-            division = next((d for d in self.store.divisions_for_season(season_id)
-                             if d.name == _clean(division_name_raw)), None)
-            if division is None:
-                return None
-            ls = self.store.get_league_season(division.league_season_id)
-            return ls.league_id if ls else None
+            name = _clean(division_name_raw)
+            division = divisions_by_name.get(name)
+            if division is not None:
+                ls = self.store.get_league_season(division.league_season_id)
+                return (ls.league_id if ls else None), None
+            if existing_team_league_id:
+                return existing_team_league_id, name
+            candidates = self.store.league_seasons_for_season(season_id)
+            return (candidates[0].league_id if candidates else None), name
+        if existing_team_league_id:
+            return existing_team_league_id, None
         candidates = self.store.league_seasons_for_season(season_id)
-        return candidates[0].league_id if candidates else None
+        return (candidates[0].league_id if candidates else None), None
+
+    def _bind_import_team_league_season(self, season_id, existing_team_league_id):
+        """The LeagueSeason a NEW Division (or a blank-division row) should
+        bind to during ``commit_teams_players_import`` apply (#331 review
+        round 15 finding 1). Prefers finding/creating the binding of the
+        Team's OWN permanent League to this Season -- never silently
+        defers to whatever League the Season happens to already have, or
+        spawns an unrelated brand-new default League, when the Team already
+        has an established identity to protect. Falls back to the pre-round-
+        15 ambient ``_import_default_league_season`` only when the Team is
+        genuinely league-less, matching the resolver above and gate (1b)'s
+        prediction exactly. Safe to call here specifically because every
+        League this could possibly bind to was already row-locked, before
+        the Season guard, by this attempt's own pre-lock pass -- calling
+        :meth:`_link_league_season` on an unlocked existing League this deep
+        into an already-Season-locked transaction would otherwise invert the
+        canonical League->Season lock order."""
+        if existing_team_league_id:
+            return self._link_league_season(existing_team_league_id, season_id)
+        return self._import_default_league_season(season_id)
 
     def _revalidate_game_participation(self, game):
         """Both teams must still be valid participants of ``game``'s competition
@@ -4860,6 +4903,24 @@ class SetupService:
         # import rule: an absent cell is "leave as-is", never a retirement).
         canonical_email = self._validate_email(email)
         canonical_name = self._validate_player_name(name)
+        if existing is not None:
+            # #331 review round 15 finding 2 — re-fetch the Player under its
+            # ROW LOCK before reading any of its fields, mirroring
+            # upsert_imported_team's identical #201 fix (which locks the
+            # Team the same way before its own field/league write). The
+            # caller (commit_hierarchy_import) already guarantees `existing`
+            # is a fresh, locked object via its own pre-lock pass before
+            # calling this method, so this re-fetch is a no-op there (the
+            # same row locked again) — but it keeps this method safe to call
+            # on its own, not just as part of that caller's larger batch
+            # discipline. A Player deleted out from under the import is
+            # dropped to the create path below (its own reserve-then-recheck
+            # already discovers and safely adopts a concurrently recreated
+            # row instead of duplicating it), never treated as a still-live
+            # target for a save that would resurrect it (Memory), silently
+            # match zero rows while still reporting success (SQLite), or
+            # lose a concurrent update (PostgreSQL).
+            existing = self.store.get_player_for_update(existing.id)
         # Enforce active-team jersey uniqueness on the IMPORTED target state
         # before any write (#269), so a conflicting row aborts the whole
         # one-transaction batch with zero committed players. An import never
@@ -5666,7 +5727,40 @@ class SetupService:
                       "players_created": 0, "players_updated": 0,
                       "clubs_created": 0, "divisions_created": 0}
             try:
+                # #331 review round 15 finding 1: an existing Team's permanent
+                # League must be row-locked BEFORE the Season guard -- the
+                # SAME canonical Team -> League -> Season order
+                # register_team_for_season already follows (#159). Locking a
+                # League only once inside the transaction below (e.g. when
+                # binding a new Division to it) would lock League AFTER
+                # Season, inverting the order delete_league/transfer_team_
+                # to_league rely on and risking a PostgreSQL deadlock.
+                # Unlocked pre-read (necessarily stale-tolerant, verified
+                # under lock and retried via _TeamLockPlanDrifted on
+                # mismatch -- the same idiom this file's other lock-plan
+                # fixes already use): every Team this batch's team_code rows
+                # currently resolve to.
+                _codes_in_batch = {_clean(row.get("team_code")) for row in team_rows}
+                _candidate_team_ids = sorted(
+                    t.id for t in self.store.all_teams()
+                    if t.external_ref in _codes_in_batch)
                 with self.store.transaction():
+                    # Lock every candidate Team row, in a deterministic
+                    # (id-sorted) order, before anything else. A row we hold
+                    # locked can't be moved by a concurrent transfer_team_
+                    # to_league/delete_team, so its league_id is trustworthy
+                    # for the rest of this attempt -- and IS the set of
+                    # League ids that need pre-locking next.
+                    _locked_teams_by_id = {}
+                    for _tid in _candidate_team_ids:
+                        _t = self.store.get_team_for_update(_tid)
+                        if _t is not None:
+                            _locked_teams_by_id[_tid] = _t
+                    _candidate_league_ids = sorted({
+                        t.league_id for t in _locked_teams_by_id.values()
+                        if t.league_id})
+                    for _lid in _candidate_league_ids:
+                        self._lock_league_for_binding(_lid)
                     # #159 — acquire the archived-Season row lock as the FIRST statement
                     # inside the single transaction that holds every import write, and
                     # derive Season-owned values from that same locked read. On
@@ -5702,6 +5796,38 @@ class SetupService:
                     # docstring for the full mechanism this closes.
                     _teams_at_gate_check = {t.external_ref: t for t in self.store.all_teams()
                                             if t.external_ref}
+                    # #331 review round 15 finding 1: verify the League
+                    # pre-lock above actually covers every Team this batch
+                    # will read as "existing" -- if a code we expected to be
+                    # absent/at a locked id now resolves to a DIFFERENT,
+                    # unlocked Team (deleted-and-recreated between the
+                    # unlocked pre-read and the lock acquisition, or simply
+                    # created there for a genuinely new code), retry with a
+                    # fresh pre-read/lock plan rather than trust a League we
+                    # never actually locked.
+                    for _code in _codes_in_batch:
+                        _gate_team = _teams_at_gate_check.get(_code)
+                        if _gate_team is not None and _gate_team.id not in _locked_teams_by_id:
+                            raise _TeamLockPlanDrifted()
+                    # Snapshot of every Division known to exist for this
+                    # Season BEFORE any row's apply can create one (#331
+                    # review round 15 finding 1), so both the gate-check
+                    # prediction below and same-upload cross-row conflict
+                    # tracking see ONE consistent "what already exists" view
+                    # -- not a view that changes mid-pass as earlier rows'
+                    # own (not-yet-run) apply creates divisions later rows
+                    # would otherwise see.
+                    _divisions_at_gate_check = {d.name: d for d in
+                                                self.store.divisions_for_season(season_id)}
+                    # Tracks, for a division_name this batch would need to
+                    # CREATE (absent from the snapshot above), the League id
+                    # the FIRST row that named it predicted. A later row
+                    # naming the identical not-yet-existing division under a
+                    # DIFFERENT predicted League is a same-upload conflict --
+                    # apply can only create that name under ONE League --
+                    # caught here, before any write, rather than left for
+                    # apply to silently resolve by whichever row runs first.
+                    _planned_new_division_league = {}
                     gate_errors = []
                     for row in team_rows:
                         code = _clean(row.get("team_code"))
@@ -5737,15 +5863,41 @@ class SetupService:
                                     "affected_game_ids": [
                                         g.id for g in self.store.all_games()
                                         if existing.id in (g.home_team_id, g.away_team_id)]})
-                        # (1b) #331 review round 14 finding 2: the SAME invariant as
-                        # (1), but at the narrower permanent-League grain -- two
-                        # Seasons can share one Program yet carry distinct permanent
-                        # Leagues, a case (1) alone cannot see since it only compares
-                        # Program ids. Read-only prediction (never auto-creates a
-                        # Division/LeagueSeason -- see the resolver's own docstring
-                        # for why, and for the narrow residual gap that leaves).
-                        target_league_id = self._resolve_import_target_league_id_readonly(
-                            season_id, row.get("division_name"))
+                        # (1b) #331 review round 14 finding 2, widened round 15
+                        # finding 1: the SAME invariant as (1), but at the
+                        # narrower permanent-League grain -- two Seasons can
+                        # share one Program yet carry distinct permanent
+                        # Leagues, a case (1) alone cannot see since it only
+                        # compares Program ids. Read-only prediction (never
+                        # auto-creates a Division/LeagueSeason itself -- see
+                        # the resolver's own docstring), but round 15
+                        # widened it to predict the League a still-to-be-
+                        # created Division/LeagueSeason WOULD bind to when the
+                        # Team already has a permanent League, instead of
+                        # returning None and skipping the gate for that row
+                        # entirely (the exact gap #331 review round 15
+                        # finding 1 reported: a missing Division or
+                        # LeagueSeason must never mean "nothing to compare").
+                        target_league_id, _new_division_name = (
+                            self._resolve_import_team_target_league(
+                                season_id, row.get("division_name"),
+                                existing.league_id, _divisions_at_gate_check))
+                        if _new_division_name is not None:
+                            _planned = _planned_new_division_league.get(_new_division_name,
+                                                                        object())
+                            if (_new_division_name in _planned_new_division_league
+                                    and _planned != target_league_id):
+                                gate_errors.append({
+                                    "sheet": "teams", "team_code": code,
+                                    "reason": "import_new_division_league_conflict",
+                                    "message": (f"Division '{_new_division_name}' would be "
+                                                "created for more than one permanent league "
+                                                "in this same import; give each team's row a "
+                                                "consistent division or resolve their leagues "
+                                                "first."),
+                                    "division_name": _new_division_name})
+                            else:
+                                _planned_new_division_league[_new_division_name] = target_league_id
                         if (target_league_id is not None
                                 and (existing.league_id or None) != target_league_id):
                             if existing.league_id is None:
@@ -5828,42 +5980,14 @@ class SetupService:
                                 counts["clubs_created"] += 1
                             club_id = club.id
 
-                        division = None
-                        division_name_raw = row.get("division_name")
-                        if not _blank(division_name_raw):
-                            division_name = _clean(division_name_raw)
-                            division = next(
-                                (d for d in self.store.divisions_for_season(season_id)
-                                 if d.name == division_name),
-                                None)
-                            if division is None:
-                                # #283: a Division belongs to a LeagueSeason. This simple
-                                # onboarding import carries no per-division League, so use
-                                # the Season's LeagueSeason, auto-provisioning a default
-                                # League when the Season has none yet (mirrors
-                                # create_division so imported rows are never orphaned with
-                                # a null league_season_id).
-                                _ls = self._import_default_league_season(season_id)
-                                division = Division(id=self.store.next_id("division"),
-                                                    league_season_id=_ls.id,
-                                                    name=division_name)
-                                self.store.add_division(division)
-                                self._audit("division_created", "division", division.id,
-                                            actor_id, {"season_id": season_id,
-                                                      "import_batch_id": batch_id})
-                                counts["divisions_created"] += 1
-
-                        division_id = division.id if division else None
-
-                        # #180/#283: a team's participation is converged onto its
-                        # permanent League + a SeasonTeamRegistration, never the legacy
-                        # Team.division_id. The team is a permanent member of THIS
-                        # import season's League (auto-provisioned if the Season had
-                        # none); the imported division lives on the registration.
-                        _import_ls = (self.store.get_league_season(division.league_season_id)
-                                      if division is not None
-                                      else self._import_default_league_season(season_id))
-                        _import_league_id = _import_ls.league_id if _import_ls else None
+                        # #331 review round 15 finding 1: Team identity is
+                        # resolved BEFORE Division/LeagueSeason (moved up
+                        # from below), so a not-yet-created Division/
+                        # LeagueSeason can be bound to the Team's OWN
+                        # permanent League when it has one -- an ambient
+                        # Season-wide default has no relationship to this
+                        # specific Team's identity and is exactly what let
+                        # the registration disagree with Team.league_id.
                         team = next((t for t in self.store.all_teams()
                                     if t.external_ref == team_code), None)
                         if team is None:
@@ -5882,16 +6006,69 @@ class SetupService:
                             _reserved_team_id = self.store.next_id("team")
                             team = next((t for t in self.store.all_teams()
                                         if t.external_ref == team_code), None)
-                        if team is not None and team_code not in _teams_at_gate_check:
-                            # #331 review round 14 finding 2: this Team did not exist
-                            # when gate_errors ran above -- a concurrent import for a
-                            # DIFFERENT Season created it (with its own Program/League
-                            # already set) in the gap between that snapshot and this
-                            # row's resolution. None of the (1)/(1b) guards above ever
-                            # evaluated it. Retry the whole attempt with a fresh
-                            # snapshot, which will correctly gate this team's real
-                            # current state before any write.
+                        # #331 review round 14 finding 2, strengthened round 15
+                        # finding 1 with id-verification (not just code
+                        # presence, mirroring the Rink lock-plan fix): a Team
+                        # this row resolves to must be the IDENTICAL row
+                        # gate_errors validated above -- a matching code but a
+                        # DIFFERENT id means the original was deleted and a
+                        # new one recreated under the same external_ref in the
+                        # gap between the gate snapshot and this row's
+                        # resolution (a code entirely absent from the snapshot
+                        # is the same signal: a concurrent import for a
+                        # DIFFERENT Season created it there). Either way none
+                        # of the (1)/(1b) guards above ever evaluated the Team
+                        # apply is about to use -- retry the whole attempt
+                        # with a fresh snapshot/lock plan, which will
+                        # correctly gate and lock this Team's real current
+                        # state before any write.
+                        _gate_team = _teams_at_gate_check.get(team_code)
+                        if team is not None and (_gate_team is None
+                                                  or _gate_team.id != team.id):
                             raise _TeamLockPlanDrifted()
+                        _existing_team_league_id = team.league_id if team is not None else None
+
+                        division = None
+                        division_name_raw = row.get("division_name")
+                        if not _blank(division_name_raw):
+                            division_name = _clean(division_name_raw)
+                            division = next(
+                                (d for d in self.store.divisions_for_season(season_id)
+                                 if d.name == division_name),
+                                None)
+                            if division is None:
+                                # #283: a Division belongs to a LeagueSeason. This simple
+                                # onboarding import carries no per-division League of its
+                                # own, so bind the Team's own permanent League into this
+                                # Season when it has one (#331 review round 15 finding 1)
+                                # -- auto-provisioning a default League only for a
+                                # genuinely league-less Team, mirroring create_division so
+                                # imported rows are never orphaned with a null
+                                # league_season_id.
+                                _ls = self._bind_import_team_league_season(
+                                    season_id, _existing_team_league_id)
+                                division = Division(id=self.store.next_id("division"),
+                                                    league_season_id=_ls.id,
+                                                    name=division_name)
+                                self.store.add_division(division)
+                                self._audit("division_created", "division", division.id,
+                                            actor_id, {"season_id": season_id,
+                                                      "import_batch_id": batch_id})
+                                counts["divisions_created"] += 1
+
+                        division_id = division.id if division else None
+
+                        # #180/#283: a team's participation is converged onto its
+                        # permanent League + a SeasonTeamRegistration, never the legacy
+                        # Team.division_id. The team is a permanent member of THIS
+                        # import season's League -- its OWN permanent League when it
+                        # has one, else auto-provisioned (#331 review round 15 finding
+                        # 1); the imported division lives on the registration.
+                        _import_ls = (self.store.get_league_season(division.league_season_id)
+                                      if division is not None
+                                      else self._bind_import_team_league_season(
+                                          season_id, _existing_team_league_id))
+                        _import_league_id = _import_ls.league_id if _import_ls else None
                         if team is not None:
                             team.name = team_name
                             team.club_id = club_id

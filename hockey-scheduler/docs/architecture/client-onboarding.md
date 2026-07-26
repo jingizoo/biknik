@@ -986,6 +986,139 @@ Proposed as decision 9 in `docs/product/operator-ux-requirements.md`'s
 assumption in PR #331, but not yet confirmed by the product owner and
 reversible pending that confirmation.
 
+Round 14's own convergence review (#331 review round 15) found two further
+gaps, both in the import-commit family the last several rounds have been
+converging.
+
+The first: `commit_teams_players_import`'s round-14 League-level gate
+predicted the target League via `_resolve_import_target_league_id_readonly`,
+which returned `None` — silently skipping the gate for that row — whenever
+the row's Division or LeagueSeason didn't exist yet, rather than treating a
+missing auto-create target as "nothing to compare." An existing Team
+already bound to permanent League A, re-imported into a Season whose own
+League is B (or with no League yet at all) via a row naming a not-yet-
+existing Division, committed cleanly: apply preserved `Team.league_id = A`
+while writing the new registration under League B's freshly-resolved
+LeagueSeason, violating the same `Team.league_id ==
+registration.LeagueSeason.league_id` invariant round 14 closed for the
+race case specifically. The correction is a full plan freeze rather than a
+narrower patch: an unlocked pre-read gathers every candidate Team this
+batch's `team_code` rows could resolve to, then — *before* the Season
+guard, honoring the codebase's own canonical Team → League → Season lock
+order (`register_team_for_season`'s established comment; inverting it
+risks a PostgreSQL deadlock against `delete_league`/`transfer_team_to_
+league`) — every candidate Team is row-locked in deterministic (id-sorted)
+order, followed by every distinct League among them. A new
+`_resolve_import_team_target_league` replaces the old readonly resolver:
+it never returns `None` when the Team already has a permanent League,
+returning that League as the predicted target for both a not-yet-existing
+named Division and a blank one, and only falling back to the Season's own
+ambient default for a genuinely League-less Team — closing the exact
+skip-the-gate gap while also tracking, across every row in one gate pass,
+whether two different Teams' rows predict *different* Leagues for the
+*same* not-yet-existing Division name (a real same-upload conflict apply
+can only resolve one way, rejected with the new `import_new_division_
+league_conflict` reason rather than silently resolved by row order). A
+matching apply-side `_bind_import_team_league_season` binds a new
+Division/LeagueSeason to the Team's own League when it has one — safe to
+call this deep inside an already-Season-locked transaction specifically
+because the pre-lock pass above already holds every League it could
+resolve to. A post-lock verification (id, not just code presence, mirroring
+the Rink fix's own discipline) confirms every row's resolved Team is the
+identical one the pre-lock pass actually locked, retrying the whole attempt
+via the existing `_TeamLockPlanDrifted` signal on any mismatch — covering
+both a Team deleted and recreated under its code and one that simply didn't
+exist at pre-read time. Regression coverage spans both non-race
+reproductions from the review (Memory/SQLite/HTTP), the same-upload
+conflicting-Division case, and a forced two-connection PostgreSQL transfer
+race (an existing Team's permanent League changes between this attempt's
+unlocked pre-read and its row lock); the desktop/390px import smoke test
+gains a same-upload-conflict case asserting the structured error rather
+than a bare `Committed` state.
+
+Re-verifying this fix against the full suite surfaced a further, non-review
+correction: round 14's own `test_identical_global_team_and_player_codes_
+across_seasons_the_loser_is_rejected` — two Seasons under one Program, each
+with its own distinct permanent League, racing to create an identical new
+`team_code` — encoded a contract round 15's own required correction
+explicitly supersedes. That correction reads, in full: "[e]ither bind the
+Team's existing compatible League into the target Season or reject … never
+preserve League A while registering under League B" — and its own two
+reproductions above are the *sequential*, non-race case of exactly this
+topology, required to succeed by binding to the Team's own League.
+`_link_league_season`'s only real compatibility constraint is a shared
+Program (rule 5), which both Leagues here satisfy, so there is no
+principled basis for rejecting the concurrent case while the sequential one
+is now required to succeed — the create-race loser now adopts the winner's
+League into its own Season (creating that second `LeagueSeason` binding as
+a side effect) exactly as `test_shared_permanent_league_across_two_
+seasons_both_racing_imports_succeed` already proves for a League an
+operator pre-bound to both Seasons by hand. The test is rewritten (`..._
+converge_on_one_league`) to assert that outcome instead — both sides commit,
+exactly one Team and one Player survive, and both Seasons' registrations
+resolve to whichever League the winner actually established — and
+falsifiability-verified against the old contract: reverting the target-
+League resolver to the Season's ambient default (ignoring the Team's own
+League) makes the second side observe `team_permanent_league_move_blocked`
+again instead of a second commit. The adjacent cross-*Program* variant
+(`..._across_different_programs_the_loser_is_rejected`) is untouched by any
+of this — gate (1)'s Program-grain check, and the review's own correction,
+both still reject a genuine cross-Program move outright.
+
+The second: `commit_hierarchy_import` (the #260 Slice F nine-sheet
+importer) snapshots every `player_code` it will touch exactly once, near
+the top of its transaction, via one `all_players()` call — then passes
+those same objects through swap-safe jersey release and, unchanged, into
+`upsert_imported_player`, which validated and saved an existing Player with
+no `get_player_for_update()` call or any other re-fetch. A canonical
+delete, deactivation, reactivation, or team-reassignment — every one of
+which *does* row-lock the Player — landing between that snapshot and this
+import's write is invisible to it: apply's `store.save_player(obj)` writes
+the *whole* stale object back, so a field this import never touches (most
+concretely `is_active`) silently reverts to its pre-concurrent-change
+value. Concretely: Memory's save is an unconditional dict-replace, so a
+deleted Player is resurrected under its original id with the import's new
+field values; SQLite's `UPDATE` by id matches zero rows and raises nothing,
+so the write is silently a no-op that still reports `committed`/`updated`
+success; PostgreSQL, under genuine concurrent interleaving, loses the
+concurrent write outright. Closed with a dedicated pre-lock pass inserted
+immediately before `release_batch_player_jerseys` (which is itself the
+first thing to read the stale snapshot): every Player id this batch's rows
+resolved to in the top-level snapshot is row-locked, in deterministic
+(id-sorted, not upload-row-order) order, via `get_player_for_update`; a
+lock that returns `None` or a row whose `external_ref` no longer matches
+the code it was locked for is dropped back to "not found" in the working
+map rather than treated as live — routing it into the existing create
+branch's own reserve-then-recheck (round 14 finding 3), which already
+discovers and safely adopts a concurrently recreated row instead of
+duplicating it, so nothing here needs to reimplement that. Every downstream
+read — jersey availability, jersey release, field apply, contact sync,
+counts, and audit — uses only the freshly locked result from that point on.
+A second, defense-in-depth fix inside `upsert_imported_player` itself
+performs the identical re-fetch under lock whenever it is called with a
+non-`None` `existing`, mirroring `upsert_imported_team`'s own established
+#201 pattern; redundant (a no-op re-lock of the same row) when called from
+the now-fixed hierarchy path, but it keeps the helper safe to call on its
+own rather than trusting every future caller to replicate the batch-level
+discipline. Regression coverage spans forced two-connection PostgreSQL
+races against canonical delete and deactivation (proving no resurrection
+and no silently reverted state, respectively, while the import's own field
+changes still land against the fresh row), plus a deterministic Memory/
+SQLite parity pair using the same stale-snapshot-injection technique this
+file's cross-importer races already established — patching `all_players()`
+so the one call `commit_hierarchy_import`'s own snapshot makes still
+returns the pre-mutation object, reproducing what an unlocked snapshot
+taken before a concurrent commit would see without needing a second
+connection. Both directions are falsifiability-verified against the full
+two-layer fix (the pre-lock pass and `upsert_imported_player`'s own
+re-fetch together), including a test-construction correction the
+deactivation parity test's own falsifiability check caught: Memory's
+`all_players()`/`get_player_for_update` return live object references, not
+copies, so capturing the "stale" snapshot as a bare reference before
+deactivating aliased the very mutation under test, keeping the test green
+even with both fix layers reverted; fixed by snapshotting an independent
+copy before mutating.
+
 ## Authorization and privacy invariants
 
 - The bootstrap claim is the only unauthenticated mutation, and only on a fresh,

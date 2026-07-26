@@ -20,7 +20,7 @@ from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 import hierarchy_fixtures as fx
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import NotificationChannel, Season
+from hockey_scheduler.domain import NotificationChannel, Season, Team
 from hockey_scheduler.services import SetupService
 from hockey_scheduler.store import InMemoryStore, SqlStore
 
@@ -198,6 +198,116 @@ class ImportCommitServiceContract:
         self.assertEqual(self._team("T1").program_id, league1)
         self.assertIsNone(
             self.store.registration_for_team_in_season(season2.id, t1.id))
+
+    # -- #331 review round 15 finding 1: registration must never disagree
+    # with an existing Team's permanent League, even when the row's own
+    # Division/LeagueSeason doesn't exist yet and must be auto-created. ----
+    def test_import_binds_existing_teams_own_league_when_season_already_has_a_different_one(self):
+        # T1's permanent league is established in self.season/self.setup's L1.
+        self.api.commit_teams_players_import(
+            self.season.id, _valid_sheets_csv(), actor_id="admin")
+        t1 = self._team("T1")
+        league_a = t1.league_id
+        self.assertIsNotNone(league_a)
+        # A DIFFERENT Season of the SAME Program (so the Program-level gate
+        # (1) is satisfied) that already has its OWN, different permanent
+        # League (League B) -- the exact reproduction from #331 review round
+        # 15 finding 1: re-importing T1 there, naming a Division that does
+        # NOT exist yet, must never silently register T1 under League B
+        # while leaving Team.league_id at League A.
+        program_id = self.store.get_season(self.season.id).program_id
+        season_b = self.setup.create_season(
+            program_id, "Season B", actor_id="admin")
+        league_b = self.setup.create_league(season_b.id, "League B", actor_id="admin")
+        res = self.api.commit_teams_players_import(
+            season_b.id, {"teams_csv":
+                "team_code,team_name,division_name\nT1,Team One,NewDiv\n"},
+            actor_id="admin")
+        self.assertTrue(res["committed"], res)
+        self.assertEqual(res["summary"]["divisions_created"], 1)
+        # T1's own permanent League is never touched...
+        self.assertEqual(self._team("T1").league_id, league_a)
+        # ...and the NEW registration in season_b resolves to THAT SAME
+        # League, never League B (the canonical invariant this finding
+        # exists to protect: Team.league_id == registration's LeagueSeason.
+        # league_id).
+        reg = self.store.registration_for_team_in_season(season_b.id, t1.id)
+        self.assertIsNotNone(reg)
+        ls = self.store.get_league_season(reg.league_season_id)
+        self.assertEqual(ls.league_id, league_a)
+        self.assertNotEqual(ls.league_id, league_b.id)
+        # League B itself is untouched -- no orphaned/unused stray state.
+        self.assertEqual(len(self.store.league_seasons_for_season(season_b.id)), 2)
+
+    def test_import_binds_existing_teams_own_league_when_season_has_no_league_yet(self):
+        self.api.commit_teams_players_import(
+            self.season.id, _valid_sheets_csv(), actor_id="admin")
+        t1 = self._team("T1")
+        league_a = t1.league_id
+        self.assertIsNotNone(league_a)
+        # A brand-new Season of the SAME Program with NO LeagueSeason at all
+        # -- the second reproduction from #331 review round 15 finding 1:
+        # apply must bind T1's OWN permanent League into this Season, never
+        # spawn an unrelated brand-new default League the way a genuinely
+        # league-less Team's bootstrap import correctly still does.
+        program_id = self.store.get_season(self.season.id).program_id
+        season_b = self.setup.create_season(
+            program_id, "Season B", actor_id="admin")
+        leagues_before = len(self.store.all_leagues())
+        res = self.api.commit_teams_players_import(
+            season_b.id, {"teams_csv": "team_code,team_name\nT1,Team One\n"},
+            actor_id="admin")
+        self.assertTrue(res["committed"], res)
+        self.assertEqual(self._team("T1").league_id, league_a)
+        reg = self.store.registration_for_team_in_season(season_b.id, t1.id)
+        self.assertIsNotNone(reg)
+        ls = self.store.get_league_season(reg.league_season_id)
+        self.assertEqual(ls.league_id, league_a)
+        # No new League was created -- League A's binding was reused.
+        self.assertEqual(len(self.store.all_leagues()), leagues_before)
+
+    def test_import_rejects_same_upload_new_division_under_conflicting_leagues(self):
+        # Two DIFFERENT Teams, each with an established but DIFFERENT
+        # permanent League, both naming the SAME not-yet-existing Division
+        # in ONE upload -- apply can only create that Division under ONE
+        # League, so this is a genuine, same-upload conflict rather than a
+        # concurrency race. Must be rejected before any write, not silently
+        # resolved by whichever row happens to run first.
+        program = self.setup.create_program("Program", actor_id="admin")
+        season_x = self.setup.create_season(program.id, "Season X", actor_id="admin")
+        self.setup.create_league(season_x.id, "League X", actor_id="admin")
+        seed_x = self.api.commit_teams_players_import(
+            season_x.id, {"teams_csv": "team_code,team_name\nTX,Team X\n"},
+            actor_id="admin")
+        self.assertTrue(seed_x["committed"], seed_x)
+        season_y = self.setup.create_season(program.id, "Season Y", actor_id="admin")
+        self.setup.create_league(season_y.id, "League Y", actor_id="admin")
+        seed_y = self.api.commit_teams_players_import(
+            season_y.id, {"teams_csv": "team_code,team_name\nTY,Team Y\n"},
+            actor_id="admin")
+        self.assertTrue(seed_y["committed"], seed_y)
+        tx_league = self._team("TX").league_id
+        ty_league = self._team("TY").league_id
+        self.assertNotEqual(tx_league, ty_league)
+
+        season_z = self.setup.create_season(program.id, "Season Z", actor_id="admin")
+        res = self.api.commit_teams_players_import(
+            season_z.id, {"teams_csv": (
+                "team_code,team_name,division_name\n"
+                "TX,Team X,SharedDiv\nTY,Team Y,SharedDiv\n")},
+            actor_id="admin")
+        self.assertFalse(res["committed"], res)
+        self.assertTrue(any(e["reason"] == "import_new_division_league_conflict"
+                            for e in res["errors"]), res)
+        # Zero writes: neither Team's league changed, no Division was
+        # created for season_z, and neither gained a season_z registration.
+        self.assertEqual(self._team("TX").league_id, tx_league)
+        self.assertEqual(self._team("TY").league_id, ty_league)
+        self.assertEqual(self.store.divisions_for_season(season_z.id), [])
+        self.assertIsNone(
+            self.store.registration_for_team_in_season(season_z.id, self._team("TX").id))
+        self.assertIsNone(
+            self.store.registration_for_team_in_season(season_z.id, self._team("TY").id))
 
     def test_import_rejects_a_season_without_a_valid_league(self):
         orphan = Season(id=self.store.next_id("season"), program_id=None,
@@ -566,6 +676,35 @@ class ImportCommitHttpTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertTrue(body["committed"])
 
+    def test_binds_existing_teams_own_league_over_real_http(self):
+        # #331 review round 15 finding 1: the same invariant proven at the
+        # service layer above, driven through the real HTTP commit path the
+        # review explicitly asked for.
+        c = self._client()
+        self._login(c, "admin")
+        status, body = self._req(c, "POST", "/api/import/commit/teams-players",
+                                 self._payload())
+        self.assertEqual(status, 200)
+        self.assertTrue(body["committed"])
+        store = self.srv.STATE.api.store
+        setup = SetupService(store)
+        t1 = next(t for t in store.all_teams() if t.external_ref == "T1")
+        league_a = t1.league_id
+        self.assertIsNotNone(league_a)
+        program_id = store.get_season(self.srv.STATE.ids["season_id"]).program_id
+        season_b = setup.create_season(program_id, "Season B", actor_id="admin")
+        setup.create_league(season_b.id, "League B", actor_id="admin")
+        body2 = {"season_id": season_b.id,
+                "teams_csv": "team_code,team_name,division_name\nT1,Team One,NewDiv\n"}
+        status2, resp2 = self._req(c, "POST", "/api/import/commit/teams-players", body2)
+        self.assertEqual(status2, 200)
+        self.assertTrue(resp2["committed"], resp2)
+        self.assertEqual(store.get_team(t1.id).league_id, league_a)
+        reg = store.registration_for_team_in_season(season_b.id, t1.id)
+        self.assertIsNotNone(reg)
+        ls = store.get_league_season(reg.league_season_id)
+        self.assertEqual(ls.league_id, league_a)
+
     def test_arena_manager_forbidden(self):
         c = self._client()
         self._login(c, "arena")
@@ -697,22 +836,36 @@ class PostgresTeamsPlayersImportRaceTest(unittest.TestCase):
         self.assertEqual(team_b.club_id, clubs[0].id,
                          "team B must point at the surviving Club, not an orphan")
 
-    def test_identical_global_team_and_player_codes_across_seasons_the_loser_is_rejected(self):
-        """#331 review round 14 finding 2: this test's own PRIOR assertion --
-        that both commits succeed, leaving the SAME Team registered under
-        BOTH Season A's permanent League (LA) and Season B's (LB) -- was
-        itself the exact bug the reviewer caught. _seed_two_seasons binds
-        Season A/B to distinct permanent Leagues under one shared Program,
-        so Team.program_id agrees for both sides while Team.league_id does
-        not: the loser's late double-checked-locking recheck used to adopt
-        the winner's Team and write a registration into ITS OWN (different)
-        League's LeagueSeason regardless, violating the canonical invariant
-        Team.league_id == registration.league_season.league_id. The correct
-        outcome is exactly one winner (whichever actually created the Team,
-        under its own permanent League) and the loser rejected atomically
-        with team_permanent_league_move_blocked -- no registration, no
-        duplicate Team/Player, and the Team's league_id never silently
-        moves to match the loser instead."""
+    def test_identical_global_team_and_player_codes_across_seasons_converge_on_one_league(self):
+        """#331 review round 15 finding 1 supersedes this test's own PRIOR
+        contract (round 14 finding 2, "the loser is rejected"). Round 15's
+        required correction reads: "[e]ither bind the Team's existing
+        compatible League into the target Season or reject ... never
+        preserve League A while registering under League B" -- and its own
+        two reproductions are SEQUENTIAL (non-race) imports of an existing
+        Team into a Season with a DIFFERENT established League, both
+        required to SUCCEED by binding to the Team's own League (see
+        test_import_binds_existing_teams_own_league_when_season_already_
+        has_a_different_one in test_import_commit.py's Memory/SQLite
+        contract -- the direct sequential analog of the race below).
+        _link_league_season's only real compatibility constraint is a
+        shared Program (rule 5), which LA and LB both satisfy here, being
+        _seed_two_seasons's own two Leagues under one shared Program -- so
+        there is no principled reason a CONCURRENT second comer should be
+        rejected when a SEQUENTIAL one is now required to succeed; the
+        only outcome either topology actually needs to reject is the one
+        the invariant names: a registration binding to a League
+        Team.league_id disagrees with. This is exactly the topology
+        test_shared_permanent_league_across_two_seasons_both_racing_
+        imports_succeed above already proves for a League PRE-bound to
+        both Seasons by an operator -- this test is that identical
+        outcome, just reached by the import itself creating the second
+        LeagueSeason binding rather than an operator doing it ahead of
+        time. Falsifiability-verified against the OLD contract: with
+        finding 1's fix reverted (target_league_id resolved from the
+        Season's ambient default instead of the Team's own League), the
+        second side to reach its retry observes team_permanent_league_
+        move_blocked here instead of a second commit."""
         seed_store = SqlStore(self.url)
         season_a, season_b = self._seed_two_seasons(seed_store)
 
@@ -750,23 +903,8 @@ class PostgresTeamsPlayersImportRaceTest(unittest.TestCase):
         for key, res in results.items():
             self.assertNotIsInstance(
                 res, Exception,
-                f"commit {key} raised instead of returning a structured result: {res!r}")
-
-        winner_key = next((k for k, r in results.items() if r.get("committed")), None)
-        self.assertIsNotNone(
-            winner_key, f"expected exactly one side to commit, got: {results}")
-        loser_key = "b" if winner_key == "a" else "a"
-        self.assertFalse(
-            results[loser_key].get("committed"),
-            f"expected the OTHER side to be atomically rejected, not also "
-            f"commit into a different permanent league: {results}")
-        self.assertEqual(
-            results[loser_key]["errors"][0]["reason"],
-            "team_permanent_league_move_blocked", results[loser_key])
-
-        winner_season = season_a if winner_key == "a" else season_b
-        loser_season = season_b if winner_key == "a" else season_a
-        winner_league_name = "LA" if winner_key == "a" else "LB"
+                f"commit {key} raised instead of committing cleanly: {res!r}")
+            self.assertTrue(res.get("committed"), f"commit {key}: {res}")
 
         fresh = SqlStore(self.url)
         teams = [t for t in fresh.all_teams() if t.external_ref == "RACE_TEAM"]
@@ -779,21 +917,26 @@ class PostgresTeamsPlayersImportRaceTest(unittest.TestCase):
             f"expected exactly one Player for RACE_PLAYER, got {[p.id for p in players]}")
         self.assertEqual(players[0].team_id, teams[0].id)
 
-        winner_league = next(l for l in fresh.all_leagues()
-                             if l.name == winner_league_name)
-        self.assertEqual(
-            teams[0].league_id, winner_league.id,
-            "the Team's permanent league must match the WINNER's season, "
-            "never silently move to the loser's")
+        # Whichever side actually won the create race established the
+        # Team's one real permanent League (LA or LB) -- both Seasons'
+        # registrations must resolve to THAT SAME League, never a stale or
+        # season-default-diverged one (the exact invariant finding 1
+        # exists to protect: Team.league_id == registration.LeagueSeason.
+        # league_id).
+        winner_league_id = teams[0].league_id
+        race_league_ids = {l.id for l in fresh.all_leagues() if l.name in ("LA", "LB")}
+        self.assertIn(winner_league_id, race_league_ids)
 
-        reg_winner = next((r for r in fresh.registrations_for_season(winner_season.id)
-                           if r.team_id == teams[0].id), None)
-        reg_loser = next((r for r in fresh.registrations_for_season(loser_season.id)
-                          if r.team_id == teams[0].id), None)
-        self.assertIsNotNone(reg_winner, "the winner's season must have its "
-                                         "own registration for the surviving Team")
-        self.assertIsNone(reg_loser, "the loser must not have written a "
-                                     "registration into the wrong permanent league")
+        reg_a = next((r for r in fresh.registrations_for_season(season_a.id)
+                     if r.team_id == teams[0].id), None)
+        reg_b = next((r for r in fresh.registrations_for_season(season_b.id)
+                     if r.team_id == teams[0].id), None)
+        self.assertIsNotNone(reg_a, "Season A must have its own registration")
+        self.assertIsNotNone(reg_b, "Season B must have its own registration")
+        self.assertEqual(fresh.get_league_season(reg_a.league_season_id).league_id,
+                         winner_league_id)
+        self.assertEqual(fresh.get_league_season(reg_b.league_season_id).league_id,
+                         winner_league_id)
         # An isolated "Team pre-existing for both, only Player races" variant
         # (mirroring the officials-availability window-only split in round
         # 11) was attempted and deliberately dropped: every audit row this
@@ -955,6 +1098,110 @@ class PostgresTeamsPlayersImportRaceTest(unittest.TestCase):
                          teams[0].league_id)
         self.assertEqual(fresh.get_league_season(reg_b.league_season_id).league_id,
                          teams[0].league_id)
+
+    def test_concurrent_transfer_between_gate_snapshot_and_apply_is_never_stale(self):
+        """#331 review round 15 finding 1's required PostgreSQL orchestration:
+        an existing Team transfers to a DIFFERENT permanent League in the
+        window between the import's unlocked pre-read and its actual Team
+        row lock -- the import must never bind the registration to the
+        STALE (pre-transfer) League. Team X is seeded with a permanent
+        League and deliberately ZERO existing registrations (via a direct
+        store insert, not an import), so transfer_team_to_league's own
+        candidate scan finds nothing to move and locks no Season -- isolating
+        this test to the Team/League race alone, not a Season-lock race
+        this file's other tests already cover (and which would otherwise
+        risk the same self-inflicted circular wait already documented for
+        the hierarchy-vs-pilot Season-lock case elsewhere in this file).
+
+        The import's own store has get_team_for_update patched to pause on
+        Team X's id -- BEFORE the real row lock is taken, so the transfer
+        can run to completion unblocked -- then resumes once the transfer
+        has committed. commit_teams_players_import must adopt Team X's
+        CURRENT (post-transfer) League, never the one its own unlocked
+        pre-read saw."""
+        seed_store = SqlStore(self.url)
+        seed_setup = SetupService(seed_store)
+        program = seed_setup.create_program("Transfer Race Program", actor_id="admin")
+        # League A and League C both need a real Season binding to exist as
+        # rows, but neither binding is the one under test -- the import
+        # targets a THIRD Season, season_import, which starts with no
+        # LeagueSeason of its own at all.
+        season_a = seed_setup.create_season(program.id, "Season A", actor_id="admin")
+        league_a = seed_setup.create_league(season_a.id, "League A", actor_id="admin")
+        season_c = seed_setup.create_season(program.id, "Season C", actor_id="admin")
+        league_c = seed_setup.create_league(season_c.id, "League C", actor_id="admin")
+        season_import = seed_setup.create_season(
+            program.id, "Season Import", actor_id="admin")
+        team_x = Team(id=seed_store.next_id("team"), name="Team X",
+                      program_id=program.id, league_id=league_a.id,
+                      external_ref="RACE_TRANSFER")
+        seed_store.add_team(team_x)
+        self.assertEqual(seed_store.registrations_for_season(season_a.id), [])
+
+        store_import = SqlStore(self.url)
+        api_import = ApiService(store_import)
+        store_transfer = SqlStore(self.url)
+        setup_transfer = SetupService(store_transfer)
+
+        reached_event = threading.Event()
+        resume_event = threading.Event()
+        real_get_team_for_update = store_import.get_team_for_update
+        def _pausing_get_team_for_update(team_id):
+            if team_id == team_x.id:
+                reached_event.set()
+                if not resume_event.wait(timeout=10):
+                    raise AssertionError("transfer side never signalled completion")
+            return real_get_team_for_update(team_id)
+        store_import.get_team_for_update = _pausing_get_team_for_update
+
+        results = {}
+
+        def run_import():
+            try:
+                results["import"] = api_import.commit_teams_players_import(
+                    season_import.id,
+                    {"teams_csv": "team_code,team_name\nRACE_TRANSFER,Team X\n"},
+                    actor_id="importer")
+            except Exception as exc:
+                results["import"] = exc
+
+        t_import = threading.Thread(target=run_import)
+        t_import.start()
+        self.assertTrue(reached_event.wait(timeout=10),
+                        "import never reached its Team row-lock pause")
+        # The import has NOT yet locked Team X's row (paused before the real
+        # call) -- the transfer must be able to acquire it and run to
+        # completion while the import waits.
+        try:
+            results["transfer"] = setup_transfer.transfer_team_to_league(
+                team_x.id, league_c.id, actor_id="admin")
+        finally:
+            resume_event.set()
+        t_import.join(20)
+
+        self.assertFalse(t_import.is_alive(), "import thread hung")
+        self.assertNotIsInstance(results["transfer"], Exception, results["transfer"])
+        self.assertEqual(results["transfer"].league_id, league_c.id)
+        self.assertNotIsInstance(
+            results["import"], Exception,
+            f"import raised instead of committing cleanly: {results['import']!r}")
+        self.assertTrue(results["import"].get("committed"), results["import"])
+
+        fresh = SqlStore(self.url)
+        fresh_team = fresh.get_team(team_x.id)
+        self.assertEqual(
+            fresh_team.league_id, league_c.id,
+            "the transfer's own result must stand -- the import must never "
+            "revert or race it")
+        reg = fresh.registration_for_team_in_season(season_import.id, team_x.id)
+        self.assertIsNotNone(reg)
+        ls = fresh.get_league_season(reg.league_season_id)
+        self.assertEqual(
+            ls.league_id, league_c.id,
+            "the import must bind to Team X's CURRENT (post-transfer) "
+            "League C, never the STALE League A its own unlocked pre-read "
+            "saw before the transfer committed")
+        self.assertNotEqual(ls.league_id, league_a.id)
 
     def test_officials_and_teams_imports_share_the_same_club_resolver(self):
         """Proves both call sites participate in the SAME serialization
