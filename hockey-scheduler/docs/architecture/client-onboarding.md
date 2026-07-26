@@ -729,14 +729,84 @@ reason before restoring it.
 
 A third, non-code finding closed this round: issue #330 lists new schema/
 migrations as an explicit non-goal, and migrations 047/048 (added in round
-11 to fix a release-blocking data-integrity bug in this PR's own already-
-in-scope import logic) are exactly that. Recorded as decision 10 in
-`docs/product/operator-ux-requirements.md`, proposed but **not** claimed
-as confirmed — the same pattern decision 9 already established for this
-PR, after an earlier round mistakenly treated a bug report as sign-off.
-The PR body's "Data/privacy impact" and rollback notes are corrected to
-describe the migrations as existing (a factual fix, independent of how the
-scope question resolves) rather than continuing to claim none exist.
+11 to fix a release-blocking data-integrity bug in already-shipped
+officials/rinks import code from #94/#95) are exactly that. Recorded as
+decision 10 in `docs/product/operator-ux-requirements.md`, proposed but
+**not** claimed as confirmed — the same pattern decision 9 already
+established for this PR, after an earlier round mistakenly treated a bug
+report as sign-off. The PR body's "Data/privacy impact" and rollback notes
+are corrected to describe the migrations as existing (a factual fix,
+independent of how the scope question resolves) rather than continuing to
+claim none exist.
+
+Round 12's own convergence review (#331 review round 13) found two further
+gaps in the same import-commit family, both closed without any additional
+migration.
+
+The first: `commit_rinks_ice_slots_import`'s lock plan is itself built from
+a snapshot — `_existing_rink_by_code` — taken *before* the lock loop that
+reads it runs. A `rink_code` absent from that snapshot is therefore never
+locked and is treated by both the `slot_type` gate and the overlap gate as
+"brand-new, nothing persisted to protect" — but a concurrent transaction
+can create that exact `rink_code`, a `GAME` slot on it, and even a Game
+booked on that slot, in the gap between this attempt's snapshot and its
+lock acquisition. Round 12's own regressions for the `slot_type`/overlap
+gates both pre-seeded their target Rink specifically, so neither could
+ever exercise this: the snapshot already included it in every case they
+tried. Closed by re-resolving every requested `rink_code` immediately
+*after* the lock loop, mirroring `commit_ice_availability`'s existing
+`_SeasonReparented` internal-retry-signal pattern: if any code that was
+absent from the original snapshot now resolves to a real Rink outside the
+locked set, the whole attempt is stale — raise `_RinkLockPlanDrifted`,
+caught by the same bounded retry loop the child-key race already uses, and
+retry with a fresh snapshot that will lock and gate the Rink correctly.
+One fix closes both the `slot_type` and overlap variants, since both read
+the same lock-plan-derived state. Regression tests for each variant pause
+the import's `get_rink_for_update` call on a second, unrelated,
+already-existing Rink (not the drifting one — it was never locked at all,
+so there is nothing on it to pause) to prove the snapshot has already run
+and missed the new Rink before letting the concurrent write land.
+
+The second: `commit_teams_players_import` has the identical unlocked
+Club-by-name find-or-create round 12 fixed in the officials import, but
+was never touched — and, unlike the officials/rinks imports, only locks
+its own target Season, so two imports for *different* Seasons never
+serialize against each other at all. `team_code` and `player_code`,
+documented in this method's own docstring as globally stable external
+references, have the same unprotected shape with no durable uniqueness
+backstop of their own (migration 009 only adds the columns). The Club fix
+is extracted into a single shared helper,
+`_find_or_create_import_club`, used by both
+`commit_officials_availability_import` and `commit_teams_players_import`
+(a new regression drives one of each import type at the identical new
+club name specifically, to prove they share the one serialization point
+rather than each having its own, independently-fixed copy). `team_code`
+and `player_code` get the identical reserve-then-recheck treatment inline.
+One planned regression — isolating the Player race alone, with the Team
+already pre-existing for both sides — turned out not to be constructible:
+every audit row this method writes, including the *unconditional*
+`team_updated` audit a pre-existing Team always gets, shares one global
+`next_id("setupaudit")` counter, so two commits that both reference an
+existing Team already fully serialize against each other at that earlier
+point, before either could reach the Player step at all. Forcing it
+anyway reproduced the exact self-inflicted circular-wait class this file's
+other `next_id()`-pausing tests are already careful to avoid. The combined
+Team+Player regression (both racing on a brand-new `team_code`, carrying
+an identical `player_code`) still proves the required end state — exactly
+one Team, exactly one Player, and a correct per-Season registration on
+each side — without hitting that trap.
+
+A final, non-code correction: round 12's own text described the
+officials/rinks import-commit code as "this PR's" or already "introduced"
+by it. `commit_officials_availability_import`, `commit_rinks_ice_slots_import`,
+and `commit_teams_players_import` all predate this PR (#93/#94/#95,
+already on `main`) — this PR's review process found and fixed concurrency
+bugs in that existing code, it did not write the code being fixed.
+Decision 10 and the PR body are corrected accordingly, along with the PR
+body's rollback note: rounds 11–13's fixes change those three functions'
+own internal locking/retry/validation-ordering behavior, so the code
+revert is not purely "additive-only" the way the new route and Dashboard
+card are, even though no public API contract changes.
 
 The card's async states carry real accessibility semantics, not just visual
 ones (#331 review round 5 finding 5): `#sp-card-slot` (the wrapper

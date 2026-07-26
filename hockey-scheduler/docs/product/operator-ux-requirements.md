@@ -713,26 +713,37 @@ through each section:
    remains reversible pending explicit sign-off, same as any other
    not-yet-confirmed product decision in this section.
 10. **Migration/schema scope for import data-integrity fixes** (#331 review
-    round 12 finding 3): **open — proposed, not yet confirmed.** Issue #330
-    explicitly lists "Any new schema, migration, API contract…" as a
-    non-goal for this PR. Round 11 nonetheless added two forward-only
-    migrations (047, 048) — partial unique indexes backstopping the
-    officials/rinks CSV-import commit against a duplicate-row PostgreSQL
-    race — because the alternative (documented in each migration's own
-    comment) was leaving a confirmed release-blocking data-integrity bug
-    unfixed in this PR's already-in-scope import-commit logic. Round 12
+    round 12 finding 3, corrected round 13 finding 3): **open — proposed,
+    not yet confirmed.** Issue #330 explicitly lists "Any new schema,
+    migration, API contract…" as a non-goal for this PR.
+    `commit_officials_availability_import` and
+    `commit_rinks_ice_slots_import` are **pre-existing code from #94/#95,
+    already on `main` before this PR** — not introduced by it; round 13
+    corrects round 12's own wording here, which imprecisely called them
+    "this PR's" logic. Round 11 nonetheless added two forward-only
+    migrations (047, 048) to this pre-existing code — partial unique
+    indexes backstopping the officials/rinks CSV-import commit against a
+    duplicate-row PostgreSQL race — because the alternative (documented in
+    each migration's own comment) was leaving a confirmed release-blocking
+    data-integrity bug unfixed in already-shipped import-commit logic that
+    this PR's own review process happened to be the one to find. Round 12
     closed an adjacent gap in the same race (the Club/Venue find-or-create
     half) without a further migration — structurally, via an existing
     locking primitive (see the code comments at each call site) rather than
-    a new index — but 047/048 themselves remain a schema change #330 didn't
-    anticipate. **Proposed** (pending @jingizoo's confirmation): accept
-    047/048 as an approved, narrowly-scoped prerequisite to this PR's own
-    import-commit correctness — not a #330 scope expansion the epic needs
-    to account for elsewhere — since they backstop a bug in code this PR
-    already introduced, not new product surface. Until confirmed, the PR
-    body's data/rollback notes describe these migrations as existing
-    (a factual correction, made regardless of how this decision resolves)
-    without claiming the scope expansion itself is accepted.
+    a new index — and round 13 closed two more gaps in the same family (a
+    Rink lock-plan-drift race, and the identical Club/Team/Player race in
+    the separate `commit_teams_players_import` path from #93) the same
+    migration-free way. 047/048 themselves remain the one actual schema
+    change #330 didn't anticipate. **Proposed** (pending @jingizoo's
+    confirmation): accept 047/048 as an approved, narrowly-scoped
+    prerequisite fixing a pre-existing data-integrity bug in already-shipped
+    import-commit code — not a #330 scope expansion the epic needs to
+    account for elsewhere, and not new product surface this PR introduced.
+    Until confirmed, the PR body's data/rollback notes describe these
+    migrations as existing and describe the import-commit logic they touch
+    as pre-existing, not additive (both factual corrections, made
+    regardless of how this decision resolves) without claiming the scope
+    expansion itself is accepted.
 
 ## Out of scope for this package
 

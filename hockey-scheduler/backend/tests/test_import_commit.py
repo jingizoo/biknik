@@ -8,6 +8,7 @@ rinks, and ice slots commit are out of scope here (#94/#95).
 """
 
 import json
+import os
 import threading
 import unittest
 import urllib.error
@@ -605,6 +606,239 @@ class ImportCommitHttpTest(unittest.TestCase):
                    if a.action in ("team_created", "team_updated")][-1]
         self.assertEqual(team_row.actor_id, admin_uid)
         self.assertNotEqual(team_row.actor_id, "attacker")
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class PostgresTeamsPlayersImportRaceTest(unittest.TestCase):
+    """#331 review round 13 finding 2: commit_teams_players_import's Club
+    find-or-create had the same unlocked check-then-create shape round 12
+    fixed for the officials/rinks imports, but was never touched -- and
+    only this method's OWN target Season is locked, so two imports for
+    DIFFERENT Seasons never serialize against each other here. club_name,
+    team_code, and player_code are all documented as globally matched (not
+    Season-scoped), so each could see an identical new value absent and
+    create a duplicate. Each thread drives its OWN
+    ApiService(SqlStore(...)) -- a separate connection and process-local
+    RLock -- so passing here depends on the real cross-connection
+    next_id() lock the fix now participates in, not the in-process lock a
+    shared store instance would provide for free."""
+
+    def setUp(self):
+        self.url = os.environ["TEST_DATABASE_URL"]
+        SqlStore(self.url).clear_all_data()
+
+    def _seed_two_seasons(self, seed_store):
+        seed_setup = SetupService(seed_store)
+        program = seed_setup.create_program("Race League", actor_id="admin")
+        season_a = seed_setup.create_season(program.id, "Season A", actor_id="admin")
+        seed_setup.create_league(season_a.id, "LA", actor_id="admin")
+        season_b = seed_setup.create_season(program.id, "Season B", actor_id="admin")
+        seed_setup.create_league(season_b.id, "LB", actor_id="admin")
+        return season_a, season_b
+
+    def _pausing(self, store, prefix_to_pause, barrier):
+        real = store.next_id
+        def _wrapped(prefix):
+            if prefix == prefix_to_pause:
+                barrier.wait(timeout=10)
+            return real(prefix)
+        return _wrapped
+
+    def test_identical_new_club_name_across_seasons_does_not_duplicate(self):
+        seed_store = SqlStore(self.url)
+        season_a, season_b = self._seed_two_seasons(seed_store)
+
+        store_a, store_b = SqlStore(self.url), SqlStore(self.url)
+        api_a, api_b = ApiService(store_a), ApiService(store_b)
+
+        # Distinct team_codes so the Team side never contends -- isolating
+        # the Club race specifically, same design as the officials/rinks
+        # Club and Venue races in round 12.
+        barrier = threading.Barrier(2)
+        store_a.next_id = self._pausing(store_a, "club", barrier)
+        store_b.next_id = self._pausing(store_b, "club", barrier)
+
+        a_csv = "team_code,team_name,club_name\nRACE_TA,Team A,Race Club\n"
+        b_csv = "team_code,team_name,club_name\nRACE_TB,Team B,Race Club\n"
+
+        results = {}
+
+        def run(api, season, csv, key):
+            try:
+                results[key] = api.commit_teams_players_import(
+                    season.id, {"teams_csv": csv}, actor_id=key)
+            except Exception as exc:
+                results[key] = exc
+
+        ta = threading.Thread(target=run, args=(api_a, season_a, a_csv, "a"))
+        tb = threading.Thread(target=run, args=(api_b, season_b, b_csv, "b"))
+        ta.start(); tb.start()
+        ta.join(20); tb.join(20)
+
+        self.assertFalse(ta.is_alive(), "thread a hung")
+        self.assertFalse(tb.is_alive(), "thread b hung")
+        for key, res in results.items():
+            self.assertNotIsInstance(
+                res, Exception,
+                f"commit {key} raised instead of committing cleanly: {res!r}")
+            self.assertTrue(res.get("committed"), f"commit {key}: {res}")
+
+        fresh = SqlStore(self.url)
+        clubs = [c for c in fresh.all_clubs() if c.name == "Race Club"]
+        self.assertEqual(
+            len(clubs), 1,
+            f"expected exactly one Club named 'Race Club', got {[c.id for c in clubs]}")
+        team_a = next(t for t in fresh.all_teams() if t.external_ref == "RACE_TA")
+        team_b = next(t for t in fresh.all_teams() if t.external_ref == "RACE_TB")
+        self.assertEqual(team_a.club_id, clubs[0].id,
+                         "team A must point at the surviving Club, not an orphan")
+        self.assertEqual(team_b.club_id, clubs[0].id,
+                         "team B must point at the surviving Club, not an orphan")
+
+    def test_identical_global_team_and_player_codes_across_seasons_does_not_duplicate(self):
+        seed_store = SqlStore(self.url)
+        season_a, season_b = self._seed_two_seasons(seed_store)
+
+        store_a, store_b = SqlStore(self.url), SqlStore(self.url)
+        api_a, api_b = ApiService(store_a), ApiService(store_b)
+
+        barrier = threading.Barrier(2)
+        store_a.next_id = self._pausing(store_a, "team", barrier)
+        store_b.next_id = self._pausing(store_b, "team", barrier)
+
+        race_teams_csv = "team_code,team_name\nRACE_TEAM,Race Team\n"
+        race_players_csv = (
+            "player_code,first_name,last_name,team_code,jersey_number,position\n"
+            "RACE_PLAYER,Race,Player,RACE_TEAM,7,forward\n"
+        )
+
+        results = {}
+
+        def run(api, season, key):
+            try:
+                results[key] = api.commit_teams_players_import(
+                    season.id,
+                    {"teams_csv": race_teams_csv, "players_csv": race_players_csv},
+                    actor_id=key)
+            except Exception as exc:
+                results[key] = exc
+
+        ta = threading.Thread(target=run, args=(api_a, season_a, "a"))
+        tb = threading.Thread(target=run, args=(api_b, season_b, "b"))
+        ta.start(); tb.start()
+        ta.join(20); tb.join(20)
+
+        self.assertFalse(ta.is_alive(), "thread a hung")
+        self.assertFalse(tb.is_alive(), "thread b hung")
+        for key, res in results.items():
+            self.assertNotIsInstance(
+                res, Exception,
+                f"commit {key} raised instead of committing cleanly: {res!r}")
+            self.assertTrue(res.get("committed"), f"commit {key}: {res}")
+
+        fresh = SqlStore(self.url)
+        teams = [t for t in fresh.all_teams() if t.external_ref == "RACE_TEAM"]
+        self.assertEqual(
+            len(teams), 1,
+            f"expected exactly one Team for RACE_TEAM, got {[t.id for t in teams]}")
+        players = [p for p in fresh.all_players() if p.external_ref == "RACE_PLAYER"]
+        self.assertEqual(
+            len(players), 1,
+            f"expected exactly one Player for RACE_PLAYER, got {[p.id for p in players]}")
+        self.assertEqual(players[0].team_id, teams[0].id)
+        reg_a = next((r for r in fresh.registrations_for_season(season_a.id)
+                     if r.team_id == teams[0].id), None)
+        reg_b = next((r for r in fresh.registrations_for_season(season_b.id)
+                     if r.team_id == teams[0].id), None)
+        self.assertIsNotNone(reg_a, "Season A must have its own registration "
+                                    "for the surviving Team")
+        self.assertIsNotNone(reg_b, "Season B must have its own registration "
+                                    "for the surviving Team")
+        # An isolated "Team pre-existing for both, only Player races" variant
+        # (mirroring the officials-availability window-only split in round
+        # 11) was attempted and deliberately dropped: every audit row this
+        # method writes -- including the UNCONDITIONAL team_updated audit a
+        # pre-existing Team always gets -- shares ONE global next_id
+        # ("setupaudit") counter. Two concurrent commits that both reference
+        # an existing Team therefore already fully serialize against each
+        # other at that EARLIER point (whichever side's team_updated audit
+        # loses the counter race blocks, at the DB level, until the other's
+        # entire transaction -- Team AND Player -- commits), so by the time
+        # either side would reach the Player step, the race is already over
+        # and the Player-specific double-check is never genuinely exercised.
+        # Attempting to force it anyway (pausing at next_id("player")) hits
+        # exactly the self-inflicted circular-wait class this file's own
+        # next_id()-pausing tests take care to avoid: one side ends up
+        # holding the setupaudit row open while blocked on the Python
+        # barrier, and the other blocks on that row before ever reaching the
+        # barrier. The Player-level fix (see setup_service.py) still
+        # verifiably prevents duplication where it CAN be exercised --
+        # exactly the combined scenario this test proves.
+
+    def test_officials_and_teams_imports_share_the_same_club_resolver(self):
+        """Proves both call sites participate in the SAME serialization
+        point, not just that each is independently safe against its own
+        kind -- an officials import and a teams/players import landing on
+        the identical new club_name must still converge on one Club.
+        Reverting either call site's use of _find_or_create_import_club
+        (back to its own unprotected inline copy) must make this fail."""
+        seed_store = SqlStore(self.url)
+        seed_setup = SetupService(seed_store)
+        program = seed_setup.create_program("Race League", actor_id="admin")
+        season = seed_setup.create_season(program.id, "2026 Season", actor_id="admin")
+        seed_setup.create_league(season.id, "L1", actor_id="admin")
+
+        store_a, store_b = SqlStore(self.url), SqlStore(self.url)
+        api_a, api_b = ApiService(store_a), ApiService(store_b)
+
+        barrier = threading.Barrier(2)
+        store_a.next_id = self._pausing(store_a, "club", barrier)
+        store_b.next_id = self._pausing(store_b, "club", barrier)
+
+        teams_csv = "team_code,team_name,club_name\nRACE_TX,Race Team,Cross Club\n"
+        officials_csv = "official_code,name,home_club_name\nRACE_OX,Race Official,Cross Club\n"
+
+        results = {}
+
+        def run_teams():
+            try:
+                results["teams"] = api_a.commit_teams_players_import(
+                    season.id, {"teams_csv": teams_csv}, actor_id="a")
+            except Exception as exc:
+                results["teams"] = exc
+
+        def run_officials():
+            try:
+                results["officials"] = api_b.commit_officials_availability_import(
+                    {"officials_csv": officials_csv}, actor_id="b")
+            except Exception as exc:
+                results["officials"] = exc
+
+        ta = threading.Thread(target=run_teams)
+        tb = threading.Thread(target=run_officials)
+        ta.start(); tb.start()
+        ta.join(20); tb.join(20)
+
+        self.assertFalse(ta.is_alive(), "teams thread hung")
+        self.assertFalse(tb.is_alive(), "officials thread hung")
+        for key, res in results.items():
+            self.assertNotIsInstance(
+                res, Exception,
+                f"commit {key} raised instead of committing cleanly: {res!r}")
+            self.assertTrue(res.get("committed"), f"commit {key}: {res}")
+
+        fresh = SqlStore(self.url)
+        clubs = [c for c in fresh.all_clubs() if c.name == "Cross Club"]
+        self.assertEqual(
+            len(clubs), 1,
+            f"expected exactly one Club named 'Cross Club', got {[c.id for c in clubs]}")
+        team = next(t for t in fresh.all_teams() if t.external_ref == "RACE_TX")
+        official = next(o for o in fresh.all_officials() if o.external_ref == "RACE_OX")
+        self.assertEqual(team.club_id, clubs[0].id,
+                         "the teams import must point at the surviving Club")
+        self.assertEqual(official.home_club_id, clubs[0].id,
+                         "the officials import must point at the surviving Club")
 
 
 if __name__ == "__main__":

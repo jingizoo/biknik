@@ -231,6 +231,20 @@ class _MoveGameRaced(Exception):
     set."""
 
 
+class _RinkLockPlanDrifted(Exception):
+    """Internal retry signal (#331 review round 13 finding 1):
+    commit_rinks_ice_slots_import's lock plan is built from a snapshot taken
+    BEFORE the lock loop runs, so a rink_code absent from that snapshot is
+    skipped by both the lock loop and the slot_type/overlap gates — even
+    though a concurrent transaction can create that exact rink_code (and a
+    booked Game on it) in the gap between the snapshot and this attempt's
+    lock acquisition. Raised when a re-check after lock acquisition finds a
+    rink_code has newly resolved to a Rink outside the locked plan. Caught by
+    the commit's bounded retry loop, which rolls back and retries with a
+    fresh snapshot — one that will correctly lock and gate the now-visible
+    Rink — rather than proceeding against an untrustworthy lock set."""
+
+
 class SetupService:
     def __init__(self, store: InMemoryStore, clock: Callable[[], datetime] = _utcnow):
         self.store = store
@@ -5432,6 +5446,46 @@ class SetupService:
                     self.store.save_session(sess)
 
     # -- CSV import commit (#93) --------------------------------------------
+    def _find_or_create_import_club(self, club_name: str, actor_id, batch_id):
+        """Find-or-create a Club by exact name match for the pilot-onboarding
+        CSV imports (#93/#94), shared by EVERY call site so a race between
+        different import types -- not just two commits of the same type --
+        still converges on one Club (#331 review round 13 finding 2: round
+        12 fixed this race but only inside
+        commit_officials_availability_import; a second, unprotected copy of
+        the same find-or-create in commit_teams_players_import could still
+        create a duplicate, and a cross-import race -- one of each type
+        landing on the identical new club_name -- was never provably safe
+        with two independent implementations of "the same" fix).
+
+        Race-safe via double-checked locking over next_id("club")'s existing
+        cross-connection counter-row lock (#331 review round 12 finding 1):
+        Club has no unique-by-name index -- asserting one would settle a
+        global-uniqueness product question no import commit gets to decide
+        on its own, see migration 048's own comment -- so a bare
+        check-then-create has no row to lock for a brand-new name.
+        Reserving the id FIRST blocks a concurrent creator until THIS
+        transaction commits or rolls back; the re-check that follows is
+        then guaranteed fresh. A reservation that goes unused (the re-check
+        finds the row after all) is a harmless gap in the "club" id
+        sequence -- ids are opaque strings.
+
+        Returns ``(club, created)``; callers own their own
+        ``counts["clubs_created"]`` bookkeeping from ``created``.
+        """
+        club = next((c for c in self.store.all_clubs() if c.name == club_name), None)
+        if club is not None:
+            return club, False
+        reserved_id = self.store.next_id("club")
+        club = next((c for c in self.store.all_clubs() if c.name == club_name), None)
+        if club is not None:
+            return club, False
+        club = Club(id=reserved_id, name=club_name)
+        self.store.add_club(club)
+        self._audit("club_created", "club", club.id, actor_id,
+                    {"import_batch_id": batch_id})
+        return club, True
+
     def commit_teams_players_import(self, season_id: str, sheets: dict,
                                     actor_id: Optional[str] = None) -> dict:
         """Commit step 2 of the pilot onboarding import wizard: teams+players.
@@ -5617,13 +5671,16 @@ class SetupService:
                 club_name_raw = row.get("club_name")
                 if not _no_club(club_name_raw):
                     club_name = _clean(club_name_raw)
-                    club = next((c for c in self.store.all_clubs()
-                                if c.name == club_name), None)
-                    if club is None:
-                        club = Club(id=self.store.next_id("club"), name=club_name)
-                        self.store.add_club(club)
-                        self._audit("club_created", "club", club.id, actor_id,
-                                    {"import_batch_id": batch_id})
+                    # #331 review round 13 finding 2: shared with
+                    # commit_officials_availability_import -- see
+                    # _find_or_create_import_club's own docstring for why a
+                    # bare check-then-create here (this method's own copy,
+                    # unprotected until now) could still duplicate a Club
+                    # racing a DIFFERENT Season's import, or an officials
+                    # import, on the identical new name.
+                    club, created = self._find_or_create_import_club(
+                        club_name, actor_id, batch_id)
+                    if created:
                         counts["clubs_created"] += 1
                     club_id = club.id
 
@@ -5665,6 +5722,22 @@ class SetupService:
                 _import_league_id = _import_ls.league_id if _import_ls else None
                 team = next((t for t in self.store.all_teams()
                             if t.external_ref == team_code), None)
+                if team is None:
+                    # #331 review round 13 finding 2: this method's own copy
+                    # of the same unlocked check-then-create shape Club had
+                    # (see _find_or_create_import_club's docstring) --
+                    # team_code is documented above as a globally stable
+                    # external ref, but this method only locks its OWN
+                    # target Season, so two imports for DIFFERENT Seasons
+                    # never serialize against each other here and could
+                    # each create their own duplicate Team for an identical
+                    # new team_code. Same fix, same mechanism: reserve the
+                    # id via next_id("team") first (blocks a concurrent
+                    # creator until it commits/rolls back), then re-check
+                    # under that lock before deciding create-vs-update.
+                    _reserved_team_id = self.store.next_id("team")
+                    team = next((t for t in self.store.all_teams()
+                                if t.external_ref == team_code), None)
                 if team is not None:
                     team.name = team_name
                     team.club_id = club_id
@@ -5678,7 +5751,7 @@ class SetupService:
                                  "import_batch_id": batch_id})
                     counts["teams_updated"] += 1
                 else:
-                    team = Team(id=self.store.next_id("team"), name=team_name,
+                    team = Team(id=_reserved_team_id, name=team_name,
                                club_id=club_id, program_id=season_league_id,
                                league_id=_import_league_id,
                                external_ref=team_code)
@@ -5767,6 +5840,16 @@ class SetupService:
 
                 player = next((p for p in self.store.all_players()
                               if p.external_ref == player_code), None)
+                if player is None:
+                    # #331 review round 13 finding 2: same gap, same fix as
+                    # Team above -- player_code is documented as a globally
+                    # stable external ref but only THIS Season's row is
+                    # locked, so two different-Season imports could each
+                    # create their own duplicate Player for an identical
+                    # new player_code.
+                    _reserved_player_id = self.store.next_id("player")
+                    player = next((p for p in self.store.all_players()
+                                  if p.external_ref == player_code), None)
                 if player is not None:
                     # Partial-field-overwrite: only fields the sheet actually
                     # supplies this time are updated. A blank jersey cell keeps
@@ -5799,7 +5882,7 @@ class SetupService:
                     # but #92 doesn't require the CSV to supply one — default
                     # a brand-new player to FORWARD as an explicit judgment
                     # call; may want revisiting.
-                    player = Player(id=self.store.next_id("player"), team_id=team_id,
+                    player = Player(id=_reserved_player_id, team_id=team_id,
                                     name=full_name,
                                     position=position or Position.FORWARD,
                                     jersey_number=jersey_number,
@@ -5936,47 +6019,13 @@ class SetupService:
                         club_name_raw = row.get("home_club_name")
                         if not _no_club(club_name_raw):
                             club_name = _clean(club_name_raw)
-                            club = next((c for c in self.store.all_clubs()
-                                        if c.name == club_name), None)
-                            if club is None:
-                                # #331 review round 12 finding 1: this find-or-
-                                # create has no row to lock for a brand-new
-                                # club_name -- Club has no unique-by-name index
-                                # (adding one would assert global club-name
-                                # uniqueness as a product rule this import
-                                # doesn't get to decide, same reasoning as
-                                # migration 048's note on Venue below). Two
-                                # concurrent commits can each see the name
-                                # absent, each create their own duplicate Club,
-                                # and the LOSER's later Official lookup then
-                                # finds the WINNER's already-committed Official
-                                # and silently repoints it at the loser's own
-                                # orphaned Club -- nothing about that sequence
-                                # violates a DB constraint (migration 047 only
-                                # protects the Official row itself), so the
-                                # retry loop below never even fires. Closed with
-                                # double-checked locking over next_id("club")'s
-                                # own cross-connection counter-row lock --
-                                # already the load-bearing mechanism the retry
-                                # loop itself depends on -- instead of a new
-                                # constraint: reserve the id FIRST (blocks a
-                                # concurrent creator until this transaction
-                                # commits or rolls back), THEN re-check absence,
-                                # now guaranteed fresh, before actually
-                                # creating. A reservation that goes unused (the
-                                # re-check finds the row after all) is just a
-                                # harmless gap in the "club" id sequence --
-                                # ids are opaque strings.
-                                _reserved_club_id = self.store.next_id("club")
-                                club = next((c for c in self.store.all_clubs()
-                                            if c.name == club_name), None)
-                                if club is None:
-                                    club = Club(id=_reserved_club_id, name=club_name)
-                                    self.store.add_club(club)
-                                    self._audit("club_created", "club", club.id,
-                                                actor_id,
-                                                {"import_batch_id": batch_id})
-                                    counts["clubs_created"] += 1
+                            # #331 review round 13 finding 2: shared with
+                            # commit_teams_players_import -- see
+                            # _find_or_create_import_club's own docstring.
+                            club, created = self._find_or_create_import_club(
+                                club_name, actor_id, batch_id)
+                            if created:
+                                counts["clubs_created"] += 1
                             club_id = club.id
 
                         official = next((o for o in self.store.all_officials()
@@ -6230,6 +6279,28 @@ class SetupService:
                                        if c in _existing_rink_by_code):
                         self.store.get_rink_for_update(_rid)
 
+                    # Re-resolve every requested rink_code AFTER the lock plan
+                    # above is fully acquired (#331 review round 13 finding
+                    # 1): _existing_rink_by_code is a snapshot taken BEFORE any
+                    # lock, so a rink_code absent from it was skipped by the
+                    # lock loop just above -- but a concurrent transaction can
+                    # create that exact rink_code (plus a GAME slot on it, plus
+                    # even a Game booked on that slot) in the gap between our
+                    # snapshot and our lock acquisition. Neither gate below can
+                    # trust a Rink this attempt never locked: both would wrongly
+                    # treat a code missing from the snapshot as "brand-new, no
+                    # persisted ice to protect" even though it may now be real,
+                    # booked ice. If any requested code has newly resolved to a
+                    # Rink outside the locked plan, this attempt's lock plan is
+                    # stale -- abort and retry with a fresh snapshot (which will
+                    # correctly lock and gate it) rather than proceed
+                    # unprotected.
+                    _rechecked_codes = {r.external_ref for r in self.store.all_rinks()
+                                       if r.external_ref}
+                    if any(c not in _existing_rink_by_code and c in _rechecked_codes
+                           for c in _codes):
+                        raise _RinkLockPlanDrifted()
+
                     # Overlap gate, under the locks and BEFORE any write (mirrors the
                     # slot_type gate's all-or-nothing placement so it rolls back cleanly
                     # on every backend, including InMemoryStore's no-op transaction). A
@@ -6403,6 +6474,15 @@ class SetupService:
                                 {"import_type": "rinks_ice_slots", "skipped": 0,
                                  "errors": 0, **counts})
                 break  # committed cleanly
+            except _RinkLockPlanDrifted:
+                # A requested rink_code resolved to a real Rink outside this
+                # attempt's lock plan (#331 review round 13 finding 1) — retry
+                # with a fresh snapshot, which will lock and gate it correctly.
+                if attempt == 2:
+                    raise ConcurrencyConflictError(
+                        "A rink referenced by this import was created "
+                        "concurrently; please retry.",
+                        {"reason": "rink_import_raced"})
             except IntegrityConflictError:
                 if attempt == 2:
                     raise
