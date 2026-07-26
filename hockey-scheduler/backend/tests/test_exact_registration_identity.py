@@ -68,6 +68,10 @@ from hockey_scheduler.store import InMemoryStore
 
 ADMIN = "admin"
 
+# Distinguishes "leave league_id alone" from "set it to None" (#331 review
+# round 24 -- None is itself one of the corrupted values under test).
+_UNSET = object()
+
 
 class _Base(unittest.TestCase):
     def setUp(self):
@@ -998,6 +1002,196 @@ class GameParticipationRevalidationTest(_Base):
         req_after = self.store.get_reschedule_request(req["id"])
         self.assertEqual(req_after.status.value, "pending_league_approval")
         self.assertEqual(self._audit_count(), before_audit)
+
+    # -- #331 review round 24: a FALSY stored League must be rejected too ----
+    # Round 23 wrote `if game.league_id and ls.league_id != game.league_id`;
+    # that truthiness guard skipped the parity check entirely for a `None`
+    # (or `""`) stored League -- and `Game.league_id` is Optional with a
+    # nullable column, so that is precisely the corrupted shape it let
+    # through. The check is now plain equality. These tests pin every shape
+    # and every entry point the reviewer named, each asserting the COMPLETE
+    # game row, both slots, published/locked/draft state, any reschedule
+    # request, the audit log, and the notification feed + deliveries are all
+    # untouched on rejection.
+
+    def _full_state(self):
+        """Everything a rejected mutation must leave byte-identical."""
+        return {
+            "games": {g.id: dict(vars(g)) for g in self.store.all_games()},
+            "slots": {s.id: (s.status.value, getattr(s, "game_id", None))
+                      for s in self.store.all_ice_slots()},
+            "audit": self._audit_count(),
+            "notifications": len(self.store.all_notifications_feed()),
+            "deliveries": len(self.store.all_notification_deliveries()),
+            "reschedules": {r.id: r.status.value
+                            for r in self.store.all_reschedule_requests()},
+        }
+
+    def _assert_zero_mutation(self, before, res, expect_stored_league):
+        self.assertEqual(res["error"]["details"]["reason"],
+                         "game_league_season_mismatch", res)
+        # The stored value is reported AS-IS (including None) so an operator
+        # repairing the row sees what is actually on it.
+        self.assertEqual(res["error"]["details"]["league_id"],
+                         expect_stored_league, res)
+        self.assertEqual(res["error"]["details"]["league_season_league_id"],
+                         self.league_a["id"], res)
+        self.assertEqual(self._full_state(), before)
+
+    def _corrupt_and_reject(self, falsy, action, expect_game_id=None):
+        game_id = expect_game_id or self.game["id"]
+        stored = self.store.get_game(game_id)
+        stored.league_id = falsy
+        self.store.save_game(stored)
+        before = self._full_state()
+        res = action(game_id)
+        self._assert_zero_mutation(before, res, falsy)
+
+    def test_move_rejects_a_null_league_id(self):
+        self._corrupt_and_reject(
+            None, lambda gid: self.api.move_game(
+                gid, self.slot2["id"], actor_id=ADMIN))
+
+    def test_publish_rejects_a_null_league_id(self):
+        self._corrupt_and_reject(
+            None, lambda gid: self.api.publish_game(gid, actor_id=ADMIN))
+
+    def test_move_rejects_an_empty_string_league_id(self):
+        # The same falsy class the truthiness guard also let through.
+        self._corrupt_and_reject(
+            "", lambda gid: self.api.move_game(
+                gid, self.slot2["id"], actor_id=ADMIN))
+
+    def test_publish_rejects_an_empty_string_league_id(self):
+        self._corrupt_and_reject(
+            "", lambda gid: self.api.publish_game(gid, actor_id=ADMIN))
+
+    def _divisioned_game(self):
+        """A second, DIVISIONED game -- the branch whose own
+        `_require_team_registered` checks season+division and would never
+        look at `game.league_id` at all."""
+        division = self.api.setup.create_division(
+            self.season["id"], "Div24", league_id=self.league_a["id"],
+            actor_id=ADMIN)
+        club = self.api.create_club("C24", actor_id=ADMIN)
+        home = self.api.create_team(club["id"], None, "H24", actor_id=ADMIN,
+                                    league_id=self.league_a["id"])
+        away = self.api.create_team(club["id"], None, "A24", actor_id=ADMIN,
+                                    league_id=self.league_a["id"])
+        for tid in (home["id"], away["id"]):
+            self.api.register_team_for_season(
+                self.season["id"], tid, division.id, actor_id=ADMIN,
+                league_id=self.league_a["id"])
+        self.slot3 = self.api.create_ice_slot(
+            self.rink["id"], "2026-09-03T18:00:00+00:00",
+            "2026-09-03T19:00:00+00:00", actor_id=ADMIN)
+        self.slot4 = self.api.create_ice_slot(
+            self.rink["id"], "2026-09-04T18:00:00+00:00",
+            "2026-09-04T19:00:00+00:00", actor_id=ADMIN)
+        game = self.api.create_game(
+            self.season["id"], division.id, home["id"], away["id"],
+            self.slot3["id"], actor_id=ADMIN, league_id=self.league_a["id"])
+        self.assertNotIn("error", game, game)
+        return game
+
+    def test_move_rejects_a_null_league_id_when_divisioned(self):
+        game2 = self._divisioned_game()
+        self._corrupt_and_reject(
+            None, lambda gid: self.api.move_game(
+                gid, self.slot4["id"], actor_id=ADMIN),
+            expect_game_id=game2["id"])
+
+    def test_publish_rejects_a_null_league_id_when_divisioned(self):
+        game2 = self._divisioned_game()
+        self._corrupt_and_reject(
+            None, lambda gid: self.api.publish_game(gid, actor_id=ADMIN),
+            expect_game_id=game2["id"])
+
+    def test_decide_reschedule_approval_rejects_a_null_league_id(self):
+        published = self.api.publish_game(self.game["id"], actor_id=ADMIN)
+        self.assertNotIn("error", published, published)
+        req = self.api.request_reschedule(
+            self.game["id"], self.home["id"], "conflict", actor_id=ADMIN)
+        self.assertNotIn("error", req, req)
+        resp = self.api.respond_to_reschedule(req["id"], True, actor_id=ADMIN)
+        self.assertNotIn("error", resp, resp)
+        stored = self.store.get_game(self.game["id"])
+        stored.league_id = None
+        self.store.save_game(stored)
+        before = self._full_state()
+        res = self.api.decide_reschedule(
+            req["id"], True, new_ice_slot_id=self.slot2["id"], actor_id=ADMIN)
+        self._assert_zero_mutation(before, res, None)
+        # Explicit, beyond the whole-state equality above: the request must
+        # still be awaiting approval, never advanced to republished.
+        self.assertEqual(
+            self.store.get_reschedule_request(req["id"]).status.value,
+            "pending_league_approval")
+
+    def _as_draft(self, game_id, league_id=_UNSET):
+        game = self.store.get_game(game_id)
+        game.is_draft = True
+        if league_id is not _UNSET:
+            game.league_id = league_id
+        self.store.save_game(game)
+
+    def test_single_draft_publish_rejects_a_null_league_id(self):
+        self._as_draft(self.game["id"], league_id=None)
+        before = self._full_state()
+        res = self.api.publish_draft_games(
+            game_ids=[self.game["id"]], actor_id=ADMIN)
+        self._assert_zero_mutation(before, res, None)
+        # The draft→real transition must not have happened either.
+        self.assertTrue(self.store.get_game(self.game["id"]).is_draft)
+
+    def test_batch_draft_publish_rolls_back_valid_peers_too(self):
+        # #331 review round 24: one invalid target must abort the WHOLE
+        # batch -- the valid peer stays a draft on an AVAILABLE slot, with
+        # no publish audit and no notification, exactly as
+        # publish_draft_games' own docstring promises.
+        peer = self.api.create_game(
+            self.season["id"], None, self.away["id"], self.home["id"],
+            self.slot2["id"], actor_id=ADMIN, league_id=self.league_a["id"])
+        self.assertNotIn("error", peer, peer)
+        self._as_draft(self.game["id"], league_id=None)
+        self._as_draft(peer["id"])
+        before = self._full_state()
+        res = self.api.publish_draft_games(
+            game_ids=[self.game["id"], peer["id"]], actor_id=ADMIN)
+        self._assert_zero_mutation(before, res, None)
+        peer_after = self.store.get_game(peer["id"])
+        self.assertTrue(peer_after.is_draft, "peer left the draft state")
+        self.assertFalse(peer_after.published, "peer was published")
+
+    def test_batch_draft_publish_all_drafts_also_rolls_back(self):
+        # The `all=true` entry point resolves its own targets, so it must be
+        # proven separately from the explicit-ids batch above.
+        peer = self.api.create_game(
+            self.season["id"], None, self.away["id"], self.home["id"],
+            self.slot2["id"], actor_id=ADMIN, league_id=self.league_a["id"])
+        self.assertNotIn("error", peer, peer)
+        self._as_draft(self.game["id"], league_id=None)
+        self._as_draft(peer["id"])
+        before = self._full_state()
+        res = self.api.publish_draft_games(all_drafts=True, actor_id=ADMIN)
+        self._assert_zero_mutation(before, res, None)
+        self.assertTrue(self.store.get_game(peer["id"]).is_draft)
+
+    def test_a_valid_league_id_still_publishes_and_moves(self):
+        # Positive control: plain equality must not have made the guard
+        # over-eager -- the exact-identity happy path still works, and the
+        # batch draft publish still succeeds when every target is valid.
+        peer = self.api.create_game(
+            self.season["id"], None, self.away["id"], self.home["id"],
+            self.slot2["id"], actor_id=ADMIN, league_id=self.league_a["id"])
+        self.assertNotIn("error", peer, peer)
+        self._as_draft(peer["id"])
+        res = self.api.publish_draft_games(all_drafts=True, actor_id=ADMIN)
+        self.assertNotIn("error", res, res)
+        self.assertEqual(res["published"], 1, res)
+        peer_after = self.store.get_game(peer["id"])
+        self.assertFalse(peer_after.is_draft)
+        self.assertTrue(peer_after.published)
 
 
 if __name__ == "__main__":

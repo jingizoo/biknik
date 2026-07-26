@@ -2278,6 +2278,74 @@ existing e2e journey exercises `decide_reschedule` (unaffected either way,
 since it needed no code change beyond `_revalidate_game_participation`
 itself).
 
+### Round 24: a falsy Game League bypassed round 23's own parity check
+
+Round 23's convergence review (#331 review round 24) confirmed the non-null
+wrong-League reproduction fixed, but found the same equality invariant still
+open for a falsy stored League — again introduced by the previous round's
+own fix.
+
+**The bug.** Round 23 wrote the parity check as
+`if game.league_id and ls.league_id != game.league_id:`. That truthiness
+guard is not an equality check: it skips the comparison entirely whenever
+the stored League is falsy. `Game.league_id` is explicitly `Optional` and
+`games.league_id TEXT` is nullable on both SQLite and PostgreSQL, so `None`
+is a genuinely storable row — and `""` behaves identically. With a valid
+Season, LeagueSeason, Teams, and exact registrations, the write proceeded.
+Reproduced live across every entry point before writing any fix: `move_game`
+and `publish_game` for both the division-less and divisioned Game (move
+changed slot occupancy and wrote an audit; publish set `published=true` and
+wrote an audit plus notifications), `decide_reschedule`'s approve path
+end-to-end (advancing the request from `pending_league_approval` to
+`republished`), and single **and** batch draft publishing (clearing
+`is_draft` and publishing). Standings then rejected the committed Game with
+`data_integrity_error`/`game_league_season_mismatch` — the same read-vs-write
+asymmetry round 23 was supposed to close.
+
+**Fix.** The comparison is now unconditional plain equality:
+`if game.league_id != ls.league_id:`. By that point the Game is REGULAR
+(exhibitions return far earlier) and `ls` is a real, Season-matched
+LeagueSeason, so a missing League is drift rather than a legacy-tolerant
+case. This also closes any other falsy value, `""` included. The stored
+value is reported in the error detail as-is — `None` included — so an
+operator repairing the row sees what is actually on it.
+
+**Checked the sibling, and it is not the same defect.** Round 22's Season
+check carries the identical `if game.season_id and ...` shape, so it was
+tested rather than assumed: a `None` `season_id` is still rejected, by the
+downstream per-Team `_require_team_in_league_season` (season-wide
+participation resolves to nothing → `team_not_registered`), so unlike the
+League case there is no fail-open write. It is left as-is: changing it
+would alter an existing, already-correct rejection's reason code without
+closing any live gap.
+
+**Regression coverage:** 11 new tests in `GameParticipationRevalidationTest`
+covering `None` and `""` for division-less move/publish, `None` for
+divisioned move/publish, reschedule approval, single draft publish, batch
+draft publish by explicit ids **and** via `all_drafts=True`, plus a positive
+control proving plain equality did not make the guard over-eager. Each
+rejection asserts a whole-state snapshot is byte-identical: every Game row's
+complete field set, every slot's status, the audit log, the notification
+feed, notification deliveries, and every reschedule request's status — with
+the batch cases additionally asserting the valid peer never left the draft
+state. `GameLeagueIdIdentitySqlTest` gains 3 more (null move, null publish,
+batch rollback) on real SQLite always and PostgreSQL when
+`TEST_DATABASE_URL` is set. `test_game_league_season_identity_http.py` gains
+2 more proving the rejection over the authenticated `/api/games/{id}/move`
+and `/api/games/{id}/publish` routes against the demo's seeded divisioned
+Game, asserting a null is reported as `null` and nothing was committed.
+
+**Falsifiability:** restoring only the truthiness guard makes exactly the 15
+new negative tests fail (13 facade/SQL, 2 HTTP) and nothing else — every
+positive control and every round-21/22/23 test stays green, so the new
+tests pin this specific defect rather than the surrounding behavior.
+
+**Verification:** full Memory/SQLite (3538 tests, 459.1s) and PostgreSQL
+(3538 tests, 1226.7s) suites both green, +16 from round 23.
+`destructive-surfaces.js` (exercises `publish_game` and draft deletion on
+real, uncorrupted demo Games) reconfirmed green at desktop and phone — no
+frontend files changed this round.
+
 - The bootstrap claim is the only unauthenticated mutation, and only on a fresh,
   durable, unclaimed installation.
 - After claim, all setup and onboarding-status detail requires an authenticated

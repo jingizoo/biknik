@@ -1701,7 +1701,18 @@ class SetupService:
         # `league_season_id` from the same `league_id` it stores), so this
         # only ever fires on a corrupted/hand-edited row -- same threat model
         # as the dangling/cross-Season checks above.
-        if game.league_id and ls.league_id != game.league_id:
+        #
+        # #331 review round 24: this comparison is UNCONDITIONAL. Round 23
+        # guarded it behind `game.league_id and ...`, which skipped the check
+        # entirely for a falsy stored League -- and `Game.league_id` is
+        # explicitly Optional with a nullable `games.league_id` column, so
+        # `None` (or `""`) is exactly the corrupted shape the guard let
+        # through. By this point the game is REGULAR (exhibitions returned
+        # far above) and `ls` is a real, Season-matched LeagueSeason, so a
+        # missing League is drift, not a legacy-tolerant case: the correct
+        # invariant is plain equality. The stored value is reported as-is
+        # (including `None`) so remediation sees what is actually on the row.
+        if game.league_id != ls.league_id:
             raise ValidationError(
                 "This game's league-season belongs to a different league; "
                 "it cannot be published or moved until it is repaired.",

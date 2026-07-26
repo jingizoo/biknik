@@ -542,6 +542,82 @@ class GameLeagueIdIdentitySqlTest(_SqlIntegrityBase):
 
         self._run(case)
 
+    # -- #331 review round 24: a FALSY stored League on a real SQL backend --
+    # ``games.league_id TEXT`` is nullable on both SQLite and PostgreSQL, so
+    # a NULL League is a genuinely storable row there -- no unique index or
+    # NOT NULL constraint makes it impossible. Round 23's truthiness guard
+    # skipped the parity check for exactly this value; these prove the now-
+    # unconditional equality rejects it on the real backends.
+
+    def _state(self, store):
+        return {
+            "games": {g.id: dict(vars(g)) for g in store.all_games()},
+            "slots": {s.id: s.status.value for s in store.all_ice_slots()},
+            "audit": len(store.all_setup_audit()),
+            "notifications": len(store.all_notifications_feed()),
+            "deliveries": len(store.all_notification_deliveries()),
+        }
+
+    def test_move_rejects_a_null_league_id_zero_mutation(self):
+        def case(api, store):
+            (program, season, league, other_league, slot1, slot2,
+             game) = self._fixture(api, store)
+            self._corrupt(store, game["id"], None)
+            before = self._state(store)
+            res = api.move_game(game["id"], slot2["id"], actor_id=ADMIN)
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "game_league_season_mismatch", res)
+            self.assertIsNone(res["error"]["details"]["league_id"], res)
+            self.assertEqual(res["error"]["details"]["league_season_league_id"],
+                             league["id"], res)
+            self.assertEqual(self._state(store), before)
+
+        self._run(case)
+
+    def test_publish_rejects_a_null_league_id_zero_mutation(self):
+        def case(api, store):
+            (program, season, league, other_league, slot1, slot2,
+             game) = self._fixture(api, store)
+            self._corrupt(store, game["id"], None)
+            before = self._state(store)
+            res = api.publish_game(game["id"], actor_id=ADMIN)
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "game_league_season_mismatch", res)
+            self.assertIsNone(res["error"]["details"]["league_id"], res)
+            self.assertEqual(self._state(store), before)
+
+        self._run(case)
+
+    def test_batch_draft_publish_rejects_a_null_league_id_zero_mutation(self):
+        # One invalid target must roll the WHOLE batch back on a real SQL
+        # backend -- the valid peer stays a draft on an AVAILABLE slot.
+        def case(api, store):
+            (program, season, league, other_league, slot1, slot2,
+             game) = self._fixture(api, store)
+            peer = api.create_game(
+                season["id"], None,
+                store.get_game(game["id"]).away_team_id,
+                store.get_game(game["id"]).home_team_id,
+                slot2["id"], actor_id=ADMIN, league_id=league["id"])
+            self.assertNotIn("error", peer, peer)
+            for gid, null_it in ((game["id"], True), (peer["id"], False)):
+                g = store.get_game(gid)
+                g.is_draft = True
+                if null_it:
+                    g.league_id = None
+                store.save_game(g)
+            before = self._state(store)
+            res = api.publish_draft_games(
+                game_ids=[game["id"], peer["id"]], actor_id=ADMIN)
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "game_league_season_mismatch", res)
+            self.assertEqual(self._state(store), before)
+            peer_after = store.get_game(peer["id"])
+            self.assertTrue(peer_after.is_draft, "peer left the draft state")
+            self.assertFalse(peer_after.published, "peer was published")
+
+        self._run(case)
+
 
 class AssignClubOptionalSqlTest(_SqlIntegrityBase):
     """Club is optional on a Team in both v1 and v2 (#233 Slice D)."""

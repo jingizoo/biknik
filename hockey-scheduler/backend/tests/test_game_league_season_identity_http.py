@@ -135,6 +135,52 @@ class GameLeagueSeasonIdentityHttpTest(unittest.TestCase):
         self.assertEqual(body["error"]["details"]["reason"],
                          "game_league_season_mismatch", body)
 
+    # -- #331 review round 24: a FALSY stored League over real HTTP ---------
+    # Round 23's truthiness guard skipped the parity check for a NULL stored
+    # League; these prove the now-unconditional equality rejects it over the
+    # real authenticated routes, against the demo's own seeded DIVISIONED
+    # Game, and that nothing was committed.
+
+    def _null_demo_game_league_id(self):
+        game = STATE.api.store.get_game(STATE.game_id)
+        game.league_id = None
+        STATE.api.store.save_game(game)
+
+    def _game_state(self):
+        game = STATE.api.store.get_game(STATE.game_id)
+        return (dict(vars(game)),
+                {s.id: s.status.value for s in STATE.api.store.all_ice_slots()},
+                len(STATE.api.store.all_setup_audit()),
+                len(STATE.api.store.all_notifications_feed()))
+
+    def test_move_over_real_http_rejects_a_null_league_id(self):
+        admin = self._login("admin")
+        self._null_demo_game_league_id()
+        slots = [s for s in STATE.api.store.all_ice_slots()
+                 if s.status.value == "available"]
+        self.assertTrue(slots, "demo seed must include an available slot")
+        before = self._game_state()
+        status, body = self._req(admin, "POST",
+                                 f"/api/games/{STATE.game_id}/move",
+                                 {"ice_slot_id": slots[0].id})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"]["details"]["reason"],
+                         "game_league_season_mismatch", body)
+        self.assertIsNone(body["error"]["details"]["league_id"], body)
+        self.assertEqual(self._game_state(), before)
+
+    def test_publish_over_real_http_rejects_a_null_league_id(self):
+        admin = self._login("admin")
+        self._null_demo_game_league_id()
+        before = self._game_state()
+        status, body = self._req(admin, "POST",
+                                 f"/api/games/{STATE.game_id}/publish")
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"]["details"]["reason"],
+                         "game_league_season_mismatch", body)
+        self.assertIsNone(body["error"]["details"]["league_id"], body)
+        self.assertEqual(self._game_state(), before)
+
 
 if __name__ == "__main__":
     unittest.main()
