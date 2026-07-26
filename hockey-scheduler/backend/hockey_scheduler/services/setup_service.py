@@ -1398,6 +1398,66 @@ class SetupService:
         candidates = self.store.league_seasons_for_season(season_id)
         return None, (candidates[0].league_id if candidates else None), False
 
+    def _resolve_import_row_registration(self, season_id, team_id,
+                                         target_league_id):
+        """The registration row a ``commit_teams_players_import`` row should
+        reuse in place, if any, and whether the Team's registrations for
+        this Season conflict too much to proceed safely (#331 review round
+        17).
+
+        Never the first registration ``registrations_for_season`` happens
+        to return for this team -- the schema allows one row per
+        LeagueSeason within a Season (migration 035), and
+        ``transfer_team_to_league`` deliberately preserves an inactive
+        prior-League row as history, never touching it again. Both are
+        looked up by their exact (team, LeagueSeason) identity instead: the
+        row already sitting in the row's own resolved target LeagueSeason
+        is reused/reactivated in place, exactly as before; failing that,
+        the Team's SOLE other active registration elsewhere in this Season
+        (a Rule 7 violation a stale pre-round-16 write path, or legacy
+        data, could have left behind) is reused via the same in-place
+        League "move" ``transfer_team_to_league`` itself performs when a
+        Team's active registration no longer matches its permanent League.
+        Inactive rows elsewhere are never candidates here, so they can
+        never be touched: history stays byte-for-byte as it was left.
+
+        Returns ``(reg_or_None, is_move, conflicting_ids)``. A non-``None``
+        ``reg`` with ``is_move=False`` is the row already at the target --
+        upsert it in place, division included, exactly as any repeat
+        import row is. ``is_move=True`` means ``reg`` currently belongs to
+        a DIFFERENT LeagueSeason and is about to move there -- its old
+        division is never comparable to the new target's (they belong to
+        different LeagueSeasons' own division pools), so callers must
+        apply the League-change game guard, never the division-move one,
+        before writing it. ``reg is None`` with no conflicts means no row
+        exists anywhere in this Season yet -- create a fresh one. A
+        non-empty ``conflicting_ids`` means the Team already holds more
+        active registrations in this Season than this row's own target can
+        unambiguously absorb (its own target row already exists AND a
+        separate row is also active elsewhere, or more than one other
+        candidate is active) -- the caller must reject before any write
+        rather than silently guess which participation is authoritative or
+        rebind one active row onto another's unique key."""
+        target_ls = (self.store.league_season_for(target_league_id, season_id)
+                    if target_league_id else None)
+        target_reg = (self.store.registration_for_team_in_league_season(
+                         target_ls.id, team_id)
+                      if target_ls is not None else None)
+        other_active = [
+            r for r in self.store.registrations_for_season(season_id)
+            if r.team_id == team_id and r.active
+            and (target_ls is None or r.league_season_id != target_ls.id)]
+        if target_reg is not None:
+            if other_active:
+                return None, False, (
+                    [target_reg.id] + [r.id for r in other_active])
+            return target_reg, False, []
+        if len(other_active) == 1:
+            return other_active[0], True, []
+        if other_active:
+            return None, False, [r.id for r in other_active]
+        return None, False, []
+
     def _bind_import_league_season(self, season_id, league_id):
         """The LeagueSeason a NEW Division (or a blank-division row) should
         bind to during ``commit_teams_players_import`` apply (#331 review
@@ -6031,45 +6091,86 @@ class SetupService:
                         # separately-queried next() lookup that could silently pick a
                         # DIFFERENT same-named Division than (1b) just validated.
                         div_name = row.get("division_name")
-                        reg = next(  # #283: find the team's registration in this Season
-                            (r for r in self.store.registrations_for_season(season_id)
-                             if r.team_id == existing.id), None)
-                        if reg is not None:
-                            if _blank(div_name):
-                                target_div_id = None
-                            else:
-                                # A not-yet-created named division is necessarily a
-                                # different placement than the current one.
-                                target_div_id = division.id if division else object()
-                            if target_div_id != reg.division_id:
-                                stranded = self._games_scheduled_for_team_in_season(
-                                    season_id, existing.id)
-                                if stranded:
-                                    gate_errors.append({
-                                        "sheet": "teams", "team_code": code,
-                                        "reason": "registration_division_move_strands_games",
-                                        "message": (f"Re-importing team {code} would move "
-                                                    "or clear its division while it has "
-                                                    "scheduled games; resolve them first."),
-                                        "affected_game_ids": stranded})
-                            # (3) #331 review round 16 reproduction 2: the STORED
-                            # registration itself can already be wrong -- pointing at
-                            # a League other than the one this row (and (1b) above)
-                            # resolves to -- entirely independent of whether
-                            # Team.league_id itself is already correct. A pre-round-16
-                            # import (or any other write path predating this
-                            # invariant) can leave exactly this behind: an active
-                            # registration with a matching division_id (so the check
-                            # above never fires) but a stale league_season_id. Repaired
-                            # with the SAME lifecycle semantics assign_season_team_
-                            # league already uses (never merely folded into apply's
-                            # raw-save condition, which would silently move a
-                            # registration out of a League committed games still
-                            # reference): zero mutation and a structured rejection
-                            # when a non-cancelled Game in the CURRENT (soon-to-be-
-                            # stale) league would be stranded, otherwise the repair
-                            # proceeds in apply below (which rewrites league_season_id
-                            # once this gate has cleared it).
+                        # #331 review round 17: resolved by exact (team, target
+                        # LeagueSeason) identity -- and, only when the Team has no
+                        # row there yet, its SOLE other active registration in this
+                        # Season, reused via the same in-place "move"
+                        # transfer_team_to_league itself performs -- never the
+                        # first registration `registrations_for_season` happens to
+                        # return, which could cannibalize an inactive HISTORICAL
+                        # row (destroying what transfer_team_to_league deliberately
+                        # preserved) or collide with an already-correct different
+                        # active one. See _resolve_import_row_registration.
+                        reg, _is_move, _conflict_ids = (
+                            self._resolve_import_row_registration(
+                                season_id, existing.id, target_league_id))
+                        if _conflict_ids:
+                            # The Team already holds more active registrations in
+                            # this Season than this row's own target can
+                            # unambiguously absorb -- never guess which
+                            # participation is authoritative or rebind one active
+                            # row onto another's unique key; reject before any
+                            # write and let the operator resolve it directly.
+                            gate_errors.append({
+                                "sheet": "teams", "team_code": code,
+                                "reason": "team_registration_conflict",
+                                "message": (f"Team {code} has more than one "
+                                            "active registration in this season; "
+                                            "resolve the conflict before "
+                                            "importing."),
+                                "affected_registration_ids": _conflict_ids,
+                                "affected_game_ids":
+                                    self._games_scheduled_for_team_in_season(
+                                        season_id, existing.id)})
+                        elif reg is not None:
+                            # #331 review round 17: skipped when `reg` is about to
+                            # MOVE into the target LeagueSeason (_is_move) -- its
+                            # old division belongs to a DIFFERENT LeagueSeason's
+                            # own division pool, so comparing it to the new
+                            # target's is meaningless (transfer_team_to_league
+                            # itself unconditionally clears the division on a
+                            # cross-league move, gated only by the League-change
+                            # guard below, never a division comparison).
+                            if not _is_move:
+                                if _blank(div_name):
+                                    target_div_id = None
+                                else:
+                                    # A not-yet-created named division is necessarily a
+                                    # different placement than the current one.
+                                    target_div_id = division.id if division else object()
+                                if target_div_id != reg.division_id:
+                                    stranded = self._games_scheduled_for_team_in_season(
+                                        season_id, existing.id)
+                                    if stranded:
+                                        gate_errors.append({
+                                            "sheet": "teams", "team_code": code,
+                                            "reason": "registration_division_move_strands_games",
+                                            "message": (f"Re-importing team {code} would move "
+                                                        "or clear its division while it has "
+                                                        "scheduled games; resolve them first."),
+                                            "affected_game_ids": stranded})
+                            # (3) #331 review round 16 reproduction 2, round 17: the
+                            # STORED registration itself can already be wrong --
+                            # pointing at a League other than the one this row (and
+                            # (1b) above) resolves to -- entirely independent of
+                            # whether Team.league_id itself is already correct. A
+                            # pre-round-16 import (or any other write path predating
+                            # this invariant) can leave exactly this behind: an
+                            # active registration with a matching division_id (so
+                            # the check above never fires) but a stale
+                            # league_season_id. Repaired with the SAME lifecycle
+                            # semantics assign_season_team_league already uses
+                            # (never merely folded into apply's raw-save condition,
+                            # which would silently move a registration out of a
+                            # League committed games still reference): zero
+                            # mutation and a structured rejection when a
+                            # non-cancelled Game in the CURRENT (soon-to-be-stale)
+                            # league would be stranded, otherwise the repair
+                            # proceeds in apply below (which rewrites
+                            # league_season_id once this gate has cleared it). A
+                            # no-op for a non-move `reg` (already in the target
+                            # LeagueSeason by construction), so this only ever
+                            # fires for the `_is_move` case above.
                             _current_reg_league = self._registration_league_id(reg)
                             if (target_league_id is not None
                                     and _current_reg_league != target_league_id):
@@ -6254,22 +6355,39 @@ class SetupService:
                             reg_ls_id = division.league_season_id
                         else:
                             reg_ls_id = _import_ls.id if _import_ls else None
-                        reg = next(
-                            (r for r in self.store.registrations_for_season(season_id)
-                             if r.team_id == team.id), None)
+                        # #331 review round 17: resolved by the SAME exact
+                        # (team, target LeagueSeason) identity gate validated
+                        # above (never the first registration
+                        # `registrations_for_season` happens to return, which
+                        # could cannibalize an inactive HISTORICAL row or
+                        # collide with an already-correct different active
+                        # one) -- see _resolve_import_row_registration. The
+                        # conflict case can never actually occur here: gate
+                        # already rejected the whole batch before any write
+                        # whenever this row's team_registration_conflict fires.
+                        reg, _is_move, _conflict_ids = (
+                            self._resolve_import_row_registration(
+                                season_id, team.id, _import_league_id))
+                        assert not _conflict_ids, (
+                            "gate_errors above must already have rejected any "
+                            "team_registration_conflict before apply runs")
                         if reg is not None:
-                            # #331 review round 16 reproduction 2: league_season_id
-                            # is now part of the trigger, not just the write --
-                            # a repeat row with an already-active, already-
-                            # division-matching registration used to skip this
-                            # branch entirely even when league_season_id had
-                            # drifted, silently reporting success while leaving
-                            # the stale League in place. Safe to include
-                            # unconditionally here (never "merely" added to a raw
-                            # save with no guard) because gate check (3) above
-                            # already rejected this exact row, before any write,
-                            # whenever the drift it is about to repair would
-                            # strand a committed Game.
+                            # #331 review round 16 reproduction 2, round 17:
+                            # league_season_id is now part of the trigger, not
+                            # just the write -- a repeat row with an already-
+                            # active, already-division-matching registration
+                            # used to skip this branch entirely even when
+                            # league_season_id had drifted, silently reporting
+                            # success while leaving the stale League in place.
+                            # Safe to include unconditionally here (never
+                            # "merely" added to a raw save with no guard)
+                            # because gate check (3) above already rejected
+                            # this exact row, before any write, whenever the
+                            # drift/move it is about to perform would strand a
+                            # committed Game. When `_is_move` is True, this is
+                            # also where the row's league_season_id actually
+                            # gets rewritten -- the SAME in-place "move" gate's
+                            # (3) already validated as safe.
                             if (not reg.active or reg.division_id != division_id
                                     or reg.league_season_id != reg_ls_id):
                                 reg.active = True

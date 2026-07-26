@@ -91,6 +91,11 @@ class ImportCommitServiceContract:
     def _team(self, code):
         return next(t for t in self.store.all_teams() if t.external_ref == code)
 
+    def _registration_audit_count(self):
+        return len([a for a in self.store.all_setup_audit()
+                   if a.action in ("season_team_registered",
+                                   "season_team_registration_updated")])
+
     # -- 1. first commit creates -------------------------------------------
     def test_first_commit_creates_teams_and_players(self):
         res = self.api.commit_teams_players_import(
@@ -605,6 +610,260 @@ class ImportCommitServiceContract:
             if a.action == "season_team_registration_updated"])
         self.assertEqual(reg_updates_after, reg_updates_before)
 
+    # -- #331 review round 17: registration row-selection must never pick
+    # the first registrations_for_season() row regardless of LeagueSeason --
+    # the schema allows one row per LeagueSeason within a Season, and
+    # transfer_team_to_league deliberately preserves an inactive prior-
+    # League row as history. ------------------------------------------------
+    def _seed_team_transferred_b_to_a(self):
+        """Team registered into League B, unregistered (B goes inactive),
+        then permanently transferred to League A -- transfer_team_to_league
+        finds no ACTIVE registration to move (B is already inactive), so it
+        writes only team.league_id and leaves B's row untouched. The #331
+        review round 17 report's own canonical reproduction. Returns
+        (team, league_a, league_b, reg_b)."""
+        self.api.commit_teams_players_import(
+            self.season.id, {"teams_csv":
+                "team_code,team_name\nHOME,Home Team\n"},
+            actor_id="admin")
+        team = self._team("HOME")
+        league_b = team.league_id
+        reg_b = self.store.registration_for_team_in_season(
+            self.season.id, team.id)
+        self.setup.unregister_team_from_season(reg_b.id, actor_id="admin")
+        league_a = self.setup.create_league(
+            self.season.id, "League A", actor_id="admin").id
+        self.setup.transfer_team_to_league(team.id, league_a, actor_id="admin")
+        return team, league_a, league_b, reg_b
+
+    def test_import_after_transfer_from_inactive_registration_creates_distinct_active_row(self):
+        # Required regression matrix bullet 1: re-importing after a
+        # transfer-from-inactive-only leaves B's row untouched as history
+        # and creates a DISTINCT active row for A -- never cannibalizes B's
+        # row by rewriting its league_season_id (which would silently erase
+        # the fact the team was ever in League B at all).
+        team, league_a, league_b, reg_b = self._seed_team_transferred_b_to_a()
+        res = self.api.commit_teams_players_import(
+            self.season.id, {"teams_csv":
+                "team_code,team_name\nHOME,Home Team\n"},
+            actor_id="admin")
+        self.assertTrue(res["committed"], res)
+        untouched_b = self.store.get_season_team_registration(reg_b.id)
+        self.assertFalse(untouched_b.active)
+        self.assertEqual(
+            self.store.get_league_season(untouched_b.league_season_id).league_id,
+            league_b)
+        regs = [r for r in self.store.registrations_for_season(self.season.id)
+                if r.team_id == team.id]
+        self.assertEqual(len(regs), 2)
+        active = [r for r in regs if r.active]
+        self.assertEqual(len(active), 1)
+        self.assertNotEqual(active[0].id, reg_b.id)
+        self.assertEqual(
+            self.store.get_league_season(active[0].league_season_id).league_id,
+            league_a)
+
+    def test_import_after_transfer_is_a_true_noop_once_active_registration_exists(self):
+        # Required regression matrix bullet 2 (forward insertion order: B's
+        # inactive row was created BEFORE A's active row): once A's row
+        # already exists and is correct, re-importing must be a true no-op
+        # -- never rewrite B's untouched history, never re-audit A. (Team
+        # itself always re-audits team_updated on any existing-team row
+        # regardless of an actual diff -- a pre-existing, unrelated contract,
+        # see test_import_stale_registration_already_correct_is_a_true_noop
+        # -- so this checks the REGISTRATION's own audit specifically, which
+        # unlike Team is genuinely diffed.)
+        team, league_a, league_b, reg_b = self._seed_team_transferred_b_to_a()
+        self.api.commit_teams_players_import(
+            self.season.id, {"teams_csv":
+                "team_code,team_name\nHOME,Home Team\n"},
+            actor_id="admin")
+        reg_audits_before = self._registration_audit_count()
+        regs_before = {r.id: (r.active, r.league_season_id, r.division_id)
+                       for r in self.store.registrations_for_season(self.season.id)
+                       if r.team_id == team.id}
+        res = self.api.commit_teams_players_import(
+            self.season.id, {"teams_csv":
+                "team_code,team_name\nHOME,Home Team\n"},
+            actor_id="admin")
+        self.assertTrue(res["committed"], res)
+        self.assertEqual(self._registration_audit_count(), reg_audits_before)
+        regs_after = {r.id: (r.active, r.league_season_id, r.division_id)
+                      for r in self.store.registrations_for_season(self.season.id)
+                      if r.team_id == team.id}
+        self.assertEqual(regs_after, regs_before)
+
+    def test_import_is_a_true_noop_when_active_registration_has_lower_id_than_inactive_sibling(self):
+        # Required regression matrix bullet 2 (REVERSE insertion order: the
+        # currently-active registration has a LOWER id than the now-
+        # inactive sibling -- the opposite of the natural chronological
+        # order above). B -> unregister -> transfer A -> register A ->
+        # unregister A -> transfer back to B -> re-registering B reactivates
+        # the ORIGINAL (lower-id) row in place, leaving A's (higher-id) row
+        # as the inactive sibling. The fix must be insertion-order-
+        # independent: the OLD next(registrations_for_season(...)) lookup
+        # would have picked whichever row sorts/iterates first regardless of
+        # which one is actually active, corrupting the wrong row here too.
+        self.api.commit_teams_players_import(
+            self.season.id, {"teams_csv":
+                "team_code,team_name\nHOME,Home Team\n"},
+            actor_id="admin")
+        team = self._team("HOME")
+        league_b = team.league_id
+        reg_b = self.store.registration_for_team_in_season(
+            self.season.id, team.id)
+        self.setup.unregister_team_from_season(reg_b.id, actor_id="admin")
+        league_a = self.setup.create_league(
+            self.season.id, "League A", actor_id="admin").id
+        self.setup.transfer_team_to_league(team.id, league_a, actor_id="admin")
+        reg_a = self.setup.register_team_for_season(
+            self.season.id, team.id, actor_id="admin")
+        self.setup.unregister_team_from_season(reg_a.id, actor_id="admin")
+        self.setup.transfer_team_to_league(team.id, league_b, actor_id="admin")
+        reactivated_b = self.setup.register_team_for_season(
+            self.season.id, team.id, actor_id="admin")
+        self.assertEqual(reactivated_b.id, reg_b.id)  # reactivated IN PLACE
+        self.assertLess(reg_b.id, reg_a.id)  # confirms the reverse id order
+
+        # (Team itself always re-audits team_updated regardless of an actual
+        # diff -- see test_import_stale_registration_already_correct_is_a_
+        # true_noop -- so only the registration-specific audit count is
+        # checked here.)
+        reg_audits_before = self._registration_audit_count()
+        res = self.api.commit_teams_players_import(
+            self.season.id, {"teams_csv":
+                "team_code,team_name\nHOME,Home Team\n"},
+            actor_id="admin")
+        self.assertTrue(res["committed"], res)
+        self.assertEqual(self._registration_audit_count(), reg_audits_before)
+        still_active_b = self.store.get_season_team_registration(reg_b.id)
+        self.assertTrue(still_active_b.active)
+        self.assertEqual(
+            self.store.get_league_season(still_active_b.league_season_id).league_id,
+            league_b)
+        still_inactive_a = self.store.get_season_team_registration(reg_a.id)
+        self.assertFalse(still_inactive_a.active)
+        self.assertEqual(
+            self.store.get_league_season(still_inactive_a.league_season_id).league_id,
+            league_a)
+
+    def test_import_repairs_stale_registration_league_with_cancelled_game_present(self):
+        # Required regression matrix bullet 3's remaining sub-case (the
+        # other two -- game-free repair, non-cancelled-game rejection --
+        # are test_import_repairs_stale_registration_league_when_game_free
+        # and test_import_rejects_stale_registration_league_repair_that_
+        # strands_games above): a CANCELLED game in the stale league must
+        # NOT block the repair -- the same not-g.cancelled exemption every
+        # other stranding guard in this file already honors.
+        team, league_a, league_b, target_season, stale_reg = (
+            self._seed_team_with_stale_registration_league())
+        game = Game(id=self.store.next_id("game"), home_team_id=team.id,
+                   away_team_id=None, start_time=datetime(2026, 9, 1, tzinfo=UTC),
+                   season_id=target_season.id, league_id=league_b.id,
+                   cancelled=True)
+        self.store.add_game(game)
+        res = self.api.commit_teams_players_import(
+            target_season.id, {"teams_csv":
+                "team_code,team_name\nHOME,Home Team\n"},
+            actor_id="admin")
+        self.assertTrue(res["committed"], res)
+        fresh_reg = self.store.get_season_team_registration(stale_reg.id)
+        self.assertEqual(
+            self.store.get_league_season(fresh_reg.league_season_id).league_id,
+            league_a)
+
+    def _plant_two_active_registrations(self, first_name, second_name):
+        """Plant a Team with TWO simultaneously ACTIVE registrations across
+        two Leagues in self.season -- directly at the store level (the same
+        technique _seed_team_with_stale_registration_league uses): a Rule 7
+        violation ("a Team's active registrations must stay consistent with
+        its permanent League") no current service-layer write path can
+        produce -- register_team_for_season and assign_season_team_league
+        both refuse to leave a second League's registration active once the
+        Team has a permanent League. Reproduces legacy data, or a state a
+        write path predating Rule 7 could have left behind. The FIRST-named
+        league's row is always created (and so always has the LOWER id)
+        before the SECOND's, so calling this with the two names swapped
+        covers both physical insertion orders. Returns (team, league_first,
+        reg_first, league_second, reg_second) with team.league_id ==
+        league_first.id (an arbitrary but fixed choice of "the" permanent
+        League for a Team that, by construction, has two)."""
+        league_first = self.setup.create_league(
+            self.season.id, first_name, actor_id="admin")
+        league_second = self.setup.create_league(
+            self.season.id, second_name, actor_id="admin")
+        team = self.setup.create_team(
+            name="Home Team", league_id=league_first.id, actor_id="admin")
+        team.external_ref = "HOME"
+        self.store.save_team(team)
+        ls_first = self.store.league_season_for(league_first.id, self.season.id)
+        ls_second = self.store.league_season_for(league_second.id, self.season.id)
+        reg_first = SeasonTeamRegistration(
+            id=self.store.next_id("streg"), league_season_id=ls_first.id,
+            team_id=team.id, division_id=None, active=True)
+        self.store.add_season_team_registration(reg_first)
+        reg_second = SeasonTeamRegistration(
+            id=self.store.next_id("streg"), league_season_id=ls_second.id,
+            team_id=team.id, division_id=None, active=True)
+        self.store.add_season_team_registration(reg_second)
+        return team, league_first, reg_first, league_second, reg_second
+
+    def _assert_registration_conflict_rejected_with_zero_mutation(
+            self, team, reg_first, reg_second):
+        teams_before = len(self.store.all_teams())
+        divisions_before = len(self.store.all_divisions())
+        league_seasons_before = len(self.store.all_league_seasons())
+        audits_before = len(self.store.all_setup_audit())
+        regs_before = {r.id: (r.active, r.league_season_id, r.division_id)
+                       for r in self.store.registrations_for_season(self.season.id)
+                       if r.team_id == team.id}
+        res = self.api.commit_teams_players_import(
+            self.season.id, {"teams_csv":
+                "team_code,team_name\nHOME,Home Team\n"},
+            actor_id="admin")
+        self.assertFalse(res["committed"], res)
+        err = next(e for e in res["errors"]
+                  if e["reason"] == "team_registration_conflict")
+        self.assertEqual(set(err["affected_registration_ids"]),
+                         {reg_first.id, reg_second.id})
+        # Required regression matrix: zero registration/Team/Division/
+        # LeagueSeason/audit mutation on rejection -- never a generic
+        # unique-constraint violation on SQLite/PostgreSQL, and never a
+        # silently-created duplicate active row on Memory.
+        self.assertEqual(len(self.store.all_teams()), teams_before)
+        self.assertEqual(len(self.store.all_divisions()), divisions_before)
+        self.assertEqual(len(self.store.all_league_seasons()),
+                         league_seasons_before)
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before)
+        regs_after = {r.id: (r.active, r.league_season_id, r.division_id)
+                      for r in self.store.registrations_for_season(self.season.id)
+                      if r.team_id == team.id}
+        self.assertEqual(regs_after, regs_before)
+
+    def test_import_rejects_two_active_registrations_target_has_lower_id(self):
+        # Required regression matrix bullet 4, forward order: the Team's
+        # OWN permanent League (the import's target) is the FIRST-planted,
+        # lower-id row; the conflicting stray is the second/higher-id row.
+        team, league_a, reg_a, league_b, reg_b = (
+            self._plant_two_active_registrations("League A", "League B"))
+        self._assert_registration_conflict_rejected_with_zero_mutation(
+            team, reg_a, reg_b)
+
+    def test_import_rejects_two_active_registrations_target_has_higher_id(self):
+        # Required regression matrix bullet 4, reverse order: the Team's
+        # OWN permanent League is the SECOND-planted, higher-id row; the
+        # conflicting stray is the first/lower-id row. The OLD next(...)
+        # lookup always picked whichever row sorts/iterates first -- this
+        # order is exactly where it would have picked the STRAY instead of
+        # the Team's own target, silently rewriting the stray onto the
+        # target's unique key.
+        team, league_b, reg_b, league_a, reg_a = (
+            self._plant_two_active_registrations("League B", "League A"))
+        team.league_id = league_a.id  # the target is now the SECOND/higher-id row
+        self.store.save_team(team)
+        self._assert_registration_conflict_rejected_with_zero_mutation(
+            team, reg_a, reg_b)
+
     def test_import_rejects_a_season_without_a_valid_league(self):
         orphan = Season(id=self.store.next_id("season"), program_id=None,
                         name="Orphan")
@@ -1077,6 +1336,52 @@ class ImportCommitHttpTest(unittest.TestCase):
                             for e in resp["errors"]), resp)
         self.assertIsNone(next((t for t in store.all_teams()
                                if t.external_ref == "HTTPAMBIG"), None))
+
+    def test_registration_conflict_rejected_over_real_http(self):
+        # #331 review round 17, driven through the real HTTP commit path: a
+        # Team with two simultaneously ACTIVE registrations in this Season
+        # (a Rule 7 violation legacy data, or a write path predating Rule 7,
+        # could have left behind) must be rejected with a structured,
+        # zero-mutation error -- never silently duplicated (as the OLD
+        # first-registrations_for_season() lookup would on Memory) or a raw
+        # unique-constraint crash (as it would on SQLite/PostgreSQL).
+        c = self._client()
+        self._login(c, "admin")
+        store = self.srv.STATE.api.store
+        setup = SetupService(store)
+        season_id = self.srv.STATE.ids["season_id"]
+        league_a = setup.create_league(
+            season_id, "HTTP Conflict League A", actor_id="admin")
+        league_b = setup.create_league(
+            season_id, "HTTP Conflict League B", actor_id="admin")
+        team = setup.create_team(
+            name="HTTP Conflict Team", league_id=league_a.id, actor_id="admin")
+        team.external_ref = "HTTPCONFLICT"
+        store.save_team(team)
+        ls_a = store.league_season_for(league_a.id, season_id)
+        ls_b = store.league_season_for(league_b.id, season_id)
+        reg_a = SeasonTeamRegistration(
+            id=store.next_id("streg"), league_season_id=ls_a.id,
+            team_id=team.id, division_id=None, active=True)
+        store.add_season_team_registration(reg_a)
+        reg_b = SeasonTeamRegistration(
+            id=store.next_id("streg"), league_season_id=ls_b.id,
+            team_id=team.id, division_id=None, active=True)
+        store.add_season_team_registration(reg_b)
+        audits_before = len(store.all_setup_audit())
+
+        body = {"season_id": season_id, "teams_csv": (
+            "team_code,team_name\nHTTPCONFLICT,HTTP Conflict Team\n")}
+        status, resp = self._req(c, "POST", "/api/import/commit/teams-players", body)
+        self.assertEqual(status, 200)
+        self.assertFalse(resp["committed"], resp)
+        err = next(e for e in resp["errors"]
+                  if e["reason"] == "team_registration_conflict")
+        self.assertEqual(set(err["affected_registration_ids"]),
+                         {reg_a.id, reg_b.id})
+        self.assertEqual(len(store.all_setup_audit()), audits_before)
+        self.assertTrue(store.get_season_team_registration(reg_a.id).active)
+        self.assertTrue(store.get_season_team_registration(reg_b.id).active)
 
     def test_arena_manager_forbidden(self):
         c = self._client()

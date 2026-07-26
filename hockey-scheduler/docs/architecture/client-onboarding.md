@@ -1229,6 +1229,119 @@ restored. Desktop and 390px import smoke coverage gains a second scenario
 (alongside round 15's) proving the ambiguous-Division-name rejection
 surfaces in the real UI, never a false `Committed` state.
 
+Round 16's own convergence review (#331 review round 17) found one further
+blocker in the same registration lifecycle, adjacent to but distinct from
+all three round 16 reproductions: both gate and apply picked `reg = next(r
+for r in registrations_for_season(season_id) if r.team_id == team.id)` —
+the FIRST registration the store happened to return for the Team anywhere
+in the Season, regardless of which `LeagueSeason` it actually belonged to.
+Migration 035's schema explicitly permits more than one row per (Team,
+Season) — one per `LeagueSeason`, unique only on `(team_id,
+league_season_id)` — and `transfer_team_to_league` relies on exactly that:
+it deliberately leaves an inactive prior-League registration untouched as
+history when transferring a Team whose active participation there has
+already been unregistered. A `next(...)` lookup with no `LeagueSeason`
+filter can't tell that untouched historical row apart from the one this
+import row actually means to upsert. Two failure shapes followed: an
+import re-run after such a transfer found the inactive row (the *only* row
+that existed) and rewrote it in place — `active=True`, `league_season_id`
+repointed at the new target — silently erasing the fact the Team was ever
+registered in the old League at all, rather than preserving it and
+creating a distinct new row for the new one; and, when a second,
+genuinely-correct active registration already existed in the target
+LeagueSeason (created directly via `register_team_for_season`, bypassing
+the import), re-running the import could pick the *other*, unrelated
+active row and rebind it onto the same unique key — a silently duplicated
+active registration on Memory (two rows both claiming to be the Team's
+canonical participation in that LeagueSeason), and a raw, unhandled
+`{"error": {"code": "conflict", "details": {"reason":
+"unique_violation"}}}` on SQLite/PostgreSQL instead of the structured,
+zero-mutation `errors[]` shape every other rejection in this gate
+produces.
+
+Closed with a new shared resolver, `_resolve_import_row_registration`,
+called identically by gate and apply (the same "never let the two derive
+different answers" discipline round 16 established for Division/League
+resolution, now extended to registration-row *selection* specifically). It
+looks up the Team's registration by its exact `(team_id,
+target_league_season_id)` identity via the store's existing
+`league_season_for` / `registration_for_team_in_league_season` primitives
+— never a bare Season-wide scan — so an inactive row in a *different*
+`LeagueSeason` is structurally invisible to it and can never be touched.
+When no row exists at the exact target but the Team holds precisely one
+OTHER active registration elsewhere in the Season, that row is reused
+in place via the identical "move" `transfer_team_to_league` and
+`assign_season_team_league` already perform for a Rule-7-violating active
+registration (rebinding its `league_season_id`, gated by the same
+non-cancelled-Game stranding check on its *own* current League this file's
+round 16 section above already describes) — preserving the round 16
+`registration_league_change_strands_games` repair behavior for the common
+single-stray-row case byte-for-byte, including its game-free-repair,
+stranded-rejection, and already-correct-no-op triple (now additionally
+proven safe against a planted, non-cancelled but CANCELLED game in the
+stale League, closing a gap the round 16 matrix itself didn't cover). Any
+other shape — the target row already exists AND a separate active row
+also exists elsewhere, or more than one other active row exists with none
+at the target — is a genuine, no-safe-default conflict: rejected before
+any write with a new `team_registration_conflict` reason listing every
+conflicting registration id, mirroring this codebase's consistent
+preference (`team_transfer_strands_games`, `team_league_ambiguous`,
+`import_division_name_ambiguous`, and round 16's own three reasons)
+for a structured, operator-visible rejection over ever silently guessing
+which of two active participations is authoritative. The existing
+division-move stranding check (checked against ANY committed game in the
+Season) is skipped specifically for the reused-elsewhere "move" case — its
+old League's own division belongs to a different `LeagueSeason`'s division
+pool entirely, so comparing it to the new target's is meaningless,
+exactly as `transfer_team_to_league` itself unconditionally clears the
+Division on a cross-League move rather than treating it as a change to
+strand-check.
+
+Regression coverage adds nine scenarios to the same `ImportCommitServiceContract`
+mix-in (Memory/SQLite/PostgreSQL, per round 16's own established pattern
+above) plus one driven through the real HTTP commit route: the canonical
+transfer-from-inactive-only reproduction (a distinct new active row is
+created, the inactive row is byte-for-byte untouched); the same
+end-state as a true no-op in both physical insertion orders (the
+Season's-first-created row inactive as the natural chronological result of
+a transfer, and — planted the opposite way, reusing `register_team_for_
+season`'s own reactivate-in-place semantics — the Season's-first-created
+row still active with a chronologically LATER inactive sibling); the
+missing cancelled-Game-doesn't-block case for round 16's own stale-registration
+repair; and the two-simultaneously-active-registrations conflict rejection,
+in both insertion orders, over the service layer and over real HTTP,
+planted directly at the store level exactly as round 16's own stale-
+registration fixture is (a Rule 7 violation no current service-layer write
+path can produce going forward, reproducing legacy data or a state a write
+path predating Rule 7 could have left behind). Falsifiability-verified by
+reverting only the `setup_service.py` resolver change and re-running the
+full new suite: the history-cannibalization and no-op-insertion-order
+scenarios fail exactly as documented, the HTTP conflict test fails, and —
+concretely confirming the review's own predicted failure shape — the
+SQLite conflict scenario doesn't fail an assertion at all but raises the
+exact raw `conflict`/`unique_violation` error shape described above,
+proving the pre-fix code never reaches a structured rejection on that
+backend. No UI change and no new e2e coverage was needed for the new
+`team_registration_conflict` reason: the import error renderer
+(`renderImportRows`/`renderImportResult`) is reason-agnostic — it renders
+`sheet`/`row`/`field`/`message` generically for every entry in `errors[]`
+— so the identical code path round 16's own desktop/390px coverage above
+already exercises for `import_division_name_ambiguous` renders this reason
+too, with no reason-specific branch to leave uncovered.
+
+Out of scope for this round, found during investigation and intentionally
+NOT fixed here: `upsert_imported_registration` (the analogous upsert
+`commit_hierarchy_import`, a separate module, calls for its own
+`registrations` sheet) contains the textually identical `next(r for r in
+registrations_for_season(season_id) if r.team_id == team_id)` pattern.
+Unlike the fix above, closing it properly would also require adding an
+equivalent multi-active-registration conflict check to
+`hierarchy_import.py`'s own `_preflight_reassignment_safety` gate — a
+second module with its own sheet-row-indexed error contract and test
+suite — which this review's report did not name and this round did not
+attempt, to keep the shipped fix scoped to exactly what was reported and
+independently verifiable.
+
 ## Authorization and privacy invariants
 
 - The bootstrap claim is the only unauthenticated mutation, and only on a fresh,
