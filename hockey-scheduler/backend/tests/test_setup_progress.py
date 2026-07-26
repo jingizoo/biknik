@@ -660,6 +660,12 @@ class SetupProgressComputationTest(unittest.TestCase):
         self.assertNotIn("error", reg_b, reg_b)
         final = api.get_setup_progress("admin", *ADMIN)
         self.assertEqual(_statuses(final)["participation"], "done")
+        # #331 review round 19: no stray/invalid row exists in this scenario
+        # -- `attention` must be absent entirely, not present-but-empty, the
+        # same "omitted when irrelevant" contract `next_blocked` follows.
+        final_participation = next(w for w in final["workflows"]
+                                   if w["key"] == "participation")
+        self.assertNotIn("attention", final_participation)
         regs_a = api.list_season_team_registrations(season_a["id"])
         self.assertEqual([r["team_id"] for r in regs_a["registrations"]
                           if r["active"]], [team["id"]],
@@ -710,6 +716,17 @@ class SetupProgressComputationTest(unittest.TestCase):
         self.assertIsNotNone(progress["next"], progress)
         self.assertEqual(progress["next"]["key"], "participation", progress)
         self.assertIsNone(progress["next_blocked"], progress)
+        # #331 review round 19: the stray row isn't just excluded from
+        # `schedulable` -- it must be surfaced as needing attention too, so
+        # an operator can discover it exists at all.
+        participation = next(w for w in progress["workflows"]
+                             if w["key"] == "participation")
+        self.assertEqual(
+            participation["attention"],
+            {"reason": "invalid_registrations", "count": 1,
+             "detail": "1 registration(s) in this season don't match "
+                       "their team's permanent league or division; "
+                       "resolve them in Season participation."})
 
         # Registering the Team correctly into its OWN permanent League A
         # genuinely unblocks it -- the stale League B row is left untouched.
@@ -722,6 +739,13 @@ class SetupProgressComputationTest(unittest.TestCase):
         still_stale = api.store.get_season_team_registration(stale.id)
         self.assertTrue(still_stale.active)
         self.assertEqual(still_stale.league_season_id, ls_b.id)
+        # #331 review round 19: "done" and "needs attention" are
+        # independent -- Team A's own registration IS genuinely valid and
+        # schedulable now, but the untouched League B stray row must still
+        # be surfaced, not silently buried now that SOMETHING is done.
+        after_participation = next(w for w in after["workflows"]
+                                   if w["key"] == "participation")
+        self.assertEqual(after_participation["attention"]["count"], 1)
 
     def test_facilities_next_is_also_blocked_when_selected_season_is_archived(self):
         """Not just "participation" -- ``commit_ice_availability`` (the Ice

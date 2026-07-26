@@ -1158,6 +1158,15 @@ class SqlStore:
             SeasonTeamRegistration,
             "league_season_id = ? AND team_id = ?", (league_season_id, team_id))
         return rows[0] if rows else None
+    def registrations_for_team_in_league_season(self, league_season_id, team_id):
+        """Every row at this EXACT (team, LeagueSeason) key (#331 review
+        round 19) -- always 0 or 1 here, since ``ux_team_league_season``
+        (migration 035) makes a second impossible to insert, but returning a
+        list gives InMemoryStore's own (unenforced) equivalent a uniform
+        contract callers can share."""
+        return self._query(
+            SeasonTeamRegistration,
+            "league_season_id = ? AND team_id = ?", (league_season_id, team_id))
     def registrations_for_season(self, season_id):
         """Every registration in a Season, across all its LeagueSeasons (#283
         convenience for whole-Season reads)."""

@@ -73,6 +73,7 @@ from .ice_availability import (plan_ice_windows, parse_hhmm,
                                curfew_instant, WEEKDAY_NAMES)
 from .season_guard import require_active_season
 from .league_scope import (
+    exact_registration_or_conflict,
     registered_team_ids_in_division as _registered_team_ids,
     team_registration_valid,
 )
@@ -255,13 +256,20 @@ def resolve_team_registration_for_import(store, season_id, team_id,
     rebind one active row onto another's unique key."""
     target_ls = (store.league_season_for(target_league_id, season_id)
                 if target_league_id else None)
-    target_reg = (store.registration_for_team_in_league_season(
-                     target_ls.id, team_id)
-                  if target_ls is not None else None)
+    # #331 review round 19: the exact-target lookup itself can no longer
+    # assume at most one row -- see exact_registration_or_conflict's own
+    # docstring for why. A conflict here (Memory-only corrupted duplicate
+    # data at the identical key) is folded into this function's own
+    # conflicting_ids output exactly like every other conflict shape below.
+    target_reg, _target_key_conflicts = (
+        exact_registration_or_conflict(store, target_ls.id, team_id)
+        if target_ls is not None else (None, []))
     other_active = [
         r for r in store.registrations_for_season(season_id)
         if r.team_id == team_id and r.active
         and (target_ls is None or r.league_season_id != target_ls.id)]
+    if _target_key_conflicts:
+        return None, False, _target_key_conflicts + [r.id for r in other_active]
     if target_reg is not None:
         if other_active:
             return None, False, (
@@ -1074,44 +1082,49 @@ class SetupService:
                  "registration_id": reg.id,
                  "affected_game_ids": stranded, "count": len(stranded)})
         new_ls = self._link_league_season(league_id, season_id)
-        # #331 review round 18: never blindly rebind reg.league_season_id --
-        # the Team may already retain ANOTHER row at the target LeagueSeason
-        # (history from a prior assignment/transfer cycle); rebinding reg
-        # onto it would either silently duplicate an active row (Memory) or
-        # raise a raw unique_violation (SQLite/PostgreSQL) instead of a
-        # structured rejection. A direct (team, target LeagueSeason) lookup
-        # -- NOT the shared import resolver -- because `reg` is already
-        # pinned by the caller here (unlike commit_teams_players_import/
-        # roll_forward_registrations, which must first DISCOVER which row a
-        # team_id resolves to): the resolver's own `other_active` scan has
-        # no way to exclude `reg` from its "other active rows" candidates,
-        # so reusing it here would misreport `reg` itself as a second
-        # conflicting registration. Guarded on reg.active: an inactive reg
-        # has no Rule 7 participation to protect and this function's
-        # pre-round-18 contract already tolerated reassigning one, so that
-        # narrow, out-of-scope case is left untouched.
-        if reg.active:
-            _target_reg = self.store.registration_for_team_in_league_season(
-                new_ls.id, reg.team_id)
-            if _target_reg is not None and _target_reg.active:
-                # An independently ACTIVE row already sits at the target --
-                # moving `reg` there would leave the Team with two
-                # concurrently active registrations in this Season, exactly
-                # the Rule 7 violation this whole review cycle exists to
-                # prevent. Unresolvable automatically: reject before any
-                # write and let the operator resolve it explicitly.
-                raise ValidationError(
-                    "This team already has an active registration in the "
-                    "target league for this season; resolve the conflict "
-                    "before reassigning this one.",
-                    {"reason": "team_registration_conflict",
-                     "affected_registration_ids": [reg.id, _target_reg.id]})
-            if _target_reg is not None:
-                # A retained INACTIVE row already sits at the target --
-                # reactivate IT in place (mirroring register_team_for_
-                # season's own reactivate-in-place semantics) and retire
-                # `reg` instead of moving it there, preserving both rows'
-                # own identities.
+        # #331 review round 18/19: never blindly rebind reg.league_season_id
+        # -- the Team may already retain ANOTHER row at the target
+        # LeagueSeason (history from a prior assignment/transfer cycle);
+        # rebinding reg onto it would either silently duplicate a row
+        # (Memory) or raise a raw unique_violation (SQLite/PostgreSQL)
+        # instead of a structured rejection. A direct (team, target
+        # LeagueSeason) lookup -- NOT the shared import resolver -- because
+        # `reg` is already pinned by the caller here (unlike
+        # commit_teams_players_import/roll_forward_registrations, which
+        # must first DISCOVER which row a team_id resolves to): the
+        # resolver's own `other_active` scan has no way to exclude `reg`
+        # from its "other active rows" candidates, so reusing it here would
+        # misreport `reg` itself as a second conflicting registration.
+        #
+        # Round 18 guarded this whole check on `reg.active`, reasoning "an
+        # inactive reg has no Rule 7 participation to protect" -- true, but
+        # irrelevant: the `(team_id, league_season_id)` uniqueness a
+        # blind rebind can violate is unconditional, not "only among active
+        # rows". An INACTIVE reg rebound onto an occupied target key is the
+        # identical duplicate-key violation, just without a Rule 7 angle --
+        # round 19 reproduced exactly this via a public lifecycle ending in
+        # this call on an inactive historical row. The lookup and its
+        # conflict handling now run regardless of reg's own active status.
+        # `reg` itself can never be among a target-key conflict: the no-op
+        # early-return above already excluded old_league == league_id, so
+        # reg.league_season_id != new_ls.id is guaranteed here.
+        _target_reg, _target_conflicts = exact_registration_or_conflict(
+            self.store, new_ls.id, reg.team_id)
+        if _target_conflicts:
+            raise ValidationError(
+                "The target league already has more than one registration "
+                "for this team in this season; resolve that conflict "
+                "before reassigning this one.",
+                {"reason": "team_registration_conflict",
+                 "affected_registration_ids": [reg.id] + _target_conflicts})
+        if _target_reg is not None:
+            if reg.active and not _target_reg.active:
+                # The ONE combination with a safe, well-defined resolution:
+                # reg (active) moves logically onto the retained INACTIVE
+                # target -- reactivate IT in place (mirroring
+                # register_team_for_season's own reactivate-in-place
+                # semantics) and retire `reg` instead of moving it there,
+                # preserving both rows' own identities.
                 reg.active = False
                 self.store.save_season_team_registration(reg)
                 self._audit(
@@ -1127,6 +1140,20 @@ class SetupService:
                     _target_reg.id, actor_id,
                     {"from": old_league, "to": league_id, "reactivated": True})
                 return _target_reg
+            # Every other combination -- reg active + target active (Rule 7
+            # conflict), or reg INACTIVE with any row already at the target
+            # (active or inactive) -- is an unresolvable key collision:
+            # rebinding reg onto an already-occupied
+            # (team_id, league_season_id) key can never proceed safely.
+            # Reject before any write and let the operator resolve it
+            # explicitly, rather than guessing which participation/history
+            # is authoritative.
+            raise ValidationError(
+                "This team already has a registration in the target "
+                "league for this season; resolve the conflict before "
+                "reassigning this one.",
+                {"reason": "team_registration_conflict",
+                 "affected_registration_ids": [reg.id, _target_reg.id]})
         # A division set on the registration must belong to the new LeagueSeason;
         # clear it if it doesn't (the league moved out from under it).
         if reg.division_id:
@@ -1327,8 +1354,18 @@ class SetupService:
                      "league_season_id": ls.id})
         # One registration per (team, LeagueSeason). A prior *inactive*
         # registration (a team removed then re-added) is reactivated in place.
-        existing = self.store.registration_for_team_in_league_season(
-            ls.id, team_id)
+        # #331 review round 19: exact-key multiplicity (Memory-only corrupted
+        # duplicate rows at this identical key) must reject before any write,
+        # the same as every other shape of conflict this method can hit.
+        existing, _existing_conflicts = exact_registration_or_conflict(
+            self.store, ls.id, team_id)
+        if _existing_conflicts:
+            raise ValidationError(
+                f"Team {team_id} already has more than one registration "
+                "at this exact league/season; resolve the conflict before "
+                "registering.",
+                {"reason": "team_registration_conflict",
+                 "affected_registration_ids": _existing_conflicts})
         if existing is not None:
             if existing.active:
                 raise ValidationError(
@@ -1815,20 +1852,27 @@ class SetupService:
         claimed_by_season = {}  # season_id -> reg.id of the first claimant
         for reg, season_id in to_move:
             target_ls = self._link_league_season(new_league_id, season_id)
-            existing_at_target = self.store.registration_for_team_in_league_season(
-                target_ls.id, team_id)
-            conflict_with = None
-            if existing_at_target is not None and existing_at_target.active:
-                conflict_with = existing_at_target.id
-            elif season_id in claimed_by_season:
-                conflict_with = claimed_by_season[season_id]
-            else:
-                claimed_by_season[season_id] = reg.id
-            if conflict_with is not None:
+            # #331 review round 19: exact-key multiplicity (Memory-only
+            # corrupted duplicate rows at this identical target key) is its
+            # own unconditional conflict -- folded into the same rejection
+            # shape as every other conflict this pre-scan already catches,
+            # rather than trusting a bare first-match lookup to hide it.
+            existing_at_target, _target_key_conflicts = (
+                exact_registration_or_conflict(self.store, target_ls.id, team_id))
+            conflict_with = list(_target_key_conflicts)
+            if not conflict_with:
+                if existing_at_target is not None and existing_at_target.active:
+                    conflict_with = [existing_at_target.id]
+                elif season_id in claimed_by_season:
+                    conflict_with = [claimed_by_season[season_id]]
+                else:
+                    claimed_by_season[season_id] = reg.id
+            if conflict_with:
                 target_conflicts.append(
                     {"registration_id": reg.id, "season_id": season_id,
-                     "conflicting_registration_id": conflict_with})
-            resolved_targets[reg.id] = (target_ls, existing_at_target)
+                     "conflicting_registration_ids": conflict_with})
+            resolved_targets[reg.id] = (
+                target_ls, None if _target_key_conflicts else existing_at_target)
         if target_conflicts:
             raise ValidationError(
                 "Cannot transfer this team while it already has an active "
@@ -2489,6 +2533,18 @@ class SetupService:
                 "v2 rollover requires a non-empty selections list; each "
                 "selection needs a target league_id.")
         program_id = src.program_id or None
+        # #331 review round 19: a Team can hold more than one active source
+        # registration in this Season (a Rule 7 violation legacy data / a
+        # write path predating Rule 7 can leave behind) -- two selections
+        # for the SAME team_id in one batch is unresolvable ambiguity,
+        # counted up front so the gate below can reject it before any write
+        # rather than letting `wanted[tid] = ...` silently keep only the
+        # last one.
+        _team_id_counts = {}
+        for sel in selections:
+            if isinstance(sel, dict) and isinstance(sel.get("team_id"), str):
+                _team_id_counts[sel["team_id"]] = (
+                    _team_id_counts.get(sel["team_id"], 0) + 1)
         # Pre-write gate — resolve/validate every selection before any write, so
         # a failure leaves the target season and audit log untouched.
         wanted = {}  # team_id -> (league_id, division_id)
@@ -2503,6 +2559,38 @@ class SetupService:
             if tid not in source_active:
                 raise ValidationError(
                     f"Team {tid} is not registered in the source season.")
+            if _team_id_counts.get(tid, 0) > 1:
+                raise ValidationError(
+                    f"Team {tid} has more than one selection in this "
+                    "rollover batch; submit only one selection per team.",
+                    {"reason": "rollover_duplicate_team_selection",
+                     "team_id": tid})
+            # #331 review round 19: when a selection names its SOURCE
+            # registration explicitly (the frontend's Season rollover panel
+            # always does, #331 review round 19 finding 4), it must resolve
+            # to an ACTIVE row for EXACTLY this team in the source season --
+            # carrying the operator's actual per-row identity all the way to
+            # the write boundary, never trusting team_id alone to mean
+            # "whichever of this team's rows happens to match."
+            # registration_id is optional (back-compat with any caller that
+            # predates this field) -- omitting it keeps the prior team_id-
+            # only contract.
+            reg_id = sel.get("registration_id")
+            if reg_id is not None:
+                if not isinstance(reg_id, str) or _blank(reg_id):
+                    raise ValidationError(
+                        "A selection's registration_id must be a "
+                        "non-empty string when present.")
+                src_reg = self.store.get_season_team_registration(reg_id)
+                if (src_reg is None or src_reg.team_id != tid
+                        or not src_reg.active
+                        or self._season_of_league_season(
+                            src_reg.league_season_id) != from_season_id):
+                    raise ValidationError(
+                        f"Registration {reg_id} is not an active "
+                        f"source-season registration for team {tid}.",
+                        {"reason": "rollover_registration_mismatch",
+                         "team_id": tid, "registration_id": reg_id})
             lid = sel.get("league_id")
             if not isinstance(lid, str) or _blank(lid):
                 raise ValidationError(
@@ -2578,8 +2666,21 @@ class SetupService:
             # resolve explicitly (assign_season_team_league /
             # transfer_team_to_league), never an implicit rollover side
             # effect.
-            existing = self.store.registration_for_team_in_league_season(
-                target_ls.id, tid)
+            # #331 review round 19: exact-key multiplicity (Memory-only
+            # corrupted duplicate rows at this identical target key) is its
+            # own unconditional conflict, checked before the "any OTHER
+            # active row" scan below so a corrupted exact-key pair is never
+            # silently absorbed into `other_active` under only one of its
+            # ids while the other goes unmentioned.
+            existing, _target_key_conflicts = exact_registration_or_conflict(
+                self.store, target_ls.id, tid)
+            if _target_key_conflicts:
+                raise ValidationError(
+                    f"Team {tid} already has more than one registration at "
+                    "the target league/season; resolve the conflict before "
+                    "rolling this team forward.",
+                    {"reason": "team_registration_conflict", "team_id": tid,
+                     "affected_registration_ids": _target_key_conflicts})
             other_active = [
                 r for r in self.store.registrations_for_season(to_season_id)
                 if r.team_id == tid and r.active
@@ -2616,8 +2717,22 @@ class SetupService:
             # The gate's own scan already proved no OTHER active row exists
             # for this team in the target Season, so this exact lookup is
             # unambiguous by construction.
-            existing = self.store.registration_for_team_in_league_season(
-                target_ls.id, tid)
+            #
+            # #331 review round 19: uses the SAME exact-key wrapper the gate
+            # above uses, not the raw store primitive -- nothing in this
+            # single transactional call can change state between the gate
+            # and here, so a conflict at this point should never happen, but
+            # this must still never fall back to guessing a row if it
+            # somehow did (a future refactor bug, not a possibility today).
+            existing, _target_key_conflicts = exact_registration_or_conflict(
+                self.store, target_ls.id, tid)
+            if _target_key_conflicts:
+                raise ValidationError(
+                    f"Team {tid} already has more than one registration at "
+                    "the target league/season; resolve the conflict before "
+                    "rolling this team forward.",
+                    {"reason": "team_registration_conflict", "team_id": tid,
+                     "affected_registration_ids": _target_key_conflicts})
             if existing is not None and existing.active:
                 # Guaranteed an exact League+Division match by the pre-write gate
                 # above — a safe idempotent skip.

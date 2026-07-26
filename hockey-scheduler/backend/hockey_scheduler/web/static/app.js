@@ -2613,13 +2613,25 @@ function renderRollover(hv, ov) {
     const srcRegs = (seasonRegs[fromId] || []).filter((r) => r.active);
     const targetActive = new Set((seasonRegs[toId] || [])
       .filter((r) => r.active).map((r) => r.team_id));
-    const eligible = [], already = [], ineligible = [];
+    // #331 review round 19: a Team can hold more than one active SOURCE
+    // registration in the same Season (a Rule 7 violation legacy data / a
+    // write path predating Rule 7 can leave behind, or -- Memory only --
+    // two rows at the exact same key, the corruption finding 1 this same
+    // round closes off at every write path). `eligible` keeps each row's
+    // OWN registration alongside its team, never just the team, so two
+    // rows for one team render as genuinely distinct, independently
+    // selectable entries instead of colliding on a team-id-only key.
+    // `already` still dedupes by team (informational only, never a pick
+    // target) so a team with two source rows doesn't list itself twice.
+    const eligible = [], ineligible = [];
+    const alreadyByTeam = new Map();
     srcRegs.forEach((r) => {
       const team = teamById(r.team_id);
-      if (!team) ineligible.push(r);
-      else if (targetActive.has(r.team_id)) already.push(team);
-      else eligible.push(team);
+      if (!team) { ineligible.push(r); return; }
+      if (targetActive.has(r.team_id)) { alreadyByTeam.set(team.id, team); return; }
+      eligible.push({ reg: r, team });
     });
+    const already = [...alreadyByTeam.values()];
     // Every carried team must land under a concrete target-season League — the
     // v2 rollover has no division-only mode, so a null-league selection can
     // never be sent (#233 Slice C2). Rows start unchecked (no implicit bulk
@@ -2632,18 +2644,24 @@ function renderRollover(hv, ov) {
     // backend rejects any other. So each row's target League is FIXED to the
     // team's permanent League (never a free picker), and its Division options
     // are that League's divisions in the target season.
-    const carryRows = eligible.map((team) => {
+    // #331 review round 19: every per-row control keys off the SOURCE
+    // registration's own id, never team.id -- two rows for the same team
+    // (see the eligible/already split above) must never collide on a
+    // shared data-rollover-* value. data-rollover-team stays on the
+    // checkbox alongside it so the commit handler can still report which
+    // team a picked row belongs to without re-deriving it from the DOM.
+    const carryRows = eligible.map(({ reg, team }) => {
       const perm = teamPermLeague[team.id];
       const permInTo = perm && toLeagues.find((lv) => lv.id === perm.id);
       const leagueCell = perm
-        ? `<select class="reg-league" data-rollover-league="${esc(team.id)}"><option value="${esc(perm.id)}" selected>${esc(perm.name)}</option></select>`
-        : `<select class="reg-league" data-rollover-league="${esc(team.id)}"><option value="">No permanent league</option></select>`;
+        ? `<select class="reg-league" data-rollover-league="${esc(reg.id)}"><option value="${esc(perm.id)}" selected>${esc(perm.name)}</option></select>`
+        : `<select class="reg-league" data-rollover-league="${esc(reg.id)}"><option value="">No permanent league</option></select>`;
       const initialDivs = permInTo ? (permInTo.divisions || []) : [];
       return `<div class="tn-leaf reg-row">
-        <label class="ro-pick"><input type="checkbox" data-rollover-pick="${esc(team.id)}">
+        <label class="ro-pick"><input type="checkbox" data-rollover-pick="${esc(reg.id)}" data-rollover-team="${esc(team.id)}">
           <span class="tn-label">👥 ${esc(team.name)}</span></label>
         ${leagueCell}
-        <select class="reg-div" data-rollover-div="${esc(team.id)}"><option value="">No division</option>${
+        <select class="reg-div" data-rollover-div="${esc(reg.id)}"><option value="">No division</option>${
           initialDivs.map((d) => opt(d.id, d.name)).join("")}</select>
         <span class="ro-row-err" hidden>This team has no permanent league</span></div>`;
     }).join("");
@@ -2702,9 +2720,14 @@ function updateRolloverCommitState(c) {
   if (!commit) return;
   let anyChecked = false, allAssigned = true;
   c.querySelectorAll("[data-rollover-pick]").forEach((cb) => {
-    const league = c.querySelector(`[data-rollover-league="${cb.dataset.rolloverPick}"]`);
-    const assigned = !!(league && league.value);
+    // #331 review round 19: scoped to THIS row, not a global attribute-value
+    // lookup -- two rows can share the same data-rollover-league VALUE
+    // (both showing the same permanent-league option) even now that the
+    // data-rollover-pick/-league/-div KEY is the row's own registration id,
+    // so a value-based query is never safe here regardless of keying.
     const row = cb.closest(".reg-row");
+    const league = row && row.querySelector("[data-rollover-league]");
+    const assigned = !!(league && league.value);
     const err = row && row.querySelector(".ro-row-err");
     if (cb.checked) {
       anyChecked = true;
@@ -6645,8 +6668,12 @@ async function render() {
   c.querySelectorAll("[data-rollover-pick]").forEach((cb) =>
     cb.onchange = () => updateRolloverCommitState(c));
   c.querySelectorAll("[data-rollover-league]").forEach((sel) => sel.onchange = () => {
-    const teamId = sel.dataset.rolloverLeague;
-    const divSel = c.querySelector(`[data-rollover-div="${teamId}"]`);
+    // #331 review round 19: scoped to THIS row -- two rows can share the
+    // same permanent-league VALUE (see updateRolloverCommitState above),
+    // so a value-based query would rescope the wrong row's Division select
+    // whenever that happens.
+    const row = sel.closest(".reg-row");
+    const divSel = row && row.querySelector("[data-rollover-div]");
     if (divSel) {
       const divs = leagueDivisions[sel.value] || [];
       divSel.innerHTML = `<option value="">No division</option>${divs.map((d) => opt(d.id, d.name)).join("")}`;
@@ -6662,11 +6689,19 @@ async function render() {
       const selections = [];
       c.querySelectorAll("[data-rollover-pick]").forEach((cb) => {
         if (!cb.checked) return;
-        const league = c.querySelector(`[data-rollover-league="${cb.dataset.rolloverPick}"]`);
-        const div = c.querySelector(`[data-rollover-div="${cb.dataset.rolloverPick}"]`);
+        // #331 review round 19: scoped to THIS row (never a value-matched
+        // global query -- two rows can share the same league VALUE, see
+        // updateRolloverCommitState above), and the outgoing selection now
+        // names its SOURCE registration explicitly rather than leaving the
+        // backend to guess which of a team's possibly-several source rows
+        // this selection meant.
+        const row = cb.closest(".reg-row");
+        const league = row && row.querySelector("[data-rollover-league]");
+        const div = row && row.querySelector("[data-rollover-div]");
         if (league && league.value) {
-          selections.push({ team_id: cb.dataset.rolloverPick, league_id: league.value,
-                             division_id: (div && div.value) || null });
+          selections.push({
+            team_id: cb.dataset.rolloverTeam, registration_id: cb.dataset.rolloverPick,
+            league_id: league.value, division_id: (div && div.value) || null });
         }
       });
       // Defensive: the button is disabled unless every checked team has a

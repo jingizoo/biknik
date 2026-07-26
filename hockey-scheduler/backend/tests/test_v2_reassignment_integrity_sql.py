@@ -517,6 +517,114 @@ class RollForwardConflictSqlTest(_SqlIntegrityBase):
 
         self._run(case)
 
+    # -- #331 review round 19: explicit registration_id identity ------------
+
+    def test_explicit_registration_id_matching_the_source_row_still_rolls(self):
+        def case(api, store):
+            s1, s2, l1t, l2t, team_a, team_b = self._two_league_target(api)
+            src_reg = next(r for r in store.registrations_for_season(s1["id"])
+                          if r.team_id == team_a["id"])
+            res = api.roll_forward_registrations_v2(
+                s1["id"], s2["id"],
+                selections=[{"team_id": team_a["id"], "league_id": l1t["id"],
+                             "registration_id": src_reg.id}],
+                actor_id=ADMIN)
+            self.assertNotIn("error", res, res)
+            self.assertEqual(res["rolled_forward"], 1, res)
+
+        self._run(case)
+
+    def test_registration_id_for_a_different_team_rejected_zero_mutation(self):
+        def case(api, store):
+            # #331 review round 19 finding 4: the frontend's Season rollover
+            # panel now sends the SOURCE registration id it rendered a row
+            # for, keyed independently of team_id (two rows for one team must
+            # never collide on a shared DOM/selection key). The backend must
+            # cross-check it against team_id, not trust team_id alone --
+            # otherwise a stale/mismatched registration_id (a bug, or a
+            # tampered request) would silently pass unnoticed.
+            s1, s2, l1t, l2t, team_a, team_b = self._two_league_target(api)
+            team_b_reg = next(
+                r for r in store.registrations_for_season(s1["id"])
+                if r.team_id == team_b["id"])
+            audits_before = len(store.all_setup_audit())
+            res = api.roll_forward_registrations_v2(
+                s1["id"], s2["id"],
+                selections=[{"team_id": team_a["id"], "league_id": l1t["id"],
+                             "registration_id": team_b_reg.id}],
+                actor_id=ADMIN)
+            self.assertEqual(res["error"]["code"], "validation_error", res)
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "rollover_registration_mismatch", res)
+            self.assertEqual(res["error"]["details"]["team_id"], team_a["id"])
+            active = {r.team_id: r for r in
+                      store.registrations_for_season(s2["id"]) if r.active}
+            self.assertEqual(active, {})
+            self.assertEqual(len(store.all_setup_audit()), audits_before)
+
+        self._run(case)
+
+    def test_inactive_registration_id_rejected_zero_mutation(self):
+        def case(api, store):
+            s1, s2, l1t, l2t, team_a, team_b = self._two_league_target(api)
+            # team_a keeps its own real ACTIVE source registration (so it
+            # still passes the "is this team registered in the source
+            # season at all" gate) -- a SEPARATE, inactive row is what the
+            # selection actually names, so this exercises the registration_
+            # id cross-check specifically, not the earlier not-in-source-
+            # season check.
+            l3 = api.create_league(s1["id"], "L3", actor_id=ADMIN)
+            api.create_division(s1["id"], "L3 Div", league_id=l3["id"],
+                                actor_id=ADMIN)
+            inactive_reg = SeasonTeamRegistration(
+                id=store.next_id("streg"),
+                league_season_id=store.league_season_for(l3["id"], s1["id"]).id,
+                team_id=team_a["id"], division_id=None, active=False)
+            store.add_season_team_registration(inactive_reg)
+            audits_before = len(store.all_setup_audit())
+            res = api.roll_forward_registrations_v2(
+                s1["id"], s2["id"],
+                selections=[{"team_id": team_a["id"], "league_id": l1t["id"],
+                             "registration_id": inactive_reg.id}],
+                actor_id=ADMIN)
+            self.assertEqual(res["error"]["code"], "validation_error", res)
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "rollover_registration_mismatch", res)
+            active = {r.team_id: r for r in
+                      store.registrations_for_season(s2["id"]) if r.active}
+            self.assertEqual(active, {})
+            self.assertEqual(len(store.all_setup_audit()), audits_before)
+
+        self._run(case)
+
+    def test_duplicate_team_selection_in_one_batch_rejected_zero_mutation(self):
+        def case(api, store):
+            # #331 review round 19 finding 4: two selections for the SAME
+            # team_id (e.g. two source rows for a Team with a Rule 7
+            # violation, both checked in the UI) is unresolvable ambiguity
+            # -- the old `wanted[tid] = ...` aggregation silently kept only
+            # the LAST one; this must reject the whole batch instead.
+            s1, s2, l1t, l2t, team_a, team_b = self._two_league_target(api)
+            audits_before = len(store.all_setup_audit())
+            res = api.roll_forward_registrations_v2(
+                s1["id"], s2["id"],
+                selections=[
+                    {"team_id": team_a["id"], "league_id": l1t["id"]},
+                    {"team_id": team_a["id"], "league_id": l1t["id"],
+                     "division_id": None},
+                ],
+                actor_id=ADMIN)
+            self.assertEqual(res["error"]["code"], "validation_error", res)
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "rollover_duplicate_team_selection", res)
+            self.assertEqual(res["error"]["details"]["team_id"], team_a["id"])
+            active = {r.team_id: r for r in
+                      store.registrations_for_season(s2["id"]) if r.active}
+            self.assertEqual(active, {})
+            self.assertEqual(len(store.all_setup_audit()), audits_before)
+
+        self._run(case)
+
 
 class TransferRetainedTargetSqlTest(_SqlIntegrityBase):
     """#331 review round 18: _transfer_team_to_league_inner must never

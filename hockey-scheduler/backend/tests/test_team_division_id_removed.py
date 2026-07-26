@@ -359,6 +359,30 @@ class LegacyFieldIsInertContract:
         for hidden in (cross.id, "team_missing", orphan.id, wrong):
             self.assertNotIn(hidden, exposed)
 
+    def test_overview_never_reports_a_stray_cross_league_row_operational(self):
+        # #331 review round 19: _registration_is_operational used to answer
+        # "does this TEAM have SOME valid registration" (team_registration_
+        # valid resolves via the Team's OWN permanent League, ignoring which
+        # row is actually being examined) rather than "is THIS row the valid
+        # one". A stray ACTIVE row under a DIFFERENT league (legacy data / a
+        # write path predating Rule 7 -- the identical shape
+        # test_inactive_sibling_in_another_league_never_hides_the_active_row
+        # above reproduces for team_registration_valid directly) rode on the
+        # credibility of the Team's real registration elsewhere: both rows
+        # appeared in get_demo_overview()["registrations"] -- the exact list
+        # the scheduling wizard reads -- each claiming a DIFFERENT league_id
+        # for the identical team_id, with no way for a caller to tell which
+        # one is actually safe to act on.
+        season, league_a, league_b, d_a = self._two_league_season("S")
+        team = self._team("Nomads", league_id=league_a)
+        self._register(season, team, d_a)
+        self._inject_reg(league_b, season, team, active=True)
+
+        rows = [r for r in self.api.get_demo_overview()["registrations"]
+                if r["team_id"] == team]
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["league_id"], league_a)
+
     def test_registration_with_a_dangling_shared_league_is_excluded(self):
         # Season and Team agree on a league id that has NO League row (#180
         # review): the resolver must still reject it, not trust matching-but-

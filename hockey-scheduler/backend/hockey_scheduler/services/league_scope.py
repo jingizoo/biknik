@@ -156,6 +156,44 @@ def league_id_for_game(store, game) -> Optional[str]:
 # generation must never silently trust one. These two helpers are the single
 # shared resolver every scheduling path uses so the rule cannot drift.
 
+def exact_registration_or_conflict(store, league_season_id, team_id):
+    """The Team's registration at this EXACT ``(team_id, league_season_id)``
+    key, or the ids of every row found there when more than one exists
+    (#331 review round 19).
+
+    SQL's ``ux_team_league_season`` unique index (migration 035) makes a
+    second row at one exact key impossible to INSERT, so on SQLite/
+    PostgreSQL this can only ever return 0 or 1 rows. ``InMemoryStore`` has
+    no equivalent enforcement on add/save, so a bare lookup there (every
+    caller used to call ``store.registration_for_team_in_league_season``
+    directly) silently returns whichever matching row happens to sort
+    first -- hiding a second one entirely -- if legacy/corrupted data (or a
+    write path this whole review cycle predates) ever left two rows at the
+    identical key. Every caller of the shared identity primitive now goes
+    through this wrapper instead, so "the row at this key" and "is this key
+    ambiguous" are answered identically everywhere, the same "one shared
+    contract" discipline ``setup_service.resolve_team_registration_for_
+    import`` already applies to cross-LeagueSeason resolution.
+
+    Returns ``(reg_or_None, conflicting_ids)``: 0 rows -> ``(None, [])``;
+    exactly 1 -> ``(that row, [])``; 2+ -> ``(None, [every row's id])`` --
+    an unconditional conflict regardless of any row's ``active`` flag,
+    since the rows' mere co-existence at one exact key is itself the
+    corrupted state, not a fact about which one is "really" current.
+
+    Lives here rather than in ``setup_service`` so both WRITE call sites
+    (``setup_service``, which already imports this module) and READ-ONLY
+    call sites (``context_scope``, which must stay independent of the much
+    larger ``setup_service`` module) can share it without a cycle."""
+    if league_season_id is None:
+        return None, []
+    rows = store.registrations_for_team_in_league_season(
+        league_season_id, team_id)
+    if len(rows) > 1:
+        return None, [r.id for r in rows]
+    return (rows[0] if rows else None), []
+
+
 def team_registration_valid(store, season, team_id, division_id=None,
                             require_division=True):
     """Return the active, league-consistent registration for ``team_id`` in
@@ -196,7 +234,13 @@ def team_registration_valid(store, season, team_id, division_id=None,
     ls = store.league_season_for(team.league_id, season.id)
     if ls is None:
         return None
-    reg = store.registration_for_team_in_league_season(ls.id, team_id)
+    # #331 review round 19: fail CLOSED on exact-key multiplicity, never
+    # guess. This is a read-only scheduling gate, not a write path with a
+    # caller to report a structured conflict to -- an ambiguous key must be
+    # treated the same as "no valid registration", deterministically,
+    # regardless of which corrupted row a bare first-match lookup would
+    # have preferred (insertion order must never change the answer).
+    reg, _conflicts = exact_registration_or_conflict(store, ls.id, team_id)
     if reg is None or not reg.active:
         return None
     if require_division and division_id is not None and reg.division_id != division_id:

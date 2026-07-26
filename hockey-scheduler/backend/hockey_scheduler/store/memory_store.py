@@ -537,6 +537,20 @@ class InMemoryStore:
                      if r.league_season_id == league_season_id
                      and r.team_id == team_id), None)
 
+    def registrations_for_team_in_league_season(
+            self, league_season_id: str,
+            team_id: str) -> List[SeasonTeamRegistration]:
+        """Every row at this EXACT (team, LeagueSeason) key (#331 review
+        round 19). Normally 0 or 1 -- SQL's ``ux_team_league_season`` unique
+        index (migration 035) guarantees it there -- but this store has no
+        equivalent enforcement on add/save, so legacy/corrupted data (or a
+        write path predating that guarantee) can leave more than one row
+        here. Callers that need "the" row use the shared conflict-detecting
+        wrapper built on this, never assume a bare lookup is unambiguous."""
+        return [r for r in self.season_team_registrations.values()
+                if r.league_season_id == league_season_id
+                and r.team_id == team_id]
+
     def registrations_for_season(
             self, season_id: str) -> List[SeasonTeamRegistration]:
         """Every registration in a Season, across all its LeagueSeasons (#283)."""

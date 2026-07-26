@@ -407,11 +407,22 @@ class ApiService:
 
         workflows = []
 
-        def add(key, label, done, detail, primary_action):
-            workflows.append({
+        def add(key, label, done, detail, primary_action, *, attention=None):
+            entry = {
                 "key": key, "label": label,
                 "status": "done" if done else "todo",
-                "detail": detail, "primary_action": primary_action})
+                "detail": detail, "primary_action": primary_action}
+            # #331 review round 19: additive and independent of `status` --
+            # a workflow can be legitimately "done" (some row IS valid and
+            # schedulable) while ALSO having other row(s) that need cleanup.
+            # Folding that into `status`/`detail` would either falsely
+            # reopen a genuinely complete workflow or silently bury the
+            # signal in prose a screen reader user can't act on; a caller
+            # that doesn't know this field simply never sees it, same as
+            # `next_blocked` being absent when nothing is blocked.
+            if attention:
+                entry["attention"] = attention
+            workflows.append(entry)
 
         # 1. League profile and seasons: every Season this Program has must
         # carry at least one grouping League. Deliberately Program-wide, NOT
@@ -443,6 +454,20 @@ class ApiService:
         teams_by_id = {t.id: t for t in teams}
         ls_league_id_by_id = {ls.id: ls.league_id for ls in program_league_seasons}
         schedulable = 0
+        # #331 review round 19: a registration this loop excludes from
+        # `schedulable` isn't necessarily irrelevant -- an active row that
+        # fails the Rule 7 League match is exactly the shape of stray
+        # cross-League row `get_onboarding_status_v2`'s own "participation"
+        # step already tracks as `invalid_regs` and reports via its
+        # "invalid_registrations" blocker. This step previously dropped the
+        # identical row with no signal at all: a Team with one genuinely
+        # valid registration (elsewhere) reports "done" here with no way
+        # for an operator to discover the OTHER row still needs cleanup.
+        # Counted separately from `schedulable` (never merged into it, and
+        # never changes `status`/`done`) -- an operator who has already
+        # achieved real, valid participation must still see "done", just
+        # ALSO see that something else needs attention.
+        needs_attention = 0
         for reg in self.store.all_season_team_registrations():
             if not reg.active or reg.team_id not in team_ids:
                 continue
@@ -462,17 +487,26 @@ class ApiService:
             team = teams_by_id.get(reg.team_id)
             if (team is None or not team.league_id
                     or team.league_id != ls_league_id_by_id.get(reg.league_season_id)):
+                needs_attention += 1
                 continue
             if reg.division_id:
                 division = divisions_by_id.get(reg.division_id)
                 if division is None or division.league_season_id != reg.league_season_id:
+                    needs_attention += 1
                     continue
             schedulable += 1
         add("participation", "Season participation and divisions",
             schedulable > 0,
             (f"{schedulable} schedulable registration(s)" if schedulable
              else "No team registered to play yet."),
-            "Register Team")
+            "Register Team",
+            attention=(
+                {"reason": "invalid_registrations", "count": needs_attention,
+                 "detail": (
+                     f"{needs_attention} registration(s) in this season "
+                     "don't match their team's permanent league or "
+                     "division; resolve them in Season participation.")}
+                if needs_attention else None))
 
         # 4. Clubs, players and staff: at least one player on one of this
         # Program's teams. Program-level like Teams — a Player belongs to a
@@ -3875,14 +3909,31 @@ class ApiService:
         and agree with a named division's league — a wrong-season / cross-league
         / missing-Team / missing-League / **league-less** row is never exposed
         to the operational UI (e.g. the game-scheduling wizard, #233 B2c).
+
+        #331 review round 19: ``team_registration_valid`` answers "does this
+        TEAM have a valid registration in this season", resolved via the
+        Team's OWN permanent League -- not "is THIS row (``r``) the valid
+        one". For a Team with a genuinely valid registration under its
+        permanent League PLUS a stray active row under a different League
+        (legacy data / a write path predating Rule 7 -- the same shape
+        ``league_scope.team_registration_valid``'s own docstring names),
+        calling this with the STRAY row still resolves the OTHER, valid row
+        and returns non-``None`` -- so both rows were reported operational,
+        each under its own (different) ``league_id``, in a view whose whole
+        purpose is deciding what's safe to schedule against. Comparing the
+        resolved row's identity back to ``r`` makes this answer "is THIS
+        row" rather than "does the Team have SOME row", the same row-vs-
+        team distinction ``exact_registration_or_conflict`` draws for exact-
+        key lookups.
         """
         # Season + competition League now resolve through the LeagueSeason (#283).
         ls = self._resolve_ls(r.league_season_id)
         if ls is None:
             return False
         season = self.store.get_season(ls.season_id)
-        if team_registration_valid(
-                self.store, season, r.team_id, r.division_id) is None:
+        valid_reg = team_registration_valid(
+            self.store, season, r.team_id, r.division_id)
+        if valid_reg is None or valid_reg.id != r.id:
             return False
         if r.division_id is not None:
             division = self.store.get_division(r.division_id)
@@ -4469,9 +4520,23 @@ class ApiService:
                 if sid is not None:
                     regs_by_season.setdefault(sid, []).append(reg)
 
-        def team_node(t):
+        def team_node(t, registration_id=None):
+            # #331 review round 19: ``registration_id`` is the SPECIFIC active
+            # SeasonTeamRegistration this node represents -- ``None`` for the
+            # permanent Program->League->Team tree below (no Season/
+            # registration involved there), and the exact row's id for every
+            # Season-participation node (division-nested or league-direct).
+            # A Team with two active registrations in one Season (a Rule 7
+            # violation legacy data/a write path predating Rule 7 can leave
+            # behind) previously produced two structurally-identical nodes a
+            # consumer could only re-associate with a lossy (team_id,
+            # league_id) reconstruction -- exactly the shape
+            # renderSeasonParticipation's own regByTeamLeague keying (#331
+            # review round 18) has to guess at. Carrying the row's own id
+            # lets a consumer key off it directly instead of guessing.
             return {"id": t.id, "name": t.name, "club_id": t.club_id,
                     "program_id": t.program_id,
+                    "registration_id": registration_id,
                     "player_count": player_count.get(t.id, 0)}
 
         # #283 Slice B: the PERMANENT Program → League → Team structure (the
@@ -4511,8 +4576,8 @@ class ApiService:
                 # Resolve every active registration in this Season into exactly
                 # one bucket: a valid Division nest, a valid League-direct team,
                 # or an invalid (needs-assignment) row.
-                teams_by_div = {}                 # division_id -> [team]
-                teams_direct_by_league = {}       # league_id  -> [team]
+                teams_by_div = {}                 # division_id -> [(team, reg)]
+                teams_direct_by_league = {}       # league_id  -> [(team, reg)]
                 needs_assignment_regs = []
                 for reg in regs_by_season.get(s.id, []):
                     # The registration's competition League now resolves via its
@@ -4546,7 +4611,7 @@ class ApiService:
                         if (div is not None
                                 and div.league_season_id == reg.league_season_id
                                 and reg_league_id in league_ids):
-                            teams_by_div.setdefault(div.id, []).append(tm)
+                            teams_by_div.setdefault(div.id, []).append((tm, reg))
                         else:
                             needs_assignment_regs.append(
                                 {"registration_id": reg.id, "team_id": reg.team_id,
@@ -4558,7 +4623,7 @@ class ApiService:
                         # League when that League is a real League in this Season.
                         if reg_league_id in league_ids:
                             teams_direct_by_league.setdefault(
-                                reg_league_id, []).append(tm)
+                                reg_league_id, []).append((tm, reg))
                         else:
                             needs_assignment_regs.append(
                                 {"registration_id": reg.id, "team_id": reg.team_id,
@@ -4570,8 +4635,8 @@ class ApiService:
                     return {"id": d.id, "name": d.name, "age_group": d.age_group,
                             "league_id": self._league_id_via(
                                 ls_by_id, d.league_season_id),
-                            "teams": [team_node(t)
-                                      for t in teams_by_div.get(d.id, [])]}
+                            "teams": [team_node(t, reg.id)
+                                      for t, reg in teams_by_div.get(d.id, [])]}
 
                 league_nodes = [
                     {"id": lv.id, "name": lv.name, "sort_order": lv.sort_order,
@@ -4585,8 +4650,8 @@ class ApiService:
                      # Division-optional: teams registered directly under this
                      # League with no Division.
                      "teams_without_division": [
-                         team_node(t)
-                         for t in teams_direct_by_league.get(lv.id, [])]}
+                         team_node(t, reg.id)
+                         for t, reg in teams_direct_by_league.get(lv.id, [])]}
                     for lv in season_leagues
                 ]
                 # Parentless / dangling Divisions (no League, or a League that
