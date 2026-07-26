@@ -277,6 +277,88 @@ class GameRegistrationLeagueSqlTest(_SqlIntegrityBase):
         self._run(case)
 
 
+class ParticipationSeasonWideConflictSqlTest(_SqlIntegrityBase):
+    """#331 review round 20 finding 1: a Team with an active registration
+    in one League PLUS an active stray in a DIFFERENT League, in the same
+    Season -- unlike the exact-key duplicate corruption
+    test_exact_registration_identity.py covers (blocked by SQL's own
+    ux_team_league_season unique index, Memory-only reachable), THIS shape
+    is constructible on every backend: the two rows sit at two genuinely
+    different LeagueSeason keys, so no unique index has anything to say
+    about it. Proven here on the real SqlStore (SQLite always, PostgreSQL
+    when TEST_DATABASE_URL is set) so the reviewer's explicit "Memory,
+    SQLite, and PostgreSQL" bar is met on the actual production store, not
+    just the in-memory one."""
+
+    def test_register_team_for_season_rejects_active_stray_elsewhere_zero_mutation(self):
+        def case(api, store):
+            org, program = self._org_program(api)
+            season = api.create_season(program["id"], "Fall", actor_id=ADMIN)
+            l1 = api.create_league(season["id"], "L1", actor_id=ADMIN)
+            l2 = api.create_league(season["id"], "L2", actor_id=ADMIN)
+            club = api.create_club("C", actor_id=ADMIN)
+            team = api.create_team(club["id"], None, "T", actor_id=ADMIN,
+                                   program_id=program["id"], league_id=l1["id"])
+            ls2 = store.league_season_for(l2["id"], season["id"])
+            stray = SeasonTeamRegistration(
+                id=store.next_id("streg"), league_season_id=ls2.id,
+                team_id=team["id"], division_id=None, active=True)
+            store.add_season_team_registration(stray)
+
+            audits_before = len(store.all_setup_audit())
+            res = api.register_team_for_season(
+                season["id"], team["id"], actor_id=ADMIN, league_id=l1["id"])
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "team_registration_conflict", res)
+            self.assertEqual(res["error"]["details"]["affected_registration_ids"],
+                             [stray.id])
+            self.assertEqual(len(store.all_setup_audit()), audits_before)
+            self.assertEqual(
+                len(store.registrations_for_season(season["id"])), 1)
+            still_active = store.get_season_team_registration(stray.id)
+            self.assertTrue(still_active.active)
+
+        self._run(case)
+
+    def test_create_game_rejects_team_with_valid_plus_active_stray_zero_mutation(self):
+        def case(api, store):
+            org, program = self._org_program(api)
+            season = api.create_season(program["id"], "Fall", actor_id=ADMIN)
+            l1 = api.create_league(season["id"], "L1", actor_id=ADMIN)
+            l2 = api.create_league(season["id"], "L2", actor_id=ADMIN)
+            club = api.create_club("C", actor_id=ADMIN)
+            team_a = api.create_team(club["id"], None, "A", actor_id=ADMIN,
+                                     program_id=program["id"], league_id=l1["id"])
+            team_b = api.create_team(club["id"], None, "B", actor_id=ADMIN,
+                                     program_id=program["id"], league_id=l1["id"])
+            api.register_team_for_season(season["id"], team_a["id"],
+                                         actor_id=ADMIN, league_id=l1["id"])
+            api.register_team_for_season(season["id"], team_b["id"],
+                                         actor_id=ADMIN, league_id=l1["id"])
+            # team_a picks up an active stray under l2 -- injected directly,
+            # the same "legacy data / a write path predating this review"
+            # shape every sibling test in this file uses (no live v2 write
+            # path can build it once round_team_for_season's own guard,
+            # proven above, is in place).
+            ls2 = store.league_season_for(l2["id"], season["id"])
+            stray = SeasonTeamRegistration(
+                id=store.next_id("streg"), league_season_id=ls2.id,
+                team_id=team_a["id"], division_id=None, active=True)
+            store.add_season_team_registration(stray)
+            slot = self._game_slot(api, org, program, season["id"])
+
+            audits_before = len(store.all_setup_audit())
+            res = api.create_game(season["id"], None, team_a["id"], team_b["id"],
+                                  slot["id"], actor_id=ADMIN, league_id=l1["id"])
+            self.assertIn("error", res, res)
+            self.assertEqual(store.all_games(), [])
+            self.assertEqual(store.get_ice_slot(slot["id"]).status,
+                             IceSlotStatus.AVAILABLE)
+            self.assertEqual(len(store.all_setup_audit()), audits_before)
+
+        self._run(case)
+
+
 class AssignClubOptionalSqlTest(_SqlIntegrityBase):
     """Club is optional on a Team in both v1 and v2 (#233 Slice D)."""
 

@@ -1731,11 +1731,27 @@ first match whenever more than one row happened to share one identical key.
    going forward) produced two structurally-identical nodes a consumer
    could only re-associate with a lossy `(team_id, league_id)`
    reconstruction — precisely what `renderSeasonParticipation`'s own
-   round-18-fixed `regByTeamLeague` map has to do today. Fixed by adding an
-   optional `registration_id` parameter to `team_node`, `None` for the
-   permanent Program→League→Team tree (no Season/registration involved
-   there) and the specific row's id everywhere Season participation is
-   represented.
+   round-18-fixed `regByTeamLeague` map has to do today, and precisely
+   where that map's own remaining gap lived: two rows sharing the exact
+   same `(team_id, league_id)` target (finding 1's own corruption, not
+   round 18's different-League case) still collapse onto one map entry, so
+   the tree's now-duplicated `team_node` occurrences both rendered bound to
+   the SAME winning registration's Save/Remove controls — two visually
+   distinct rows, but one of the two registrations entirely unreachable,
+   `regByTeamLeague`'s original team-id-only failure mode one level up.
+   Fixed on both ends: `team_node` gained an optional `registration_id`
+   parameter, `None` for the permanent Program→League→Team tree (no
+   Season/registration involved there) and the specific row's id everywhere
+   Season participation is represented — `get_setup_hierarchy_v2` already
+   emits one tree entry per registration in the duplicate case
+   (`teams_by_div`/`teams_direct_by_league` append one `(team, reg)` pair
+   per registration), so a Team with two rows at one target was already
+   appearing twice; and `renderSeasonParticipation`'s `regRow` now resolves
+   each row's registration via `t.registration_id` directly (through a
+   `regsById` map keyed by registration id, replacing `regByTeamLeague`)
+   instead of re-deriving one from `(team_id, league_id)` — trusting the id
+   each tree entry already carries, rather than reconstructing one, is what
+   makes both rows independently addressable.
 
    `renderRollover`'s answer to round 18's open question turned out to be:
    yes, the identical shape reaches it, just via *source*-Season rows
@@ -1787,20 +1803,39 @@ a genuinely valid registration makes it `done`, and staying entirely absent
 when nothing needs it) and one new Memory/SQLite test in `test_team_
 division_id_removed.py` (`get_demo_overview` exposing exactly one
 registration — the Team's own permanent-League row — for a Team with a
-stray cross-League sibling, never both); new browser coverage in `hierarchy-
-import.js` (the real conflict reproduction described above, both desktop and
-390×844) and `season-rollover.js` (two active source registrations for one
-Team rendering as genuinely distinct DOM elements, the *second* row checked
-and given an explicit Division via real interaction — the League cascade's
-own Division-select — then committed via a real keyboard Enter activation on
-the focused Commit button rather than a click, proving the outgoing
+stray cross-League sibling, never both); two new `test_setup_hierarchy.py`
+tests for `team_node`'s `registration_id` (`None` on the permanent tree,
+correct for a real registration, and distinct across two active
+registrations at one target); new browser coverage in `hierarchy-import.js`
+(the real conflict reproduction described above, both desktop and 390×844)
+and `season-rollover.js` (two active source registrations for one Team
+rendering as genuinely distinct DOM elements, the *second* row checked and
+given an explicit Division via real interaction — the League cascade's own
+Division-select — then committed via a real keyboard Enter activation on the
+focused Commit button rather than a click, proving the outgoing
 `registration_id`/`division_id` match the row actually operated on and the
-Team's untouched first row is byte-for-byte unaffected); and new SQL-backend
+Team's untouched first row is byte-for-byte unaffected); new SQL-backend
 tests extending `RollForwardConflictSqlTest` in `test_v2_reassignment_
 integrity_sql.py` for the `registration_id` cross-check (matching row
 accepted, wrong-team row rejected, inactive row rejected) and the
 duplicate-team-selection rejection, each with the standard zero-record/
-zero-audit-mutation assertion.
+zero-audit-mutation assertion; and a new dedicated browser journey,
+`hierarchy-duplicate-registration.js`, for the `regByTeamLeague`/`regsById`
+fix specifically. That corruption is unconstructible on any SQL backend (the
+same `ux_team_league_season` index finding 1 relies on), so this file runs
+the demo server in-memory via a small Python launcher that starts
+`hockey_scheduler.web.server`'s own unmodified `serve()` in a background
+thread and injects the second registration directly into that live store on
+demand, rather than the durable-SQLite-file-plus-separate-process technique
+the other files above use. Two independent fixtures each build one real
+registration through genuine HTTP writes, inject a second active one at the
+identical target, confirm the Setup hierarchy renders both as distinct,
+independently-attributed rows, then keyboard-remove one via a real `Tab`
+walk from the row's own League select to its Remove button (bounded-loop
+Tab presses, never a JS `.focus()`) followed by a real `Enter` — one fixture
+removing the first-created row, the other removing the second-created
+(injected) row, so both orders are proven, each asserting the untouched row
+survives active and unchanged, at desktop and 390×844.
 
 Falsifiability-verified: the shared primitive's "unconditional regardless of
 active state" design decision (temporarily narrowed to active-only rows,
@@ -1814,10 +1849,182 @@ test fails with a `KeyError` on the now-absent `attention` field); the
 `roll_forward_registrations_v2` `registration_id` cross-check and duplicate-
 selection guard (each removed in turn, confirmed the corresponding new SQL
 test fails with no `error` key at all — the request that should be rejected
-silently succeeds); and the frontend rollover keying fix (reverted `data-
+silently succeeds); the frontend rollover keying fix (reverted `data-
 rollover-pick`/`-league`/`-div` back to `team.id`, confirmed the new e2e
 section times out locating the second row by its registration id — it no
-longer exists as a distinguishable element at all).
+longer exists as a distinguishable element at all); and the `regByTeamLeague`
+→ `regsById` hierarchy-tree fix (reverted `regRow` to its prior `(team_id,
+league_id)`-derived lookup, confirmed `hierarchy-duplicate-registration.js`
+fails with the exact shape the bug produces — one registration id matching
+zero DOM elements, the other matching two — restored, reconfirmed both
+viewports green).
+
+Round 19's own convergence review (#331 review round 20) confirmed both
+remaining halves of finding 4 and surfaced one much larger new finding.
+
+**Finding 4, completed.** Two gaps in the round-19 fix: (a) the accessible
+name on a duplicate row's Save/Remove controls was built purely from
+`t.name`/`s.name`, so two rows for the identical team under the identical
+League — the exact shape the fix exists for — announced identically to a
+screen reader despite being independently addressable underneath. Fixed by
+a `dupKeyCounts` map gating a `(registration ${id})` suffix onto both the
+visible label and the Save/Remove aria-labels, only when a genuine
+duplicate exists — the ordinary single-row case is byte-for-byte unchanged.
+(b) The reviewer's own round-20 reproduction of this exact bug used two
+rows in *different* Leagues, where `(team, league)` is unique by
+construction — unable to falsify the true failure mode — and used a
+JS-forced `.focus()` rather than proving Tab reachability. Replaced with a
+dedicated new browser journey, `hierarchy-duplicate-registration.js`: since
+this corruption (two ACTIVE rows at the identical exact key) is
+unconstructible on any SQL backend — the same `ux_team_league_season`
+unique index finding 1 relies on — the demo server runs IN-MEMORY here via
+a small Python launcher that starts `hockey_scheduler.web.server`'s own
+unmodified `serve()` in a background thread and injects the second
+registration directly into that live store on demand. Two independent
+fixtures each prove a same-target duplicate is reachable and removable via
+genuine `Tab`/`Shift+Tab` walks (a bounded loop of real key presses, never
+`.focus()`) and both native button-activation keys (`Enter` in one order,
+`Space` in the other), in both selection orders, asserting the untouched
+row survives active and unchanged and the two rows' accessible names are
+distinct and self-identifying.
+
+**Finding 1 — a unified Team/Season participation resolver.** The required
+invariant: an exact `(team_id, league_season_id)` key is never ambiguous
+(round 19), *and* live participation exists only when the Team has
+**exactly one** active registration in the Season, matching the expected
+LeagueSeason. Four parallel research passes over the full call graph
+confirmed every one of the reviewer's reproductions and one they hadn't
+named:
+
+1. `register_team_for_season` only ever checked the exact TARGET key via
+   `exact_registration_or_conflict` — nothing anywhere in the method asked
+   "does this Team already have an active row at a DIFFERENT LeagueSeason
+   this Season." Registering a Team into its own permanent League while an
+   active stray already existed elsewhere (legacy data, or a write path
+   predating full Rule 7 enforcement) committed a brand-new row and left
+   both active.
+2. `team_registration_valid` resolves exclusively via the Team's own
+   `league_id` → LeagueSeason → exact row; it has no branch that inspects
+   any *other* LeagueSeason, so it is structurally blind to a same-Season,
+   different-League active sibling. Its four callers — `create_game`,
+   `_revalidate_game_participation` (`move_game`/`publish_game`),
+   `_require_team_registered`, `_registration_is_operational`/
+   `get_demo_overview` — inherited the same blind spot, letting `create_game`
+   commit a regular Game, and `move_game`/`publish_game` revalidate and
+   pass, against a Team whose participation was genuinely ambiguous.
+3. `_require_batch_team_participation` (the draft-commit gate) built
+   `active = {r.team_id: r for r in registrations_for_league_season(...) if
+   r.active}` — for the round-19 exact-key corruption (2+ ACTIVE rows at
+   one key), this dict comprehension silently keeps whichever row wins the
+   key collision and **accepts the batch on it** — an actual
+   accept-when-should-reject bug, not merely a blind spot, and a
+   measurably weaker guarantee than the `exact_registration_or_conflict`
+   pattern every sibling write path already uses for the identical class of
+   corruption.
+4. `_require_team_registered`'s fallback error-reason lookup picked
+   whichever registration row a bare `next(...)` scan (all rows, active or
+   not) happened to find first, so its reported `reason` — `"team_not_
+   registered"` vs `"team_wrong_division"` — flipped depending on
+   insertion order for the identical underlying corrupted state.
+5. `registered_team_ids_in_division`/`registered_teams_by_division_in_league`
+   (draft *generation*, read-only) and the independent, fifth raw-loop
+   implementation inside `_standings_for_league_season` were confirmed to
+   have the identical blind spot in isolation, but NOT to misattribute or
+   double-count in practice: both build a plain `set` of team ids, and a
+   `set` cannot hold a duplicate regardless of how many underlying rows
+   feed it, and standings independently re-derives trust from `team.
+   league_id` per row rather than trusting "a resolved registration
+   exists." Any unsafe proposal these two would admit is independently
+   caught at commit time by fix 3 above. Left unchanged, with this
+   rationale recorded rather than silently addressed — the same "flag,
+   don't invent a fix for a non-demonstrated problem" discipline earlier
+   rounds have followed.
+6. `context_scope._team_season_ids`, `get_demo_overview`, and
+   `get_onboarding_status_v2` were investigated and confirmed to already
+   behave correctly: Context access is granted via the Team's genuinely
+   valid row in its OWN permanent League regardless of an unrelated stray
+   elsewhere (correct — the scoped user's own participation is
+   unambiguous; a data-hygiene issue elsewhere is an admin concern, not a
+   reason to hide a Season the Team really is in), `get_demo_overview`
+   already inherits fix 2 for free (it delegates to `team_registration_
+   valid`), and `get_onboarding_status_v2`'s `invalid_registrations`
+   blocker already independently trips on the stray, unaffected by whether
+   a valid row also exists. `get_setup_progress`'s "done" + `attention`
+   coexistence (round 19) is a deliberate, separately-tested UX contract —
+   a per-user "what's next" nudge, not the installation-wide hard gate —
+   and was left as-is.
+
+Closed with one new shared primitive, `league_scope.team_season_
+participation(store, season_id, team_id)`: every ACTIVE registration for
+this Team across the whole Season, any League. Returns `(reg_or_None,
+conflicting_ids)` — 0 active rows → `(None, [])`; exactly 1 → `(that row,
+[])`; 2+ anywhere in the Season → `(None, [every active row's id])`. This
+is a *complement* to `exact_registration_or_conflict`, never a
+replacement: the new primitive is ACTIVE-only and — by design — blind to a
+same-key active+inactive pair, which is still `exact_registration_or_
+conflict`'s job, unconditional on active state. `team_registration_valid`
+now layers both checks (the exact-key check first, then the season-wide
+check against the *same* row it resolved), so every one of its four
+callers inherited the fix automatically. `register_team_for_season` gained
+an equivalent season-wide guard ahead of its existing exact-key check,
+rejecting with the established `team_registration_conflict` reason before
+any write. `_require_batch_team_participation` was rewritten to resolve
+each team through both primitives explicitly (replacing the unsafe dict)
+so it independently fails closed on either shape. `_require_team_
+registered` now checks for a structured conflict (either shape) before its
+fallback raw pick, so the reported reason is deterministic regardless of
+insertion order.
+
+One consequence of the tightened invariant: an operator can no longer
+register a Team into its correct League while an active stray exists
+elsewhere in the same Season — the two round-19 tests whose fixtures relied
+on that succeeding (`test_stale_wrong_league_active_registration_never_
+counts_as_done`, `test_same_program_cross_league_registration_is_invalid_
+not_schedulable`) were updated to first assert the new rejection, explicitly
+remove the stray via `unregister_team_from_season` (the same action Season
+participation's own "Remove" button already performs), and only then
+register — matching the real remediation workflow round 20 now requires.
+
+Regression coverage: `test_exact_registration_identity.py` gained five new
+test classes covering the primitive directly (0/1/2+ active rows, any
+number of different Leagues, insertion-order independence, an inactive
+sibling never counting), `team_registration_valid`'s layered season-wide
+fail-closed behavior plus a live `create_game` end-to-end rejection,
+`register_team_for_season`'s season-wide rejection (single and multiple
+strays), `_require_batch_team_participation` tested directly against both
+failure shapes (bypassing the public API's own independent
+`draft_fingerprint`-staleness net, which would otherwise mask which check
+is actually rejecting — a duplicate row for an already-rostered team
+doesn't change the `set` of registered team ids draft generation computes,
+so this corruption is invisible to that generic net and
+`_require_batch_team_participation`'s own check is confirmed the only line
+of defense), and `_require_team_registered`'s deterministic reason
+(exact-key both insertion orders, season-wide). A new `test_v2_
+reassignment_integrity_sql.py` class proves the season-wide corruption —
+unlike the exact-key one — is genuinely constructible on real SQL (no
+unique index spans two different keys) and correctly rejected on both
+SQLite and PostgreSQL, for both `register_team_for_season` and
+`create_game`, zero mutation. A new HTTP-level test in `test_season_
+registration_http.py` proves the same rejection over the real `/api/v2/
+setup/seasons/{id}/team-registrations` boundary the Season participation
+UI actually posts to.
+
+Falsifiability-verified: reverting the finding-4 accessible-label
+distinguisher (confirmed `hierarchy-duplicate-registration.js` fails with
+identical aria-labels on both rows, restored); reverting all of finding 1's
+backend changes together (confirmed every new test in `test_exact_
+registration_identity.py` fails to even import, since `team_season_
+participation` no longer exists; confirmed the new SQL-backend and HTTP
+tests reproduce the reviewer's exact claims live — `create_game` genuinely
+commits a Game against an ambiguous Team on real SQLite, and `register_
+team_for_season` genuinely returns 200 instead of rejecting — restored,
+reconfirmed all green).
+
+**Verification:** full Memory/SQLite/PostgreSQL suite green (3495 tests, +23
+from this round). `season-participation.js`, `season-rollover.js`,
+`hierarchy-duplicate-registration.js`, `team-division-participation.js`, and
+`registration-cleanup.js` all re-confirmed green at desktop and 390×844
+after the backend changes, zero console errors.
 
 - The bootstrap claim is the only unauthenticated mutation, and only on a fresh,
   durable, unclaimed installation.

@@ -194,6 +194,37 @@ def exact_registration_or_conflict(store, league_season_id, team_id):
     return (rows[0] if rows else None), []
 
 
+def team_season_participation(store, season_id, team_id):
+    """Every ACTIVE ``SeasonTeamRegistration`` for this Team in this Season,
+    across every League (#331 review round 20) -- the season-wide
+    complement to ``exact_registration_or_conflict``'s single-LeagueSeason
+    exactness, not a replacement for it: this one is ACTIVE-only and blind
+    to a same-key active+inactive pair (by design -- that shape is still
+    ``exact_registration_or_conflict``'s job, unconditional on active state,
+    and must keep running independently wherever both checks matter). What
+    this adds is visibility across DIFFERENT LeagueSeasons in one Season --
+    a Team with two unambiguous single rows, each valid on its own but at
+    two different Leagues (a Rule 7 violation only legacy data or a write
+    path predating full enforcement can leave behind, e.g. an old League's
+    row a since-superseded transfer didn't retire) -- a shape
+    ``exact_registration_or_conflict`` alone cannot see, since it only ever
+    looks at ONE LeagueSeason at a time.
+
+    Returns ``(reg_or_None, conflicting_ids)``: 0 active rows -> ``(None,
+    [])``; exactly 1 -> ``(that row, [])``; 2+ active rows anywhere in the
+    Season -- regardless of which Leagues they're under -- -> ``(None,
+    [every active row's id])``. A Team's LIVE participation in a Season
+    must be unambiguous: never a guess between several simultaneously-
+    active rows regardless of which looks more current."""
+    if season_id is None:
+        return None, []
+    rows = [r for r in store.registrations_for_season(season_id)
+            if r.team_id == team_id and r.active]
+    if len(rows) > 1:
+        return None, [r.id for r in rows]
+    return (rows[0] if rows else None), []
+
+
 def team_registration_valid(store, season, team_id, division_id=None,
                             require_division=True):
     """Return the active, league-consistent registration for ``team_id`` in
@@ -239,9 +270,25 @@ def team_registration_valid(store, season, team_id, division_id=None,
     # caller to report a structured conflict to -- an ambiguous key must be
     # treated the same as "no valid registration", deterministically,
     # regardless of which corrupted row a bare first-match lookup would
-    # have preferred (insertion order must never change the answer).
+    # have preferred (insertion order must never change the answer). This
+    # check is UNCONDITIONAL on active state -- two rows co-existing at one
+    # exact key is itself the corrupted state, never a fact about which one
+    # is "really" current -- so it must run before, and independently of,
+    # the season-wide active check below.
     reg, _conflicts = exact_registration_or_conflict(store, ls.id, team_id)
     if reg is None or not reg.active:
+        return None
+    # #331 review round 20: fail CLOSED season-wide too, not just at this
+    # exact key -- a Team with a single unambiguous row at the WRONG
+    # LeagueSeason (a stray active registration in a different League this
+    # same Season) is exactly as invalid here as a Team with two colliding
+    # rows at the right one, but the exact-key check above cannot see it,
+    # since it never looks outside the one LeagueSeason `ls` names. Live
+    # participation means EXACTLY one active row this Season, full stop --
+    # a valid row existing at `ls` is necessary but not sufficient.
+    _season_reg, _season_conflicts = team_season_participation(
+        store, season.id, team_id)
+    if _season_conflicts or _season_reg is None or _season_reg.id != reg.id:
         return None
     if require_division and division_id is not None and reg.division_id != division_id:
         return None

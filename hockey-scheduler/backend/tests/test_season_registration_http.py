@@ -108,6 +108,40 @@ class SeasonRegistrationHttpTest(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(dup["error"]["code"], "validation_error")
 
+    def test_v2_register_rejects_active_stray_elsewhere_over_real_http(self):
+        """#331 review round 20 finding 1: register_team_for_season's new
+        season-wide conflict guard, over the actual v2 HTTP boundary the
+        real Season participation UI posts to -- not just the ApiService
+        facade called directly, which every other regression for this fix
+        uses. The reviewer's "real HTTP paths" bar, met once."""
+        from hockey_scheduler.domain import SeasonTeamRegistration
+        api = STATE.api
+        program = api.create_program("P", actor_id="admin")
+        season = api.create_season(program["id"], "S", actor_id="admin")
+        l1 = api.create_league(season["id"], "L1", actor_id="admin")
+        l2 = api.create_league(season["id"], "L2", actor_id="admin")
+        club = api.create_club("C", actor_id="admin")
+        team = api.create_team(club["id"], None, "T", actor_id="admin",
+                               league_id=l1["id"])
+        ls2 = api.store.league_season_for(l2["id"], season["id"])
+        stray = SeasonTeamRegistration(
+            id=api.store.next_id("streg"), league_season_id=ls2.id,
+            team_id=team["id"], division_id=None, active=True)
+        api.store.add_season_team_registration(stray)
+
+        status, body = self._req(
+            "POST", f"/api/v2/setup/seasons/{season['id']}/team-registrations",
+            {"team_id": team["id"], "league_id": l1["id"], "division_id": None},
+            role="league_admin")
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"]["details"]["reason"],
+                         "team_registration_conflict", body)
+        self.assertEqual(body["error"]["details"]["affected_registration_ids"],
+                         [stray.id])
+        # Zero mutation: only the stray still exists for this Team.
+        self.assertEqual(
+            len(api.store.registrations_for_season(season["id"])), 1)
+
     def test_viewer_cannot_register(self):
         status, body = self._req(
             "POST", "/api/setup/seasons/season_x/team-registrations",

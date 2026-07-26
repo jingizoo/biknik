@@ -373,6 +373,17 @@ class LegacyFieldIsInertContract:
         # the scheduling wizard reads -- each claiming a DIFFERENT league_id
         # for the identical team_id, with no way for a caller to tell which
         # one is actually safe to act on.
+        #
+        # #331 review round 20: round 19's fix stopped there -- the valid
+        # league_a row still reported operational, only league_b's stray was
+        # excluded. That's no longer enough: live participation means
+        # EXACTLY one active registration this Season, full stop, so a
+        # Team with an unresolved stray ANYWHERE this Season has no row
+        # trustworthy enough to expose as operational, not even a
+        # genuinely-valid-looking one elsewhere -- team_registration_valid
+        # (which _registration_is_operational delegates to) now fails
+        # closed for the whole Team, not just the stray row, until the
+        # operator resolves the ambiguity.
         season, league_a, league_b, d_a = self._two_league_season("S")
         team = self._team("Nomads", league_id=league_a)
         self._register(season, team, d_a)
@@ -380,8 +391,7 @@ class LegacyFieldIsInertContract:
 
         rows = [r for r in self.api.get_demo_overview()["registrations"]
                 if r["team_id"] == team]
-        self.assertEqual(len(rows), 1, rows)
-        self.assertEqual(rows[0]["league_id"], league_a)
+        self.assertEqual(rows, [])
 
     def test_registration_with_a_dangling_shared_league_is_excluded(self):
         # Season and Team agree on a league id that has NO League row (#180

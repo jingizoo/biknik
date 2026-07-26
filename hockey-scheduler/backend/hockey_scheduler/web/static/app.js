@@ -2371,17 +2371,33 @@ function renderSeasonParticipation(hv, ov, sv) {
 
     const seasonBlocks = seasons.map((s) => {
       const regs = (seasonRegs[s.id] || []).filter((r) => r.active);
-      // #331 review round 18: keyed by (team_id, league_id), never team_id
-      // alone — a Team can hold more than one active registration in this
-      // Season across different Leagues (the exact structured conflict
-      // round 17's commit_teams_players_import gate now rejects, pending
-      // operator remediation here). A team_id-only map silently collapses
-      // the second row, so both League sections render the SAME baked-in
-      // registration id on their Save/Remove controls — clicking either
-      // row's Save/Remove can only ever address whichever row won the
-      // last-write overwrite, never the one actually shown.
-      const regByTeamLeague = {};
-      regs.forEach((r) => { regByTeamLeague[`${r.team_id}::${r.league_id}`] = r; });
+      // #331 review round 19: keyed by registration id, never re-derived
+      // from (team_id, league_id) — round 18's fix (see below), which still
+      // collapses two ACTIVE rows sharing the exact same target (the Memory
+      // multiplicity round 19 finding 1 now rejects at every write path,
+      // still reachable as legacy/injected data). get_setup_hierarchy_v2
+      // already emits one distinct tree entry per registration in that case
+      // (teams_by_div/teams_direct_by_league append one (team, reg) pair
+      // per registration, so a Team with two rows at one target appears
+      // TWICE), so trusting each entry's own registration_id — rather than
+      // re-deriving "the" registration from the team/league it happens to
+      // sit under — is what makes both rows independently addressable
+      // instead of two identical-looking rows that are secretly the same
+      // control twice.
+      const regsById = {};
+      regs.forEach((r) => { regsById[r.id] = r; });
+      // #331 review round 20: a duplicate-target pair (finding 1's Memory-only
+      // corruption) renders as two rows with the SAME visible team name and
+      // the SAME accessible name on their Save/Remove controls (identical
+      // `t.name`/`s.name`, the only inputs the aria-label was built from) —
+      // reachable and independently addressable via the reg-id keying above,
+      // but indistinguishable to a screen reader. Counted per (team_id,
+      // league_id) so the common single-row case stays exactly as before.
+      const dupKeyCounts = {};
+      regs.forEach((r) => {
+        const k = `${r.team_id}::${r.league_id}`;
+        dupKeyCounts[k] = (dupKeyCounts[k] || 0) + 1;
+      });
       const registeredTeamIds = new Set(regs.map((r) => r.team_id));
       const leagues = s.leagues || [];
       // Cache each League's Division options for the cascade handlers wired
@@ -2481,20 +2497,34 @@ function renderSeasonParticipation(hv, ov, sv) {
         const divOptsFor = (selId) => divs.map((d) => opt(d.id, d.name, d.id === selId)).join("");
         // A registered team's row: its own League+Division cascade (both
         // scoped to this season) plus Save/Remove. `reg` is looked up by
-        // (team id, THIS section's own League id) — #331 review round 18:
-        // never team id alone, which would resolve to whichever OTHER
-        // League's registration happened to win the map's last-write
-        // overwrite when a Team has more than one active row this Season.
+        // THIS tree entry's own registration_id — #331 review round 19:
+        // never re-derived from (team id, league id), which collapses to
+        // one winning row when a Team has two ACTIVE registrations at the
+        // exact same target (round 18's fix only separated DIFFERENT
+        // League targets). Trusting the id `t` already carries is what lets
+        // two such rows — same team, same league, genuinely different
+        // registrations — render as independently addressable controls
+        // instead of one control duplicated twice.
         const regRow = (t, divId) => {
-          const reg = regByTeamLeague[`${t.id}::${lv.id}`];
+          const reg = regsById[t.registration_id];
           if (!reg) return "";
+          // #331 review round 20: when two rows share this exact (team,
+          // league) target, their visible name and their controls' accessible
+          // names would otherwise be byte-for-byte identical (both built from
+          // the same t.name/s.name) -- indistinguishable to a screen reader
+          // even though the controls underneath are independently addressable
+          // by registration id. Only the duplicate case gets the suffix; the
+          // ordinary single-row case is unchanged.
+          const dup = dupKeyCounts[`${t.id}::${lv.id}`] > 1;
+          const distinguisher = dup ? ` (registration ${esc(reg.id)})` : "";
           return `<div class="tn-leaf reg-row">
-            <span class="tn-label">👥 ${esc(t.name)}</span>
+            <span class="tn-label">👥 ${esc(t.name)}${dup ? ` <code>${esc(reg.id)}</code>` : ""}</span>
             <select id="reg-league-${esc(reg.id)}" data-reg-league-for="${esc(reg.id)}">${leagueOptsFor(lv.id)}</select>
             <select id="reg-div-${esc(reg.id)}" data-reg-div-for="${esc(reg.id)}"><option value="">No division</option>${divOptsFor(divId)}</select>
-            <button class="act" data-reg-save="${esc(reg.id)}" data-reg-orig-league="${esc(lv.id)}" data-reg-orig-div="${esc(divId || "")}">Save</button>
+            <button class="act" data-reg-save="${esc(reg.id)}" data-reg-orig-league="${esc(lv.id)}" data-reg-orig-div="${esc(divId || "")}"${
+              dup ? ` aria-label="Save ${esc(t.name)}${distinguisher} in ${esc(s.name)}"` : ""}>Save</button>
             <button class="icon-btn danger" data-reg-remove="${esc(reg.id)}"
-              title="Remove from season" aria-label="Remove ${esc(t.name)} from ${esc(s.name)}">${ICONS.circleMinus}</button></div>`;
+              title="Remove from season" aria-label="Remove ${esc(t.name)}${distinguisher} from ${esc(s.name)}">${ICONS.circleMinus}</button></div>`;
         };
         const divRows = divs.map((d) => (d.teams || []).map((t) => regRow(t, d.id)).join("")).join("");
         const twdRows = (lv.teams_without_division || []).map((t) => regRow(t, "")).join("");

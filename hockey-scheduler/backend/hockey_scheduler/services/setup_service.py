@@ -76,6 +76,7 @@ from .league_scope import (
     exact_registration_or_conflict,
     registered_team_ids_in_division as _registered_team_ids,
     team_registration_valid,
+    team_season_participation,
 )
 from .notifier import push as _push_notification
 
@@ -1352,6 +1353,33 @@ class SetupService:
                      "division_id": division_id,
                      "division_league_season_id": division.league_season_id,
                      "league_season_id": ls.id})
+        # #331 review round 20: a Team may have at most one ACTIVE
+        # registration in this Season, full stop -- not just at this exact
+        # LeagueSeason key. Rule 7 above already keeps `ls` at the Team's own
+        # permanent League when one is set, so the only way another active
+        # row can exist elsewhere in this Season is legacy data or a write
+        # path predating full enforcement (e.g. an old League's row a
+        # since-superseded transfer didn't retire) -- reject it the same as
+        # every other shape of conflict this method can hit, rather than
+        # silently leaving two active rows behind. Checked BEFORE the
+        # exact-key reactivate-or-create decision below, using the same
+        # zero-mutation-before-reject discipline.
+        _other_active, _other_conflicts = team_season_participation(
+            self.store, season_id, team_id)
+        if _other_conflicts:
+            raise ValidationError(
+                f"Team {team_id} already has more than one active "
+                "registration this season; resolve the conflict before "
+                "registering.",
+                {"reason": "team_registration_conflict",
+                 "affected_registration_ids": _other_conflicts})
+        if _other_active is not None and _other_active.league_season_id != ls.id:
+            raise ValidationError(
+                f"Team {team_id} already has an active registration "
+                "elsewhere this season; remove it before registering "
+                "into a different League.",
+                {"reason": "team_registration_conflict",
+                 "affected_registration_ids": [_other_active.id]})
         # One registration per (team, LeagueSeason). A prior *inactive*
         # registration (a team removed then re-added) is reactivated in place.
         # #331 review round 19: exact-key multiplicity (Memory-only corrupted
@@ -4142,8 +4170,39 @@ class SetupService:
                                       require_division=require_division)
         if reg is not None:
             return reg
-        # No valid registration — surface the precise reason. #283: a team's
-        # registration in a Season is found across the Season's LeagueSeasons.
+        # No valid registration — surface the precise reason. #331 review
+        # round 20: check for a structured conflict FIRST — both the
+        # exact-key shape round 19 established and the season-wide shape
+        # round 20 adds — so a genuinely ambiguous state gets a
+        # deterministic conflict reason, instead of the raw first-match
+        # pick below silently depending on which of several colliding rows
+        # happens to sort first (insertion order must never change the
+        # answer).
+        if season is not None and resolved is not None and resolved.league_id:
+            ls = self.store.league_season_for(resolved.league_id, season.id)
+            if ls is not None:
+                _exact_reg, exact_conflicts = exact_registration_or_conflict(
+                    self.store, ls.id, team_id)
+                if exact_conflicts:
+                    raise DivisionMismatchError(
+                        f"{label} has more than one registration at this "
+                        "exact league/season; resolve the conflict before "
+                        "scheduling.",
+                        {"reason": "team_registration_conflict",
+                         "team_id": team_id, "league_season_id": ls.id,
+                         "affected_registration_ids": exact_conflicts})
+        if season is not None:
+            _season_reg, season_conflicts = team_season_participation(
+                self.store, season.id, team_id)
+            if season_conflicts:
+                raise DivisionMismatchError(
+                    f"{label} has more than one active registration this "
+                    "season; resolve the conflict before scheduling.",
+                    {"reason": "team_registration_conflict",
+                     "team_id": team_id, "season_id": season_id,
+                     "affected_registration_ids": season_conflicts})
+        # #283: a team's registration in a Season is found across the
+        # Season's LeagueSeasons.
         raw = (next((r for r in self.store.registrations_for_season(season_id)
                      if r.team_id == team_id), None)
                if season is not None else None)
@@ -4182,6 +4241,14 @@ class SetupService:
         reference it exactly, require any Division to belong to it, and require
         each Team's permanent League to match it. This is the same fail-closed
         competition identity later enforced by publish/move.
+
+        #331 review round 20: "reference it exactly" is enforced two ways —
+        ``exact_registration_or_conflict`` rejects a Team with 2+ rows
+        colliding at this exact key (regardless of active state), and
+        ``team_season_participation`` additionally rejects a Team whose
+        one unambiguous row here ISN'T also its only active registration
+        this Season (a stray active row under a different League). Both
+        must hold for a row to be trusted.
         """
         league_season = (
             self.store.get_league_season(league_season_id)
@@ -4200,12 +4267,6 @@ class SetupService:
                  "league_season_id": league_season.id,
                  "league_season_season_id": league_season.season_id})
 
-        active = {
-            r.team_id: r
-            for r in self.store.registrations_for_league_season(
-                league_season.id)
-            if r.active
-        }
         for row in rows:
             division_id = row.get("division_id")
             if division_id is not None:
@@ -4225,13 +4286,44 @@ class SetupService:
             for team_id in (row["home_team_id"], row["away_team_id"]):
                 team = self.store.get_team(team_id)
                 label = team.name if team is not None else team_id
-                registration = active.get(team_id)
+                # #331 review round 20: two layered checks, matching
+                # team_registration_valid's own contract. exact_registration_
+                # or_conflict is unconditional on active state (co-existence
+                # at this identical key is itself corrupted, regardless of
+                # which row is live) -- the raw {team_id: r} dict this
+                # replaced would silently pick whichever of two colliding
+                # rows won the dict-key collision and accept the batch on
+                # it. team_season_participation additionally catches a
+                # genuinely-valid exact-key row that ISN'T the Team's only
+                # active registration this Season (a stray row active under
+                # a different League) -- neither check alone covers both
+                # shapes.
+                exact_reg, exact_conflicts = exact_registration_or_conflict(
+                    self.store, league_season.id, team_id)
+                if exact_conflicts:
+                    raise DivisionMismatchError(
+                        f"{label} has more than one registration at this "
+                        "exact league/season; resolve the conflict before "
+                        "drafting.",
+                        {"reason": "team_registration_conflict",
+                         "team_id": team_id,
+                         "league_season_id": league_season.id,
+                         "affected_registration_ids": exact_conflicts})
+                season_reg, season_conflicts = team_season_participation(
+                    self.store, season_id, team_id)
+                if season_conflicts:
+                    raise DivisionMismatchError(
+                        f"{label} has more than one active registration "
+                        "this season; resolve the conflict before drafting.",
+                        {"reason": "team_registration_conflict",
+                         "team_id": team_id, "season_id": season_id,
+                         "affected_registration_ids": season_conflicts})
+                registration = (
+                    exact_reg if exact_reg is not None and exact_reg.active
+                    and season_reg is not None and season_reg.id == exact_reg.id
+                    else None)
                 if registration is None:
-                    raw = next((
-                        r for r in self.store.registrations_for_season(
-                            season_id)
-                        if r.team_id == team_id and r.active), None)
-                    if raw is None:
+                    if season_reg is None:
                         raise DivisionMismatchError(
                             f"{label} is not registered in this season.",
                             {"reason": "team_not_registered",
@@ -4244,7 +4336,7 @@ class SetupService:
                          "season_id": season_id,
                          "league_season_id": league_season.id,
                          "registered_league_season_id":
-                             raw.league_season_id})
+                             season_reg.league_season_id})
                 if (team is None or not team.league_id
                         or team.league_id != league_season.league_id):
                     raise DivisionMismatchError(
