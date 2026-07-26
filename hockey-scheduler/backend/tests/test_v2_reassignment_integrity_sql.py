@@ -465,6 +465,84 @@ class GameLeagueSeasonIdentitySqlTest(_SqlIntegrityBase):
         self._run(case)
 
 
+class GameLeagueIdIdentitySqlTest(_SqlIntegrityBase):
+    """#331 review round 23: round 22 validated the game's own LeagueSeason
+    exists and belongs to the game's Season, and that both Teams are
+    registered exactly there -- but never checked the game's own legacy
+    ``league_id`` against ``league_season.league_id``. Standings already
+    fail closed on exactly this drift when reading (``_standings_for_
+    division``/``_standings_for_league_season``); nothing stopped move/
+    publish from committing it. No unique index spans a Game's `league_id`
+    and its LeagueSeason's `league_id`, so this is reachable on every SQL
+    backend by corrupting `league_id` alone -- proven here on SQLite always
+    and PostgreSQL when ``TEST_DATABASE_URL`` is set, zero mutation on
+    rejection."""
+
+    def _fixture(self, api, store):
+        org, program = self._org_program(api)
+        season = api.create_season(program["id"], "Fall", actor_id=ADMIN)
+        league = api.create_league(season["id"], "L", actor_id=ADMIN)
+        other_league = api.create_league(season["id"], "L2", actor_id=ADMIN)
+        club = api.create_club("C", actor_id=ADMIN)
+        home = api.create_team(club["id"], None, "Home", actor_id=ADMIN,
+                               program_id=program["id"], league_id=league["id"])
+        away = api.create_team(club["id"], None, "Away", actor_id=ADMIN,
+                               program_id=program["id"], league_id=league["id"])
+        api.register_team_for_season(season["id"], home["id"], actor_id=ADMIN,
+                                     league_id=league["id"])
+        api.register_team_for_season(season["id"], away["id"], actor_id=ADMIN,
+                                     league_id=league["id"])
+        venue = api.create_venue("V", organization_id=org["id"],
+                                 league_id=program["id"], actor_id=ADMIN)
+        api.grant_season_venue_access(season["id"], venue["id"], actor_id=ADMIN)
+        rink = api.create_rink(venue["id"], "R", actor_id=ADMIN)
+        slot1 = api.create_ice_slot(
+            rink["id"], "2026-09-01T18:30:00+00:00",
+            "2026-09-01T20:00:00+00:00", "game", actor_id=ADMIN)
+        slot2 = api.create_ice_slot(
+            rink["id"], "2026-09-02T18:30:00+00:00",
+            "2026-09-02T20:00:00+00:00", "game", actor_id=ADMIN)
+        game = api.create_game(season["id"], None, home["id"], away["id"],
+                               slot1["id"], actor_id=ADMIN, league_id=league["id"])
+        self.assertNotIn("error", game, game)
+        return program, season, league, other_league, slot1, slot2, game
+
+    def _corrupt(self, store, game_id, new_league_id):
+        game = store.get_game(game_id)
+        game.league_id = new_league_id
+        store.save_game(game)
+
+    def test_move_rejects_a_disagreeing_league_id_zero_mutation(self):
+        def case(api, store):
+            (program, season, league, other_league, slot1, slot2,
+             game) = self._fixture(api, store)
+            self._corrupt(store, game["id"], other_league["id"])
+            audits_before = len(store.all_setup_audit())
+            res = api.move_game(game["id"], slot2["id"], actor_id=ADMIN)
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "game_league_season_mismatch", res)
+            self.assertEqual(res["error"]["details"]["league_id"],
+                             other_league["id"])
+            self.assertEqual(store.get_game(game["id"]).ice_slot_id, slot1["id"])
+            self.assertEqual(len(store.all_setup_audit()), audits_before)
+
+        self._run(case)
+
+    def test_publish_rejects_a_disagreeing_league_id_zero_mutation(self):
+        def case(api, store):
+            (program, season, league, other_league, slot1, slot2,
+             game) = self._fixture(api, store)
+            self._corrupt(store, game["id"], other_league["id"])
+            audits_before = len(store.all_setup_audit())
+            res = api.publish_game(game["id"], actor_id=ADMIN)
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "game_league_season_mismatch", res)
+            self.assertFalse(store.get_game(game["id"]).published)
+            self.assertEqual(len(store.all_setup_audit()), audits_before)
+
+        self._run(case)
+
+
 class AssignClubOptionalSqlTest(_SqlIntegrityBase):
     """Club is optional on a Team in both v1 and v2 (#233 Slice D)."""
 

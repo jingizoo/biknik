@@ -720,7 +720,17 @@ class GameParticipationRevalidationTest(_Base):
     by resolving and validating the game's LeagueSeason (existence, then
     Season match) the same way ``_require_batch_team_participation``
     resolves its own target LeagueSeason, before checking either Team
-    against it via the newly-shared ``_require_team_in_league_season``."""
+    against it via the newly-shared ``_require_team_in_league_season``.
+
+    #331 review round 23: round 22's fix validated that the game's own
+    LeagueSeason exists and belongs to the game's Season, and that both
+    Teams are registered exactly there -- but never checked the game's own
+    legacy ``league_id`` against ``league_season.league_id``. Standings
+    (``_standings_for_division``/``_standings_for_league_season``) already
+    fail closed on exactly this drift when READING; nothing stopped
+    move/publish/reschedule-approval from COMMITTING it. Fixed by the same
+    unconditional-before-the-division-split placement as round 22's Season
+    check, reusing its ``game_league_season_mismatch`` reason code."""
 
     def setUp(self):
         super().setUp()
@@ -743,6 +753,7 @@ class GameParticipationRevalidationTest(_Base):
         venue = self.api.create_venue("V", league_id=self.program["id"], actor_id=ADMIN)
         self.api.grant_season_venue_access(self.season["id"], venue["id"], actor_id=ADMIN)
         rink = self.api.create_rink(venue["id"], "R", actor_id=ADMIN)
+        self.rink = rink
         self.slot1 = self.api.create_ice_slot(
             rink["id"], "2026-09-01T18:00:00+00:00", "2026-09-01T19:00:00+00:00",
             actor_id=ADMIN)
@@ -886,6 +897,106 @@ class GameParticipationRevalidationTest(_Base):
                          "game_league_season_mismatch", res)
         game = self.store.get_game(self.game["id"])
         self.assertFalse(game.published)
+        self.assertEqual(self._audit_count(), before_audit)
+
+    def _corrupt_league_id(self, new_league_id):
+        # #331 review round 23: the game's own LeagueSeason (`ls_a`, under
+        # league_a) is left VALID and untouched -- only the redundant legacy
+        # `league_id` column drifts, exactly the shape `create_game` itself
+        # can never produce (it always derives `league_season_id` from the
+        # same League it stores as `league_id`).
+        game = self.store.get_game(self.game["id"])
+        game.league_id = new_league_id
+        self.store.save_game(game)
+
+    def test_move_rejects_a_game_league_id_disagreeing_with_its_league_season(self):
+        self._corrupt_league_id(self.league_b["id"])
+        before_audit = self._audit_count()
+        res = self.api.move_game(self.game["id"], self.slot2["id"], actor_id=ADMIN)
+        self.assertEqual(res["error"]["details"]["reason"],
+                         "game_league_season_mismatch", res)
+        self.assertEqual(res["error"]["details"]["league_id"], self.league_b["id"])
+        self.assertEqual(res["error"]["details"]["league_season_league_id"],
+                         self.league_a["id"])
+        game = self.store.get_game(self.game["id"])
+        self.assertEqual(game.ice_slot_id, self.slot1["id"])
+        self.assertEqual(self._audit_count(), before_audit)
+
+    def test_publish_rejects_a_game_league_id_disagreeing_with_its_league_season(self):
+        self._corrupt_league_id(self.league_b["id"])
+        before_audit = self._audit_count()
+        res = self.api.publish_game(self.game["id"], actor_id=ADMIN)
+        self.assertEqual(res["error"]["details"]["reason"],
+                         "game_league_season_mismatch", res)
+        game = self.store.get_game(self.game["id"])
+        self.assertFalse(game.published)
+        self.assertEqual(self._audit_count(), before_audit)
+
+    def test_move_rejects_disagreeing_league_id_when_divisioned(self):
+        # #331 review round 23: the divisioned branch's own
+        # _require_team_registered checks season+division match -- nothing
+        # about game.league_id -- so this must fire unconditionally before
+        # the divisioned/divisionless split, not only in the division-less
+        # per-team loop round 22 touched.
+        division = self.api.setup.create_division(
+            self.season["id"], "Div", league_id=self.league_a["id"],
+            actor_id=ADMIN)
+        c3 = self.api.create_club("C3", actor_id=ADMIN)
+        home2 = self.api.create_team(c3["id"], None, "Home2", actor_id=ADMIN,
+                                     league_id=self.league_a["id"])
+        away2 = self.api.create_team(c3["id"], None, "Away2", actor_id=ADMIN,
+                                     league_id=self.league_a["id"])
+        self.api.register_team_for_season(
+            self.season["id"], home2["id"], division.id, actor_id=ADMIN,
+            league_id=self.league_a["id"])
+        self.api.register_team_for_season(
+            self.season["id"], away2["id"], division.id, actor_id=ADMIN,
+            league_id=self.league_a["id"])
+        slot3 = self.api.create_ice_slot(
+            self.rink["id"], "2026-09-03T18:00:00+00:00",
+            "2026-09-03T19:00:00+00:00", actor_id=ADMIN)
+        slot4 = self.api.create_ice_slot(
+            self.rink["id"], "2026-09-04T18:00:00+00:00",
+            "2026-09-04T19:00:00+00:00", actor_id=ADMIN)
+        game2 = self.api.create_game(
+            self.season["id"], division.id, home2["id"], away2["id"],
+            slot3["id"], actor_id=ADMIN, league_id=self.league_a["id"])
+        self.assertNotIn("error", game2, game2)
+        stored = self.store.get_game(game2["id"])
+        stored.league_id = self.league_b["id"]
+        self.store.save_game(stored)
+        before_audit = self._audit_count()
+        res = self.api.move_game(game2["id"], slot4["id"], actor_id=ADMIN)
+        self.assertEqual(res["error"]["details"]["reason"],
+                         "game_league_season_mismatch", res)
+        self.assertEqual(res["error"]["details"]["league_id"], self.league_b["id"])
+        game_after = self.store.get_game(game2["id"])
+        self.assertEqual(game_after.ice_slot_id, slot3["id"])
+        self.assertEqual(self._audit_count(), before_audit)
+
+    def test_decide_reschedule_approval_rejects_disagreeing_league_id(self):
+        # #331 review round 23: decide_reschedule's approve path calls
+        # move_game/publish_game directly rather than duplicating their
+        # logic, so it must inherit this rejection for free -- proven here,
+        # not merely asserted from the shared code path.
+        published = self.api.publish_game(self.game["id"], actor_id=ADMIN)
+        self.assertNotIn("error", published, published)
+        req = self.api.request_reschedule(
+            self.game["id"], self.home["id"], "conflict", actor_id=ADMIN)
+        self.assertNotIn("error", req, req)
+        resp = self.api.respond_to_reschedule(req["id"], True, actor_id=ADMIN)
+        self.assertNotIn("error", resp, resp)
+        self._corrupt_league_id(self.league_b["id"])
+        before_audit = self._audit_count()
+        res = self.api.decide_reschedule(
+            req["id"], True, new_ice_slot_id=self.slot2["id"], actor_id=ADMIN)
+        self.assertEqual(res["error"]["details"]["reason"],
+                         "game_league_season_mismatch", res)
+        game = self.store.get_game(self.game["id"])
+        self.assertEqual(game.ice_slot_id, self.slot1["id"])
+        self.assertTrue(game.published)
+        req_after = self.store.get_reschedule_request(req["id"])
+        self.assertEqual(req_after.status.value, "pending_league_approval")
         self.assertEqual(self._audit_count(), before_audit)
 
 

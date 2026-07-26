@@ -1631,13 +1631,18 @@ class SetupService:
         enforces; when the game also carries a Division, the stricter
         season+division match is kept too. The game's own ``league_season_id``
         is itself resolved and validated first -- it must exist and belong to
-        the game's Season (#331 review round 22) -- before either teams'
-        registrations are checked against it; a Team's registration must sit
-        at this EXACT LeagueSeason, not merely one under the same permanent
-        League. A legacy regular game with no ``league_season_id`` falls back
-        to the season(+division) check. An EXHIBITION only requires both
-        teams to remain active participants of the game's Season (it may
-        cross Leagues)."""
+        the game's Season AND League (#331 review round 22/23) -- before
+        either teams' registrations are checked against it; a Team's
+        registration must sit at this EXACT LeagueSeason, not merely one
+        under the same permanent League. A legacy regular game with no
+        ``league_season_id`` falls back to the season(+division) check. An
+        EXHIBITION only requires both teams to remain active participants of
+        the game's Season (it may cross Leagues).
+
+        move_game/publish_game both call this before mutating, and
+        decide_reschedule's approve path calls move_game/publish_game in
+        turn, so the reschedule-approval workflow inherits every guard here
+        with no separate implementation to keep in sync."""
         if game.game_type == GameType.EXHIBITION.value:
             if not game.season_id:
                 return
@@ -1687,6 +1692,22 @@ class SetupService:
                 {"reason": "game_league_season_mismatch", "game_id": game.id,
                  "season_id": game.season_id, "league_season_id": ls.id,
                  "league_season_season_id": ls.season_id})
+        # #331 review round 23: a real LeagueSeason at the right Season still
+        # isn't proof the game's own legacy `league_id` agrees with it --
+        # standings (``_standings_for_division``/``_standings_for_league_
+        # season``) already fail closed on exactly this drift when READING,
+        # so the write boundary must refuse to CREATE it. Nothing in normal
+        # operation can produce this split (`create_game` always derives
+        # `league_season_id` from the same `league_id` it stores), so this
+        # only ever fires on a corrupted/hand-edited row -- same threat model
+        # as the dangling/cross-Season checks above.
+        if game.league_id and ls.league_id != game.league_id:
+            raise ValidationError(
+                "This game's league-season belongs to a different league; "
+                "it cannot be published or moved until it is repaired.",
+                {"reason": "game_league_season_mismatch", "game_id": game.id,
+                 "league_id": game.league_id, "league_season_id": ls.id,
+                 "league_season_league_id": ls.league_id})
         # The season+division check runs first: it raises the precise
         # DivisionMismatchError and is the stricter guard for a divisioned game.
         if game.season_id and game.division_id:

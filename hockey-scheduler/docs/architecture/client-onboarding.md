@@ -2200,6 +2200,84 @@ caller of the now-shared per-team resolver) and `setup-progress-conflict-
 attention.js` all reconfirmed green at desktop and 390×844, zero console
 errors — no frontend files changed this round.
 
+### Round 23: Game↔LeagueSeason League parity gap in round 22's own fix
+
+Round 22's convergence review (#331 review round 23) confirmed both
+previously reported reproductions fixed, but found one more adjacent
+release blocker in the same identity invariant, introduced by round 22's
+own fix.
+
+**The bug.** `_revalidate_game_participation` validated that the Game's own
+`league_season_id` resolves to a real row and belongs to the Game's Season,
+and that both Teams hold an exact, unambiguous, active registration there
+— but never checked the Game's own legacy `league_id` column against
+`league_season.league_id`. Standings (`_standings_for_division`/
+`_standings_for_league_season`) already fail closed on exactly this drift
+when READING — a regular Game whose `league_id`/`season_id` disagree with
+its `league_season_id` returns `data_integrity_error`/
+`game_league_season_mismatch` rather than silently miscounting. Nothing
+stopped `move_game`, `publish_game`, or `decide_reschedule`'s approve path
+from COMMITTING that same drift in the first place. Reproduced live by
+changing only a valid Game's stored `league_id` to a different League in
+the same Season (leaving its valid `league_season_id`, Season, Teams, and
+registrations untouched): on Memory and real SQLite, both `move_game` and
+`publish_game` succeeded — move changed slot occupancy and wrote an audit
+row, publish set `published=true` and wrote an audit row — for both the
+division-less and divisioned Game, and `decide_reschedule`'s approve path
+(which calls `move_game`/`publish_game` directly) committed the identical
+drift. No current write path can produce this state (`create_game` always
+derives `league_season_id` from the same League it stores as `league_id`),
+so — like every gap this identity invariant has closed since round 21 —
+this only ever fires on a corrupted/hand-edited row.
+
+**Fix.** Adds one more unconditional check alongside round 22's own Season-
+match check, in the same place (before the divisioned/divisionless split):
+if `game.league_id` is set and disagrees with the already-validated
+LeagueSeason's `league_id`, reject with the same `game_league_season_
+mismatch` reason round 22 introduced (the standings boundary's existing
+reason code, now reused rather than duplicated), including both the
+Game's stored `league_id` and the LeagueSeason's actual `league_id` in the
+details so remediation is unambiguous. `decide_reschedule`'s approve path
+requires no separate change — it calls `move_game`/`publish_game`
+directly, so it inherits every guard in `_revalidate_game_participation`
+automatically.
+
+**Regression coverage:** four new tests in `GameParticipationRevalidationTest`
+(`test_exact_registration_identity.py`) — division-less `move_game`/
+`publish_game`, a divisioned `move_game` (a fresh Division + Teams built
+within the test, proving the divisioned branch is equally protected), and
+`decide_reschedule`'s approve path end-to-end (request → opponent accept →
+corrupt → approve, asserting the Game, its slot, and the
+`RescheduleRequest`'s own status all stay unchanged on rejection) — each
+asserting zero mutation. A new `GameLeagueIdIdentitySqlTest` class in
+`test_v2_reassignment_integrity_sql.py` proves the `move`/`publish` cases on
+real SQLite always and PostgreSQL when `TEST_DATABASE_URL` is set, same
+zero-mutation assertions. `test_game_league_season_identity_http.py` gains
+two more tests proving the rejection over the actual authenticated
+`/api/games/{id}/move` and `/api/games/{id}/publish` routes, against the
+demo's own seeded (divisioned) Game — covering the divisioned boundary at
+the HTTP layer while the division-less shape is covered directly at the
+facade/SQL layers. Fixing this file's tests also surfaced a test-isolation
+bug of its own: the HTTP test class only called `STATE.reset()` once in
+`setUpClass`, so one test's corruption of the shared demo Game leaked into
+whichever test ran next (alphabetical, not declaration order); moved to a
+per-test `setUp` so every HTTP test starts from a clean demo seed.
+
+**Falsifiability:** reverting the `setup_service.py` fix alone reproduces
+every new case live — all 8 new tests fail with the exact bug symptom
+(facade/SQL: the call succeeds instead of returning a structured error;
+HTTP: 200 instead of 400) — restored, reconfirmed green on Memory, both SQL
+backends, and over real HTTP.
+
+**Verification:** full Memory/SQLite (3522 tests, 466.5s) and PostgreSQL
+(3522 tests, 1245.9s) suites both green, +8 from round 22.
+`destructive-surfaces.js` (exercises `publish_game` on a real, uncorrupted
+demo Game as setup for its own Cancel/Delete assertions) reconfirmed green
+at desktop and phone — no frontend files changed this round, and no
+existing e2e journey exercises `decide_reschedule` (unaffected either way,
+since it needed no code change beyond `_revalidate_game_participation`
+itself).
+
 - The bootstrap claim is the only unauthenticated mutation, and only on a fresh,
   durable, unclaimed installation.
 - After claim, all setup and onboarding-status detail requires an authenticated
