@@ -697,5 +697,124 @@ class RequireTeamRegisteredDeterministicReasonTest(_Base):
                          {reg_a.id, reg_b.id})
 
 
+class GameParticipationRevalidationTest(_Base):
+    """#331 review round 21 finding 1: ``_revalidate_game_participation``'s
+    DIVISION-LESS regular-game branch (behind ``move_game``/``publish_game``)
+    used to fall back to a raw ``{active team_ids in ls_id}`` set instead of
+    the shared resolver -- a check that only asks "is this team active
+    SOMEWHERE in this LeagueSeason," which stays true even with an active
+    stray registration elsewhere this Season, or an exact active+inactive
+    duplicate at the game's own LeagueSeason. The divisioned branch
+    (`_require_team_registered` with a real ``division_id``) already routed
+    through the fixed shared resolver; this closes the one branch that
+    didn't."""
+
+    def setUp(self):
+        super().setUp()
+        self.program = self.api.create_program("P", actor_id=ADMIN)
+        self.season = self.api.create_season(self.program["id"], "S", actor_id=ADMIN)
+        self.league_a = self.api.create_league(self.season["id"], "A", actor_id=ADMIN)
+        self.league_b = self.api.create_league(self.season["id"], "B", actor_id=ADMIN)
+        self.ls_a = self.store.league_season_for(self.league_a["id"], self.season["id"])
+        club = self.api.create_club("C", actor_id=ADMIN)
+        self.home = self.api.create_team(club["id"], None, "Home", actor_id=ADMIN,
+                                         league_id=self.league_a["id"])
+        self.away = self.api.create_team(club["id"], None, "Away", actor_id=ADMIN,
+                                         league_id=self.league_a["id"])
+        self.home_reg = self.api.register_team_for_season(
+            self.season["id"], self.home["id"], actor_id=ADMIN,
+            league_id=self.league_a["id"])
+        self.api.register_team_for_season(
+            self.season["id"], self.away["id"], actor_id=ADMIN,
+            league_id=self.league_a["id"])
+        venue = self.api.create_venue("V", league_id=self.program["id"], actor_id=ADMIN)
+        self.api.grant_season_venue_access(self.season["id"], venue["id"], actor_id=ADMIN)
+        rink = self.api.create_rink(venue["id"], "R", actor_id=ADMIN)
+        self.slot1 = self.api.create_ice_slot(
+            rink["id"], "2026-09-01T18:00:00+00:00", "2026-09-01T19:00:00+00:00",
+            actor_id=ADMIN)
+        self.slot2 = self.api.create_ice_slot(
+            rink["id"], "2026-09-02T18:00:00+00:00", "2026-09-02T19:00:00+00:00",
+            actor_id=ADMIN)
+        self.game = self.api.create_game(
+            self.season["id"], None, self.home["id"], self.away["id"],
+            self.slot1["id"], actor_id=ADMIN, league_id=self.league_a["id"])
+        self.assertNotIn("error", self.game, self.game)
+
+    def _inject_stray(self, active=True):
+        ls_b = self.store.league_season_for(self.league_b["id"], self.season["id"])
+        stray = SeasonTeamRegistration(
+            id=self.store.next_id("streg"), league_season_id=ls_b.id,
+            team_id=self.home["id"], division_id=None, active=active)
+        self.store.add_season_team_registration(stray)
+        return stray
+
+    def test_baseline_move_succeeds_without_corruption(self):
+        moved = self.api.move_game(self.game["id"], self.slot2["id"], actor_id=ADMIN)
+        self.assertNotIn("error", moved, moved)
+
+    def test_baseline_publish_succeeds_without_corruption(self):
+        published = self.api.publish_game(self.game["id"], actor_id=ADMIN)
+        self.assertNotIn("error", published, published)
+
+    def test_move_rejects_active_stray_at_a_different_league(self):
+        stray = self._inject_stray(active=True)
+        res = self.api.move_game(self.game["id"], self.slot2["id"], actor_id=ADMIN)
+        self.assertEqual(res["error"]["details"]["reason"],
+                         "team_registration_conflict", res)
+        self.assertEqual(set(res["error"]["details"]["affected_registration_ids"]),
+                         {self.home_reg["id"], stray.id})
+        # Zero mutation: the game is still on its original slot.
+        game = self.store.get_game(self.game["id"])
+        self.assertEqual(game.ice_slot_id, self.slot1["id"])
+
+    def test_publish_rejects_active_stray_at_a_different_league(self):
+        stray = self._inject_stray(active=True)
+        res = self.api.publish_game(self.game["id"], actor_id=ADMIN)
+        self.assertEqual(res["error"]["details"]["reason"],
+                         "team_registration_conflict", res)
+        self.assertEqual(set(res["error"]["details"]["affected_registration_ids"]),
+                         {self.home_reg["id"], stray.id})
+        game = self.store.get_game(self.game["id"])
+        self.assertFalse(game.published)
+
+    def test_inactive_stray_never_blocks_move_or_publish(self):
+        self._inject_stray(active=False)
+        moved = self.api.move_game(self.game["id"], self.slot2["id"], actor_id=ADMIN)
+        self.assertNotIn("error", moved, moved)
+        published = self.api.publish_game(self.game["id"], actor_id=ADMIN)
+        self.assertNotIn("error", published, published)
+
+    def test_move_rejects_exact_active_inactive_duplicate_at_the_games_own_league_season(self):
+        # An exact active+inactive duplicate AT the game's own LeagueSeason
+        # (ls_a) -- unconditional on active state per exact_registration_or_
+        # conflict, distinct from the season-wide stray case above.
+        dup = SeasonTeamRegistration(
+            id=self.store.next_id("streg"), league_season_id=self.ls_a.id,
+            team_id=self.home["id"], division_id=None, active=False)
+        self.store.add_season_team_registration(dup)
+        res = self.api.move_game(self.game["id"], self.slot2["id"], actor_id=ADMIN)
+        self.assertEqual(res["error"]["details"]["reason"],
+                         "team_registration_conflict", res)
+        self.assertEqual(set(res["error"]["details"]["affected_registration_ids"]),
+                         {self.home_reg["id"], dup.id})
+        game = self.store.get_game(self.game["id"])
+        self.assertEqual(game.ice_slot_id, self.slot1["id"])
+
+    def test_move_rejects_when_the_away_team_is_the_ambiguous_one(self):
+        # The check applies to BOTH teams, not just whichever is checked
+        # first.
+        ls_b = self.store.league_season_for(self.league_b["id"], self.season["id"])
+        stray = SeasonTeamRegistration(
+            id=self.store.next_id("streg"), league_season_id=ls_b.id,
+            team_id=self.away["id"], division_id=None, active=True)
+        self.store.add_season_team_registration(stray)
+        res = self.api.move_game(self.game["id"], self.slot2["id"], actor_id=ADMIN)
+        self.assertEqual(res["error"]["details"]["reason"],
+                         "team_registration_conflict", res)
+        game = self.store.get_game(self.game["id"])
+        self.assertEqual(game.ice_slot_id, self.slot1["id"])
+
+
 if __name__ == "__main__":
     unittest.main()

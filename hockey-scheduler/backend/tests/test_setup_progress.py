@@ -724,6 +724,7 @@ class SetupProgressComputationTest(unittest.TestCase):
         self.assertEqual(
             participation["attention"],
             {"reason": "invalid_registrations", "count": 1,
+             "affected_registration_ids": [stale.id],
              "detail": "1 registration(s) in this season don't match "
                        "their team's permanent league or division; "
                        "resolve them in Season participation."})
@@ -763,6 +764,107 @@ class SetupProgressComputationTest(unittest.TestCase):
         after_participation = next(w for w in after["workflows"]
                                    if w["key"] == "participation")
         self.assertNotIn("attention", after_participation, after_participation)
+
+    def test_valid_registration_plus_active_stray_is_not_reported_complete(self):
+        """#331 review round 21 finding 2: unlike the test above (a Team NEVER
+        successfully registered at its own permanent League), this Team DOES
+        hold a genuinely valid row at League A -- exactly the shape the OLD
+        per-row check counted as `schedulable` on its own, since that row's
+        League matches the Team's in isolation. The shared season-wide
+        resolver (`team_registration_valid`) rejects it anyway: this Team
+        has TWO active rows this Season (League A's real one, League B's
+        stray), so neither is trusted as live participation. With every
+        OTHER workflow complete, the reproduction isolates the bug exactly:
+        the OLD code reported `status: "done"`, `complete: True`, `next:
+        None` here -- an operator steered toward Schedule for a Team the
+        production create_game/move_game/publish_game resolver would reject
+        outright."""
+        api = self._api()
+        api.create_user_account("admin", "pw", "league_admin")
+        program = api.create_program("Prog", actor_id="admin")
+        season = api.create_season(program["id"], "Season", actor_id="admin")
+        league_a = api.create_league(season["id"], "League A", actor_id="admin")
+        league_b = api.create_league(season["id"], "League B", actor_id="admin")
+        club = api.create_club("C", actor_id="admin")
+        team = api.create_team(club["id"], None, "Team", actor_id="admin",
+                               league_id=league_a["id"])
+        reg = api.register_team_for_season(season["id"], team["id"],
+                                           actor_id="admin",
+                                           league_id=league_a["id"])
+        self.assertNotIn("error", reg, reg)
+        api.create_player(team["id"], "Vince Skater", "forward", actor_id="admin")
+        venue = api.create_venue("V", league_id=program["id"], actor_id="admin")
+        rink = api.create_rink(venue["id"], "R", actor_id="admin")
+        api.create_ice_slot(rink["id"], "2026-09-01T18:30:00+00:00",
+                            "2026-09-01T20:00:00+00:00", actor_id="admin")
+        api.grant_season_venue_access(season["id"], venue["id"], actor_id="admin")
+
+        # Sanity check the fixture: without the stray, this is genuinely
+        # complete already.
+        api.set_active_context("admin", Role.LEAGUE_ADMIN, {},
+                               program["id"], season["id"])
+        clean = api.get_setup_progress("admin", *ADMIN)
+        self.assertTrue(clean["complete"], clean)
+
+        ls_b = api.store.league_season_for(league_b["id"], season["id"])
+        stray = SeasonTeamRegistration(
+            id=api.store.next_id("streg"), league_season_id=ls_b.id,
+            team_id=team["id"], division_id=None, active=True)
+        api.store.add_season_team_registration(stray)
+
+        progress = api.get_setup_progress("admin", *ADMIN)
+        statuses = _statuses(progress)
+        self.assertEqual(statuses["participation"], "todo", progress)
+        self.assertFalse(progress["complete"], progress)
+        self.assertIsNotNone(progress["next"], progress)
+        self.assertEqual(progress["next"]["key"], "participation", progress)
+        participation = next(w for w in progress["workflows"]
+                             if w["key"] == "participation")
+        self.assertEqual(participation["attention"]["count"], 2, participation)
+        self.assertEqual(
+            set(participation["attention"]["affected_registration_ids"]),
+            {reg["id"], stray.id})
+
+    def test_inactive_sibling_at_a_different_league_season_still_reads_complete(self):
+        """#331 review round 21 finding 2 sanity check -- the required
+        correction's OWN stated boundary: "exactly one expected active row
+        with inactive historical siblings must remain complete." A Team
+        transferred from League B to its current permanent League A leaves
+        an INACTIVE row behind at League B (history, not live participation)
+        -- this must never be confused with the active-stray case above."""
+        api = self._api()
+        api.create_user_account("admin", "pw", "league_admin")
+        program = api.create_program("Prog", actor_id="admin")
+        season = api.create_season(program["id"], "Season", actor_id="admin")
+        league_a = api.create_league(season["id"], "League A", actor_id="admin")
+        league_b = api.create_league(season["id"], "League B", actor_id="admin")
+        club = api.create_club("C", actor_id="admin")
+        team = api.create_team(club["id"], None, "Team", actor_id="admin",
+                               league_id=league_a["id"])
+        reg = api.register_team_for_season(season["id"], team["id"],
+                                           actor_id="admin",
+                                           league_id=league_a["id"])
+        self.assertNotIn("error", reg, reg)
+        api.create_player(team["id"], "Vince Skater", "forward", actor_id="admin")
+        venue = api.create_venue("V", league_id=program["id"], actor_id="admin")
+        rink = api.create_rink(venue["id"], "R", actor_id="admin")
+        api.create_ice_slot(rink["id"], "2026-09-01T18:30:00+00:00",
+                            "2026-09-01T20:00:00+00:00", actor_id="admin")
+        api.grant_season_venue_access(season["id"], venue["id"], actor_id="admin")
+
+        ls_b = api.store.league_season_for(league_b["id"], season["id"])
+        api.store.add_season_team_registration(SeasonTeamRegistration(
+            id=api.store.next_id("streg"), league_season_id=ls_b.id,
+            team_id=team["id"], division_id=None, active=False))
+
+        api.set_active_context("admin", Role.LEAGUE_ADMIN, {},
+                               program["id"], season["id"])
+        progress = api.get_setup_progress("admin", *ADMIN)
+        self.assertEqual(_statuses(progress)["participation"], "done", progress)
+        self.assertTrue(progress["complete"], progress)
+        participation = next(w for w in progress["workflows"]
+                             if w["key"] == "participation")
+        self.assertNotIn("attention", participation, participation)
 
     def test_facilities_next_is_also_blocked_when_selected_season_is_archived(self):
         """Not just "participation" -- ``commit_ice_availability`` (the Ice

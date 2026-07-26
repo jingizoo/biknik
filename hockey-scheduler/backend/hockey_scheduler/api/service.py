@@ -451,8 +451,6 @@ class ApiService:
         # get_onboarding_status_v2's "participation" step, scoped further to
         # one Season here.
         divisions_by_id = {d.id: d for d in self.store.all_divisions()}
-        teams_by_id = {t.id: t for t in teams}
-        ls_league_id_by_id = {ls.id: ls.league_id for ls in program_league_seasons}
         schedulable = 0
         # #331 review round 19: a registration this loop excludes from
         # `schedulable` isn't necessarily irrelevant -- an active row that
@@ -468,31 +466,43 @@ class ApiService:
         # achieved real, valid participation must still see "done", just
         # ALSO see that something else needs attention.
         needs_attention = 0
+        # #331 review round 21 finding 2: resolved per-TEAM through the
+        # shared `team_registration_valid` resolver, not per-row against its
+        # own League alone (round 18's check, replaced here). A row that
+        # matches its Team's permanent League in isolation is NOT
+        # schedulable if the Team ALSO holds another active row elsewhere
+        # this Season, in any League -- the identical unconditional
+        # season-wide conflict `create_game`/`move_game`/`publish_game`
+        # already fail closed on (round 20). The per-row check asked only
+        # "does THIS row's League match its Team" and had no way to see a
+        # SECOND active row at a different LeagueSeason, so it counted a
+        # Team's conflicted row as `schedulable` while the live-scheduling
+        # resolver would reject every game that Team plays in -- exactly
+        # the reproduction this round names. Memoized per Team (not
+        # recomputed per row): a Team can hold more than one row among this
+        # Season's LeagueSeasons -- the active stray this fixes, or a
+        # historical inactive one already excluded by the `.active` guard
+        # above, which must keep reading complete on its own.
+        resolved_by_team = {}
+        attention_ids = []
         for reg in self.store.all_season_team_registrations():
             if not reg.active or reg.team_id not in team_ids:
                 continue
             if reg.league_season_id not in season_ls_ids:
                 continue
-            # #331 review round 18: a registration only counts once its
-            # LeagueSeason's League matches the Team's OWN permanent League
-            # (Rule 7) -- the same invariant register_team_for_season and
-            # team_registration_valid (the shared live-scheduling resolver)
-            # both enforce. transfer_team_to_league deliberately leaves an
-            # archived/ended Season's active registration frozen at its OLD
-            # League while Team.league_id moves on (history preservation) —
-            # exactly the state that must never be reported as "done" here,
-            # since create_game/move/publish would reject it outright, and
-            # counting it would report a false "schedulable" completion
-            # signal for this Season's guided-setup workflow.
-            team = teams_by_id.get(reg.team_id)
-            if (team is None or not team.league_id
-                    or team.league_id != ls_league_id_by_id.get(reg.league_season_id)):
+            if reg.team_id not in resolved_by_team:
+                resolved_by_team[reg.team_id] = team_registration_valid(
+                    self.store, season, reg.team_id, require_division=False)
+            live = resolved_by_team[reg.team_id]
+            if live is None or live.id != reg.id:
                 needs_attention += 1
+                attention_ids.append(reg.id)
                 continue
             if reg.division_id:
                 division = divisions_by_id.get(reg.division_id)
                 if division is None or division.league_season_id != reg.league_season_id:
                     needs_attention += 1
+                    attention_ids.append(reg.id)
                     continue
             schedulable += 1
         add("participation", "Season participation and divisions",
@@ -502,6 +512,7 @@ class ApiService:
             "Register Team",
             attention=(
                 {"reason": "invalid_registrations", "count": needs_attention,
+                 "affected_registration_ids": attention_ids,
                  "detail": (
                      f"{needs_attention} registration(s) in this season "
                      "don't match their team's permanent league or "

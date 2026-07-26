@@ -2026,6 +2026,114 @@ from this round). `season-participation.js`, `season-rollover.js`,
 `registration-cleanup.js` all re-confirmed green at desktop and 390×844
 after the backend changes, zero console errors.
 
+### Round 21: divisionless move/publish bypass and setup-progress false completion
+
+Round 20's convergence review (#331 review round 21) confirmed the season-wide
+resolver's two write-side fixes but found two more places still bypassing it
+entirely.
+
+**Finding 1 — `_revalidate_game_participation`'s divisionless branch.**
+`move_game`/`publish_game` share one revalidation gate before any write; the
+divisioned branch already routed through `_require_team_registered` (and so
+already inherited round 20's fix), but the branch behind a DIVISION-LESS
+regular Game fell back to a raw `{r.team_id for r in registrations_for_league_
+season(ls_id) if r.active}` set — "is this Team active SOMEWHERE in this
+LeagueSeason." That stayed true with an active stray registration elsewhere
+in the same Season (the same shape create_game/register_team_for_season
+already reject), and even with an exact active+inactive duplicate at the
+Game's own LeagueSeason (`exact_registration_or_conflict`'s own unconditional
+job, invisible to a plain set built from only the `.active` rows). Fixed by
+routing this branch through `_require_team_registered` too — inheriting both
+conflict checks for free — followed by an explicit `registration_wrong_league`
+re-check (mirroring `create_game`'s own Rules 8/9 check for the identical
+gap): `_require_team_registered` resolves via the Team's own permanent
+League, not necessarily this specific Game's `league_season_id`, so a Team
+whose permanent League has since diverged from the Game's own recorded
+LeagueSeason needs that separate, explicit comparison.
+
+**Finding 2 — `get_setup_progress` reported an unschedulable Team as fully
+done.** The participation step counted a row `schedulable` whenever its
+LeagueSeason matched the Team's own permanent League in isolation — exactly
+the round-18 check finding 1 above widened everywhere else, but never applied
+here. A Team holding a genuinely valid row at its own League AND an active
+stray elsewhere in the Season (finding 1's own reproduction) had its valid
+row counted as `schedulable` regardless, so participation read `"done"`,
+overall `complete` could read `true`, and the Home/Tasks hub's success card
+told the operator every workflow was finished while the shared resolver would
+reject every Game that Team plays in. Fixed by resolving each candidate row's
+Team through `team_registration_valid` (memoized once per Team, not
+recomputed per row) instead of comparing its League in isolation: a row only
+counts as `schedulable` when it IS that Team's one live resolved registration
+this Season; every other row — the Team's own stray included — now counts
+toward `attention`, which also gained an `affected_registration_ids` list
+(the established shape every other conflict response already carries)
+alongside its existing count and guidance text.
+
+That fix alone made `complete`/`status` correct, but the Home/Tasks hub's own
+rendering had never read a workflow's `attention` field AT ALL, in any of its
+three states — not just the success card the reviewer named, but the
+"Continue setup" and blocked-workflow states too, which list every workflow's
+`detail` but never its separate `attention`. Round 19 deliberately designed
+`attention` to coexist with a workflow reading `"done"` (a DIFFERENT Team's
+unrelated stray, say), so the fix could not simply rely on `complete` going
+`false` — that only happens when the SAME Team's own row is what's
+ambiguous. Both the primary card (the success state's own new attention rows,
+and "Continue setup"'s own named workflow) and the secondary workflow list
+below it now render a workflow's `attention.detail` as a distinct, visibly
+separate line, reusing existing markup this same card already had elsewhere
+(the blocked-state's amber `na-row`, and the draft scheduler's `.li-sub.
+conflict` convention) rather than introducing new, unreviewed color
+combinations into a card round 3's own review already had to fix real
+contrast failures in once.
+
+**Regression coverage:** a new `GameParticipationRevalidationTest` class in
+`test_exact_registration_identity.py` covers the divisionless branch directly
+— a clean baseline (both `move_game` and `publish_game` succeed with no
+corruption), the season-wide active-stray rejection for the home Team AND
+independently for the away Team, the exact active+inactive duplicate at the
+Game's own LeagueSeason, and that a purely historical inactive stray never
+blocks either write — every rejection asserted zero-mutation (the Game's
+slot/publish state unchanged). `test_setup_progress.py` gained two new tests:
+the exact reproduction (valid registration + active stray, every other
+workflow complete, asserting `status`/`complete`/`next`/`attention.count`/
+`affected_registration_ids` all correct) and the required boundary case from
+the review's own wording — one active row plus an inactive historical
+sibling at a different LeagueSeason must still read fully complete with no
+attention at all. The pre-existing `test_stale_wrong_league_active_
+registration_never_counts_as_done` assertion on the exact `attention` shape
+was extended for the new `affected_registration_ids` field. A new
+`setup-progress-conflict-attention.js` browser journey reuses the in-memory-
+server-with-live-injection technique `hierarchy-duplicate-registration.js`
+established (the season-wide shape, unlike the exact-key one, spans two
+different LeagueSeasons and so needs no special corruption technique of its
+own — it is genuinely constructible on a real database — but the technique
+is convenient here regardless, letting one page session build the fixture,
+inject, and re-observe the same live server): it builds every workflow to
+completion via genuine HTTP writes, confirms the success card renders first,
+injects the active stray, and confirms the card switches to "Continue setup"
+with the conflict visibly named in both the primary card and the workflow
+list below it, on desktop and 390px.
+
+**Falsifiability:** reverting the `_revalidate_game_participation` fix alone
+reproduces all three claimed shapes live on Memory (`move_game`/`publish_game`
+both succeed against an active stray at a different League, and `move_game`
+succeeds despite an exact active+inactive duplicate) — restored, reconfirmed
+green. Reverting the `get_setup_progress` backend fix reproduces the exact
+false-`"done"`/`complete: true` state the review named — restored. Reverting
+the frontend attention-rendering addition alone (backend fix left in place)
+makes `setup-progress-conflict-attention.js` fail with an empty
+`attentionRows` array — proving the browser journey genuinely exercises the
+rendering fix, not just the backend's already-correct `complete: false` —
+restored, reconfirmed green both viewports.
+
+**Verification:** full Memory/SQLite (3504 tests) and PostgreSQL (3504 tests,
+1009.8s) suites both green, +9 from round 20. `hierarchy-duplicate-
+registration.js`, `season-participation.js`, `season-rollover.js`, `team-
+division-participation.js`, `registration-cleanup.js`, and `home-tasks-hub.js`
+(the full suite, both roles) all re-confirmed green at desktop and 390×844
+after the shared-code changes, plus the new `setup-progress-conflict-
+attention.js` journey itself, zero console errors throughout.
+
 - The bootstrap claim is the only unauthenticated mutation, and only on a fresh,
   durable, unclaimed installation.
 - After claim, all setup and onboarding-status detail requires an authenticated

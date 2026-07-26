@@ -607,9 +607,26 @@ function renderSetupProgressCard(progress, hadError, loading) {
     // it for Arena Manager instead of routing them to a surface they cannot
     // use, rather than falling back to a generic always-shown label.
     const importWf = progress.workflows.find((w) => w.key === "import");
+    // #331 review round 21 finding 2: `complete` and a workflow's own
+    // `attention` are independent by design (round 19's docstring) -- a
+    // Team can be genuinely, validly participating (this workflow reads
+    // "done") while some OTHER row still needs cleanup. The success card
+    // used to render unconditionally here whenever `complete` was true,
+    // silently dropping every workflow's `attention` on the floor -- the
+    // one place in this whole function that never read the field at all.
+    // Reuses the exact na-row/amber markup `next_blocked` below already
+    // renders in this same card, rather than introducing an unreviewed
+    // color combination.
+    const attentionRows = progress.workflows.filter((w) => w.attention).map((w) => `
+      <div class="na-row">
+        <div class="na-ico amber">⚠️</div>
+        <div class="na-body"><div class="na-title">${esc(w.label)}</div>
+          <div class="na-sub">${esc(w.attention.detail)}</div></div>
+      </div>`).join("");
     return `<div class="dash-card sp-card" style="margin-bottom:16px">
       <div class="dash-card-head"><h3>✓ All setup steps complete</h3></div>
       <p class="muted">Every Setup workflow is done for ${esc(progress.program.name)}.</p>
+      ${attentionRows}
       <div class="actions">
         <button class="act primary" data-goto="calendar">Go to Schedule</button>
         ${importWf ? `<button class="act ghost" data-setup-progress-action="import"
@@ -625,14 +642,33 @@ function renderSetupProgressCard(progress, hadError, loading) {
       : w.status === "optional" ? "blue" : "gray";
     const text = w.status === "done" ? "Done"
       : w.status === "optional" ? "Optional" : "To do";
+    // #331 review round 21 finding 2: surfaces `attention` here too --
+    // reusing the existing `.li-sub.conflict` convention (draft scheduler)
+    // -- so a workflow reading "To do" because its only registration(s)
+    // are ambiguous shows THAT reason, not just the generic done/todo
+    // detail text alone.
+    const attentionLine = w.attention
+      ? `<div class="li-sub conflict">⚠️ ${esc(w.attention.detail)}</div>` : "";
     return `<div class="li">
       <span class="badge ${cls}">${text}</span>
       <div class="li-main"><div class="li-title">${esc(w.label)}</div>
-        <div class="li-sub">${esc(w.detail)}</div></div>
+        <div class="li-sub">${esc(w.detail)}</div>${attentionLine}</div>
     </div>`;
   }).join("");
   const next = progress.next;
   if (next) {
+    // #331 review round 21 finding 2: `next` is the same workflow object
+    // `rows` renders below, carrying its own `attention` when present (e.g.
+    // "participation" reading "No team registered to play yet" while a
+    // registration DOES exist, just ambiguously -- this workflow's own
+    // attention names that instead of leaving the generic detail as the
+    // only signal).
+    const nextAttention = next.attention ? `
+      <div class="na-row">
+        <div class="na-ico amber">⚠️</div>
+        <div class="na-body"><div class="na-title">${esc(next.label)}</div>
+          <div class="na-sub">${esc(next.attention.detail)}</div></div>
+      </div>` : "";
     return `<div class="dash-card sp-card" style="margin-bottom:16px">
       <div class="dash-card-head"><span class="dch-dot"></span><h3>Continue setup</h3></div>
       <div class="na-row">
@@ -640,6 +676,7 @@ function renderSetupProgressCard(progress, hadError, loading) {
         <div class="na-body"><div class="na-title">${esc(next.label)}</div>
           <div class="na-sub">${esc(next.detail)}</div></div>
       </div>
+      ${nextAttention}
       <div class="actions">
         <button class="act primary" data-setup-progress-action="${esc(next.key)}"
           >${esc(next.primary_action)}</button>

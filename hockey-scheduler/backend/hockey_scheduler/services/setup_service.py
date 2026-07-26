@@ -1624,12 +1624,15 @@ class SetupService:
         scope (#283 Slice E) — checked before any write (publish/move), so a
         rejection mutates nothing.
 
-        A REGULAR game requires both teams to have an ACTIVE registration in the
-        game's exact LeagueSeason (its single competition identity); when the
-        game also carries a Division, the stricter season+division match is kept
-        too. A legacy regular game with no ``league_season_id`` falls back to the
-        season(+division) check. An EXHIBITION only requires both teams to remain
-        active participants of the game's Season (it may cross Leagues)."""
+        A REGULAR game requires both teams to have an ACTIVE, unambiguous
+        registration in the game's exact LeagueSeason (its single competition
+        identity) -- unconditionally on any exact-key or season-wide conflict
+        (#331 review round 21 finding 1), exactly as ``create_game`` itself
+        enforces; when the game also carries a Division, the stricter
+        season+division match is kept too. A legacy regular game with no
+        ``league_season_id`` falls back to the season(+division) check. An
+        EXHIBITION only requires both teams to remain active participants of
+        the game's Season (it may cross Leagues)."""
         if game.game_type == GameType.EXHIBITION.value:
             if not game.season_id:
                 return
@@ -1664,18 +1667,36 @@ class SetupService:
             self._require_team_registered(
                 game.season_id, game.away_team_id, game.division_id)
         # Both teams must be active in the game's exact LeagueSeason (covers the
-        # division-less regular game the check above skips).
-        active_ids = {r.team_id for r
-                      in self.store.registrations_for_league_season(ls_id)
-                      if r.active}
+        # division-less regular game the check above skips). #331 review
+        # round 21 finding 1: routed through the same shared resolver
+        # create_game itself uses -- _require_team_registered (season-wide +
+        # exact-key conflict-aware since round 20) -- instead of a raw
+        # {active team_ids in ls_id} set, which only asked "is this team
+        # active SOMEWHERE in ls_id" and stayed true with an active stray
+        # registration active elsewhere this Season, or with an exact
+        # active+inactive duplicate at ls_id itself (both invisible to a
+        # plain set membership test). _require_team_registered resolves via
+        # the Team's own permanent League, not necessarily THIS game's
+        # ls_id, so an explicit registration_wrong_league re-check follows,
+        # mirroring create_game's own Rules 8/9 check for the identical gap.
+        ls = self.store.get_league_season(ls_id)
+        expected_league_id = ls.league_id if ls else None
         for tid in (game.home_team_id, game.away_team_id):
-            if tid is not None and tid not in active_ids:
-                label = (self.store.get_team(tid) or Team(id=tid, name=tid)).name
+            if tid is None:
+                continue
+            team = self.store.get_team(tid)
+            reg = self._require_team_registered(
+                game.season_id, tid, None, team, require_division=False)
+            reg_league_id = self._registration_league_id(reg)
+            if expected_league_id is not None and reg_league_id != expected_league_id:
+                label = team.name if team is not None else tid
                 raise ValidationError(
-                    f"{label} is no longer registered in this game's "
-                    "league-season.",
-                    {"reason": "team_not_in_league_season",
-                     "team_id": tid, "league_season_id": ls_id})
+                    f"{label}'s registration belongs to a different league "
+                    "than this game.",
+                    {"reason": "registration_wrong_league", "team_id": tid,
+                     "season_id": game.season_id,
+                     "expected_league_id": expected_league_id,
+                     "registered_league_id": reg_league_id})
 
     @_transactional
     def assign_season_team_division(self, registration_id: str,

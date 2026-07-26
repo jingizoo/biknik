@@ -12,6 +12,7 @@
     "hierarchy-import": "node hierarchy-import.js",
     "season-participation": "node season-participation.js",
     "hierarchy-duplicate-registration": "node hierarchy-duplicate-registration.js",
+    "setup-progress-conflict-attention": "node setup-progress-conflict-attention.js",
     "season-rollover": "node season-rollover.js",
     "team-division-participation": "node team-division-participation.js",
     "scheduler-empty-state": "node scheduler-empty-state.js",
