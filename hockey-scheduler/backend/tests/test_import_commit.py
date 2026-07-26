@@ -1021,6 +1021,8 @@ class PostgresTeamsPlayersImportRaceTest(unittest.TestCase):
                          "the officials import must point at the surviving Club")
 
 
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
 class PostgresHierarchyVsPilotTeamPlayerRaceTest(unittest.TestCase):
     """#331 review round 14 finding 3: commit_hierarchy_import and
     commit_teams_players_import each resolve Team/Player external_ref
