@@ -27,10 +27,14 @@
 //      malicious/curious console user would, not a URL route -- this SPA
 //      has none) into a hidden view renders no privileged data/controls;
 //   6. a real unauthorized mutation request is rejected by the server (403
-//      "forbidden"), with a snapshot of the exact affected collection taken
-//      through an authorized reader session BEFORE and AFTER the probe and
-//      required to be byte-identical -- not merely a 403 status, which an
-//      orchestration bug could still return after a real write;
+//      "forbidden"), with a snapshot of BOTH the exact affected business
+//      resource AND its persisted audit boundary (SetupAuditLog via
+//      /api/demo/overview's setup_audit, or the per-game AuditLog via
+//      /api/games/{id}/board's audit array) taken through an authorized
+//      reader session BEFORE and AFTER the probe and required to be
+//      byte-identical -- not merely a 403 status, which an orchestration
+//      bug could still return after a real write or a recorded audit
+//      event with the business resource left untouched;
 //   7. zero unexpected browser console/page errors AND zero unexpected
 //      HTTP responses >=400 -- each negative probe's own exact
 //      method/path/403 is individually registered and consumed, so an
@@ -355,30 +359,35 @@ function makeFailureTracker(page, errors) {
 }
 
 // A real unauthorized HTTP mutation must be rejected by the SERVER (403
-// "forbidden"), and a snapshot of the affected collection -- read through an
-// INDEPENDENT, authorized reader session, since most roles here cannot read
-// what they're forbidden to write -- must be byte-identical before and
-// after. A 403 status alone (the previous version of this journey's own
-// check) cannot rule out an orchestration bug that mutates and THEN answers
-// 403; this closes that gap for every probe, including the two
-// (Player/Guardian build-roster) whose body carries no distinguishing
-// marker a simple string search could ever have caught.
-async function assertForbiddenNoChange(page, reader, tracker, fail, label, mutatePath, body, snapshotPath) {
-  const before = await apiGet(reader, snapshotPath);
+// "forbidden"), and BOTH the affected business resource AND the relevant
+// persisted audit collection -- each read through an INDEPENDENT, authorized
+// reader session, since most roles here cannot read what they're forbidden
+// to write -- must be byte-identical before and after. A 403 status alone
+// cannot rule out an orchestration bug that mutates (or appends an audit
+// event) and THEN answers 403; checking only the business resource cannot
+// rule out a defect that records the attempt as a real audit event while
+// leaving that resource untouched. `snapshotPaths` names every collection
+// this probe must leave byte-identical -- the exact resource AND its audit
+// boundary, never just one.
+async function assertForbiddenNoChange(page, reader, tracker, fail, label, mutatePath, body, snapshotPaths) {
+  const paths = Array.isArray(snapshotPaths) ? snapshotPaths : [snapshotPaths];
+  const befores = await Promise.all(paths.map((p) => apiGet(reader, p)));
   tracker.expect("POST", mutatePath, 403);
   const res = await apiPost(page, mutatePath, body || {});
   if (res.status !== 403 || !res.body.error || res.body.error.code !== "forbidden") {
     fail(`${label}: expected 403 "forbidden" POSTing ${mutatePath}, got `
       + `status=${res.status} body=${JSON.stringify(res.body)}`);
   }
-  const after = await apiGet(reader, snapshotPath);
-  const beforeStr = JSON.stringify(before.body);
-  const afterStr = JSON.stringify(after.body);
-  if (beforeStr !== afterStr) {
-    fail(`${label}: rejected with 403 but ${snapshotPath} changed anyway -- `
-      + `this was a real write, not just a hidden button. before=${beforeStr} `
-      + `after=${afterStr}`);
-  }
+  const afters = await Promise.all(paths.map((p) => apiGet(reader, p)));
+  paths.forEach((p, i) => {
+    const beforeStr = JSON.stringify(befores[i].body);
+    const afterStr = JSON.stringify(afters[i].body);
+    if (beforeStr !== afterStr) {
+      fail(`${label}: rejected with 403 but ${p} changed anyway -- this was `
+        + `a real write (or audit record), not just a hidden button. `
+        + `before=${beforeStr} after=${afterStr}`);
+    }
+  });
 }
 
 const iso = (d) => d.toISOString().replace(/\.\d{3}Z$/, "+00:00");
@@ -759,11 +768,13 @@ async function checkViewport(browser, viewport) {
     }
     // Unauthorized mutation, rejected by the SERVER: League-structure
     // Setup ("unrelated administration") requires MANAGE_SETUP, which
-    // Arena Manager does not hold. The affected collection (the whole
-    // Setup overview) must be byte-identical before and after.
+    // Arena Manager does not hold. Both the whole Setup overview AND the
+    // SetupAuditLog trail (/api/demo/overview's setup_audit -- a rejected
+    // attempt must not be recorded as a real audit event either) must be
+    // byte-identical before and after.
     await assertForbiddenNoChange(page, reader, tracker, fail, "Arena Manager",
       "/api/setup/league", { name: "Should Not Exist (arena manager)" },
-      "/api/v2/setup/overview");
+      ["/api/v2/setup/overview", "/api/demo/overview"]);
     await logout(page);
 
     // ============================================================
@@ -803,7 +814,7 @@ async function checkViewport(browser, viewport) {
     await reachDashboard(page);
     await assertForbiddenNoChange(page, reader, tracker, fail, "Coach",
       "/api/v2/setup/venue", { name: "Should Not Exist (coach)", organization_id: null },
-      "/api/v2/setup/overview");
+      ["/api/v2/setup/overview", "/api/demo/overview"]);
     await logout(page);
 
     // ============================================================
@@ -835,11 +846,14 @@ async function checkViewport(browser, viewport) {
       fail("Player: direct-navigating to Setup must show no \"+ New\" controls");
     }
     // Player's own build-roster probe carries no distinguishing marker a
-    // string search could ever catch -- the game's real lineups (read
-    // through the authorized reader session) must be byte-identical.
+    // string search could ever catch. Both the game's real lineups AND its
+    // per-game AuditLog trail (/api/games/{id}/board's `audit` array --
+    // roster_selected/availability_set events, distinct from the setup-only
+    // SetupAuditLog above) must be byte-identical -- a rejected attempt
+    // must not be recorded as a real audit event either.
     await assertForbiddenNoChange(page, reader, tracker, fail, "Player",
       `/api/games/${game.body.id}/build-roster`, {},
-      `/api/games/${game.body.id}/lineups`);
+      [`/api/games/${game.body.id}/lineups`, `/api/games/${game.body.id}/board`]);
     await logout(page);
 
     // ============================================================
@@ -875,9 +889,11 @@ async function checkViewport(browser, viewport) {
     if ((await page.evaluate(() => document.querySelectorAll(".sc-new").length)) !== 0) {
       fail("Guardian: direct-navigating to Setup must show no \"+ New\" controls");
     }
+    // Same two-collection proof as Player's own probe above: the lineups
+    // AND the per-game AuditLog trail must both stay byte-identical.
     await assertForbiddenNoChange(page, reader, tracker, fail, "Guardian",
       `/api/games/${game.body.id}/build-roster`, {},
-      `/api/games/${game.body.id}/lineups`);
+      [`/api/games/${game.body.id}/lineups`, `/api/games/${game.body.id}/board`]);
     await logout(page);
 
     // ============================================================
@@ -911,7 +927,7 @@ async function checkViewport(browser, viewport) {
     }
     await assertForbiddenNoChange(page, reader, tracker, fail, "Official",
       "/api/setup/official", { name: "Should Not Exist (official)" },
-      "/api/v2/setup/overview");
+      ["/api/v2/setup/overview", "/api/demo/overview"]);
     await logout(page);
 
     // ============================================================
@@ -943,7 +959,7 @@ async function checkViewport(browser, viewport) {
     await assertForbiddenNoChange(page, reader, tracker, fail, "Viewer",
       "/api/setup/team", { club_id: club.body.id, league_id: level.body.id,
         name: "Should Not Exist (viewer)" },
-      "/api/v2/setup/overview");
+      ["/api/v2/setup/overview", "/api/demo/overview"]);
     await logout(page);
 
     // Every registered negative-mutation expectation must have actually
