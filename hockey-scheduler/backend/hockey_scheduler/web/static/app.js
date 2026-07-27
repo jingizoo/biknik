@@ -915,7 +915,30 @@ function focusContentHeading(attempt) {
     content.focus();
     return;
   }
-  if ((attempt || 0) < 40) setTimeout(() => focusContentHeading((attempt || 0) + 1), 50);
+  if ((attempt || 0) < 40) {
+    setTimeout(() => focusContentHeading((attempt || 0) + 1), 50);
+    return;
+  }
+  // Poll exhausted (40 x 50ms = 2s). It used to simply return here, which
+  // silently LOST focus: on a loaded machine the destination view can still
+  // be fetching after two seconds, so the caller -- typically the dialog
+  // close path restoring focus when the trigger itself was removed -- was
+  // left with focus on <body>. Reproduced as a real CI failure on
+  // browser-smoke shard 2 ("focus restore (removed trigger): focus was left
+  // on <body> instead of the view fallback"), passing locally where the
+  // render lands well inside the budget.
+  //
+  // #content is always present and carries tabindex="-1" (added with the
+  // skip link), so it is a guaranteed floor. Taking it is strictly better
+  // than <body>: focus is inside the main region, the next Tab continues
+  // from there, and a screen reader announces the region rather than
+  // nothing. Deliberately unconditional -- a slow render must never end with
+  // focus nowhere.
+  if (content) {
+    content.setAttribute("tabindex", "-1");
+    content.setAttribute("aria-label", "Page content");
+    content.focus();
+  }
 }
 
 // Destination focus for "participation" (#331 review round 2 finding 4):
