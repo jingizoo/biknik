@@ -9043,8 +9043,12 @@ function gateChrome() {
   toggle('.tab[data-tab="activity"]', canSeeOpsConsole());
   toggle('.tab[data-tab="roster"]', canReadAnyPrivateGame());
   toggle('.tab[data-tab="sheet"]', canReadAnyPrivateGame());
-  // Hide a nav group once all of its tabs are hidden, so its section label
-  // (Home / Schedule / People / …) doesn't hang orphaned above nothing.
+  // Hide a nav area once all of its destinations are hidden, so its label
+  // (Home/Tasks, Schedule, Teams & People, …) doesn't hang orphaned above
+  // nothing. #345: this also covers Facilities, which is declared in the
+  // seven-area IA but carries no destination until the `setup` split makes
+  // "Venues, rinks and ice" separately addressable — an area with zero tabs
+  // is hidden by exactly the same rule as one whose tabs a role cannot see.
   document.querySelectorAll(".nav-group").forEach((g) => {
     const anyTab = Array.from(g.querySelectorAll(".tab"))
       .some((t) => t.style.display !== "none");

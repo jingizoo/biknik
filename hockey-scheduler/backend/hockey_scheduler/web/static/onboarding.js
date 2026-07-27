@@ -340,7 +340,9 @@ async function renderInitialSetup() {
   document.getElementById("nav-title").textContent = NAV.onboarding;
   document.body.dataset.view = "onboarding";
   const breadcrumb = document.getElementById("breadcrumb");
-  if (breadcrumb) breadcrumb.textContent = "Admin Setup · Initial Setup";
+  // #345: names the seven-area IA's "Administration" (the area this
+  // destination now sits in), not the retired "Admin Setup" group.
+  if (breadcrumb) breadcrumb.textContent = "Administration · Initial Setup";
   updateToast();
 
   if (!hasPerm("manage_setup")) {
