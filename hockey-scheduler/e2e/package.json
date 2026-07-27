@@ -11,6 +11,7 @@
     "shell-accessibility-coverage": "node shell-accessibility-coverage.js",
     "home-tasks-hub": "node home-tasks-hub.js",
     "setup-workflow-hub": "node setup-workflow-hub.js",
+    "setup-accessibility-axe-gate": "node setup-accessibility-axe-gate.js",
     "role-home-journeys": "node role-home-journeys.js",
     "role-authorization-matrix": "node role-authorization-matrix.js",
     "hierarchy-import": "node hierarchy-import.js",
