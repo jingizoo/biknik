@@ -49,7 +49,8 @@ import hockey_scheduler.web.server as srv
 from hockey_scheduler.domain import GameType, OfficialRole, Role
 from hockey_scheduler.domain.models import Game
 from hockey_scheduler.domain.setup_models import LeagueSeason, OfficialAssignment
-from hockey_scheduler.store import InMemoryStore
+from hockey_scheduler.services import context_scope
+from hockey_scheduler.store import InMemoryStore, SqlStore
 from hockey_scheduler.web.server import STATE, Handler
 
 PASSWORD = "demo"
@@ -181,6 +182,75 @@ class LeagueContextHttpContract:
         if ls is not None:
             with self.store.transaction():
                 self.store.delete_league_season(ls.id)
+
+    def is_postgres(self):
+        """True only where a SECOND, independent connection can commit while a
+        first one is paused mid-transaction. Memory/SQLite serialize every
+        writer behind one process lock, so that shape is unreachable there by
+        construction, not merely untested."""
+        return False
+
+    def _offered_leagues(self, opener, program_id):
+        _s, opts = self._req("GET", "/api/context/options", opener=opener)
+        program = next((p for p in opts["programs"] if p["id"] == program_id),
+                       None)
+        return {lg["id"] for lg in (program or {}).get("leagues", [])}
+
+    def _transfer_scenario(self):
+        """One Program/Season with TWO bound Leagues, a Team permanently in
+        Gold, and every scoped role attached to it — the only shape that can
+        falsify the frozen-Game-vs-live-Team rule.
+
+        Coach/Player/Guardian derive their League from the Team's CURRENT
+        ``team.league_id``, so a transfer must move them. An Official derives
+        theirs from each assigned Game's FROZEN ``league_season_id``, so the
+        same transfer must NOT move them. A fixture that never transfers
+        cannot tell those two rules apart — both look identical before it.
+        """
+        pid = self.api.create_program("P", "US", "UTC")["id"]
+        sid = self.api.create_season(pid, "S1")["id"]
+        gold = self.api.create_league(sid, "Gold")["id"]
+        silver = self.api.create_league(sid, "Silver")["id"]
+        did = self.api.create_division(sid, "D1", league_id=gold)["id"]
+        club = self.api.create_club("Club")["id"]
+        team = self.api.create_team(club_id=club, name="Alpha",
+                                    league_id=gold, division_id=did)["id"]
+        self.api.setup.register_team_for_season(sid, team, did)
+        player = self.api.create_player(team, "Junior", "skater")["id"]
+        oid = self.api.create_official("Ref")["id"]
+        ls = self.store.league_season_for(gold, sid)
+        with self.store.transaction():
+            gid = self.store.next_id("game")
+            # CANCELLED on purpose. A Team with live scheduled games cannot be
+            # transferred at all (`team_transfer_strands_games`), so cancelling
+            # is exactly how an operator unblocks a real transfer — and it does
+            # NOT change what the Official derives, because the derivation keys
+            # on the Game's game_type and frozen league_season_id, never on its
+            # status. That is what lets one fixture exercise a genuine transfer
+            # and still hold the Official's frozen League fixed.
+            self.store.add_game(Game(
+                id=gid, home_team_id=team, away_team_id=team, start_time=None,
+                season_id=sid, league_id=gold, league_season_id=ls.id,
+                game_type=GameType.REGULAR.value, cancelled=True))
+            self.store.add_official_assignment(OfficialAssignment(
+                id=self.store.next_id("assign"), game_id=gid, official_id=oid,
+                role=OfficialRole.REFEREE))
+        return {"pid": pid, "sid": sid, "gold": gold, "silver": silver,
+                "team": team, "player": player, "oid": oid}
+
+    def _transfer_team(self, team_id, new_league_id):
+        """Run the REAL production transfer (`setup_service.transfer_team_to_
+        league`), not a hand-written `save_team`.
+
+        It atomically moves the Team's ACTIVE registration to the target
+        League's LeagueSeason for the same Season, which is what keeps the
+        Team-derived roles authorized afterwards — a bare `team.league_id`
+        write leaves the registration behind and revokes their Season instead,
+        proving nothing about the League axis. Historical Games are deliberately
+        NOT rewritten, which is exactly why the Official's frozen derivation and
+        the live Team-derived one diverge here."""
+        self.api.setup.transfer_team_to_league(
+            team_id, new_league_id, actor_id="test_seed")
 
     # -- contract ----------------------------------------------------------
     def test_get_carries_the_league_axis_and_post_round_trips_it(self):
@@ -588,48 +658,327 @@ class LeagueContextHttpContract:
         # Ignored, not rewritten: restoring the assignment restores the choice.
         self.assertEqual(self._saved_league("user_official2"), lid)
 
-    # -- races -------------------------------------------------------------
-    def test_unbind_racing_a_post_never_persists_an_unbound_pair(self):
-        """The invariant is not "who wins" — it is that no outcome leaves a
-        saved context naming a pair with no binding."""
+    # -- frozen Game identity vs live Team membership ----------------------
+    def test_team_transfer_moves_live_roles_but_never_the_officials_league(self):
+        """The critical rule, falsified rather than assumed.
+
+        After the Team moves Gold -> Silver in the SAME Program and Season:
+        Coach / Player / Guardian follow it (their entitlement IS the Team), and
+        the Official does NOT (their entitlement is per-Game, resolved against
+        the Game's frozen LeagueSeason). Reading the Team for an Official would
+        both grant Silver — a League no assignment covers — and revoke Gold,
+        which is a scoped role enumerating outside its own scope.
+        """
+        fx = self._transfer_scenario()
+        official = self._account("off_t", Role.OFFICIAL,
+                                 {"official_id": fx["oid"]})
+        coach = self._account("coach_t", Role.COACH, {"team_id": fx["team"]})
+        player = self._account("player_t", Role.PLAYER,
+                               {"team_id": fx["team"],
+                                "player_id": fx["player"]})
+        guardian = self._account("guard_t", Role.GUARDIAN, {})
+        self.api.guardians.link_guardian(
+            "user_guard_t", fx["player"], verified=True, actor_id="test_seed")
+
+        live = (("coach", coach), ("player", player), ("guardian", guardian))
+        # BEFORE: every scoped role sees exactly Gold — so the assertions after
+        # the transfer are the ONLY thing that can distinguish the two rules.
+        for name, opener in live + (("official", official),):
+            self.assertEqual(self._offered_leagues(opener, fx["pid"]),
+                             {fx["gold"]}, name)
+
+        self._transfer_team(fx["team"], fx["silver"])
+
+        # The Official is FROZEN: still Gold, never Silver.
+        self.assertEqual(self._offered_leagues(official, fx["pid"]),
+                         {fx["gold"]}, "official League followed the Team")
+        before = self._saved_league("user_off_t")
+        bindings = self._league_season_count()
+        status, resp = self._req(
+            "POST", "/api/context",
+            {"program_id": fx["pid"], "season_id": fx["sid"],
+             "league_id": fx["silver"]}, opener=official)
+        self.assertEqual(status, 404, resp)
+        self.assertEqual(resp["error"]["details"].get("reason"),
+                         "league_not_accessible", resp)
+        self.assertEqual(self._saved_league("user_off_t"), before)
+        self.assertEqual(self._league_season_count(), bindings)
+        # ...and the League the assignment really grants still commits.
+        status, ok = self._req(
+            "POST", "/api/context",
+            {"program_id": fx["pid"], "season_id": fx["sid"],
+             "league_id": fx["gold"]}, opener=official)
+        self.assertEqual(status, 200, ok)
+        self.assertEqual(ok["league_id"], fx["gold"], ok)
+
+        # The Team-derived roles moved WITH the Team.
+        for name, opener in live:
+            self.assertEqual(self._offered_leagues(opener, fx["pid"]),
+                             {fx["silver"]}, f"{name} did not follow the Team")
+            status, got = self._req(
+                "POST", "/api/context",
+                {"program_id": fx["pid"], "season_id": fx["sid"],
+                 "league_id": fx["silver"]}, opener=opener)
+            self.assertEqual(status, 200, (name, got))
+            self.assertEqual(got["league_id"], fx["silver"], (name, got))
+            # Gold is now outside their scope, refused with the same reason.
+            status, denied = self._req(
+                "POST", "/api/context",
+                {"program_id": fx["pid"], "season_id": fx["sid"],
+                 "league_id": fx["gold"]}, opener=opener)
+            self.assertEqual(status, 404, (name, denied))
+            self.assertEqual(denied["error"]["details"].get("reason"),
+                             "league_not_accessible", (name, denied))
+
+    # -- idempotency, concurrency, restoration -----------------------------
+    def test_league_bearing_post_is_idempotent_and_concurrency_safe(self):
         admin = self._login("admin")
         pid, sid, lid = self._program_season_league()
-        barrier = threading.Barrier(2)
-        outcome = {}
+        body = {"program_id": pid, "season_id": sid, "league_id": lid}
 
-        def select():
+        first = self._req("POST", "/api/context", body, opener=admin)
+        second = self._req("POST", "/api/context", body, opener=admin)
+        self.assertEqual((first[0], second[0]), (200, 200), (first, second))
+        self.assertEqual(first[1]["league_id"], second[1]["league_id"])
+
+        results = {}
+        barrier = threading.Barrier(2)
+
+        def post(key):
             op = self._login("admin")
             barrier.wait()
-            outcome["status"] = self._req(
-                "POST", "/api/context",
-                {"program_id": pid, "season_id": sid, "league_id": lid},
-                opener=op)[0]
+            results[key] = self._req("POST", "/api/context", body, opener=op)
 
-        def unbind():
-            barrier.wait()
-            self._unbind(lid, sid)
-
-        threads = [threading.Thread(target=select),
-                   threading.Thread(target=unbind)]
+        threads = [threading.Thread(target=post, args=(k,)) for k in ("a", "b")]
         for t in threads:
             t.start()
         for t in threads:
             t.join(20)
+        # Both succeed (no primary-key race surfacing as a 500) and exactly one
+        # row survives, still naming the League.
+        self.assertEqual({r[0] for r in results.values()}, {200}, results)
+        self.assertEqual(self._saved_league("user_admin"), lid)
 
-        self.assertIn(outcome.get("status"), (200, 404), outcome)
-        saved = self._saved_row("user_admin")
-        if saved is not None and saved.league_id is not None:
-            # A League was recorded — it may only be one whose binding existed
-            # when the write committed.
-            self.assertEqual(outcome["status"], 200, outcome)
-        # Whatever happened, what the endpoint REPORTS must agree with what the
-        # binding table now says — no dangling selection is ever rendered.
-        _s, rendered = self._req("GET", "/api/context", opener=admin)
-        if rendered["league_id"] is not None:
+    def test_revoked_authorization_restores_the_saved_league_unrewritten(self):
+        """Authorization revocation — distinct from unbinding — must IGNORE the
+        saved League, never rewrite it, so restoring authority restores the
+        operator's own choice rather than silently losing it."""
+        fx = self._transfer_scenario()
+        official = self._account("off_r", Role.OFFICIAL,
+                                 {"official_id": fx["oid"]})
+        status, got = self._req(
+            "POST", "/api/context",
+            {"program_id": fx["pid"], "season_id": fx["sid"],
+             "league_id": fx["gold"]}, opener=official)
+        self.assertEqual(status, 200, got)
+
+        assignments = self.store.assignments_for_official(fx["oid"])
+        self.assertTrue(assignments)
+        with self.store.transaction():
+            for a in assignments:
+                self.store.remove_official_assignment(a.id)
+
+        _s, revoked = self._req("GET", "/api/context", opener=official)
+        self.assertIsNone(revoked["league_id"], revoked)
+        self.assertIsNone(revoked["league"], revoked)
+        self.assertEqual(self._offered_leagues(official, fx["pid"]), set())
+        self.assertEqual(self._saved_league("user_off_r"), fx["gold"])  # kept
+
+        with self.store.transaction():
+            for a in assignments:
+                self.store.add_official_assignment(a)
+
+        _s, restored = self._req("GET", "/api/context", opener=official)
+        self.assertEqual(restored["league_id"], fx["gold"], restored)
+        self.assertEqual(restored["league"]["id"], fx["gold"], restored)
+
+    # -- races -------------------------------------------------------------
+    def _mutate_after_league_check(self, mutate):
+        """Land ``mutate`` at the REAL boundary — immediately after
+        ``authorized_league_ids`` has validated the League, before the enclosing
+        transaction writes. Returns a ``fired`` dict the caller MUST assert, so
+        the barrier can never silently stop engaging (the exact failure mode
+        that made a sibling race test vacuous earlier in this branch).
+
+        A start-barrier alone is NOT a race: two threads released together can
+        still run entirely sequentially and the assertions pass regardless.
+        Injecting at the validate->write seam is what makes the window real and
+        deterministic on every backend.
+        """
+        original = context_scope.authorized_league_ids
+        fired = {"done": False}
+
+        def wrapper(*a, **k):
+            result = original(*a, **k)
+            if not fired["done"]:
+                fired["done"] = True
+                mutate()
+            return result
+
+        context_scope.authorized_league_ids = wrapper
+        self.addCleanup(
+            setattr, context_scope, "authorized_league_ids", original)
+        return fired
+
+    def _assert_no_dangling_league(self, opener, label):
+        """What the endpoint RENDERS must agree with the binding/authorization
+        state — never a hybrid payload, never a dangling id, never enumeration
+        of something the caller could not have selected."""
+        _s, rendered = self._req("GET", "/api/context", opener=opener)
+        self.assertNotIn("error", rendered, (label, rendered))
+        if rendered["league_id"] is None:
+            self.assertIsNone(rendered["league"], (label, rendered))
+        else:
+            self.assertIsNotNone(rendered["league"], (label, rendered))
+            self.assertEqual(rendered["league"]["id"], rendered["league_id"],
+                             (label, rendered))
             self.assertIsNotNone(
                 self.store.league_season_for(rendered["league_id"],
                                              rendered["season_id"]),
-                rendered)
+                (label, "rendered a League with no binding", rendered))
+        return rendered
+
+    def _assert_race_outcome(self, status, resp, label):
+        """Either the wholly-authorized pre-change result, or a STABLE
+        post-change rejection. Never a 500, and never an integrity error
+        escaping as one."""
+        self.assertIn(status, (200, 404), (label, resp))
+        if status == 200:
+            self.assertNotIn("error", resp, (label, resp))
+            if resp["league_id"] is None:
+                self.assertIsNone(resp["league"], (label, resp))
+            else:
+                self.assertEqual(resp["league"]["id"], resp["league_id"],
+                                 (label, resp))
+        else:
+            self.assertEqual(resp["error"]["details"].get("reason"),
+                             "league_not_accessible", (label, resp))
+
+    def test_unbind_at_the_validation_write_boundary(self):
+        """The unbind lands AFTER the League validated, BEFORE the write."""
+        admin = self._login("admin")
+        pid, sid, lid = self._program_season_league()
+        bindings = self._league_season_count()
+        fired = self._mutate_after_league_check(lambda: self._unbind(lid, sid))
+
+        status, resp = self._req(
+            "POST", "/api/context",
+            {"program_id": pid, "season_id": sid, "league_id": lid},
+            opener=admin)
+
+        self.assertTrue(fired["done"], "barrier never engaged — vacuous race")
+        self._assert_race_outcome(status, resp, "unbind@boundary")
+        # The context endpoint must never create or repair the binding it has
+        # just failed to find.
+        self.assertEqual(self._league_season_count(), bindings - 1)
+        self.assertIsNone(self.store.league_season_for(lid, sid))
+        self._assert_no_dangling_league(admin, "unbind@boundary")
+
+    def test_authorization_revocation_at_the_validation_write_boundary(self):
+        """Same seam, different invalidation: the caller's AUTHORITY is revoked
+        between validation and write. A scoped role must never end up having
+        enumerated or persisted a League it may no longer see."""
+        fx = self._transfer_scenario()
+        official = self._account("off_race", Role.OFFICIAL,
+                                 {"official_id": fx["oid"]})
+        assignments = self.store.assignments_for_official(fx["oid"])
+
+        def revoke():
+            with self.store.transaction():
+                for a in assignments:
+                    self.store.remove_official_assignment(a.id)
+
+        bindings = self._league_season_count()
+        fired = self._mutate_after_league_check(revoke)
+        status, resp = self._req(
+            "POST", "/api/context",
+            {"program_id": fx["pid"], "season_id": fx["sid"],
+             "league_id": fx["gold"]}, opener=official)
+
+        self.assertTrue(fired["done"], "barrier never engaged — vacuous race")
+        self._assert_race_outcome(status, resp, "revoke@boundary")
+        self.assertEqual(self._league_season_count(), bindings)
+        # Post-revocation the League is neither offered nor rendered.
+        self.assertEqual(self._offered_leagues(official, fx["pid"]), set())
+        rendered = self._assert_no_dangling_league(official, "revoke@boundary")
+        self.assertIsNone(rendered["league_id"], rendered)
+
+    def test_get_is_snapshot_consistent_at_its_league_boundary(self):
+        """The READ path gets the same treatment: a mutation landing inside the
+        resolve window must still yield a consistent payload, and must never
+        rewrite the saved preference."""
+        admin = self._login("admin")
+        pid, sid, lid = self._program_season_league()
+        self._req("POST", "/api/context",
+                  {"program_id": pid, "season_id": sid, "league_id": lid},
+                  opener=admin)
+        fired = self._mutate_after_league_check(lambda: self._unbind(lid, sid))
+
+        status, resp = self._req("GET", "/api/context", opener=admin)
+        self.assertTrue(fired["done"], "barrier never engaged — vacuous race")
+        self.assertEqual(status, 200, resp)
+        if resp["league_id"] is not None:
+            self.assertEqual(resp["league"]["id"], resp["league_id"], resp)
+        self.assertEqual(self._saved_league("user_admin"), lid)  # not rewritten
+
+    def test_independent_connection_commits_while_the_request_is_paused(self):
+        """The genuinely concurrent shape — PostgreSQL only.
+
+        Memory/SQLite serialize every writer behind one process lock, so a
+        second connection CANNOT commit while the first holds its transaction;
+        the boundary tests above are the reachable equivalent there. Skipped
+        with a visible reason rather than silently omitted."""
+        if not self.is_postgres():
+            self.skipTest("independent-connection commit-while-paused needs "
+                          "PostgreSQL; Memory/SQLite serialize on one lock")
+        admin = self._login("admin")
+        pid, sid, lid = self._program_season_league()
+        paused, release = threading.Event(), threading.Event()
+        fired = {"done": False}
+        original = context_scope.authorized_league_ids
+
+        def wrapper(*a, **k):
+            result = original(*a, **k)
+            if not fired["done"]:
+                fired["done"] = True
+                paused.set()
+                release.wait(20)
+            return result
+
+        context_scope.authorized_league_ids = wrapper
+        self.addCleanup(
+            setattr, context_scope, "authorized_league_ids", original)
+        out = {}
+
+        def post():
+            op = self._login("admin")
+            out["r"] = self._req(
+                "POST", "/api/context",
+                {"program_id": pid, "season_id": sid, "league_id": lid},
+                opener=op)
+
+        thread = threading.Thread(target=post)
+        thread.start()
+        try:
+            self.assertTrue(paused.wait(20),
+                            "request never reached the League boundary")
+            # Connection B commits the unbind while A is paused mid-transaction.
+            mutator = SqlStore(self.database_url())
+            try:
+                ls = mutator.league_season_for(lid, sid)
+                if ls is not None:
+                    with mutator.transaction():
+                        mutator.delete_league_season(ls.id)
+            finally:
+                mutator.close()
+        finally:
+            release.set()
+            thread.join(30)
+
+        status, resp = out["r"]
+        self._assert_race_outcome(status, resp, "pg-concurrent")
+        self.assertIsNone(self.store.league_season_for(lid, sid))
+        self._assert_no_dangling_league(admin, "pg-concurrent")
 
 
 class MemoryLeagueContextHttpTest(LeagueContextHttpContract, unittest.TestCase):
@@ -653,6 +1002,12 @@ class PostgresLeagueContextHttpTest(LeagueContextHttpContract,
                                     unittest.TestCase):
     def database_url(self):
         return os.environ["TEST_DATABASE_URL"]
+
+    def is_postgres(self):
+        # Without this override the independent-connection race would skip on
+        # EVERY backend and the suite would still report OK — the same silent
+        # no-coverage failure this file's barriers are written to prevent.
+        return True
 
 
 if __name__ == "__main__":
