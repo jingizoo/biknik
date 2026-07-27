@@ -189,6 +189,7 @@ jobs:
           node --check hockey-scheduler/e2e/home-tasks-hub.js
           node --check hockey-scheduler/e2e/setup-workflow-hub.js
           node --check hockey-scheduler/e2e/role-home-journeys.js
+          node --check hockey-scheduler/e2e/role-authorization-matrix.js
           node --check hockey-scheduler/e2e/setup-progress-conflict-attention.js
           node --check hockey-scheduler/e2e/breakpoint-contract.js
           node --check hockey-scheduler/e2e/breakpoint-boundaries.js
@@ -225,7 +226,7 @@ jobs:
           - shard: 2
             scripts: "team-division-participation scheduler-empty-state scheduler-already-scheduled allowed-venues venue-access-cleanup venue-sharing permanent-teams player-edit accessibility-foundations setup-workflow-hub"
           - shard: 3
-            scripts: "safe-destructive destructive-surfaces reset-visibility factory-reset demo-lifecycle api-error-resilience ice-availability-builder context-switcher role-home-journeys"
+            scripts: "safe-destructive destructive-surfaces reset-visibility factory-reset demo-lifecycle api-error-resilience ice-availability-builder context-switcher role-home-journeys role-authorization-matrix"
           - shard: 4
             scripts: "v1-dependency-proof team-club-optional division-delete-cleanup registration-cleanup records-delete coach-scope player-lifecycle home-tasks-hub setup-progress-conflict-attention"
     steps:
