@@ -15,20 +15,29 @@
 //   1. the correct initial landing destination;
 //   2. the exact set of nav tabs visible for that role (gateChrome's real
 //      permission gates, not an assumed subset);
-//   3. one authorized primary action reached and activated by KEYBOARD
-//      (Tab/focus + Enter), proven by its real, persisted effect;
+//   3. one authorized primary action reached via a real, BOUNDED Tab/
+//      Shift+Tab traversal from a defined starting point -- never
+//      page.focus() (it can jump past the real tab order and never
+//      triggers :focus-visible) -- with the landed node's exact identity
+//      and a real, browser-computed visible focus indicator asserted
+//      before Enter, then the persisted effect asserted after;
 //   4. an unauthorized action absent or disabled (nav tabs AND, for the
 //      roles it applies to, the Setup Records "+ New" controls);
 //   5. direct navigation (calling the app's own switchTab() the way a
 //      malicious/curious console user would, not a URL route -- this SPA
 //      has none) into a hidden view renders no privileged data/controls;
 //   6. a real unauthorized mutation request is rejected by the server (403
-//      "forbidden"), never merely a hidden button -- verified again at the
-//      end by re-reading the affected collection as League Admin and
-//      confirming nothing was created;
-//   7. zero browser console/page errors (the deliberately-provoked 403s'
-//      own "Failed to load resource" noise is the one expected exception,
-//      same convention every other journey in this suite uses).
+//      "forbidden"), with a snapshot of the exact affected collection taken
+//      through an authorized reader session BEFORE and AFTER the probe and
+//      required to be byte-identical -- not merely a 403 status, which an
+//      orchestration bug could still return after a real write;
+//   7. zero unexpected browser console/page errors AND zero unexpected
+//      HTTP responses >=400 -- each negative probe's own exact
+//      method/path/403 is individually registered and consumed, so an
+//      unrelated 404/500 (or a probe answering something other than the
+//      expected 403) cannot hide behind a blanket "ignore resource-load
+//      noise" filter. A self-test proves the detector actually catches an
+//      unregistered failure before it is ever relied on.
 //
 // League Admin holds every permission, so legs 4-6 don't apply to it the
 // way they do the other six roles -- its own scenario instead proves the
@@ -184,11 +193,75 @@ function assertVisibleTabs(fail, label, actual, expected) {
   }
 }
 
-// Real keyboard activation, not a click: focus the element the way Tab
-// would land on it, then Enter -- the same proof-of-keyboard-operability
-// convention home-tasks-hub.js uses throughout.
-async function keyboardActivate(page, selector) {
-  await page.focus(selector);
+// Real keyboard-only reachability + activation (#345 exact-head review:
+// page.focus() bypasses the actual Tab order entirely and never triggers
+// :focus-visible, so it proved neither "reachable by Tab" nor "visible
+// focus indicator" -- both required legs of this journey's own claim).
+//
+// Starts from a DEFINED, reproducible point. `withinDialog: false` (the
+// default) blurs whatever currently has focus so the very next Tab press is
+// the document's own first tab stop -- the same convention
+// accessibility-foundations.js's own skip-link check uses. `withinDialog:
+// true` instead asserts focus is ALREADY inside the currently-open
+// `.drawer[role=dialog]`/`.modal[role=dialog]` (itself a defined,
+// already-proven starting point -- the drawer's own documented
+// auto-focus-on-open behavior) and tabs forward from there without ever
+// leaving it.
+//
+// Bounded (not unbounded polling): a broken tabindex, a disabled control, or
+// an unreachable stop placed in front of the real target must exhaust the
+// bound and fail this leg, not silently pass.
+async function tabToAndActivate(page, selector, label, {
+  maxPresses = 200, shift = false, withinDialog = false,
+} = {}) {
+  if (withinDialog) {
+    const startsInDialog = await page.evaluate(() => {
+      const dialog = document.querySelector('.drawer[role="dialog"], .modal[role="dialog"]');
+      return !!(dialog && document.activeElement && dialog.contains(document.activeElement));
+    });
+    if (!startsInDialog) {
+      throw new Error(`${label}: expected focus already inside the open `
+        + `dialog before tabbing toward ${selector}`);
+    }
+  } else {
+    await page.evaluate(() => {
+      if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+    });
+  }
+  let reachedAt = null;
+  for (let i = 1; i <= maxPresses; i += 1) {
+    await page.keyboard.press(shift ? "Shift+Tab" : "Tab");
+    const hit = await page.evaluate((sel) => {
+      const el = document.activeElement;
+      const target = document.querySelector(sel);
+      return !!(el && target && el === target);
+    }, selector);
+    if (hit) { reachedAt = i; break; }
+  }
+  if (reachedAt === null) {
+    throw new Error(`${label}: could not reach ${selector} via real keyboard `
+      + `Tab traversal within ${maxPresses} presses`);
+  }
+  // A real, browser-computed focus indicator -- not just "is the
+  // activeElement", which an element can satisfy while being visually
+  // indistinguishable (outline:none with no replacement). Requires either
+  // the native outline or an explicit compensating box-shadow, this app's
+  // own convention wherever it overrides the UA outline (.icon-btn,
+  // .ctx-select, .login-field input, etc.).
+  const focusStyle = await page.evaluate((sel) => {
+    const el = document.querySelector(sel);
+    if (!el || document.activeElement !== el) return null;
+    const cs = getComputedStyle(el);
+    return { outlineStyle: cs.outlineStyle, outlineWidth: cs.outlineWidth, boxShadow: cs.boxShadow };
+  }, selector);
+  const visible = !!focusStyle && (
+    (focusStyle.outlineStyle !== "none" && focusStyle.outlineWidth !== "0px")
+    || focusStyle.boxShadow !== "none"
+  );
+  if (!visible) {
+    throw new Error(`${label}: reached ${selector} via Tab (press ${reachedAt}) `
+      + `but it has no visible focus indicator: ${JSON.stringify(focusStyle)}`);
+  }
   await page.keyboard.press("Enter");
 }
 
@@ -245,15 +318,66 @@ async function assertNoEnabledMutations(page, fail, label) {
   }
 }
 
-// A real, unauthorized HTTP mutation must be rejected by the SERVER (403
-// "forbidden"), never merely a hidden button (#345 testing rule). Runs
-// entirely outside the DOM/UI -- a raw fetch from the role's own real
-// session cookie.
-async function assertForbidden(page, fail, label, path, body) {
-  const res = await apiPost(page, path, body || {});
+// Precise unauthorized-response tracking (#345 exact-head review): rather
+// than blanket-ignoring every "Failed to load resource" console line (which
+// could hide an unrelated, genuinely unexpected 404/500), track the EXACT
+// method/path/status this journey's own negative probes expect via the real
+// network layer -- not console-text matching, which carries neither the
+// method nor the path. Any response >=400 that doesn't match a registered
+// expectation is a hard failure; a "Failed to load resource" console line is
+// only ever silently absorbed once per REALIZED registered expectation.
+function makeFailureTracker(page, errors) {
+  const expected = []; // {method, path, status, matched}
+  const unexpected = []; // "METHOD path -> status" strings
+  let allowance = 0;
+  page.on("response", (response) => {
+    const status = response.status();
+    if (status < 400) return;
+    let respPath;
+    try { respPath = new URL(response.url()).pathname; } catch (_) { respPath = response.url(); }
+    const method = response.request().method();
+    const match = expected.find((e) =>
+      !e.matched && e.method === method && e.path === respPath && e.status === status);
+    if (match) { match.matched = true; allowance += 1; } else {
+      unexpected.push(`${method} ${respPath} -> ${status}`);
+    }
+  });
+  page.on("console", (m) => {
+    if (m.type() !== "error") return;
+    if (/Failed to load resource/.test(m.text()) && allowance > 0) { allowance -= 1; return; }
+    errors.push(`[console] ${m.text()}`);
+  });
+  return {
+    expect(method, reqPath, status) { expected.push({ method, path: reqPath, status, matched: false }); },
+    unexpected,
+    unmatched: () => expected.filter((e) => !e.matched),
+  };
+}
+
+// A real unauthorized HTTP mutation must be rejected by the SERVER (403
+// "forbidden"), and a snapshot of the affected collection -- read through an
+// INDEPENDENT, authorized reader session, since most roles here cannot read
+// what they're forbidden to write -- must be byte-identical before and
+// after. A 403 status alone (the previous version of this journey's own
+// check) cannot rule out an orchestration bug that mutates and THEN answers
+// 403; this closes that gap for every probe, including the two
+// (Player/Guardian build-roster) whose body carries no distinguishing
+// marker a simple string search could ever have caught.
+async function assertForbiddenNoChange(page, reader, tracker, fail, label, mutatePath, body, snapshotPath) {
+  const before = await apiGet(reader, snapshotPath);
+  tracker.expect("POST", mutatePath, 403);
+  const res = await apiPost(page, mutatePath, body || {});
   if (res.status !== 403 || !res.body.error || res.body.error.code !== "forbidden") {
-    fail(`${label}: expected 403 "forbidden" POSTing ${path}, got `
+    fail(`${label}: expected 403 "forbidden" POSTing ${mutatePath}, got `
       + `status=${res.status} body=${JSON.stringify(res.body)}`);
+  }
+  const after = await apiGet(reader, snapshotPath);
+  const beforeStr = JSON.stringify(before.body);
+  const afterStr = JSON.stringify(after.body);
+  if (beforeStr !== afterStr) {
+    fail(`${label}: rejected with 403 but ${snapshotPath} changed anyway -- `
+      + `this was a real write, not just a hidden button. before=${beforeStr} `
+      + `after=${afterStr}`);
   }
 }
 
@@ -273,25 +397,45 @@ async function checkViewport(browser, viewport) {
   const page = await context.newPage();
   const errors = [];
   page.on("pageerror", (e) => errors.push(`[pageerror] ${e.message}`));
-  page.on("console", (m) => {
-    // Every negative-mutation probe below deliberately provokes a 403,
-    // which Chromium always logs as a resource-load console error
-    // regardless of how gracefully app code handles it -- same accepted
-    // convention coach-scope.js/scheduling-policy.js/home-tasks-hub.js use.
-    if (m.type() === "error" && !/Failed to load resource/.test(m.text())) {
-      errors.push(`[console] ${m.text()}`);
-    }
-  });
+  const tracker = makeFailureTracker(page, errors);
 
   const fail = (msg) => { throw new Error(`[${viewport.label}] ${msg}`); };
   const L = viewport.label;
   const suffix = viewport.port; // keep usernames unique per viewport/port
 
+  let reader; // the independent authorized-reader context, opened once the fixture exists
   try {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
     await reachDashboard(page); // signed in as the auto-provisioned League Admin ("admin"/"demo")
+
+    // ============================================================
+    // Self-test: prove the failure tracker actually catches an unregistered
+    // (unexpected) HTTP failure before anything else relies on it. Without
+    // this, a broken tracker (e.g. one that always grants allowance) would
+    // let every OTHER assertion in this file pass for the wrong reason.
+    // ============================================================
+    const errorsBeforeSelfTest = errors.length;
+    const bogus = await apiGet(page, "/api/does-not-exist-xyz-345");
+    if (bogus.status !== 404) {
+      fail(`self-test: expected the deliberately unregistered route to `
+        + `404, got ${bogus.status}`);
+    }
+    await new Promise((r) => setTimeout(r, 150)); // let the response listener fire
+    const caughtSelfTest = tracker.unexpected.some(
+      (u) => u.includes("does-not-exist-xyz-345") && u.endsWith("-> 404"));
+    if (!caughtSelfTest) {
+      fail("self-test: the unexpected-response tracker did not catch a "
+        + "deliberately unregistered 404 -- detection is broken, so every "
+        + "later 'no unexpected failures' assertion in this file would be "
+        + "meaningless");
+    }
+    // Consumed and proven -- discard this self-test's own artifacts (both
+    // the tracked response and its console noise) so they don't fail the
+    // real run for a reason unrelated to any role's own behavior.
+    tracker.unexpected.length = 0;
+    errors.length = errorsBeforeSelfTest;
 
     // ============================================================
     // League Admin -- landing, full nav, and the required #345 leg:
@@ -318,13 +462,18 @@ async function checkViewport(browser, viewport) {
       fail(`League Admin: expected a fresh Program to recommend "Add Season" `
         + `next, got ${JSON.stringify(s)}`);
     }
-    // Keyboard-reach and activate the card's own primary action -- not a
-    // click -- landing focus inside the real Season drawer it opens.
-    await keyboardActivate(page, "[data-setup-progress-action]");
+    // Keyboard-reach and activate the card's own primary action via a real,
+    // bounded Tab traversal from a blurred document start -- landing focus
+    // inside the real Season drawer it opens.
+    await tabToAndActivate(page, "[data-setup-progress-action]", "League Admin Add Season");
     await page.waitForSelector(".drawer[role=dialog]", { timeout: 10000 });
     const seasonName = `Matrix Season ${suffix}`;
     await page.fill("#f-season", seasonName);
-    await keyboardActivate(page, '[data-drawer-submit="season"]');
+    // The drawer's own documented open behavior already auto-focused a
+    // field inside it (a defined starting point) -- tab forward from there,
+    // still entirely by keyboard, to reach the real submit control.
+    await tabToAndActivate(page, '[data-drawer-submit="season"]',
+      "League Admin submit Season", { withinDialog: true, maxPresses: 20 });
     await page.waitForSelector(".drawer[role=dialog]", { state: "detached", timeout: 10000 });
     // Read the real, persisted Season back through the API boundary (not
     // just the card's own re-render) -- proves the mutation reached the
@@ -421,7 +570,7 @@ async function checkViewport(browser, viewport) {
     // Seven distinct, role-scoped accounts (League Admin reuses the
     // existing seeded "admin"/"demo" login used to build this fixture).
     const PW = "matrix-account-pw";
-    const mk = (role, extra) => `matrix_${role}_${suffix}`;
+    const mk = (role) => `matrix_${role}_${suffix}`;
     const accounts = {
       arena_manager: { username: mk("arena"), role: "arena_manager", scope: {} },
       coach: { username: mk("coach"), role: "coach", scope: { team_id: coachTeam.body.id } },
@@ -448,6 +597,20 @@ async function checkViewport(browser, viewport) {
     if (verify.status !== 200 || verify.body.error) {
       fail(`guardian link verify failed: ${JSON.stringify(verify)}`);
     }
+
+    // An INDEPENDENT, authorized reader session (its own browser context),
+    // used ONLY to snapshot state before/after each negative-mutation probe
+    // below. Most roles under test cannot read the collections they're
+    // forbidden to write, so proving zero-write requires reading through a
+    // session that legitimately can -- the same authorized server boundary
+    // the rest of this journey already insists on.
+    const readerContext = await browser.newContext({
+      viewport: { width: viewport.width, height: viewport.height },
+    });
+    reader = await readerContext.newPage();
+    await reader.goto(base, { waitUntil: "domcontentloaded" });
+    await reader.waitForLoadState("networkidle").catch(() => {});
+    await loginAs(reader, "admin", "demo");
 
     // ============================================================
     // Explicit in-app, NO-RELOAD role switch: League Admin -> Viewer via
@@ -570,13 +733,12 @@ async function checkViewport(browser, viewport) {
     }
     await page.click('.tab[data-tab="dashboard"]');
     await reachDashboard(page);
-    // Recurring ice creation, reached and driven entirely by keyboard: nav
-    // to Calendar, activate "Build ice", preview, commit -- a REAL
-    // authorized mutation, not just a reachability check.
-    await page.focus('.tab[data-tab="calendar"]');
-    await page.keyboard.press("Enter");
+    // Recurring ice creation, reached and driven entirely by real keyboard
+    // Tab traversal: nav to Calendar, activate "Build ice", preview, commit
+    // -- a REAL authorized mutation, not just a reachability check.
+    await tabToAndActivate(page, '.tab[data-tab="calendar"]', "Arena Manager reach Calendar");
     await page.waitForSelector("[data-ice-builder-open]", { timeout: 10000 });
-    await keyboardActivate(page, "[data-ice-builder-open]");
+    await tabToAndActivate(page, "[data-ice-builder-open]", "Arena Manager open Build ice");
     await page.waitForSelector(".ib-wrap", { timeout: 10000 });
     await page.waitForSelector(`.ib-rink[value="${iceRink.body.id}"]`, { timeout: 10000 });
     await page.check(`.ib-rink[value="${iceRink.body.id}"]`);
@@ -584,9 +746,9 @@ async function checkViewport(browser, viewport) {
     const ibTo = new Date(ibFrom.getTime() + 13 * 24 * 3600 * 1000); // spans a Tue+Thu (default weekdays)
     await page.fill("#ib-from", dateOnly(ibFrom));
     await page.fill("#ib-to", dateOnly(ibTo));
-    await keyboardActivate(page, "[data-ib-preview]");
+    await tabToAndActivate(page, "[data-ib-preview]", "Arena Manager preview ice");
     await page.waitForSelector("[data-ib-commit]:not([disabled])", { timeout: 10000 });
-    await keyboardActivate(page, "[data-ib-commit]");
+    await tabToAndActivate(page, "[data-ib-commit]", "Arena Manager commit ice");
     await page.waitForFunction(() => !document.querySelector(".ib-wrap"), null, { timeout: 10000 });
     const overviewAfterIce = await apiGet(page, "/api/v2/setup/overview");
     const iceRinkSlots = (overviewAfterIce.body.ice_slots || [])
@@ -597,9 +759,11 @@ async function checkViewport(browser, viewport) {
     }
     // Unauthorized mutation, rejected by the SERVER: League-structure
     // Setup ("unrelated administration") requires MANAGE_SETUP, which
-    // Arena Manager does not hold.
-    await assertForbidden(page, fail, "Arena Manager",
-      "/api/setup/league", { name: "Should Not Exist (arena manager)" });
+    // Arena Manager does not hold. The affected collection (the whole
+    // Setup overview) must be byte-identical before and after.
+    await assertForbiddenNoChange(page, reader, tracker, fail, "Arena Manager",
+      "/api/setup/league", { name: "Should Not Exist (arena manager)" },
+      "/api/v2/setup/overview");
     await logout(page);
 
     // ============================================================
@@ -614,9 +778,9 @@ async function checkViewport(browser, viewport) {
     ]);
     await assertNoEnabledMutations(page, fail, "Coach (Setup Admin group hidden)");
     // The Next Game card (#146) links straight to Coach's own next game's
-    // roster -- keyboard-focus it directly (not click) and activate.
+    // roster -- reached and activated by a real, bounded Tab traversal.
     await page.waitForSelector('.dash-card [data-goto="roster"]', { timeout: 10000 });
-    await keyboardActivate(page, '.dash-card [data-goto="roster"]');
+    await tabToAndActivate(page, '.dash-card [data-goto="roster"]', "Coach reach Roster");
     await waitForView(page, "roster");
     await waitForRealContent(page);
     const coachRosterText = await page.evaluate(() =>
@@ -637,8 +801,9 @@ async function checkViewport(browser, viewport) {
     }
     await page.click('.tab[data-tab="dashboard"]');
     await reachDashboard(page);
-    await assertForbidden(page, fail, "Coach",
-      "/api/v2/setup/venue", { name: "Should Not Exist (coach)", organization_id: null });
+    await assertForbiddenNoChange(page, reader, tracker, fail, "Coach",
+      "/api/v2/setup/venue", { name: "Should Not Exist (coach)", organization_id: null },
+      "/api/v2/setup/overview");
     await logout(page);
 
     // ============================================================
@@ -659,7 +824,7 @@ async function checkViewport(browser, viewport) {
         + `got: ${playerText.slice(0, 200)}`);
     }
     await assertNoEnabledMutations(page, fail, "Player");
-    await keyboardActivate(page, '[data-goto="notifications"]');
+    await tabToAndActivate(page, '[data-goto="notifications"]', "Player reach Notifications");
     await waitForView(page, "notifications");
     await page.click('.tab[data-tab="player_home"]');
     await waitForView(page, "player_home");
@@ -669,8 +834,12 @@ async function checkViewport(browser, viewport) {
     if ((await page.evaluate(() => document.querySelectorAll(".sc-new").length)) !== 0) {
       fail("Player: direct-navigating to Setup must show no \"+ New\" controls");
     }
-    await assertForbidden(page, fail, "Player",
-      `/api/games/${game.body.id}/build-roster`, {});
+    // Player's own build-roster probe carries no distinguishing marker a
+    // string search could ever catch -- the game's real lineups (read
+    // through the authorized reader session) must be byte-identical.
+    await assertForbiddenNoChange(page, reader, tracker, fail, "Player",
+      `/api/games/${game.body.id}/build-roster`, {},
+      `/api/games/${game.body.id}/lineups`);
     await logout(page);
 
     // ============================================================
@@ -689,12 +858,13 @@ async function checkViewport(browser, viewport) {
       fail(`Guardian: expected "My Players" to list the verified junior `
         + `Jamie Junior ${suffix}, got: ${guardianText.slice(0, 200)}`);
     }
-    // Authorized primary action reached by keyboard: confirm attendance
-    // for the linked junior's real next game -- a genuine authorized
-    // mutation (RESPOND_AVAILABILITY), not merely a reachable button.
+    // Authorized primary action reached by a real, bounded Tab traversal:
+    // confirm attendance for the linked junior's real next game -- a
+    // genuine authorized mutation (RESPOND_AVAILABILITY), not merely a
+    // reachable button.
     const confirmSelector = `[data-g-confirm="${junior.body.id}"]`;
     await page.waitForSelector(confirmSelector, { timeout: 10000 });
-    await keyboardActivate(page, confirmSelector);
+    await tabToAndActivate(page, confirmSelector, "Guardian confirm attendance");
     // The disabled/"In ✓" button state is itself the proof of a real,
     // persisted server response -- renderJuniorCard only renders it
     // disabled once guardianHome reflects attendance_status "confirmed",
@@ -705,8 +875,9 @@ async function checkViewport(browser, viewport) {
     if ((await page.evaluate(() => document.querySelectorAll(".sc-new").length)) !== 0) {
       fail("Guardian: direct-navigating to Setup must show no \"+ New\" controls");
     }
-    await assertForbidden(page, fail, "Guardian",
-      `/api/games/${game.body.id}/build-roster`, {});
+    await assertForbiddenNoChange(page, reader, tracker, fail, "Guardian",
+      `/api/games/${game.body.id}/build-roster`, {},
+      `/api/games/${game.body.id}/lineups`);
     await logout(page);
 
     // ============================================================
@@ -725,7 +896,7 @@ async function checkViewport(browser, viewport) {
     if (!/No assignments yet/i.test(officialText)) {
       fail(`Official: expected the Inbox empty state, got: ${officialText.slice(0, 200)}`);
     }
-    await keyboardActivate(page, '.tab[data-tab="notifications"]');
+    await tabToAndActivate(page, '.tab[data-tab="notifications"]', "Official reach Notifications");
     await waitForView(page, "notifications");
     await page.click('.tab[data-tab="inbox"]');
     await waitForView(page, "inbox");
@@ -735,11 +906,12 @@ async function checkViewport(browser, viewport) {
     const offUsersBypass = await page.evaluate(() =>
       (document.querySelector("#content .banner") || {}).textContent || "");
     if (!/League admins only/i.test(offUsersBypass)) {
-      fail(`Official: direct-navigating to Users must show the "Operators `
-        + `only" guard, got "${offUsersBypass}"`);
+      fail(`Official: direct-navigating to Users must show the "League `
+        + `admins only" guard, got "${offUsersBypass}"`);
     }
-    await assertForbidden(page, fail, "Official",
-      "/api/setup/official", { name: "Should Not Exist (official)" });
+    await assertForbiddenNoChange(page, reader, tracker, fail, "Official",
+      "/api/setup/official", { name: "Should Not Exist (official)" },
+      "/api/v2/setup/overview");
     await logout(page);
 
     // ============================================================
@@ -763,46 +935,42 @@ async function checkViewport(browser, viewport) {
     const viewerBanner = await page.evaluate(() =>
       (document.querySelector("#content .banner") || {}).textContent || "");
     if (!/League admins only/i.test(viewerBanner)) {
-      fail(`Viewer: direct-navigating to Users must show the "Operators `
-        + `only" guard, got "${viewerBanner}"`);
+      fail(`Viewer: direct-navigating to Users must show the "League `
+        + `admins only" guard, got "${viewerBanner}"`);
     }
     await page.click('.tab[data-tab="standings"]');
     await waitForView(page, "standings");
-    await assertForbidden(page, fail, "Viewer",
+    await assertForbiddenNoChange(page, reader, tracker, fail, "Viewer",
       "/api/setup/team", { club_id: club.body.id, league_id: level.body.id,
-        name: "Should Not Exist (viewer)" });
+        name: "Should Not Exist (viewer)" },
+      "/api/v2/setup/overview");
     await logout(page);
 
-    // ============================================================
-    // Final server-side proof that every negative-mutation probe above
-    // was genuinely rejected -- not merely a 403 status that a bug could
-    // still have let slip past into a write. Re-read the affected
-    // collections as League Admin and confirm none of the six
-    // "Should Not Exist"/probe entities exist anywhere.
-    // ============================================================
-    await loginAs(page, "admin", "demo");
-    const finalOverview = await apiGet(page, "/api/v2/setup/overview");
-    const bodyText = JSON.stringify(finalOverview.body);
-    if (/Should Not Exist/.test(bodyText)) {
-      fail("a negative-mutation probe was rejected with 403 but still "
-        + "left a persisted record -- rejection was not real");
+    // Every registered negative-mutation expectation must have actually
+    // occurred -- if a probe silently answered something other than 403
+    // (and assertForbiddenNoChange's own explicit status check somehow
+    // didn't catch it), an unrealized expectation here would still fail
+    // the run rather than pass by omission.
+    const unrealized = tracker.unmatched();
+    if (unrealized.length) {
+      fail(`expected negative-mutation probe(s) never occurred: ${JSON.stringify(unrealized)}`);
     }
-    const officialsAfter = await apiGet(page, "/api/setup/official").catch(() => null);
-    if (officialsAfter && /Should Not Exist \(official\)/.test(JSON.stringify(officialsAfter.body))) {
-      fail("Official's negative-mutation probe (create Official) left a persisted record");
+    if (tracker.unexpected.length) {
+      fail(`unexpected HTTP failure response(s) during this run:\n${tracker.unexpected.join("\n")}`);
     }
-
     if (errors.length) {
       fail(`console/page errors:\n${errors.join("\n")}`);
     }
     console.log(`[${L}] OK — all seven roles land on their correct `
       + `destination with exactly the right nav, reach one authorized `
-      + `action by keyboard, cannot bypass authorization by direct `
-      + `navigation or a real HTTP mutation, and role/session switches `
-      + `leak nothing.`);
+      + `action via real bounded keyboard Tab traversal, cannot bypass `
+      + `authorization by direct navigation, and every unauthorized `
+      + `mutation is rejected by the server with zero actual change to the `
+      + `affected collection.`);
   } catch (error) {
     throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {
+    if (reader) await reader.context().close();
     await context.close();
     await stopServer(server);
   }
