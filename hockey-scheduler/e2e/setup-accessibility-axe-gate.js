@@ -41,9 +41,13 @@
 // this journey is run against that edit to confirm the gate reports the
 // EXACT violating node on both, then the edit is reverted (`git checkout`,
 // confirmed clean) and the gate re-run to confirm both viewports pass again
-// on the real, unmodified markup. The unexpected-HTTP-failure ledger has
-// its own, separate self-test: an unregistered 404 must be caught by the
-// same tracker the real run uses.
+// on the real, unmodified markup. A second falsifiability leg covers the
+// scoped color-contrast fix itself (styles.css): temporarily revert ONLY
+// that fix, confirm this same gate fails with the exact previously-reported
+// Dashboard/Setup selectors and contrast ratio, then restore it and confirm
+// both viewports pass again. The unexpected-HTTP-failure ledger has its own,
+// separate self-test: an unregistered 404 must be caught by the same
+// tracker the real run uses.
 const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
@@ -145,17 +149,15 @@ async function hiddenFocusedControl(page) {
 // addScriptTag({path}) -- which inlines the file body -- is blocked); same
 // technique as home-tasks-hub.js/shell-accessibility-coverage.js. Filters to
 // serious/critical only, per #359's own stated bar.
-async function seriousOrCriticalViolations(page, selector, disabledRules) {
+async function seriousOrCriticalViolations(page, selector) {
   await page.addScriptTag({ url: "/__axe-core__.js" });
-  return page.evaluate(async ({ sel, rules }) => {
+  return page.evaluate(async (sel) => {
     const root = sel ? document.querySelector(sel) : document;
     if (!root) return [{ id: "selector-not-found", impact: "critical", help: `"${sel}" not found`, nodes: [] }];
-    const ruleConfig = {};
-    (rules || []).forEach((id) => { ruleConfig[id] = { enabled: false }; });
-    const report = await axe.run(root, { resultTypes: ["violations"], rules: ruleConfig });
+    const report = await axe.run(root, { resultTypes: ["violations"] });
     return report.violations.filter((v) => v.impact === "serious" || v.impact === "critical")
       .map((v) => ({ id: v.id, impact: v.impact, help: v.help, nodes: v.nodes.map((n) => n.target.join(" ")) }));
-  }, { sel: selector, rules: disabledRules || [] });
+  }, selector);
 }
 
 // A precise error ledger, not a text-pattern blanket filter: this journey
@@ -256,7 +258,7 @@ async function checkViewport(browser, viewport) {
   // the root axe scans (never `document` for an authenticated surface --
   // scoping to #content/a specific surface root keeps a violation
   // elsewhere in the shell from masking which surface actually owns it).
-  const scanSurface = async (name, selector, expectedTitle, disabledRules) => {
+  const scanSurface = async (name, selector, expectedTitle) => {
     scanned.add(name);
     await waitForTitle(page, expectedTitle, fail, name);
     if (await skipLinkDangling(page)) {
@@ -269,7 +271,7 @@ async function checkViewport(browser, viewport) {
       });
       fail(`${name}: focus is on a hidden control -- ${JSON.stringify(info)}`);
     }
-    const violations = await seriousOrCriticalViolations(page, selector, disabledRules);
+    const violations = await seriousOrCriticalViolations(page, selector);
     if (violations.length) {
       fail(`${name}: automated accessibility scan found serious/critical `
         + `violations:\n${violations.map((v) =>
@@ -310,29 +312,21 @@ async function checkViewport(browser, viewport) {
     }
 
     // ---- (3) Authenticated Home/Tasks (Dashboard) -------------------------
-    // color-contrast is disabled HERE ONLY, with a rule-specific documented
-    // reason (#359's own scope boundary permits this, and explicitly
-    // forbids fixing application code from this test-only PR): the
-    // Dashboard's stat tiles/empty-state cards (.ds-label/.ds-sub/.dch-sub/
-    // .na-empty) use the sitewide --muted:#8e8e93 (styles.css:5), which
-    // measures 3.26:1 against white (needs 4.5:1). The setup-progress
-    // card's own .sp-card override (--muted:#6b6b70, styles.css:27) and
-    // .login-screen/.public-screen's identical override (web.css:290)
-    // already prove the fix; it was just never applied to the REST of the
-    // Dashboard, because no prior scan ever ran axe against #content as a
-    // whole. Reported with exact violating selectors on #359; every OTHER
-    // rule, and every OTHER surface's color-contrast check, stays enabled.
-    await scanSurface("Home/Tasks (Dashboard)", "#content", `Dashboard — ${APP_TITLE}`,
-      ["color-contrast"]);
+    // --muted:#8e8e93 (styles.css:5, 3.26:1 on white) previously failed
+    // color-contrast here (.ds-label/.ds-sub/.dch-sub/.na-empty) -- fixed by
+    // a scoped body[data-view="dashboard"] .main > .content override
+    // reusing the same verified --muted:#6b6b70 the setup-progress card and
+    // login/public screens already use (styles.css). No exclusion: this
+    // rule runs unmodified.
+    await scanSurface("Home/Tasks (Dashboard)", "#content", `Dashboard — ${APP_TITLE}`);
 
     // ---- (4)-(10) Setup hub + all six workflow landings --------------------
     await page.click('.tab[data-tab="setup"]');
     await page.waitForFunction(() => document.body.dataset.view === "setup", null, { timeout: 10000 });
     await page.click('[data-setup-view="hub"]');
     await page.waitForSelector(".swf-grid", { timeout: 10000 });
-    // Same --muted:#8e8e93 root cause as the Dashboard above (.swf-purpose/
-    // .swf-stat/.swf-optional/.muted) -- reported on #359, not fixed here.
-    await scanSurface("Setup hub", "#content", `Setup — ${APP_TITLE}`, ["color-contrast"]);
+    // Same --muted fix, scoped to .swf-grid (styles.css) -- no exclusion.
+    await scanSurface("Setup hub", "#content", `Setup — ${APP_TITLE}`);
 
     const foundCardKeys = await page.$$eval("[data-setup-workflow-card]",
       (els) => els.map((e) => e.dataset.setupWorkflowCard));
@@ -344,11 +338,8 @@ async function checkViewport(browser, viewport) {
       await page.waitForSelector(`[data-setup-workflow="${key}"]`, { timeout: 10000 });
       await page.click(`[data-setup-workflow="${key}"]`);
       await page.waitForSelector(".swf-landing", { timeout: 10000 });
-      // Same --muted:#8e8e93 root cause (.swf-purpose/.swf-stat/.swf-back/
-      // section-title, even the primary .swf-landing button itself on some
-      // landings) -- reported on #359, not fixed here.
-      await scanSurface(`Setup workflow landing: ${key}`, ".swf-landing", `Setup — ${APP_TITLE}`,
-        ["color-contrast"]);
+      // Same --muted fix, scoped to .swf-landing (styles.css) -- no exclusion.
+      await scanSurface(`Setup workflow landing: ${key}`, ".swf-landing", `Setup — ${APP_TITLE}`);
       await page.click("[data-setup-workflow='']"); // back to the hub
       await page.waitForSelector(".swf-grid", { timeout: 10000 });
     }

@@ -144,10 +144,17 @@ body[data-view="games"] .main > .content { max-width: 1480px; }
   position: absolute; top: 15px; right: 16px; font-size: 11px; font-weight: 700;
   padding: 3px 9px; border-radius: 20px;
 }
-.ds-pill.green { background: #e7f7ec; color: #1a8a44; }
+/* #359 exact-head review: .green/.gray measured 3.97:1/4.23:1 on their own
+   backgrounds (needs 4.5:1) -- found by the new axe CI gate. .amber/.blue
+   were not flagged and are left unchanged. Reuses .sp-card .badge.green/
+   .badge.gray's own verified-compliant text colors (styles.css) for the
+   same hue -- NOT the plain, unscoped .badge.green/.badge.gray (styles.css
+   lines ~300-302), which are themselves still short of 4.5:1 and out of
+   this fix's scope. */
+.ds-pill.green { background: #e7f7ec; color: #167029; }
 .ds-pill.amber { background: #fdf0dd; color: #b4690e; }
 .ds-pill.blue { background: #e8f0ff; color: #2563eb; }
-.ds-pill.gray { background: #eef0f4; color: #6b7280; font-family: var(--mono); }
+.ds-pill.gray { background: #eef0f4; color: #6b6b70; font-family: var(--mono); }
 
 /* ---------- dashboard: two-column body ---------- */
 .dash-grid { display: grid; grid-template-columns: 1fr 380px; gap: 16px; align-items: start; }
