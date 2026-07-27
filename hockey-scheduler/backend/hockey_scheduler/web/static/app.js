@@ -895,6 +895,43 @@ async function contextSeededDrawerValues(kind) {
       .concat(program.teams_without_league || []);
     return { ok: true, values: teams.length ? { "f-player-team": teams[0].id } : {} };
   }
+  // #345 batch 2 review blocker: the Setup workflow landings expose secondary
+  // create actions whose parent <select> spans EVERY Program (the #159
+  // context switcher is display-only, so those option lists are unfiltered).
+  // Opened with drawerValues = {}, drawerField()'s `current || rows[0][0]`
+  // fallback selects the first GLOBAL row -- so a valid submit persists the
+  // record under a different Program than the landing the operator is acting
+  // from. Same wrong-Program write risk rounds 5/6 closed for the hub-driven
+  // paths, reintroduced by copying Records' unseeded "+ New" onto a
+  // context-scoped surface.
+  if (kind === "level") {
+    // A League hangs off a Season. Seed from the ACTIVE Season in the context
+    // selection rather than from the hierarchy payload: it is the
+    // authoritative value the operator actually chose, and it avoids
+    // depending on a per-program `seasons` field this payload is not
+    // confirmed to carry -- an absent field would fall through to `{}` and
+    // silently restore the first-global fallback this fix exists to close.
+    // No active Season means there is nothing correct to seed, so fail closed
+    // rather than open the drawer on a global guess.
+    const seasonId = contextOptions && contextOptions.selected
+      && contextOptions.selected.season_id;
+    if (!seasonId) return { ok: false, needsSeason: true };
+    return { ok: true, values: { "f-level-season": seasonId } };
+  }
+  if (kind === "division") {
+    // A Division hangs off a League.
+    const lgs = program.leagues || [];
+    return { ok: true, values: lgs.length ? { "f-div-league": lgs[0].id } : {} };
+  }
+  if (kind === "rink" || kind === "ice-slot") {
+    // Facilities are Venue-scoped rather than Program-scoped, so the
+    // hierarchy payload cannot resolve them. Returning ok with NO seed would
+    // silently re-enable the same first-global fallback, so these fail closed
+    // instead: the caller declines to open the drawer and surfaces a retry.
+    // Narrowing this to a real Venue/Rink seed needs a venue-scoped context
+    // axis that does not exist yet -- tracked, not silently dropped.
+    return { ok: false, unsupported: true };
+  }
   return { ok: true, values: {} };
 }
 // Best-effort focus landing for a plain view switch (no drawer of its own to
@@ -2856,7 +2893,7 @@ const SETUP_WORKFLOWS = [
     perm: "manage_setup",
     primary: { label: "Add Player", go: "roster" },
     secondary: [{ label: "Officials", act: "official" }],
-    summary: (sv, ov) => [
+    summary: (sv) => [
       { label: "Players", n: (playersList || []).length },
       { label: "Officials", n: (sv.officials || []).length }] },
   { key: "facilities", title: "Venues, rinks and ice", icon: "🏟️",
@@ -2889,7 +2926,11 @@ function setupWorkflowsFor() {
 }
 
 function setupSummaryHtml(w, sv, ov) {
-  if (!w.summary) return "";
+  // Guard the payload, not each accessor: renderSetup can be reached before
+  // (or without) a successful overview load -- an early return, a failed
+  // fetch, a role whose payload is redacted -- and a summary card must
+  // degrade to "no counts yet" rather than throwing and blanking the view.
+  if (!w.summary || !sv) return "";
   const parts = w.summary(sv, ov).map((s) =>
     `<span class="swf-stat"><strong>${s.n}</strong> ${esc(s.label)}</span>`).join("");
   return `<div class="swf-stats">${parts}</div>`;
@@ -6985,10 +7026,26 @@ async function render() {
     if (key === "onboarding") { switchTab("onboarding"); focusContentHeading(); return; }
     goToSetupWorkflow(key);
   });
-  // Demoted actions open the plain entity drawer, identical to Records' own
-  // "+ New" control (same state shape, so submitSetup needs no new branch).
-  c.querySelectorAll("[data-setup-workflow-act]").forEach((b) => b.onclick = () => {
-    drawer = { kind: b.dataset.setupWorkflowAct }; drawerError = ""; drawerValues = {};
+  // Demoted actions go through the SAME seeded, fail-closed path as the
+  // primary ones. They used to open a raw drawer with drawerValues = {},
+  // mirroring Records' own "+ New" -- which is correct on Records (a flat
+  // record-management surface) and wrong here, because a workflow landing is
+  // scoped to the active Program and its parent selects are not.
+  c.querySelectorAll("[data-setup-workflow-act]").forEach((b) => b.onclick = async () => {
+    const kind = b.dataset.setupWorkflowAct;
+    const mySeq = ++drawerSeedFetchSeq;
+    const seeded = await contextSeededDrawerValues(kind);
+    if (mySeq !== drawerSeedFetchSeq) return;  // a newer open already won
+    if (!seeded.ok) {
+      toast = seeded.unsupported
+        ? "Add this from the Arena Calendar, where the venue is already chosen."
+        : seeded.needsSeason
+          ? "Pick a season in the context bar first — a league is created inside one."
+          : "Couldn't load what's needed to open that — try again.";
+      toastIsError = true;
+      return render();
+    }
+    drawer = { kind }; drawerError = ""; drawerValues = seeded.values;
     toast = "";
     render();
   });
