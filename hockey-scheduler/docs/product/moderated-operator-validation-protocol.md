@@ -60,10 +60,12 @@ here rather than silently picking one. The two are not in tension: reaching
 the primary action is a strict subset of completing the full flow, so a
 moderator may let a participant continue through completion if they reach it
 naturally, but the pass/fail bar in this protocol is "reached the
-authorized primary action," matching #345's own text. **If the repository
-owner intends the fuller §8 task instead, flag that during
-[readiness sign-off](#readiness-checklist-before-a-real-session) and adjust
-before running the Arena Manager session.**
+authorized primary action," matching #345's own text.
+
+**Owner-confirmed (2026-07-27):** the repository owner confirmed "reach the
+primary action" as the intended Arena Manager task scope, matching #345's
+body and this protocol's default. The §8 draft's fuller "complete the
+write" task is superseded for the purpose of this validation session.
 
 No other conflicts between #345 and the requirements package were found for
 this protocol. If a future reviewer finds one, record it in the
@@ -73,7 +75,7 @@ this protocol. If a future reviewer finds one, record it in the
 
 | Date found | Section | Description | Resolution |
 | --- | --- | --- | --- |
-| 2026-07-27 | Arena Manager task scope | §8 draft asks for a completed write; #345 body asks only to reach the primary action | Followed #345 body (see above); flagged for owner confirmation at readiness sign-off |
+| 2026-07-27 | Arena Manager task scope | §8 draft asks for a completed write; #345 body asks only to reach the primary action | **Resolved 2026-07-27** — repository owner confirmed "reach the primary action" per #345's body; §8's fuller task does not apply to this session |
 
 ---
 
@@ -421,10 +423,11 @@ evidentiary value for #345's merge gate.
 - [ ] A plan exists for where results will be attached to
       [#345][issue-345] (e.g. as a PR comment or linked file) once the
       session is complete.
-- [ ] The [Conflicts log](#conflicts-log) has been reviewed, and any open
-      item (currently: the Arena Manager task-scope question) has either
-      been resolved by the repository owner or explicitly accepted as this
-      protocol's default.
+- [x] The [Conflicts log](#conflicts-log) has been reviewed; its one entry
+      (Arena Manager task scope) was resolved by the repository owner on
+      2026-07-27 — "reach the primary action" is confirmed. Re-check this
+      item if the Conflicts log gains a new, unresolved entry before a
+      future session.
 
 ---
 
