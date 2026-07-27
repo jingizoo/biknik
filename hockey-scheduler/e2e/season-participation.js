@@ -149,6 +149,17 @@ finally:
   return result.stdout.trim();
 }
 
+// Selects the Hierarchy sub-view via the user-visible toggle and confirms it
+// took effect. Centralized so every Setup entry uses the same path and a
+// later mutation cannot silently leave us on the workflow hub.
+async function enterSetupHierarchy(page) {
+  await page.click('[data-setup-view="hierarchy"]');
+  await page.waitForFunction(() => {
+    const seg = document.querySelector(".setup-viewtoggle .seg.active");
+    return !!(seg && seg.dataset.setupView === "hierarchy");
+  }, null, { timeout: 10000 });
+}
+
 async function checkViewport(browser, viewport) {
   const base = `http://${HOST}:${viewport.port}`;
   // A durable SQLite file (not the in-memory demo default) so the repair-UI
@@ -193,6 +204,20 @@ async function checkViewport(browser, viewport) {
     // the page's own in-memory `hv`/`seasonRegs`/`leagueDivisions` state.
     const refreshSetup = async (marker) => {
       await page.click('.tab[data-tab="setup"]');
+    // Setup now LANDS on the six-workflow hub (#345 batch 2). Select the
+    // Hierarchy sub-view through the real toggle -- never by setting
+    // setupView directly -- and assert the segment is actually active
+    // BEFORE waiting on any domain control, so a future default change
+    // fails here with "wrong sub-view" instead of an opaque selector
+    // timeout on a control that was simply never rendered.
+    await enterSetupHierarchy(page);
+      // Setup now LANDS on the six-workflow hub (#345 batch 2). Select the
+      // Hierarchy sub-view through the real toggle -- never by setting
+      // setupView directly -- and assert the segment is actually active
+      // BEFORE waiting on any domain control, so a future default change
+      // fails here with "wrong sub-view" instead of an opaque selector
+      // timeout on a control that was simply never rendered.
+      await enterSetupHierarchy(page);
       await page.waitForFunction((m) => {
         const sel = document.querySelector(m.selector);
         return !!sel && (!m.optionValue || Array.from(sel.options).some((o) => o.value === m.optionValue));
@@ -243,6 +268,13 @@ async function checkViewport(browser, viewport) {
     // League-only id collided across Seasons sharing that same permanent
     // League, which this file's own lg1/lg2 fixture below exercises).
     await page.click('.tab[data-tab="setup"]');
+    // Setup now LANDS on the six-workflow hub (#345 batch 2). Select the
+    // Hierarchy sub-view through the real toggle -- never by setting
+    // setupView directly -- and assert the segment is actually active
+    // BEFORE waiting on any domain control, so a future default change
+    // fails here with "wrong sub-view" instead of an opaque selector
+    // timeout on a control that was simply never rendered.
+    await enterSetupHierarchy(page);
     await page.waitForFunction(
       (sel) => !!document.querySelector(sel), `#reg-team-${ids.s1}-${ids.lg1}`, { timeout: 15000 });
 

@@ -48,6 +48,17 @@ function stopServer(server) {
   });
 }
 
+// Selects the Hierarchy sub-view via the user-visible toggle and confirms it
+// took effect. Centralized so every Setup entry uses the same path and a
+// later mutation cannot silently leave us on the workflow hub.
+async function enterSetupHierarchy(page) {
+  await page.click('[data-setup-view="hierarchy"]');
+  await page.waitForFunction(() => {
+    const seg = document.querySelector(".setup-viewtoggle .seg.active");
+    return !!(seg && seg.dataset.setupView === "hierarchy");
+  }, null, { timeout: 10000 });
+}
+
 async function checkViewport(browser, viewport) {
   const base = `http://${HOST}:${viewport.port}`;
   const server = spawn(
@@ -110,6 +121,13 @@ async function checkViewport(browser, viewport) {
       (u) => fetch(u, { credentials: "same-origin" }).then((r) => r.json()), p);
 
     await page.click('.tab[data-tab="setup"]');
+      // Setup now LANDS on the six-workflow hub (#345 batch 2). Select the
+      // Hierarchy sub-view through the real toggle -- never by setting
+      // setupView directly -- and assert the segment is actually active
+      // BEFORE waiting on any domain control, so a future default change
+      // fails here with "wrong sub-view" instead of an opaque selector
+      // timeout on a control that was simply never rendered.
+      await enterSetupHierarchy(page);
     // Scoped to the Competition structure tree (#251): the Season
     // participation panel below it now renders its own delBtn for the same
     // Program/Season/League ids, so an unscoped selector would match twice.
