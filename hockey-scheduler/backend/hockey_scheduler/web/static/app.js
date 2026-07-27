@@ -879,13 +879,27 @@ async function contextSeededDrawerValues(kind) {
   // now bumps the instant a switch is attempted (setActiveContext()'s own
   // first bump, before its POST), so comparing against it closes that gap.
   const seededRevision = contextRevision;
-  if (!programId) return { ok: true, values: {} };
+  // Kinds whose parent select spans every Program/Season. For these there is
+  // no safe "open it unseeded" outcome: drawerField()'s `current || rows[0][0]`
+  // fallback would pick the first GLOBAL row, so a missing or unresolvable
+  // active context must fail CLOSED rather than returning ok with {} and
+  // letting the drawer open on a global guess.
+  const CONTEXT_BOUND = ["level", "division"];
+  const mustBind = CONTEXT_BOUND.indexOf(kind) !== -1;
+  if (!programId) {
+    return mustBind ? { ok: false, needsContext: true } : { ok: true, values: {} };
+  }
   if (kind === "season") return { ok: true, values: { "f-season-league": programId } };
   const hvr = await getJSON("/api/v2/setup/hierarchy");
   const stillCurrent = contextRevision === seededRevision;
   if (!hvr || hvr.error || !stillCurrent) return { ok: false };
   const program = (hvr.programs || []).find((p) => p.id === programId);
-  if (!program) return { ok: true, values: {} };
+  // Selected Program not present in the hierarchy the server just returned --
+  // a stale or mismatched context. Same rule: fail closed for the
+  // context-bound kinds instead of falling through to a global default.
+  if (!program) {
+    return mustBind ? { ok: false, needsContext: true } : { ok: true, values: {} };
+  }
   if (kind === "team") {
     const lgs = program.leagues || [];
     return { ok: true, values: lgs.length ? { "f-team-perm-league": lgs[0].id } : {} };
@@ -919,19 +933,28 @@ async function contextSeededDrawerValues(kind) {
     return { ok: true, values: { "f-level-season": seasonId } };
   }
   if (kind === "division") {
-    // A Division hangs off a League.
-    const lgs = program.leagues || [];
-    return { ok: true, values: lgs.length ? { "f-div-league": lgs[0].id } : {} };
+    // A Division hangs off a LeagueSeason -- a League paired with a SEASON --
+    // so seeding the Program's first permanent League ignores which Season is
+    // active and lets a Division be created under a League that is not in it.
+    // Bind to the active Season instead, using the overview payload because it
+    // is the one that carries each League's season_id.
+    const seasonId = contextOptions && contextOptions.selected
+      && contextOptions.selected.season_id;
+    if (!seasonId) return { ok: false, needsSeason: true };
+    const svr = await getJSON("/api/v2/setup/overview");
+    if (!svr || svr.error || contextRevision !== seededRevision) return { ok: false };
+    const inSeason = (svr.leagues || []).filter((lg) => lg.season_id === seasonId);
+    if (!inSeason.length) return { ok: false, noLeagueInSeason: true };
+    return { ok: true, values: { "f-div-league": inSeason[0].id } };
   }
-  if (kind === "rink" || kind === "ice-slot") {
-    // Facilities are Venue-scoped rather than Program-scoped, so the
-    // hierarchy payload cannot resolve them. Returning ok with NO seed would
-    // silently re-enable the same first-global fallback, so these fail closed
-    // instead: the caller declines to open the drawer and surfaces a retry.
-    // Narrowing this to a real Venue/Rink seed needs a venue-scoped context
-    // axis that does not exist yet -- tracked, not silently dropped.
-    return { ok: false, unsupported: true };
-  }
+  // Rink and ice-slot deliberately fall through to the unseeded return below.
+  // Their parents are a Venue and a Rink -- shared facilities with no Program
+  // axis -- so an unseeded default cannot produce the cross-PROGRAM write this
+  // seeding exists to prevent, and there is no active-context value to bind
+  // them to. An earlier revision failed these closed, which rendered two
+  // controls that could never succeed; a dead control is a worse outcome than
+  // an unseeded one. Season-scoped venue access (SeasonVenueAccess) would be
+  // the real axis to bind to and is not wired into the context bar yet.
   return { ok: true, values: {} };
 }
 // Best-effort focus landing for a plain view switch (no drawer of its own to
@@ -7037,11 +7060,13 @@ async function render() {
     const seeded = await contextSeededDrawerValues(kind);
     if (mySeq !== drawerSeedFetchSeq) return;  // a newer open already won
     if (!seeded.ok) {
-      toast = seeded.unsupported
-        ? "Add this from the Arena Calendar, where the venue is already chosen."
+      toast = seeded.needsContext
+        ? "Pick a program in the context bar first, so this is created in the right one."
         : seeded.needsSeason
-          ? "Pick a season in the context bar first — a league is created inside one."
-          : "Couldn't load what's needed to open that — try again.";
+          ? "Pick a season in the context bar first — this is created inside one."
+          : seeded.noLeagueInSeason
+            ? "That season has no leagues yet — add one before adding divisions."
+            : "Couldn't load what's needed to open that — try again.";
       toastIsError = true;
       return render();
     }

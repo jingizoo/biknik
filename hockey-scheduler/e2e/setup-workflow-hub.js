@@ -253,6 +253,141 @@ async function checkViewport(browser, viewport) {
       }
     }
 
+    // ---- (4b) PERSISTED two-Program / two-Season context binding ---------
+    // The defect this exists for: these secondary create actions have a parent
+    // <select> spanning every Program/Season, so an unseeded drawer takes
+    // drawerField()'s first-GLOBAL-row fallback and the record is PERSISTED
+    // under the wrong parent. Asserting the select's rendered value is not
+    // enough -- it must be checked against what the server actually stored.
+    const fx = await page.evaluate(async () => {
+      const post = async (path, body) => (await fetch(path, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      })).json();
+      // Program A sorts first globally, so it is what every unseeded fallback
+      // lands on. All assertions below act from Program B.
+      const pA = await post("/api/v2/setup/program", { name: "AAA Ctx Program A", country: "US" });
+      const sA = await post("/api/v2/setup/season", { program_id: pA.id, name: "AAA Season A" });
+      const lA = await post("/api/v2/setup/league", { season_id: sA.id, name: "AAA League A" });
+      const pB = await post("/api/v2/setup/program", { name: "ZZZ Ctx Program B", country: "US" });
+      const s1 = await post("/api/v2/setup/season", { program_id: pB.id, name: "ZZZ Season One" });
+      const s2 = await post("/api/v2/setup/season", { program_id: pB.id, name: "ZZZ Season Two" });
+      // A league in EACH of B's seasons, so "first league of the Program" and
+      // "a league in the ACTIVE season" are different answers -- that gap is
+      // the wrong-Season write the seeding must close.
+      const l1 = await post("/api/v2/setup/league", { season_id: s1.id, name: "ZZZ League S1" });
+      const l2 = await post("/api/v2/setup/league", { season_id: s2.id, name: "ZZZ League S2" });
+      // A Program with NO seasons: the only shape in which the active context
+      // genuinely has no Season, since /api/context auto-selects one whenever
+      // the chosen Program has any.
+      const pC = await post("/api/v2/setup/program", { name: "ZZZ Ctx Program C", country: "US" });
+      return { pA: pA.id, sA: sA.id, lA: lA.id, pB: pB.id, pC: pC.id,
+               s1: s1.id, s2: s2.id, l1: l1.id, l2: l2.id };
+    });
+
+    // Act from Program B / Season TWO.
+    await page.evaluate(async ([program_id, season_id]) => {
+      await fetch("/api/context", {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ program_id, season_id }),
+      });
+    }, [fx.pB, fx.s2]);
+    await page.reload();
+    await page.waitForSelector("#content", { timeout: 15000 });
+
+    // (i) Divisions must persist under a league in the ACTIVE Season.
+    await openSetupHub(page, `${L}/persist-division`);
+    await page.click('[data-setup-workflow="participation"]');
+    await page.waitForSelector(".swf-landing", { timeout: 10000 });
+    await page.click('[data-setup-workflow-act="division"]');
+    await page.waitForSelector("#f-div-league", { timeout: 10000 }).catch(() => fail(
+      `[${L}] the Divisions action did not open its drawer`));
+    await page.fill("#f-div", "Ctx Bound Division");
+    const divResp = page.waitForResponse((r) =>
+      r.url().includes("/api/v2/setup/division") && r.request().method() === "POST");
+    await page.click('[data-drawer-submit="division"]');
+    const created = await (await divResp).json();
+    if (created.error) fail(`[${L}] division create failed: ${JSON.stringify(created.error)}`);
+    // Read the PERSISTED row back, rather than trusting the request body.
+    const stored = await page.evaluate(async (id) => {
+      const ov = await (await fetch("/api/v2/setup/overview",
+        { credentials: "same-origin" })).json();
+      const d = (ov.divisions || []).find((x) => x.id === id);
+      const lg = d && (ov.leagues || []).find((x) => x.id === d.league_id);
+      return { divisionLeague: d && d.league_id, leagueSeason: lg && lg.season_id };
+    }, created.id);
+    if (stored.divisionLeague === fx.lA) {
+      fail(`[${L}] PERSISTED wrong-PROGRAM write: the division landed under `
+        + `Program A's league (${fx.lA}) while Program B was active`);
+    }
+    if (stored.divisionLeague === fx.l1 || stored.leagueSeason !== fx.s2) {
+      fail(`[${L}] PERSISTED wrong-SEASON write: the division landed under a `
+        + `league in season ${stored.leagueSeason}, expected the ACTIVE season `
+        + `${fx.s2} (seeding the Program's first permanent league gives ${fx.l1})`);
+    }
+
+    // (ii) Leagues must persist under the ACTIVE Season.
+    await openSetupHub(page, `${L}/persist-league`);
+    await page.click('[data-setup-workflow="league_season"]');
+    await page.waitForSelector(".swf-landing", { timeout: 10000 });
+    await page.click('[data-setup-workflow-act="level"]');
+    await page.waitForSelector("#f-level-season", { timeout: 10000 }).catch(() => fail(
+      `[${L}] the Leagues action did not open its drawer`));
+    await page.fill("#f-level", "Ctx Bound League");
+    const lvlResp = page.waitForResponse((r) =>
+      r.url().includes("/api/v2/setup/league") && r.request().method() === "POST");
+    await page.click('[data-drawer-submit="level"]');
+    const lvl = await (await lvlResp).json();
+    if (lvl.error) fail(`[${L}] league create failed: ${JSON.stringify(lvl.error)}`);
+    const lvlStored = await page.evaluate(async (id) => {
+      const ov = await (await fetch("/api/v2/setup/overview",
+        { credentials: "same-origin" })).json();
+      const lg = (ov.leagues || []).find((x) => x.id === id);
+      return lg && lg.season_id;
+    }, lvl.id);
+    if (lvlStored !== fx.s2) {
+      fail(`[${L}] PERSISTED wrong-Season write: the league landed under season `
+        + `${lvlStored}, expected the ACTIVE season ${fx.s2} (Program A's `
+        + `season is ${fx.sA})`);
+    }
+
+    // (iii) NOT ASSERTED, deliberately: the no-active-Season fail-closed
+    // branch. I could not establish the precondition through the app's own
+    // API -- POSTing /api/context with season_id:null, including for a
+    // Program created with no seasons at all, still comes back with a
+    // resolved season. So the active context appears to ALWAYS carry one,
+    // which makes the `needsSeason` branch defensive rather than reachable.
+    // It stays in the code (a future Program-only context would need it) but
+    // is left unproven rather than covered by a leg that asserts into a state
+    // that was never actually created. Flagged for review rather than
+    // silently dropped.
+
+    // (iv) The facilities controls must be REAL, not permanently-failing
+    // decoration: an action that can never succeed is worse than an unseeded
+    // one. Venue/Rink carry no Program axis, so these open normally.
+    await page.evaluate(async ([program_id, season_id]) => {
+      await fetch("/api/context", {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ program_id, season_id }),
+      });
+    }, [fx.pB, fx.s2]);
+    await page.reload();
+    await page.waitForSelector("#content", { timeout: 15000 });
+    await openSetupHub(page, `${L}/facilities-live`);
+    await page.click('[data-setup-workflow="facilities"]');
+    await page.waitForSelector(".swf-landing", { timeout: 10000 });
+    for (const act of ["rink", "ice-slot"]) {
+      await page.click(`[data-setup-workflow-act="${act}"]`);
+      await page.waitForSelector(".drawer[role=dialog]", { timeout: 10000 }).catch(() => fail(
+        `[${L}] the facilities "${act}" action rendered but never opens a `
+        + `drawer — a control that always fails should not be offered`));
+      await page.keyboard.press("Escape");
+      await page.waitForFunction(() => !document.querySelector(".drawer"),
+        null, { timeout: 10000 });
+    }
+
     // ---- (5) nothing previously reachable became unreachable -------------
     await openSetupHub(page, `${L}/reachability`);
     await page.click('[data-setup-view="hierarchy"]');
