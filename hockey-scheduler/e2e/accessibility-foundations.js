@@ -822,15 +822,13 @@ async function checkViewport(browser, viewport) {
     await expectShell("anonymous public",
       { title: "Public Schedule — Hockey Scheduler", skipVisible: false });
 
-    // NOT covered here: the public -> "Staff sign in" leg. That control is
-    // visible and clickable in isolation, but becomes unclickable when this
-    // leg runs at the end of the full journey (after the dialog/Escape and
-    // sign-out sections), and I did not want to ship either a flaky step or a
-    // fake one that dispatches the handler directly instead of clicking. The
-    // blocker itself is fully covered by the four transitions above --
-    // authenticated -> signed out -> failed login -> public -- each asserting
-    // the title names the visible surface and no skip link points into a
-    // hidden shell. Tracked as remaining coverage on #345.
+    // The public -> "Staff sign in" leg (that control was visible and
+    // clickable in isolation here, but became unclickable when reached at
+    // the end of THIS journey, after the dialog/Escape and sign-out
+    // sections), the forced loading/error surface, and the Restricted
+    // early-return are covered separately, via a real click on
+    // #public-signin-link and dedicated fixtures rather than a step
+    // reordered into this file, in shell-accessibility-coverage.js (#345).
 
     if (errors.length) {
       fail(`browser errors:\n${errors.join("\n")}`);

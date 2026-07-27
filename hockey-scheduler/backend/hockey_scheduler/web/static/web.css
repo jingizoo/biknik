@@ -277,6 +277,20 @@ body.signed-out .web { display: none; }
 .public-topbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; gap: 10px; }
 .public-topbar .login-brand { margin-bottom: 0; }
 
+/* Shell accessibility coverage (#345): the sitewide --muted (3.26:1 on
+   white), button.primary's white-on-blue (~3.65:1), and .banner.alert's
+   white-on-red (~3.3:1) all fail WCAG 2.2 AA for normal text -- the same
+   pre-existing tokens, same failures, that styles.css's .sp-card rule
+   already worked around for the setup-progress card. Scoped to
+   .login-screen/.public-screen (every brand/label/persona-role caption,
+   every fixture's .li-sub line, and the public schedule's own forced-error
+   banner) so every other screen reusing these shared tokens is unaffected.
+   Reuses the exact values already verified there rather than inventing
+   new ones. */
+.login-screen, .public-screen { --muted: #6b6b70; }
+.login-screen button.primary, .public-screen button.primary { background: #0a64c4; }
+.public-screen .banner.alert { background: #c0271b; }
+
 /* ---------- responsive ---------- */
 @media (max-width: 1040px) {
   .dash-grid { grid-template-columns: 1fr; }
