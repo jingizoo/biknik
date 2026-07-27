@@ -289,6 +289,15 @@ body.signed-out .web { display: none; }
    new ones. */
 .login-screen, .public-screen { --muted: #6b6b70; }
 .login-screen button.primary, .public-screen button.primary { background: #0a64c4; }
+/* #345 review: showPublicGuest() now deliberately focuses this control on
+   every entry (mirrors showLogin()'s own u.focus()), but a PROGRAMMATIC
+   .focus() called from within another element's click handler does not
+   reliably earn Chromium's default :focus-visible outline the way a
+   keyboard Tab does -- observed directly (outlineStyle "none" after the
+   exact showPublicGuest() call path). Same fix shape as
+   .login-field input:focus: an explicit :focus (not :focus-visible) rule
+   guarantees the ring regardless of how focus arrived here. */
+#public-signin-link:focus { outline: 2px solid var(--accent); outline-offset: 2px; }
 .public-screen .banner.alert { background: #c0271b; }
 
 /* ---------- responsive ---------- */

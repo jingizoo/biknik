@@ -41,12 +41,12 @@
 // setup-progress card's own #sp-card-slot contract in home-tasks-hub.js),
 // its error banner additionally carries role="alert", and a monotonic
 // publicRenderSeq guards a held/obsolete response from clobbering a NEWER
-// render's content once it finally resolves -- this specific guard is NOT
-// independently exercised below (see the comment at its call site: every
-// control that could start a second request lives inside the region the
-// first one wipes to a bare skeleton, so a genuinely overlapping SECOND
-// real click cannot be constructed through this app's current UI). The
-// Restricted early-return now carries role="alert" too. FOCUS: since
+// render's content once it finally resolves -- exercised below via two
+// genuinely overlapping real clicks (hold a Standings fetch, navigate out
+// via the PERSISTENT #public-signin-link and back in via the persistent
+// #guest-public-link to start a second, newer render, THEN release the
+// obsolete first one and prove it changed nothing). The Restricted
+// early-return now carries role="alert" too. FOCUS: since
 // #public-content itself is never replaced (only its children are),
 // focusing the box once (only when the interaction that triggered this
 // render started INSIDE it) keeps focus connected and visible across every
@@ -184,6 +184,67 @@ async function seriousOrCriticalViolations(page, selector) {
   }, selector);
 }
 
+// A precise error ledger, not a text-pattern blanket filter. This journey
+// deliberately provokes exactly three real HTTP failures (a wrong-password
+// 401, the Restricted surface's own 403 scope check, a forced public 502).
+// expectFailure() must be called, by exact method/URL-substring/status,
+// immediately before each deliberate action; only THAT exact response is
+// consumed and excluded. Any OTHER response >= 400 -- an unrelated 404/500
+// on any request -- fails the run. Chromium also mirrors any >=400 response
+// into the console as "Failed to load resource: status NNN"; that is the
+// SAME underlying event the response listener below already captures with
+// full precision, so it is not double-counted as a console error, but a
+// genuine console.error(...) call or uncaught exception still is.
+function wireErrorTracking(page) {
+  const errors = [];
+  const expectedFailures = [];
+  const expectFailure = (method, urlIncludes, status) => {
+    expectedFailures.push({ method, urlIncludes, status, consumed: false });
+  };
+  page.on("pageerror", (e) => errors.push(`[pageerror] ${e.message}`));
+  page.on("response", (response) => {
+    const status = response.status();
+    if (status < 400) return;
+    const req = response.request();
+    const method = req.method();
+    const url = response.url();
+    const idx = expectedFailures.findIndex((f) => !f.consumed
+      && f.method === method && f.status === status && url.includes(f.urlIncludes));
+    if (idx !== -1) { expectedFailures[idx].consumed = true; return; }
+    errors.push(`[http] UNEXPECTED ${method} ${url} -> ${status}`);
+  });
+  const RESOURCE_STATUS_NOISE = /^Failed to load resource: the server responded with a status of \d+/;
+  page.on("console", (m) => {
+    if (m.type() === "error" && !RESOURCE_STATUS_NOISE.test(m.text())) errors.push(`[console] ${m.text()}`);
+  });
+  return { errors, expectFailure, expectedFailures };
+}
+
+// Falsifiability proof (#345 review): an injected, UNLISTED failure must
+// still be caught by the exact same tracker the real journey below uses --
+// not a parallel reimplementation, the same wireErrorTracking() function.
+// No expectFailure() is registered here, so this 404 has no allowlist
+// entry; if the tracker were a blanket filter this would silently vanish.
+async function verifyLedgerFalsifiability(browser, base, viewportLabel, fail) {
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const { errors } = wireErrorTracking(page);
+  const SENTINEL = "/api/__shell-coverage-ledger-selftest__";
+  await page.route(`**${SENTINEL}`, (route) => route.fulfill({
+    status: 404, contentType: "application/json", body: '{"error":"not_found"}',
+  }));
+  await page.goto(base, { waitUntil: "domcontentloaded" });
+  await page.waitForSelector("#content .dash-card, #content h2, #content h3", { timeout: 15000 });
+  await page.evaluate((p) => fetch(p, { credentials: "same-origin" }).catch(() => {}), SENTINEL);
+  await page.waitForTimeout(300);
+  await context.close();
+  if (!errors.some((e) => e.includes(SENTINEL) && e.includes("404"))) {
+    fail(`[${viewportLabel}] ledger falsifiability: an injected, UNLISTED 404 `
+      + `was not flagged by the same tracker the real journey uses -- the `
+      + `mechanism is not falsifiable, got ${JSON.stringify(errors)}`);
+  }
+}
+
 async function checkViewport(browser, viewport) {
   const base = `http://${HOST}:${viewport.port}`;
   const server = spawn(
@@ -198,20 +259,7 @@ async function checkViewport(browser, viewport) {
     viewport: { width: viewport.width, height: viewport.height },
   });
   const page = await context.newPage();
-  const errors = [];
-  page.on("pageerror", (e) => errors.push(`[pageerror] ${e.message}`));
-  // Chromium mirrors ANY non-2xx fetch/XHR response into the console as
-  // "Failed to load resource: the server responded with a status of NNN" --
-  // this journey deliberately provokes several (a wrong-password 401, the
-  // Restricted surface's own 403 scope check, a forced 502), so counting
-  // that specific browser-networking message would fail on the very
-  // behavior being tested rather than on a real bug. A genuine app error
-  // (an actual console.error(...) call, an uncaught exception via
-  // pageerror above) has a completely different shape and still counts.
-  const RESOURCE_STATUS_NOISE = /^Failed to load resource: the server responded with a status of \d+/;
-  page.on("console", (m) => {
-    if (m.type() === "error" && !RESOURCE_STATUS_NOISE.test(m.text())) errors.push(`[console] ${m.text()}`);
-  });
+  const { errors, expectFailure, expectedFailures } = wireErrorTracking(page);
   const axeSource = fs.readFileSync(AXE_PATH, "utf8");
   await page.route("**/__axe-core__.js", (route) => route.fulfill({
     status: 200, contentType: "application/javascript", body: axeSource,
@@ -244,6 +292,7 @@ async function checkViewport(browser, viewport) {
 
   try {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
+    await verifyLedgerFalsifiability(browser, base, viewport.label, fail);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content .dash-card, #content h2, #content h3", { timeout: 15000 });
     checkpointErrors("initial authenticated boot");
@@ -330,6 +379,7 @@ async function checkViewport(browser, viewport) {
         + `visible focus indicator -- ${JSON.stringify(loginStops)}`);
     }
     // A failed login keeps the sign-in surface and surfaces a real message.
+    expectFailure("POST", "/api/auth/login", 401);
     await page.fill("#login-user", "admin");
     await page.fill("#login-pass", "definitely-not-the-password");
     await page.click(".login-submit");
@@ -381,6 +431,15 @@ async function checkViewport(browser, viewport) {
       fail(`public schedule: expected a visible "${expectedPublicHeading}" `
         + `primary heading, got ${JSON.stringify(publicHeading)}`);
     }
+    // showPublicGuest() mirrors showLogin()'s own unconditional focus: the
+    // #guest-public-link that triggered this entry is hidden along with the
+    // whole sign-in card, so #public-signin-link (persistent, always
+    // rendered) takes focus instead of dropping to <body>.
+    const publicEntryFocus = await activeInfo(page);
+    if (!publicEntryFocus || publicEntryFocus.id !== "public-signin-link" || !publicEntryFocus.visibleFocus) {
+      fail(`public schedule: expected focus on #public-signin-link right `
+        + `after entry, got ${JSON.stringify(publicEntryFocus)}`);
+    }
     const publicNames = await page.evaluate(() => ({
       signIn: ((document.getElementById("public-signin-link") || {}).textContent || "").trim(),
       scheduleTab: ((document.querySelector('[data-public-tab="schedule"]') || {}).textContent || "").trim(),
@@ -393,13 +452,15 @@ async function checkViewport(browser, viewport) {
         || !/vs/.test(publicNames.firstFixture)) {
       fail(`public schedule: unexpected accessible names/content, got ${JSON.stringify(publicNames)}`);
     }
-    await blurActive(page);
-    await page.keyboard.press("Tab");
-    let stop = await activeInfo(page);
-    if (!stop || stop.id !== "public-signin-link" || !stop.visibleFocus) {
-      fail(`public schedule: expected the first Tab stop to be #public-signin-link, `
-        + `got ${JSON.stringify(stop)}`);
-    }
+    // Continue the Tab walk from the CURRENT position (already verified
+    // above to be #public-signin-link, via showPublicGuest()'s own
+    // deliberate focus) rather than blur()+Tab: blur() alone does not reset
+    // the browser's sequential-navigation origin once a real focus() call
+    // has anchored it here, so a fresh Tab from a blurred state would
+    // actually land on the NEXT stop, not this one (the same nuance
+    // accessibility-foundations.js's own comment documents for the skip
+    // link).
+    let stop;
     await page.keyboard.press("Tab");
     stop = await activeInfo(page);
     if (!stop || !stop.cls.includes("seg") || !/Schedule/.test(stop.text) || !stop.visibleFocus) {
@@ -455,27 +516,23 @@ async function checkViewport(browser, viewport) {
     await page.waitForSelector(".hero h2", { timeout: 10000 });
     checkpointErrors("public schedule (return for surface 4)");
 
-    // NOT constructed here, and why: an "obsolete held response released
-    // after a NEWER render already settled" race (app.js's publicRenderSeq
-    // guard) needs a SECOND real click while the FIRST request is still in
-    // flight. renderPublicGuest() wipes #public-content to the bare
-    // skeleton synchronously the instant a request starts -- every control
-    // that could start a second request (the segment tabs, Retry, the
-    // division select) lives INSIDE that region and is gone the moment
-    // loading begins, so there is no second real, visible control left to
-    // click before the first request resolves. Confirmed directly: a
-    // `[data-public-tab="schedule"]` click while Standings's own fetch was
-    // held timed out -- the selector does not exist during loading. The
-    // production guard (publicRenderSeq) is still correct defensive code
-    // matching this codebase's own established pattern elsewhere
-    // (setupProgressFetchSeq), but this specific race is not achievable
-    // through the app's current UI without a synthetic action this
-    // journey's own rules forbid. Same precedent as PR #347's "left
-    // unproven rather than covered by a leg asserting into a state that
-    // was never created" -- worth a look, not silently assumed passing.
+    // The FIRST request this route sees is held indefinitely (released only
+    // once a NEWER render has already settled); every later one resolves
+    // immediately. #public-content's own segment tabs vanish the instant
+    // loading starts, but the PERSISTENT shell controls outside that region
+    // (#public-signin-link in .public-topbar, #guest-public-link on the
+    // sign-in card) do not -- navigating out to Sign-in and back in starts a
+    // genuinely second, overlapping renderPublicGuest() call via two real
+    // clicks while the first request is still in flight. This is the exact
+    // real-click path #345 review identified.
     let releaseHeldFetch;
     const heldFetch = new Promise((resolve) => { releaseHeldFetch = resolve; });
-    await page.route("**/api/public/schedule", async (route) => { await heldFetch; await route.continue(); });
+    let publicFetchCount = 0;
+    await page.route("**/api/public/schedule", async (route) => {
+      publicFetchCount += 1;
+      if (publicFetchCount === 1) await heldFetch;
+      await route.continue();
+    });
     await page.click('[data-public-tab="standings"]');
     await page.waitForSelector("#public-content .skeleton", { timeout: 10000 });
     await waitForTitle(page, "Public Schedule — Hockey Scheduler", fail, "forced loading");
@@ -503,20 +560,66 @@ async function checkViewport(browser, viewport) {
         + `public schedule" status text, got ${JSON.stringify(loadingState)}`);
     }
     await assertNoSeriousViolations("#public-screen", "forced loading");
-    releaseHeldFetch();
+
+    // While that first (Standings) fetch is STILL held, navigate away via
+    // the persistent Staff sign-in control, then back in via the persistent
+    // guest link -- a second, real, overlapping renderPublicGuest() call.
+    await page.click("#public-signin-link");
+    await page.waitForFunction(() => !document.getElementById("login-screen").hidden,
+      null, { timeout: 10000 });
+    await page.click("#guest-public-link");
     await page.waitForFunction(() => !document.querySelector("#public-content .skeleton")
       && document.querySelector(".hero h2"), null, { timeout: 10000 });
-    const settledAfterLoad = await page.evaluate(() => ({
-      ariaBusy: (document.getElementById("public-content") || {}).getAttribute("aria-busy"),
-      focusOnBox: document.activeElement === document.getElementById("public-content"),
+    // #345 review fix: showPublicGuest() now mirrors showLogin()'s own
+    // unconditional focus -- #public-signin-link (a persistent, always-
+    // rendered control, unlike anything inside #public-content) takes
+    // focus on every entry to this screen, so this SECOND entry (whose own
+    // trigger, #guest-public-link, was just hidden along with the sign-in
+    // card) still lands somewhere connected and meaningful instead of
+    // <body>.
+    const fingerprint = () => page.evaluate(() => {
+      const el = document.activeElement;
+      return {
+        title: document.title,
+        heading: (document.querySelector(".hero h2") || {}).textContent || "",
+        ariaBusy: (document.getElementById("public-content") || {}).getAttribute("aria-busy"),
+        activeId: el ? el.id : null,
+        activeTag: el ? el.tagName : null,
+      };
+    });
+    const settledFingerprint = await fingerprint();
+    if (!settledFingerprint.heading || settledFingerprint.ariaBusy !== "false"
+        || settledFingerprint.activeId !== "public-signin-link"
+        || settledFingerprint.title !== "Public Schedule — Hockey Scheduler") {
+      fail(`forced loading: the second, newer render (via Staff sign-in -> `
+        + `guest link) did not settle with real content, aria-busy="false", `
+        + `focus on #public-signin-link (never <body>), and the correct `
+        + `title, got ${JSON.stringify(settledFingerprint)}`);
+    }
+    // NOW release the obsolete FIRST (Standings) fetch. publicRenderSeq
+    // already moved on to this second render, so releasing it must be a
+    // complete no-op -- the settled content/focus/title above must be
+    // totally unaffected once it finally resolves.
+    releaseHeldFetch();
+    await page.waitForTimeout(300);  // give the obsolete response's own (discarded) handler a chance to run
+    const afterObsoleteRelease = await fingerprint();
+    const stillHasSkeletonOrError = await page.evaluate(() => ({
+      hasSkeleton: !!document.querySelector("#public-content .skeleton"),
+      hasError: !!document.querySelector("#public-content .banner.alert"),
     }));
-    if (settledAfterLoad.ariaBusy !== "false" || !settledAfterLoad.focusOnBox) {
-      fail(`forced loading: expected aria-busy="false" and focus retained `
-        + `on #public-content once settled, got ${JSON.stringify(settledAfterLoad)}`);
+    if (afterObsoleteRelease.title !== settledFingerprint.title
+        || afterObsoleteRelease.heading !== settledFingerprint.heading
+        || afterObsoleteRelease.ariaBusy !== "false" || afterObsoleteRelease.activeId !== "public-signin-link"
+        || stillHasSkeletonOrError.hasSkeleton || stillHasSkeletonOrError.hasError) {
+      fail(`forced loading: releasing the obsolete FIRST fetch (Standings, `
+        + `held while a second real navigation started a newer render) `
+        + `clobbered the already-settled render -- `
+        + `${JSON.stringify({ ...afterObsoleteRelease, ...stillHasSkeletonOrError })}`);
     }
     await page.unroute("**/api/public/schedule");
     checkpointErrors("forced loading");
 
+    expectFailure("GET", "/api/public/schedule", 502);
     await page.route("**/api/public/schedule", (route) => route.fulfill(BAD_GATEWAY));
     await page.click('[data-public-tab="schedule"]');
     await page.waitForSelector("#public-retry-btn", { timeout: 10000 });
@@ -605,6 +708,7 @@ async function checkViewport(browser, viewport) {
 
     const rosterTab = await page.$('.tab[data-tab="roster"]');
     if (!rosterTab) fail("restricted: could not find the Roster nav tab");
+    expectFailure("GET", "/lineups", 403);
     await rosterTab.click();
     await page.waitForFunction(() => document.body.dataset.view === "roster", null, { timeout: 10000 });
     await page.waitForSelector("#content .banner.neutral h2", { timeout: 10000 });
@@ -678,6 +782,14 @@ async function checkViewport(browser, viewport) {
     await assertNoSeriousViolations("#content", "restricted");
     checkpointErrors("restricted");
 
+    // The ledger must have been exercised, not just registered: all three
+    // deliberate failures (401/403/502) must have actually occurred and
+    // been consumed -- proves the allowlist matched real responses rather
+    // than silently never firing (e.g. a URL-substring typo).
+    const unconsumed = expectedFailures.filter((f) => !f.consumed);
+    if (unconsumed.length) {
+      fail(`expected deliberate failure(s) never occurred: ${JSON.stringify(unconsumed)}`);
+    }
     if (errors.length) {
       fail(`browser errors:\n${errors.join("\n")}`);
     }
@@ -689,15 +801,21 @@ async function checkViewport(browser, viewport) {
       + `forced 502 error on the public schedule's own fetch (role="status"`
       + `/aria-live/aria-busy while loading with focus held on `
       + `#public-content instead of dropping to <body>, role="alert" on the `
-      + `error, Retry reachable and visibly focused, real recovery), and `
-      + `the Restricted early return for an unassigned `
-      + `Official reached by one real Roster-tab click (title, `
-      + `role="alert", focus landing on the heading, no keyboard trap) — `
-      + `each with a zero-serious/critical axe scan and no console/page `
-      + `errors. The skip link was never focusable while #content was `
-      + `hidden across every signed-out/anonymous surface, and was a real, `
-      + `reachable tab stop once #content was genuinely visible on the `
-      + `Restricted surface.`);
+      + `error, Retry reachable and visibly focused, real recovery, and an `
+      + `obsolete held response -- released only after a genuinely second, `
+      + `newer render was started via two real clicks on the persistent `
+      + `Staff-sign-in/guest-link controls -- proven unable to clobber that `
+      + `newer render's content, title, or focus), and the Restricted early `
+      + `return for an unassigned Official reached by one real Roster-tab `
+      + `click (title, role="alert", focus landing on the heading, no `
+      + `keyboard trap) — each with a zero-serious/critical axe scan. A `
+      + `precise HTTP-response ledger (not a text-pattern filter) allowed `
+      + `only the three deliberate failures (401/403/502) through, proven `
+      + `falsifiable against a genuinely unlisted 404 via the same tracker, `
+      + `and confirmed to have actually fired all three. The skip link was `
+      + `never focusable while #content was hidden across every signed-out`
+      + `/anonymous surface, and was a real, reachable tab stop once `
+      + `#content was genuinely visible on the Restricted surface.`);
   } catch (e) {
     if (serverOutput.trim()) {
       console.error("--- demo server output ---\n" + serverOutput.trim());

@@ -9048,6 +9048,13 @@ function showPublicGuest() {
   if (location.hash !== "#public") history.replaceState(null, "", location.pathname + location.search + "#public");
   const signIn = document.getElementById("public-signin-link");
   if (signIn) signIn.onclick = () => showLogin();
+  // #345 review: mirrors showLogin()'s unconditional u.focus() -- whatever
+  // triggered this entry (the guest link on the just-hidden sign-in card,
+  // or nothing on a fresh #public boot) is gone or never existed, so focus
+  // would otherwise fall to <body>. #public-signin-link is a persistent,
+  // always-rendered control (unlike anything inside #public-content, which
+  // renderPublicGuest() below is still about to fetch/paint).
+  if (signIn) signIn.focus();
   renderPublicGuest();
 }
 // Demo mode exposes the seeded personas as one-click sign-ins; production
