@@ -6444,9 +6444,22 @@ async function render() {
   // game's scope gets a 403 (#73). Show a clear "restricted" state instead of
   // the generic backend-error banner.
   if (["roster", "sheet"].includes(view) && lineups && lineups.error) {
-    c.innerHTML = `<div class="banner neutral"><h2>Restricted</h2>
+    // #345 review: role="alert" so this is announced without requiring
+    // focus, AND focus moves onto the heading as the destination a nav
+    // click just asked for -- but only the FIRST time this state is
+    // entered. Every other cause of a render() re-entry (a toast update,
+    // an unrelated poll) rebuilds this exact banner too; re-focusing and
+    // re-announcing it each time would be a spurious repeat, not a new
+    // status. Checked against the OLD DOM, before it is replaced below.
+    const alreadyHere = !!(document.activeElement && document.activeElement.closest
+      && document.activeElement.closest(".banner.neutral[role=alert] h2"));
+    c.innerHTML = `<div class="banner neutral" role="alert"><h2>Restricted</h2>
       <p>${esc(lineups.error.message
         || "You don't have access to this game's roster.")}</p></div>`;
+    if (!alreadyHere) {
+      const h = c.querySelector(".banner.neutral h2");
+      if (h) { h.setAttribute("tabindex", "-1"); h.focus(); }
+    }
     return;
   }
   // Per-card loading boundary (#331 review round 2 finding 3): the card's
@@ -8940,17 +8953,41 @@ function hidePublicGuest() {
   if (screen) screen.hidden = true;
   if (location.hash === "#public") history.replaceState(null, "", location.pathname + location.search);
 }
+// Monotonic guard (#345 review) -- same pattern as setupProgressFetchSeq --
+// so a held/slow response from an EARLIER call (e.g. a Standings click whose
+// fetch is still in flight) cannot clobber a NEWER call's already-rendered
+// content or focus once it finally resolves.
+let publicRenderSeq = 0;
 async function renderPublicGuest() {
   const box = document.getElementById("public-content");
   if (!box) return;
   updateToast();  // the guest screen has no other render() path to surface post() errors
-  box.innerHTML = `<div class="skeleton"></div><div class="skeleton"></div>`;
+  const mySeq = ++publicRenderSeq;
+  // #345 review: every state this function renders wholesale-replaces
+  // #public-content's children, which destroys whichever control (a
+  // segment tab, Retry) the operator just clicked to GET here -- capture
+  // whether focus was already inside the box before wiping it, so the box
+  // itself can be given focus instead of losing it to <body>. #public-
+  // content itself is never replaced (only its children are), so once
+  // focused here it stays focused across every later state in this same
+  // render cycle without needing to be re-applied. Never done on the
+  // FIRST, uninteracted load (focusWasInBox is false then), so landing on
+  // the public screen never steals focus from wherever the visitor was.
+  const focusWasInBox = !!(document.activeElement && box.contains(document.activeElement));
+  box.setAttribute("role", "status");
+  box.setAttribute("aria-live", "polite");
+  box.setAttribute("aria-busy", "true");
+  box.innerHTML = `<div class="skeleton"><span class="sr-only">Loading public schedule…</span></div>`
+    + `<div class="skeleton"></div>`;
+  if (focusWasInBox) { box.setAttribute("tabindex", "-1"); box.focus(); }
   // A network failure or a non-JSON/5xx response — getJSON now surfaces the
   // latter as {error} rather than throwing — must give an anonymous visitor the
   // same clear error + Retry a signed-in user gets, not an empty schedule or an
   // infinite skeleton (#133).
   const fail = (message) => {
-    box.innerHTML = `<div class="banner alert"><h2>Could not load the public schedule</h2>
+    if (mySeq !== publicRenderSeq) return;  // an obsolete response must not clobber a newer render
+    box.setAttribute("aria-busy", "false");
+    box.innerHTML = `<div class="banner alert" role="alert"><h2>Could not load the public schedule</h2>
       <p>${esc(message)}</p></div>
       <div class="actions"><button class="act primary" id="public-retry-btn">Retry</button></div>`;
     const retry = document.getElementById("public-retry-btn");
@@ -8958,6 +8995,7 @@ async function renderPublicGuest() {
   };
   try {
     const sch = await getJSON("/api/public/schedule");
+    if (mySeq !== publicRenderSeq) return;  // obsolete -- a newer call already owns the box
     if (sch && sch.error) return fail(sch.error.message);
     publicState.schedule = sch || { fixtures: [], divisions: [] };
     if (!publicState.division && publicState.schedule.divisions[0]) {
@@ -8965,12 +9003,15 @@ async function renderPublicGuest() {
     }
     if (publicTab === "standings" && publicState.division) {
       const st = await getJSON(`/api/public/standings/${publicState.division}`);
+      if (mySeq !== publicRenderSeq) return;  // obsolete
       if (st && st.error) return fail(st.error.message);
       publicState.standings = st;
     }
   } catch (e) {
+    if (mySeq !== publicRenderSeq) return;  // obsolete
     return fail(e.message || String(e));
   }
+  box.setAttribute("aria-busy", "false");
   box.innerHTML = renderPublic({});
   box.querySelectorAll("[data-public-tab]").forEach((b) => b.onclick = () => {
     publicTab = b.dataset.publicTab; publicState.game = null;

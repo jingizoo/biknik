@@ -34,20 +34,25 @@
 // indicated wherever it lands, and an axe-core scan reports zero serious or
 // critical violations. Fails on any browser console/page error.
 //
-// KNOWN, REPORTED GAP (not fixed by this slice -- scope is coverage, not a
-// production change): the failed-login message (#login-error), the forced
-// public-schedule loading/error banners (#public-content), and the
-// Restricted banner (app.js's render() early return) carry no role="alert"/
-// role="status"/aria-live of their own, and neither the Restricted
-// transition nor the forced-loading skeleton moves focus anywhere
-// deliberate (the latter actively DROPS it to <body>, since
-// renderPublicGuest() rewrites #public-content wholesale and destroys
-// whatever control was just clicked) -- so a screen-reader user is not
-// programmatically told status/error changed (WCAG 4.1.3). This differs
-// from the setup-progress card (home-tasks-hub.js), which already does this
-// correctly (role="status"/"alert", aria-busy). Reproduced live and reported
-// before writing this file, per this slice's own scope rules; each site is
-// called out at its assertion below instead of asserted as passing.
+// STATUS/ERROR ANNOUNCEMENTS (#345 review release blocker, fixed here, not
+// just documented): #login-error now carries role="alert" (index.html).
+// renderPublicGuest() now gives #public-content role="status"
+// aria-live="polite" aria-busy (flipping false once settled, matching the
+// setup-progress card's own #sp-card-slot contract in home-tasks-hub.js),
+// its error banner additionally carries role="alert", and a monotonic
+// publicRenderSeq guards a held/obsolete response from clobbering a NEWER
+// render's content once it finally resolves -- this specific guard is NOT
+// independently exercised below (see the comment at its call site: every
+// control that could start a second request lives inside the region the
+// first one wipes to a bare skeleton, so a genuinely overlapping SECOND
+// real click cannot be constructed through this app's current UI). The
+// Restricted early-return now carries role="alert" too. FOCUS: since
+// #public-content itself is never replaced (only its children are),
+// focusing the box once (only when the interaction that triggered this
+// render started INSIDE it) keeps focus connected and visible across every
+// later state in the same cycle instead of dropping to <body>; Restricted
+// moves focus onto its own heading, but only the FIRST time that state is
+// entered, so a redundant re-render never re-announces or re-steals focus.
 const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
@@ -333,10 +338,30 @@ async function checkViewport(browser, viewport) {
       return !!(e && !e.hidden && e.textContent.trim());
     }, null, { timeout: 10000 });
     await waitForTitle(page, "Sign in — Hockey Scheduler", fail, "login screen (failed login)");
-    // KNOWN GAP (see file header): #login-error carries no role="alert"/
-    // aria-live, so this is intentionally NOT asserted as an accessible
-    // announcement -- only that the message itself is visible and the
-    // surface identity (title/heading) is unchanged.
+    const loginErrorRole = await page.evaluate(() =>
+      (document.getElementById("login-error") || {}).getAttribute
+        && document.getElementById("login-error").getAttribute("role"));
+    if (loginErrorRole !== "alert") {
+      fail(`login screen (failed login): expected #login-error to carry `
+        + `role="alert", got ${JSON.stringify(loginErrorRole)}`);
+    }
+    // showLogin() re-focuses the username field on every call, including
+    // this failure path -- usable focus, not just a visible message. The
+    // browser's own default "focus the clicked submit button" can still be
+    // settling a beat after showLogin()'s synchronous u.focus() call runs
+    // (observed directly: activeElement briefly stays on the submit button
+    // before moving to #login-user), so poll for the settled state rather
+    // than reading it once.
+    await page.waitForFunction(() => document.activeElement
+      && document.activeElement.id === "login-user", null, { timeout: 5000 }).catch(async () => {
+      fail(`login screen (failed login): expected focus back on #login-user, `
+        + `got ${JSON.stringify(await activeInfo(page))}`);
+    });
+    const afterFailedLogin = await activeInfo(page);
+    if (!afterFailedLogin || !afterFailedLogin.visibleFocus) {
+      fail(`login screen (failed login): #login-user has no visible focus `
+        + `indicator, got ${JSON.stringify(afterFailedLogin)}`);
+    }
     assertSkip(await skipLinkState(page), "login screen (failed login)");
     await assertNoSeriousViolations("#login-screen", "login screen");
     checkpointErrors("login screen");
@@ -430,31 +455,65 @@ async function checkViewport(browser, viewport) {
     await page.waitForSelector(".hero h2", { timeout: 10000 });
     checkpointErrors("public schedule (return for surface 4)");
 
-    let releaseDelay;
-    const delayPromise = new Promise((resolve) => { releaseDelay = resolve; });
-    await page.route("**/api/public/schedule", async (route) => { await delayPromise; await route.continue(); });
+    // NOT constructed here, and why: an "obsolete held response released
+    // after a NEWER render already settled" race (app.js's publicRenderSeq
+    // guard) needs a SECOND real click while the FIRST request is still in
+    // flight. renderPublicGuest() wipes #public-content to the bare
+    // skeleton synchronously the instant a request starts -- every control
+    // that could start a second request (the segment tabs, Retry, the
+    // division select) lives INSIDE that region and is gone the moment
+    // loading begins, so there is no second real, visible control left to
+    // click before the first request resolves. Confirmed directly: a
+    // `[data-public-tab="schedule"]` click while Standings's own fetch was
+    // held timed out -- the selector does not exist during loading. The
+    // production guard (publicRenderSeq) is still correct defensive code
+    // matching this codebase's own established pattern elsewhere
+    // (setupProgressFetchSeq), but this specific race is not achievable
+    // through the app's current UI without a synthetic action this
+    // journey's own rules forbid. Same precedent as PR #347's "left
+    // unproven rather than covered by a leg asserting into a state that
+    // was never created" -- worth a look, not silently assumed passing.
+    let releaseHeldFetch;
+    const heldFetch = new Promise((resolve) => { releaseHeldFetch = resolve; });
+    await page.route("**/api/public/schedule", async (route) => { await heldFetch; await route.continue(); });
     await page.click('[data-public-tab="standings"]');
     await page.waitForSelector("#public-content .skeleton", { timeout: 10000 });
     await waitForTitle(page, "Public Schedule — Hockey Scheduler", fail, "forced loading");
     assertSkip(await skipLinkState(page), "forced loading");
-    // KNOWN GAP (see file header): renderPublicGuest() rewrites #public-
-    // content's innerHTML wholesale for the skeleton, which destroys the
-    // very Standings control that was just clicked -- so focus is dropped
-    // to <body> rather than preserved or deliberately moved, same category
-    // as the missing role="status"/aria-busy. Not asserted as "focus stays
-    // visible" here; only that it did not silently land somewhere ELSE
-    // unexpected (a stale/removed node Playwright would fail to resolve).
-    focused = await activeInfo(page);
-    if (!focused || focused.tag !== "body") {
-      fail(`forced loading: expected the known focus-to-<body> gap (see file `
-        + `header), got something else entirely: ${JSON.stringify(focused)}`);
+    // #345 review fix: #public-content itself (never replaced, only its
+    // children are) takes focus and carries the busy/status contract,
+    // instead of dropping to <body> when the clicked Standings control is
+    // destroyed by the innerHTML rewrite.
+    const loadingState = await page.evaluate(() => {
+      const box = document.getElementById("public-content");
+      const el = document.activeElement;
+      return {
+        focusOnBox: el === box,
+        role: box && box.getAttribute("role"),
+        ariaLive: box && box.getAttribute("aria-live"),
+        ariaBusy: box && box.getAttribute("aria-busy"),
+        srText: (box && box.querySelector(".sr-only") || {}).textContent || "",
+      };
+    });
+    if (!loadingState.focusOnBox || loadingState.role !== "status"
+        || loadingState.ariaLive !== "polite" || loadingState.ariaBusy !== "true"
+        || !/Loading public schedule/.test(loadingState.srText)) {
+      fail(`forced loading: expected #public-content to own focus with `
+        + `role="status" aria-live="polite" aria-busy="true" and a "Loading `
+        + `public schedule" status text, got ${JSON.stringify(loadingState)}`);
     }
-    // KNOWN GAP (see file header): the loading skeleton carries no heading,
-    // role="status", or aria-busy of its own -- not asserted here.
     await assertNoSeriousViolations("#public-screen", "forced loading");
-    releaseDelay();
-    await page.waitForFunction(() => !document.querySelector("#public-content .skeleton"),
-      null, { timeout: 10000 });
+    releaseHeldFetch();
+    await page.waitForFunction(() => !document.querySelector("#public-content .skeleton")
+      && document.querySelector(".hero h2"), null, { timeout: 10000 });
+    const settledAfterLoad = await page.evaluate(() => ({
+      ariaBusy: (document.getElementById("public-content") || {}).getAttribute("aria-busy"),
+      focusOnBox: document.activeElement === document.getElementById("public-content"),
+    }));
+    if (settledAfterLoad.ariaBusy !== "false" || !settledAfterLoad.focusOnBox) {
+      fail(`forced loading: expected aria-busy="false" and focus retained `
+        + `on #public-content once settled, got ${JSON.stringify(settledAfterLoad)}`);
+    }
     await page.unroute("**/api/public/schedule");
     checkpointErrors("forced loading");
 
@@ -471,10 +530,24 @@ async function checkViewport(browser, viewport) {
       fail(`forced error: expected a visible "Could not load the public schedule" `
         + `heading, got ${JSON.stringify(errorHeading)}`);
     }
-    // KNOWN GAP (see file header): this banner also carries no role="alert"/
-    // aria-live -- not asserted here, only that the Retry control is reachable
-    // and visibly focused.
-    await blurActive(page);
+    const errorSemantics = await page.evaluate(() => {
+      const banner = document.querySelector("#public-content .banner.alert");
+      const box = document.getElementById("public-content");
+      return {
+        bannerRole: banner && banner.getAttribute("role"),
+        boxAriaBusy: box && box.getAttribute("aria-busy"),
+        focusOnBox: document.activeElement === box,
+      };
+    });
+    if (errorSemantics.bannerRole !== "alert" || errorSemantics.boxAriaBusy !== "false" || !errorSemantics.focusOnBox) {
+      fail(`forced error: expected the banner to carry role="alert", `
+        + `#public-content aria-busy="false", and focus to have stayed on `
+        + `#public-content (never lost across the loading -> error `
+        + `transition), got ${JSON.stringify(errorSemantics)}`);
+    }
+    // Tab forward from the box itself (its real current focus, not a reset)
+    // must still reach Retry, keyboard-operable exactly as a real user
+    // encountering this error would experience it.
     const retryStops = [];
     let reachedRetry = false;
     for (let i = 0; i < 8; i += 1) {
@@ -498,6 +571,19 @@ async function checkViewport(browser, viewport) {
     await page.waitForFunction(() => !document.querySelector("#public-retry-btn")
       && !document.querySelector("#public-content .skeleton"), null, { timeout: 10000 });
     await page.waitForSelector(".hero h2", { timeout: 10000 });
+    const recovered = await page.evaluate(() => {
+      const box = document.getElementById("public-content");
+      return {
+        ariaBusy: box && box.getAttribute("aria-busy"),
+        focusOnBox: document.activeElement === box,
+        hasError: !!document.querySelector("#public-content .banner.alert"),
+      };
+    });
+    if (recovered.ariaBusy !== "false" || !recovered.focusOnBox || recovered.hasError) {
+      fail(`forced error retry recovery: expected aria-busy="false", focus `
+        + `retained on #public-content, and the error banner gone, got `
+        + `${JSON.stringify(recovered)}`);
+    }
     checkpointErrors("forced error retry recovery");
 
     // ---- (5) Restricted early return, via a real "Roster" nav click -------
@@ -544,37 +630,50 @@ async function checkViewport(browser, viewport) {
       fail(`restricted: expected a visible "Restricted" heading with detail text, `
         + `got ${JSON.stringify(restrictedHeading)}`);
     }
-    // Focus stays on the still-visible Roster tab that triggered this (real,
-    // meaningful -- not lost to <body> or an invisible node). Reached by a
-    // real MOUSE click, so no visible-focus-ring check here: Chromium's
-    // :focus-visible heuristic correctly withholds the ring for pointer-
-    // initiated focus (WCAG 2.4.7 is a keyboard-operation requirement) --
-    // the keyboard-driven return below is where that check belongs.
+    // #345 review fix: role="alert" announces this without needing focus,
+    // AND focus moves onto the heading as the destination the Roster click
+    // asked for -- a deliberate, connected, meaningful landing, not left on
+    // the (now stale-context) Roster tab or lost to <body>.
+    const restrictedSemantics = await page.evaluate(() => {
+      const banner = document.querySelector("#content .banner.neutral");
+      return { role: banner && banner.getAttribute("role") };
+    });
+    if (restrictedSemantics.role !== "alert") {
+      fail(`restricted: expected the banner to carry role="alert", got `
+        + `${JSON.stringify(restrictedSemantics)}`);
+    }
     focused = await activeInfo(page);
-    if (!focused || focused.tag !== "button" || !/Roster/.test(focused.text)) {
-      fail(`restricted: expected focus to remain on the Roster tab button, `
+    if (!focused || focused.tag !== "h2" || focused.text !== "Restricted") {
+      fail(`restricted: expected focus to land on the "Restricted" heading, `
         + `got ${JSON.stringify(focused)}`);
     }
-    // KNOWN GAP (see file header): the Restricted banner carries no
-    // role="alert"/aria-live and focus does not move into it -- not
-    // asserted as an accessible announcement here. What IS asserted: no
-    // keyboard trap. One Tab must move focus away to a different, real
-    // control, and Shift+Tab must return exactly to the Roster tab with a
-    // now-genuinely-keyboard-driven visible focus ring.
+    // No keyboard trap. The heading is tabindex="-1" (a landing spot, like
+    // #content's own established floor -- not a dialog container with its
+    // own JS-enforced cycle), so it is NOT part of the normal sequential
+    // Tab order: Shift+Tab from whatever follows it does NOT return to it,
+    // by design. What matters is that BOTH directions from this landing
+    // spot lead somewhere real, never <body> or a dead end.
     await page.keyboard.press("Tab");
     const afterTab = await activeInfo(page);
-    if (!afterTab || afterTab.id === focused.id && afterTab.cls === focused.cls && afterTab.text === focused.text) {
-      fail(`restricted: Tab from the Roster tab did not move focus anywhere, `
-        + `got ${JSON.stringify(afterTab)}`);
+    if (!afterTab || afterTab.tag === "body" || (afterTab.tag === focused.tag && afterTab.text === focused.text)) {
+      fail(`restricted: Tab from the Restricted heading did not move focus `
+        + `anywhere real, got ${JSON.stringify(afterTab)}`);
     }
     if (!afterTab.visibleFocus) {
-      fail(`restricted: the control after Roster has no visible focus indicator, got ${JSON.stringify(afterTab)}`);
+      fail(`restricted: the control after the heading has no visible focus indicator, got ${JSON.stringify(afterTab)}`);
     }
+    // Re-focus the heading directly to probe the REVERSE direction from the
+    // same landing spot -- test setup, not a bypass of the interaction
+    // under test (the click that put focus there is already proven above).
+    await page.evaluate(() => {
+      const h = document.querySelector("#content .banner.neutral h2");
+      if (h) h.focus();
+    });
     await page.keyboard.press("Shift+Tab");
-    const backOnRoster = await activeInfo(page);
-    if (!backOnRoster || backOnRoster.tag !== "button" || !/Roster/.test(backOnRoster.text) || !backOnRoster.visibleFocus) {
-      fail(`restricted: Shift+Tab did not return focus to the Roster tab `
-        + `with a visible focus indicator, got ${JSON.stringify(backOnRoster)}`);
+    const beforeHeading = await activeInfo(page);
+    if (!beforeHeading || beforeHeading.tag === "body" || !beforeHeading.visibleFocus) {
+      fail(`restricted: Shift+Tab from the Restricted heading did not move `
+        + `focus anywhere real, got ${JSON.stringify(beforeHeading)}`);
     }
     await assertNoSeriousViolations("#content", "restricted");
     checkpointErrors("restricted");
@@ -583,18 +682,22 @@ async function checkViewport(browser, viewport) {
       fail(`browser errors:\n${errors.join("\n")}`);
     }
     console.log(`[${viewport.label}] OK — signed-out login (title, heading, `
-      + `accessible names, real Tab order, visible focus), the public `
-      + `schedule (heading, fixtures, Tab order), the public -> Staff `
-      + `sign-in leg via a real click (title, heading, focus landing on `
-      + `#login-user), a forced loading then forced 502 error on the public `
-      + `schedule's own fetch (title stable, Retry reachable and visibly `
-      + `focused, real recovery), and the Restricted early return for an `
-      + `unassigned Official reached by one real Roster-tab click (title, `
-      + `heading, no keyboard trap) — each with a zero-serious/critical axe `
-      + `scan and no console/page errors. The skip link was never `
-      + `focusable while #content was hidden across every signed-out/`
-      + `anonymous surface, and was a real, reachable tab stop once `
-      + `#content was genuinely visible on the Restricted surface.`);
+      + `accessible names, real Tab order, visible focus, role="alert" on a `
+      + `failed attempt), the public schedule (heading, fixtures, Tab `
+      + `order), the public -> Staff sign-in leg via a real click (title, `
+      + `heading, focus landing on #login-user), a forced loading then `
+      + `forced 502 error on the public schedule's own fetch (role="status"`
+      + `/aria-live/aria-busy while loading with focus held on `
+      + `#public-content instead of dropping to <body>, role="alert" on the `
+      + `error, Retry reachable and visibly focused, real recovery), and `
+      + `the Restricted early return for an unassigned `
+      + `Official reached by one real Roster-tab click (title, `
+      + `role="alert", focus landing on the heading, no keyboard trap) — `
+      + `each with a zero-serious/critical axe scan and no console/page `
+      + `errors. The skip link was never focusable while #content was `
+      + `hidden across every signed-out/anonymous surface, and was a real, `
+      + `reachable tab stop once #content was genuinely visible on the `
+      + `Restricted surface.`);
   } catch (e) {
     if (serverOutput.trim()) {
       console.error("--- demo server output ---\n" + serverOutput.trim());
