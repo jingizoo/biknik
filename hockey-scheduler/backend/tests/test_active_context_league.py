@@ -31,7 +31,7 @@ from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api.service import ApiService
 from hockey_scheduler.domain import (
-    ActiveContext, GuardianLink, OfficialRole, Role, SeasonStatus)
+    ActiveContext, GameType, GuardianLink, OfficialRole, Role, SeasonStatus)
 from hockey_scheduler.domain.models import Game
 from hockey_scheduler.domain.setup_models import LeagueSeason, OfficialAssignment
 from hockey_scheduler.services import context_scope
@@ -78,16 +78,36 @@ def _registered_team(api, sid, lid, tname="Alpha"):
     return team
 
 
-def _assigned_official(api, sid, team_id):
-    oid = api.create_official("Ref")["id"]
+def _assign_game(api, official_id, *, season_id, team_id, league_id=None,
+                 league_season_id=None, game_type=GameType.REGULAR.value):
+    """Assign ``official_id`` to a Game with an EXPLICIT competition identity.
+
+    Every field an Official's League derivation reads is passed in deliberately
+    — `league_season_id` is the frozen source of truth, `season_id`/`league_id`
+    are the denormalized columns it must agree with, and `game_type` decides
+    whether the Game owns a League at all — so a test can construct the exact
+    valid, missing, or drifted shape it means to exercise."""
     store = api.store
     with store.transaction():
         gid = store.next_id("game")
         store.add_game(Game(id=gid, home_team_id=team_id, away_team_id=team_id,
-                            start_time=None, season_id=sid))
+                            start_time=None, season_id=season_id,
+                            league_id=league_id,
+                            league_season_id=league_season_id,
+                            game_type=game_type))
         store.add_official_assignment(OfficialAssignment(
-            id=store.next_id("assign"), game_id=gid, official_id=oid,
+            id=store.next_id("assign"), game_id=gid, official_id=official_id,
             role=OfficialRole.REFEREE))
+    return gid
+
+
+def _assigned_official(api, sid, team_id, league_id):
+    """An Official assigned to a well-formed REGULAR Game in ``league_id``/``sid``,
+    carrying that pair's real frozen LeagueSeason."""
+    oid = api.create_official("Ref")["id"]
+    ls = api.store.league_season_for(league_id, sid)
+    gid = _assign_game(api, oid, season_id=sid, team_id=team_id,
+                       league_id=league_id, league_season_id=ls.id)
     return oid, gid
 
 
@@ -430,7 +450,7 @@ class LeagueScopeMatrixTest(unittest.TestCase):
                     self.assertNotIn(silver, got, (label, role))
 
                 # Official: the Leagues of the games they are assigned to.
-                oid, _gid = _assigned_official(api, sid, team)
+                oid, _gid = _assigned_official(api, sid, team, gold)
                 self.assertEqual(
                     context_scope.authorized_league_ids(
                         store, Role.OFFICIAL, {"official_id": oid}, pid, "u1"),
@@ -503,6 +523,162 @@ class LeagueScopeMatrixTest(unittest.TestCase):
                     "u1", Role.COACH, {"team_id": team})
                 self.assertEqual(
                     {lg.id for (_prog, _seasons, lgs) in programs for lg in lgs},
+                    {gold}, label)
+                _close(store)
+
+
+class OfficialFrozenLeagueIdentityTest(unittest.TestCase):
+    """An Official's League comes from each assigned Game's FROZEN
+    ``league_season_id``, never from either Team's mutable permanent League.
+
+    Reading the Team was a real defect caught in review: a transfer changes
+    ``Team.league_id`` without rewriting historical Games, so a Team-derived
+    projection simultaneously GRANTS a League the assignment never covered and
+    REVOKES the one it does. Every leg here is falsifiable against that
+    implementation.
+    """
+
+    def _reason(self, fn):
+        try:
+            fn()
+        except Exception as exc:
+            return getattr(exc, "details", {}).get("reason"), str(exc)
+        return None, "no error raised"
+
+    def test_team_transfer_does_not_move_the_officials_league(self):
+        """Scenario 1: the assignment's League is invariant under a transfer of
+        the Game's Team to another same-Program, same-Season League."""
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                pid, sid, gold = _program_season_league(api, "P", "S1", "Gold")
+                silver = api.create_league(sid, "Silver")["id"]
+                team = _registered_team(api, sid, gold)
+                oid, _gid = _assigned_official(api, sid, team, gold)
+                official = (Role.OFFICIAL, {"official_id": oid})
+                svc = ContextService(store)
+
+                self.assertEqual(
+                    context_scope.authorized_league_ids(
+                        store, *official, pid, "u1"), {gold}, label)
+
+                # The Team leaves Gold for Silver; the Game stays in Gold/S1.
+                t = store.get_team(team)
+                t.league_id = silver
+                store.save_team(t)
+
+                got = context_scope.authorized_league_ids(
+                    store, *official, pid, "u1")
+                self.assertEqual(got, {gold}, f"{label}: assignment League moved")
+                self.assertNotIn(silver, got, label)
+
+                # The switcher must not offer Silver either.
+                programs, _p, _s, _lg = svc.options_with_league("u1", *official)
+                self.assertEqual(
+                    {lg.id for (_pr, _se, lgs) in programs for lg in lgs},
+                    {gold}, label)
+
+                # Selecting Silver is refused with the same non-oracle reason,
+                # and leaves no context row behind; Gold stays selectable.
+                reason, msg = self._reason(
+                    lambda: svc.set_with_league("u1", *official, pid, sid, silver))
+                self.assertEqual(reason, "league_not_accessible", (label, msg))
+                self.assertIsNone(store.get_active_context("u1"), label)
+                self.assertEqual(
+                    svc.set_with_league("u1", *official, pid, sid, gold)[2].id,
+                    gold, label)
+                _close(store)
+
+    def test_league_set_is_the_union_of_assigned_game_identities(self):
+        """Scenario 2: two assignments in two valid Leagues yield both — proving
+        the set is keyed on Game identity, not on one Team or insertion order."""
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                pid, sid, gold = _program_season_league(api, "P", "S1", "Gold")
+                silver = api.create_league(sid, "Silver")["id"]
+                gold_team = _registered_team(api, sid, gold, "GoldTeam")
+                silver_team = _registered_team(api, sid, silver, "SilverTeam")
+                oid, _gid = _assigned_official(api, sid, gold_team, gold)
+                _assign_game(
+                    api, oid, season_id=sid, team_id=silver_team,
+                    league_id=silver,
+                    league_season_id=store.league_season_for(silver, sid).id)
+                official = (Role.OFFICIAL, {"official_id": oid})
+
+                self.assertEqual(
+                    context_scope.authorized_league_ids(
+                        store, *official, pid, "u1"), {gold, silver}, label)
+
+                # Moving ONE Team does not disturb either assignment's League.
+                t = store.get_team(gold_team)
+                t.league_id = silver
+                store.save_team(t)
+                self.assertEqual(
+                    context_scope.authorized_league_ids(
+                        store, *official, pid, "u1"), {gold, silver}, label)
+                _close(store)
+
+    def test_exhibition_assignment_contributes_no_league(self):
+        """Scenario 3: an exhibition owns no LeagueSeason, so it grants nothing
+        — even though its Teams do sit in a League."""
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                pid, sid, gold = _program_season_league(api, "P", "S1", "Gold")
+                team = _registered_team(api, sid, gold)
+                oid = api.create_official("Ref")["id"]
+                _assign_game(api, oid, season_id=sid, team_id=team,
+                             league_id=None, league_season_id=None,
+                             game_type=GameType.EXHIBITION.value)
+                official = (Role.OFFICIAL, {"official_id": oid})
+                self.assertEqual(
+                    context_scope.authorized_league_ids(
+                        store, *official, pid, "u1"), set(), label)
+                _close(store)
+
+    def test_missing_or_drifted_identity_fails_closed(self):
+        """Scenario 4: a regular Game whose frozen identity is absent, dangling,
+        cross-Season, or League-mismatched exposes NO League."""
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                pid, s1, gold = _program_season_league(api, "P", "S1", "Gold")
+                s2 = api.create_season(pid, "S2")["id"]
+                silver = api.create_league(s1, "Silver")["id"]
+                team = _registered_team(api, s1, gold)
+                gold_ls = store.league_season_for(gold, s1).id
+                other_ls = api.setup.create_league_season(gold, s2).id
+
+                cases = {
+                    # A regular Game with no frozen identity at all.
+                    "missing": dict(league_id=gold, league_season_id=None),
+                    # Points at a LeagueSeason that no longer exists.
+                    "dangling": dict(league_id=gold,
+                                     league_season_id="ls_does_not_exist"),
+                    # Binding's Season disagrees with the Game's own season_id.
+                    "cross_season": dict(league_id=gold,
+                                         league_season_id=other_ls),
+                    # Binding's League disagrees with the Game's own league_id.
+                    "league_mismatch": dict(league_id=silver,
+                                            league_season_id=gold_ls),
+                }
+                for name, kwargs in cases.items():
+                    oid = api.create_official(f"Ref-{name}")["id"]
+                    _assign_game(api, oid, season_id=s1, team_id=team, **kwargs)
+                    self.assertEqual(
+                        context_scope.authorized_league_ids(
+                            store, Role.OFFICIAL, {"official_id": oid},
+                            pid, "u1"),
+                        set(), f"{label}/{name} did not fail closed")
+
+                # A well-formed assignment still resolves, so the guard above is
+                # rejecting drift specifically — not refusing everything.
+                ok_oid, _gid = _assigned_official(api, s1, team, gold)
+                self.assertEqual(
+                    context_scope.authorized_league_ids(
+                        store, Role.OFFICIAL, {"official_id": ok_oid},
+                        pid, "u1"),
                     {gold}, label)
                 _close(store)
 
