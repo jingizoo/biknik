@@ -915,7 +915,30 @@ function focusContentHeading(attempt) {
     content.focus();
     return;
   }
-  if ((attempt || 0) < 40) setTimeout(() => focusContentHeading((attempt || 0) + 1), 50);
+  if ((attempt || 0) < 40) {
+    setTimeout(() => focusContentHeading((attempt || 0) + 1), 50);
+    return;
+  }
+  // Poll exhausted (40 x 50ms = 2s). It used to simply return here, which
+  // silently LOST focus: on a loaded machine the destination view can still
+  // be fetching after two seconds, so the caller -- typically the dialog
+  // close path restoring focus when the trigger itself was removed -- was
+  // left with focus on <body>. Reproduced as a real CI failure on
+  // browser-smoke shard 2 ("focus restore (removed trigger): focus was left
+  // on <body> instead of the view fallback"), passing locally where the
+  // render lands well inside the budget.
+  //
+  // #content is always present and carries tabindex="-1" (added with the
+  // skip link), so it is a guaranteed floor. Taking it is strictly better
+  // than <body>: focus is inside the main region, the next Tab continues
+  // from there, and a screen reader announces the region rather than
+  // nothing. Deliberately unconditional -- a slow render must never end with
+  // focus nowhere.
+  if (content) {
+    content.setAttribute("tabindex", "-1");
+    content.setAttribute("aria-label", "Page content");
+    content.focus();
+  }
 }
 
 // Destination focus for "participation" (#331 review round 2 finding 4):
@@ -7969,7 +7992,18 @@ function overlayFocusables(root) {
 //     before the frame ran never steals focus;
 //   * on close, focus returns once to the captured trigger if it is still
 //     connected and visible, otherwise to the view-level fallback.
-let overlayFocusedKey = null;      // instance key we have already focused
+// Two DISTINCT pieces of state, and the distinction is the whole fix:
+//   overlayOpenKey   -- the instance observed open, recorded SYNCHRONOUSLY;
+//   overlayFocusedKey -- the instance whose focus frame actually executed.
+// Ownership used to be recorded only inside the queued frame, so an overlay
+// closed before that frame ran left both null: the close branch below saw no
+// owned instance, skipped the restore entirely, and focus stayed on <body>.
+// The queued frame then found no overlay and returned. Recording the open
+// synchronously means a close ALWAYS has an instance to restore for, whether
+// or not its frame ever ran.
+let overlayOpenKey = null;         // instance observed open (synchronous)
+let overlayFocusedKey = null;      // instance whose focus frame actually ran
+let overlayFocusHandle = 0;        // pending frame handle, so close can cancel
 let overlayReturnFocus = null;     // element to restore to on close
 let overlayReturnSelector = null;  // ...and how to re-find it after a re-render
 let overlayFocusQueued = false;    // a frame is already pending
@@ -8080,10 +8114,21 @@ function focusOverlayContainer(overlay, key) {
 function syncOverlayFocus() {
   const key = overlayKey();
   if (!key) {
-    // Closed. Restore once, then clear.
-    if (overlayFocusedKey) {
+    // Closed. Restore once, then clear. Gated on overlayOpenKey, NOT
+    // overlayFocusedKey: an instance closed before its focus frame ran is
+    // still an instance we owe a restore for.
+    if (overlayOpenKey) {
+      // Obsolete any frame still pending for the instance just closed, so it
+      // cannot fire after the restore and move focus back into a dialog that
+      // no longer exists.
+      if (overlayFocusHandle) {
+        cancelAnimationFrame(overlayFocusHandle);
+        overlayFocusHandle = 0;
+      }
+      overlayFocusQueued = false;
       // Resolve BEFORE clearing -- resolveReturnFocus() reads both fields.
       const back = resolveReturnFocus();
+      overlayOpenKey = null;
       overlayFocusedKey = null;
       overlayReturnFocus = null;
       overlayReturnSelector = null;
@@ -8102,7 +8147,11 @@ function syncOverlayFocus() {
     }
     return;
   }
-  if (key === overlayFocusedKey) {
+  if (key === overlayOpenKey) {
+    // Same instance. Only RE-ANCHOR once its frame has actually focused the
+    // container -- otherwise the pending frame still owns the first focus and
+    // must not be pre-empted here.
+    if (key !== overlayFocusedKey) return;
     // Same dialog instance, already focused once. The render that just ran
     // replaced its container node, so if focus was on the dialog (or on any
     // control inside it) it is now on <body>. Re-anchor to the rebuilt
@@ -8120,18 +8169,24 @@ function syncOverlayFocus() {
   // over a drawer still restores to whatever opened the drawer. Closing that
   // modal leaves the drawer open, which reads here as a new instance key and
   // lands focus back on the drawer container.
-  if (!overlayFocusedKey) {
+  if (!overlayOpenKey) {
     overlayReturnFocus = lastActivatedTrigger;
     overlayReturnSelector = triggerSelector(lastActivatedTrigger);
   }
-  if (overlayFocusQueued) return;
+  // Take ownership NOW, before awaiting a frame.
+  overlayOpenKey = key;
+  // A newly-observed instance supersedes any frame queued for the previous
+  // one (e.g. a modal opening over a drawer), so cancel rather than skip --
+  // "already queued" must not mean the new instance never gets focused.
+  if (overlayFocusHandle) cancelAnimationFrame(overlayFocusHandle);
   overlayFocusQueued = true;
-  requestAnimationFrame(() => {
+  overlayFocusHandle = requestAnimationFrame(() => {
     overlayFocusQueued = false;
-    // Re-check at fire time: the dialog may have closed or been replaced
-    // between queueing and running.
+    overlayFocusHandle = 0;
+    // Re-check at fire time against the SYNCHRONOUS owner: the dialog may
+    // have closed, or another overlay opened, between queueing and running.
     const nowKey = overlayKey();
-    if (!nowKey || nowKey === overlayFocusedKey) return;
+    if (!nowKey || nowKey !== overlayOpenKey || nowKey === overlayFocusedKey) return;
     const overlay = openOverlayElement();
     if (!overlay) return;
     focusOverlayContainer(overlay, nowKey);
