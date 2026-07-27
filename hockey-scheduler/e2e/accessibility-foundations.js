@@ -300,7 +300,7 @@ async function checkViewport(browser, viewport) {
 
     // ---- (3) dialog focus trapping ---------------------------------------
     // The topbar "Add Ice" shortcut opens a real create drawer.
-    const trigger = await page.$('.topbar [data-open-drawer="ice-slot"]');
+    let trigger = await page.$('.topbar [data-open-drawer="ice-slot"]');
     if (!trigger) fail("focus containment: could not find the topbar Add Ice trigger");
     await trigger.focus();
     await trigger.click();
@@ -598,6 +598,115 @@ async function checkViewport(browser, viewport) {
         + `(${CLUB_NEW}) after the modal-over-drawer sequence, got `
         + `${JSON.stringify(await activeInfo(page))}`);
     });
+
+    // ---- (3c) CLOSE BEFORE THE FOCUS FRAME ------------------------------
+    // The reproduced main-branch race. Focus-on-open is queued in a
+    // requestAnimationFrame; ownership of the instance used to be recorded
+    // only INSIDE that frame. An overlay closed before the frame ran left no
+    // owned instance, so the close path skipped the restore entirely and
+    // focus stayed on <body>, while the frame later fired against nothing.
+    //
+    // Real elapsed timing cannot orchestrate this reliably, so the frame
+    // queue is taken over: rAF callbacks are captured instead of scheduled,
+    // and flushed on demand. That makes "closed before its frame" exact
+    // rather than probabilistic.
+    // Section (3)'s own removed-trigger case deleted the topbar control, so
+    // reload to restore it and re-acquire a live handle before orchestrating
+    // anything here.
+    await page.reload();
+    await page.waitForSelector("#content", { timeout: 15000 });
+    trigger = await page.$('.topbar [data-open-drawer="ice-slot"]');
+    if (!trigger) fail(`[${viewport.label}] Add Ice trigger missing after reload for the race section`);
+    await page.evaluate(() => {
+      window.__frames = [];
+      window.__realRAF = window.requestAnimationFrame.bind(window);
+      window.__realCAF = window.cancelAnimationFrame.bind(window);
+      window.requestAnimationFrame = (cb) => window.__frames.push(cb);  // 1-based handle
+      window.cancelAnimationFrame = (h) => { if (h) window.__frames[h - 1] = null; };
+      window.__flushFrames = () => {
+        const q = window.__frames; window.__frames = [];
+        q.forEach((cb) => { if (cb) cb(0); });
+        return q.filter(Boolean).length;
+      };
+      window.__pendingFrames = () => window.__frames.filter(Boolean).length;
+    });
+
+    const closeBeforeFrame = async (label, closeFn, expectTrigger) => {
+      await trigger.focus();
+      await trigger.click();
+      await page.waitForSelector(".drawer, .modal", { timeout: 10000 });
+      // The focus frame must be pending and NOT yet executed -- otherwise
+      // this leg silently degrades into the ordinary already-focused case.
+      const pending = await page.evaluate(() => window.__pendingFrames());
+      if (!pending) {
+        fail(`[${viewport.label}] ${label}: expected a queued focus frame to still be `
+          + `pending; the race cannot be exercised without one`);
+      }
+      await closeFn();
+      await page.waitForFunction(() => !document.querySelector(".drawer, .modal"),
+        null, { timeout: 10000 });
+      // Poll rather than read once: the restore runs at the END of the render
+      // that removed the dialog, and a click-driven close focuses the clicked
+      // control first, so a one-shot read can land in the gap between the
+      // node being detached and the restore executing.
+      await page.waitForFunction(() => {
+        const el = document.activeElement;
+        return !!(el && el !== document.body);
+      }, null, { timeout: 5000 }).catch(() => {});
+      const after = await activeInfo(page);
+      if (!after || after.tag === "body") {
+        fail(`[${viewport.label}] ${label}: closing before the focus frame ran left focus on `
+          + `<body>; the close path must restore even when the frame never `
+          + `executed, got ${JSON.stringify(after)}`);
+      }
+      if (expectTrigger && !(after.cls || "").includes("act")) {
+        fail(`[${viewport.label}] ${label}: expected the surviving trigger to own focus, `
+          + `got ${JSON.stringify(after)}`);
+      }
+      // The obsolete frame must be inert: flushing it cannot move focus into
+      // a dialog that no longer exists.
+      const before = await page.evaluate(() => {
+        const el = document.activeElement;
+        return el ? (el.id || el.className || el.tagName) : "null";
+      });
+      await page.evaluate(() => window.__flushFrames());
+      const settled = await page.evaluate(() => {
+        const el = document.activeElement;
+        return el ? (el.id || el.className || el.tagName) : "null";
+      });
+      if (settled !== before) {
+        fail(`[${viewport.label}] ${label}: flushing the obsolete focus frame MOVED focus `
+          + `from ${before} to ${settled}; a superseded frame must be inert`);
+      }
+    };
+
+    // Escape, with the trigger surviving the close.
+    await closeBeforeFrame("close-before-frame (Escape)",
+      () => page.keyboard.press("Escape"), true);
+    // Close BUTTON, a different close path through the same lifecycle.
+    await closeBeforeFrame("close-before-frame (close button)",
+      () => page.click(".drawer-x[data-drawer-close]"), true);
+    // Trigger removed by the closing action: no trigger survives, so the
+    // defined view fallback must own focus -- still never <body>.
+    await closeBeforeFrame("close-before-frame (removed trigger)", async () => {
+      await page.evaluate(() => {
+        const t = document.querySelector('.topbar [data-open-drawer="ice-slot"]');
+        if (t) t.dataset.tempRemoved = "1";
+        if (t) t.remove();
+      });
+      await page.keyboard.press("Escape");
+    }, false);
+
+    // Restore the real frame scheduler and the trigger, so everything after
+    // this section runs against ordinary browser timing.
+    await page.evaluate(() => {
+      window.requestAnimationFrame = window.__realRAF;
+      window.cancelAnimationFrame = window.__realCAF;
+    });
+    await page.reload();
+    await page.waitForSelector("#content", { timeout: 15000 });
+    trigger = await page.$('.topbar [data-open-drawer="ice-slot"]');
+    if (!trigger) fail(`[${viewport.label}] the Add Ice trigger did not come back after reload`);
 
     // ---- (4) shell states: title + skip link follow the VISIBLE surface ---
     // #345 review blocker: the title used to be owned by a successful
