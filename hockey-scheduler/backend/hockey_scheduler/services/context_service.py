@@ -1,4 +1,4 @@
-"""Per-user active Program/Season context — the selection backend (#159).
+"""Per-user active Program/Season/League context — the selection backend (#159/#345).
 
 Which Program + Season a user is currently working in. A VIEW selection only: it
 never grants authority. On EVERY resolve and set it is filtered through the
@@ -28,6 +28,17 @@ orders entirely before this request (it sees the old scope) or entirely after it
 (it sees the new scope) — the result can never be a hybrid of the two (e.g. an
 old Program set with a now-empty Season set). Memory/SQLite get the same guarantee
 for free: their process-wide lock fully serializes every transaction.
+
+**League is the optional third axis (#345).** It is added ADDITIVELY: ``resolve``,
+``options`` and ``set`` keep their exact pre-#345 signatures and tuple shapes, and
+the League-aware behavior is exposed as the separate ``resolve_with_league`` /
+``options_with_league`` / ``set_with_league``, so the HTTP and context-bar layers
+can adopt it in a later slice without this one touching transport or UI. Every
+guarantee above extends to it unchanged: one snapshot, bounded retry, detached
+objects, non-oracle rejection, ignore-don't-rewrite on an invalid saved value.
+Two rules are specific to it — a League must belong to the selected Program, and
+a Season+League pair must name an EXISTING ``LeagueSeason`` binding, which the
+context resolves read-only and never creates.
 """
 
 import copy
@@ -202,6 +213,185 @@ class ContextService:
             return programs, _detached(sel_program), _detached(sel_season)
         return self._snapshot(work)
 
+    # -- League axis (#345) ------------------------------------------------
+    # Additive throughout: `resolve`/`options`/`set` above keep their exact
+    # signatures and 2-/3-tuple shapes, because `api/service.py` unpacks them
+    # positionally. Every League-aware entry point is a NEW method returning a
+    # wider tuple, so the HTTP/UI integration slice can adopt them one at a time
+    # without a flag day and without this slice touching the transport layer.
+
+    def _resolve_league_locked(self, user_id, role, scope, program, season):
+        """The saved League for an already-resolved ``(program, season)`` — live
+        row or None. MUST run inside the transaction.
+
+        Returns None (Season-without-League, a first-class state) whenever the
+        saved League is absent, deleted, cross-Program, unauthorized, or — with a
+        Season selected — not bound to it. The saved row is NEVER rewritten here,
+        so restoring the League or the caller's authorization restores the
+        choice, exactly as the Program/Season axes already behave.
+
+        The League is deliberately NOT re-derived from anything else when it is
+        invalid: dropping to None keeps the operator's validated Program/Season
+        intact and never invents a League they did not choose — the same
+        "do not invent an unrelated one" rule `_resolve_locked` applies to
+        Season. It also means this method can never change the Program/Season
+        that `resolve()` already returned, which is what keeps the pre-#345
+        two-axis contract byte-identical.
+        """
+        if program is None:
+            return None
+        saved = self.store.get_active_context(user_id) if user_id else None
+        league_id = getattr(saved, "league_id", None) if saved else None
+        if not league_id:
+            return None
+        # The saved League only applies to the context it was saved against: if
+        # the Program/Season resolution fell back to something else, the saved
+        # League is stale by construction and is dropped rather than reattached.
+        if saved.program_id != program.id:
+            return None
+        saved_season = saved.season_id
+        current_season = season.id if season is not None else None
+        if saved_season != current_season:
+            return None
+        authorized = context_scope.authorized_league_ids(
+            self.store, role, scope, program.id, user_id,
+            season_id=current_season)
+        if league_id not in authorized:
+            return None
+        return self.store.get_league(league_id)
+
+    def resolve_with_league(self, user_id: Optional[str], role, scope):
+        """``(program, season, league)`` — the League-aware form of
+        :meth:`resolve`, with identical Program/Season semantics.
+
+        The first two elements are always exactly what :meth:`resolve` returns
+        for the same arguments; the third is the saved League when it is still
+        valid for that resolved context, else None. All three are read under ONE
+        serializable snapshot and DETACHED before the lock releases, so a
+        concurrent unbind/delete/revocation cannot make the triple internally
+        contradict itself.
+        """
+        def work():
+            program, season = self._resolve_locked(user_id, role, scope)
+            league = self._resolve_league_locked(
+                user_id, role, scope, program, season)
+            return _detached(program), _detached(season), _detached(league)
+        return self._snapshot(work)
+
+    def options_with_league(self, user_id: Optional[str], role, scope):
+        """``(programs, selected_program, selected_season, selected_league)``
+        where ``programs`` is ``[(program, [season, ...], [league, ...]), ...]``
+        — the League-aware form of :meth:`options`.
+
+        Each Program carries the Leagues the caller may actually select under it,
+        through the SAME `context_scope` rules :meth:`set_with_league` enforces,
+        so the switcher can never offer a League the caller could not select. The
+        list is Program-scoped rather than Season-scoped: a League that exists
+        under the Program but is not bound to the currently-selected Season is
+        still offered, because selecting it is a legitimate way to move to a
+        Season+League pair — the binding requirement is enforced at selection
+        time, where it can report a precise reason, not silently by omission
+        here.
+        """
+        def work():
+            authorized = context_scope.authorized_program_ids(
+                self.store, role, scope, user_id)
+            programs = []
+            for pid in sorted(authorized):
+                program = self.store.get_program(pid)
+                if program is None:
+                    continue
+                season_ids = context_scope.authorized_season_ids(
+                    self.store, role, scope, pid, user_id)
+                seasons = sorted(
+                    (s for sid in season_ids
+                     if (s := self.store.get_season(sid)) is not None),
+                    key=_season_sort_key, reverse=True)   # latest first
+                league_ids = context_scope.authorized_league_ids(
+                    self.store, role, scope, pid, user_id)
+                leagues = sorted(
+                    (lg for lid in league_ids
+                     if (lg := self.store.get_league(lid)) is not None),
+                    key=lambda lg: (lg.sort_order or 0, lg.id))
+                programs.append((_detached(program),
+                                 [_detached(s) for s in seasons],
+                                 [_detached(lg) for lg in leagues]))
+            sel_program, sel_season = self._resolve_locked(user_id, role, scope)
+            sel_league = self._resolve_league_locked(
+                user_id, role, scope, sel_program, sel_season)
+            return (programs, _detached(sel_program), _detached(sel_season),
+                    _detached(sel_league))
+        return self._snapshot(work)
+
+    def set_with_league(self, user_id: Optional[str], role, scope,
+                        program_id, season_id, league_id=None):
+        """Record a Program/Season/League selection and return the exact
+        ``(program, season, league)`` objects validated+written (detached).
+
+        The League-aware form of :meth:`set`, with identical Program/Season
+        validation. ``league_id`` may be None — Program-only and
+        Season-without-League both remain first-class, so passing None here is a
+        deliberate selection of "no League", not a missing argument.
+
+        A League selection is rejected with ONE generic non-oracle not-found —
+        identical whether the League does not exist, belongs to another Program,
+        is outside the caller's scope, or is not bound to the selected Season —
+        so this never becomes an existence oracle for records the caller may not
+        see. That single reason is the point: distinguishing them would leak
+        exactly what the scope rules exist to hide.
+
+        When both a Season and a League are given they must name an EXISTING
+        ``LeagueSeason``. This never creates one: an unbound pair is refused, and
+        binding a League to a Season stays the authorized, audited job of
+        ``setup_service.create_league_season``.
+        """
+        if not user_id:
+            raise ValidationError(
+                "A signed-in user is required to set a working context.")
+        if not program_id:
+            raise ValidationError("A program_id is required.",
+                                  {"reason": "field_required"})
+
+        def work():
+            programs = context_scope.authorized_program_ids(
+                self.store, role, scope, user_id)
+            program = (self.store.get_program(program_id)
+                       if program_id in programs else None)
+            if program is None:
+                raise NotFoundError("Program not found or not accessible.",
+                                    {"reason": "program_not_accessible"})
+            season = None
+            if season_id is not None:
+                seasons = context_scope.authorized_season_ids(
+                    self.store, role, scope, program_id, user_id)
+                season = self.store.get_season(season_id)
+                if season_id not in seasons or season is None:
+                    raise NotFoundError("Season not found or not accessible.",
+                                        {"reason": "season_not_accessible"})
+            league = None
+            if league_id is not None:
+                # `authorized_league_ids` already restricts to Leagues under this
+                # Program (cross-Program rejection by construction) and, with a
+                # Season, to those carrying an exact existing binding — resolved
+                # fail-closed, so an ambiguous duplicate refuses rather than
+                # picking a winner. One membership test therefore covers
+                # nonexistent / cross-Program / unauthorized / unbound alike, and
+                # they are indistinguishable to the caller by design.
+                allowed = context_scope.authorized_league_ids(
+                    self.store, role, scope, program_id, user_id,
+                    season_id=season_id)
+                league = self.store.get_league(league_id)
+                if league_id not in allowed or league is None:
+                    raise NotFoundError(
+                        "League not found or not accessible for this context.",
+                        {"reason": "league_not_accessible"})
+            self.store.set_active_context(ActiveContext(
+                id=user_id, program_id=program_id, season_id=season_id,
+                updated_at=self.clock(), league_id=league_id))
+            return (_detached(program), _detached(season), _detached(league))
+
+        return self._snapshot(work)
+
     # -- mutation ----------------------------------------------------------
     def set(self, user_id: Optional[str], role, scope,
             program_id, season_id) -> _Resolved:
@@ -217,7 +407,14 @@ class ContextService:
         in one transaction, so a concurrent parent delete either is seen (and
         rejected) here or lands after the row is written — where it is harmless,
         since a saved row pointing at a since-deleted parent is ignored (never
-        rendered) by ``resolve`` and grants no authority."""
+        rendered) by ``resolve`` and grants no authority.
+
+        Unchanged by #345, deliberately: this two-axis entry point CLEARS any
+        previously-saved League (the written row's ``league_id`` defaults to
+        None). Carrying one over would leave a League bound to a Program/Season
+        it may not belong to — the one state the League axis must never reach.
+        Callers that want to preserve or set a League use
+        :meth:`set_with_league`."""
         if not user_id:
             raise ValidationError(
                 "A signed-in user is required to set a working context.")

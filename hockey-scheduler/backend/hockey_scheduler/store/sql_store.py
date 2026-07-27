@@ -1713,15 +1713,24 @@ class SqlStore:
         first writes for the same user would both see "missing" and race the
         PRIMARY KEY, one hitting a raw integrity error/500. Here one INSERTs and
         the other DO-UPDATEs; both commit, exactly one row remains, and the
-        last-committed values win."""
+        last-committed values win.
+
+        ``league_id`` (#345, migration 049) is written on the SAME row and in the
+        same statement, so the three axes can never be persisted half-updated:
+        a caller that selects Program+Season without a League overwrites any
+        previously-saved League with NULL rather than leaving a stale one bound
+        to a context it may not belong to."""
         with self.transaction():
             self._exec(
                 "INSERT INTO user_active_context "
-                "(id, program_id, season_id, updated_at) VALUES (?, ?, ?, ?) "
+                "(id, program_id, season_id, updated_at, league_id) "
+                "VALUES (?, ?, ?, ?, ?) "
                 "ON CONFLICT (id) DO UPDATE SET "
                 "program_id = excluded.program_id, "
                 "season_id = excluded.season_id, "
-                "updated_at = excluded.updated_at",
+                "updated_at = excluded.updated_at, "
+                "league_id = excluded.league_id",
                 (ctx.id, ctx.program_id, ctx.season_id,
-                 ctx.updated_at.isoformat() if ctx.updated_at else None))
+                 ctx.updated_at.isoformat() if ctx.updated_at else None,
+                 getattr(ctx, "league_id", None)))
         return ctx

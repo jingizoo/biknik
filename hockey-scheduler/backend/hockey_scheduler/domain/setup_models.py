@@ -553,7 +553,7 @@ class UserAccount:
 
 @dataclass
 class ActiveContext:
-    """A user's currently-selected Program + Season working context (#159).
+    """A user's currently-selected Program + Season (+ League) working context.
 
     Operators run several Programs and Seasons; this is the one they are
     *looking at* — persisted so future slices' screens/deep links can restore it.
@@ -567,11 +567,28 @@ class ActiveContext:
     is ignored in favor of a deterministic authorized fallback. The stored row is
     NOT rewritten on resolve, so if authorization is later restored the saved
     choice resolves again.
+
+    ``league_id`` (#345) is the optional third context axis, promoted into the
+    persistent bar alongside Program/Season. It is null for every pre-#345 row
+    (migration 049 backfills nothing) and stays null for the two states that
+    remain first-class: Program-only, and Season-without-League. When BOTH a
+    Season and a League are selected they must name an EXISTING ``LeagueSeason``
+    binding — the context never creates one implicitly, and never stands in for
+    the Program/Season-shared invariant enforced elsewhere.
+
+    **Field order is deliberately append-only.** ``league_id`` is declared LAST,
+    after ``updated_at``, rather than in hierarchy order after ``season_id``:
+    callers already construct this dataclass with four POSITIONAL arguments
+    (``ActiveContext("u", "p", "s", ts)``), so inserting a field ahead of
+    ``updated_at`` would silently reinterpret an existing caller's timestamp as
+    a League id. Read the logical hierarchy from the docstring, not from the
+    field order.
     """
     id: str
     program_id: Optional[str]
     season_id: Optional[str]
     updated_at: datetime
+    league_id: Optional[str] = None
 
 
 @dataclass

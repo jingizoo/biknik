@@ -21,7 +21,8 @@ the new Program/Season *projection* on top of that canonical identity.
 
 from ..domain import Role
 from . import scope_bridge
-from .league_scope import exact_registration_or_conflict
+from .league_scope import (
+    exact_league_season_or_conflict, exact_registration_or_conflict)
 from .subject_scope import own_team_id as _own_team_id
 
 # Roles that see every Program under the current account model (#211): the two
@@ -134,3 +135,87 @@ def authorized_season_ids(store, role, scope, program_id, user_id):
     if role == Role.GUARDIAN:
         return _guardian_program_seasons(store, user_id)[1] & program_seasons
     return set()
+
+
+def _own_league_ids(store, role, scope, user_id):
+    """The permanent League ids a SCOPED account's own subject belongs to.
+
+    Coach/Player resolve through the same canonical ``own_team_id`` identity the
+    web scope guards use, so the League projection can never drift from the Team
+    projection above. Guardian resolves through its VERIFIED links only. Official
+    is derived from the Teams actually playing in the games they are assigned to
+    — an Official's entitlement is per-game, so their League view is exactly the
+    Leagues of those games' teams and nothing wider."""
+    leagues = set()
+    if role in (Role.COACH, Role.PLAYER):
+        team_id = _own_team_id(role, scope, store)
+        team = store.get_team(team_id) if team_id else None
+        if team is not None and team.league_id:
+            leagues.add(team.league_id)
+        return leagues
+    if role == Role.GUARDIAN:
+        for link in store.guardian_links_for(user_id or ""):
+            if not getattr(link, "verified", False):
+                continue
+            player = store.get_player(link.player_id)
+            if player is None or not player.team_id:
+                continue
+            team = store.get_team(player.team_id)
+            if team is not None and team.league_id:
+                leagues.add(team.league_id)
+        return leagues
+    if role == Role.OFFICIAL:
+        official_id = (scope or {}).get("official_id")
+        if not official_id:
+            return leagues
+        for a in store.assignments_for_official(official_id):
+            game = store.get_game(a.game_id)
+            if game is None:
+                continue
+            for team_id in (game.home_team_id, game.away_team_id):
+                team = store.get_team(team_id) if team_id else None
+                if team is not None and team.league_id:
+                    leagues.add(team.league_id)
+        return leagues
+    return leagues
+
+
+def authorized_league_ids(store, role, scope, program_id, user_id,
+                          season_id=None):
+    """The permanent League ids the account may see/select within ``program_id``
+    (#345), optionally narrowed to those BOUND to ``season_id``.
+
+    League is the third persistent context axis. This mirrors
+    ``authorized_season_ids`` exactly in shape and discipline, so all three axes
+    are filtered by one consistent rule set:
+
+    * the candidate set is always the Leagues permanently under ``program_id``,
+      so a League from another Program can never appear regardless of role —
+      the cross-Program invariant is enforced by construction here, not only by
+      the selection-time check in the service;
+    * global roles (League Admin, Arena Manager, Viewer) see all of them;
+    * a scoped role sees only the League(s) its own subject belongs to,
+      intersected with the Program's — so a scoped Coach/Player/Guardian/
+      Official can neither select nor ENUMERATE a League outside their scope;
+    * anything unrecognized fails closed (empty).
+
+    When ``season_id`` is given, the result is further narrowed to Leagues with
+    an EXISTING ``LeagueSeason`` binding to that Season, resolved through
+    :func:`exact_league_season_or_conflict` so an ambiguous binding fails closed
+    rather than granting access on whichever duplicate row sorts first. This is
+    a read-only projection: it never creates a binding.
+    """
+    if program_id is None:
+        return set()
+    program_leagues = {lg.id for lg in store.leagues_for_program(program_id)}
+    if role in _GLOBAL_ROLES:
+        allowed = program_leagues
+    elif role in (Role.COACH, Role.PLAYER, Role.OFFICIAL, Role.GUARDIAN):
+        allowed = _own_league_ids(store, role, scope, user_id) & program_leagues
+    else:
+        return set()
+    if season_id is None:
+        return allowed
+    return {lid for lid in allowed
+            if exact_league_season_or_conflict(store, lid, season_id)[0]
+            is not None}

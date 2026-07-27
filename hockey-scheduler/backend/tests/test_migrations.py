@@ -170,6 +170,12 @@ class MigrationApplyTest(unittest.TestCase):
             cur.execute("ALTER TABLE games DROP COLUMN league_season_id")  # #283 Slice E additive col
             cur.execute("ALTER TABLE seasons DROP COLUMN status")  # #159 additive col
             cur.execute("ALTER TABLE seasons DROP COLUMN archived_at")  # #159 additive col
+            # #345 migration 049: the persistent League axis on the per-user
+            # context row. A legacy adopter has 044's table without this column,
+            # so drop it here — otherwise adoption re-runs 049's ALTER against a
+            # column that already exists and fails with "duplicate column name".
+            cur.execute(
+                "ALTER TABLE user_active_context DROP COLUMN league_id")
             cur.execute("DELETE FROM schema_migrations")
             cur.execute("INSERT INTO schema_migrations(version, applied_at) "
                         "VALUES ('0001_initial', '2026-01-01')")

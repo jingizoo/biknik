@@ -1,0 +1,26 @@
+-- Persistent League axis on the per-user active context (#345).
+--
+-- #345 promotes League into the persistent Program/Season context bar. This adds
+-- the third, OPTIONAL axis to the existing one-row-per-user selection from
+-- migration 044.
+--
+-- Additive and portable (a nullable TEXT column, no rebuild, no backfill, no
+-- index): every pre-existing row keeps its Program/Season selection and reads
+-- back with league_id = NULL, which is exactly the "Season without League"
+-- state the context model already supports. There is therefore no data
+-- migration and no adoption ordering requirement.
+--
+-- NULL is a first-class value here, not "unset pending backfill": Program-only
+-- and Season-without-League are both permanent, supported states.
+--
+-- No foreign key is declared, deliberately and consistently with program_id /
+-- season_id on this same table. The saved row is a VIEW PREFERENCE that grants
+-- no authority: a selection whose League is deleted, unbound from the Season, or
+-- no longer authorized is IGNORED on resolve (a deterministic authorized
+-- fallback is returned) and the row is NOT rewritten, so restoring the League or
+-- the caller's authorization restores the saved choice. An FK would instead
+-- delete or block, destroying that restore-on-reauthorization property.
+--
+-- Forward-only. Rollback reality: reverting application code does not drop this
+-- column; dropping it is a separate manual database operation.
+ALTER TABLE user_active_context ADD COLUMN league_id TEXT;
