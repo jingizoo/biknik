@@ -4205,12 +4205,19 @@ class ApiService:
         venues_by_id = {v.id: v for v in venues}
         rinks_by_id = {r.id: r for r in rinks}
         # A League's Season and a Division's Season + League resolve through
-        # LeagueSeason now (#283); ``season_by_league`` maps a League to a
-        # participating Season so the DTO keeps its legacy ``season_id``.
+        # LeagueSeason now (#283); ``season_by_league`` maps a League to A
+        # participating Season so the DTO keeps its legacy ``season_id`` (a
+        # League bound to several Seasons reports only the first one found —
+        # fine for that single display field, but ``seasons_by_league`` (#345)
+        # additionally carries EVERY binding, because a consumer that needs to
+        # know whether a League participates in a SPECIFIC Season (not just
+        # "a" Season) cannot answer that from the lossy singular field).
         ls_by_id = {ls.id: ls for ls in self.store.all_league_seasons()}
         season_by_league = {}
+        seasons_by_league = {}
         for ls in ls_by_id.values():
             season_by_league.setdefault(ls.league_id, ls.season_id)
+            seasons_by_league.setdefault(ls.league_id, []).append(ls.season_id)
 
         def is_junior(div):
             tag = (div.age_group or div.name or "").upper()
@@ -4247,6 +4254,7 @@ class ApiService:
                 for s in seasons],
             "leagues": [
                 {"id": lg.id, "season_id": season_by_league.get(lg.id),
+                 "season_ids": seasons_by_league.get(lg.id, []),
                  "name": lg.name, "sort_order": lg.sort_order}
                 for lg in leagues],
             "divisions": [_division_row_v2(d) for d in divisions],
@@ -4765,11 +4773,14 @@ class ApiService:
 
     @catch
     def create_division_v2(self, league_id: str, name: str, age_group: str = "",
+                           season_id: Optional[str] = None,
                            actor_id: Optional[str] = None) -> dict:
         """Canonical v2 division create (#233 Slice C2): parented by a grouping
-        League (REQUIRED); Season is derived from the league."""
+        League (REQUIRED); Season is derived from the league, unless the
+        optional ``season_id`` (#345) selects one exact binding for a League
+        bound to several Seasons."""
         return self._division_dict(self.setup.create_division_under_league(
-            league_id, name, age_group, actor_id))
+            league_id, name, age_group, season_id, actor_id))
 
     @catch
     def create_club(self, name: str, country: str = "",

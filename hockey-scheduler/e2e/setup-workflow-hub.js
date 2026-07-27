@@ -352,7 +352,72 @@ async function checkViewport(browser, viewport) {
         + `season is ${fx.sA})`);
     }
 
-    // (iii) NOT ASSERTED, deliberately: the no-active-Season fail-closed
+    // (iii) Exact Season+League Division write contract (#345 review): a
+    // permanent League bound to BOTH s1 and the active s2 must commit a
+    // Division into s2 specifically, instead of the ambiguous_season_for_
+    // league rejection the review found -- a genuine committable-drawer dead
+    // end for a valid multi-Season League, not just an interim guard. l1/l2
+    // above are each bound to only ONE season and cannot falsify this; a
+    // THIRD league (lShared) is bound to BOTH via the same public path
+    // production code already relies on to link an existing League into a
+    // new Season (register_team_for_season -> _link_league_season with an
+    // explicit league_id), so no internal/test-only backdoor is needed.
+    const shared = await page.evaluate(async ([s1, s2]) => {
+      const post = async (path, body) => (await fetch(path, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      })).json();
+      const lShared = await post("/api/v2/setup/league", { season_id: s1, name: "ZZZ League Shared" });
+      const club = await post("/api/v2/setup/club", { name: "ZZZ Shared Club" });
+      const team = await post("/api/v2/setup/team",
+        { league_id: lShared.id, club_id: club.id, name: "ZZZ Shared Team" });
+      const reg = await post(`/api/v2/setup/seasons/${s2}/team-registrations`,
+        { team_id: team.id, league_id: lShared.id });
+      if (reg.error) {
+        return { error: `binding league to second season failed: ${JSON.stringify(reg.error)}` };
+      }
+      return { lShared: lShared.id };
+    }, [fx.s1, fx.s2]);
+    if (shared.error) fail(`[${L}] ${shared.error}`);
+
+    await openSetupHub(page, `${L}/persist-division-shared-league`);
+    await page.click('[data-setup-workflow="participation"]');
+    await page.waitForSelector(".swf-landing", { timeout: 10000 });
+    await page.click('[data-setup-workflow-act="division"]');
+    await page.waitForSelector("#f-div-league", { timeout: 10000 }).catch(() => fail(
+      `[${L}] the Divisions action did not open its drawer for the `
+      + `shared-league case`));
+    // Explicitly choose the SHARED League -- the one genuinely bound to both
+    // Seasons -- rather than relying on which option the seeding happens to
+    // pick first, so this leg specifically exercises the exact-binding path
+    // regardless of creation order among the active Season's several leagues.
+    await page.selectOption("#f-div-league", shared.lShared);
+    await page.fill("#f-div", "Shared-League Division");
+    const sharedResp = page.waitForResponse((r) =>
+      r.url().includes("/api/v2/setup/division") && r.request().method() === "POST");
+    await page.click('[data-drawer-submit="division"]');
+    const sharedCreated = await (await sharedResp).json();
+    if (sharedCreated.error) {
+      fail(`[${L}] shared-league division create failed: `
+        + `${JSON.stringify(sharedCreated.error)} -- a League genuinely bound `
+        + `to the active Season must be able to commit, not fall through to `
+        + `ambiguous_season_for_league`);
+    }
+    // Read the PERSISTED row back -- must belong to the exact L/S2 binding,
+    // not the S1 binding the same League also has.
+    const sharedStored = await page.evaluate(async (id) => {
+      const ov = await (await fetch("/api/v2/setup/overview",
+        { credentials: "same-origin" })).json();
+      const d = (ov.divisions || []).find((x) => x.id === id);
+      return d && d.season_id;
+    }, sharedCreated.id);
+    if (sharedStored !== fx.s2) {
+      fail(`[${L}] PERSISTED wrong-SEASON write: the shared League's division `
+        + `landed under season ${sharedStored}, expected the ACTIVE season `
+        + `${fx.s2} (its OTHER binding is season ${fx.s1})`);
+    }
+
+    // (iv) NOT ASSERTED, deliberately: the no-active-Season fail-closed
     // branch. I could not establish the precondition through the app's own
     // API -- POSTing /api/context with season_id:null, including for a
     // Program created with no seasons at all, still comes back with a
@@ -363,7 +428,7 @@ async function checkViewport(browser, viewport) {
     // that was never actually created. Flagged for review rather than
     // silently dropped.
 
-    // (iv) The facilities controls must be REAL, not permanently-failing
+    // (v) The facilities controls must be REAL, not permanently-failing
     // decoration: an action that can never succeed is worse than an unseeded
     // one. Venue/Rink carry no Program axis, so these open normally.
     await page.evaluate(async ([program_id, season_id]) => {

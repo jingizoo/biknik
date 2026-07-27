@@ -982,33 +982,62 @@ class SetupService:
     @_transactional
     def create_division_under_league(self, league_id: str, name: str,
                                      age_group: str = "",
+                                     season_id: Optional[str] = None,
                                      actor_id: Optional[str] = None) -> Division:
         """Create a Division under a permanent League (#283 back-compat, v2).
 
-        The League participates in one Season here (the common case); the
-        LeagueSeason is resolved from the league's sole binding. Delegates to the
-        Division create against that LeagueSeason."""
+        Without ``season_id`` (legacy/back-compat, unchanged): the League
+        participates in one Season here (the common case); the LeagueSeason is
+        resolved from the league's sole binding, and is still ambiguous when the
+        league has more than one.
+
+        With ``season_id`` (#345 additive correction): resolves the EXISTING
+        ``LeagueSeason(league_id, season_id)`` binding exactly. Never infers the
+        first/sole binding and never creates a new one — a League bound to
+        several Seasons can commit a Division against a specific one instead of
+        always failing ``ambiguous_season_for_league``. Requires the League and
+        Season share a Program (rule 5) and the target binding to already exist."""
         # #159 — canonical League→Season lock order: lock the League row first,
-        # then resolve its sole binding, then lock that binding's Season.
-        self._lock_league_for_binding(league_id)
-        lss = self.store.league_seasons_for_league(league_id)
-        if not lss:
-            raise ValidationError(
-                "That league is not yet part of any season.",
-                {"reason": "league_has_no_season", "league_id": league_id})
-        if len(lss) > 1:
-            raise ValidationError(
-                "That league participates in several seasons; create the "
-                "division against a specific season.",
-                {"reason": "ambiguous_season_for_league", "league_id": league_id})
-        self._require_active_season(lss[0].season_id)  # #159 read-only guard
+        # then resolve the target binding, then lock that binding's Season.
+        league = self._lock_league_for_binding(league_id)
+        if season_id is not None:
+            season = self.store.get_season(season_id)
+            if season is None:
+                raise NotFoundError(f"Season {season_id} not found.")
+            if league.program_id != season.program_id:
+                raise ValidationError(
+                    "That League and Season belong to different Programs.",
+                    {"reason": "league_season_program_mismatch",
+                     "league_id": league_id, "season_id": season_id,
+                     "league_program_id": league.program_id,
+                     "season_program_id": season.program_id})
+            binding = self.store.league_season_for(league_id, season_id)
+            if binding is None:
+                raise ValidationError(
+                    "That league is not part of the given season.",
+                    {"reason": "league_not_in_season",
+                     "league_id": league_id, "season_id": season_id})
+        else:
+            lss = self.store.league_seasons_for_league(league_id)
+            if not lss:
+                raise ValidationError(
+                    "That league is not yet part of any season.",
+                    {"reason": "league_has_no_season", "league_id": league_id})
+            if len(lss) > 1:
+                raise ValidationError(
+                    "That league participates in several seasons; create the "
+                    "division against a specific season.",
+                    {"reason": "ambiguous_season_for_league", "league_id": league_id})
+            binding = lss[0]
+        self._require_active_season(binding.season_id)  # #159 read-only guard
         # #159 — RE-FETCH the binding UNDER the Season lock before inserting: the
-        # sole-binding read above is unlocked, so a concurrent
-        # delete_league_season (which locks the same Season row) could have
-        # unbound it. Inserting a Division against a deleted LeagueSeason would
-        # orphan it (migration 035 has no FK). A binding unbound out from under us
-        # fails closed with zero write/audit.
-        binding = self.store.get_league_season(lss[0].id)
+        # resolution above is unlocked, so a concurrent delete_league_season
+        # (which locks the same Season row) could have unbound it. Inserting a
+        # Division against a deleted LeagueSeason would orphan it (migration 035
+        # has no FK). A binding unbound out from under us fails closed with zero
+        # write/audit — this applies identically whether the binding came from
+        # the sole-binding legacy path or the exact season_id path above.
+        binding = self.store.get_league_season(binding.id)
         if binding is None:
             raise ValidationError(
                 "That league is not yet part of any season.",

@@ -936,16 +936,23 @@ async function contextSeededDrawerValues(kind) {
     // A Division hangs off a LeagueSeason -- a League paired with a SEASON --
     // so seeding the Program's first permanent League ignores which Season is
     // active and lets a Division be created under a League that is not in it.
-    // Bind to the active Season instead, using the overview payload because it
-    // is the one that carries each League's season_id.
+    // Bind to the active Season instead, using the overview payload's
+    // per-league `season_ids` (#345 -- NOT the older singular `season_id`,
+    // which is only the FIRST binding `get_setup_overview_v2` happened to see
+    // and would silently miss a League that also participates in the active
+    // Season through a LATER binding).
     const seasonId = contextOptions && contextOptions.selected
       && contextOptions.selected.season_id;
     if (!seasonId) return { ok: false, needsSeason: true };
     const svr = await getJSON("/api/v2/setup/overview");
     if (!svr || svr.error || contextRevision !== seededRevision) return { ok: false };
-    const inSeason = (svr.leagues || []).filter((lg) => lg.season_id === seasonId);
+    const inSeason = (svr.leagues || [])
+      .filter((lg) => (lg.season_ids || []).indexOf(seasonId) !== -1);
     if (!inSeason.length) return { ok: false, noLeagueInSeason: true };
-    return { ok: true, values: { "f-div-league": inSeason[0].id } };
+    // f-div-season carries the exact active Season through to submit (#345),
+    // so a League bound to several Seasons commits into this one instead of
+    // the ambiguous legacy sole-binding path.
+    return { ok: true, values: { "f-div-league": inSeason[0].id, "f-div-season": seasonId } };
   }
   // Rink and ice-slot deliberately fall through to the unseeded return below.
   // Their parents are a Venue and a Rink -- shared facilities with no Program
@@ -1267,7 +1274,14 @@ const SETUP_ENTITIES = [
       { id: "f-div-league", label: "League", type: "select", required: true, ofNoun: "level",
         options: (ov) => (ov.leagues || []).map((lv) => [lv.id, `${nameById(ov.seasons, lv.season_id)} · ${lv.name}`]) },
       { id: "f-div", label: "Division name", required: true, placeholder: "e.g. Gold" },
-      { id: "f-div-age", label: "Age group", placeholder: "e.g. U14 (optional)" }] },
+      { id: "f-div-age", label: "Age group", placeholder: "e.g. U14 (optional)" },
+      // Carries the active Season a #345 context-seeded open resolved the
+      // League against, so a League bound to several Seasons commits into the
+      // exact one the operator was acting from rather than the ambiguous
+      // legacy sole-binding path. Empty/absent (the plain Records "+ New"
+      // open, or any League with only one binding) preserves that legacy
+      // behavior unchanged.
+      { id: "f-div-season", type: "hidden" }] },
   { key: "club", title: "Clubs", icon: "🏒", noun: "club", perm: "manage_setup",
     delKind: "club",  // a club with no team can be deleted from here (#215)
     list: (ov) => (ov.clubs || []).map((c) => ({ id: c.id, title: c.name })),
@@ -1401,7 +1415,7 @@ const SETUP_POST = {
   season: () => post("/api/v2/setup/season", { program_id: val("f-season-league"), name: val("f-season"),
     start_date: val("f-season-start") || null, end_date: val("f-season-end") || null }),
   level: () => post("/api/v2/setup/league", { season_id: val("f-level-season"), name: val("f-level"), sort_order: val("f-level-sort") ? Number(val("f-level-sort")) : 0 }),
-  division: () => post("/api/v2/setup/division", { league_id: val("f-div-league"), name: val("f-div"), age_group: val("f-div-age") }),
+  division: () => post("/api/v2/setup/division", { league_id: val("f-div-league"), name: val("f-div"), age_group: val("f-div-age"), season_id: val("f-div-season") || null }),
   club: () => post("/api/v2/setup/club", { name: val("f-club") }),
   team: () => post("/api/v2/setup/team", { league_id: val("f-team-perm-league") || null, club_id: val("f-team-club") || null, name: val("f-team") }),
   organization: () => post("/api/v2/setup/organization", { name: val("f-org"), short_name: val("f-org-short") }),
@@ -3105,6 +3119,11 @@ function drawerField(f, sv) {
   // Preserve what the user already typed/selected across an error re-render;
   // fall back to the field's default only on first open.
   const current = f.id in drawerValues ? drawerValues[f.id] : (f.value || "");
+  // A context value the operator never picks or sees (e.g. the active Season
+  // a #345 context-seeded Division carries alongside its visible League
+  // select) -- present in the submitted body via the same val()/drawerValues
+  // pipeline as every visible field, without its own label/control.
+  if (f.type === "hidden") return `<input id="${f.id}" type="hidden" value="${esc(current)}" />`;
   if (f.type === "select") {
     const rows = f.options(sv);
     if (!rows.length) {

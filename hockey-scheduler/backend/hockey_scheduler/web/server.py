@@ -3029,12 +3029,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(api.create_league(
                 b.get("season_id"), b.get("name"), sort_order, actor_id))
         if entity == "division":
-            # v2: parented by a League (REQUIRED); season derived from it.
+            # v2: parented by a League (REQUIRED); season derived from it, or
+            # (#345) resolved EXACTLY from the optional season_id when the
+            # League participates in more than one Season.
             if not (b.get("league_id") or None):
                 return _required_error("A league_id is required.")
             return self._send_api(api.create_division_v2(
                 b.get("league_id"), b.get("name"), b.get("age_group", ""),
-                actor_id))
+                b.get("season_id") or None, actor_id))
         if entity == "club":
             return self._send_api(api.create_club(
                 b.get("name"), b.get("country", ""), actor_id))
