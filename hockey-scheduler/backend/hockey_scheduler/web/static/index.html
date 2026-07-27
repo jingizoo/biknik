@@ -87,10 +87,17 @@
         </div>
         <div class="nav-group" data-nav-area="facilities" role="group" aria-labelledby="nav-area-facilities">
           <div class="nav-group-label" id="nav-area-facilities">Facilities</div>
-          <!-- No destination yet — see the FACILITIES note above. Declared so
-               the seven-area IA is complete and machine-checkable; the existing
-               empty-group rule keeps it out of the rendered nav until the Setup
-               split gives it "Venues, rinks and ice". -->
+          <!-- The crosswalk's Setup split: "Venues, rinks and ice" → Facilities,
+               the other five workflows → Administration. This is a COMPOSITE
+               destination — the same `setup` view plus a `setupWorkflow` half —
+               so it declares its workflow via data-setup-workflow-nav and opens
+               through openSetupWorkflowLanding(), NOT switchTab() (which clears
+               that half) and NOT goToSetupWorkflow() (which jumps straight to
+               the Calendar Ice Builder, the landing's own primary action rather
+               than the summary-first landing the IA requires). Gated on
+               manage_arena, matching SETUP_WORKFLOWS.facilities.perm, so the
+               Arena Manager whose primary journey this is reaches it. -->
+          <button class="tab" data-tab="setup" data-setup-workflow-nav="facilities" style="display:none"><span class="nav-dot"></span><span class="nav-label">Venues, rinks and ice</span></button>
         </div>
         <div class="nav-group" data-nav-area="communications" role="group" aria-labelledby="nav-area-communications">
           <div class="nav-group-label" id="nav-area-communications">Communications</div>

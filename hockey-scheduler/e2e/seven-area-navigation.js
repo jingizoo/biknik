@@ -37,14 +37,17 @@
 //      horizontal page overflow or clip the final destination at 390x844.
 //   8. Zero unexpected console/page errors throughout.
 //
-// FACILITIES is deliberately empty in this slice and therefore asserted as
-// declared-but-hidden rather than as a populated area: the crosswalk maps the
-// single `setup` destination to "Facilities + Administration", splitting only
-// once the six Setup workflows become separately addressable. Splitting it is
-// explicitly out of this slice's scope, so `setup` sits under Administration
-// (five of its six workflows) and Facilities carries no destination yet. The
-// test pins that as the CURRENT contract so the day a destination is added
-// there, this assertion is what tells you to update the crosswalk with it.
+// FACILITIES is the crosswalk's Setup split, and it is a COMPOSITE
+// destination: the same `setup` view plus a `setupWorkflow` half, so the
+// Administration entry (the workflow INDEX) and the Facilities entry (the
+// "Venues, rinks and ice" LANDING) share one route key while being two
+// genuinely different destinations. Every identity/uniqueness assertion here
+// therefore keys on `(tab, setupWorkflow)` -- `setup` vs `setup+facilities` --
+// because matching on `data-tab` alone would call them the same screen. A
+// dedicated leg proves the sidebar entry opens the summary-first LANDING (not
+// the Calendar Ice Builder, which is that landing's own primary action), that
+// its Add Ice primary still reaches the builder, and that a role without
+// `manage_arena` can neither see nor directly activate it.
 const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
@@ -86,7 +89,21 @@ const EXPECTED_AREA = {
   readiness: "reports",
   users: "administration", onboarding: "administration",
   import: "administration", setup: "administration",
+  // The crosswalk's Setup split: the same `setup` view, distinguished by its
+  // workflow half. Both are real, separately-reachable destinations.
+  "setup+facilities": "facilities",
 };
+
+// A composite destination key ("setup+facilities") maps to a DIFFERENT button
+// and a different activation path than a plain one. These two helpers keep
+// every leg honest about that instead of assuming `data-tab` is the identity.
+function selFor(key) {
+  const [tab, workflow] = key.split("+");
+  return workflow
+    ? `.tab[data-setup-workflow-nav="${workflow}"]`
+    : `.tab[data-tab="${tab}"]:not([data-setup-workflow-nav])`;
+}
+function viewFor(key) { return key.split("+")[0]; }
 
 function fail(msg) { throw new Error(msg); }
 
@@ -166,9 +183,14 @@ async function readNav(page) {
         labelId: label ? label.id : null,
         role: g.getAttribute("role"),
         groupHidden: g.style.display === "none",
-        all: tabs.map((t) => t.dataset.tab),
+        // Composite identity: two entries share data-tab="setup" (the
+        // Administration workflow INDEX and the Facilities LANDING), so the
+        // destination key is (tab, setupWorkflow) -- `setup` vs `setup+facilities`.
+        all: tabs.map((t) => t.dataset.tab
+          + (t.dataset.setupWorkflowNav ? `+${t.dataset.setupWorkflowNav}` : "")),
         visible: tabs.filter((t) => t.style.display !== "none")
-          .map((t) => t.dataset.tab),
+          .map((t) => t.dataset.tab
+            + (t.dataset.setupWorkflowNav ? `+${t.dataset.setupWorkflowNav}` : "")),
       };
     });
     return { areas, navKeys: Object.keys(NAV) };
@@ -220,12 +242,15 @@ async function checkInventoryAndUniqueness(page, L) {
 
   // Neither direction may drift: no NAV key missing from the IA, and no
   // rendered destination that is not a real NAV key.
-  const missing = navKeys.filter((k) => !seen.has(k));
+  // A composite destination's NAV key is its view half, so `setup` is covered
+  // by either entry; strip the workflow suffix before checking NAV coverage.
+  const baseKeys = new Set([...seen.keys()].map((k) => k.split("+")[0]));
+  const missing = navKeys.filter((k) => !baseKeys.has(k));
   if (missing.length) {
     fail(`${L}: destination(s) in the production NAV map are absent from the `
       + `seven-area navigation: ${missing.join(", ")}`);
   }
-  const invented = [...seen.keys()].filter((k) => !navKeys.includes(k));
+  const invented = [...baseKeys].filter((k) => !navKeys.includes(k));
   if (invented.length) {
     fail(`${L}: navigation renders destination(s) with no NAV entry `
       + `(they would open nothing): ${invented.join(", ")}`);
@@ -239,21 +264,39 @@ async function checkInventoryAndUniqueness(page, L) {
     }
   }
 
+  // Any view key carried by MORE THAN ONE nav entry makes the bare
+  // `.tab[data-tab="<key>"]` selector ambiguous for every existing consumer.
+  // That is not hypothetical: adding the Facilities entry broke
+  // setup-workflow-hub, accessibility-foundations and role-authorization-matrix
+  // exactly this way, because Facilities sorts before Administration in DOM
+  // order so the bare selector silently resolved to the wrong destination.
+  // Flag it here so the next composite destination is caught at authoring time
+  // rather than as three unrelated-looking journey failures.
+  const perView = new Map();
+  for (const [dest, area] of seen) {
+    const v = dest.split("+")[0];
+    perView.set(v, (perView.get(v) || []).concat(`${dest} (${area})`));
+  }
+  const shared = [...perView].filter(([, list]) => list.length > 1);
+  const KNOWN_SHARED = ["setup"];
+  for (const [v, list] of shared) {
+    if (!KNOWN_SHARED.includes(v)) {
+      fail(`${L}: view key "${v}" is now used by ${list.length} nav entries `
+        + `(${list.join(", ")}). Every journey selecting `
+        + `.tab[data-tab="${v}"] becomes ambiguous — narrow those selectors `
+        + `and add "${v}" to KNOWN_SHARED once done.`);
+    }
+  }
+
   // Explicit, separately-named checks the issue calls out by name.
   if (seen.get("users") !== "administration") {
     fail(`${L}: "Users" must live under Administration, found in `
       + `"${seen.get("users")}"`);
   }
   const facilities = areas.find((a) => a.key === "facilities");
-  if (facilities.all.length !== 0) {
-    fail(`${L}: Facilities now carries destination(s) `
-      + `(${facilities.all.join(", ")}). That is the intended end state, but `
-      + `the crosswalk in this test and in index.html must be updated to name `
-      + `them rather than describing Facilities as pending the setup split.`);
-  }
-  if (!facilities.groupHidden) {
-    fail(`${L}: the empty Facilities area is rendered — an area with no `
-      + `destination must be hidden, not left as an orphaned heading`);
+  if (JSON.stringify(facilities.all) !== JSON.stringify(["setup+facilities"])) {
+    fail(`${L}: Facilities must carry exactly the composite "Venues, rinks and `
+      + `ice" destination, got ${JSON.stringify(facilities.all)}`);
   }
   return seen;
 }
@@ -263,13 +306,13 @@ async function checkDestinationIdentity(page, L) {
   const { areas } = await readNav(page);
   const visible = areas.flatMap((a) => a.visible);
   for (const tab of visible) {
-    await page.click(`.tab[data-tab="${tab}"]`);
+    await page.click(selFor(tab));
     // `public` renders the read-only portal inside the shell; every other
-    // destination sets body.dataset.view to its own key.
+    // destination sets body.dataset.view to its own (view-half) key.
     await page.waitForFunction(
-      (t) => document.body.dataset.view === t, tab, { timeout: 10000 })
-      .catch(() => fail(`${L}: activating "${tab}" did not open view "${tab}" `
-        + `(body.dataset.view stayed "?"). The route key must survive regrouping.`));
+      (t) => document.body.dataset.view === t, viewFor(tab), { timeout: 10000 })
+      .catch(() => fail(`${L}: activating "${tab}" did not open view `
+        + `"${viewFor(tab)}". The route key must survive regrouping.`));
     const title = await page.title();
     if (!title || !title.includes("Hockey Scheduler")) {
       fail(`${L}: destination "${tab}" left a bad per-view title: "${title}"`);
@@ -294,7 +337,13 @@ async function checkKeyboardReach(page, L, expectedVisible) {
       const cs = getComputedStyle(el);
       const ring = (cs.outlineStyle !== "none" && parseFloat(cs.outlineWidth) > 0)
         || (cs.boxShadow && cs.boxShadow !== "none");
-      return { tab: el.dataset.tab, ring };
+      // Composite key, so the two data-tab="setup" entries are not deduped
+      // into one and a genuinely unreachable one cannot hide behind the other.
+      return {
+        tab: el.dataset.tab
+          + (el.dataset.setupWorkflowNav ? `+${el.dataset.setupWorkflowNav}` : ""),
+        ring,
+      };
     });
     if (info && !reached.includes(info.tab)) {
       if (!info.ring) {
@@ -325,10 +374,21 @@ async function checkDeepLinks(page, L, visible) {
     if (!byArea.has(area)) byArea.set(area, tab);
   }
   for (const [area, tab] of byArea) {
-    await page.evaluate((t) => switchTab(t), tab);
-    await waitForView(page, tab).catch(() =>
+    const workflow = tab.includes("+") ? tab.split("+")[1] : null;
+    await page.evaluate(([t, wf]) => (wf
+      ? openSetupWorkflowLanding(wf) : switchTab(t)), [viewFor(tab), workflow]);
+    await waitForView(page, viewFor(tab)).catch(() =>
       fail(`${L}: direct navigation into "${tab}" (area ${area}) did not `
         + `restore that view`));
+    if (workflow) {
+      // render() is async, so wait for the landing to paint rather than
+      // sampling the frame the view key flipped on.
+      await page.waitForFunction((wf) => !!document.querySelector(
+        `[data-setup-workflow-landing="${wf}"]`), workflow, { timeout: 10000 })
+        .catch(() => fail(`${L}: deep-link restoration of "${tab}" reached view `
+          + `"${viewFor(tab)}" but not its "${workflow}" landing — the `
+          + `composite destination's workflow half was lost`));
+    }
     const skip = await page.evaluate(() => {
       const link = document.getElementById("skip-link");
       const target = document.getElementById("content");
@@ -394,6 +454,119 @@ async function checkRole(page, L, role, expect) {
         fail(`${L}/viewer: ${mutations} enabled mutation control(s) on "${tab}"`);
       }
     }
+  }
+}
+
+// ---- Facilities: the composite "Venues, rinks and ice" destination ---------
+// The sidebar entry must open the SUMMARY-FIRST LANDING the IA crosswalk
+// requires -- not goToSetupWorkflow("facilities"), which jumps straight to the
+// Calendar Ice Availability Builder (that landing's own primary action). The
+// two are easy to confuse because both are "Facilities work", which is exactly
+// why this asserts the landing's own workflow marker rather than just "some
+// setup screen rendered".
+async function checkFacilitiesLanding(page, L, role) {
+  await page.click('.tab[data-setup-workflow-nav="facilities"]');
+  await page.waitForFunction(() => document.body.dataset.view === "setup"
+    && !!document.querySelector('[data-setup-workflow-landing="facilities"]'),
+    null, { timeout: 10000 })
+    .catch(() => fail(`${L}/${role}: the Facilities nav entry did not open the `
+      + `"Venues, rinks and ice" summary-first landing`));
+
+  // focusContentHeading() polls for the painted heading, so wait for focus to
+  // SETTLE inside the landing rather than sampling the instant it renders --
+  // otherwise this asserts against a frame the app hasn't finished.
+  await page.waitForFunction(() => {
+    const el = document.querySelector('[data-setup-workflow-landing="facilities"]');
+    return !!(el && el.contains(document.activeElement));
+  }, null, { timeout: 5000 })
+    .catch(() => fail(`${L}/${role}: focus never settled inside the Facilities `
+      + `landing (focusContentHeading did not reach its heading)`));
+
+  const landed = await page.evaluate(() => {
+    const el = document.querySelector('[data-setup-workflow-landing="facilities"]');
+    const h = el && el.querySelector(".swf-landing-title");
+    const primary = el && el.querySelector(".swf-actions .act.primary");
+    const active = Array.from(document.querySelectorAll(".tab.active"))
+      .map((t) => t.dataset.tab
+        + (t.dataset.setupWorkflowNav ? `+${t.dataset.setupWorkflowNav}` : ""));
+    return {
+      heading: h ? h.textContent.trim() : null,
+      primaryLabel: primary ? primary.textContent.trim() : null,
+      active,
+      title: document.title,
+      focusInLanding: !!(el && el.contains(document.activeElement)),
+    };
+  });
+  if (!landed.heading || !landed.heading.includes("Venues, rinks and ice")) {
+    fail(`${L}/${role}: Facilities landing heading is "${landed.heading}", `
+      + `expected the "Venues, rinks and ice" workflow`);
+  }
+  if (landed.primaryLabel !== "Add Ice") {
+    fail(`${L}/${role}: Facilities landing primary action is `
+      + `"${landed.primaryLabel}", expected "Add Ice"`);
+  }
+  // Exactly ONE nav entry highlights: the composite one, never Administration's
+  // plain Setup, even though both carry data-tab="setup".
+  if (JSON.stringify(landed.active) !== JSON.stringify(["setup+facilities"])) {
+    fail(`${L}/${role}: active nav after opening Facilities is `
+      + `${JSON.stringify(landed.active)}, expected exactly ["setup+facilities"]`);
+  }
+  if (!landed.title.includes("Hockey Scheduler")) {
+    fail(`${L}/${role}: Facilities landing left a bad title "${landed.title}"`);
+  }
+  if (!landed.focusInLanding) {
+    fail(`${L}/${role}: focus was not moved into the Facilities landing`);
+  }
+
+  // The landing's own primary action still reaches the real Ice Builder.
+  await page.click('[data-setup-workflow-landing="facilities"] .swf-actions .act.primary');
+  await page.waitForFunction(
+    () => document.body.dataset.view === "calendar", null, { timeout: 10000 })
+    .catch(() => fail(`${L}/${role}: "Add Ice" did not open the Calendar Ice `
+      + `Availability Builder`));
+
+  // Administration's plain Setup is still the workflow INDEX, not the landing.
+  await page.click('.tab[data-tab="setup"]:not([data-setup-workflow-nav])');
+  await page.waitForFunction(() => document.body.dataset.view === "setup",
+    null, { timeout: 10000 });
+  const onIndex = await page.evaluate(() => ({
+    landing: !!document.querySelector("[data-setup-workflow-landing]"),
+    active: Array.from(document.querySelectorAll(".tab.active"))
+      .map((t) => t.dataset.tab
+        + (t.dataset.setupWorkflowNav ? `+${t.dataset.setupWorkflowNav}` : "")),
+  }));
+  if (onIndex.landing) {
+    fail(`${L}/${role}: Administration's Setup opened a workflow landing; it `
+      + `must return to the workflow index`);
+  }
+  if (JSON.stringify(onIndex.active) !== JSON.stringify(["setup"])) {
+    fail(`${L}/${role}: active nav on the Setup index is `
+      + `${JSON.stringify(onIndex.active)}, expected exactly ["setup"]`);
+  }
+}
+
+// A role WITHOUT manage_arena must neither see the composite destination nor
+// be able to activate it directly -- the nav gate and the transition guard
+// both have to hold, not just the one that is easier to satisfy.
+async function checkFacilitiesDenied(page, L, role) {
+  const visible = await page.evaluate(() => {
+    const el = document.querySelector('.tab[data-setup-workflow-nav="facilities"]');
+    return !!(el && el.style.display !== "none");
+  });
+  if (visible) {
+    fail(`${L}/${role}: the Facilities destination is visible without manage_arena`);
+  }
+  const opened = await page.evaluate(
+    () => openSetupWorkflowLanding("facilities"));
+  if (opened !== false) {
+    fail(`${L}/${role}: openSetupWorkflowLanding("facilities") returned `
+      + `${JSON.stringify(opened)} without manage_arena — it must fail closed`);
+  }
+  const leaked = await page.evaluate(
+    () => !!document.querySelector('[data-setup-workflow-landing="facilities"]'));
+  if (leaked) {
+    fail(`${L}/${role}: direct activation rendered the Facilities landing `
+      + `without manage_arena`);
   }
 }
 
@@ -480,6 +653,7 @@ async function run(browser, viewport) {
     const adminVisible = await checkDestinationIdentity(page, `${L}/league_admin`);
     await checkKeyboardReach(page, `${L}/league_admin`, adminVisible);
     await checkDeepLinks(page, `${L}/league_admin`, adminVisible);
+    await checkFacilitiesLanding(page, L, "league_admin");
     await assertNoOverflow(page, `${L}/league_admin`);
 
     // ---- the other six roles ----
@@ -491,7 +665,7 @@ async function run(browser, viewport) {
       arena_manager: {
         destinations: ["activity", "calendar", "dashboard", "delivery", "games",
           "import", "notifications", "public", "roster", "scheduler", "setup",
-          "sheet", "standings"],
+          "setup+facilities", "sheet", "standings"],
         forbidden: "users",
       },
       coach: {
@@ -538,6 +712,11 @@ async function run(browser, viewport) {
         accounts[role].username, { timeout: 10000 });
       await reachLanding(page, LANDING[role]);
       await checkRole(page, L, role, EXPECT[role]);
+      // Facilities is manage_arena-gated: Arena Manager (whose primary journey
+      // this is) must reach the landing; every role without it must be denied
+      // by BOTH the nav gate and the transition guard.
+      if (role === "arena_manager") await checkFacilitiesLanding(page, L, role);
+      else await checkFacilitiesDenied(page, L, role);
       await assertNoOverflow(page, `${L}/${role}`);
     }
 

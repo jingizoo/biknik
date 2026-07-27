@@ -432,7 +432,7 @@ async function checkViewport(browser, viewport) {
     // #content and therefore survives every render. The Setup view is where
     // the harder cases are: its triggers are inside #content, so the render
     // that paints the dialog destroys them.
-    await page.click('.tab[data-tab="setup"]');
+    await page.click('.tab[data-tab="setup"]:not([data-setup-workflow-nav])');
     await page.waitForFunction(() => document.body.dataset.view === "setup",
       null, { timeout: 10000 });
     // Setup opens on the Hierarchy sub-view; the per-entity cards (and their
