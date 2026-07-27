@@ -159,7 +159,11 @@ let setupProgressError = false;  // the fetch above failed (distinct from "no da
 // re-derivable DOM form state that doesn't fit a server-resolved context
 // fetch), so a minimal monotonic sequence number is used directly instead.
 let setupProgressFetchSeq = 0;
-let setupView = "hierarchy";  // "hierarchy" | "records" — Setup sub-view (#165)
+let setupView = "hub";  // "hub" | "hierarchy" | "records" — Setup sub-view
+// (#165; "hub" added by #345 batch 2). The workflow hub is the DEFAULT route
+// into Setup: the undifferentiated mega-page must not be the only way in.
+// Both older sub-views stay reachable from the segmented toggle, so no
+// destination that was reachable before became unreachable.
 let readinessCheck = null;  // /api/readiness snapshot for the Pilot Readiness card (#104)
 let importState = {         // Pilot onboarding import wizard (#96)
   type: "teams_players",    // which IMPORT_TYPES entry is selected
@@ -875,13 +879,27 @@ async function contextSeededDrawerValues(kind) {
   // now bumps the instant a switch is attempted (setActiveContext()'s own
   // first bump, before its POST), so comparing against it closes that gap.
   const seededRevision = contextRevision;
-  if (!programId) return { ok: true, values: {} };
+  // Kinds whose parent select spans every Program/Season. For these there is
+  // no safe "open it unseeded" outcome: drawerField()'s `current || rows[0][0]`
+  // fallback would pick the first GLOBAL row, so a missing or unresolvable
+  // active context must fail CLOSED rather than returning ok with {} and
+  // letting the drawer open on a global guess.
+  const CONTEXT_BOUND = ["level", "division"];
+  const mustBind = CONTEXT_BOUND.indexOf(kind) !== -1;
+  if (!programId) {
+    return mustBind ? { ok: false, needsContext: true } : { ok: true, values: {} };
+  }
   if (kind === "season") return { ok: true, values: { "f-season-league": programId } };
   const hvr = await getJSON("/api/v2/setup/hierarchy");
   const stillCurrent = contextRevision === seededRevision;
   if (!hvr || hvr.error || !stillCurrent) return { ok: false };
   const program = (hvr.programs || []).find((p) => p.id === programId);
-  if (!program) return { ok: true, values: {} };
+  // Selected Program not present in the hierarchy the server just returned --
+  // a stale or mismatched context. Same rule: fail closed for the
+  // context-bound kinds instead of falling through to a global default.
+  if (!program) {
+    return mustBind ? { ok: false, needsContext: true } : { ok: true, values: {} };
+  }
   if (kind === "team") {
     const lgs = program.leagues || [];
     return { ok: true, values: lgs.length ? { "f-team-perm-league": lgs[0].id } : {} };
@@ -891,6 +909,59 @@ async function contextSeededDrawerValues(kind) {
       .concat(program.teams_without_league || []);
     return { ok: true, values: teams.length ? { "f-player-team": teams[0].id } : {} };
   }
+  // #345 batch 2 review blocker: the Setup workflow landings expose secondary
+  // create actions whose parent <select> spans EVERY Program (the #159
+  // context switcher is display-only, so those option lists are unfiltered).
+  // Opened with drawerValues = {}, drawerField()'s `current || rows[0][0]`
+  // fallback selects the first GLOBAL row -- so a valid submit persists the
+  // record under a different Program than the landing the operator is acting
+  // from. Same wrong-Program write risk rounds 5/6 closed for the hub-driven
+  // paths, reintroduced by copying Records' unseeded "+ New" onto a
+  // context-scoped surface.
+  if (kind === "level") {
+    // A League hangs off a Season. Seed from the ACTIVE Season in the context
+    // selection rather than from the hierarchy payload: it is the
+    // authoritative value the operator actually chose, and it avoids
+    // depending on a per-program `seasons` field this payload is not
+    // confirmed to carry -- an absent field would fall through to `{}` and
+    // silently restore the first-global fallback this fix exists to close.
+    // No active Season means there is nothing correct to seed, so fail closed
+    // rather than open the drawer on a global guess.
+    const seasonId = contextOptions && contextOptions.selected
+      && contextOptions.selected.season_id;
+    if (!seasonId) return { ok: false, needsSeason: true };
+    return { ok: true, values: { "f-level-season": seasonId } };
+  }
+  if (kind === "division") {
+    // A Division hangs off a LeagueSeason -- a League paired with a SEASON --
+    // so seeding the Program's first permanent League ignores which Season is
+    // active and lets a Division be created under a League that is not in it.
+    // Bind to the active Season instead, using the overview payload's
+    // per-league `season_ids` (#345 -- NOT the older singular `season_id`,
+    // which is only the FIRST binding `get_setup_overview_v2` happened to see
+    // and would silently miss a League that also participates in the active
+    // Season through a LATER binding).
+    const seasonId = contextOptions && contextOptions.selected
+      && contextOptions.selected.season_id;
+    if (!seasonId) return { ok: false, needsSeason: true };
+    const svr = await getJSON("/api/v2/setup/overview");
+    if (!svr || svr.error || contextRevision !== seededRevision) return { ok: false };
+    const inSeason = (svr.leagues || [])
+      .filter((lg) => (lg.season_ids || []).indexOf(seasonId) !== -1);
+    if (!inSeason.length) return { ok: false, noLeagueInSeason: true };
+    // f-div-season carries the exact active Season through to submit (#345),
+    // so a League bound to several Seasons commits into this one instead of
+    // the ambiguous legacy sole-binding path.
+    return { ok: true, values: { "f-div-league": inSeason[0].id, "f-div-season": seasonId } };
+  }
+  // Rink and ice-slot deliberately fall through to the unseeded return below.
+  // Their parents are a Venue and a Rink -- shared facilities with no Program
+  // axis -- so an unseeded default cannot produce the cross-PROGRAM write this
+  // seeding exists to prevent, and there is no active-context value to bind
+  // them to. An earlier revision failed these closed, which rendered two
+  // controls that could never succeed; a dead control is a worse outcome than
+  // an unseeded one. Season-scoped venue access (SeasonVenueAccess) would be
+  // the real axis to bind to and is not wired into the context bar yet.
   return { ok: true, values: {} };
 }
 // Best-effort focus landing for a plain view switch (no drawer of its own to
@@ -1203,7 +1274,14 @@ const SETUP_ENTITIES = [
       { id: "f-div-league", label: "League", type: "select", required: true, ofNoun: "level",
         options: (ov) => (ov.leagues || []).map((lv) => [lv.id, `${nameById(ov.seasons, lv.season_id)} · ${lv.name}`]) },
       { id: "f-div", label: "Division name", required: true, placeholder: "e.g. Gold" },
-      { id: "f-div-age", label: "Age group", placeholder: "e.g. U14 (optional)" }] },
+      { id: "f-div-age", label: "Age group", placeholder: "e.g. U14 (optional)" },
+      // Carries the active Season a #345 context-seeded open resolved the
+      // League against, so a League bound to several Seasons commits into the
+      // exact one the operator was acting from rather than the ambiguous
+      // legacy sole-binding path. Empty/absent (the plain Records "+ New"
+      // open, or any League with only one binding) preserves that legacy
+      // behavior unchanged.
+      { id: "f-div-season", type: "hidden" }] },
   { key: "club", title: "Clubs", icon: "🏒", noun: "club", perm: "manage_setup",
     delKind: "club",  // a club with no team can be deleted from here (#215)
     list: (ov) => (ov.clubs || []).map((c) => ({ id: c.id, title: c.name })),
@@ -1337,7 +1415,7 @@ const SETUP_POST = {
   season: () => post("/api/v2/setup/season", { program_id: val("f-season-league"), name: val("f-season"),
     start_date: val("f-season-start") || null, end_date: val("f-season-end") || null }),
   level: () => post("/api/v2/setup/league", { season_id: val("f-level-season"), name: val("f-level"), sort_order: val("f-level-sort") ? Number(val("f-level-sort")) : 0 }),
-  division: () => post("/api/v2/setup/division", { league_id: val("f-div-league"), name: val("f-div"), age_group: val("f-div-age") }),
+  division: () => post("/api/v2/setup/division", { league_id: val("f-div-league"), name: val("f-div"), age_group: val("f-div-age"), season_id: val("f-div-season") || null }),
   club: () => post("/api/v2/setup/club", { name: val("f-club") }),
   team: () => post("/api/v2/setup/team", { league_id: val("f-team-perm-league") || null, club_id: val("f-team-club") || null, name: val("f-team") }),
   organization: () => post("/api/v2/setup/organization", { name: val("f-org"), short_name: val("f-org-short") }),
@@ -2835,13 +2913,165 @@ function updateRolloverCommitState(c) {
   commit.disabled = !(anyChecked && allAssigned);
 }
 
+// The six Setup workflows (#345 batch 2), matching the keys the backend's
+// get_setup_progress already reports and goToSetupWorkflow already routes --
+// one definition, so the Home/Tasks hub, the progress API and these screens
+// can never name a different set of six.
+//
+// Each entry carries the PRIMARY action the requirements package's
+// primary-action audit designates for that workflow, plus the actions that
+// audit explicitly demotes. That table is a checklist, not a design decision
+// taken here: one `.act.primary` per screen, everything else secondary or
+// tertiary.
+const SETUP_WORKFLOWS = [
+  { key: "league_season", title: "League profile and seasons", icon: "🗓️",
+    purpose: "The program's identity, and the seasons that give it schedulable time.",
+    perm: "manage_setup",
+    primary: { label: "Add Season", go: "league_season" },
+    secondary: [{ label: "Programs", act: "league" }, { label: "Leagues", act: "level" }],
+    summary: (sv) => [
+      { label: "Programs", n: (sv.programs || []).length },
+      { label: "Seasons", n: (sv.seasons || []).length },
+      { label: "Leagues", n: (sv.leagues || []).length }] },
+  { key: "teams", title: "Permanent teams", icon: "👥",
+    purpose: "Teams as lasting members of a league, independent of any one season.",
+    perm: "manage_setup",
+    primary: { label: "Add Team", go: "teams" },
+    secondary: [{ label: "Clubs", act: "club" }],
+    summary: (sv) => [
+      { label: "Teams", n: (sv.teams || []).length },
+      { label: "Clubs", n: (sv.clubs || []).length }] },
+  { key: "participation", title: "Season participation and divisions", icon: "🏅",
+    purpose: "Which teams play in which league-season, and the divisions that split them.",
+    perm: "manage_setup",
+    primary: { label: "Register Team", go: "participation" },
+    secondary: [{ label: "Divisions", act: "division" }],
+    summary: (sv) => [
+      { label: "Divisions", n: (sv.divisions || []).length }] },
+  { key: "roster", title: "Clubs, players and staff", icon: "🧑",
+    purpose: "The people: players on teams, and the officials who work the games.",
+    perm: "manage_setup",
+    primary: { label: "Add Player", go: "roster" },
+    secondary: [{ label: "Officials", act: "official" }],
+    summary: (sv) => [
+      { label: "Players", n: (playersList || []).length },
+      { label: "Officials", n: (sv.officials || []).length }] },
+  { key: "facilities", title: "Venues, rinks and ice", icon: "🏟️",
+    purpose: "Where games can be played, and the recurring ice that makes them schedulable.",
+    perm: "manage_arena",
+    // "Add Ice" opens the recurring Ice Availability Builder rather than a
+    // single-slot form: it is the highest-leverage action here, because it
+    // bulk-generates the inventory everything downstream schedules against.
+    primary: { label: "Add Ice", go: "facilities" },
+    secondary: [{ label: "Venues", act: "venue" }, { label: "Rinks", act: "rink" }],
+    tertiary: [{ label: "Add one ice slot", act: "ice-slot" }],
+    summary: (sv) => [
+      { label: "Venues", n: (sv.venues || []).length },
+      { label: "Rinks", n: (sv.rinks || []).length }] },
+  // Workflow 6 is OPTIONAL (Decision 9): always visible and always reachable,
+  // never the hub's `next` recommendation, and never blocking the complete
+  // state. It carries its own status wording rather than done/todo.
+  { key: "import", title: "Imports and onboarding", icon: "📥", optional: true,
+    purpose: "Bring an existing league in from spreadsheets instead of typing it in.",
+    perm: "manage_arena",
+    primary: { label: "Import data", go: "import" },
+    secondary: [{ label: "Initial Setup wizard", go: "onboarding" }] },
+];
+
+// Which workflow landing is open, or null for the hub index.
+let setupWorkflow = null;
+
+function setupWorkflowsFor() {
+  return SETUP_WORKFLOWS.filter((w) => !w.perm || hasPerm(w.perm));
+}
+
+function setupSummaryHtml(w, sv, ov) {
+  // Guard the payload, not each accessor: renderSetup can be reached before
+  // (or without) a successful overview load -- an early return, a failed
+  // fetch, a role whose payload is redacted -- and a summary card must
+  // degrade to "no counts yet" rather than throwing and blanking the view.
+  if (!w.summary || !sv) return "";
+  const parts = w.summary(sv, ov).map((s) =>
+    `<span class="swf-stat"><strong>${s.n}</strong> ${esc(s.label)}</span>`).join("");
+  return `<div class="swf-stats">${parts}</div>`;
+}
+
+// Hub index: the six workflows as summary cards. This is what replaces the
+// undifferentiated Setup mega-page as the DEFAULT route -- the mega-page's
+// two sub-views stay reachable from the toggle, so nothing that was
+// reachable before becomes unreachable.
+function renderSetupHub(sv, ov) {
+  const mine = setupWorkflowsFor();
+  if (!mine.length) {
+    return `<div class="empty">Your role doesn't manage any setup workflows.
+      Ask a league admin for access if you need to change this program's structure.</div>`;
+  }
+  const cards = mine.map((w) => `
+    <section class="swf-card" data-setup-workflow-card="${esc(w.key)}">
+      <header class="swf-head">
+        <span class="swf-ico" aria-hidden="true">${w.icon}</span>
+        <h3 class="swf-title">${esc(w.title)}</h3>
+        ${w.optional ? `<span class="swf-optional">Optional</span>` : ""}
+      </header>
+      <p class="swf-purpose">${esc(w.purpose)}</p>
+      ${setupSummaryHtml(w, sv, ov)}
+      <button class="act ghost swf-open" data-setup-workflow="${esc(w.key)}">
+        Open ${esc(w.title.toLowerCase())}</button>
+    </section>`).join("");
+  return `${pageIntro("Setup is six focused workflows. Open the one you need — "
+    + "each opens on a summary, not a form.")}
+    <div class="swf-grid">${cards}</div>`;
+}
+
+// A single workflow's LANDING: summary first, then exactly one primary
+// action, then the demoted ones. Detail lives one level in (the Records and
+// Hierarchy views), per "show summary first; reveal detail progressively".
+function renderSetupWorkflowLanding(w, sv, ov) {
+  // `go` routes through goToSetupWorkflow -- the seeded, fail-closed path
+  // (#331 review rounds 5/6) that binds a create drawer to the ACTIVE
+  // Program/Season instead of letting it fall back to a global first option.
+  // `act` opens a plain entity drawer, identical to Records' own "+ New".
+  const attr = (a) => a.go
+    ? `data-setup-workflow-go="${esc(a.go)}"` : `data-setup-workflow-act="${esc(a.act)}"`;
+  const act = (a, cls) =>
+    `<button class="act ${cls}" ${attr(a)}>${esc(a.label)}</button>`;
+  const secondary = (w.secondary || []).map((a) => act(a, "ghost")).join("");
+  const tertiary = (w.tertiary || []).map((a) =>
+    `<button class="linklike" ${attr(a)}>${esc(a.label)}</button>`).join("");
+  return `
+    <div class="swf-landing">
+      <button class="linklike swf-back" data-setup-workflow="">← All setup workflows</button>
+      <h2 class="swf-landing-title">${w.icon} ${esc(w.title)}</h2>
+      <p class="swf-purpose">${esc(w.purpose)}</p>
+      ${w.optional ? `<p class="swf-optional-note">This step is optional — you can
+        set everything up by hand instead, and skipping it never blocks the
+        rest of setup.</p>` : ""}
+      ${setupSummaryHtml(w, sv, ov)}
+      <div class="swf-actions">
+        ${act(w.primary, "primary")}
+        ${secondary}
+      </div>
+      ${tertiary ? `<div class="swf-tertiary">${tertiary}</div>` : ""}
+      <div class="swf-detail">
+        <div class="section-title">Detail</div>
+        <button class="linklike" data-setup-view="records">All records</button>
+        <button class="linklike" data-setup-view="hierarchy">Hierarchy view</button>
+      </div>
+    </div>`;
+}
+
 function renderSetup(sv, hv, ov) {
+  const seg = (v, label) =>
+    `<button class="seg ${setupView === v ? "active" : ""}" data-setup-view="${v}">${label}</button>`;
   const toggle = `<div class="seg-group setup-viewtoggle">
-    <button class="seg ${setupView === "hierarchy" ? "active" : ""}" data-setup-view="hierarchy">Hierarchy</button>
-    <button class="seg ${setupView === "records" ? "active" : ""}" data-setup-view="records">Records</button>
+    ${seg("hub", "Workflows")}${seg("hierarchy", "Hierarchy")}${seg("records", "Records")}
   </div>`;
   let body;
-  if (setupView === "hierarchy") {
+  if (setupView === "hub") {
+    const w = setupWorkflow
+      && setupWorkflowsFor().find((x) => x.key === setupWorkflow);
+    body = w ? renderSetupWorkflowLanding(w, sv, ov) : renderSetupHub(sv, ov);
+  } else if (setupView === "hierarchy") {
     body = `${pageIntro("Review and fix how your venues, programs, teams, and rosters are connected.")}${renderSetupHierarchy(sv, hv, ov)}`;
   } else {
     const cards = SETUP_ENTITIES.map((ent) => setupCard(ent, sv)).join("");
@@ -2889,6 +3119,11 @@ function drawerField(f, sv) {
   // Preserve what the user already typed/selected across an error re-render;
   // fall back to the field's default only on first open.
   const current = f.id in drawerValues ? drawerValues[f.id] : (f.value || "");
+  // A context value the operator never picks or sees (e.g. the active Season
+  // a #345 context-seeded Division carries alongside its visible League
+  // select) -- present in the submitted body via the same val()/drawerValues
+  // pipeline as every visible field, without its own label/control.
+  if (f.type === "hidden") return `<input id="${f.id}" type="hidden" value="${esc(current)}" />`;
   if (f.type === "select") {
     const rows = f.options(sv);
     if (!rows.length) {
@@ -6535,7 +6770,7 @@ async function render() {
   wireCopyFeedUrl(c);
   // Setup sub-view toggle (#165): Hierarchy tree vs the record cards.
   c.querySelectorAll("[data-setup-view]").forEach((b) => b.onclick = () => {
-    setupView = b.dataset.setupView; toast = ""; render();
+    setupView = b.dataset.setupView; setupWorkflow = null; toast = ""; render();
   });
   // Setup drawers (#44): open, close, submit. A drawer opened from the
   // hierarchy tree (#165) can carry a data-prefill-field/value to preselect
@@ -6849,6 +7084,51 @@ async function render() {
   // syncOverlayFocus() targets the dialog CONTAINER instead of a form
   // control, and only on the closed -> open transition (or to re-anchor
   // focus a re-render orphaned), so neither problem survives.
+  // Setup workflow hub (#345 batch 2). Opening/closing a landing is pure view
+  // state; the actions delegate to the SAME handlers the rest of Setup uses,
+  // so a workflow landing can never drift from the behaviour of the control
+  // it fronts.
+  c.querySelectorAll("[data-setup-workflow]").forEach((b) => b.onclick = () => {
+    setupWorkflow = b.dataset.setupWorkflow || null;
+    toast = "";
+    render();
+    // Land keyboard focus on the destination's own heading rather than
+    // leaving it on a control that the render just replaced.
+    focusContentHeading();
+  });
+  // Primary actions route through goToSetupWorkflow -- the seeded, fail-closed
+  // path -- rather than opening a raw drawer, so a landing's primary action
+  // carries the same active-Program binding the Home/Tasks hub's does.
+  c.querySelectorAll("[data-setup-workflow-go]").forEach((b) => b.onclick = () => {
+    const key = b.dataset.setupWorkflowGo;
+    if (key === "onboarding") { switchTab("onboarding"); focusContentHeading(); return; }
+    goToSetupWorkflow(key);
+  });
+  // Demoted actions go through the SAME seeded, fail-closed path as the
+  // primary ones. They used to open a raw drawer with drawerValues = {},
+  // mirroring Records' own "+ New" -- which is correct on Records (a flat
+  // record-management surface) and wrong here, because a workflow landing is
+  // scoped to the active Program and its parent selects are not.
+  c.querySelectorAll("[data-setup-workflow-act]").forEach((b) => b.onclick = async () => {
+    const kind = b.dataset.setupWorkflowAct;
+    const mySeq = ++drawerSeedFetchSeq;
+    const seeded = await contextSeededDrawerValues(kind);
+    if (mySeq !== drawerSeedFetchSeq) return;  // a newer open already won
+    if (!seeded.ok) {
+      toast = seeded.needsContext
+        ? "Pick a program in the context bar first, so this is created in the right one."
+        : seeded.needsSeason
+          ? "Pick a season in the context bar first — this is created inside one."
+          : seeded.noLeagueInSeason
+            ? "That season has no leagues yet — add one before adding divisions."
+            : "Couldn't load what's needed to open that — try again.";
+      toastIsError = true;
+      return render();
+    }
+    drawer = { kind }; drawerError = ""; drawerValues = seeded.values;
+    toast = "";
+    render();
+  });
   c.querySelectorAll("button[data-act]").forEach((b) => b.onclick = () => rosterAction(b.dataset.act, b.dataset.id));
   c.querySelectorAll(".seg[data-view]").forEach((b) => b.onclick = () => { gameView = b.dataset.view; toast = ""; render(); });
   c.querySelectorAll("[data-side]").forEach((b) => b.onclick = () => { rosterSide = b.dataset.side; toast = ""; render(); });
@@ -8243,6 +8523,12 @@ document.addEventListener("keydown", (e) => {
 function switchTab(next) {
   view = next; toast = ""; if (next !== "calendar") { wizard = null; conflict = null; movingGameId = null; pendingMove = null; iceBuilder = null; }
   if (next !== "setup") { drawer = null; drawerError = ""; drawerValues = {}; pendingReassign = null; }
+  // Clicking the top-level Setup destination always returns to the workflow
+  // INDEX (#345 batch 2), never to whichever landing happened to be open last
+  // -- same reset discipline the drawer/wizard state above gets, and for the
+  // same reason: a nav click means "take me to Setup", not "resume where I
+  // was three screens deep". Unconditional, so it also clears on re-entry.
+  setupWorkflow = null;
   // A pending checkout confirmation doesn't survive leaving Home (#107) —
   // same reset discipline as drawer/wizard above, so a stale "are you
   // sure?" never reappears over changed attendance state.

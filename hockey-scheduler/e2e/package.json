@@ -10,6 +10,7 @@
     "accessibility-foundations": "node accessibility-foundations.js",
     "shell-accessibility-coverage": "node shell-accessibility-coverage.js",
     "home-tasks-hub": "node home-tasks-hub.js",
+    "setup-workflow-hub": "node setup-workflow-hub.js",
     "role-home-journeys": "node role-home-journeys.js",
     "hierarchy-import": "node hierarchy-import.js",
     "season-participation": "node season-participation.js",
