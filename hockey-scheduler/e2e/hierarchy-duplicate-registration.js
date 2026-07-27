@@ -136,6 +136,20 @@ function startInjectableServer(port) {
   return { proc, inject, getOutput: () => serverOutput };
 }
 
+// Selects the Hierarchy sub-view via the user-visible toggle and confirms it
+// took effect (#345 batch 2: Setup now lands on the six-workflow hub, so a
+// journey asserting against Hierarchy controls has to navigate there). Never
+// sets setupView directly, and asserts the segment is active BEFORE any
+// domain control is awaited, so a future default change fails with "wrong
+// sub-view" rather than an opaque selector timeout.
+async function enterSetupHierarchy(page) {
+  await page.click('[data-setup-view="hierarchy"]');
+  await page.waitForFunction(() => {
+    const seg = document.querySelector(".setup-viewtoggle .seg.active");
+    return !!(seg && seg.dataset.setupView === "hierarchy");
+  }, null, { timeout: 10000 });
+}
+
 async function checkViewport(browser, viewport) {
   const base = `http://${HOST}:${viewport.port}`;
   const server = startInjectableServer(viewport.port);
@@ -157,6 +171,7 @@ async function checkViewport(browser, viewport) {
     // this page's own writes is reflected in its in-memory hv/seasonRegs.
     const refreshSetup = async (marker) => {
       await page.click('.tab[data-tab="setup"]');
+      await enterSetupHierarchy(page);
       await page.waitForFunction((sel) => !!document.querySelector(sel), marker, { timeout: 15000 });
     };
 
