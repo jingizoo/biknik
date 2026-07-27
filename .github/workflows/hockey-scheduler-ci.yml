@@ -185,6 +185,7 @@ jobs:
           node --check hockey-scheduler/e2e/season-fmt-unit.js
           node --check hockey-scheduler/e2e/scheduling-policy.js
           node --check hockey-scheduler/e2e/accessibility-foundations.js
+          node --check hockey-scheduler/e2e/shell-accessibility-coverage.js
           node --check hockey-scheduler/e2e/home-tasks-hub.js
           node --check hockey-scheduler/e2e/role-home-journeys.js
           node --check hockey-scheduler/e2e/setup-progress-conflict-attention.js
@@ -219,7 +220,7 @@ jobs:
         # runner.
         include:
           - shard: 1
-            scripts: "smoke setup-claim onboarding-wizard hierarchy-import season-participation hierarchy-duplicate-registration season-rollover season-dates scheduling-policy breakpoint-boundaries"
+            scripts: "smoke setup-claim onboarding-wizard hierarchy-import season-participation hierarchy-duplicate-registration season-rollover season-dates scheduling-policy breakpoint-boundaries shell-accessibility-coverage"
           - shard: 2
             scripts: "team-division-participation scheduler-empty-state scheduler-already-scheduled allowed-venues venue-access-cleanup venue-sharing permanent-teams player-edit accessibility-foundations"
           - shard: 3
