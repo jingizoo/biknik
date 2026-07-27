@@ -3008,6 +3008,12 @@ function openSetupWorkflowLanding(key) {
   view = "setup";
   setupWorkflow = key || null;
   toast = "";
+  // The SAME per-destination reset switchTab() applies. Bypassing switchTab is
+  // deliberate (it would clear the `setupWorkflow` half being established), but
+  // that must not mean bypassing the transient-state discipline too: without
+  // this, arriving from the Calendar carried a live Ice Builder over, and from
+  // Player/Guardian Home a pending checkout confirmation.
+  resetTransientViewState("setup");
   syncActiveNav();
   setPageTitle("setup");
   render();
@@ -8550,22 +8556,50 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
+// Per-view transient UI state that must NOT survive a destination change,
+// factored out of switchTab() (#345 review) so every transition into a
+// destination applies the identical discipline.
+//
+// This exists because it already drifted once: openSetupWorkflowLanding()
+// deliberately bypasses switchTab() (which would clear the `setupWorkflow`
+// half it is establishing), and in doing so it silently skipped ALL of the
+// resets below — so navigating to Facilities from the Calendar carried a live
+// Ice Builder/move/conflict across, and from Player or Guardian Home carried a
+// pending checkout confirmation across. A stale overlay rendering over a
+// different destination is exactly what these guards exist to prevent, so the
+// rule now lives in one place both callers use rather than being re-derived.
+//
+// `next` is the destination's VIEW half; the conditions are unchanged from
+// their original sites, including preserving an open drawer for `setup` (the
+// topbar "+ Add Ice"/"＋ New" shortcuts set `drawer` and THEN switch to setup,
+// so clearing it here would break them).
+function resetTransientViewState(next) {
+  if (next !== "calendar") {
+    wizard = null; conflict = null; movingGameId = null; pendingMove = null;
+    iceBuilder = null;
+  }
+  if (next !== "setup") {
+    drawer = null; drawerError = ""; drawerValues = {}; pendingReassign = null;
+  }
+  // A pending checkout confirmation doesn't survive leaving Home (#107) —
+  // so a stale "are you sure?" never reappears over changed attendance state.
+  if (next !== "player_home") {
+    checkoutConfirm = null; oppDetailGame = null; oppDetail = null;
+  }
+  // Same discipline for the guardian surface (#26): leaving "My Players"
+  // clears any open junior checkout confirm / opportunity detail.
+  if (next !== "guardian_home") { gCheckout = null; gOpp = null; gOppDetail = null; }
+}
+
 function switchTab(next) {
-  view = next; toast = ""; if (next !== "calendar") { wizard = null; conflict = null; movingGameId = null; pendingMove = null; iceBuilder = null; }
-  if (next !== "setup") { drawer = null; drawerError = ""; drawerValues = {}; pendingReassign = null; }
+  view = next; toast = "";
+  resetTransientViewState(next);
   // Clicking the top-level Setup destination always returns to the workflow
   // INDEX (#345 batch 2), never to whichever landing happened to be open last
   // -- same reset discipline the drawer/wizard state above gets, and for the
   // same reason: a nav click means "take me to Setup", not "resume where I
   // was three screens deep". Unconditional, so it also clears on re-entry.
   setupWorkflow = null;
-  // A pending checkout confirmation doesn't survive leaving Home (#107) —
-  // same reset discipline as drawer/wizard above, so a stale "are you
-  // sure?" never reappears over changed attendance state.
-  if (next !== "player_home") { checkoutConfirm = null; oppDetailGame = null; oppDetail = null; }
-  // Same discipline for the guardian surface (#26): leaving "My Players"
-  // clears any open junior checkout confirm / opportunity detail.
-  if (next !== "guardian_home") { gCheckout = null; gOpp = null; gOppDetail = null; }
   syncActiveNav(next);
   setPageTitle(next);
   render();

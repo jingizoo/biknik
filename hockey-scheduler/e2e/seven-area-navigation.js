@@ -525,6 +525,8 @@ async function checkFacilitiesLanding(page, L, role) {
     .catch(() => fail(`${L}/${role}: "Add Ice" did not open the Calendar Ice `
       + `Availability Builder`));
 
+  await checkNoStaleTransientState(page, L, role);
+
   // Administration's plain Setup is still the workflow INDEX, not the landing.
   await page.click('.tab[data-tab="setup"]:not([data-setup-workflow-nav])');
   await page.waitForFunction(() => document.body.dataset.view === "setup",
@@ -542,6 +544,53 @@ async function checkFacilitiesLanding(page, L, role) {
   if (JSON.stringify(onIndex.active) !== JSON.stringify(["setup"])) {
     fail(`${L}/${role}: active nav on the Setup index is `
       + `${JSON.stringify(onIndex.active)}, expected exactly ["setup"]`);
+  }
+}
+
+// Transient per-view UI state must not survive the Facilities transition.
+// openSetupWorkflowLanding() deliberately bypasses switchTab(), and the first
+// version of it bypassed switchTab's RESET discipline too -- so a live Ice
+// Builder (Calendar) or a pending checkout confirmation (Player/Guardian Home)
+// travelled into the landing and rendered as a stale overlay over a different
+// destination. Sets each piece of state through the app's own module bindings,
+// navigates via the real sidebar entry, and requires it cleared.
+async function checkNoStaleTransientState(page, L, role) {
+  const cases = [
+    { name: "calendar Ice Builder", set: () => {
+        iceBuilder = { form: { probe: true }, preview: null };
+        wizard = { probe: true }; conflict = { probe: true };
+        movingGameId = "probe-game"; pendingMove = { probe: true };
+      },
+      read: () => ({ iceBuilder, wizard, conflict, movingGameId, pendingMove }) },
+    { name: "player-home checkout confirm", set: () => {
+        checkoutConfirm = { game_id: "probe" };
+        oppDetailGame = "probe"; oppDetail = { probe: true };
+      },
+      read: () => ({ checkoutConfirm, oppDetailGame, oppDetail }) },
+    { name: "guardian-home checkout confirm", set: () => {
+        gCheckout = { jid: "probe", game_id: "probe" };
+        gOpp = { jid: "probe" }; gOppDetail = { probe: true };
+      },
+      read: () => ({ gCheckout, gOpp, gOppDetail }) },
+  ];
+  for (const c of cases) {
+    // Start from the Setup INDEX so the only transition under test is the one
+    // into the Facilities landing.
+    await page.evaluate(() => switchTab("setup"));
+    await page.waitForFunction(() => document.body.dataset.view === "setup",
+      null, { timeout: 10000 });
+    await page.evaluate(`(${c.set.toString()})()`);
+    await page.click('.tab[data-setup-workflow-nav="facilities"]');
+    await page.waitForFunction(() => !!document.querySelector(
+      '[data-setup-workflow-landing="facilities"]'), null, { timeout: 10000 });
+    const left = await page.evaluate(`(${c.read.toString()})()`);
+    const stale = Object.entries(left).filter(([, v]) =>
+      v !== null && v !== undefined && v !== "");
+    if (stale.length) {
+      fail(`${L}/${role}: ${c.name} survived the Facilities transition — `
+        + `${stale.map(([k]) => k).join(", ")} still set. A destination change `
+        + `must apply the same transient-state reset switchTab() does.`);
+    }
   }
 }
 
