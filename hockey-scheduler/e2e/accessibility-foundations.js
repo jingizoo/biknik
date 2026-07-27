@@ -631,7 +631,14 @@ async function checkViewport(browser, viewport) {
       window.__pendingFrames = () => window.__frames.filter(Boolean).length;
     });
 
-    const closeBeforeFrame = async (label, closeFn, expectTrigger) => {
+    // expectation: "trigger" (the exact live topbar Add Ice trigger must own
+    // focus) or "fallback" (the exact live production-contract fallback
+    // node must) -- both re-resolved INSIDE the page.evaluate below, at
+    // assertion time, since a Node-side selector cannot cross into the
+    // browser realm a page.evaluate callback runs in. The fallback mirrors
+    // focusContentHeading()'s own contract: the first heading-ish element
+    // inside #content, else #content itself.
+    const closeBeforeFrame = async (label, closeFn, expectation) => {
       await trigger.focus();
       await trigger.click();
       await page.waitForSelector(".drawer, .modal", { timeout: 10000 });
@@ -659,35 +666,59 @@ async function checkViewport(browser, viewport) {
           + `<body>; the close path must restore even when the frame never `
           + `executed, got ${JSON.stringify(after)}`);
       }
-      if (expectTrigger && !(after.cls || "").includes("act")) {
-        fail(`[${viewport.label}] ${label}: expected the surviving trigger to own focus, `
-          + `got ${JSON.stringify(after)}`);
+      // EXACT node identity, not "an element whose class merely contains
+      // act" -- a loose class match would still pass if focus landed on a
+      // DIFFERENT primary action (e.g. the topbar's Schedule Game button),
+      // which is exactly the kind of wrong-but-plausible restore this test
+      // exists to catch.
+      const exact = await page.evaluate((exp) => {
+        const active = document.activeElement;
+        let expected;
+        if (exp === "trigger") {
+          expected = document.querySelector('.topbar [data-open-drawer="ice-slot"]');
+        } else {
+          const content = document.getElementById("content");
+          expected = (content && content.querySelector("h1, h2, h3, .section-title")) || content;
+        }
+        const desc = (el) => el
+          ? { tag: el.tagName, id: el.id || null, cls: el.className || null } : null;
+        return { same: active === expected, active: desc(active), expected: desc(expected) };
+      }, expectation);
+      if (!exact.same) {
+        fail(`[${viewport.label}] ${label}: expected the exact ${expectation} `
+          + `element to own focus, got ${JSON.stringify(exact.active)} instead `
+          + `of ${JSON.stringify(exact.expected)}`);
       }
       // The obsolete frame must be inert: flushing it cannot move focus into
-      // a dialog that no longer exists.
-      const before = await page.evaluate(() => {
-        const el = document.activeElement;
-        return el ? (el.id || el.className || el.tagName) : "null";
+      // a dialog that no longer exists. Compared by DOM NODE IDENTITY inside
+      // one evaluate() call -- two different elements can share the same
+      // derived "id || className || tagName" string (e.g. two undecorated
+      // <button>s), which would let a real focus move slip past a string
+      // comparison undetected.
+      const inert = await page.evaluate(() => {
+        const before = document.activeElement;
+        window.__flushFrames();
+        const after = document.activeElement;
+        const desc = (el) => el
+          ? { tag: el.tagName, id: el.id || null, cls: el.className || null } : null;
+        return { same: before === after, before: desc(before), after: desc(after) };
       });
-      await page.evaluate(() => window.__flushFrames());
-      const settled = await page.evaluate(() => {
-        const el = document.activeElement;
-        return el ? (el.id || el.className || el.tagName) : "null";
-      });
-      if (settled !== before) {
+      if (!inert.same) {
         fail(`[${viewport.label}] ${label}: flushing the obsolete focus frame MOVED focus `
-          + `from ${before} to ${settled}; a superseded frame must be inert`);
+          + `from ${JSON.stringify(inert.before)} to ${JSON.stringify(inert.after)}; `
+          + `a superseded frame must be inert`);
       }
     };
 
     // Escape, with the trigger surviving the close.
     await closeBeforeFrame("close-before-frame (Escape)",
-      () => page.keyboard.press("Escape"), true);
+      () => page.keyboard.press("Escape"), "trigger");
     // Close BUTTON, a different close path through the same lifecycle.
     await closeBeforeFrame("close-before-frame (close button)",
-      () => page.click(".drawer-x[data-drawer-close]"), true);
+      () => page.click(".drawer-x[data-drawer-close]"), "trigger");
     // Trigger removed by the closing action: no trigger survives, so the
-    // defined view fallback must own focus -- still never <body>.
+    // defined view fallback must own focus -- still never <body>, and not
+    // merely "anything that isn't <body>".
     await closeBeforeFrame("close-before-frame (removed trigger)", async () => {
       await page.evaluate(() => {
         const t = document.querySelector('.topbar [data-open-drawer="ice-slot"]');
@@ -695,7 +726,7 @@ async function checkViewport(browser, viewport) {
         if (t) t.remove();
       });
       await page.keyboard.press("Escape");
-    }, false);
+    }, "fallback");
 
     // Restore the real frame scheduler and the trigger, so everything after
     // this section runs against ordinary browser timing.
