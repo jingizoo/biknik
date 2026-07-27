@@ -220,6 +220,77 @@ async function assertFocusLandedInContent(page) {
   }, null, { timeout: 10000 });
 }
 
+// Context-switch race coverage deliberately leaves an OLD request in flight
+// while the destination view repaints. Waiting for Playwright's global
+// "networkidle" state can never succeed in that window: the held request is
+// itself proof the network is not idle. Instead, require the exact destination
+// view, context, and select binding to remain the same across two browser
+// paints. This can settle while the old request is held, but cannot pass on the
+// switcher's early value update or on a soon-to-be-replaced content node.
+async function selectContextAndWaitForStableView(page, base, {
+  contextValue, programId, seasonId, viewName, selector,
+  requiredSelectors = [], absentSelectors = [],
+}) {
+  const contextResponsePromise = page.waitForResponse((response) =>
+    response.url() === `${base}/api/context`
+      && response.request().method() === "POST",
+  { timeout: 10000 });
+  const optionsResponsePromise = page.waitForResponse((response) =>
+    response.url() === `${base}/api/context/options`
+      && response.request().method() === "GET",
+  { timeout: 10000 });
+  await page.selectOption("#ctx-select", contextValue);
+  const [contextResponse, optionsResponse] = await Promise.all([
+    contextResponsePromise, optionsResponsePromise,
+  ]);
+  if (!contextResponse.ok() || !optionsResponse.ok()) {
+    throw new Error(`context switch to ${contextValue} failed: `
+      + `POST ${contextResponse.status()}, options ${optionsResponse.status()}`);
+  }
+  const [persisted, options] = await Promise.all([
+    contextResponse.json(), optionsResponse.json(),
+  ]);
+  const selected = options && options.selected;
+  if (!persisted || persisted.program_id !== programId
+      || (persisted.season_id || null) !== (seasonId || null)
+      || !selected || selected.program_id !== programId
+      || (selected.season_id || null) !== (seasonId || null)) {
+    throw new Error(`context switch to ${contextValue} did not persist the `
+      + `requested Program/Season: POST=${JSON.stringify(persisted)}, `
+      + `options=${JSON.stringify(selected)}`);
+  }
+  await page.waitForFunction(
+    ({ viewName, selector, seasonId, contextValue,
+      requiredSelectors, absentSelectors }) =>
+      new Promise((resolve) => {
+        const contextSelect = document.getElementById("ctx-select");
+        const boundSelect = document.querySelector(selector);
+        if (document.body.dataset.view !== viewName
+            || !contextSelect || contextSelect.value !== contextValue
+            || !boundSelect || boundSelect.value !== seasonId
+            || requiredSelectors.some((required) => !document.querySelector(required))
+            || absentSelectors.some((absent) => document.querySelector(absent))) {
+          resolve(false);
+          return;
+        }
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          const currentContext = document.getElementById("ctx-select");
+          const currentBound = document.querySelector(selector);
+          resolve(document.body.dataset.view === viewName
+            && currentContext === contextSelect
+            && currentContext.value === contextValue
+            && currentBound === boundSelect
+            && currentBound.value === seasonId
+            && requiredSelectors.every((required) => document.querySelector(required))
+            && absentSelectors.every((absent) => !document.querySelector(absent)));
+        }));
+      }),
+    { viewName, selector, seasonId, contextValue,
+      requiredSelectors, absentSelectors },
+    { timeout: 10000 }
+  );
+}
+
 async function apiPost(page, p, body) {
   return page.evaluate(async (arg) => (await fetch(arg.p, {
     method: "POST", credentials: "same-origin",
@@ -1663,24 +1734,47 @@ async function checkRoleScenarios(browser, viewport) {
     // unawaited follow-up render() (after fetching
     // /api/import/hierarchy-codes) right after the first paint -- which
     // briefly wipes #content back to a loading skeleton before
-    // repainting. This is the first visit to Import in this whole
-    // checkRoleScenarios run, so it WILL fire; wait for that specific
-    // fetch explicitly (registered before the triggering click, so a
-    // fast response can't be missed) rather than racing a value-poll
-    // against an unbounded second render.
+    // repainting. Hold that fetch until the first #import-season node is
+    // observably live, mark that exact node, then require a NEW, correctly
+    // bound node after release. This deterministically puts the second
+    // repaint between the old assertion's visibility check and value read;
+    // the single retrying assertion below cannot pass on the detached node
+    // that intermittently failed CI (#337).
+    let releaseHierarchyCodes;
+    const hierarchyCodesHold = new Promise((resolve) => {
+      releaseHierarchyCodes = resolve;
+    });
+    const hierarchyCodesPattern = "**/api/import/hierarchy-codes";
+    const holdHierarchyCodesRoute = async (route) => {
+      await hierarchyCodesHold;
+      await route.continue();
+    };
+    await page.route(hierarchyCodesPattern, holdHierarchyCodesRoute);
     const hierarchyCodesResp = page.waitForResponse((r) =>
-      r.url() === `${base}/api/import/hierarchy-codes` && r.request().method() === "GET")
-      .catch(() => null);
+      r.url() === `${base}/api/import/hierarchy-codes`
+        && r.request().method() === "GET");
     await page.click('[data-setup-progress-action="import"]');
-    await hierarchyCodesResp;
     await page.waitForFunction(
-      (v) => (document.getElementById("import-season") || {}).value === v,
+      (v) => {
+        const select = document.getElementById("import-season");
+        if (!select || select.value !== v) return false;
+        select.dataset.beforeHierarchyCodesRepaint = "true";
+        return true;
+      },
       f.seasonF1, { timeout: 10000 });
-    const importSeasonSelected = await page.$eval("#import-season", (el) => el.value);
-    if (importSeasonSelected !== f.seasonF1) {
-      fail(`Import: expected the Season select to default to the ACTIVE `
-        + `Season F1 (${f.seasonF1}), got ${importSeasonSelected}`);
-    }
+    releaseHierarchyCodes();
+    await hierarchyCodesResp;
+    await page.unroute(hierarchyCodesPattern, holdHierarchyCodesRoute);
+    await page.waitForSelector(
+      "#import-season[data-before-hierarchy-codes-repaint]",
+      { state: "detached", timeout: 10000 });
+    await page.waitForFunction(
+      (v) => {
+        const select = document.getElementById("import-season");
+        return !!(select && select.value === v
+          && !select.dataset.beforeHierarchyCodesRepaint);
+      },
+      f.seasonF1, { timeout: 10000 });
     // -- Validate then Commit against F1, entirely through the real UI,
     // and assert the ACTUAL POSTED season_id belongs to F1.
     await page.click("[data-import-sample]");
@@ -2131,17 +2225,19 @@ async function checkRoleScenarios(browser, viewport) {
     await page.click("[data-import-validate]");
     await new Promise((r) => setTimeout(r, 200));  // let the stale Validate request actually leave
     const switchToJ3 = `${j.progJ3}|${j.seasonJ3}`;
-    await page.selectOption("#ctx-select", switchToJ3);
-    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
-      switchToJ3, { timeout: 10000 });
     // Wait for the Import view's OWN re-render to bind J3, not just
     // #ctx-select's value (same gap steps F/G/K's own comments document
     // elsewhere in this file), so the switch is genuinely FULLY SETTLED
     // before the stale response below is released.
-    await page.waitForFunction(
-      (v) => (document.getElementById("import-season") || {}).value === v,
-      j.seasonJ3, { timeout: 10000 });
-    await page.waitForLoadState("networkidle").catch(() => {});
+    await selectContextAndWaitForStableView(page, base, {
+      contextValue: switchToJ3,
+      programId: j.progJ3,
+      seasonId: j.seasonJ3,
+      viewName: "import",
+      selector: "#import-season",
+      requiredSelectors: [".import-form", "[data-import-commit]:disabled"],
+      absentSelectors: [".import-report"],
+    });
     releaseValidateJ2();
     await page.unroute("**/api/import/dry-run");
     await new Promise((r) => setTimeout(r, 300));  // let the stale response's own (discarded) handler run
@@ -2152,6 +2248,10 @@ async function checkRoleScenarios(browser, viewport) {
     if (jCommitEnabledAfterStraggler) {
       fail("(J2) expected a Validate response straggling in after the "
         + "switch to J3 fully settled to NOT re-enable Commit");
+    }
+    if (await page.$(".import-report")) {
+      fail("(J2) expected the stale Validate response to leave no Import "
+        + "report under J3");
     }
 
     // ---- (J3) A COMMIT response that straggles in AFTER a switch has
@@ -2189,13 +2289,15 @@ async function checkRoleScenarios(browser, viewport) {
     await page.click("[data-import-commit]");
     await new Promise((r) => setTimeout(r, 200));  // let the stale Commit request actually leave
     const switchToJ5 = `${j.progJ5}|${j.seasonJ5}`;
-    await page.selectOption("#ctx-select", switchToJ5);
-    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
-      switchToJ5, { timeout: 10000 });
-    await page.waitForFunction(
-      (v) => (document.getElementById("import-season") || {}).value === v,
-      j.seasonJ5, { timeout: 10000 });
-    await page.waitForLoadState("networkidle").catch(() => {});
+    await selectContextAndWaitForStableView(page, base, {
+      contextValue: switchToJ5,
+      programId: j.progJ5,
+      seasonId: j.seasonJ5,
+      viewName: "import",
+      selector: "#import-season",
+      requiredSelectors: [".import-form", "[data-import-commit]:disabled"],
+      absentSelectors: [".import-report"],
+    });
     releaseCommitJ4();
     await page.unroute("**/api/import/commit/teams-players");
     await new Promise((r) => setTimeout(r, 300));  // let the stale response's own (discarded) handler run
@@ -2203,6 +2305,9 @@ async function checkRoleScenarios(browser, viewport) {
       fail("(J3) expected a Commit response straggling in after the "
         + "switch to J5 fully settled to NOT paint a result banner there");
     }
+    await page.waitForFunction(
+      (v) => (document.getElementById("import-season") || {}).value === v,
+      j.seasonJ5, { timeout: 10000 });
 
     // ---- (J, same-input reorder) Two Validate requests for IDENTICAL
     // input, released newest-failure-then-older-success, must let only
@@ -2668,11 +2773,15 @@ async function checkRoleScenarios(browser, viewport) {
     await page.click("[data-ib-preview]");
     await new Promise((r) => setTimeout(r, 200));  // let the stale Preview request actually leave
     const switchToK1Again = `${k.progK1}|${k.seasonK1}`;
-    await page.selectOption("#ctx-select", switchToK1Again);
-    await page.waitForFunction(
-      (v) => (document.getElementById("ib-season") || {}).value === v,
-      k.seasonK1, { timeout: 10000 });
-    await page.waitForLoadState("networkidle").catch(() => {});  // the switch itself fully settles first
+    await selectContextAndWaitForStableView(page, base, {
+      contextValue: switchToK1Again,
+      programId: k.progK1,
+      seasonId: k.seasonK1,
+      viewName: "calendar",
+      selector: "#ib-season",
+      requiredSelectors: [".ib-form"],
+      absentSelectors: [".ib-preview", "[data-ib-commit]"],
+    });
     releasePreviewK3();
     await page.unroute("**/api/setup/ice-availability/preview");
     await new Promise((r) => setTimeout(r, 300));  // let the stale response's own (discarded) handler run
@@ -2680,6 +2789,10 @@ async function checkRoleScenarios(browser, viewport) {
       fail("(K2) expected a Preview response straggling in after the "
         + "switch to K1 fully settled to NOT resurrect a committable "
         + "stale preview");
+    }
+    if (await page.$(".ib-preview")) {
+      fail("(K2) expected the stale Preview response to leave no preview "
+        + "under K1");
     }
 
     // ---- (K3) A COMMIT response that straggles in AFTER a switch has
@@ -2711,11 +2824,15 @@ async function checkRoleScenarios(browser, viewport) {
     await page.click("[data-ib-commit]");
     await new Promise((r) => setTimeout(r, 200));  // let the stale Commit request actually leave
     const switchToK5 = `${k.progK5}|${k.seasonK5}`;
-    await page.selectOption("#ctx-select", switchToK5);
-    await page.waitForFunction(
-      (v) => (document.getElementById("ib-season") || {}).value === v,
-      k.seasonK5, { timeout: 10000 });
-    await page.waitForLoadState("networkidle").catch(() => {});
+    await selectContextAndWaitForStableView(page, base, {
+      contextValue: switchToK5,
+      programId: k.progK5,
+      seasonId: k.seasonK5,
+      viewName: "calendar",
+      selector: "#ib-season",
+      requiredSelectors: [".ib-form"],
+      absentSelectors: [".ib-preview", "[data-ib-commit]"],
+    });
     releaseCommitK4();
     await page.unroute("**/api/setup/ice-availability/commit");
     await new Promise((r) => setTimeout(r, 300));  // let the stale response's own (discarded) handler run
@@ -2723,6 +2840,13 @@ async function checkRoleScenarios(browser, viewport) {
       fail("(K3) expected the Ice Builder to remain open under K5 after a "
         + "stale K4 Commit response landed -- it must never null out a "
         + "different context's builder");
+    }
+    await page.waitForFunction(
+      (v) => (document.getElementById("ib-season") || {}).value === v,
+      k.seasonK5, { timeout: 10000 });
+    if (await page.$(".ib-preview")) {
+      fail("(K3) expected the stale Commit response to leave no preview "
+        + "under K5");
     }
     const k3ToastAfter = await page.evaluate(() =>
       (document.querySelector("#toast-root .toast-msg") || {}).textContent || "");
