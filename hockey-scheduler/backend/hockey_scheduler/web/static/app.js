@@ -159,7 +159,11 @@ let setupProgressError = false;  // the fetch above failed (distinct from "no da
 // re-derivable DOM form state that doesn't fit a server-resolved context
 // fetch), so a minimal monotonic sequence number is used directly instead.
 let setupProgressFetchSeq = 0;
-let setupView = "hierarchy";  // "hierarchy" | "records" — Setup sub-view (#165)
+let setupView = "hub";  // "hub" | "hierarchy" | "records" — Setup sub-view
+// (#165; "hub" added by #345 batch 2). The workflow hub is the DEFAULT route
+// into Setup: the undifferentiated mega-page must not be the only way in.
+// Both older sub-views stay reachable from the segmented toggle, so no
+// destination that was reachable before became unreachable.
 let readinessCheck = null;  // /api/readiness snapshot for the Pilot Readiness card (#104)
 let importState = {         // Pilot onboarding import wizard (#96)
   type: "teams_players",    // which IMPORT_TYPES entry is selected
@@ -2812,13 +2816,161 @@ function updateRolloverCommitState(c) {
   commit.disabled = !(anyChecked && allAssigned);
 }
 
+// The six Setup workflows (#345 batch 2), matching the keys the backend's
+// get_setup_progress already reports and goToSetupWorkflow already routes --
+// one definition, so the Home/Tasks hub, the progress API and these screens
+// can never name a different set of six.
+//
+// Each entry carries the PRIMARY action the requirements package's
+// primary-action audit designates for that workflow, plus the actions that
+// audit explicitly demotes. That table is a checklist, not a design decision
+// taken here: one `.act.primary` per screen, everything else secondary or
+// tertiary.
+const SETUP_WORKFLOWS = [
+  { key: "league_season", title: "League profile and seasons", icon: "🗓️",
+    purpose: "The program's identity, and the seasons that give it schedulable time.",
+    perm: "manage_setup",
+    primary: { label: "Add Season", go: "league_season" },
+    secondary: [{ label: "Programs", act: "league" }, { label: "Leagues", act: "level" }],
+    summary: (sv) => [
+      { label: "Programs", n: (sv.programs || []).length },
+      { label: "Seasons", n: (sv.seasons || []).length },
+      { label: "Leagues", n: (sv.leagues || []).length }] },
+  { key: "teams", title: "Permanent teams", icon: "👥",
+    purpose: "Teams as lasting members of a league, independent of any one season.",
+    perm: "manage_setup",
+    primary: { label: "Add Team", go: "teams" },
+    secondary: [{ label: "Clubs", act: "club" }],
+    summary: (sv) => [
+      { label: "Teams", n: (sv.teams || []).length },
+      { label: "Clubs", n: (sv.clubs || []).length }] },
+  { key: "participation", title: "Season participation and divisions", icon: "🏅",
+    purpose: "Which teams play in which league-season, and the divisions that split them.",
+    perm: "manage_setup",
+    primary: { label: "Register Team", go: "participation" },
+    secondary: [{ label: "Divisions", act: "division" }],
+    summary: (sv) => [
+      { label: "Divisions", n: (sv.divisions || []).length }] },
+  { key: "roster", title: "Clubs, players and staff", icon: "🧑",
+    purpose: "The people: players on teams, and the officials who work the games.",
+    perm: "manage_setup",
+    primary: { label: "Add Player", go: "roster" },
+    secondary: [{ label: "Officials", act: "official" }],
+    summary: (sv, ov) => [
+      { label: "Players", n: (playersList || []).length },
+      { label: "Officials", n: (sv.officials || []).length }] },
+  { key: "facilities", title: "Venues, rinks and ice", icon: "🏟️",
+    purpose: "Where games can be played, and the recurring ice that makes them schedulable.",
+    perm: "manage_arena",
+    // "Add Ice" opens the recurring Ice Availability Builder rather than a
+    // single-slot form: it is the highest-leverage action here, because it
+    // bulk-generates the inventory everything downstream schedules against.
+    primary: { label: "Add Ice", go: "facilities" },
+    secondary: [{ label: "Venues", act: "venue" }, { label: "Rinks", act: "rink" }],
+    tertiary: [{ label: "Add one ice slot", act: "ice-slot" }],
+    summary: (sv) => [
+      { label: "Venues", n: (sv.venues || []).length },
+      { label: "Rinks", n: (sv.rinks || []).length }] },
+  // Workflow 6 is OPTIONAL (Decision 9): always visible and always reachable,
+  // never the hub's `next` recommendation, and never blocking the complete
+  // state. It carries its own status wording rather than done/todo.
+  { key: "import", title: "Imports and onboarding", icon: "📥", optional: true,
+    purpose: "Bring an existing league in from spreadsheets instead of typing it in.",
+    perm: "manage_arena",
+    primary: { label: "Import data", go: "import" },
+    secondary: [{ label: "Initial Setup wizard", go: "onboarding" }] },
+];
+
+// Which workflow landing is open, or null for the hub index.
+let setupWorkflow = null;
+
+function setupWorkflowsFor() {
+  return SETUP_WORKFLOWS.filter((w) => !w.perm || hasPerm(w.perm));
+}
+
+function setupSummaryHtml(w, sv, ov) {
+  if (!w.summary) return "";
+  const parts = w.summary(sv, ov).map((s) =>
+    `<span class="swf-stat"><strong>${s.n}</strong> ${esc(s.label)}</span>`).join("");
+  return `<div class="swf-stats">${parts}</div>`;
+}
+
+// Hub index: the six workflows as summary cards. This is what replaces the
+// undifferentiated Setup mega-page as the DEFAULT route -- the mega-page's
+// two sub-views stay reachable from the toggle, so nothing that was
+// reachable before becomes unreachable.
+function renderSetupHub(sv, ov) {
+  const mine = setupWorkflowsFor();
+  if (!mine.length) {
+    return `<div class="empty">Your role doesn't manage any setup workflows.
+      Ask a league admin for access if you need to change this program's structure.</div>`;
+  }
+  const cards = mine.map((w) => `
+    <section class="swf-card" data-setup-workflow-card="${esc(w.key)}">
+      <header class="swf-head">
+        <span class="swf-ico" aria-hidden="true">${w.icon}</span>
+        <h3 class="swf-title">${esc(w.title)}</h3>
+        ${w.optional ? `<span class="swf-optional">Optional</span>` : ""}
+      </header>
+      <p class="swf-purpose">${esc(w.purpose)}</p>
+      ${setupSummaryHtml(w, sv, ov)}
+      <button class="act ghost swf-open" data-setup-workflow="${esc(w.key)}">
+        Open ${esc(w.title.toLowerCase())}</button>
+    </section>`).join("");
+  return `${pageIntro("Setup is six focused workflows. Open the one you need — "
+    + "each opens on a summary, not a form.")}
+    <div class="swf-grid">${cards}</div>`;
+}
+
+// A single workflow's LANDING: summary first, then exactly one primary
+// action, then the demoted ones. Detail lives one level in (the Records and
+// Hierarchy views), per "show summary first; reveal detail progressively".
+function renderSetupWorkflowLanding(w, sv, ov) {
+  // `go` routes through goToSetupWorkflow -- the seeded, fail-closed path
+  // (#331 review rounds 5/6) that binds a create drawer to the ACTIVE
+  // Program/Season instead of letting it fall back to a global first option.
+  // `act` opens a plain entity drawer, identical to Records' own "+ New".
+  const attr = (a) => a.go
+    ? `data-setup-workflow-go="${esc(a.go)}"` : `data-setup-workflow-act="${esc(a.act)}"`;
+  const act = (a, cls) =>
+    `<button class="act ${cls}" ${attr(a)}>${esc(a.label)}</button>`;
+  const secondary = (w.secondary || []).map((a) => act(a, "ghost")).join("");
+  const tertiary = (w.tertiary || []).map((a) =>
+    `<button class="linklike" ${attr(a)}>${esc(a.label)}</button>`).join("");
+  return `
+    <div class="swf-landing">
+      <button class="linklike swf-back" data-setup-workflow="">← All setup workflows</button>
+      <h2 class="swf-landing-title">${w.icon} ${esc(w.title)}</h2>
+      <p class="swf-purpose">${esc(w.purpose)}</p>
+      ${w.optional ? `<p class="swf-optional-note">This step is optional — you can
+        set everything up by hand instead, and skipping it never blocks the
+        rest of setup.</p>` : ""}
+      ${setupSummaryHtml(w, sv, ov)}
+      <div class="swf-actions">
+        ${act(w.primary, "primary")}
+        ${secondary}
+      </div>
+      ${tertiary ? `<div class="swf-tertiary">${tertiary}</div>` : ""}
+      <div class="swf-detail">
+        <div class="section-title">Detail</div>
+        <button class="linklike" data-setup-view="records">All records</button>
+        <button class="linklike" data-setup-view="hierarchy">Hierarchy view</button>
+      </div>
+    </div>`;
+}
+
 function renderSetup(sv, hv, ov) {
+  const seg = (v, label) =>
+    `<button class="seg ${setupView === v ? "active" : ""}" data-setup-view="${v}">${label}</button>`;
   const toggle = `<div class="seg-group setup-viewtoggle">
-    <button class="seg ${setupView === "hierarchy" ? "active" : ""}" data-setup-view="hierarchy">Hierarchy</button>
-    <button class="seg ${setupView === "records" ? "active" : ""}" data-setup-view="records">Records</button>
+    ${seg("hub", "Workflows")}${seg("hierarchy", "Hierarchy")}${seg("records", "Records")}
   </div>`;
   let body;
-  if (setupView === "hierarchy") {
+  if (setupView === "hub") {
+    const w = setupWorkflow
+      && setupWorkflowsFor().find((x) => x.key === setupWorkflow);
+    body = w ? renderSetupWorkflowLanding(w, sv, ov) : renderSetupHub(sv, ov);
+  } else if (setupView === "hierarchy") {
     body = `${pageIntro("Review and fix how your venues, programs, teams, and rosters are connected.")}${renderSetupHierarchy(sv, hv, ov)}`;
   } else {
     const cards = SETUP_ENTITIES.map((ent) => setupCard(ent, sv)).join("");
@@ -6499,7 +6651,7 @@ async function render() {
   wireCopyFeedUrl(c);
   // Setup sub-view toggle (#165): Hierarchy tree vs the record cards.
   c.querySelectorAll("[data-setup-view]").forEach((b) => b.onclick = () => {
-    setupView = b.dataset.setupView; toast = ""; render();
+    setupView = b.dataset.setupView; setupWorkflow = null; toast = ""; render();
   });
   // Setup drawers (#44): open, close, submit. A drawer opened from the
   // hierarchy tree (#165) can carry a data-prefill-field/value to preselect
@@ -6813,6 +6965,33 @@ async function render() {
   // syncOverlayFocus() targets the dialog CONTAINER instead of a form
   // control, and only on the closed -> open transition (or to re-anchor
   // focus a re-render orphaned), so neither problem survives.
+  // Setup workflow hub (#345 batch 2). Opening/closing a landing is pure view
+  // state; the actions delegate to the SAME handlers the rest of Setup uses,
+  // so a workflow landing can never drift from the behaviour of the control
+  // it fronts.
+  c.querySelectorAll("[data-setup-workflow]").forEach((b) => b.onclick = () => {
+    setupWorkflow = b.dataset.setupWorkflow || null;
+    toast = "";
+    render();
+    // Land keyboard focus on the destination's own heading rather than
+    // leaving it on a control that the render just replaced.
+    focusContentHeading();
+  });
+  // Primary actions route through goToSetupWorkflow -- the seeded, fail-closed
+  // path -- rather than opening a raw drawer, so a landing's primary action
+  // carries the same active-Program binding the Home/Tasks hub's does.
+  c.querySelectorAll("[data-setup-workflow-go]").forEach((b) => b.onclick = () => {
+    const key = b.dataset.setupWorkflowGo;
+    if (key === "onboarding") { switchTab("onboarding"); focusContentHeading(); return; }
+    goToSetupWorkflow(key);
+  });
+  // Demoted actions open the plain entity drawer, identical to Records' own
+  // "+ New" control (same state shape, so submitSetup needs no new branch).
+  c.querySelectorAll("[data-setup-workflow-act]").forEach((b) => b.onclick = () => {
+    drawer = { kind: b.dataset.setupWorkflowAct }; drawerError = ""; drawerValues = {};
+    toast = "";
+    render();
+  });
   c.querySelectorAll("button[data-act]").forEach((b) => b.onclick = () => rosterAction(b.dataset.act, b.dataset.id));
   c.querySelectorAll(".seg[data-view]").forEach((b) => b.onclick = () => { gameView = b.dataset.view; toast = ""; render(); });
   c.querySelectorAll("[data-side]").forEach((b) => b.onclick = () => { rosterSide = b.dataset.side; toast = ""; render(); });
@@ -8175,6 +8354,12 @@ document.addEventListener("keydown", (e) => {
 function switchTab(next) {
   view = next; toast = ""; if (next !== "calendar") { wizard = null; conflict = null; movingGameId = null; pendingMove = null; iceBuilder = null; }
   if (next !== "setup") { drawer = null; drawerError = ""; drawerValues = {}; pendingReassign = null; }
+  // Clicking the top-level Setup destination always returns to the workflow
+  // INDEX (#345 batch 2), never to whichever landing happened to be open last
+  // -- same reset discipline the drawer/wizard state above gets, and for the
+  // same reason: a nav click means "take me to Setup", not "resume where I
+  // was three screens deep". Unconditional, so it also clears on re-entry.
+  setupWorkflow = null;
   // A pending checkout confirmation doesn't survive leaving Home (#107) —
   // same reset discipline as drawer/wizard above, so a stale "are you
   // sure?" never reappears over changed attendance state.

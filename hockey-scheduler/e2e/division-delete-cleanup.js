@@ -132,6 +132,11 @@ async function checkViewport(browser, viewport) {
     }, CAL_DAY);
 
     await page.click('.tab[data-tab="setup"]');
+    // Setup now LANDS on the six-workflow hub (#345 batch 2), so a journey
+    // that works against the Hierarchy tree must select that sub-view
+    // explicitly -- the same deliberate navigation the Records-based
+    // journeys already do for their own sub-view.
+    await page.click('[data-setup-view="hierarchy"]');
     await page.waitForFunction(
       (sel) => !!document.querySelector(sel), `#reg-team-${fx.season}-${fx.league}`, { timeout: 15000 });
 
@@ -219,6 +224,7 @@ async function checkViewport(browser, viewport) {
     // (2) A SEPARATE Division with an ACTIVE registration still blocks, zero
     // mutation.
     await page.click('.tab[data-tab="setup"]');
+    await page.click('[data-setup-view="hierarchy"]');
     await page.waitForFunction(
       (sel) => !!document.querySelector(sel), `#reg-team-${fx.season}-${fx.league}`, { timeout: 15000 });
     await page.selectOption(`#reg-team-${fx.season}-${fx.league}`, fx.teamActive);
