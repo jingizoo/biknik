@@ -25,11 +25,11 @@ current GitHub state remain authoritative for later merge readiness** — if
 #354 advances, new active PRs are opened, or #345's acceptance boxes
 change, this document's status values become stale until a fresh refresh.
 
-- **Snapshot taken**: `2026-07-27T13:15:00Z` (all SHAs, mergeable states,
+- **Snapshot taken**: `2026-07-27T13:45:00Z` (all SHAs, mergeable states,
   and CI results below were re-checked live at this time, not carried over
   from an earlier read).
 - **Base branch**: `main` at `9447bb69f69209c86f44377da212ff9f9f2fd716` (merge
-  of PR #356).
+  of PR #356, League-context backend foundation).
 
 ## Revision history
 
@@ -74,10 +74,11 @@ the snapshot timestamp `2026-07-27T11:14:44Z`:
    advanced to current `main` in the same push described in (1).
 4. Refreshed the summary table, criteria 2/4/6/9, and the PR body to match.
 
-**Round 3 refresh** (this revision, `2026-07-27T13:15:00Z`): #347, #352,
-#353, and #356 have all merged to `main`. This refresh updates the status
-of merged PRs from `Pending active PR` to `Verified on main` where their
-accepted evidence fully covers the criterion:
+**Round 3 refresh** (this revision, `2026-07-27T13:45:00Z`): Four PRs have
+merged to current `main` since the Round 2 snapshot. This refresh moves their
+evidence from pending to verified and updates affected criteria. Four new
+tracking issues (#357–#360) are now recorded as planned/open work, never as
+completion evidence:
 
 1. **#347** (Guided Setup hub) merged via commit `5dfa6e0` on
    2026-07-27T11:59:39Z. The two prior blockers (positional-argument
@@ -216,10 +217,10 @@ itself. The decision rule for picking the one overall value:
 | | |
 | --- | --- |
 | Required boundary/evidence | Per `operator-ux-requirements.md` §5, the full states matrix applies to Home/Tasks and each of the six Setup workflows (per-card error boundaries for hub-shaped screens, named empty states with the #311 recipe, stale-response guards, named-resource confirmation modals, and Workflow 6's distinct optional status). |
-| Evidence merged to `main` | Home/Tasks hub has substantial, but not complete, state coverage: skeleton loading (`renderSetupProgressCard(_, _, true)`, `app.js:578-582`), per-card error + retry (`hadError` branch, `app.js:584-599`, `data-setup-progress-retry`), stale-response guard (`setupProgressFetchSeq`, `app.js:161,721,729`), success/complete (`progress.complete` branch, `app.js:602-640`), and a distinct optional badge for Workflow 6 (`app.js:643-649`) are all real and tested. **Corrected from an earlier draft of this ledger, which called this "fully" covered**: Home/Tasks hub's own Empty state (see the §2 inventory) is an unverified blank-render branch (`!progress \|\| !progress.program_id` returns `""`, `app.js:601`), not a confirmed, message-bearing empty state — so even Home/Tasks alone does not close the full required set of states. The six Setup workflows themselves still route through the single, pre-#345 `renderSetup()`/whole-pane `render()` skeleton (`app.js:6098`) and whole-pane `#retry-btn` (`app.js:6425`) — **not** per-card — for every one of the seven required states. |
-| Candidate evidence in active PR | #347 (head `746c823e4`) adds the landing *structure* (summary counts via `setupSummaryHtml()`) but, by its own PR body ("Explicitly NOT in this batch: ... the full state matrix"), does not add per-card loading/error/retry/stale-guard to the new landings — they inherit the same whole-pane behavior as today's mega-page. Its landing's own "empty" case is a bare `<div class="empty">Your role doesn't manage any setup workflows.…</div>` for a *role* with zero permitted workflows (`renderSetupHub`, `app.js`) — not the required per-workflow "No seasons yet" / "No teams yet" recipe from §5, which is not present anywhere in this PR either. |
-| Remaining gap | Per-card loading/empty/stale/error/retry for all six new workflow landings; a confirmed, message-bearing empty state for Home/Tasks hub itself. The confirmation-modal convention already exists for entity deletes in the pre-existing drill-in views (`records-delete`/`safe-destructive`/`division-delete-cleanup`/`registration-cleanup`/`player-lifecycle`/`destructive-surfaces` — all merged, pre-#345) but is not yet re-verified against the *new* landing entry points. See §2 below for the full per-screen inventory. |
-| **Status** | **`Missing`** — the six Setup workflows' landing-level states have no per-card implementation anywhere (merged or pending), and even Home/Tasks hub's own Empty state is unverified, so no required portion of this criterion is a closed set |
+| Evidence merged to `main` | Home/Tasks hub has substantial, but not complete, state coverage: skeleton loading (`renderSetupProgressCard(_, _, true)`, `app.js:578-582`), per-card error + retry (`hadError` branch, `app.js:584-599`, `data-setup-progress-retry`), stale-response guard (`setupProgressFetchSeq`, `app.js:161,721,729`), success/complete (`progress.complete` branch, `app.js:602-640`), and a distinct optional badge for Workflow 6 (`app.js:643-649`) are all real and tested. **Corrected from an earlier draft**: Home/Tasks hub's own Empty state (see the §2 inventory) is an unverified blank-render branch (`!progress \|\| !progress.program_id` returns `""`, `app.js:601`), not a confirmed, message-bearing empty state — so even Home/Tasks alone does not close the full required set of states. The six Setup workflows themselves route through the single, pre-#345 `renderSetup()`/whole-pane `render()` skeleton (`app.js:6098`) and whole-pane `#retry-btn` (`app.js:6425`) — **not** per-card — for every one of the seven required states. |
+| Candidate evidence in active PR | None — #347 (merged `5dfa6e0`) added the landing *structure* (summary counts via `setupSummaryHtml()`) but, by its own PR body ("Explicitly NOT in this batch: ... the full state matrix"), does not add per-card loading/error/retry/stale-guard to the new landings — they inherit the same whole-pane behavior as the pre-#345 mega-page. Its landing's own "empty" case is a bare `<div class="empty">Your role doesn't manage any setup workflows.…</div>` for a *role* with zero permitted workflows, not the required per-workflow "No seasons yet" / "No teams yet" recipe. Tracked under #358 (seven-area IA). |
+| Remaining gap | Per-card loading/empty/stale/error/retry for all six new workflow landings; a confirmed, message-bearing empty state for Home/Tasks hub itself. The confirmation-modal convention already exists for entity deletes in pre-existing drill-in views but is not yet re-verified against the *new* landing entry points. These are tracked in #358 and #359 (broader axe coverage). |
+| **Status** | **`Missing`** — the six Setup workflows' landing-level states have no per-card implementation anywhere, and even Home/Tasks hub's own Empty state is unverified, so no required portion of this criterion is a closed set |
 
 ### Criterion 6 — "Player, Guardian, Official, Viewer, League Admin, Arena Manager, and Coach journeys pass with correct authorization."
 
@@ -246,18 +247,20 @@ row.
 | Keyboard-only (manual pass) | `docs/product/manual-keyboard-screenreader-validation-protocol.md` (merged, PR #350, `e8c7d96`) — a **protocol and blank evidence template only**; the document's own Status section states no manual pass has been run under it. | n/a | Human-only, unperformed |
 | Screen-reader (manual pass) | Same protocol document as above; same caveat. | n/a | Human-only, unperformed |
 | WCAG 2.2 AA (automated) | **Yes.** `axe-core@^4.12.1` is a declared `devDependency` (`e2e/package.json:48`), and is now actively used. `e2e/shell-accessibility-coverage.js` (merged via PR #352, `91c5e2a`) loads `axe-core` and calls `axe.run(root, {resultTypes: ["violations"]})` across five shell surfaces (signed-out login, public schedule, staff sign-in transition, forced loading/error, restricted early-return), reporting zero serious/critical violations on all surfaces. Three production accessibility fixes were found and merged with the PR: color-contrast overrides for login/public screens, ARIA role + live-region semantics on error/status content, and focus management on persistent controls. The prior falsifiability blocker was resolved: the held route now resolves to a deliberately distinct stale fixture, the guard is verified load-bearing by temporarily disabling it and confirming test failure, and all 9/9 CI checks were green on merge (2026-07-27T11:26:59Z). `accessibility-foundations.js` (merged, pre-#345) covers skip-link, per-view titles, and dialog focus/containment as a *subset* of WCAG 2.2 AA. | Five shell surfaces verified merged; six Setup workflow landings and Home/Tasks hub itself still have no axe scanning (pending broader accessibility work) |
-| Zero-console-error | **Verified inventory, not an assumed convention.** Of the 35 files under `e2e/*.js` that are real Playwright browser journeys (`require("playwright")` present), **34 install both `page.on("pageerror", ...)` and `page.on("console", ...)` tracking** (confirmed by `grep -c` across every file, e.g. `accessibility-foundations.js`, `home-tasks-hub.js`, `role-home-journeys.js`). The one exception, `api-error-resilience.js`, installs `pageerror` tracking only, by design — it deliberately provokes 401/403/502 responses and does not assert a zero-console-error bar for itself. The six other `e2e/*.js` files (`breakpoint-contract.js`, `check-v1-route-contract.js`, `ci-classify.js`/`.test.js`/`.integration.test.js`, `season-fmt-unit.js`) are static/unit checks, not browser journeys, and are correctly outside this claim's scope. | Same tracking convention continued in the browser journeys added by all four active PRs. | Verified for 34/35 merged browser journeys as a baseline convention; not yet a completion claim for the whole redesign, most of which isn't merged |
+| Zero-console-error | **Verified inventory, not an assumed convention.** Of the 35 files under `e2e/*.js` that are real Playwright browser journeys (`require("playwright")` present), **34 install both `page.on("pageerror", ...)` and `page.on("console", ...)` tracking** (confirmed by `grep -c` across every file, e.g. `accessibility-foundations.js`, `home-tasks-hub.js`, `role-home-journeys.js`). The one exception, `api-error-resilience.js`, installs `pageerror` tracking only, by design — it deliberately provokes 401/403/502 responses and does not assert a zero-console-error bar for itself. The six other `e2e/*.js` files (`breakpoint-contract.js`, `check-v1-route-contract.js`, `ci-classify.js`/`.test.js`/`.integration.test.js`, `season-fmt-unit.js`) are static/unit checks, not browser journeys, and are correctly outside this claim's scope. | Same tracking convention continued in the merged journeys (#347, #352, #353). | Verified for 34/35 merged browser journeys as a baseline convention; not yet a completion claim for the whole redesign, most of which isn't merged |
 
 **Overall status for Criterion 7: `Missing`.** Two of its six required
 evidence types (keyboard-only and screen-reader manual passes) have zero
 human evidence and cannot be produced by merging any PR — that alone means
 a required portion of this criterion has no evidence at all, which is
 decisive per the status rule above regardless of how much of the rest is
-merged or pending. Separately, neither of the two code-completable
-sub-items currently in an active PR (breakpoint-boundary via #354, WCAG via
-#352) is itself merge-ready: both have open, unresolved review blockers on
-their exact heads (see rows above), so even the automatable two-thirds of
-this criterion is not "one active PR away" from done.
+merged or pending. The WCAG 2.2 AA (automated) sub-item is now merged via
+#352 (`91c5e2a`), but the scope is limited to five shell surfaces only —
+the six Setup workflow landings and Home/Tasks hub itself lack axe scanning,
+tracked under #359 (broader automated axe coverage). The breakpoint-boundary
+sub-item (#354) remains unmerged and conflicting, still duplicating
+already-merged #351 work. Manual keyboard and screen-reader evidence are
+unperformed and tracked under #359.
 
 ### Criterion 8 — "All three moderated operator-validation sessions are completed and documented."
 
@@ -374,19 +377,21 @@ to paper over an unimplemented state.
 
 ## Stale or contradictory claims found (called out, not silently reconciled)
 
-1. **PR #354's Test Plan checkmarks are local-only, not exact-head CI evidence, and its branch cannot currently merge cleanly.** The PR body checks off `npm run check-breakpoint-contract` and `npm run breakpoint-boundaries` as passing, but its exact head has zero CI check-runs, and `gh pr view 354` reports `mergeable: CONFLICTING`, `mergeStateStatus: DIRTY` against current `main`. Treat this PR's evidence as unverified by CI and currently blocked, not as ready-to-merge "pending" evidence on the same footing as #347/#352/#353. (Re-confirmed still true at this revision's snapshot time — #354 has not moved.)
-2. **`axe-core` has been a declared dependency in `e2e/package.json` since before this audit, but no merged journey calls it.** A reader could reasonably assume the dependency's presence means automated WCAG scanning already runs somewhere on `main` — it does not; the only caller is PR #352's new, unmerged `shell-accessibility-coverage.js`.
-3. **`e2e/coach-scope.js` is a real, merged, passing journey, but it does not test what its name might suggest to a reviewer scanning file names for "Coach coverage."** It tests the *admin-side* account-scoping mechanism (does creating a Coach account correctly require/attach a Team), not the Coach role's own sign-in/landing/authorization journey — that gap is what PR #353 fills.
+1. **PR #354's Test Plan checkmarks are local-only, not exact-head CI evidence, and its branch cannot currently merge cleanly.** The PR body checks off `npm run check-breakpoint-contract` and `npm run breakpoint-boundaries` as passing, but its exact head has zero CI check-runs, and `gh pr view 354` reports `mergeable: CONFLICTING`, `mergeStateStatus: DIRTY` against current `main`. Treat this PR's evidence as unverified by CI and currently blocked. #354 duplicates already-merged #351's canonical guard rather than extending it, and remains unmerged as of this snapshot.
+2. **Outdated: `axe-core` dependency claim.** Earlier snapshots noted that `axe-core` was a declared dependency but not called by any merged journey. `e2e/shell-accessibility-coverage.js` (merged via #352, `91c5e2a`) now actively calls `axe.run()` across five shell surfaces. The broader axe gate for Setup landings/Home/Tasks remains unmerged and is tracked under #359.
 4. **`ROADMAP.md`'s "Currently active sequencing" section still describes #345 as one undifferentiated deliverable** ("guided Setup, seven-area IA, accessibility, and operator validation completion (#345)") and does not yet reflect the batch split now visible across #347/#349/#350/#351/#352/#353/#354. This is not necessarily wrong (the batches are all still "part of #345"), but a reader relying on `ROADMAP.md` alone would not learn that #345 has already been split into seven-plus tracked pieces, three of them merged. Flagged for the owner's awareness; not fixed here per this task's scope boundary (`ROADMAP.md` is explicitly out of scope for this PR).
 
-**Superseded finding, removed from the list above per the freshness
-review**: Round 1 of this ledger listed "PR #347 is based on an older
-`main` commit (`4279ca4`)" as a stale claim. #347 has since advanced to
-`746c823e4` and rebased onto current `main` (`49d662a`) in the same push
-that fixed its Division write blocker — that finding is no longer true and
-is removed rather than left as a now-false statement in a "stale claims"
-list, which would itself become another stale claim. This is exactly the
-kind of drift the freshness rule above exists to catch.
+**Superseded findings removed from the stale claims list**: 
+- Round 2 listed "PR #347 is based on an older `main` commit" — #347 has 
+  since merged, so base-branch staleness no longer applies.
+- Earlier snapshots called #352/#353 unmerged with open blockers — both are 
+  now merged with all cited blockers resolved. Do not read obsolete PR heads 
+  (`746c823e4`, `f2a0e554`, `057e9e8`) as current in non-history sections of 
+  this document.
+
+These false statements are removed rather than kept in a "stale claims" list, 
+which would itself become another false claim when it outdates. The freshness 
+rule above exists to catch exactly this kind of drift.
 
 ---
 
@@ -423,10 +428,26 @@ evidence.
 
 ---
 
+## Planned/open tracking issues (not completion evidence)
+
+The following issues track remaining work as of this snapshot. They are
+recorded for roadmap visibility only, never as implementation evidence:
+
+- **#357**: Refresh PR #355's acceptance ledger after merges (this task)
+- **#358**: Seven-area information architecture IA and navigation restructure
+- **#359**: Broader automated WCAG coverage (axe-core across all affected surfaces)
+- **#360**: League-context HTTP transport and context-bar UI integration
+
+None of these have merged implementation. Criterion 3, 4 (UI portion), 5, 7
+(manual passes and broader axe), 8, and #354's remaining breakpoint work are
+all mapped to these tracked issues or remain explicitly unaddressed.
+
+---
+
 ## Snapshot semantics
 
 This ledger is a **timestamped snapshot** of #345's acceptance state as of
-`2026-07-27T13:15:00Z`, based on `main` @ `9447bb6`. It is accurate for
+`2026-07-27T13:45:00Z`, based on `main` @ `9447bb6`. It is accurate for
 that exact SHA and time only.
 
 **#345's issue checklist and current GitHub state remain authoritative for
@@ -434,10 +455,10 @@ later merge readiness.** If any of the following occur after this snapshot,
 this document's status values become stale:
 
 - #354 (Breakpoint consolidation) advances, is rebased, or is merged.
+- Issues #357–#360 advance or are closed without the implementation they track.
 - New active PRs are opened for #345 work.
 - The seven acceptance boxes on #345's issue body are modified.
-- Other cited merge commits or PRs are force-pushed or revert their
-  changes.
+- Other cited merge commits or PRs are force-pushed or revert their changes.
 
 Do not treat a stale snapshot as authoritative for merge gates. Instead,
 re-read the live GitHub state and refresh this document before relying on
