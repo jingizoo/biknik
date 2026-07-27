@@ -436,7 +436,11 @@ render = async function renderWithInitialSetup() {
     }
   }
 
-  if (view === "onboarding") return renderInitialSetup();
+  // #345: this branch returns WITHOUT calling the base render(), which is
+  // where the per-view page title is normally set -- so the title has to be
+  // set here too, or landing on Initial Setup (what a fresh Program actually
+  // does) leaves the static index.html title in place and announces nothing.
+  if (view === "onboarding") { setPageTitle(view); return renderInitialSetup(); }
   const result = await onboardingBaseRender();
   if (currentUser && hasPerm("manage_setup")) {
     if (onboardingStatusDirty || !onboardingStatus) {

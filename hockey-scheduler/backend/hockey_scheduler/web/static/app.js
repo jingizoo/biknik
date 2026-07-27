@@ -221,6 +221,11 @@ const NAV = {
   notifications: "Notifications", delivery: "Delivery", activity: "Activity",
   public: "Public", users: "Users", scheduler: "Scheduler", import: "Import",
   readiness: "Pilot Readiness", player_home: "Home", guardian_home: "My Players",
+  // #345: "onboarding" is a real destination (the #174 Initial Setup wizard,
+  // and the view a fresh Program actually LANDS on) but had no NAV entry, so
+  // it had neither a topbar heading nor -- once titles existed -- a page
+  // title. Label matches its sidebar button.
+  onboarding: "Initial Setup",
 };
 const POS_CLASS = { goalie: "pos-G", defense: "pos-D", forward: "pos-F", skater: "pos-D" };
 const REPO = "https://github.com/jingizoo/biknik/issues";
@@ -1627,7 +1632,7 @@ function playerActiveModalHtml(m) {
 
 function modalShell(kind, title, body, foot) {
   return `<div class="modal-scrim" data-modal-close></div>
-    <div class="modal ${kind}" role="dialog" aria-modal="true" aria-label="${esc(title)}">
+    <div class="modal ${kind}" role="dialog" aria-modal="true" tabindex="-1" aria-label="${esc(title)}">
       <header class="modal-head"><h2>${esc(title)}</h2>
         <button class="modal-x" data-modal-close aria-label="Close">×</button></header>
       <div class="modal-body">${body}</div>
@@ -2896,8 +2901,13 @@ function renderDrawer(sv) {
   // submit (an edit's parents already exist).
   const blocked = !editing && ent.fields.some(
     (f) => f.type === "select" && f.required && !f.options(sv).length);
+  // tabindex="-1" (#345): makes the dialog CONTAINER programmatically
+  // focusable so opening it can land focus on the dialog itself -- announcing
+  // its role and accessible name -- instead of jumping straight into a form
+  // control. -1 keeps it out of the sequential tab order, and
+  // overlayFocusables() ignores tabindex="-1", so it never becomes a Tab stop.
   return `<div class="drawer-scrim" data-drawer-close></div>
-    <aside class="drawer" role="dialog" aria-modal="true" aria-label="${heading}">
+    <aside class="drawer" role="dialog" aria-modal="true" tabindex="-1" aria-label="${heading}">
       <header class="drawer-head"><span class="drawer-ico">${ent.icon}</span>
         <span class="drawer-title">${heading}</span>
         <button class="drawer-x" data-drawer-close aria-label="Close">×</button></header>
@@ -6055,6 +6065,11 @@ async function render() {
   updateToast();
   const c = document.getElementById("content");
   document.body.dataset.view = view;
+  // #345 review: set BEFORE the awaited overview load and before either
+  // early return below (backend-error banner, restricted roster/sheet), so an
+  // error or restricted state still announces the destination the user chose
+  // rather than the previous view's title.
+  setPageTitle(view);
   let ov, sv, hv, board, lineups, standings, inbox, playerHome;
   try {
     c.innerHTML = `<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>`;
@@ -6786,10 +6801,18 @@ async function render() {
       await render();
     };
   }
-  if (drawer) {
-    const first = c.querySelector(".drawer-body input, .drawer-body select");
-    if (first) first.focus();
-  }
+  // (#345) The unconditional `if (drawer) { firstField.focus(); }` that used
+  // to live here has moved into syncOverlayFocus(), which is now the SINGLE
+  // owner of dialog focus. Two reasons it could not stay:
+  //   * it re-focused on EVERY render, not on open. render() rewrites
+  //     #content wholesale, so an open drawer re-runs this on any state
+  //     change -- dragging focus back to field 1 out from under an operator
+  //     who had tabbed to field 4, and firing focus/blur/change on a
+  //     data-bound input each time;
+  //   * two independent focus owners race, and whichever runs last wins.
+  // syncOverlayFocus() targets the dialog CONTAINER instead of a form
+  // control, and only on the closed -> open transition (or to re-anchor
+  // focus a re-render orphaned), so neither problem survives.
   c.querySelectorAll("button[data-act]").forEach((b) => b.onclick = () => rosterAction(b.dataset.act, b.dataset.id));
   c.querySelectorAll(".seg[data-view]").forEach((b) => b.onclick = () => { gameView = b.dataset.view; toast = ""; render(); });
   c.querySelectorAll("[data-side]").forEach((b) => b.onclick = () => { rosterSide = b.dataset.side; toast = ""; render(); });
@@ -7869,7 +7892,285 @@ async function render() {
     if (res && !res.error) { toast = wizard.exhibition ? "Exhibition game scheduled." : "Game scheduled."; currentGame = res.id; wizard = null; view = "games"; }
     render();
   };
+  // #345: last thing every render does -- after ALL wiring above, so the
+  // dialog's controls exist and are bound before focus lands on one. Also
+  // handles the close half: when the render that just ran removed the
+  // dialog, focus returns to whatever opened it.
+  syncOverlayFocus();
 }
+
+// Per-view page title (#345). A single-page app never reloads, so without
+// this every view reports the same static <title> -- screen-reader users get
+// no announcement that the destination changed, and browser history/tab
+// labels are useless. Format is "<View> — Hockey Scheduler": the view first,
+// because assistive tech announces the beginning of the title and that is
+// the part that actually changed.
+const APP_TITLE = "Hockey Scheduler";
+// #345 review: the title must follow the surface that is actually VISIBLE,
+// not just the authenticated view. There are three shell states -- the
+// authenticated console, the sign-in card, and the anonymous public portal --
+// and only the first has a NAV view at all. Coupling the title to a
+// successful authenticated render() left "Initial Setup — Hockey Scheduler"
+// on screen after Sign out and on the public portal (reproduced), so
+// assistive tech announced a destination the user had already left.
+// Each shell entry point sets its own title SYNCHRONOUSLY, before any awaited
+// load or early return.
+function setShellTitle(state, v) {
+  if (state === "login") { document.title = `Sign in — ${APP_TITLE}`; return; }
+  if (state === "public") {
+    document.title = `Public Schedule — ${APP_TITLE}`;
+    return;
+  }
+  const label = NAV[v];
+  document.title = label ? `${label} — ${APP_TITLE}` : APP_TITLE;
+}
+function setPageTitle(v) { setShellTitle("app", v); }
+
+// ---- dialog focus management (#345) --------------------------------------
+// The modal/drawer markup already carries role="dialog" aria-modal="true",
+// but aria-modal alone does NOT constrain the keyboard -- browsers still tab
+// out into the page behind. These three pieces complete the contract:
+// remember what opened the dialog, move focus into it, cycle Tab inside it,
+// and put focus back where it came from on close.
+const OVERLAY_SEL = ".modal, .drawer";
+const FOCUSABLE_SEL = [
+  "a[href]", "button:not([disabled])", "input:not([disabled])",
+  "select:not([disabled])", "textarea:not([disabled])",
+  '[tabindex]:not([tabindex="-1"])',
+].join(",");
+
+function openOverlayElement() {
+  // The LAST match wins: renderModal() is appended after the drawer, so a
+  // confirm modal opened on top of a drawer is the one that owns focus.
+  const all = document.querySelectorAll(OVERLAY_SEL);
+  return all.length ? all[all.length - 1] : null;
+}
+
+function overlayFocusables(root) {
+  return Array.from(root.querySelectorAll(FOCUSABLE_SEL)).filter((el) =>
+    // offsetParent is null for display:none subtrees; a zero-size box is
+    // also unreachable in practice. Cheaper and more reliable here than
+    // checking computed visibility on every candidate.
+    el.offsetParent !== null || el.getClientRects().length > 0);
+}
+
+// #345 focus lifecycle. The earlier attempt in this PR focused the dialog's
+// first CONTROL from every render, which on these forms is a data-bound input
+// -- the resulting focus/blur/change events destabilised the held-response
+// journeys in home-tasks-hub.js. This version follows the reviewed shape and
+// avoids that entirely:
+//   * the trigger is captured BEFORE state mutation, by a capture-phase
+//     listener that runs ahead of the opener's own click handler;
+//   * each open dialog has a logical INSTANCE KEY derived from app state
+//     (not from the DOM node, which innerHTML replaces on every render);
+//   * focus moves ONCE per instance, onto the dialog CONTAINER
+//     (tabindex="-1") -- never onto a form control, so no change events;
+//   * the queued frame re-checks the key, so a dialog that closed or changed
+//     before the frame ran never steals focus;
+//   * on close, focus returns once to the captured trigger if it is still
+//     connected and visible, otherwise to the view-level fallback.
+let overlayFocusedKey = null;      // instance key we have already focused
+let overlayReturnFocus = null;     // element to restore to on close
+let overlayReturnSelector = null;  // ...and how to re-find it after a re-render
+let overlayFocusQueued = false;    // a frame is already pending
+
+// Last element the user activated OUTSIDE any dialog. Capture phase, so it
+// records the trigger before the opener's handler mutates `drawer`/`modal`.
+let lastActivatedTrigger = null;
+function noteTrigger(el) {
+  if (el && el.closest && !el.closest(OVERLAY_SEL)) lastActivatedTrigger = el;
+}
+document.addEventListener("pointerdown", (e) => {
+  const el = e.target && e.target.closest
+    && e.target.closest("button, a[href], [role=\"button\"], input, select");
+  noteTrigger(el);
+}, true);
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter" && e.key !== " ") return;
+  noteTrigger(document.activeElement);
+}, true);
+
+// Logical identity of the topmost open dialog. Derived from state so it is
+// stable across the re-renders that replace the DOM node, and distinct for a
+// modal opened OVER a drawer (renderModal is appended after renderDrawer, so
+// the modal is topmost in both this key and openOverlayElement()).
+function overlayKey() {
+  if (modal) return `modal:${modal.type || ""}:${modal.id || ""}`;
+  if (drawer) {
+    return `drawer:${drawer.kind || ""}:${drawer.mode || ""}:${drawer.id || ""}`;
+  }
+  return null;
+}
+
+function isUsableTarget(el) {
+  return !!(el && el.isConnected && typeof el.focus === "function"
+    && (el.offsetParent !== null || el.getClientRects().length > 0));
+}
+
+// A selector that can re-find the trigger after a re-render.
+//
+// Holding the element alone is not enough. render() rewrites #content
+// wholesale, so any trigger INSIDE the view -- a Setup card's "+ New", a
+// row's delete control, a hub card's action -- is destroyed by the very
+// render that paints the dialog. By the time the dialog closes the captured
+// node is detached, so restore would fall through to the view heading for
+// every in-view trigger and only ever really work for the topbar/sidebar
+// controls that live outside #content. Triggers here are identified by id or
+// by stable data-* attributes, so rebuild a selector from those.
+//
+// Attribute form for the id too (rather than "#id") so one escaping rule
+// covers every case and no CSS.escape dependency is needed.
+function triggerSelector(el) {
+  if (!el || !el.tagName || !el.attributes) return null;
+  const q = (v) => String(v).replace(/["\\]/g, "\\$&");
+  const tag = el.tagName.toLowerCase();
+  if (el.id) return `${tag}[id="${q(el.id)}"]`;
+  const parts = [];
+  for (let i = 0; i < el.attributes.length; i += 1) {
+    const a = el.attributes[i];
+    if (a.name.slice(0, 5) !== "data-") continue;
+    parts.push(`[${a.name}="${q(a.value)}"]`);
+  }
+  return parts.length ? tag + parts.join("") : null;
+}
+
+// Prefer the original node when it survived; otherwise re-resolve the
+// selector. A UNIQUE match is required: an ambiguous selector could land
+// focus on a different row's control, which is worse than falling back to
+// the view heading.
+function resolveReturnFocus() {
+  if (isUsableTarget(overlayReturnFocus)) return overlayReturnFocus;
+  if (!overlayReturnSelector) return null;
+  let matches;
+  try {
+    matches = document.querySelectorAll(overlayReturnSelector);
+  } catch (err) {
+    return null;  // an attribute value we failed to escape
+  }
+  if (matches.length !== 1) return null;
+  return isUsableTarget(matches[0]) ? matches[0] : null;
+}
+
+// True when nothing meaningful holds focus: no activeElement, <body> (where
+// the browser parks focus after the focused node is removed from the
+// document), or a node that has since been detached.
+//
+// This is the whole basis for telling "the render orphaned focus" apart from
+// "focus is deliberately somewhere else". render() rewrites #content
+// wholesale on every pass, so an OPEN dialog's container is destroyed and
+// rebuilt each time and focus falls back to <body> -- that case must be
+// re-anchored or the dialog silently loses the keyboard. But when something
+// real still holds focus (an operator typing in a drawer field, or the
+// #ctx-select whose own change dismissed the drawer) moving it would be the
+// bug, not the fix.
+function focusIsOrphaned() {
+  const a = document.activeElement;
+  return !a || a === document.body || !a.isConnected;
+}
+
+// Focus the dialog CONTAINER, never a control inside it. The container
+// carries tabindex="-1" from its markup; the setAttribute is a cheap
+// belt-and-braces for any overlay that lacks it.
+function focusOverlayContainer(overlay, key) {
+  overlayFocusedKey = key;
+  overlay.setAttribute("tabindex", "-1");
+  overlay.focus();
+}
+
+function syncOverlayFocus() {
+  const key = overlayKey();
+  if (!key) {
+    // Closed. Restore once, then clear.
+    if (overlayFocusedKey) {
+      // Resolve BEFORE clearing -- resolveReturnFocus() reads both fields.
+      const back = resolveReturnFocus();
+      overlayFocusedKey = null;
+      overlayReturnFocus = null;
+      overlayReturnSelector = null;
+      // Only when the close actually orphaned focus. A context switch that
+      // dismisses an open drawer from the #ctx-select the operator is still
+      // sitting on must leave them there -- yanking focus back to the stale
+      // trigger that opened the now-irrelevant drawer would strand them
+      // somewhere they never navigated to.
+      if (focusIsOrphaned()) {
+        // A trigger removed by the very action that closed the dialog
+        // (delete/confirm flows) is not restorable -- fall back to the view's
+        // own heading rather than leaving focus on <body>.
+        if (back) back.focus();
+        else focusContentHeading();
+      }
+    }
+    return;
+  }
+  if (key === overlayFocusedKey) {
+    // Same dialog instance, already focused once. The render that just ran
+    // replaced its container node, so if focus was on the dialog (or on any
+    // control inside it) it is now on <body>. Re-anchor to the rebuilt
+    // container -- this is not a second "focus on open", it is keeping the
+    // position the open transition already established. Still the container
+    // and never a form control, so no focus/blur/change reaches a data-bound
+    // input. Focus that is genuinely elsewhere is left untouched.
+    if (focusIsOrphaned()) {
+      const overlay = openOverlayElement();
+      if (overlay) focusOverlayContainer(overlay, key);
+    }
+    return;
+  }
+  // Capture the return target only for the OUTERMOST open, so a modal opened
+  // over a drawer still restores to whatever opened the drawer. Closing that
+  // modal leaves the drawer open, which reads here as a new instance key and
+  // lands focus back on the drawer container.
+  if (!overlayFocusedKey) {
+    overlayReturnFocus = lastActivatedTrigger;
+    overlayReturnSelector = triggerSelector(lastActivatedTrigger);
+  }
+  if (overlayFocusQueued) return;
+  overlayFocusQueued = true;
+  requestAnimationFrame(() => {
+    overlayFocusQueued = false;
+    // Re-check at fire time: the dialog may have closed or been replaced
+    // between queueing and running.
+    const nowKey = overlayKey();
+    if (!nowKey || nowKey === overlayFocusedKey) return;
+    const overlay = openOverlayElement();
+    if (!overlay) return;
+    focusOverlayContainer(overlay, nowKey);
+  });
+}
+
+// Tab/Shift+Tab cycle within the open dialog.
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Tab") return;
+  const overlay = openOverlayElement();
+  if (!overlay) return;
+  const focusables = overlayFocusables(overlay);
+  if (!focusables.length) { e.preventDefault(); return; }
+  const first = focusables[0], last = focusables[focusables.length - 1];
+  // ENTRY BOUNDARY. Focus is not on one of the dialog's sequential stops --
+  // either it is outside the dialog entirely (the browser moved it there), or
+  // it is on the tabindex="-1" CONTAINER, which is where every open and every
+  // re-render re-anchor puts it and which overlayFocusables() deliberately
+  // excludes. Enter at the appropriate edge in both cases.
+  //
+  // The container case used to fall through to the wrap rules below, and they
+  // key off the first/last CONTROL, so neither ever matched and the event was
+  // left unprevented. Forward looked correct by accident -- native sequential
+  // navigation from a tabindex="-1" element goes to its first focusable
+  // descendant -- but BACKWARD walked to whatever preceded the container in
+  // the document, i.e. straight out of the dialog to the page behind it, on
+  // the very first keystroke after open. `overlay.contains()` did not catch
+  // it because Node.contains() is true for the node itself.
+  if (focusables.indexOf(document.activeElement) === -1) {
+    e.preventDefault();
+    (e.shiftKey ? last : first).focus();
+    return;
+  }
+  if (e.shiftKey && document.activeElement === first) {
+    e.preventDefault(); last.focus();
+  } else if (!e.shiftKey && document.activeElement === last) {
+    e.preventDefault(); first.focus();
+  }
+});
 
 function switchTab(next) {
   view = next; toast = ""; if (next !== "calendar") { wizard = null; conflict = null; movingGameId = null; pendingMove = null; iceBuilder = null; }
@@ -7882,6 +8183,7 @@ function switchTab(next) {
   // clears any open junior checkout confirm / opportunity detail.
   if (next !== "guardian_home") { gCheckout = null; gOpp = null; gOppDetail = null; }
   document.querySelectorAll(".tab").forEach((x) => x.classList.toggle("active", x.dataset.tab === next));
+  setPageTitle(next);
   render();
 }
 document.querySelectorAll(".tab").forEach((b) => b.onclick = () => switchTab(b.dataset.tab));
@@ -8551,6 +8853,9 @@ function setUser(user) {
 // the console shell so a signed-out visitor only ever sees the login card.
 function showLogin(message) {
   hidePublicGuest();
+  // #345 review: title follows the VISIBLE surface, set before anything else
+  // here can early-return or await.
+  setShellTitle("login");
   const screen = document.getElementById("login-screen");
   document.body.classList.add("signed-out");
   if (screen) screen.hidden = false;
@@ -8636,6 +8941,9 @@ function showPublicGuest() {
   // Same shell-hiding rule as showLogin(): body.signed-out keeps the
   // authenticated sidebar/nav out of the tab order and off-screen for
   // assistive tech, not just visually covered by the fixed overlay.
+  // #345 review: the title changes with the shell state, synchronously --
+  // renderPublicGuest() below is async and must not own this.
+  setShellTitle("public");
   document.body.classList.add("signed-out");
   const login = document.getElementById("login-screen");
   if (login) login.hidden = true;

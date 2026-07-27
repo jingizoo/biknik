@@ -7,6 +7,7 @@
     "context-switcher": "node context-switcher.js",
     "setup-claim": "node setup-claim.js",
     "onboarding-wizard": "node onboarding-wizard.js",
+    "accessibility-foundations": "node accessibility-foundations.js",
     "home-tasks-hub": "node home-tasks-hub.js",
     "role-home-journeys": "node role-home-journeys.js",
     "hierarchy-import": "node hierarchy-import.js",

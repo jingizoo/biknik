@@ -10,6 +10,23 @@
 </head>
 <body class="web-body">
   <div class="web">
+    <!-- Skip to content (#345): the first focusable element inside the
+         AUTHENTICATED shell, so a keyboard or screen-reader user can bypass
+         the whole sidebar nav instead of tabbing through every destination on
+         every view. Visually hidden until focused (see .skip-link in
+         web.css). Targets the #content region rather than <main>, because
+         #content is what each view actually repaints.
+
+         #345 review: deliberately INSIDE .web. It used to sit outside, but
+         `body.signed-out .web { display: none }` hides only the authenticated
+         shell -- so on the sign-in card and the anonymous public portal the
+         link stayed focusable and announced while its #content target was
+         hidden, offering a bypass that could not reach the visible content.
+         Living inside .web makes the link's visibility and tab-order state
+         change atomically with the target it points at. Neither the sign-in
+         card nor the public portal has repeated navigation to bypass, so
+         neither needs its own skip link. -->
+    <a class="skip-link" href="#content" id="skip-link">Skip to main content</a>
     <aside class="sidebar">
       <div class="brand">
         <span class="brand-mark" aria-hidden="true">H</span>
@@ -107,7 +124,12 @@
           </div>
         </div>
       </header>
-      <div id="content" class="content"></div>
+      <!-- tabindex="-1" (#345): a fragment link only moves FOCUS to its
+           target if that target is focusable. Without this the skip link
+           scrolls the page but leaves focus on <body>, so the next Tab
+           starts from the top of the sidebar again and the link achieves
+           nothing for a keyboard user. Not in the tab order (-1). -->
+      <div id="content" class="content" tabindex="-1"></div>
     </main>
   </div>
 
