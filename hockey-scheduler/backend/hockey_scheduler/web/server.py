@@ -3036,7 +3036,7 @@ class Handler(BaseHTTPRequestHandler):
                 return _required_error("A league_id is required.")
             return self._send_api(api.create_division_v2(
                 b.get("league_id"), b.get("name"), b.get("age_group", ""),
-                b.get("season_id") or None, actor_id))
+                actor_id, season_id=b.get("season_id") or None))
         if entity == "club":
             return self._send_api(api.create_club(
                 b.get("name"), b.get("country", ""), actor_id))

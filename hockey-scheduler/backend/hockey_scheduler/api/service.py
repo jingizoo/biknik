@@ -4773,14 +4773,17 @@ class ApiService:
 
     @catch
     def create_division_v2(self, league_id: str, name: str, age_group: str = "",
-                           season_id: Optional[str] = None,
-                           actor_id: Optional[str] = None) -> dict:
+                           actor_id: Optional[str] = None, *,
+                           season_id: Optional[str] = None) -> dict:
         """Canonical v2 division create (#233 Slice C2): parented by a grouping
         League (REQUIRED); Season is derived from the league, unless the
         optional ``season_id`` (#345) selects one exact binding for a League
-        bound to several Seasons."""
+        bound to several Seasons. ``season_id`` is keyword-only, added AFTER
+        ``actor_id`` in the existing (league_id, name, age_group, actor_id)
+        order -- a legacy positional caller's fourth argument must stay the
+        actor, never silently become a Season id."""
         return self._division_dict(self.setup.create_division_under_league(
-            league_id, name, age_group, season_id, actor_id))
+            league_id, name, age_group, actor_id, season_id=season_id))
 
     @catch
     def create_club(self, name: str, country: str = "",

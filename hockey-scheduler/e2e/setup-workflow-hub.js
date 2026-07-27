@@ -380,10 +380,22 @@ async function checkViewport(browser, viewport) {
     }, [fx.s1, fx.s2]);
     if (shared.error) fail(`[${L}] ${shared.error}`);
 
+    // #345 review: this leg's own required evidence is keyboard-open/submit,
+    // not just mouse activation -- opening the workflow landing, opening the
+    // Division action, and submitting the drawer are each a real DOM
+    // <button> (see app.js's data-setup-workflow/-act/-drawer-submit
+    // markup), so each is focused directly and activated with a real
+    // keydown, matching the same focus()-then-Enter shape already used for
+    // "keyboard-submit its focused row" elsewhere in this suite
+    // (home-tasks-hub.js). Only the <select>'s own option choice keeps
+    // page.selectOption -- the established way this suite already drives a
+    // <select> without a mouse (same file, same convention).
     await openSetupHub(page, `${L}/persist-division-shared-league`);
-    await page.click('[data-setup-workflow="participation"]');
+    await page.focus('[data-setup-workflow="participation"]');
+    await page.keyboard.press("Enter");
     await page.waitForSelector(".swf-landing", { timeout: 10000 });
-    await page.click('[data-setup-workflow-act="division"]');
+    await page.focus('[data-setup-workflow-act="division"]');
+    await page.keyboard.press("Enter");
     await page.waitForSelector("#f-div-league", { timeout: 10000 }).catch(() => fail(
       `[${L}] the Divisions action did not open its drawer for the `
       + `shared-league case`));
@@ -395,7 +407,8 @@ async function checkViewport(browser, viewport) {
     await page.fill("#f-div", "Shared-League Division");
     const sharedResp = page.waitForResponse((r) =>
       r.url().includes("/api/v2/setup/division") && r.request().method() === "POST");
-    await page.click('[data-drawer-submit="division"]');
+    await page.focus('[data-drawer-submit="division"]');
+    await page.keyboard.press("Enter");
     const sharedCreated = await (await sharedResp).json();
     if (sharedCreated.error) {
       fail(`[${L}] shared-league division create failed: `

@@ -163,6 +163,38 @@ class DivisionSeasonBindingContract:
         ls = self.store.get_league_season(div.league_season_id)
         self.assertEqual(ls.season_id, season["id"])
 
+    # -- legacy POSITIONAL callers must keep working unchanged (review) -----
+    # season_id was added AFTER actor_id (keyword-only) specifically so a
+    # caller passing all four positional args -- (league_id, name, age_group,
+    # actor_id), the shape every pre-existing caller in this repo already
+    # used before this batch -- can never have its actor_id silently
+    # reinterpreted as a Season id.
+    def test_legacy_four_positional_args_setup_service(self):
+        prog = self.api.create_program("Pos Prog", "US", "UTC")
+        season = self.api.create_season(prog["id"], "Pos S")
+        league = self.api.create_league(season["id"], "Pos League")
+        div = self.api.setup.create_division_under_league(
+            league["id"], "Gold", "U14", "positional-actor")
+        ls = self.store.get_league_season(div.league_season_id)
+        self.assertEqual(ls.season_id, season["id"])
+        self.assertEqual(div.age_group, "U14")
+        audits = [a for a in self.store.all_setup_audit()
+                  if a.entity_id == div.id and a.action == "division_created"]
+        self.assertEqual(len(audits), 1)
+        self.assertEqual(audits[0].actor_id, "positional-actor")
+
+    def test_legacy_four_positional_args_api_facade(self):
+        prog = self.api.create_program("Pos Prog 2", "US", "UTC")
+        season = self.api.create_season(prog["id"], "Pos S2")
+        league = self.api.create_league(season["id"], "Pos League 2")
+        resp = self.api.create_division_v2(
+            league["id"], "Gold", "U16", "positional-actor-2")
+        self.assertEqual(resp["season_id"], season["id"])
+        audits = [a for a in self.store.all_setup_audit()
+                  if a.entity_id == resp["id"] and a.action == "division_created"]
+        self.assertEqual(len(audits), 1)
+        self.assertEqual(audits[0].actor_id, "positional-actor-2")
+
 
 class MemoryDivisionSeasonBindingTest(DivisionSeasonBindingContract, unittest.TestCase):
     def make_store(self):

@@ -982,8 +982,8 @@ class SetupService:
     @_transactional
     def create_division_under_league(self, league_id: str, name: str,
                                      age_group: str = "",
-                                     season_id: Optional[str] = None,
-                                     actor_id: Optional[str] = None) -> Division:
+                                     actor_id: Optional[str] = None, *,
+                                     season_id: Optional[str] = None) -> Division:
         """Create a Division under a permanent League (#283 back-compat, v2).
 
         Without ``season_id`` (legacy/back-compat, unchanged): the League
