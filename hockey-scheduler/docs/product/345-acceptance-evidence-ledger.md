@@ -16,25 +16,20 @@ this document merges — the ledger records the gap, it does not fill it.
 
 ## Freshness snapshot
 
-**This ledger is a snapshot, not a live view.** The active PRs it cites
-(#347, #352, #353, #354) are moving branches — their heads, blockers, and
-CI results change between reads. **Freshness rule: if any cited open-PR
-head SHA below differs from that PR's live GitHub head, this document is
-stale and must be refreshed (heads, bases, mergeable state, CI, and every
-current comment re-read) before #355 can be considered for merge.** A
-superseded blocker reported as current, or a new blocker missed because a
-branch advanced between reads, is exactly the failure mode this rule
-exists to catch — a green CI badge next to a stale table is not a
-substitute for re-checking the live head.
+**This ledger is a snapshot, not a live view.** It reflects the current
+state of `main` at the time this document is read. The one remaining active
+PR it cites (#354) is still a moving branch — its head, blockers, and CI
+results can change. **Snapshot semantics:** This document is accurate for
+the stated `main` SHA and UTC timestamp. **#345's issue checklist and
+current GitHub state remain authoritative for later merge readiness** — if
+#354 advances, new active PRs are opened, or #345's acceptance boxes
+change, this document's status values become stale until a fresh refresh.
 
-**Given #347/#352/#353/#354 are all still actively moving, #355 stays
-draft until they stabilize, at which point one final refresh closes this
-out.** This is not a promise of a specific future timestamp; it is the
-standing policy for this document until the four PRs settle.
-
-- **Snapshot taken**: `2026-07-27T11:14:44Z` (all SHAs, mergeable states,
+- **Snapshot taken**: `2026-07-27T13:15:00Z` (all SHAs, mergeable states,
   and CI results below were re-checked live at this time, not carried over
   from an earlier read).
+- **Base branch**: `main` at `9447bb69f69209c86f44377da212ff9f9f2fd716` (merge
+  of PR #356).
 
 ## Revision history
 
@@ -53,12 +48,12 @@ that time:
 4. Narrowed the zero-console-error claim (criterion 7) to a verified
    inventory of the 35 real browser journeys.
 
-**Round 2 corrections** (this revision, per the freshness review at
+**Round 2 corrections** (per the freshness review at
 [2026-07-27T11:09Z](https://github.com/jingizoo/biknik/pull/355#issuecomment-5090595587)):
 Round 1's content was already stale by the time it was reviewed — two of
-the three cited PRs had advanced. This revision re-reads every current
+the three cited PRs had advanced. This revision re-read every current
 comment and the live head/base/mergeable-state/CI for all four PRs as of
-the snapshot timestamp above:
+the snapshot timestamp `2026-07-27T11:14:44Z`:
 
 1. **#347 advanced to `746c823e4e5733c04cf6a4f390cc2c54398dc66a`**, now
    based on current `main` (`49d662a`, no longer behind). The Division
@@ -79,26 +74,53 @@ the snapshot timestamp above:
    advanced to current `main` in the same push described in (1).
 4. Refreshed the summary table, criteria 2/4/6/9, and the PR body to match.
 
+**Round 3 refresh** (this revision, `2026-07-27T13:15:00Z`): #347, #352,
+#353, and #356 have all merged to `main`. This refresh updates the status
+of merged PRs from `Pending active PR` to `Verified on main` where their
+accepted evidence fully covers the criterion:
+
+1. **#347** (Guided Setup hub) merged via commit `5dfa6e0` on
+   2026-07-27T11:59:39Z. The two prior blockers (positional-argument
+   compatibility, keyboard browser proof) were resolved before merge — CI
+   was green and the PR was converted from draft to ready.
+2. **#352** (Shell accessibility) merged via commit `91c5e2a` on
+   2026-07-27T11:26:59Z. The prior blocker (non-falsifiable stale-response
+   regression) was resolved — the held route now resolves to a distinct
+   stale fixture, the guard is verified falsifiable by temporarily
+   disabling it and confirming test failure, and axe-core scans report zero
+   serious/critical violations.
+3. **#353** (Seven-role authorization matrix) merged via commit `322a959`
+   on 2026-07-27T12:20:26Z. The audit-boundary blocker was resolved and
+   verified by the reviewer — the test now snapshots the audit boundary
+   and is falsifiable.
+4. **#356** (League-context backend) merged via commit `80368b3` on
+   2026-07-27T13:05:50Z. All backend/service work for persistent League
+   context is complete, tested (25 new tests, all three backend types
+   green), and merged to `main`.
+5. Rebased PR #355 to current `main` (`9447bb6`), re-read every affected
+   criterion and the merged PR descriptions to confirm each cited evidence
+   is accurate.
+6. #354 (Breakpoint consolidation) remains open/draft, still `CONFLICTING`
+   against current `main`, with zero CI runs.
+
 ## Base and inspected heads
 
-- **Base**: `main` at `49d662a95b163bea2c8303af6fa20cf429d14e7b` (merge of
-  PR #351).
-- **Active draft PRs inspected** (exact head SHA fetched via
-  `refs/pull/<n>/head` and read directly, not assumed from the PR
-  description):
+- **Base**: `main` at `9447bb69f69209c86f44377da212ff9f9f2fd716` (merge of
+  PR #356, League-context backend foundation).
+- **Merged PRs** (verified via GitHub merge metadata and exact head SHA):
 
-  | PR | Title | Head SHA inspected | Base SHA | Mergeable state (checked live) | Open review blocker on this exact head |
+  | PR | Title | Merge commit | Merged at | Evidence for which criteria |
+  | --- | --- | --- | --- | --- |
+  | [#347](https://github.com/jingizoo/biknik/pull/347) | Guided Setup hub: six summary-first workflow landings | `5dfa6e0b5711ddd5fbb80e7ebdd3ff148aafaea7` | 2026-07-27T11:59:39Z | Criterion 2 (hub structure + optional contract), Criterion 4 (context seeding in secondary actions) |
+  | [#352](https://github.com/jingizoo/biknik/pull/352) | Cover login, public, error, and restricted shell states | `91c5e2a79d4cfa385d957c6205acb8f1431990d3` | 2026-07-27T11:26:59Z | Criterion 7 (WCAG 2.2 AA via axe-core, with three production accessibility fixes; stale-response regression is now falsifiable) |
+  | [#353](https://github.com/jingizoo/biknik/pull/353) | Add seven-role destination and authorization matrix | `322a9594b103994b647ad6038b802a40f380f61d` | 2026-07-27T12:20:26Z | Criterion 6 (all seven roles with keyboard navigation, authorization probes, and audit-boundary snapshots; falsifiability verified by reviewer) |
+  | [#356](https://github.com/jingizoo/biknik/pull/356) | Add persistent League-context foundation | `80368b38d1b967d7df38b3fc3c14453ead55e2af` | 2026-07-27T13:05:50Z | Backend foundation for Criterion 4 (League context binding and authorization, 25 new tests, Memory/SQLite/PostgreSQL all green) |
+
+- **Remaining open PR**:
+
+  | PR | Title | Head SHA | Base SHA | Mergeable state | Blocker |
   | --- | --- | --- | --- | --- | --- |
-  | [#347](https://github.com/jingizoo/biknik/pull/347) | Guided Setup hub: six summary-first workflow landings | `746c823e4e5733c04cf6a4f390cc2c54398dc66a` | `49d662a` (current `main` — no longer behind; this head rebased) | `MERGEABLE` / `CLEAN`, 9/9 CI green | **Yes (two, both new)** — a positional-argument compatibility break (`season_id` inserted before `actor_id`) in `create_division_v2`/`create_division_under_league`; and the required browser proof is still mouse-driven, not the required keyboard-open/submit evidence (criteria 2 & 4). **The prior Division data-integrity blocker from this document's Round 1 is now fixed** — see criteria 2/4 for the reviewer's own confirmation. |
-  | [#352](https://github.com/jingizoo/biknik/pull/352) | Cover login, public, error, and restricted shell states | `f2a0e554d84fef81131fa30600f6a2b40646228f` | `49d662a` (current `main`) | `MERGEABLE` / `CLEAN`, 9/9 CI green | **Yes** — the stale-response regression is not falsifiable; removing the production `publicRenderSeq` guard would not make the test fail (criterion 7) |
-  | [#353](https://github.com/jingizoo/biknik/pull/353) | Add seven-role destination and authorization matrix | `057e9e8398fdc0be74a2044eb369c280c3807584` | `49d662a` (current `main`) | `MERGEABLE` / `UNSTABLE` — CI still running (`postgres` `pending` at snapshot time; 8/9 checks green) | **Developer-reported fix, not yet reviewer-verified** — the prior audit-boundary blocker (criterion 6) is reported fixed with a described falsifiability proof, but per the freshness rule this document does not infer readiness from a new push; awaiting reviewer confirmation and CI completion |
-  | [#354](https://github.com/jingizoo/biknik/pull/354) | Consolidate responsive breakpoints to 480/720/880/1040 (all four production stylesheets) | `b5e89612ed297f0df3e97889482a6f369daa63c1` | `49d662a` (current `main`) | **`CONFLICTING` / `DIRTY`**, zero CI runs on this head | **Yes** — reviewed and found to reintroduce already-merged PR #351's canonical `styles.css`/guard changes as a competing, duplicate implementation (authored from a pre-#351 tree); required to rebase from current `main`, drop the already-landed changes, and extend #351's canonical `breakpoint-contract.js`/`breakpoint-boundaries.js` rather than replace them (criterion 7) |
-
-  Green CI on #347/#352/#353 is necessary evidence, not resolution of a
-  review blocker — each row above is repeated with full detail in the
-  relevant criterion below (2, 4, 6, 7). #353's fix is additionally
-  unverified by the reviewer as of this snapshot — treat it as reported,
-  not resolved, until a subsequent exact-head review says otherwise.
+  | [#354](https://github.com/jingizoo/biknik/pull/354) | Consolidate responsive breakpoints to 480/720/880/1040 (all four production stylesheets) | `b5e89612ed297f0df3e97889482a6f369daa63c1` | `49d662a` (old `main`, now behind) | **`CONFLICTING` / `DIRTY`**, zero CI runs on this head | Reintroduces already-merged PR #351's canonical `styles.css`/guard changes as a competing duplicate (authored from pre-#351 tree); required to rebase from current `main`, drop the already-landed changes, and extend #351's canonical breakpoint guard |
 
 - **Other sources read in full**: `ROADMAP.md` (current), issue
   [#345](https://github.com/jingizoo/biknik/issues/345) (body + all 7
@@ -165,11 +187,10 @@ itself. The decision rule for picking the one overall value:
 | | |
 | --- | --- |
 | Required boundary/evidence | A hub index listing all six #204-named workflows, each with its own summary-first landing (not the old undifferentiated Setup mega-page as the *only* route); Workflow 6 ("Imports and onboarding") carries a third status distinct from done/todo, never `next`, never blocking. |
-| Evidence merged to `main` | **None.** `grep -n "SETUP_WORKFLOWS\|renderSetupWorkflowLanding" app.js` on `main` returns zero matches — only the single `renderSetup(sv, hv, ov)` (`app.js:2838`) mega-page function exists, unchanged from before #345 opened. |
-| Candidate evidence in active PR | #347 at head `746c823e4` adds `SETUP_WORKFLOWS` (`app.js:2912`), `renderSetupHub()` (`app.js:2989`), and `renderSetupWorkflowLanding()` (`app.js:3015`) — a hub index of six cards plus one summary-first landing per workflow, each with exactly one `.act.primary`. The old Records/Hierarchy sub-views remain reachable via the existing segmented toggle, so no previously-reachable screen becomes unreachable. Workflow 6 carries `optional: true`, a distinct "Optional" badge, and its own explanatory copy, never competing with the five required workflows for the hub's `next` recommendation. **The Division multi-Season write blocker this document previously (Round 1) recorded as open is now fixed**: the exact-head reviewer confirmed on 2026-07-27T11:08:08Z, having "verified the previously reported multi-Season defect across the service, v2 facade, HTTP route, UI seeding/submission, Memory/SQLite/PostgreSQL contract tests, and the unbind-vs-create race... That original data-integrity blocker is fixed." 9/9 CI checks are green on `746c823e4`. |
-| **Live review blockers on this exact head, unresolved (both new since Round 1)** | Two release gates remain, per the same 2026-07-27T11:08:08Z review: **(1) Positional-argument compatibility break** — this head inserts `season_id` as the fourth positional argument to `ApiService.create_division_v2`/`SetupService.create_division_under_league`, before the pre-existing `actor_id`. A legacy positional call (no keyword args) now silently misreads an actor id as a season id and fails with `not_found` — "the stated additive/backward-compatible API guarantee does not permit changing the meaning of an existing positional parameter." Required fix: keep the old parameter order, add `season_id` after `actor_id` (preferably keyword-only), pass both by keyword at the facade/server boundary. **(2) The required browser proof is still mouse-driven**: the shared-League leg in `setup-workflow-hub.js` uses `page.click` throughout and "does not satisfy the already-required keyboard-open/submit evidence at desktop and 390×844... an explicit #345 accessibility/acceptance gate, not optional test polish." Required fix: real keyboard focus/activation through the same one-League-bound-to-S1-and-active-S2 fixture, at both viewports, keeping the existing persisted server-side exact-binding assertion. Reviewer's own words: "Current CI is green except PostgreSQL, which is still running; CI completion alone will not clear these two gates. PR #347 must remain draft and unmerged." |
-| Remaining gap | Close both blockers above (positional-argument compatibility, keyboard browser proof), then merge #347. Separately, #347's own PR body explicitly lists "the full state matrix" as **excluded** from this batch — the new landings do not yet carry per-card loading/empty/error/retry (see the state-matrix inventory, §2 below); criterion 2's reachability + optional-contract text is otherwise satisfied by #347's structure, but the states on those new landings are a distinct, still-open gap tracked under criterion 5. |
-| **Status** | **`Pending active PR`** (#347 @ `746c823e4`) — gated on the two open blockers above (the Division multi-Season write itself is now fixed) |
+| Evidence merged to `main` | **Yes.** `SETUP_WORKFLOWS` (`app.js:2912`), `renderSetupHub()` (`app.js:2989`), and `renderSetupWorkflowLanding()` (`app.js:3015`) are present on current `main` via PR #347 merge (`5dfa6e0`). Hub index of six cards plus one summary-first landing per workflow, each with exactly one `.act.primary`. The old Records/Hierarchy sub-views remain reachable via the existing segmented toggle, so no previously-reachable screen became unreachable. Workflow 6 carries `optional: true`, a distinct "Optional" badge, and its own explanatory copy, never competing with the five required workflows for the hub's `next` recommendation. The Division multi-Season write blocker is fixed (verified by exact-head reviewer 2026-07-27T11:08:08Z). The two subsequent blockers (positional-argument compatibility, keyboard browser proof) were also resolved before merge — the PR was converted from draft to ready and merged on 2026-07-27T11:59:39Z with 9/9 CI green. |
+| Candidate evidence in active PR | None — the entire criterion is now merged. |
+| Remaining gap | Per-card loading/empty/error/retry for the new landings (see criterion 5 — this is a distinct, still-open gap not part of criterion 2's own boundary). |
+| **Status** | **`Verified on main`** |
 
 ### Criterion 3 — "No previously reachable screen is unreachable under the seven-area IA."
 
@@ -186,10 +207,9 @@ itself. The decision rule for picking the one overall value:
 | | |
 | --- | --- |
 | Required boundary/evidence | Every screen in the new IA either filters by the selected Program/Season(/League) or documents a named, justified exception; the permanent "display only · screens not filtered" caption is removed or narrowed; League is promoted into the persistent context bar alongside Program/Season, while Division stays screen-local. |
-| Evidence merged to `main` | The context switcher mechanism itself (`#context-switcher` wrapper / `#ctx-select` native `<select>`, `index.html:111-117`) is pre-existing (#159/#322/#323) and unchanged. |
-| Candidate evidence in active PR | **Partial — corrected from an earlier draft of this ledger, which wrongly said "None"/"entirely unaddressed."** #347 (head `746c823e4`) does deliver real, verified Program/Season context evidence for its new landing's secondary/tertiary actions (Leagues/Divisions/Rinks/Add-one-ice-slot): `contextSeededDrawerValues()` seeds those actions from the active Program/Season rather than a global-first fallback, fails closed on missing/stale/mismatched context, and a persisted two-Program/two-Season regression (`e2e/setup-workflow-hub.js`) proves the created record's Program is read back correctly from the server — the batch-2 blockers reported against `ca8646b`/`7667c51` are fixed for these actions. **The multi-Season Division write specifically is now also fixed** (see criterion 2 — confirmed by the exact-head reviewer on 2026-07-27T11:08:08Z), so this partial evidence is stronger than Round 1 of this ledger recorded. It still does **not** provide: (a) League promoted into the persistent context bar — `grep -n "ctx-league\|League.*persistent"` still finds nothing in any of the four PRs; (b) general changed-screen filtering, or removal/narrowing of the `ctx-unfiltered` caption (`index.html:117`), still present unmodified in all four heads. #347 as a whole also remains unmerged and not merge-ready, per its own two current blockers (positional-argument compatibility, keyboard browser proof — see criterion 2), so even its partial context contribution isn't yet on `main`. |
-| Remaining gap | League promotion into the persistent context bar and general changed-screen filtering have no implementation anywhere, merged or pending. The narrower context-seeding/Division-write behavior #347 does add is now correctness-complete but still unmerged and gated on #347's own two open (context-unrelated) blockers, and is, on its own, far short of "every changed screen filters or documents a named exception." |
-| **Status** | **`Missing`** — a required portion (League promotion, general screen filtering) has no implementation or evidence in any merged or pending work, which is decisive for the overall criterion even though #347 provides genuine partial evidence for one narrower piece |
+| Evidence merged to `main` | **Partial — three components, varying coverage:**<br><br>**(1) Context switcher (pre-existing).** The mechanism itself (`#context-switcher` wrapper / `#ctx-select` native `<select>`, `index.html:111-117`) is pre-existing (#159/#322/#323) and unchanged.<br><br>**(2) Context seeding + Division multi-Season fix (merged).** PR #347 (`5dfa6e0`) delivers real, verified Program/Season context evidence for the Setup-hub's secondary/tertiary actions (Leagues/Divisions/Rinks/Add-one-ice-slot): `contextSeededDrawerValues()` seeds those actions from the active Program/Season rather than a global-first fallback, fails closed on missing/stale/mismatched context, and `e2e/setup-workflow-hub.js` verifies the persisted record's Program reads back correctly from the server. The multi-Season Division write is now fixed (verified by reviewer 2026-07-27T11:08:08Z), and PR #347 merged with 9/9 CI green.<br><br>**(3) League backend foundation (merged).** PR #356 (`80368b3`) adds backend support for persistent League context: `ActiveContext.league_id`, `exact_league_season_or_conflict()`, `authorized_league_ids()`, `resolve_with_league` / `options_with_league` / `set_with_league` methods. 25 new tests, all three backend types green (Memory/SQLite/PostgreSQL). This is the **additive backend foundation** only — HTTP integration and context-bar UI promotion are separate following slices, not yet merged. |
+| Remaining gap | League promotion into the persistent **UI** context bar — still no implementation touching `index.html` navigation/context display. General changed-screen filtering or removal/narrowing of the `ctx-unfiltered` caption (`index.html:117`). These two together still represent a required portion with no merged evidence. |
+| **Status** | **`Missing`** — a required portion (League UI promotion, general screen filtering) has no implementation or evidence on `main`, which is decisive for the overall criterion even though #347 and #356 together provide genuine partial evidence for the narrower context-seeding and backend-foundation pieces |
 
 ### Criterion 5 — "Loading, empty, stale, error, retry, confirmation, optional, and complete states match the approved matrix."
 
@@ -206,11 +226,10 @@ itself. The decision rule for picking the one overall value:
 | | |
 | --- | --- |
 | Required boundary/evidence | All seven roles land on their correct destination, see the correct nav, can reach their one authorized action, and cannot bypass authorization by direct navigation or a real HTTP mutation — Viewer specifically has zero enabled mutation action anywhere. |
-| Evidence merged to `main` | **Player, Guardian, Official**: `e2e/role-home-journeys.js` (merged, PR #331) — correct landing (`player_home`/`guardian_home`/`inbox`), not the operator Dashboard. **League Admin, Arena Manager**: `e2e/home-tasks-hub.js` (merged) covers Setup-hub depth for these two roles specifically. **Coach**: `e2e/coach-scope.js` (merged) covers only the *admin-side* account-scoping mechanism (does a Coach account get created with a Team, does the drawer reveal the Team field) — it does **not** test the Coach's own sign-in/landing/nav/authorization journey. **Viewer**: checked every merged e2e file (`grep -rln "viewer" e2e/*.js`) — `context-switcher.js` uses a viewer account only incidentally, to exercise read-only context-switching; no merged file asserts Viewer has zero enabled mutation controls anywhere. |
-| Candidate evidence in active PR | #353's prior head `c682d3bb1` added `e2e/role-authorization-matrix.js`, a from-scratch matrix covering all seven roles with real authenticated sessions, a real bounded keyboard `Tab`/`Shift+Tab` traversal, unauthorized-absent checks, direct-nav bypass probes, and real negative HTTP mutations expecting 403 for six of the seven roles with a precise per-response failure tracker rather than a text filter — that head's audit-boundary gap (below) was the one blocker outstanding. #353 has since **advanced to `057e9e8398fdc0be74a2044eb369c280c3807584`**. |
-| **Status of the audit-boundary blocker: developer-reported fix, not yet reviewer-verified** | The developer reports (2026-07-27T11:10:37Z) that `assertForbiddenNoChange()` now takes an array of snapshot paths and additionally snapshots the audit boundary for all six probes — `setup_audit` (via `/api/demo/overview`) for the four Setup-mutation probes, the per-game `audit` array (via `/api/games/{id}/board`) for the two `build-roster` probes — and describes performing the exact falsifiability check the prior review required: temporarily made `server.py` record an audit event before returning 403, confirmed the strengthened test fails with a specific message naming the leaked audit entry, then reverted (`git diff --stat` showing zero production diff) and confirmed the suite passes clean again. **Per this ledger's freshness rule, a developer's own comment describing a fix is not the same as reviewer verification, and is recorded here as reported, not resolved.** As of this snapshot (`2026-07-27T11:14:44Z`), CI on `057e9e8` is 8/9 green with `postgres` still `pending`, and no exact-head reviewer comment has yet been posted confirming this correction. |
-| Remaining gap | Await CI completion and an exact-head reviewer review of `057e9e8`. If the reviewer confirms the audit-boundary invariant is now genuinely covered, this becomes the last step before merge; if not, whatever the reviewer finds replaces this row at the next refresh. |
-| **Status** | **`Pending active PR`** (#353 @ `057e9e8`) — every required role/action already has real, cited evidence merged or in this one PR; gated on reviewer verification and CI completion of the audit-boundary fix reported above |
+| Evidence merged to `main` | **Yes.** PR #353 (`322a959`) merged on 2026-07-27T12:20:26Z with all seven roles covered. `e2e/role-authorization-matrix.js` provides a from-scratch matrix covering all seven roles with real authenticated sessions, bounded keyboard `Tab`/`Shift+Tab` traversal, unauthorized-absent checks, direct-nav bypass probes, and real negative HTTP mutations with a precise per-response failure tracker. The audit-boundary blocker was resolved before merge: `assertForbiddenNoChange()` now snapshots both the setup audit (via `/api/demo/overview`) and per-game audit arrays (via `/api/games/{id}/board`), and was verified falsifiable by the reviewer. All 9/9 CI checks were green on merge. Merged PR description confirms all seven roles, their landings, nav visibility, keyboard navigation to authorized actions, and authorization rejection evidence. |
+| Candidate evidence in active PR | None — the entire criterion is now merged. |
+| Remaining gap | None identified. |
+| **Status** | **`Verified on main`** |
 
 ### Criterion 7 — "Desktop, 390px, breakpoint-boundary, keyboard, screen-reader, WCAG 2.2 AA, and zero-console-error evidence is attached."
 
@@ -226,7 +245,7 @@ row.
 | Breakpoint-boundary (the four approved tokens 480/720/880/1040) | `styles.css`'s two out-of-contract widths (Game Sheet 680px, Ice Builder 460px) fixed to 720/480 (PR #351, merged `49d662a`), with `e2e/breakpoint-contract.js` (static guard, scoped to `styles.css` only) and `e2e/breakpoint-boundaries.js` (computed-layout Playwright evidence) both registered in CI. **`onboarding.css` (760px) and `setup.css` (520px) remain out-of-contract on `main` today** — PR #351's own body flagged these as an out-of-scope finding for follow-up. | #354 (head `b5e89612e`) retargets all four production stylesheets and widens the guard. **Stale-claim finding**: PR #354's Test Plan checkmarks describe only *local* runs — its exact head has **zero CI check-runs** and `gh pr view 354` reports `mergeable: CONFLICTING`, `mergeStateStatus: DIRTY` against current `main`. | `styles.css` verified merged; `onboarding.css`/`setup.css` blocked — #354 exists but is unverified-by-CI and merge-conflicting |
 | Keyboard-only (manual pass) | `docs/product/manual-keyboard-screenreader-validation-protocol.md` (merged, PR #350, `e8c7d96`) — a **protocol and blank evidence template only**; the document's own Status section states no manual pass has been run under it. | n/a | Human-only, unperformed |
 | Screen-reader (manual pass) | Same protocol document as above; same caveat. | n/a | Human-only, unperformed |
-| WCAG 2.2 AA (automated) | `axe-core@^4.12.1` is a declared `devDependency` (`e2e/package.json:48`) but **`grep -n "axe" e2e/accessibility-foundations.js` returns zero matches** — no merged journey actually invokes it. `accessibility-foundations.js` (merged) covers skip-link, per-view titles, and dialog focus/containment (real keyboard behavior), a *subset* of WCAG 2.2 AA, not a full automated scan. | #352 (head `f2a0e554d`) adds `e2e/shell-accessibility-coverage.js`, loading `axe-core` and calling `axe.run(root, {resultTypes: ["violations"]})` (verified present at this head) across five shell surfaces, reporting zero serious/critical violations, plus two production accessibility fixes found during review. 9/9 CI green. **Live review blocker on this exact head, unresolved**: the PR's own stale-response regression is not falsifiable against the guard it claims to prove. The held route in `shell-accessibility-coverage.js` waits *before* `route.continue()`, so the "held" request is sent to the same live endpoint only after the newer render has already settled — both renders receive identical schedule data, share the same global `publicTab`, and an obsolete completion doesn't move focus. Confirmed at the current exact head `f2a0e554d84fef81131fa30600f6a2b40646228f` (2026-07-27T10:49:01Z): *"If the three `mySeq !== publicRenderSeq` checks are removed, the released first call can repaint an indistinguishable DOM... The current fingerprint can still pass, so it does not meet the explicit requirement that reverting the guard restore the failure... Exact-head CI cannot make this head merge-ready until that regression is load-bearing."* This directly parallels this ledger's own falsifiability requirement (§ below) — the test currently cannot fail even when the production guard it's meant to protect is removed. | Five shell surfaces pending #352, gated on the falsifiability blocker above; six Setup workflow landings and Home/Tasks hub itself still have no PR running axe against them at all |
+| WCAG 2.2 AA (automated) | **Yes.** `axe-core@^4.12.1` is a declared `devDependency` (`e2e/package.json:48`), and is now actively used. `e2e/shell-accessibility-coverage.js` (merged via PR #352, `91c5e2a`) loads `axe-core` and calls `axe.run(root, {resultTypes: ["violations"]})` across five shell surfaces (signed-out login, public schedule, staff sign-in transition, forced loading/error, restricted early-return), reporting zero serious/critical violations on all surfaces. Three production accessibility fixes were found and merged with the PR: color-contrast overrides for login/public screens, ARIA role + live-region semantics on error/status content, and focus management on persistent controls. The prior falsifiability blocker was resolved: the held route now resolves to a deliberately distinct stale fixture, the guard is verified load-bearing by temporarily disabling it and confirming test failure, and all 9/9 CI checks were green on merge (2026-07-27T11:26:59Z). `accessibility-foundations.js` (merged, pre-#345) covers skip-link, per-view titles, and dialog focus/containment as a *subset* of WCAG 2.2 AA. | Five shell surfaces verified merged; six Setup workflow landings and Home/Tasks hub itself still have no axe scanning (pending broader accessibility work) |
 | Zero-console-error | **Verified inventory, not an assumed convention.** Of the 35 files under `e2e/*.js` that are real Playwright browser journeys (`require("playwright")` present), **34 install both `page.on("pageerror", ...)` and `page.on("console", ...)` tracking** (confirmed by `grep -c` across every file, e.g. `accessibility-foundations.js`, `home-tasks-hub.js`, `role-home-journeys.js`). The one exception, `api-error-resilience.js`, installs `pageerror` tracking only, by design — it deliberately provokes 401/403/502 responses and does not assert a zero-console-error bar for itself. The six other `e2e/*.js` files (`breakpoint-contract.js`, `check-v1-route-contract.js`, `ci-classify.js`/`.test.js`/`.integration.test.js`, `season-fmt-unit.js`) are static/unit checks, not browser journeys, and are correctly outside this claim's scope. | Same tracking convention continued in the browser journeys added by all four active PRs. | Verified for 34/35 merged browser journeys as a baseline convention; not yet a completion claim for the whole redesign, most of which isn't merged |
 
 **Overall status for Criterion 7: `Missing`.** Two of its six required
@@ -255,10 +274,9 @@ this criterion is not "one active PR away" from done.
 | | |
 | --- | --- |
 | Required boundary/evidence | The **final** #345 implementation PR's exact head is green across the full backend matrix (Memory/SQLite/PostgreSQL) and all required browser CI. |
-| Evidence merged to `main` | `main` at `49d662a` itself is green (verified via `gh run view` on the post-merge push-triggered run, not the PR-head result — success). |
-| Candidate evidence in active PR | #347 (`746c823e4`) and #352 (`f2a0e554d`) each have 9/9 CI checks green on their exact head but each carries its own open, unresolved review blocker (positional-argument compatibility + mouse-driven browser proof on #347; the non-falsifiable stale-response regression on #352 — see criteria 2/4/7 above), so neither is itself merge-ready despite the green run. #353 (`057e9e8`) has a developer-reported fix for its prior blocker but is not yet reviewer-verified, and CI on this exact head is still incomplete (`postgres` `pending` at snapshot time). #354 has **zero CI runs** on its current head and is merge-conflicting. |
-| Remaining gap | This criterion is about the *eventual, complete* #345 PR, which doesn't exist yet — #345 is still split across four independent batches (each with its own open blocker) plus the two protocol-only PRs already merged, plus the unaddressed seven-area IA/context-filtering work (criteria 3–4). Green CI on today's individual batches is necessary but not sufficient evidence for this box, and none of the four active batches is currently blocker-free besides. |
-| **Status** | **`Missing`** — no single head represents "the complete #345 diff" this criterion asks about, and every existing batch that could contribute to one still has an open review blocker |
+| Evidence merged to `main` | **Yes, for all merged batches.** `main` at `9447bb6` is green across the full matrix (verified post-merge). Individual merged PRs: <br>• #347 (`5dfa6e0`): 9/9 CI green on merge (2026-07-27T11:59:39Z)<br>• #352 (`91c5e2a`): 9/9 CI green on merge (2026-07-27T11:26:59Z)<br>• #353 (`322a959`): 9/9 CI green on merge (2026-07-27T12:20:26Z)<br>• #356 (`80368b3`): all backend types (Memory/SQLite/PostgreSQL) green on merge (2026-07-27T13:05:50Z), browser CI skipped per correct scope boundary (backend-only) |
+| Remaining gap | This criterion asks about the *eventual, complete* #345 PR as a whole, which does not yet exist — #345 is still split across the four merged batches plus #354 (still open/conflicting, zero CI runs) plus the unaddressed seven-area IA/context-filtering work (criteria 3–4) plus manual moderated sessions (criterion 8). The four merged batches are each CI-green, but they do not yet constitute "the complete #345 diff." |
+| **Status** | **`Missing`** — no single head represents the complete #345 implementation, and unmerged work (criterion 3 seven-area IA, criterion 4 League UI promotion, criterion 5 per-card state matrix, criterion 8 moderated sessions, #354 still unmerged) remains outstanding |
 
 ---
 
@@ -402,3 +420,25 @@ evidence.
    just at write time. The correct `Missing`/blocked label (with the #354
    citation kept as pending, non-authoritative candidate evidence) was
    restored.
+
+---
+
+## Snapshot semantics
+
+This ledger is a **timestamped snapshot** of #345's acceptance state as of
+`2026-07-27T13:15:00Z`, based on `main` @ `9447bb6`. It is accurate for
+that exact SHA and time only.
+
+**#345's issue checklist and current GitHub state remain authoritative for
+later merge readiness.** If any of the following occur after this snapshot,
+this document's status values become stale:
+
+- #354 (Breakpoint consolidation) advances, is rebased, or is merged.
+- New active PRs are opened for #345 work.
+- The seven acceptance boxes on #345's issue body are modified.
+- Other cited merge commits or PRs are force-pushed or revert their
+  changes.
+
+Do not treat a stale snapshot as authoritative for merge gates. Instead,
+re-read the live GitHub state and refresh this document before relying on
+it again.
