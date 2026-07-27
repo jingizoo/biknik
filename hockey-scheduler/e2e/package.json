@@ -40,7 +40,9 @@
     "player-lifecycle": "node player-lifecycle.js",
     "season-dates": "node season-dates.js",
     "scheduling-policy": "node scheduling-policy.js",
-    "season-fmt-unit": "node season-fmt-unit.js"
+    "season-fmt-unit": "node season-fmt-unit.js",
+    "breakpoint-contract": "node breakpoint-contract.js",
+    "breakpoint-boundaries": "node breakpoint-boundaries.js"
   },
   "devDependencies": {
     "axe-core": "^4.12.1",
