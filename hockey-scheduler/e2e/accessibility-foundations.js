@@ -100,6 +100,37 @@ function activeInfo(page) {
   });
 }
 
+// Sends exactly ONE navigation key and reports where focus landed relative to
+// the topmost dialog's own sequential stops.
+//
+// This is deliberately a FIRST-keystroke probe. A containment check that tabs
+// forward a few times before testing the reverse direction cannot see the
+// entry-boundary bug it is written for: by then focus is on a real control,
+// where the first/last wrap rules apply. The broken case is only reachable
+// while focus is still on the tabindex="-1" container -- which is exactly
+// where every open, and every re-render re-anchor, leaves it.
+async function oneKeyFromHere(page, shift) {
+  await page.keyboard.press(shift ? "Shift+Tab" : "Tab");
+  return page.evaluate(() => {
+    const el = document.activeElement;
+    const overlays = document.querySelectorAll(".modal, .drawer");
+    const top = overlays.length ? overlays[overlays.length - 1] : null;
+    const stops = top ? Array.from(top.querySelectorAll([
+      "a[href]", "button:not([disabled])", "input:not([disabled])",
+      "select:not([disabled])", "textarea:not([disabled])",
+      '[tabindex]:not([tabindex="-1"])',
+    ].join(","))).filter((n) =>
+      n.offsetParent !== null || n.getClientRects().length > 0) : [];
+    return {
+      inTopDialog: !!(top && el && top.contains(el)),
+      isFirstStop: !!(stops.length && el === stops[0]),
+      isLastStop: !!(stops.length && el === stops[stops.length - 1]),
+      desc: el ? (el.id ? `#${el.id}` : (el.className || el.tagName)) : "null",
+      text: el ? (el.textContent || "").trim().slice(0, 40) : "",
+    };
+  });
+}
+
 function fail(msg) { throw new Error(msg); }
 
 async function checkViewport(browser, viewport) {
@@ -285,6 +316,40 @@ async function checkViewport(browser, viewport) {
         + `got ${JSON.stringify(await activeInfo(page))}`);
     });
 
+    // ENTRY BOUNDARY, both directions, as the FIRST key after open. Focus is
+    // still on the tabindex="-1" container here, which is not one of the
+    // dialog's sequential stops -- so a trap that only wraps at the first and
+    // last CONTROL never fires, and native navigation takes over. Forward
+    // looks fine by accident (it descends into the container's first
+    // focusable child); backward walks to whatever precedes the container in
+    // the document, i.e. straight out of the dialog. Each direction gets a
+    // FRESH open so focus is genuinely on the container, not on a control
+    // left over from the previous probe.
+    let entry = await oneKeyFromHere(page, false);
+    if (!entry.inTopDialog || !entry.isFirstStop) {
+      fail(`entry boundary (Tab): the first Tab after open must land on the `
+        + `dialog's first control, got ${JSON.stringify(entry)}`);
+    }
+    const reopenDrawer = async () => {
+      await page.keyboard.press("Escape");
+      await page.waitForFunction(() =>
+        !document.querySelector(".drawer, .modal"), null, { timeout: 10000 });
+      await trigger.click();
+      await page.waitForSelector(".drawer, .modal", { timeout: 10000 });
+      await page.waitForFunction(() => {
+        const el = document.activeElement;
+        return !!(el && el.matches && el.matches(".modal, .drawer"));
+      }, null, { timeout: 5000 });
+    };
+    await reopenDrawer();
+    entry = await oneKeyFromHere(page, true);
+    if (!entry.inTopDialog || !entry.isLastStop) {
+      fail(`entry boundary (Shift+Tab): the first Shift+Tab after open must `
+        + `stay in the dialog and land on its LAST control, never escape to `
+        + `the page behind it, got ${JSON.stringify(entry)}`);
+    }
+    await reopenDrawer();
+
     // Tab forward well past the number of controls in the dialog; focus must
     // never leave it. 40 is comfortably more than any dialog's control count,
     // so this wraps several times if the trap works.
@@ -398,6 +463,27 @@ async function checkViewport(browser, viewport) {
     await page.waitForSelector(".drawer .drawer-err", { timeout: 10000 });
     await drawerContainerFocused("re-render while open");
 
+    // The re-anchored container is the same entry boundary as a fresh open,
+    // and it is reachable repeatedly (any state change re-renders), so both
+    // first-key directions are asserted here too. Re-anchoring after each
+    // probe is free: clicking Submit again re-runs the same client-side
+    // validation and re-renders, putting focus back on the container.
+    let reEntry = await oneKeyFromHere(page, false);
+    if (!reEntry.inTopDialog || !reEntry.isFirstStop) {
+      fail(`entry boundary after re-render (Tab): expected the dialog's first `
+        + `control, got ${JSON.stringify(reEntry)}`);
+    }
+    const reAnchor = async () => {
+      await page.click('[data-drawer-submit="club"]');
+      await drawerContainerFocused("re-anchor for the next boundary probe");
+    };
+    await reAnchor();
+    reEntry = await oneKeyFromHere(page, true);
+    if (!reEntry.inTopDialog || !reEntry.isLastStop) {
+      fail(`entry boundary after re-render (Shift+Tab): must stay in the `
+        + `dialog and land on its LAST control, got ${JSON.stringify(reEntry)}`);
+    }
+
     // Now complete the create for real. This both leaves a row with a delete
     // control -- the only way to open a modal OVER a drawer below, since the
     // Records cards start empty -- and exercises restore on the ordinary
@@ -468,6 +554,28 @@ async function checkViewport(browser, viewport) {
     });
     if (!(await page.$(".drawer"))) {
       fail("modal over drawer: the drawer should still be open underneath");
+    }
+    // Entry boundary on the TOPMOST dialog. Backward is the case that matters
+    // most here: the modal is appended after the drawer, so whatever precedes
+    // the modal container in the document is the drawer -- an escape would
+    // land on the surface the modal is supposed to be blocking, not obviously
+    // "outside a dialog", and so could pass a naive inDialog check.
+    let modalEntry = await oneKeyFromHere(page, false);
+    if (!modalEntry.inTopDialog || !modalEntry.isFirstStop) {
+      fail(`modal over drawer, entry boundary (Tab): expected the MODAL's `
+        + `first control, got ${JSON.stringify(modalEntry)}`);
+    }
+    // Re-anchor to the modal container: Escape would close it, so re-focus it
+    // directly, which is the same state syncOverlayFocus() establishes.
+    await page.evaluate(() => {
+      const m = document.querySelector(".modal[role=dialog]");
+      if (m) m.focus();
+    });
+    modalEntry = await oneKeyFromHere(page, true);
+    if (!modalEntry.inTopDialog || !modalEntry.isLastStop) {
+      fail(`modal over drawer, entry boundary (Shift+Tab): must stay in the `
+        + `MODAL and land on its last control, never fall through to the `
+        + `drawer beneath it, got ${JSON.stringify(modalEntry)}`);
     }
     // First Escape closes only the modal (app.js checks `modal` before
     // `drawer`); focus returns to the drawer still open underneath.

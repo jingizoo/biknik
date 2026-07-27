@@ -8146,10 +8146,21 @@ document.addEventListener("keydown", (e) => {
   const focusables = overlayFocusables(overlay);
   if (!focusables.length) { e.preventDefault(); return; }
   const first = focusables[0], last = focusables[focusables.length - 1];
-  // Focus currently outside the dialog (e.g. the browser moved it there):
-  // pull it back to the appropriate edge rather than letting Tab continue
-  // through the page behind.
-  if (!overlay.contains(document.activeElement)) {
+  // ENTRY BOUNDARY. Focus is not on one of the dialog's sequential stops --
+  // either it is outside the dialog entirely (the browser moved it there), or
+  // it is on the tabindex="-1" CONTAINER, which is where every open and every
+  // re-render re-anchor puts it and which overlayFocusables() deliberately
+  // excludes. Enter at the appropriate edge in both cases.
+  //
+  // The container case used to fall through to the wrap rules below, and they
+  // key off the first/last CONTROL, so neither ever matched and the event was
+  // left unprevented. Forward looked correct by accident -- native sequential
+  // navigation from a tabindex="-1" element goes to its first focusable
+  // descendant -- but BACKWARD walked to whatever preceded the container in
+  // the document, i.e. straight out of the dialog to the page behind it, on
+  // the very first keystroke after open. `overlay.contains()` did not catch
+  // it because Node.contains() is true for the node itself.
+  if (focusables.indexOf(document.activeElement) === -1) {
     e.preventDefault();
     (e.shiftKey ? last : first).focus();
     return;
