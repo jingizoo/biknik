@@ -15,6 +15,20 @@
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, system-ui, sans-serif; }
 .web { display: flex; min-height: 100vh; align-items: stretch; }
 
+/* ---------- skip to content (#345) ----------
+   Off-screen rather than display:none/visibility:hidden, so it stays in the
+   tab order and is announced when focused. WCAG 2.2 AA target size (24×24
+   minimum) is satisfied by the padded box once it is on screen. */
+.skip-link {
+  position: absolute; left: 8px; top: -60px; z-index: 200;
+  padding: 10px 16px; min-height: 24px;
+  background: var(--accent); color: #fff; border-radius: 0 0 10px 10px;
+  font-weight: 700; font-size: 14px; text-decoration: none;
+  transition: top .12s ease-out;
+}
+.skip-link:focus { top: 0; outline: 3px solid #0b1220; outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) { .skip-link { transition: none; } }
+
 /* ---------- sidebar (dark, grouped) ---------- */
 .sidebar {
   width: 236px; flex: 0 0 236px;

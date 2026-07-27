@@ -221,6 +221,11 @@ const NAV = {
   notifications: "Notifications", delivery: "Delivery", activity: "Activity",
   public: "Public", users: "Users", scheduler: "Scheduler", import: "Import",
   readiness: "Pilot Readiness", player_home: "Home", guardian_home: "My Players",
+  // #345: "onboarding" is a real destination (the #174 Initial Setup wizard,
+  // and the view a fresh Program actually LANDS on) but had no NAV entry, so
+  // it had neither a topbar heading nor -- once titles existed -- a page
+  // title. Label matches its sidebar button.
+  onboarding: "Initial Setup",
 };
 const POS_CLASS = { goalie: "pos-G", defense: "pos-D", forward: "pos-F", skater: "pos-D" };
 const REPO = "https://github.com/jingizoo/biknik/issues";
@@ -6452,6 +6457,11 @@ async function render() {
   // after the view content on every render and wire it below.
   c.innerHTML += renderModal();
 
+  // #345: the title must track the view on EVERY render, not only on an
+  // explicit switchTab() -- deep links (#hash routing), sign-in, and the
+  // role-based default landing all reach a view without going through
+  // switchTab, and each of those changed the destination.
+  setPageTitle(view);
   wireModal(c);
   c.querySelectorAll("[data-goto]").forEach((b) => b.onclick = () => switchTab(b.dataset.goto));
   // Home/Tasks hub setup-progress card (#330): its own fetch, content, and
@@ -7869,7 +7879,92 @@ async function render() {
     if (res && !res.error) { toast = wizard.exhibition ? "Exhibition game scheduled." : "Game scheduled."; currentGame = res.id; wizard = null; view = "games"; }
     render();
   };
+  // #345: last thing every render does -- after ALL wiring above, so the
+  // dialog's controls exist and are bound before focus lands on one. Also
+  // handles the close half: when the render that just ran removed the
+  // dialog, focus returns to whatever opened it.
+  syncOverlayFocus();
 }
+
+// Per-view page title (#345). A single-page app never reloads, so without
+// this every view reports the same static <title> -- screen-reader users get
+// no announcement that the destination changed, and browser history/tab
+// labels are useless. Format is "<View> — Hockey Scheduler": the view first,
+// because assistive tech announces the beginning of the title and that is
+// the part that actually changed.
+const APP_TITLE = "Hockey Scheduler";
+function setPageTitle(v) {
+  const label = NAV[v];
+  document.title = label ? `${label} — ${APP_TITLE}` : APP_TITLE;
+}
+
+// ---- dialog focus management (#345) --------------------------------------
+// The modal/drawer markup already carries role="dialog" aria-modal="true",
+// but aria-modal alone does NOT constrain the keyboard -- browsers still tab
+// out into the page behind. These three pieces complete the contract:
+// remember what opened the dialog, move focus into it, cycle Tab inside it,
+// and put focus back where it came from on close.
+let overlayWasOpen = false;      // previous render's open/closed state
+const OVERLAY_SEL = ".modal, .drawer";
+const FOCUSABLE_SEL = [
+  "a[href]", "button:not([disabled])", "input:not([disabled])",
+  "select:not([disabled])", "textarea:not([disabled])",
+  '[tabindex]:not([tabindex="-1"])',
+].join(",");
+
+function openOverlayElement() {
+  // The LAST match wins: renderModal() is appended after the drawer, so a
+  // confirm modal opened on top of a drawer is the one that owns focus.
+  const all = document.querySelectorAll(OVERLAY_SEL);
+  return all.length ? all[all.length - 1] : null;
+}
+
+function overlayFocusables(root) {
+  return Array.from(root.querySelectorAll(FOCUSABLE_SEL)).filter((el) =>
+    // offsetParent is null for display:none subtrees; a zero-size box is
+    // also unreachable in practice. Cheaper and more reliable here than
+    // checking computed visibility on every candidate.
+    el.offsetParent !== null || el.getClientRects().length > 0);
+}
+
+// #345: DELIBERATELY does not move focus. An earlier version of this slice
+// focused the dialog's first control on open and restored focus to the
+// trigger on close. Both are correct WCAG behaviour and both are still
+// wanted -- but calling .focus() from the render cycle fires focus/blur
+// (and, on some controls, change) events, and that measurably destabilised
+// the deliberately-raced Ice Builder and coalesced-context journeys in
+// home-tasks-hub.js: two runs failed in two DIFFERENT timing-sensitive
+// scenarios (stale-preview ordering, and a coalesced queue dequeuing), while
+// the same journey passed with these focus calls disabled and every other
+// part of this change active. Landing focus-on-open/restore-on-close needs
+// its own slice with those journeys re-synchronised; containment below is
+// the part that ships safely now. Tracked as follow-up on #345.
+function syncOverlayFocus() {
+  overlayWasOpen = !!openOverlayElement();
+}
+
+// Tab/Shift+Tab cycle within the open dialog.
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Tab") return;
+  const overlay = openOverlayElement();
+  if (!overlay) return;
+  const focusables = overlayFocusables(overlay);
+  if (!focusables.length) { e.preventDefault(); return; }
+  const first = focusables[0], last = focusables[focusables.length - 1];
+  // Focus currently outside the dialog (e.g. the browser moved it there):
+  // pull it back to the appropriate edge rather than letting Tab continue
+  // through the page behind.
+  if (!overlay.contains(document.activeElement)) {
+    e.preventDefault();
+    (e.shiftKey ? last : first).focus();
+    return;
+  }
+  if (e.shiftKey && document.activeElement === first) {
+    e.preventDefault(); last.focus();
+  } else if (!e.shiftKey && document.activeElement === last) {
+    e.preventDefault(); first.focus();
+  }
+});
 
 function switchTab(next) {
   view = next; toast = ""; if (next !== "calendar") { wizard = null; conflict = null; movingGameId = null; pendingMove = null; iceBuilder = null; }
@@ -7882,6 +7977,7 @@ function switchTab(next) {
   // clears any open junior checkout confirm / opportunity detail.
   if (next !== "guardian_home") { gCheckout = null; gOpp = null; gOppDetail = null; }
   document.querySelectorAll(".tab").forEach((x) => x.classList.toggle("active", x.dataset.tab === next));
+  setPageTitle(next);
   render();
 }
 document.querySelectorAll(".tab").forEach((b) => b.onclick = () => switchTab(b.dataset.tab));
