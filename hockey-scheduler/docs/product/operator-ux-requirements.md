@@ -4,29 +4,45 @@
 
 > Before any redesign code ships, define exactly what "better" means — per
 > role, per screen, per state, per breakpoint, per WCAG success criterion —
-> so the first implementation PR (Home/Tasks + a guided Setup hub) has an
+> so the Home/Tasks + guided Setup implementation milestone has an
 > unambiguous, testable target instead of a general mandate to "make it
 > nicer."
 
 ## Status
 
 Bounded first deliverable of epic #204 (child issue #324; #204 stays open).
-Per the reordered plan, this package now precedes #206 (Planner v2), which
-resumes once this package and the first implementation PR land. **This
+Per the reordered plan, this package precedes #206 (Planner v2); the first
+implementation milestone is now split between PR #331 and #345. **This
 document is the deliverable — no application code changes accompany it.**
 Sequencing:
 
 ```text
 this requirements package (#324)
   → validated by @jingizoo
-  → PR 1: Home/Tasks + guided Setup hub
-  → PR 2: Schedule/Facilities UX
+  → #330 / PR #331: bounded first slice — Program-scoped setup-progress
+    contract and Home/Tasks card, deep-links into the existing Setup
+    screens, and role-home regression coverage
+  → #345: guided Setup hub and the remaining IA, context-filtering,
+    state/error, breakpoint, accessibility, and operator-validation work
+  → Schedule/Facilities UX
   → bounded #287 pre-#205 deliverable (documentation/design + a
     non-production UX prototype only — no schema, persistence, API
     mutations, notifications, or runtime state transitions; matches
     Release 2's own bar, corrected per review — see ROADMAP.md)
   → #206 (Planner v2) resumes
 ```
+
+**Scope split approved by @jingizoo (2026-07-27):** PR #331 is the bounded
+first implementation slice, not completion of the full Home/Tasks + guided
+Setup milestone. It delivers the Program-scoped setup-progress contract and
+Home/Tasks card, deep-links into today's Setup screens, and the role-home
+regression journeys. It does not claim the guided Setup hub, seven-area IA,
+context-filtering redesign, full state/error treatment, breakpoint
+consolidation and verification, repository-wide accessibility gates, manual
+keyboard/screen-reader acceptance, or moderated operator validation. Those
+remaining #204 acceptance items transfer intact to #345, which stays ahead
+of Schedule/Facilities UX. This is a scope transfer, not a waiver: those
+items cease to block PR #331 only and remain required before #345 can close.
 
 ## Current state (baseline — requirements below are deltas, not inventions)
 
@@ -145,19 +161,15 @@ create one:
 | Official | Accept/decline my own assignments | *(none named — inbox tab exists but hidden by default, `index.html:31`)* | **New journey needed** |
 | Viewer | Read schedule/roster/standings with zero mutation surface | `smoke` (partial coverage only) | Confirm no primary action ever renders enabled for Viewer; needs an explicit assertion, not incidental coverage |
 
-**Requirement**: Player, Guardian, and Official each get a real e2e journey
-(even a thin one) as part of the **first implementation PR's own test
-plan** — not a prerequisite gate before that PR starts. This is not a docs-
+**Requirement (delivered by PR #331)**: Player, Guardian, and Official each
+get a real e2e journey (even a thin one) as part of **PR #331's own test
+plan**. This is not a docs-
 vs-code conflict: Player Home, Guardian Home ("My Players"), and Official
 Inbox ("My Assignments") are themselves part of the Home/Tasks area (§2),
-so their journeys are naturally in scope for the PR that builds Home/Tasks,
-same as any other screen it touches needing its own acceptance test. Three
-of seven roles currently have zero scripted acceptance coverage, and a
-Home/Tasks PR that only re-validates the two roles already covered
-(League Admin's Dashboard, and indirectly Coach via `coach-scope`) would
-silently ship regressions to the other three — so this package requires
-the PR's test plan name all three explicitly, rather than treat "Home/Tasks
-built and desktop looks right" as sufficient.
+so their journeys are naturally in scope for the slice that first adds the
+Home/Tasks card. `e2e/role-home-journeys.js` names all three explicitly
+rather than treating "Home/Tasks built and desktop looks right" as
+sufficient.
 
 ### 2. Task-oriented navigation and setup
 
@@ -358,13 +370,13 @@ different from the default.
   | Token | Value | Replaces | Rationale |
   | --- | --- | --- | --- |
   | `--bp-phone` | **480px** | 460 (Ice Builder 2-col→1-col), 480 (drawer full-width, icon-btn 40×40 touch target, context-switcher compact mode, the dedicated "#100: responsive pass" block, iOS 16px input fix), 520 (setup.css) | 480 is already the dominant, most-used value (5 of 8 sites); 460 and 520 are the same "phone-density" concern authored at slightly different times, so consolidating onto 480 is the target choice — **not yet visually verified**: folding 460→480 and 520→480 moves each affected layout's collapse point by up to 40px, and must be checked at the affected widths plus desktop/390px before this token ships |
-  | `--bp-tablet` | **720px** | 680 (Game Sheet grids → 1-col), 720 (Arena Calendar `.cal-layout` row→column, kept as-is), 760 (onboarding) | 720 already serves the single most content-dense of the three (the Calendar), making it the target consolidation point — **not yet visually verified**: folding 680→720 and 760→720 must be checked at those exact widths (and desktop/390px) as part of the first implementation PR, not assumed negligible from the pixel delta alone |
+  | `--bp-tablet` | **720px** | 680 (Game Sheet grids → 1-col), 720 (Arena Calendar `.cal-layout` row→column, kept as-is), 760 (onboarding) | 720 already serves the single most content-dense of the three (the Calendar), making it the target consolidation point — **not yet visually verified**: folding 680→720 and 760→720 must be checked at those exact widths (and desktop/390px) as part of #345, not assumed negligible from the pixel delta alone |
   | `--bp-nav-flip` | **880px** | 880 (unchanged) | The one true structural layout change (sidebar → horizontal scrollable top nav) stays isolated from the two content-collapse tokens above so nav layout and content density can vary independently — unchanged, so no new verification needed here |
   | `--bp-wide` | **1040px** | 1040 (unchanged) | A distinct, wider concern (dashboard/report grid de-densifies pre-emptively while the sidebar is still full-width, i.e. *before* the 880px nav flip) — kept as its own token rather than force-merged into 880, since it fires at a meaningfully different width for a different reason; unchanged, so no new verification needed here |
 
   New hub CSS uses these four tokens exclusively — it must not add a fifth
   magic number. **The two consolidations above are a target decision, not a
-  demonstrated non-regression** — the first implementation PR must visually
+  demonstrated non-regression** — #345 must visually
   verify Game Sheet, Ice Builder, onboarding, and setup.css's affected
   layouts at their old and new breakpoints (plus the standard desktop/390px
   pair) before relying on the new tokens.
@@ -543,17 +555,17 @@ is genuinely inapplicable, with why.
 only so they are never mistaken for AA requirements): SC 2.4.12 Focus Not
 Obscured (Enhanced), SC 2.4.13 Focus Appearance, SC 3.3.9 Accessible
 Authentication (Enhanced). If the redesign happens to satisfy any of these,
-that's a bonus — none gate this package's or the first implementation PR's
-acceptance.
+that's a bonus — none gate this package's acceptance, PR #331's acceptance,
+or #345's acceptance.
 
 **Automated + manual gates**:
 
 - Add an automated accessibility check (e.g. axe-core) to CI, catching the
   markup-detectable subset of the matrix above. `ROADMAP.md:217` (#208)
-  already anticipates this; this package treats it as one of *its own*
-  closeable acceptance items (§8).
+  already anticipates this. #345 owns the repository-wide CI integration;
+  PR #331's focused card-state scans do not satisfy that broader gate.
 - A manual keyboard-only and screen-reader pass on the Home/Tasks hub and
-  guided Setup hub is required before that PR is considered done, per
+  guided Setup hub is required before #345 is considered done, per
   #204's own "manual keyboard/screen-reader acceptance" line — this is what
   catches everything the automated gate structurally cannot.
 
@@ -561,9 +573,10 @@ acceptance.
 
 **This package's own acceptance criteria** (narrower than epic #204's, which
 cover the eventual shipped redesign — these gate *this document*). **All
-nine satisfied and signed off by @jingizoo (2026-07-24)** — see the sign-off
-note under "Product decisions requiring sign-off" below for the decision-
-by-decision record:
+nine package-level criteria were satisfied and signed off by @jingizoo
+(2026-07-24)**. Decisions 9 and 10 arose during PR #331 review and were
+separately signed off on 2026-07-27 — see the decision-by-decision record
+below:
 
 - [x] Every one of sections 1–7 above has concrete, testable requirements —
       no item left open as "TBD."
@@ -577,17 +590,17 @@ by-decision record:
 - [x] The WCAG 2.2 AA conformance matrix (§7) covers every applicable A/AA
       success criterion, not a curated subset; the priority regression list
       is subordinate to it, not a substitute for it.
-- [x] The eight product decisions below are resolved and signed off by
-      @jingizoo.
+- [x] The ten product decisions below are resolved and signed off by
+      @jingizoo (decisions 1–8 on 2026-07-24; decisions 9–10 on 2026-07-27).
 - [x] Real operator validation is **scheduled** (owner, participants, tasks,
       evidence, and milestone below) — the sessions themselves run against
-      the first implementation PR's prototype, per the stated milestone;
-      "scheduled" is satisfied now, "conducted" is that PR's own gate.
+      the completed Home/Tasks + guided Setup prototype in #345; "scheduled"
+      is satisfied here, while "conducted" is #345's own gate.
 - [x] No application code changes are included in this deliverable.
 
 **Operator validation plan**: a moderated usability walkthrough of the
-Home/Tasks + guided Setup hub prototype, run before that PR is considered
-done — not deferred to "sometime before final rollout":
+Home/Tasks + guided Setup hub prototype, run before #345 is considered done
+— not deferred to "sometime before final rollout":
 
 - **Owner**: @jingizoo (product owner), as the accountable party for
   commissioning and running the sessions — consistent with every other
@@ -606,14 +619,14 @@ done — not deferred to "sometime before final rollout":
   task, number of moderator interventions/hints needed, a post-task 1–5
   ease rating, and verbatim quotes on any confusion point. Recorded as
   session notes (recording optional, moderator's call).
-- **Milestone**: sessions run, and their results documented, **before the
-  first implementation PR (Home/Tasks + guided Setup hub) is merged** —
-  this gates that PR's completion, not a later "final rollout" checkpoint,
+- **Milestone**: sessions run, and their results documented, **before #345's
+  implementation PR is merged** — this gates that follow-up's completion,
+  not a later "final rollout" checkpoint,
   matching #204's own "documented before final rollout" line applied to the
   earliest point it can actually be tested.
 
-**Measurable success criteria for the first implementation PR** (forward-
-looking — the bar that PR must clear once it ships):
+**Measurable success criteria for the completed Home/Tasks + guided Setup
+milestone (#345)**:
 
 - A first-time League Admin can identify their next incomplete setup step
   without reading the Setup mega-page's raw data model (#204's own epic
@@ -631,7 +644,7 @@ looking — the bar that PR must clear once it ships):
 - Desktop and 390px journeys both pass for every new screen, per the
   existing delivery rule (`ROADMAP.md:266`).
 
-## Product decisions requiring sign-off
+## Product decisions and sign-off
 
 **Signed off by @jingizoo (2026-07-24)**: decisions 1–7 accepted as written.
 Decision 8 (#158 closure) resolved below — #158's own four acceptance
@@ -640,18 +653,19 @@ conflicts reported, not silently created; a month view renders; zero
 console errors desktop+phone with backend tests) are each satisfied by
 #313's delivered scope, with no unmet item identified — #158 is closed as
 functionally complete, citing #313 (closing #315) and #277's policy
-integration (#318/#319). Decision 9 (workflow 6's completion contract) was
-raised during #331's review, after implementation against decisions 1–8
-was already under way — a specific resolution is PROPOSED below, but,
-unlike decisions 1–8, has not been confirmed by @jingizoo: the review
-comment that surfaced the gap identified the problem and offered two
-possible directions, which is not itself approval of either one. Treat
-decision 9 as open until that confirmation lands.
+integration (#318/#319).
 
-Eight decisions this package resolves, plus two (workflow 6; import-fix
-migration scope) still awaiting explicit confirmation — gathered here so
-they can be reviewed and checked off in one place rather than hunting
-through each section:
+**Owner confirmation and scope split (2026-07-27):** @jingizoo confirmed
+decisions 9 and 10 as proposed below and directed PR #331 to merge as a
+bounded, technically clean first slice. The unfinished guided Setup, IA,
+accessibility, breakpoint, state-matrix, role-journey, and moderated
+operator-validation work moves to #345 as the immediate next critical
+deliverable. This changes decision 6's delivery milestone only: the three
+human sessions remain required before #345's implementation PR merges and
+are not represented as completed for #331. #345 remains ahead of the
+Schedule/Facilities UX PR and every later Release 4 item.
+
+All ten decisions are therefore resolved here:
 
 1. **Users placement** (§2): Administration, not Teams & People — account/
    login lifecycle is a one-time administrative concern, distinct from
@@ -674,10 +688,13 @@ through each section:
    retained as a priority regression list, not the scope itself. SC 2.4.12
    is Level AAA and is explicitly excluded from the AA target (listed only
    as a voluntary stretch goal).
-6. **Operator validation** (§8): owner (@jingizoo), participants (League
-   Admin, Arena Manager, Coach — 3 sessions), moderated tasks, evidence, and
-   milestone (before the first implementation PR merges) are all specified
-   in §8 — reviewed here for confirmation, not decided from scratch.
+6. **Operator validation** (§8): **confirmed, with milestone adjusted
+   2026-07-27.** Owner (@jingizoo), participants (League Admin, Arena
+   Manager, Coach — 3 sessions), moderated tasks, and evidence remain as
+   specified in §8. The owner-directed #331/#345 scope split moves the
+   milestone from before the first implementation slice (#331) to before
+   #345's implementation PR merges; the sessions are not waived or
+   simulated.
 7. **Breakpoint token values** (§6): four exact tokens — `--bp-phone: 480px`,
    `--bp-tablet: 720px`, `--bp-nav-flip: 880px`, `--bp-wide: 1040px` —
    chosen by inspecting what each of today's eight ad hoc values actually
@@ -692,29 +709,26 @@ through each section:
    errors desktop+phone with backend tests) — no unmet item identified.
    Closed per @jingizoo's sign-off above, citing #313, #315, #318, #319.
 9. **Workflow 6 ("Imports and onboarding") completion contract** (§2/§4):
-   **open — proposed, not yet confirmed.** The first Home/Tasks hub
+   **confirmed by @jingizoo (2026-07-27).** The first Home/Tasks hub
    implementation (#330 PR #331) derived this workflow's done/todo state
    from whether workflows 1–5 were all done — an invented rule with no
    grounding, flagged in #331's review as inventing an undocumented
    completion signal and, as a side effect, making this workflow impossible
    to ever surface as the hub's `next` action. The review comment offered
    two directions: bind it to a real completion signal, or formally
-   redefine it as an always-reachable alternative. **Proposed** (pending
-   @jingizoo's confirmation): the latter, as a third status distinct from
-   both "done" and "todo" — never a candidate for the hub's `next`
-   recommendation, never blocking the hub's complete/success state, but
-   staying fully visible and reachable as its own entry point the whole
-   time. The rationale for proposing this over binding to a real signal:
+   redefine it as an always-reachable alternative. The confirmed contract
+   is the latter: a third status distinct from both "done" and "todo" —
+   never a candidate for the hub's `next` recommendation, never blocking
+   the hub's complete/success state, but staying fully visible and
+   reachable as its own entry point the whole time. The rationale:
    there is no reliable Program-scoped "has an import ever run here" signal
    to compute a real done/todo state from — two of the three import-commit
    paths (officials/availability, rinks/ice-slots) write only aggregate
    counts into their own audit summary row, no season- or program-derivable
-   field. This is implemented in PR #331 as the working assumption, but
-   remains reversible pending explicit sign-off, same as any other
-   not-yet-confirmed product decision in this section.
+   field. PR #331 implements this confirmed contract.
 10. **Migration/schema scope for import data-integrity fixes** (#331 review
-    round 12 finding 3, corrected round 13 finding 3): **open — proposed,
-    not yet confirmed.** Issue #330 explicitly lists "Any new schema,
+    round 12 finding 3, corrected round 13 finding 3): **confirmed by
+    @jingizoo (2026-07-27).** Issue #330 explicitly lists "Any new schema,
     migration, API contract…" as a non-goal for this PR.
     `commit_officials_availability_import` and
     `commit_rinks_ice_slots_import` are **pre-existing code from #94/#95,
@@ -734,23 +748,22 @@ through each section:
     Rink lock-plan-drift race, and the identical Club/Team/Player race in
     the separate `commit_teams_players_import` path from #93) the same
     migration-free way. 047/048 themselves remain the one actual schema
-    change #330 didn't anticipate. **Proposed** (pending @jingizoo's
-    confirmation): accept 047/048 as an approved, narrowly-scoped
+    change #330 didn't anticipate. The owner accepts 047/048 as an approved,
+    narrowly-scoped
     prerequisite fixing a pre-existing data-integrity bug in already-shipped
     import-commit code — not a #330 scope expansion the epic needs to
     account for elsewhere, and not new product surface this PR introduced.
-    Until confirmed, the PR body's data/rollback notes describe these
-    migrations as existing and describe the import-commit logic they touch
-    as pre-existing, not additive (both factual corrections, made
-    regardless of how this decision resolves) without claiming the scope
-    expansion itself is accepted.
+    PR #331's data/rollback notes describe these migrations as existing,
+    forward-only changes and describe the import-commit logic they touch as
+    pre-existing, not additive.
 
 ## Out of scope for this package
 
-- Any implementation code — the first implementation PR (Home/Tasks + guided
-  Setup hub) is separate and starts only after this package is validated.
-- Schedule/Facilities UX — explicitly deferred to the PR after Home/Tasks +
-  Setup hub, per the reordered plan.
+- Any implementation code — this package remains documentation-only.
+  Implementation is split between the bounded #330 / PR #331 slice and the
+  remaining Home/Tasks + guided Setup work in #345.
+- Schedule/Facilities UX — explicitly deferred until after #345, per the
+  reordered plan.
 - The bounded #287 pre-#205 deliverable — documentation/design plus a
   non-production UX prototype only (no schema, persistence, API
   mutations, notifications, or runtime state transitions; matches
@@ -764,8 +777,10 @@ through each section:
 
 ## Relationships
 
-Child of epic #204 (issue #324). Blocks the first implementation PR
-(Home/Tasks + guided Setup hub). The Schedule/Facilities UX PR follows that,
+Child of epic #204 (issue #324). Its requirements govern the bounded
+#330 / PR #331 first slice and the remaining Home/Tasks + guided Setup
+milestone in #345. PR #331's scope split does not close #204 or mark the
+transferred acceptance work complete. Schedule/Facilities UX follows #345,
 then the bounded #287 pre-#205 deliverable (documentation/design plus a
 non-production UX prototype only — no schema, persistence, API mutations,
 notifications, or runtime state transitions, matching Release 2's bar

@@ -371,7 +371,7 @@ class ApiService:
         for ``next`` and never blocks ``complete``, but the workflow stays
         fully visible and reachable the whole time, per #330. Recorded as
         decision 9 in ``docs/product/operator-ux-requirements.md``'s
-        "Product decisions requiring sign-off" section.
+        "Product decisions and sign-off" section.
         """
         program, season = self.context.resolve(user_id, role, scope)
         if program is None:

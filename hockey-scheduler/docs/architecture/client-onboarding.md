@@ -117,7 +117,7 @@ the source — exiting non-zero on any divergence. Run it after configuring a
 client and after any risky operation. See runbook *Backup/restore acceptance
 check*.
 
-## 7. Home/Tasks hub setup-progress (#204/#330)
+## 7. Home/Tasks hub setup-progress (#204/#330, PR #331 bounded slice)
 
 A second, narrower progress view sits alongside the wizard above:
 `GET /api/v2/setup/progress` (`MANAGE_ARENA` — League Admin **and** Arena
@@ -131,6 +131,15 @@ deliberately Program-wide (an integrity check with no Season dimension of
 its own, for teams); season participation and facilities are scoped further,
 to the ACTUAL resolved Season, so an older Season's registrations or granted
 ice can never mask required work in a newly-selected Season.
+
+Per the product-owner scope split confirmed on 2026-07-27, this section
+documents PR #331's bounded first slice: the Program-scoped setup-progress
+contract and Home/Tasks card, deep-links into existing Setup screens, and
+role-home regression coverage. The guided Setup hub, broader IA and
+context-filtering redesign, full state/error treatment, breakpoint
+consolidation, repository-wide accessibility gates, manual accessibility
+acceptance, and operator validation remain in #345, ahead of
+Schedule/Facilities UX.
 
 The Dashboard's Home/Tasks hub card leads with a single "Continue setup"
 primary action naming the actual next incomplete workflow and deep-linking
@@ -731,13 +740,11 @@ A third, non-code finding closed this round: issue #330 lists new schema/
 migrations as an explicit non-goal, and migrations 047/048 (added in round
 11 to fix a release-blocking data-integrity bug in already-shipped
 officials/rinks import code from #94/#95) are exactly that. Recorded as
-decision 10 in `docs/product/operator-ux-requirements.md`, proposed but
-**not** claimed as confirmed — the same pattern decision 9 already
-established for this PR, after an earlier round mistakenly treated a bug
-report as sign-off. The PR body's "Data/privacy impact" and rollback notes
-are corrected to describe the migrations as existing (a factual fix,
-independent of how the scope question resolves) rather than continuing to
-claim none exist.
+decision 10 in `docs/product/operator-ux-requirements.md`, the owner
+confirmed them on 2026-07-27 as a narrow prerequisite for the pre-existing
+import data-integrity defect. The PR body's "Data/privacy impact" and
+rollback notes describe the migrations as existing rather than claiming
+none exist.
 
 Round 12's own convergence review (#331 review round 13) found two further
 gaps in the same import-commit family, both closed without any additional
@@ -981,10 +988,9 @@ made this workflow impossible to ever surface as `next`. `"optional"` is
 never a candidate for `next` and never blocks `complete`, but the workflow
 stays fully visible on the card and independently reachable at all times via
 the persistent Import nav tab both League Admin and Arena Manager hold.
-Proposed as decision 9 in `docs/product/operator-ux-requirements.md`'s
-"Product decisions requiring sign-off" section — implemented as the working
-assumption in PR #331, but not yet confirmed by the product owner and
-reversible pending that confirmation.
+This is decision 9 in `docs/product/operator-ux-requirements.md` and was
+confirmed by @jingizoo on 2026-07-27; PR #331 implements the approved
+contract.
 
 Round 14's own convergence review (#331 review round 15) found two further
 gaps, both in the import-commit family the last several rounds have been
