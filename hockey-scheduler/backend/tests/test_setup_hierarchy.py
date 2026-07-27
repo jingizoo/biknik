@@ -76,6 +76,67 @@ class SetupHierarchyTest(unittest.TestCase):
         self.assertEqual(lv["id"], level["id"])
         self.assertEqual(lv["league_season_id"], binding.id)
 
+    def test_v2_team_node_carries_its_registration_id(self):
+        # #331 review round 19: a v2 hierarchy team node names the EXACT
+        # registration it represents, not just its team_id -- required so a
+        # consumer with two active registrations to distinguish (a Rule 7
+        # violation legacy data can leave behind) never has to reconstruct
+        # identity from a lossy (team_id, league_id) pair.
+        league, season, level, div, club, team = self._competition()
+        reg = self.api.store.registration_for_team_in_league_season(
+            self.api.store.league_season_for(level["id"], season["id"]).id,
+            team["id"])
+        h2 = self.api.get_setup_hierarchy_v2()
+        prog = next(p for p in h2["programs"] if p["id"] == league["id"])
+        division_team = prog["seasons"][0]["leagues"][0]["divisions"][0]["teams"][0]
+        self.assertEqual(division_team["registration_id"], reg.id)
+        # The PERMANENT Program->League->Team tree has no Season/registration
+        # of its own -- its team nodes carry registration_id=None, never a
+        # stale/misleading id borrowed from wherever the team happens to be
+        # registered this Season.
+        perm_team = prog["leagues"][0]["teams"][0]
+        self.assertEqual(perm_team["id"], team["id"])
+        self.assertIsNone(perm_team["registration_id"])
+
+    def test_v2_two_active_registrations_carry_distinct_registration_ids(self):
+        # #331 review round 19 finding 4: a Team with two simultaneously
+        # active registrations in one Season across two Leagues (legacy data/
+        # a write path predating Rule 7 -- register_team_for_season/
+        # assign_season_team_league/transfer_team_to_league all now refuse to
+        # create this) previously produced two structurally-IDENTICAL
+        # division-less team nodes; a consumer had no way to tell them apart.
+        league = self.api.create_program("Prog")
+        season = self.api.create_season(league["id"], "Season")
+        league_a = self.api.create_league(season["id"], "League A")
+        league_b = self.api.create_league(season["id"], "League B")
+        club = self.api.create_club("Club")
+        team = self.api.create_team(club["id"], None, "Team",
+                                    league_id=league_a["id"])
+        reg_a = self.api.register_team_for_season(
+            season["id"], team["id"], actor_id="admin",
+            league_id=league_a["id"])
+        # Planted directly -- no current write path can leave a second active
+        # row under a different League behind for a Team with a permanent
+        # League already set (the exact shape league_scope.py's own
+        # team_registration_valid docstring names).
+        from hockey_scheduler.domain import SeasonTeamRegistration
+        ls_b = self.api.store.league_season_for(league_b["id"], season["id"])
+        reg_b = SeasonTeamRegistration(
+            id=self.api.store.next_id("streg"), league_season_id=ls_b.id,
+            team_id=team["id"], division_id=None, active=True)
+        self.api.store.add_season_team_registration(reg_b)
+
+        h2 = self.api.get_setup_hierarchy_v2()
+        prog = next(p for p in h2["programs"] if p["id"] == league["id"])
+        season_node = prog["seasons"][0]
+        nodes_by_league = {
+            lv["id"]: lv["teams_without_division"] for lv in season_node["leagues"]}
+        ids_a = [t["registration_id"] for t in nodes_by_league[league_a["id"]]]
+        ids_b = [t["registration_id"] for t in nodes_by_league[league_b["id"]]]
+        self.assertEqual(ids_a, [reg_a["id"]])
+        self.assertEqual(ids_b, [reg_b.id])
+        self.assertNotEqual(reg_a["id"], reg_b.id)
+
     def test_competition_tree_nests_level_division_team(self):
         league, season, level, div, club, team = self._competition()
         self.api.create_player(team["id"], "Vince Skater", "forward")

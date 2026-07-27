@@ -26,6 +26,7 @@ from ..domain import (
     NotificationKind,
     NotificationPreference,
     NotificationRecipient,
+    Permission,
     Role,
     OfficialRole,
     ResultStatus,
@@ -33,6 +34,7 @@ from ..domain import (
     SeasonStatus,
     SlotType,
     SubstituteStatus,
+    can,
     intervals_overlap,
 )
 from ..domain.errors import (
@@ -245,6 +247,462 @@ class ApiService:
                               and sel_season.status == SeasonStatus.ARCHIVED),
             },
         }
+
+    # The permission each Setup workflow's own primary action needs (#330
+    # review round 1 finding 1). Facilities is MANAGE_ARENA — the one
+    # permission both League Admin and Arena Manager hold — like its own
+    # underlying routes (ice-slot create, the Ice Availability Builder); every
+    # other workflow's primary action (season/team/player create, season
+    # team-registration, the full import surface) requires MANAGE_SETUP,
+    # which only League Admin holds.
+    _WORKFLOW_PERMISSION = {
+        "league_season": Permission.MANAGE_SETUP,
+        "teams": Permission.MANAGE_SETUP,
+        "participation": Permission.MANAGE_SETUP,
+        "roster": Permission.MANAGE_SETUP,
+        "facilities": Permission.MANAGE_ARENA,
+        "import": Permission.MANAGE_SETUP,
+    }
+
+    @catch
+    def get_setup_progress(self, user_id, role, scope) -> dict:
+        """Program-scoped completion state for the six Setup workflows #204/
+        #330 name, for the Home/Tasks hub's "Continue setup" primary action:
+        which of the six is next incomplete AND actually actionable by the
+        caller's role, so the operator is told rather than left to infer it
+        from the data model or steered into a CTA they cannot execute (#330
+        review round 1 finding 1 — an Arena Manager, who holds MANAGE_ARENA
+        but not MANAGE_SETUP, must never be handed "Add Season").
+
+        Resolves the acting Program AND Season from the SAME active-context
+        selection as ``get_active_context`` (#159) — this is a per-user,
+        session-scoped view, unlike the installation-wide
+        ``get_setup_overview_v2``/``get_onboarding_status_v2``. No Program yet
+        (or none authorized) is a legitimate empty state, not an error: an
+        empty ``workflows`` list with ``next: None``.
+
+        Each workflow's own "done" boundary mirrors the matching
+        ``get_onboarding_status_v2`` step, scoped to this Program instead of
+        the whole installation. Season participation and facilities are
+        further scoped to the ACTUAL resolved Season, not every Season the
+        Program has (#330 review round 1 finding 2) — see the comment at
+        their computation for why "league profile and seasons" stays
+        deliberately Program-wide instead.
+
+        The response's ``workflows`` is filtered to entries this caller's
+        role can actually manage (#331 review round 3 finding 1): an Arena
+        Manager reading this alongside "facilities" must never also receive
+        League-Admin-only completion signals or exact team/registration/
+        player counts — that crosses the same role/privacy boundary
+        ``next``'s own permission filter exists to hold. ``complete`` and
+        ``next`` are still DERIVED from the FULL, unfiltered internal list
+        computed below, BEFORE that filtering step: ``complete`` means the
+        WHOLE Program's setup is done, independent of role, and must not
+        flip true just because the one workflow a caller can see happens to
+        be done.
+
+        Whether that derived value is actually EXPOSED, though, depends on
+        whether this caller's role can see the full list it was derived
+        from (#331 review round 5 finding 3): a role whose ``workflows`` is
+        narrower than the full set (today, Arena Manager) can never
+        truthfully verify a whole-Program claim, so it receives ``None``
+        rather than the real boolean — exposing the real value
+        unconditionally let a change to a workflow this caller cannot even
+        see flip a bit in their own response, leaking through the same
+        redaction boundary ``workflows`` itself exists to hold. ``None`` is
+        neither an overclaimed ``true`` (round 3's bug) nor an
+        independently meaningful ``false`` (round 5's bug) — it is constant
+        regardless of invisible state, so by construction it carries none
+        of it. A role that CAN see everything (today, only League Admin)
+        is unaffected and keeps receiving the real value. A caller with
+        nothing left THEY can act on (e.g. an Arena Manager once facilities
+        is done, while League-Admin-only workflows remain) gets
+        ``next: None`` alongside this non-``true`` ``complete`` — the
+        caller distinguishes "genuinely done" (League Admin only, real
+        ``true``) from "nothing more for you" by checking ``complete``.
+
+        ``next`` is the FIRST todo workflow, in the fixed #204 order, that
+        this caller's role can manage — filtered to what's actually safe to
+        execute right now, not merely permitted (#331 review rounds 3-5):
+        both "facilities" and "participation" need a resolved, ACTIVE
+        Season (their real writes both route through
+        ``season_guard.require_active_season`` and fail ``season_missing``
+        with none resolved, ``season_archived`` if the resolved one is
+        archived), AND each has one more hard floor beyond the Season alone
+        that would otherwise leave its CTA a guaranteed dead end —
+        "facilities" needs at least one Rink with active Season venue
+        access (``venue_access_missing`` — a preview with none provably
+        yields zero slots, and an Arena Manager cannot grant that access
+        themselves) and "participation" needs at least one Program Team
+        eligible for the resolved Season's league(s)
+        (``team_league_mismatch`` — a Team with a permanent League can only
+        register into a LeagueSeason of that same League, so with no
+        eligible Team every registration attempt is a guaranteed rejection)
+        — see ``_workflow_prerequisite_gap`` for the full detail on both.
+        The FIRST permitted-todo workflow is the one this applies to; a
+        prerequisite gap there blocks it IN PLACE rather than falling
+        through to a later, incidentally-safe workflow — #330 names "the
+        actual next incomplete step" as a strictly ordered contract, and
+        skipping ahead would silently reorder it and could read as the
+        blocked step being forgotten rather than blocked. When that first
+        workflow is safe, it is ``next``; when it is blocked, ``next`` is
+        None and ``next_blocked`` names it with a reason code and
+        human-readable guidance, so the operator is told what to resolve
+        first instead of being left to infer it (or, for a role that
+        cannot resolve it themselves — an Arena Manager blocked on a
+        Season only a League Admin can create, or on venue access only a
+        League Admin can grant — at least told clearly rather than handed
+        a CTA that silently fails).
+
+        "Imports and onboarding" reports a third ``status``, ``"optional"``,
+        instead of ``"done"``/``"todo"`` (#330 review round 1 finding 5): it
+        is a standing, always-available alternative entry point into 1-5
+        (bulk-import teams/players, officials/availability, or rinks/ice-
+        slots), not an independently gated step — unlike 1-5, there is no
+        reliable Program-scoped "has an import ever run here" signal to
+        compute a real done/todo state from (two of the three import-commit
+        paths write only aggregate counts into their own audit summary row,
+        no season- or program-derivable field — see
+        ``SetupService.commit_officials_availability_import``/
+        ``commit_rinks_ice_slots_import``). Deriving "done" from whether 1-5
+        happen to all be done (the prior shape) was an invented rule with no
+        such grounding, and made it impossible for this step to ever be
+        surfaced as ``next`` on its own. ``"optional"`` is never a candidate
+        for ``next`` and never blocks ``complete``, but the workflow stays
+        fully visible and reachable the whole time, per #330. Recorded as
+        decision 9 in ``docs/product/operator-ux-requirements.md``'s
+        "Product decisions and sign-off" section.
+        """
+        program, season = self.context.resolve(user_id, role, scope)
+        if program is None:
+            return {"program_id": None, "program": None, "workflows": [],
+                    "next": None, "next_blocked": None, "complete": False}
+
+        seasons = self.store.seasons_for_program(program.id)
+        season_ids = {s.id for s in seasons}
+        leagues = self.store.leagues_for_program(program.id)
+        program_league_seasons = [ls for ls in self.store.all_league_seasons()
+                                  if ls.season_id in season_ids]
+        teams = self.store.teams_for_program(program.id)
+        team_ids = {t.id for t in teams}
+        # Participation and facilities are inherently per-Season concepts —
+        # narrowed to the RESOLVED active Season's own LeagueSeasons/venue
+        # access below, never every Season the Program has, so an older
+        # Season's registrations or granted ice can't mask required work in
+        # a newly-selected Season (#330 review round 1 finding 2). No Season
+        # resolved (a Program-only context) means neither can be done yet.
+        season_ls_ids = ({ls.id for ls in program_league_seasons
+                          if ls.season_id == season.id} if season else set())
+        # The resolved Season's own League ids (via its LeagueSeasons) --
+        # used below by _workflow_prerequisite_gap to check whether ANY
+        # Program Team is even eligible to register here (#331 review round
+        # 5 finding 2): a Team with a permanent League can only ever
+        # register into a LeagueSeason of that same League
+        # (register_team_for_season rule 7, team_league_mismatch), so if no
+        # Team's permanent League appears here (and none is league-less),
+        # every possible registration attempt in this Season is a
+        # guaranteed rejection.
+        season_league_ids = ({ls.league_id for ls in program_league_seasons
+                              if ls.season_id == season.id} if season else set())
+
+        workflows = []
+
+        def add(key, label, done, detail, primary_action, *, attention=None):
+            entry = {
+                "key": key, "label": label,
+                "status": "done" if done else "todo",
+                "detail": detail, "primary_action": primary_action}
+            # #331 review round 19: additive and independent of `status` --
+            # a workflow can be legitimately "done" (some row IS valid and
+            # schedulable) while ALSO having other row(s) that need cleanup.
+            # Folding that into `status`/`detail` would either falsely
+            # reopen a genuinely complete workflow or silently bury the
+            # signal in prose a screen reader user can't act on; a caller
+            # that doesn't know this field simply never sees it, same as
+            # `next_blocked` being absent when nothing is blocked.
+            if attention:
+                entry["attention"] = attention
+            workflows.append(entry)
+
+        # 1. League profile and seasons: every Season this Program has must
+        # carry at least one grouping League. Deliberately Program-wide, NOT
+        # scoped to the selected Season like participation/facilities below:
+        # this is an integrity check ("does EVERY Season have a League"),
+        # mirroring get_onboarding_status_v2's own "league" step exactly, not
+        # a per-selected-Season fact.
+        seasons_without_league = [
+            s for s in seasons
+            if s.id not in {ls.season_id for ls in program_league_seasons}]
+        league_done = bool(seasons) and not seasons_without_league
+        add("league_season", "League profile and seasons", league_done,
+            (f"{len(seasons)} season(s), {len(leagues)} league(s)"
+             if seasons else "No season created yet."),
+            "Add Season")
+
+        # 2. Permanent teams — Program-level, no Season dimension at all.
+        add("teams", "Permanent teams", bool(teams),
+            f"{len(teams)} team(s)" if teams else "No team added yet.",
+            "Add Team")
+
+        # 3. Season participation/divisions: at least one active
+        # registration, IN THE SELECTED SEASON, whose League resolves and
+        # whose Team is this Program's, with any Division agreeing with the
+        # registration's League+Season — same validity rule as
+        # get_onboarding_status_v2's "participation" step, scoped further to
+        # one Season here.
+        divisions_by_id = {d.id: d for d in self.store.all_divisions()}
+        schedulable = 0
+        # #331 review round 19: a registration this loop excludes from
+        # `schedulable` isn't necessarily irrelevant -- an active row that
+        # fails the Rule 7 League match is exactly the shape of stray
+        # cross-League row `get_onboarding_status_v2`'s own "participation"
+        # step already tracks as `invalid_regs` and reports via its
+        # "invalid_registrations" blocker. This step previously dropped the
+        # identical row with no signal at all: a Team with one genuinely
+        # valid registration (elsewhere) reports "done" here with no way
+        # for an operator to discover the OTHER row still needs cleanup.
+        # Counted separately from `schedulable` (never merged into it, and
+        # never changes `status`/`done`) -- an operator who has already
+        # achieved real, valid participation must still see "done", just
+        # ALSO see that something else needs attention.
+        needs_attention = 0
+        # #331 review round 21 finding 2: resolved per-TEAM through the
+        # shared `team_registration_valid` resolver, not per-row against its
+        # own League alone (round 18's check, replaced here). A row that
+        # matches its Team's permanent League in isolation is NOT
+        # schedulable if the Team ALSO holds another active row elsewhere
+        # this Season, in any League -- the identical unconditional
+        # season-wide conflict `create_game`/`move_game`/`publish_game`
+        # already fail closed on (round 20). The per-row check asked only
+        # "does THIS row's League match its Team" and had no way to see a
+        # SECOND active row at a different LeagueSeason, so it counted a
+        # Team's conflicted row as `schedulable` while the live-scheduling
+        # resolver would reject every game that Team plays in -- exactly
+        # the reproduction this round names. Memoized per Team (not
+        # recomputed per row): a Team can hold more than one row among this
+        # Season's LeagueSeasons -- the active stray this fixes, or a
+        # historical inactive one already excluded by the `.active` guard
+        # above, which must keep reading complete on its own.
+        resolved_by_team = {}
+        attention_ids = []
+        for reg in self.store.all_season_team_registrations():
+            if not reg.active or reg.team_id not in team_ids:
+                continue
+            if reg.league_season_id not in season_ls_ids:
+                continue
+            if reg.team_id not in resolved_by_team:
+                resolved_by_team[reg.team_id] = team_registration_valid(
+                    self.store, season, reg.team_id, require_division=False)
+            live = resolved_by_team[reg.team_id]
+            if live is None or live.id != reg.id:
+                needs_attention += 1
+                attention_ids.append(reg.id)
+                continue
+            if reg.division_id:
+                division = divisions_by_id.get(reg.division_id)
+                if division is None or division.league_season_id != reg.league_season_id:
+                    needs_attention += 1
+                    attention_ids.append(reg.id)
+                    continue
+            schedulable += 1
+        add("participation", "Season participation and divisions",
+            schedulable > 0,
+            (f"{schedulable} schedulable registration(s)" if schedulable
+             else "No team registered to play yet."),
+            "Register Team",
+            attention=(
+                {"reason": "invalid_registrations", "count": needs_attention,
+                 "affected_registration_ids": attention_ids,
+                 "detail": (
+                     f"{needs_attention} registration(s) in this season "
+                     "don't match their team's permanent league or "
+                     "division; resolve them in Season participation.")}
+                if needs_attention else None))
+
+        # 4. Clubs, players and staff: at least one player on one of this
+        # Program's teams. Program-level like Teams — a Player belongs to a
+        # Team, never a Season directly.
+        program_players = [p for p in self.store.all_players()
+                           if p.team_id in team_ids]
+        add("roster", "Clubs, players and staff", bool(program_players),
+            (f"{len(program_players)} player(s)" if program_players
+             else "No player added yet."),
+            "Add Player")
+
+        # 5. Venues, rinks and ice: at least one available GAME slot at a
+        # rink whose Venue holds active SeasonVenueAccess to the SELECTED
+        # Season specifically (not any of the Program's Seasons).
+        venue_access_venue_ids = ({
+            a.venue_id for a in self.store.all_season_venue_access()
+            if a.active and a.season_id == season.id} if season else set())
+        schedulable_rink_ids = {
+            r.id for r in self.store.all_rinks()
+            if r.venue_id in venue_access_venue_ids}
+        available_game_slots = [
+            s for s in self.store.all_ice_slots()
+            if s.rink_id in schedulable_rink_ids
+            and s.slot_type == IceSlotType.GAME
+            and s.status == IceSlotStatus.AVAILABLE]
+        add("facilities", "Venues, rinks and ice", bool(available_game_slots),
+            (f"{len(available_game_slots)} available game slot(s)"
+             if available_game_slots else "No available game ice slot yet."),
+            "Add Ice")
+
+        # 6. Imports and onboarding — see docstring: "optional", not
+        # done/todo, since there is no real Program-scoped completion signal
+        # to compute either from.
+        workflows.append({
+            "key": "import", "label": "Imports and onboarding",
+            "status": "optional",
+            "detail": "Bulk-import league, team, or ice data.",
+            "primary_action": "Import data"})
+
+        complete = all(w["status"] == "done" for w in workflows
+                       if w["status"] != "optional")
+
+        # #331 review round 3/4 finding 1: `next` is the FIRST todo workflow
+        # this role can manage, in the fixed #204 order -- #330's "actual
+        # next incomplete step" is a strictly ordered contract, not "the
+        # first one that happens to be safe". A prerequisite gap on that
+        # one workflow blocks it in place; it is never skipped in favor of
+        # a LATER todo workflow that happens to be unblocked (round 4
+        # review: doing so silently reordered the sequence and could read
+        # as "participation was skipped/forgotten" instead of "blocked,
+        # here's why"). Permission still filters candidacy exactly as
+        # before (round 1) -- only the FIRST permitted one is ever
+        # considered, whether that turns out safe or blocked.
+        # Prerequisite context for _workflow_prerequisite_gap (#331 review
+        # round 5 findings 1/2), computed once here rather than re-derived
+        # inside a static method: `schedulable_rink_ids` is exactly the set
+        # already computed for facilities' own done/todo check above (a Rink
+        # is a candidate ice-generation target only via that same active
+        # SeasonVenueAccess), and `team_league_eligible` mirrors
+        # register_team_for_season's own rule 7.
+        team_league_eligible = any(
+            t.league_id is None or t.league_id in season_league_ids
+            for t in teams)
+        next_incomplete = None
+        next_blocked = None
+        for w in workflows:
+            if w["status"] != "todo" or not can(role, self._WORKFLOW_PERMISSION[w["key"]]):
+                continue
+            gap = self._workflow_prerequisite_gap(
+                w["key"], season, schedulable_rink_ids, team_league_eligible)
+            if gap is None:
+                next_incomplete = w
+            else:
+                reason, detail = gap
+                next_blocked = {"key": w["key"], "label": w["label"],
+                                 "reason": reason, "detail": detail}
+            break
+
+        # Redact workflows this caller's role cannot manage from the
+        # response (#331 review round 3 finding 1) -- computed from the full
+        # list above only AFTER complete/next_incomplete are already
+        # resolved internally, so an Arena Manager's narrower view can never
+        # change either of those INTERNAL values.
+        visible_workflows = [w for w in workflows
+                              if can(role, self._WORKFLOW_PERMISSION[w["key"]])]
+
+        # #331 review round 5 finding 3: `complete` (computed above from the
+        # FULL, unfiltered list) must not be EXPOSED to a role whose visible
+        # slice is narrower than that full list -- round 3 already held its
+        # raw value to the full list so it could never overclaim true just
+        # because the caller's own narrower slice happened to be done, but
+        # exposing that value unconditionally still let a change to a
+        # workflow this caller cannot even see flip a bit in THEIR own
+        # response -- an information leak through the very redaction
+        # boundary `workflows` itself exists to hold. A role that cannot
+        # see the full list can also never truthfully VERIFY a claim about
+        # the whole Program, so it gets `None` instead: neither `true`
+        # (would overclaim, the round 3 bug) nor a real, independently
+        # meaningful `false` (would still leak the invisible signal) --
+        # `None` is constant regardless of invisible state, so by
+        # construction it can carry none of it. A role that CAN see
+        # everything (today, only League Admin -- MANAGE_SETUP AND
+        # MANAGE_ARENA) is completely unaffected: its `visible_workflows`
+        # already equals the full list, so it keeps receiving the real,
+        # verifiable value exactly as before.
+        role_sees_every_workflow = len(visible_workflows) == len(workflows)
+
+        return {
+            "program_id": program.id, "program": _serialize(program),
+            "workflows": visible_workflows,
+            "next": next_incomplete,
+            "next_blocked": next_blocked,
+            "complete": complete if role_sees_every_workflow else None,
+        }
+
+    @staticmethod
+    def _workflow_prerequisite_gap(key, season, schedulable_rink_ids,
+                                   team_league_eligible):
+        """None if `key`'s primary action is safe to execute given the
+        resolved Season context; otherwise (reason, detail) describing what
+        must change first (#331 review rounds 3-5). Mirrors the exact
+        conditions the real writes enforce, read-only -- never mutates or
+        row-locks, unlike the guards it mirrors.
+
+        Both "facilities" (``SetupService.commit_ice_availability``, behind
+        the Ice Availability Builder) and "participation"
+        (``register_team_for_season``) route through
+        ``season_guard.require_active_season``, so both fail identically at
+        the Season level: ``season_missing`` with no Season resolved
+        (nothing to generate ice into / no season to register a team for --
+        also true for "participation" specifically because its own real
+        destination, ``focusParticipationRegisterControl()``, needs an exact
+        selected Season to deep-link/focus a specific Register control; with
+        none resolved it can only fall back to a generic, unbound landing on
+        the Setup tree, not the precise binding #330's round-2 review
+        already required), and ``season_archived`` if the resolved one is
+        archived (read-only until an authorized reopen).
+
+        Beyond the Season itself, each has one more hard floor that makes
+        its CTA a guaranteed dead end even with an active Season resolved
+        (#331 review round 5 findings 1/2) -- both are existence checks the
+        real write also has no way around, not heuristics:
+
+        - "facilities": ``schedulable_rink_ids`` (the Rinks reachable via
+          active ``SeasonVenueAccess`` for the resolved Season -- the exact
+          set ``get_setup_progress`` already computes for facilities' own
+          done/todo check) must be non-empty. With none, every rink the
+          builder could offer lands in ``venue_access_missing``, so a
+          preview provably generates zero slots no matter what the operator
+          picks -- and an Arena Manager, who holds MANAGE_ARENA but not
+          MANAGE_SETUP, cannot grant that access themselves, making this a
+          true dead end rather than a gap the same role could close.
+        - "participation": ``team_league_eligible`` (whether any of this
+          Program's Teams has no permanent League yet, or a permanent
+          League that matches one of the resolved Season's own
+          LeagueSeasons) must be true. A Team WITH a permanent League can
+          only ever register into a LeagueSeason of that same League (rule
+          7); if none of the Program's Teams qualify, every possible
+          registration in this Season is a guaranteed
+          ``team_league_mismatch`` rejection, regardless of which team the
+          operator picks in the control.
+
+        Every other workflow's primary action (Add Season, Add Team, Add
+        Player, Import data) has no Season prerequisite of its own."""
+        if key not in ("facilities", "participation"):
+            return None
+        action = "adding ice" if key == "facilities" else "registering teams"
+        if season is None:
+            return ("season_missing", f"Create or select a Season before {action}.")
+        if season.status == SeasonStatus.ARCHIVED:
+            return ("season_archived",
+                    f"Season '{season.name}' is archived and read-only — "
+                    f"reopen it or select an active Season before {action}.")
+        if key == "facilities" and not schedulable_rink_ids:
+            return ("venue_access_missing",
+                    f"No rink has venue access granted for Season "
+                    f"'{season.name}' yet — a League Admin must grant "
+                    f"access to at least one rink before ice can be added.")
+        if key == "participation" and not team_league_eligible:
+            return ("team_league_mismatch",
+                    f"No permanent team is eligible to register in Season "
+                    f"'{season.name}' yet — add a team under a matching "
+                    f"league, or add a league to this season that matches "
+                    f"an existing team, before registering teams.")
+        return None
 
     # -- competition-hierarchy resolution (#283) ---------------------------
     # After the #283 model change a League is a permanent child of a Program
@@ -1445,7 +1903,18 @@ class ApiService:
             # is structurally impossible now — the League need only resolve.
             league_ok = league is not None
             team = teams_by_id.get(reg.team_id)
-            team_ok = team is not None and team.program_id == season.program_id
+            # #331 review round 18: Program membership alone is not enough --
+            # the registration must sit in the Team's OWN permanent League
+            # (Rule 7), the same invariant register_team_for_season and
+            # team_registration_valid (the shared live-scheduling resolver)
+            # both enforce. transfer_team_to_league deliberately leaves an
+            # archived/ended Season's active registration frozen at its OLD
+            # League while Team.league_id moves on (history preservation) --
+            # exactly the same-Program cross-League drift that must never be
+            # counted as schedulable here, since create_game/move/publish
+            # would reject it outright.
+            team_ok = (team is not None and team.program_id == season.program_id
+                      and team.league_id and team.league_id == ls.league_id)
             div_ok = True
             if reg.division_id:
                 division = divisions_by_id.get(reg.division_id)
@@ -3451,14 +3920,31 @@ class ApiService:
         and agree with a named division's league — a wrong-season / cross-league
         / missing-Team / missing-League / **league-less** row is never exposed
         to the operational UI (e.g. the game-scheduling wizard, #233 B2c).
+
+        #331 review round 19: ``team_registration_valid`` answers "does this
+        TEAM have a valid registration in this season", resolved via the
+        Team's OWN permanent League -- not "is THIS row (``r``) the valid
+        one". For a Team with a genuinely valid registration under its
+        permanent League PLUS a stray active row under a different League
+        (legacy data / a write path predating Rule 7 -- the same shape
+        ``league_scope.team_registration_valid``'s own docstring names),
+        calling this with the STRAY row still resolves the OTHER, valid row
+        and returns non-``None`` -- so both rows were reported operational,
+        each under its own (different) ``league_id``, in a view whose whole
+        purpose is deciding what's safe to schedule against. Comparing the
+        resolved row's identity back to ``r`` makes this answer "is THIS
+        row" rather than "does the Team have SOME row", the same row-vs-
+        team distinction ``exact_registration_or_conflict`` draws for exact-
+        key lookups.
         """
         # Season + competition League now resolve through the LeagueSeason (#283).
         ls = self._resolve_ls(r.league_season_id)
         if ls is None:
             return False
         season = self.store.get_season(ls.season_id)
-        if team_registration_valid(
-                self.store, season, r.team_id, r.division_id) is None:
+        valid_reg = team_registration_valid(
+            self.store, season, r.team_id, r.division_id)
+        if valid_reg is None or valid_reg.id != r.id:
             return False
         if r.division_id is not None:
             division = self.store.get_division(r.division_id)
@@ -4045,9 +4531,23 @@ class ApiService:
                 if sid is not None:
                     regs_by_season.setdefault(sid, []).append(reg)
 
-        def team_node(t):
+        def team_node(t, registration_id=None):
+            # #331 review round 19: ``registration_id`` is the SPECIFIC active
+            # SeasonTeamRegistration this node represents -- ``None`` for the
+            # permanent Program->League->Team tree below (no Season/
+            # registration involved there), and the exact row's id for every
+            # Season-participation node (division-nested or league-direct).
+            # A Team with two active registrations in one Season (a Rule 7
+            # violation legacy data/a write path predating Rule 7 can leave
+            # behind) previously produced two structurally-identical nodes a
+            # consumer could only re-associate with a lossy (team_id,
+            # league_id) reconstruction -- exactly the shape
+            # renderSeasonParticipation's own regByTeamLeague keying (#331
+            # review round 18) has to guess at. Carrying the row's own id
+            # lets a consumer key off it directly instead of guessing.
             return {"id": t.id, "name": t.name, "club_id": t.club_id,
                     "program_id": t.program_id,
+                    "registration_id": registration_id,
                     "player_count": player_count.get(t.id, 0)}
 
         # #283 Slice B: the PERMANENT Program → League → Team structure (the
@@ -4087,8 +4587,8 @@ class ApiService:
                 # Resolve every active registration in this Season into exactly
                 # one bucket: a valid Division nest, a valid League-direct team,
                 # or an invalid (needs-assignment) row.
-                teams_by_div = {}                 # division_id -> [team]
-                teams_direct_by_league = {}       # league_id  -> [team]
+                teams_by_div = {}                 # division_id -> [(team, reg)]
+                teams_direct_by_league = {}       # league_id  -> [(team, reg)]
                 needs_assignment_regs = []
                 for reg in regs_by_season.get(s.id, []):
                     # The registration's competition League now resolves via its
@@ -4122,7 +4622,7 @@ class ApiService:
                         if (div is not None
                                 and div.league_season_id == reg.league_season_id
                                 and reg_league_id in league_ids):
-                            teams_by_div.setdefault(div.id, []).append(tm)
+                            teams_by_div.setdefault(div.id, []).append((tm, reg))
                         else:
                             needs_assignment_regs.append(
                                 {"registration_id": reg.id, "team_id": reg.team_id,
@@ -4134,7 +4634,7 @@ class ApiService:
                         # League when that League is a real League in this Season.
                         if reg_league_id in league_ids:
                             teams_direct_by_league.setdefault(
-                                reg_league_id, []).append(tm)
+                                reg_league_id, []).append((tm, reg))
                         else:
                             needs_assignment_regs.append(
                                 {"registration_id": reg.id, "team_id": reg.team_id,
@@ -4146,8 +4646,8 @@ class ApiService:
                     return {"id": d.id, "name": d.name, "age_group": d.age_group,
                             "league_id": self._league_id_via(
                                 ls_by_id, d.league_season_id),
-                            "teams": [team_node(t)
-                                      for t in teams_by_div.get(d.id, [])]}
+                            "teams": [team_node(t, reg.id)
+                                      for t, reg in teams_by_div.get(d.id, [])]}
 
                 league_nodes = [
                     {"id": lv.id, "name": lv.name, "sort_order": lv.sort_order,
@@ -4161,8 +4661,8 @@ class ApiService:
                      # Division-optional: teams registered directly under this
                      # League with no Division.
                      "teams_without_division": [
-                         team_node(t)
-                         for t in teams_direct_by_league.get(lv.id, [])]}
+                         team_node(t, reg.id)
+                         for t, reg in teams_direct_by_league.get(lv.id, [])]}
                     for lv in season_leagues
                 ]
                 # Parentless / dangling Divisions (no League, or a League that

@@ -126,7 +126,14 @@ class MigrationApplyTest(unittest.TestCase):
             cur.execute("ALTER TABLE games DROP COLUMN is_draft")  # #86 additive col
             cur.execute("ALTER TABLE teams DROP COLUMN external_ref")  # #93 additive col
             cur.execute("ALTER TABLE players DROP COLUMN external_ref")  # #93 additive col
+            # #331 review round 11: officials.external_ref and rinks.external_ref
+            # each gained a unique index (migrations 047/048) after #94/#95
+            # first added the columns, so a legacy DB has neither the index
+            # nor the column -- same as the #173/#174 columns below, drop the
+            # index before the indexed column (SQLite rejects dropping one).
+            cur.execute("DROP INDEX IF EXISTS ux_officials_external_ref")
             cur.execute("ALTER TABLE officials DROP COLUMN external_ref")  # #94 additive col
+            cur.execute("DROP INDEX IF EXISTS ux_rinks_external_ref")
             cur.execute("ALTER TABLE rinks DROP COLUMN external_ref")  # #95 additive col
             cur.execute("ALTER TABLE venues DROP COLUMN organization_id")  # #166 additive col
             cur.execute("ALTER TABLE divisions DROP COLUMN level_id")  # #166 additive col

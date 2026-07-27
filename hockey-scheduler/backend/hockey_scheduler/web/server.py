@@ -169,6 +169,7 @@ _GET_ROUTES = [re.compile(p) for p in (
     r"^/api/onboarding/status$",
     r"^/api/v2/setup/overview$",
     r"^/api/v2/setup/hierarchy$",
+    r"^/api/v2/setup/progress$",
     r"^/api/v2/setup/programs/[^/]+/teams$",
     r"^/api/v2/setup/seasons/[^/]+/team-registrations$",
     r"^/api/v2/setup/seasons/[^/]+/venue-access$",
@@ -1035,6 +1036,32 @@ class Handler(BaseHTTPRequestHandler):
             if self._operator_only("/api/v2/setup/player"):
                 return
             return self._send_api(api.get_setup_hierarchy_v2())
+        if path == "/api/v2/setup/progress":
+            # Home/Tasks hub setup-progress (#330): the six Setup workflows'
+            # completion state for the operator's ACTIVE Program (#159
+            # context) — unlike its siblings above this is a per-user read,
+            # so it needs a real session (not the identity-less X-Demo-Role/
+            # headerless demo fallbacks _operator_only alone would accept)
+            # to have a context selection to resolve, same requirement as
+            # /api/context itself.
+            role, scope, user_id, err = self._resolve_role()
+            if err is not None:
+                code, payload = err
+                return self._send_json(payload, code)
+            if user_id is None:
+                return self._send_json({"error": {
+                    "code": "unauthorized",
+                    "message": "A signed-in account is required."}}, 401)
+            if not authorize(role, "/api/v2/setup/progress"):
+                perm = required_permission("/api/v2/setup/progress")
+                return self._send_json({"error": {
+                    "code": "forbidden",
+                    "message": (f"Your role ({ROLE_LABELS[role]}) can't do "
+                                f"this (requires {perm.value})."),
+                    "details": {"role": role.value,
+                                "required": perm.value if perm else None},
+                }}, 403)
+            return self._send_api(api.get_setup_progress(user_id, role, scope))
         mpt = re.match(r"^/api/v2/setup/programs/([^/]+)/teams$", path)
         if mpt:
             if self._operator_only("/api/v2/setup/player"):

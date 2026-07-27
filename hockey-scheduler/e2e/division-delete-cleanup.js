@@ -133,13 +133,13 @@ async function checkViewport(browser, viewport) {
 
     await page.click('.tab[data-tab="setup"]');
     await page.waitForFunction(
-      (sel) => !!document.querySelector(sel), `#reg-team-${fx.league}`, { timeout: 15000 });
+      (sel) => !!document.querySelector(sel), `#reg-team-${fx.season}-${fx.league}`, { timeout: 15000 });
 
     // (1) Register two teams into divClean through the real Season
     // participation panel.
     const registerVia = async (teamId) => {
-      await page.selectOption(`#reg-team-${fx.league}`, teamId);
-      await page.selectOption(`#reg-div-add-${fx.league}`, fx.divClean);
+      await page.selectOption(`#reg-team-${fx.season}-${fx.league}`, teamId);
+      await page.selectOption(`#reg-div-add-${fx.season}-${fx.league}`, fx.divClean);
       const resp = page.waitForResponse((r) =>
         r.url() === `${base}/api/v2/setup/seasons/${fx.season}/team-registrations`
         && r.request().method() === "POST");
@@ -150,7 +150,7 @@ async function checkViewport(browser, viewport) {
     };
     const reg1 = await registerVia(fx.team1);
     await page.waitForFunction(
-      (sel) => !!document.querySelector(sel), `#reg-team-${fx.league}`, { timeout: 15000 });
+      (sel) => !!document.querySelector(sel), `#reg-team-${fx.season}-${fx.league}`, { timeout: 15000 });
     const reg2 = await registerVia(fx.team2);
 
     // Remove BOTH from the season — the UI now shows 0 active teams under
@@ -220,9 +220,9 @@ async function checkViewport(browser, viewport) {
     // mutation.
     await page.click('.tab[data-tab="setup"]');
     await page.waitForFunction(
-      (sel) => !!document.querySelector(sel), `#reg-team-${fx.league}`, { timeout: 15000 });
-    await page.selectOption(`#reg-team-${fx.league}`, fx.teamActive);
-    await page.selectOption(`#reg-div-add-${fx.league}`, fx.divActive);
+      (sel) => !!document.querySelector(sel), `#reg-team-${fx.season}-${fx.league}`, { timeout: 15000 });
+    await page.selectOption(`#reg-team-${fx.season}-${fx.league}`, fx.teamActive);
+    await page.selectOption(`#reg-div-add-${fx.season}-${fx.league}`, fx.divActive);
     const activeRegResp = page.waitForResponse((r) =>
       r.url() === `${base}/api/v2/setup/seasons/${fx.season}/team-registrations`
       && r.request().method() === "POST");

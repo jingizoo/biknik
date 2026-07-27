@@ -268,15 +268,37 @@ function hierarchyResultHtml() {
         <div class="li-sub">Created ${counts.created} · Updated ${counts.updated} · Skipped ${counts.skipped}</div></div></div>`).join("")
     : Object.entries(result.entities || {}).map(([name, count]) => `<div class="li">
         <div class="li-main"><div class="li-title">${esc(name)}</div><div class="li-sub">${count} row(s) resolved</div></div></div>`).join("");
-  const problems = errors.map((item) => `<li><code>${esc(item.sheet)}:${item.row}</code> ${esc(item.message)}</li>`).join("");
-  const cautions = warnings.map((item) => `<li>${esc(item.message)}</li>`).join("");
+  // #331 review round 19: shares the app.js renderImportRows() renderer
+  // instead of its own inline <li> mapping. This panel is a SEPARATE
+  // renderer from renderImportReport/renderImportResult (also
+  // renderImportRows callers) -- it's the one the real hierarchy commit
+  // panel calls, and round 18's affected-id fix (idList: renders
+  // affected_registration_ids/affected_game_ids) never touched it, so a
+  // team_registration_conflict (or any other reason naming exact
+  // conflicting rows) surfaced here with no way to identify which rows.
+  // Sharing the renderer instead of re-fixing this file's own copy keeps
+  // both panels' error/warning shape identical (sheet/row/field/message/
+  // affected ids) by construction, never just by convention.
+  // #331 review round 19: shares the app.js renderImportRows() renderer
+  // instead of its own inline <li> mapping. This panel is a SEPARATE
+  // renderer from renderImportReport/renderImportResult (also
+  // renderImportRows callers) -- it's the one the real hierarchy commit
+  // panel calls, and round 18's affected-id fix (idList: renders
+  // affected_registration_ids/affected_game_ids) never touched it, so a
+  // team_registration_conflict (or any other reason naming exact
+  // conflicting rows) surfaced here with no way to identify which rows.
+  // Sharing the renderer instead of re-fixing this file's own copy keeps
+  // both panels' error/warning shape identical (sheet/row/field/message/
+  // affected ids) by construction, never just by convention.
+  const problems = renderImportRows(errors, "error");
+  const cautions = renderImportRows(warnings, "warn");
   const kind = errors.length ? "alert" : result.committed ? "ok" : "neutral";
   const title = errors.length ? "Validation blocked the batch" : result.committed ? "Hierarchy committed" : "Hierarchy validation passed";
   return `<div class="banner ${kind}"><h2>${title}</h2>
       <p>${errors.length ? `${errors.length} error(s); nothing was written.` : "All cross-file references are valid."}</p></div>
     ${rows ? `<div class="card">${rows}</div>` : ""}
-    ${problems ? `<div class="card"><div class="section-title">Errors</div><ul>${problems}</ul></div>` : ""}
-    ${cautions ? `<div class="card"><div class="section-title">Warnings</div><ul>${cautions}</ul></div>` : ""}`;
+    ${problems ? `<div class="card"><div class="section-title">Errors</div>${problems}</div>` : ""}
+    ${cautions ? `<div class="card"><div class="section-title">Warnings</div>${cautions}</div>` : ""}`;
 }
 
 // -- the seven locked questions (#260 review) -------------------------------

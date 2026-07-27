@@ -157,6 +157,7 @@ jobs:
           node --check hockey-scheduler/e2e/onboarding-wizard.js
           node --check hockey-scheduler/e2e/hierarchy-import.js
           node --check hockey-scheduler/e2e/season-participation.js
+          node --check hockey-scheduler/e2e/hierarchy-duplicate-registration.js
           node --check hockey-scheduler/e2e/season-rollover.js
           node --check hockey-scheduler/e2e/team-division-participation.js
           node --check hockey-scheduler/e2e/scheduler-empty-state.js
@@ -183,6 +184,9 @@ jobs:
           node --check hockey-scheduler/e2e/season-dates.js
           node --check hockey-scheduler/e2e/season-fmt-unit.js
           node --check hockey-scheduler/e2e/scheduling-policy.js
+          node --check hockey-scheduler/e2e/home-tasks-hub.js
+          node --check hockey-scheduler/e2e/role-home-journeys.js
+          node --check hockey-scheduler/e2e/setup-progress-conflict-attention.js
       - name: Check v1 route contract (#233 B2c)
         run: node hockey-scheduler/e2e/check-v1-route-contract.js
       - name: Season date formatter unit regression (#272)
@@ -210,13 +214,13 @@ jobs:
         # runner.
         include:
           - shard: 1
-            scripts: "smoke setup-claim onboarding-wizard hierarchy-import season-participation season-rollover season-dates scheduling-policy"
+            scripts: "smoke setup-claim onboarding-wizard hierarchy-import season-participation hierarchy-duplicate-registration season-rollover season-dates scheduling-policy"
           - shard: 2
             scripts: "team-division-participation scheduler-empty-state scheduler-already-scheduled allowed-venues venue-access-cleanup venue-sharing permanent-teams player-edit"
           - shard: 3
-            scripts: "safe-destructive destructive-surfaces reset-visibility factory-reset demo-lifecycle api-error-resilience ice-availability-builder context-switcher"
+            scripts: "safe-destructive destructive-surfaces reset-visibility factory-reset demo-lifecycle api-error-resilience ice-availability-builder context-switcher role-home-journeys"
           - shard: 4
-            scripts: "v1-dependency-proof team-club-optional division-delete-cleanup registration-cleanup records-delete coach-scope player-lifecycle"
+            scripts: "v1-dependency-proof team-club-optional division-delete-cleanup registration-cleanup records-delete coach-scope player-lifecycle home-tasks-hub setup-progress-conflict-attention"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

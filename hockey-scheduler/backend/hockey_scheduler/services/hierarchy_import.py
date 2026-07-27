@@ -24,7 +24,7 @@ from datetime import timezone
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from ..domain.enums import Position
-from ..domain.errors import ValidationError
+from ..domain.errors import ConcurrencyConflictError, ValidationError
 from ..domain.jersey import (
     MAX_JERSEY_NUMBER,
     MIN_JERSEY_NUMBER,
@@ -33,7 +33,15 @@ from ..domain.jersey import (
 # The season-boundary parser + timezone resolver are shared with the interactive
 # create_season path (#272) so manual setup and this import normalize dates
 # identically. setup_service does not import this module, so there is no cycle.
-from .setup_service import parse_season_boundary, resolve_timezone
+# _HierarchyTeamOrPlayerDrifted (#331 review round 14 finding 3) is this
+# commit's own internal retry signal, raised by upsert_imported_team/
+# upsert_imported_player and caught by commit_hierarchy_import below.
+from .setup_service import (
+    _HierarchyTeamOrPlayerDrifted,
+    parse_season_boundary,
+    resolve_team_registration_for_import,
+    resolve_timezone,
+)
 
 
 HIERARCHY_SHEET_NAMES = (
@@ -1033,19 +1041,44 @@ def _preflight_reassignment_safety(store, rows, now=None) -> List[dict]:
     # (b) A registration's LEAGUE or DIVISION move must not strand committed
     #     games (#260 review: league_code is now an explicit, changeable
     #     registration field, not just division_code).
+    league_id_by_code = {code: lid for lid, code in league_code_by_id.items()}
     for index, row in enumerate(rows["registrations"], start=1):
         season = seasons.get(_clean(row.get("season_code")))
         team = teams.get(_clean(row.get("team_code")))
         if season is None or team is None:
             continue  # a new season/team has no existing registration to move
-        # #283: registration_for_team_in_season is gone; a Team registers per
-        # LeagueSeason, so find its row among the Season's registrations.
-        reg = next((r for r in store.registrations_for_season(season.id)
-                    if r.team_id == team.id), None)
-        if reg is None:
-            continue  # a genuinely new registration moves nothing
         new_league_code = _clean(row.get("league_code"))
         new_division_code = _clean(row.get("division_code"))
+        # #331 review round 18: resolved by exact (team, target LeagueSeason)
+        # identity -- and, only when the Team has no row there yet, its SOLE
+        # other active registration in this Season -- never the first
+        # registration registrations_for_season happens to return, which
+        # could cannibalize an inactive HISTORICAL row (destroying what
+        # transfer_team_to_league deliberately preserved) or collide with an
+        # already-correct different active one. Shared with upsert_imported_
+        # registration's own apply-time resolution (the same module-level
+        # resolve_team_registration_for_import) so this gate and that apply
+        # can never derive different answers for the identical row. A
+        # league_code naming a League not yet created in this SAME batch
+        # resolves to target_league_id=None, which the shared resolver
+        # already treats safely: no LeagueSeason can match it, so the
+        # Team's other active registration (if exactly one) is still
+        # correctly identified as the row being compared against.
+        target_league_id = league_id_by_code.get(new_league_code)
+        reg, _is_move, conflict_ids = resolve_team_registration_for_import(
+            store, season.id, team.id, target_league_id)
+        if conflict_ids:
+            errors.append({
+                "sheet": "registrations", "row": index, "field": "team_code",
+                "code": "team_registration_conflict",
+                "message": (f"Team {_clean(row.get('team_code'))} already "
+                            "has more than one active registration in "
+                            f"season {_clean(row.get('season_code'))}; "
+                            "resolve the conflict before importing."),
+                "affected_registration_ids": conflict_ids})
+            continue
+        if reg is None:
+            continue  # a genuinely new registration moves nothing
         # #283: registration.league_id dropped; resolve current League via LeagueSeason.
         reg_ls = store.get_league_season(reg.league_season_id)
         reg_league_id = reg_ls.league_id if reg_ls else None
@@ -1188,302 +1221,357 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
     store = setup.store
     rows = {name: list((sheets or {}).get(name) or [])
             for name in HIERARCHY_SHEET_NAMES}
-    counts = _new_counts()
+    for attempt in range(3):
+        counts = _new_counts()
+        try:
+            with store.transaction():
+                result = validate_hierarchy_import(sheets, store)
+                if not result["ok"]:
+                    return {
+                        "committed": False,
+                        "import_type": "hierarchy",
+                        "summary": _new_counts(),
+                        "errors": result["errors"],
+                        "warnings": result["warnings"],
+                    }
+                # Reassignment safety (#214 review, extended #260): a program/
+                # league/division move or a venue-access revoke that would strand
+                # games or orphan registrations aborts the whole batch with zero
+                # writes.
+                unsafe = _preflight_reassignment_safety(store, rows, now=setup.clock())
+                if unsafe:
+                    return {
+                        "committed": False,
+                        "import_type": "hierarchy",
+                        "summary": _new_counts(),
+                        "errors": unsafe,
+                        "warnings": result["warnings"],
+                    }
 
-    with store.transaction():
-        result = validate_hierarchy_import(sheets, store)
-        if not result["ok"]:
-            return {
-                "committed": False,
-                "import_type": "hierarchy",
-                "summary": _new_counts(),
-                "errors": result["errors"],
-                "warnings": result["warnings"],
-            }
-        # Reassignment safety (#214 review, extended #260): a program/
-        # league/division move or a venue-access revoke that would strand
-        # games or orphan registrations aborts the whole batch with zero
-        # writes.
-        unsafe = _preflight_reassignment_safety(store, rows, now=setup.clock())
-        if unsafe:
-            return {
-                "committed": False,
-                "import_type": "hierarchy",
-                "summary": _new_counts(),
-                "errors": unsafe,
-                "warnings": result["warnings"],
-            }
+                batch_id = store.next_id("importbatch")
 
-        batch_id = store.next_id("importbatch")
+                orgs = {o.external_ref: o for o in store.all_organizations()
+                        if o.external_ref}
+                programs = {o.external_ref: o for o in store.all_programs()
+                           if o.external_ref}
+                venues = {o.external_ref: o for o in store.all_venues()
+                          if o.external_ref}
+                rinks = {o.external_ref: o for o in store.all_rinks()
+                         if o.external_ref}
+                seasons = {o.external_ref: o for o in store.all_seasons()
+                           if o.external_ref}
+                leagues = {o.external_ref: o for o in store.all_leagues()
+                          if o.external_ref}
+                divisions = {o.external_ref: o for o in store.all_divisions()
+                             if o.external_ref}
+                clubs = {o.external_ref: o for o in store.all_clubs()
+                         if o.external_ref}
+                teams = {o.external_ref: o for o in store.all_teams()
+                         if o.external_ref}
+                players = {o.external_ref: o for o in store.all_players()
+                          if o.external_ref}
 
-        orgs = {o.external_ref: o for o in store.all_organizations()
-                if o.external_ref}
-        programs = {o.external_ref: o for o in store.all_programs()
-                   if o.external_ref}
-        venues = {o.external_ref: o for o in store.all_venues()
-                  if o.external_ref}
-        rinks = {o.external_ref: o for o in store.all_rinks()
-                 if o.external_ref}
-        seasons = {o.external_ref: o for o in store.all_seasons()
-                   if o.external_ref}
-        leagues = {o.external_ref: o for o in store.all_leagues()
-                  if o.external_ref}
-        divisions = {o.external_ref: o for o in store.all_divisions()
-                     if o.external_ref}
-        clubs = {o.external_ref: o for o in store.all_clubs()
-                 if o.external_ref}
-        teams = {o.external_ref: o for o in store.all_teams()
-                 if o.external_ref}
-        players = {o.external_ref: o for o in store.all_players()
-                  if o.external_ref}
+                def _tally(bucket, created, changed):
+                    if created:
+                        counts[bucket]["created"] += 1
+                    elif changed:
+                        counts[bucket]["updated"] += 1
+                    else:
+                        counts[bucket]["skipped"] += 1
 
-        def _tally(bucket, created, changed):
-            if created:
-                counts[bucket]["created"] += 1
-            elif changed:
-                counts[bucket]["updated"] += 1
-            else:
-                counts[bucket]["skipped"] += 1
+                for row in rows["organizations"]:
+                    code = _clean(row.get("organization_code"))
+                    obj, created, changed = setup.upsert_imported_organization(
+                        code, _clean(row.get("organization_name")),
+                        _clean(row.get("short_name")), existing=orgs.get(code),
+                        actor_id=actor_id, import_batch_id=batch_id)
+                    orgs[code] = obj
+                    _tally("organizations", created, changed)
 
-        for row in rows["organizations"]:
-            code = _clean(row.get("organization_code"))
-            obj, created, changed = setup.upsert_imported_organization(
-                code, _clean(row.get("organization_name")),
-                _clean(row.get("short_name")), existing=orgs.get(code),
-                actor_id=actor_id, import_batch_id=batch_id)
-            orgs[code] = obj
-            _tally("organizations", created, changed)
+                for row in rows["programs"]:
+                    code = _clean(row.get("program_code"))
+                    org_code = _optional(row.get("operator_organization_code"))
+                    org = orgs.get(org_code) if org_code else None
+                    obj, created, changed = setup.upsert_imported_program(
+                        code, _clean(row.get("program_name")),
+                        _clean(row.get("country")),
+                        _clean(row.get("timezone"), "UTC") or "UTC",
+                        org.id if org else None, existing=programs.get(code),
+                        actor_id=actor_id, import_batch_id=batch_id)
+                    programs[code] = obj
+                    _tally("programs", created, changed)
 
-        for row in rows["programs"]:
-            code = _clean(row.get("program_code"))
-            org_code = _optional(row.get("operator_organization_code"))
-            org = orgs.get(org_code) if org_code else None
-            obj, created, changed = setup.upsert_imported_program(
-                code, _clean(row.get("program_name")),
-                _clean(row.get("country")),
-                _clean(row.get("timezone"), "UTC") or "UTC",
-                org.id if org else None, existing=programs.get(code),
-                actor_id=actor_id, import_batch_id=batch_id)
-            programs[code] = obj
-            _tally("programs", created, changed)
+                # Venues carry no program/league column at all (#233 Slice E, #260)
+                # — the legacy Venue.league_id bridge is never written here.
+                for code, row in _group_first(
+                        rows["venues_rinks"], "venue_code").items():
+                    org = orgs[_clean(row.get("organization_code"))]
+                    obj, created, changed = setup.upsert_imported_venue(
+                        code, _clean(row.get("venue_name")),
+                        _clean(row.get("address")),
+                        _clean(row.get("timezone"), "UTC") or "UTC", org.id,
+                        existing=venues.get(code), actor_id=actor_id,
+                        import_batch_id=batch_id)
+                    venues[code] = obj
+                    _tally("venues", created, changed)
 
-        # Venues carry no program/league column at all (#233 Slice E, #260)
-        # — the legacy Venue.league_id bridge is never written here.
-        for code, row in _group_first(
-                rows["venues_rinks"], "venue_code").items():
-            org = orgs[_clean(row.get("organization_code"))]
-            obj, created, changed = setup.upsert_imported_venue(
-                code, _clean(row.get("venue_name")),
-                _clean(row.get("address")),
-                _clean(row.get("timezone"), "UTC") or "UTC", org.id,
-                existing=venues.get(code), actor_id=actor_id,
-                import_batch_id=batch_id)
-            venues[code] = obj
-            _tally("venues", created, changed)
+                for row in rows["venues_rinks"]:
+                    code = _clean(row.get("rink_code"))
+                    venue = venues[_clean(row.get("venue_code"))]
+                    obj, created, changed = setup.upsert_imported_rink(
+                        code, _clean(row.get("rink_name")), venue.id,
+                        existing=rinks.get(code), actor_id=actor_id,
+                        import_batch_id=batch_id)
+                    rinks[code] = obj
+                    _tally("rinks", created, changed)
 
-        for row in rows["venues_rinks"]:
-            code = _clean(row.get("rink_code"))
-            venue = venues[_clean(row.get("venue_code"))]
-            obj, created, changed = setup.upsert_imported_rink(
-                code, _clean(row.get("rink_name")), venue.id,
-                existing=rinks.get(code), actor_id=actor_id,
-                import_batch_id=batch_id)
-            rinks[code] = obj
-            _tally("rinks", created, changed)
+                # #159 — canonical League→Season lock order for the whole batch: row-lock
+                # every EXISTING League this import will bind (a competition league_code
+                # that already resolves to a stored League) in sorted order, BEFORE the
+                # upserts below take any Season row lock (upsert_imported_season /
+                # _league_season / _division / _registration all guard the Season). A
+                # League created by this import is locked in-txn by its own upsert and is
+                # unreachable by a concurrent delete, so only pre-existing Leagues need
+                # pre-locking here. This keeps the batch's League→Season order canonical:
+                # a bound League can't be orphaned by a concurrent delete_league, and the
+                # order never inverts against delete/transfer (no deadlock on Postgres).
+                for _lid in sorted({
+                        leagues[_lc].id
+                        for _lc in {_clean(r.get("league_code"))
+                                    for r in rows["competition"]}
+                        if _lc and _lc in leagues}):
+                    setup._lock_league_for_binding(_lid)
 
-        # #159 — canonical League→Season lock order for the whole batch: row-lock
-        # every EXISTING League this import will bind (a competition league_code
-        # that already resolves to a stored League) in sorted order, BEFORE the
-        # upserts below take any Season row lock (upsert_imported_season /
-        # _league_season / _division / _registration all guard the Season). A
-        # League created by this import is locked in-txn by its own upsert and is
-        # unreachable by a concurrent delete, so only pre-existing Leagues need
-        # pre-locking here. This keeps the batch's League→Season order canonical:
-        # a bound League can't be orphaned by a concurrent delete_league, and the
-        # order never inverts against delete/transfer (no deadlock on Postgres).
-        for _lid in sorted({
-                leagues[_lc].id
-                for _lc in {_clean(r.get("league_code"))
-                            for r in rows["competition"]}
-                if _lc and _lc in leagues}):
-            setup._lock_league_for_binding(_lid)
+                for code, row in _group_first(
+                        rows["competition"], "season_code").items():
+                    program = programs[_clean(row.get("program_code"))]
+                    # Normalize date-only boundaries in the freshly-upserted Program's
+                    # timezone — the SAME parser + zone preview validated (#272). A blank
+                    # cell parses to None and preserves any stored boundary in the
+                    # upsert. Validation already passed, so parsing cannot raise here.
+                    tz = resolve_timezone(program.timezone) or timezone.utc
+                    raw = _season_raw_boundaries(rows["competition"], code)
+                    start = parse_season_boundary(raw["season_start"], "start_date", tz)
+                    end = parse_season_boundary(raw["season_end"], "end_date", tz)
+                    obj, created, changed = setup.upsert_imported_season(
+                        code, _clean(row.get("season_name")), program.id,
+                        start_date=start, end_date=end,
+                        existing=seasons.get(code), actor_id=actor_id,
+                        import_batch_id=batch_id)
+                    seasons[code] = obj
+                    _tally("seasons", created, changed)
 
-        for code, row in _group_first(
-                rows["competition"], "season_code").items():
-            program = programs[_clean(row.get("program_code"))]
-            # Normalize date-only boundaries in the freshly-upserted Program's
-            # timezone — the SAME parser + zone preview validated (#272). A blank
-            # cell parses to None and preserves any stored boundary in the
-            # upsert. Validation already passed, so parsing cannot raise here.
-            tz = resolve_timezone(program.timezone) or timezone.utc
-            raw = _season_raw_boundaries(rows["competition"], code)
-            start = parse_season_boundary(raw["season_start"], "start_date", tz)
-            end = parse_season_boundary(raw["season_end"], "end_date", tz)
-            obj, created, changed = setup.upsert_imported_season(
-                code, _clean(row.get("season_name")), program.id,
-                start_date=start, end_date=end,
-                existing=seasons.get(code), actor_id=actor_id,
-                import_batch_id=batch_id)
-            seasons[code] = obj
-            _tally("seasons", created, changed)
+                # League (season-scoped, was "level") — REQUIRED on every competition
+                # row (#260 review), unlike the old optional level_code/level_name.
+                for code, row in _group_first(
+                        rows["competition"], "league_code").items():
+                    season = seasons[_clean(row.get("season_code"))]
+                    obj, created, changed = setup.upsert_imported_league(
+                        code, _clean(row.get("league_name")),
+                        _int(row.get("league_sort_order"), 0), season.id,
+                        existing=leagues.get(code), actor_id=actor_id,
+                        import_batch_id=batch_id)
+                    leagues[code] = obj
+                    _tally("leagues", created, changed)
 
-        # League (season-scoped, was "level") — REQUIRED on every competition
-        # row (#260 review), unlike the old optional level_code/level_name.
-        for code, row in _group_first(
-                rows["competition"], "league_code").items():
-            season = seasons[_clean(row.get("season_code"))]
-            obj, created, changed = setup.upsert_imported_league(
-                code, _clean(row.get("league_name")),
-                _int(row.get("league_sort_order"), 0), season.id,
-                existing=leagues.get(code), actor_id=actor_id,
-                import_batch_id=batch_id)
-            leagues[code] = obj
-            _tally("leagues", created, changed)
+                # #283 blocker: a permanent League may participate in MULTIPLE Seasons.
+                # The upsert above creates/updates the League once and binds only its
+                # FIRST Season's LeagueSeason; bind every OTHER distinct (League, Season)
+                # pair the sheet declares here — including a Season row that carries no
+                # Division and no registration, which the loops below would never reach.
+                seen_league_seasons = set()
+                for row in rows["competition"]:
+                    league_code = _clean(row.get("league_code"))
+                    season_code = _clean(row.get("season_code"))
+                    if not league_code or not season_code:
+                        continue
+                    pair = (league_code, season_code)
+                    if pair in seen_league_seasons:
+                        continue
+                    seen_league_seasons.add(pair)
+                    setup.upsert_imported_league_season(
+                        leagues[league_code].id, seasons[season_code].id,
+                        actor_id=actor_id, import_batch_id=batch_id)
 
-        # #283 blocker: a permanent League may participate in MULTIPLE Seasons.
-        # The upsert above creates/updates the League once and binds only its
-        # FIRST Season's LeagueSeason; bind every OTHER distinct (League, Season)
-        # pair the sheet declares here — including a Season row that carries no
-        # Division and no registration, which the loops below would never reach.
-        seen_league_seasons = set()
-        for row in rows["competition"]:
-            league_code = _clean(row.get("league_code"))
-            season_code = _clean(row.get("season_code"))
-            if not league_code or not season_code:
-                continue
-            pair = (league_code, season_code)
-            if pair in seen_league_seasons:
-                continue
-            seen_league_seasons.add(pair)
-            setup.upsert_imported_league_season(
-                leagues[league_code].id, seasons[season_code].id,
-                actor_id=actor_id, import_batch_id=batch_id)
+                for row in rows["competition"]:
+                    code = _optional(row.get("division_code"))
+                    if not code:
+                        continue  # optional per row (#260) — no division on this row
+                    season = seasons[_clean(row.get("season_code"))]
+                    league = leagues[_clean(row.get("league_code"))]
+                    obj, created, changed = setup.upsert_imported_division(
+                        code, _clean(row.get("division_name")),
+                        _clean(row.get("age_group")), season.id, league.id,
+                        existing=divisions.get(code), actor_id=actor_id,
+                        import_batch_id=batch_id)
+                    divisions[code] = obj
+                    _tally("divisions", created, changed)
 
-        for row in rows["competition"]:
-            code = _optional(row.get("division_code"))
-            if not code:
-                continue  # optional per row (#260) — no division on this row
-            season = seasons[_clean(row.get("season_code"))]
-            league = leagues[_clean(row.get("league_code"))]
-            obj, created, changed = setup.upsert_imported_division(
-                code, _clean(row.get("division_name")),
-                _clean(row.get("age_group")), season.id, league.id,
-                existing=divisions.get(code), actor_id=actor_id,
-                import_batch_id=batch_id)
-            divisions[code] = obj
-            _tally("divisions", created, changed)
+                # Clubs (#260): matched by club_code, never by name — a renamed Club
+                # (same code, new club_name) updates the existing record in place.
+                for row in rows["clubs"]:
+                    code = _clean(row.get("club_code"))
+                    obj, created, changed = setup.upsert_imported_club(
+                        code, _clean(row.get("club_name")),
+                        _clean(row.get("country")), existing=clubs.get(code),
+                        actor_id=actor_id, import_batch_id=batch_id)
+                    clubs[code] = obj
+                    _tally("clubs", created, changed)
 
-        # Clubs (#260): matched by club_code, never by name — a renamed Club
-        # (same code, new club_name) updates the existing record in place.
-        for row in rows["clubs"]:
-            code = _clean(row.get("club_code"))
-            obj, created, changed = setup.upsert_imported_club(
-                code, _clean(row.get("club_name")),
-                _clean(row.get("country")), existing=clubs.get(code),
-                actor_id=actor_id, import_batch_id=batch_id)
-            clubs[code] = obj
-            _tally("clubs", created, changed)
+                # Permanent Program teams (#180, extended #260 with optional
+                # club_code): blank/NA club_code means club_id=None, on both a
+                # create AND a repeat row (#260 review decision 1) — a placeholder
+                # Club is never created, but a blank cell on a repeat import
+                # genuinely unassigns a previously-set club, exactly like the
+                # interactive "— none —" option already does.
+                for code, row in _group_first(
+                        rows["permanent_teams"], "team_code").items():
+                    program = programs[_clean(row.get("program_code"))]
+                    # #283 Slice E: a permanent Team is bound to its permanent League.
+                    league = leagues[_clean(row.get("league_code"))]
+                    club_code = _optional(row.get("club_code"))
+                    club = clubs.get(club_code) if club_code else None
+                    obj, created, changed = setup.upsert_imported_team(
+                        code, _clean(row.get("team_name")), program.id,
+                        club.id if club else None, existing=teams.get(code),
+                        league_id=league.id,
+                        actor_id=actor_id, import_batch_id=batch_id)
+                    teams[code] = obj
+                    _tally("permanent_teams", created, changed)
 
-        # Permanent Program teams (#180, extended #260 with optional
-        # club_code): blank/NA club_code means club_id=None, on both a
-        # create AND a repeat row (#260 review decision 1) — a placeholder
-        # Club is never created, but a blank cell on a repeat import
-        # genuinely unassigns a previously-set club, exactly like the
-        # interactive "— none —" option already does.
-        for code, row in _group_first(
-                rows["permanent_teams"], "team_code").items():
-            program = programs[_clean(row.get("program_code"))]
-            # #283 Slice E: a permanent Team is bound to its permanent League.
-            league = leagues[_clean(row.get("league_code"))]
-            club_code = _optional(row.get("club_code"))
-            club = clubs.get(club_code) if club_code else None
-            obj, created, changed = setup.upsert_imported_team(
-                code, _clean(row.get("team_name")), program.id,
-                club.id if club else None, existing=teams.get(code),
-                league_id=league.id,
-                actor_id=actor_id, import_batch_id=batch_id)
-            teams[code] = obj
-            _tally("permanent_teams", created, changed)
+                # Players (#260, new): matched by player_code, never by name. Email
+                # sync mirrors add_player's own behavior exactly (setup_service.py)
+                # — an existing player:<id> ContactDestination's value is updated in
+                # place, never duplicated; omitting the email column on a repeat row
+                # leaves a previously-set contact untouched.
+                #
+                # #331 review round 15 finding 2: `players` above is a snapshot
+                # taken before ANY of this batch's writes -- release_batch_
+                # player_jerseys just below, and the per-row upsert after it,
+                # both used to read/save that snapshot's objects directly, with
+                # no re-fetch or lock. A canonical delete/update/activation/
+                # team-assignment path (every one of which DOES lock the Player
+                # row) landing between this snapshot and the write could be
+                # silently resurrected (Memory's save replaces the dict entry
+                # unconditionally), silently no-op'd while still reporting
+                # success (SQLite's UPDATE matches zero rows but raises
+                # nothing), or lost (PostgreSQL, under real concurrent
+                # interleaving). Lock every row this sheet's OWN snapshot
+                # claims exists, in deterministic (id-sorted, not upload-row-
+                # order) order -- so two concurrent hierarchy imports touching
+                # an overlapping player set always attempt their locks in the
+                # same relative order -- and use ONLY the freshly-locked
+                # result from here on, for jersey availability, release,
+                # field apply, contact changes, counts, and audit alike. A
+                # row the lock reveals is gone (or somehow no longer carries
+                # this row's own player_code -- the SAME id-verification
+                # discipline finding 1 above and the Rink fix both use) is
+                # dropped back to "not found": the create branch's own
+                # reserve-then-recheck (#331 review round 14 finding 3)
+                # already discovers and safely adopts a concurrently
+                # recreated row instead of duplicating it, so nothing here
+                # needs to re-implement that -- dropping the stale entry is
+                # enough to route it there.
+                _stale_player_id_by_code = {}
+                for row in rows["players"]:
+                    _pcode = _clean(row.get("player_code"))
+                    _pstale = players.get(_pcode)
+                    if _pstale is not None:
+                        _stale_player_id_by_code[_pstale.id] = _pcode
+                for _pid in sorted(_stale_player_id_by_code):
+                    _pcode = _stale_player_id_by_code[_pid]
+                    _plocked = store.get_player_for_update(_pid)
+                    if _plocked is None or _plocked.external_ref != _pcode:
+                        del players[_pcode]
+                    else:
+                        players[_pcode] = _plocked
+                # Swap-safe apply (#292): release every existing player's jersey whose
+                # final slot moves, BEFORE any per-row assignment, so a valid same-team
+                # (or cross-team) swap commits without a transient uniqueness failure.
+                # The returned map preserves each released player's ORIGINAL number so
+                # the per-row upsert diffs against the operator's real before-value, not
+                # the transient NULL (a Team-only move keeping the same number must not
+                # falsely audit a jersey change).
+                released = setup.release_batch_player_jerseys(
+                    (players.get(_clean(row.get("player_code"))),
+                     teams[_clean(row.get("team_code"))].id,
+                     int(_optional(row.get("jersey_number")))
+                     if _optional(row.get("jersey_number")) else None)
+                    for row in rows["players"])
+                for row in rows["players"]:
+                    code = _clean(row.get("player_code"))
+                    team = teams[_clean(row.get("team_code"))]
+                    jersey = _optional(row.get("jersey_number"))
+                    name = (f"{_clean(row.get('first_name'))} "
+                            f"{_clean(row.get('last_name'))}").strip()
+                    existing_player = players.get(code)
+                    extra = {}
+                    if existing_player is not None:
+                        extra["staged_original_jersey"] = released.get(
+                            existing_player.id, existing_player.jersey_number)
+                    obj, created, changed = setup.upsert_imported_player(
+                        code, name, team.id,
+                        Position(_clean(row.get("position")).lower()),
+                        int(jersey) if jersey else None, _optional(row.get("email")),
+                        existing=existing_player, actor_id=actor_id,
+                        import_batch_id=batch_id, **extra)
+                    players[code] = obj
+                    _tally("players", created, changed)
 
-        # Players (#260, new): matched by player_code, never by name. Email
-        # sync mirrors add_player's own behavior exactly (setup_service.py)
-        # — an existing player:<id> ContactDestination's value is updated in
-        # place, never duplicated; omitting the email column on a repeat row
-        # leaves a previously-set contact untouched.
-        # Swap-safe apply (#292): release every existing player's jersey whose
-        # final slot moves, BEFORE any per-row assignment, so a valid same-team
-        # (or cross-team) swap commits without a transient uniqueness failure.
-        # The returned map preserves each released player's ORIGINAL number so
-        # the per-row upsert diffs against the operator's real before-value, not
-        # the transient NULL (a Team-only move keeping the same number must not
-        # falsely audit a jersey change).
-        released = setup.release_batch_player_jerseys(
-            (players.get(_clean(row.get("player_code"))),
-             teams[_clean(row.get("team_code"))].id,
-             int(_optional(row.get("jersey_number")))
-             if _optional(row.get("jersey_number")) else None)
-            for row in rows["players"])
-        for row in rows["players"]:
-            code = _clean(row.get("player_code"))
-            team = teams[_clean(row.get("team_code"))]
-            jersey = _optional(row.get("jersey_number"))
-            name = (f"{_clean(row.get('first_name'))} "
-                    f"{_clean(row.get('last_name'))}").strip()
-            existing_player = players.get(code)
-            extra = {}
-            if existing_player is not None:
-                extra["staged_original_jersey"] = released.get(
-                    existing_player.id, existing_player.jersey_number)
-            obj, created, changed = setup.upsert_imported_player(
-                code, name, team.id,
-                Position(_clean(row.get("position")).lower()),
-                int(jersey) if jersey else None, _optional(row.get("email")),
-                existing=existing_player, actor_id=actor_id,
-                import_batch_id=batch_id, **extra)
-            players[code] = obj
-            _tally("players", created, changed)
+                # Season registrations (#180, #260): one per (season, team),
+                # assigning an explicit league (#260 review decision 2 — never
+                # derived) and optional division. SeasonTeamRegistration has no
+                # external code of its own — the (season_id, team_id) pair is its
+                # identity, so a repeat import updates the league/division in place
+                # rather than duplicating.
+                for row in rows["registrations"]:
+                    season = seasons[_clean(row.get("season_code"))]
+                    team = teams[_clean(row.get("team_code"))]
+                    league = leagues[_clean(row.get("league_code"))]
+                    division_code = _optional(row.get("division_code"))
+                    division = divisions.get(division_code) if division_code else None
+                    reg, created, changed = setup.upsert_imported_registration(
+                        season.id, team.id, league.id,
+                        division.id if division else None, actor_id=actor_id,
+                        import_batch_id=batch_id)
+                    _tally("registrations", created, changed)
 
-        # Season registrations (#180, #260): one per (season, team),
-        # assigning an explicit league (#260 review decision 2 — never
-        # derived) and optional division. SeasonTeamRegistration has no
-        # external code of its own — the (season_id, team_id) pair is its
-        # identity, so a repeat import updates the league/division in place
-        # rather than duplicating.
-        for row in rows["registrations"]:
-            season = seasons[_clean(row.get("season_code"))]
-            team = teams[_clean(row.get("team_code"))]
-            league = leagues[_clean(row.get("league_code"))]
-            division_code = _optional(row.get("division_code"))
-            division = divisions.get(division_code) if division_code else None
-            reg, created, changed = setup.upsert_imported_registration(
-                season.id, team.id, league.id,
-                division.id if division else None, actor_id=actor_id,
-                import_batch_id=batch_id)
-            _tally("registrations", created, changed)
+                # Season venue access (#260, new): grants, reactivates, or revokes a
+                # Season's access to a Venue's ice — never Venue.league_id. Blank
+                # active defaults to true. Revoking a pair that never existed is a
+                # no-op (already flagged as a warning by validate), not a write.
+                for row in rows["season_venue_access"]:
+                    season = seasons[_clean(row.get("season_code"))]
+                    venue = venues[_clean(row.get("venue_code"))]
+                    want_active = _bool(row.get("active"), True)
+                    access, created, changed = setup.upsert_imported_venue_access(
+                        season.id, venue.id, want_active, actor_id=actor_id,
+                        import_batch_id=batch_id)
+                    if access is None:
+                        counts["season_venue_access"]["skipped"] += 1  # no-op revoke
+                    else:
+                        _tally("season_venue_access", created, changed)
 
-        # Season venue access (#260, new): grants, reactivates, or revokes a
-        # Season's access to a Venue's ice — never Venue.league_id. Blank
-        # active defaults to true. Revoking a pair that never existed is a
-        # no-op (already flagged as a warning by validate), not a write.
-        for row in rows["season_venue_access"]:
-            season = seasons[_clean(row.get("season_code"))]
-            venue = venues[_clean(row.get("venue_code"))]
-            want_active = _bool(row.get("active"), True)
-            access, created, changed = setup.upsert_imported_venue_access(
-                season.id, venue.id, want_active, actor_id=actor_id,
-                import_batch_id=batch_id)
-            if access is None:
-                counts["season_venue_access"]["skipped"] += 1  # no-op revoke
-            else:
-                _tally("season_venue_access", created, changed)
-
-        totals = {
-            key: sum(values[key] for values in counts.values())
-            for key in ("created", "updated", "skipped")}
-        setup._audit(
-            "import_committed", "import_batch", batch_id, actor_id,
-            {"import_type": "hierarchy", "errors": 0,
-             **totals, "summary": counts})
+                totals = {
+                    key: sum(values[key] for values in counts.values())
+                    for key in ("created", "updated", "skipped")}
+                setup._audit(
+                    "import_committed", "import_batch", batch_id, actor_id,
+                    {"import_type": "hierarchy", "errors": 0,
+                     **totals, "summary": counts})
+            break  # committed cleanly
+        except _HierarchyTeamOrPlayerDrifted:
+            # A team_code/player_code resolved to a real row outside
+            # this attempt's pre-write snapshot (#331 review round 14
+            # finding 3) -- retry the whole batch with a fresh
+            # snapshot, which will correctly re-run the preflight
+            # reassignment-safety pass and every downstream check
+            # against it.
+            if attempt == 2:
+                raise ConcurrencyConflictError(
+                    "A team or player referenced by this import was "
+                    "created concurrently; please retry.",
+                    {"reason": "hierarchy_import_raced"})
 
     return {
         "committed": True,

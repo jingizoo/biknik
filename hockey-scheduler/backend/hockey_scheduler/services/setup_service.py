@@ -73,8 +73,10 @@ from .ice_availability import (plan_ice_windows, parse_hhmm,
                                curfew_instant, WEEKDAY_NAMES)
 from .season_guard import require_active_season
 from .league_scope import (
+    exact_registration_or_conflict,
     registered_team_ids_in_division as _registered_team_ids,
     team_registration_valid,
+    team_season_participation,
 )
 from .notifier import push as _push_notification
 
@@ -203,6 +205,84 @@ def parse_season_boundary(value, field_name: str, tz) -> Optional[datetime]:
         field)
 
 
+def resolve_team_registration_for_import(store, season_id, team_id,
+                                         target_league_id):
+    """The registration row an import row should reuse in place, if any,
+    and whether the Team's registrations for this Season conflict too
+    much to proceed safely (#331 review round 17, generalized round 18).
+
+    Never the first registration ``registrations_for_season`` happens
+    to return for this team -- the schema allows one row per
+    LeagueSeason within a Season (migration 035), and
+    ``transfer_team_to_league`` deliberately preserves an inactive
+    prior-League row as history, never touching it again. Both are
+    looked up by their exact (team, LeagueSeason) identity instead: the
+    row already sitting in the row's own resolved target LeagueSeason
+    is reused/reactivated in place, exactly as before; failing that,
+    the Team's SOLE other active registration elsewhere in this Season
+    (a Rule 7 violation a stale pre-round-16 write path, or legacy
+    data, could have left behind) is reused via the same in-place
+    League "move" ``transfer_team_to_league`` itself performs when a
+    Team's active registration no longer matches its permanent League.
+    Inactive rows elsewhere are never candidates here, so they can
+    never be touched: history stays byte-for-byte as it was left.
+
+    A module-level, ``store``-only function (rather than a
+    ``SetupService`` method) so it is the SAME callable every writer of
+    a registration's League/Division shares -- ``commit_teams_players_
+    import``, ``upsert_imported_registration``, ``roll_forward_
+    registrations``/``_v2``, and ``hierarchy_import.py``'s own pre-write
+    ``_preflight_reassignment_safety`` gate, which has no ``SetupService``
+    instance of its own to call a method on -- so gate and apply, or two
+    independent import entry points, can never derive different answers
+    for the identical row (#331 review round 18's own required
+    correction: "one exact-identity policy everywhere").
+
+    Returns ``(reg_or_None, is_move, conflicting_ids)``. A non-``None``
+    ``reg`` with ``is_move=False`` is the row already at the target --
+    upsert it in place, division included, exactly as any repeat
+    import row is. ``is_move=True`` means ``reg`` currently belongs to
+    a DIFFERENT LeagueSeason and is about to move there -- its old
+    division is never comparable to the new target's (they belong to
+    different LeagueSeasons' own division pools), so callers must
+    apply the League-change game guard, never the division-move one,
+    before writing it. ``reg is None`` with no conflicts means no row
+    exists anywhere in this Season yet -- create a fresh one. A
+    non-empty ``conflicting_ids`` means the Team already holds more
+    active registrations in this Season than this row's own target can
+    unambiguously absorb (its own target row already exists AND a
+    separate row is also active elsewhere, or more than one other
+    candidate is active) -- the caller must reject before any write
+    rather than silently guess which participation is authoritative or
+    rebind one active row onto another's unique key."""
+    target_ls = (store.league_season_for(target_league_id, season_id)
+                if target_league_id else None)
+    # #331 review round 19: the exact-target lookup itself can no longer
+    # assume at most one row -- see exact_registration_or_conflict's own
+    # docstring for why. A conflict here (Memory-only corrupted duplicate
+    # data at the identical key) is folded into this function's own
+    # conflicting_ids output exactly like every other conflict shape below.
+    target_reg, _target_key_conflicts = (
+        exact_registration_or_conflict(store, target_ls.id, team_id)
+        if target_ls is not None else (None, []))
+    other_active = [
+        r for r in store.registrations_for_season(season_id)
+        if r.team_id == team_id and r.active
+        and (target_ls is None or r.league_season_id != target_ls.id)]
+    if _target_key_conflicts:
+        return None, False, _target_key_conflicts + [r.id for r in other_active]
+    if target_reg is not None:
+        if other_active:
+            return None, False, (
+                [target_reg.id] + [r.id for r in other_active])
+        return target_reg, False, []
+    if len(other_active) == 1:
+        return other_active[0], True, []
+    if other_active:
+        return None, False, [r.id for r in other_active]
+    return None, False, []
+
+
 def _transactional(fn):
     """Wrap a mutating service method in a single store transaction."""
     @functools.wraps(fn)
@@ -229,6 +309,67 @@ class _MoveGameRaced(Exception):
     SetupService._retry_on_move_race, which rolls back and retries cleanly in
     a fresh transaction rather than proceeding against an untrustworthy lock
     set."""
+
+
+class _RinkLockPlanDrifted(Exception):
+    """Internal retry signal (#331 review round 13 finding 1):
+    commit_rinks_ice_slots_import's lock plan is built from a snapshot taken
+    BEFORE the lock loop runs, so a rink_code absent from that snapshot is
+    skipped by both the lock loop and the slot_type/overlap gates — even
+    though a concurrent transaction can create that exact rink_code (and a
+    booked Game on it) in the gap between the snapshot and this attempt's
+    lock acquisition. Raised when a re-check after lock acquisition finds a
+    rink_code has newly resolved to a Rink outside the locked plan. Caught by
+    the commit's bounded retry loop, which rolls back and retries with a
+    fresh snapshot — one that will correctly lock and gate the now-visible
+    Rink — rather than proceeding against an untrustworthy lock set."""
+
+
+class _TeamLockPlanDrifted(Exception):
+    """Internal retry signal (#331 review round 14 finding 2):
+    commit_teams_players_import's gate_errors pass (Program/permanent-League/
+    registration-division move guards) runs from a snapshot of
+    store.all_teams() taken BEFORE any of that row's writes — a team_code
+    absent from that snapshot is a team the gate never evaluated at all, even
+    though a concurrent import for a DIFFERENT Season can create that exact
+    team_code (with its OWN Program/League already set) in the gap between
+    the gate snapshot and this attempt's later double-checked-locking
+    recheck. Without this signal, that later recheck would silently adopt
+    the concurrently-created Team via the plain "team is not None" update
+    branch and write a registration into THIS attempt's League/Program
+    without ever re-running the guards that branch exists to enforce.
+    Raised when the recheck finds a team_code that was not present at the
+    gate_errors snapshot. Caught by the commit's bounded retry loop, which
+    rolls back and retries with a fresh snapshot — one whose gate_errors
+    pass will correctly evaluate the now-visible Team — rather than
+    proceeding against an ungated write."""
+
+
+class _HierarchyTeamOrPlayerDrifted(Exception):
+    """Internal retry signal (#331 review round 14 finding 3):
+    commit_hierarchy_import resolves every Team/Player external_ref ONCE,
+    into a {code: obj} snapshot taken before its own _preflight_reassignment_
+    safety pass and before any write, then passes each row's resolved
+    ``existing`` (or None) into upsert_imported_team/upsert_imported_player.
+    Neither helper previously rechecked a None ``existing`` under its
+    next_id() reservation lock before inserting, so a Team/Player created by
+    a DIFFERENT concurrent writer — the pilot commit_teams_players_import,
+    or another hierarchy import — in the gap between that snapshot and this
+    row's upsert could either (a) be silently duplicated (no lock at all
+    protected the insert), or, once (a) is closed by the SAME reserve-then-
+    recheck pattern commit_teams_players_import already uses, (b) be
+    silently ADOPTED via a plain "existing is not None" update branch that
+    _preflight_reassignment_safety's own snapshot never evaluated for
+    program/league-move stranding — exactly the "late materialization
+    bypasses the earlier gate" class _TeamLockPlanDrifted closes for the
+    pilot import, here for the hierarchy path's own preflight instead.
+    Raised when either helper's reserve-then-recheck finds a row for a code
+    the caller believed absent. Caught by commit_hierarchy_import's bounded
+    retry loop, which rolls back and retries the WHOLE nine-sheet batch with
+    a fresh snapshot — one whose _preflight_reassignment_safety pass (and
+    every other check downstream of it) will correctly evaluate the
+    now-visible Team/Player — rather than proceeding against an unguarded
+    or ungated write."""
 
 
 class SetupService:
@@ -942,6 +1083,78 @@ class SetupService:
                  "registration_id": reg.id,
                  "affected_game_ids": stranded, "count": len(stranded)})
         new_ls = self._link_league_season(league_id, season_id)
+        # #331 review round 18/19: never blindly rebind reg.league_season_id
+        # -- the Team may already retain ANOTHER row at the target
+        # LeagueSeason (history from a prior assignment/transfer cycle);
+        # rebinding reg onto it would either silently duplicate a row
+        # (Memory) or raise a raw unique_violation (SQLite/PostgreSQL)
+        # instead of a structured rejection. A direct (team, target
+        # LeagueSeason) lookup -- NOT the shared import resolver -- because
+        # `reg` is already pinned by the caller here (unlike
+        # commit_teams_players_import/roll_forward_registrations, which
+        # must first DISCOVER which row a team_id resolves to): the
+        # resolver's own `other_active` scan has no way to exclude `reg`
+        # from its "other active rows" candidates, so reusing it here would
+        # misreport `reg` itself as a second conflicting registration.
+        #
+        # Round 18 guarded this whole check on `reg.active`, reasoning "an
+        # inactive reg has no Rule 7 participation to protect" -- true, but
+        # irrelevant: the `(team_id, league_season_id)` uniqueness a
+        # blind rebind can violate is unconditional, not "only among active
+        # rows". An INACTIVE reg rebound onto an occupied target key is the
+        # identical duplicate-key violation, just without a Rule 7 angle --
+        # round 19 reproduced exactly this via a public lifecycle ending in
+        # this call on an inactive historical row. The lookup and its
+        # conflict handling now run regardless of reg's own active status.
+        # `reg` itself can never be among a target-key conflict: the no-op
+        # early-return above already excluded old_league == league_id, so
+        # reg.league_season_id != new_ls.id is guaranteed here.
+        _target_reg, _target_conflicts = exact_registration_or_conflict(
+            self.store, new_ls.id, reg.team_id)
+        if _target_conflicts:
+            raise ValidationError(
+                "The target league already has more than one registration "
+                "for this team in this season; resolve that conflict "
+                "before reassigning this one.",
+                {"reason": "team_registration_conflict",
+                 "affected_registration_ids": [reg.id] + _target_conflicts})
+        if _target_reg is not None:
+            if reg.active and not _target_reg.active:
+                # The ONE combination with a safe, well-defined resolution:
+                # reg (active) moves logically onto the retained INACTIVE
+                # target -- reactivate IT in place (mirroring
+                # register_team_for_season's own reactivate-in-place
+                # semantics) and retire `reg` instead of moving it there,
+                # preserving both rows' own identities.
+                reg.active = False
+                self.store.save_season_team_registration(reg)
+                self._audit(
+                    "season_team_registration_deactivated",
+                    "season_team_registration", reg.id, actor_id,
+                    {"reason": "superseded_by_retained_target",
+                     "league_id": league_id, "superseded_by": _target_reg.id})
+                _target_reg.active = True
+                _target_reg.division_id = None
+                self.store.save_season_team_registration(_target_reg)
+                self._audit(
+                    "season_team_league_assigned", "season_team_registration",
+                    _target_reg.id, actor_id,
+                    {"from": old_league, "to": league_id, "reactivated": True})
+                return _target_reg
+            # Every other combination -- reg active + target active (Rule 7
+            # conflict), or reg INACTIVE with any row already at the target
+            # (active or inactive) -- is an unresolvable key collision:
+            # rebinding reg onto an already-occupied
+            # (team_id, league_season_id) key can never proceed safely.
+            # Reject before any write and let the operator resolve it
+            # explicitly, rather than guessing which participation/history
+            # is authoritative.
+            raise ValidationError(
+                "This team already has a registration in the target "
+                "league for this season; resolve the conflict before "
+                "reassigning this one.",
+                {"reason": "team_registration_conflict",
+                 "affected_registration_ids": [reg.id, _target_reg.id]})
         # A division set on the registration must belong to the new LeagueSeason;
         # clear it if it doesn't (the league moved out from under it).
         if reg.division_id:
@@ -1140,10 +1353,47 @@ class SetupService:
                      "division_id": division_id,
                      "division_league_season_id": division.league_season_id,
                      "league_season_id": ls.id})
+        # #331 review round 20: a Team may have at most one ACTIVE
+        # registration in this Season, full stop -- not just at this exact
+        # LeagueSeason key. Rule 7 above already keeps `ls` at the Team's own
+        # permanent League when one is set, so the only way another active
+        # row can exist elsewhere in this Season is legacy data or a write
+        # path predating full enforcement (e.g. an old League's row a
+        # since-superseded transfer didn't retire) -- reject it the same as
+        # every other shape of conflict this method can hit, rather than
+        # silently leaving two active rows behind. Checked BEFORE the
+        # exact-key reactivate-or-create decision below, using the same
+        # zero-mutation-before-reject discipline.
+        _other_active, _other_conflicts = team_season_participation(
+            self.store, season_id, team_id)
+        if _other_conflicts:
+            raise ValidationError(
+                f"Team {team_id} already has more than one active "
+                "registration this season; resolve the conflict before "
+                "registering.",
+                {"reason": "team_registration_conflict",
+                 "affected_registration_ids": _other_conflicts})
+        if _other_active is not None and _other_active.league_season_id != ls.id:
+            raise ValidationError(
+                f"Team {team_id} already has an active registration "
+                "elsewhere this season; remove it before registering "
+                "into a different League.",
+                {"reason": "team_registration_conflict",
+                 "affected_registration_ids": [_other_active.id]})
         # One registration per (team, LeagueSeason). A prior *inactive*
         # registration (a team removed then re-added) is reactivated in place.
-        existing = self.store.registration_for_team_in_league_season(
-            ls.id, team_id)
+        # #331 review round 19: exact-key multiplicity (Memory-only corrupted
+        # duplicate rows at this identical key) must reject before any write,
+        # the same as every other shape of conflict this method can hit.
+        existing, _existing_conflicts = exact_registration_or_conflict(
+            self.store, ls.id, team_id)
+        if _existing_conflicts:
+            raise ValidationError(
+                f"Team {team_id} already has more than one registration "
+                "at this exact league/season; resolve the conflict before "
+                "registering.",
+                {"reason": "team_registration_conflict",
+                 "affected_registration_ids": _existing_conflicts})
         if existing is not None:
             if existing.active:
                 raise ValidationError(
@@ -1251,17 +1501,148 @@ class SetupService:
         ls = self.store.get_league_season(reg.league_season_id)
         return ls.league_id if ls else None
 
+    def _pick_division_candidate(self, candidates, preferred_league_id):
+        """Disambiguate same-named Division candidates for one
+        ``commit_teams_players_import`` row (#331 review round 16
+        reproduction 3): Division names are NOT unique within a Season
+        (creation enforces no such constraint), so two Divisions can
+        legitimately share a name under two different permanent Leagues.
+        The prior code let gate and apply pick DIFFERENT rows for the
+        identical ambiguous name -- gate's ``{name: division}`` snapshot
+        dict was last-wins by iteration order, apply's own ``next(...)``
+        lookup was first-wins -- silently committing a registration under
+        whichever League apply happened to prefer, regardless of what gate
+        had actually validated. A single candidate is always unambiguous
+        regardless of League. Two or more requires ``preferred_league_id``
+        (the row's Team's existing permanent League, when it has one) to
+        resolve to EXACTLY one candidate's own LeagueSeason -- no
+        preference to disambiguate with, or none/more than one candidate
+        actually matching it, is genuinely ambiguous and the caller must
+        reject rather than silently guess.
+
+        Returns ``(division_or_None, ambiguous_bool)``. ``None`` with
+        ``ambiguous=False`` means the name doesn't exist yet (the caller
+        creates it); ``None`` with ``ambiguous=True`` means this row cannot
+        safely proceed at all."""
+        if not candidates:
+            return None, False
+        if len(candidates) == 1:
+            return candidates[0], False
+        if preferred_league_id:
+            matches = []
+            for d in candidates:
+                ls = self.store.get_league_season(d.league_season_id)
+                if ls and ls.league_id == preferred_league_id:
+                    matches.append(d)
+            if len(matches) == 1:
+                return matches[0], False
+        return None, True
+
+    def _resolve_row_division_and_league(self, division_name_raw,
+                                         existing_team_league_id,
+                                         divisions_by_name,
+                                         new_division_target_league,
+                                         season_id):
+        """One shared, frozen resolution of a ``commit_teams_players_import``
+        row's Division and target permanent League -- called identically by
+        gate validation AND apply (#331 review round 16), so the two can
+        never again independently derive different answers for the same
+        row the way reproductions 1 and 3 exploited. Supersedes round 15's
+        ``_resolve_import_team_target_league``, which only ever considered
+        THIS row's own ``existing_team_league_id`` for a not-yet-existing
+        Division -- correct for an existing Team's row, but blind to a
+        brand-new Team's row, which the per-existing-Team gate loop never
+        even reached, letting apply's own live ``divisions_for_season()``
+        re-query silently adopt whatever League an EARLIER row's create
+        happened to pick moments before, unconstrained by any gate at all
+        (round 16 reproduction 1). ``divisions_by_name`` (grouped by name,
+        never a last-wins ``{name: division}`` dict) and
+        ``new_division_target_league`` (the whole batch's cross-row-
+        resolved consensus for a name that doesn't exist yet -- built
+        BEFORE any row is decided, so the result never depends on which
+        row a loop visits first) are the two frozen, whole-batch inputs
+        that make this deterministic regardless of upload order.
+
+        Returns ``(division_or_None, target_league_id, ambiguous_bool)``.
+        A non-``None`` division is an EXISTING row to reuse as-is. Ambiguous
+        rows are already rejected by a dedicated pre-pass before gate_errors
+        is checked, so apply -- which only ever runs once gate_errors is
+        empty -- never actually observes ``ambiguous=True`` in practice."""
+        if _blank(division_name_raw):
+            if existing_team_league_id:
+                return None, existing_team_league_id, False
+            candidates = self.store.league_seasons_for_season(season_id)
+            return None, (candidates[0].league_id if candidates else None), False
+        name = _clean(division_name_raw)
+        candidates = divisions_by_name.get(name, [])
+        if candidates:
+            division, ambiguous = self._pick_division_candidate(
+                candidates, existing_team_league_id)
+            if ambiguous:
+                return None, None, True
+            ls = self.store.get_league_season(division.league_season_id)
+            return division, (ls.league_id if ls else None), False
+        if name in new_division_target_league:
+            return None, new_division_target_league[name], False
+        candidates = self.store.league_seasons_for_season(season_id)
+        return None, (candidates[0].league_id if candidates else None), False
+
+    def _resolve_import_row_registration(self, season_id, team_id,
+                                         target_league_id):
+        """Thin delegate to the module-level ``resolve_team_registration_
+        for_import`` (#331 review round 18) -- kept as a method purely for
+        this class's own many existing ``self._resolve_import_row_
+        registration(...)`` call sites; see that function's docstring for
+        the full contract and why it takes ``store`` directly rather than
+        living only here."""
+        return resolve_team_registration_for_import(
+            self.store, season_id, team_id, target_league_id)
+
+    def _bind_import_league_season(self, season_id, league_id):
+        """The LeagueSeason a NEW Division (or a blank-division row) should
+        bind to during ``commit_teams_players_import`` apply (#331 review
+        round 15 finding 1, generalized round 16): finds/creates the
+        binding of ``league_id`` -- the row's already fully RESOLVED target
+        League, from ``_resolve_row_division_and_league`` above, whether
+        that came from the Team's own permanent League, an existing
+        Division's own League, or the batch's cross-row-resolved consensus
+        for a not-yet-existing name -- to this Season. Falls back to the
+        ambient ``_import_default_league_season`` only when ``league_id``
+        is falsy, i.e. a genuinely league-less Team with no other row in
+        the batch expressing a preference either. Safe to call here
+        specifically because every League this could possibly bind to was
+        already row-locked, before the Season guard, by this attempt's own
+        pre-lock pass -- calling :meth:`_link_league_season` on an unlocked
+        existing League this deep into an already-Season-locked transaction
+        would otherwise invert the canonical League->Season lock order."""
+        if league_id:
+            return self._link_league_season(league_id, season_id)
+        return self._import_default_league_season(season_id)
+
     def _revalidate_game_participation(self, game):
         """Both teams must still be valid participants of ``game``'s competition
         scope (#283 Slice E) — checked before any write (publish/move), so a
         rejection mutates nothing.
 
-        A REGULAR game requires both teams to have an ACTIVE registration in the
-        game's exact LeagueSeason (its single competition identity); when the
-        game also carries a Division, the stricter season+division match is kept
-        too. A legacy regular game with no ``league_season_id`` falls back to the
-        season(+division) check. An EXHIBITION only requires both teams to remain
-        active participants of the game's Season (it may cross Leagues)."""
+        A REGULAR game requires both teams to have an ACTIVE, unambiguous
+        registration in the game's exact LeagueSeason (its single competition
+        identity) -- unconditionally on any exact-key or season-wide conflict
+        (#331 review round 21 finding 1), exactly as ``create_game`` itself
+        enforces; when the game also carries a Division, the stricter
+        season+division match is kept too. The game's own ``league_season_id``
+        is itself resolved and validated first -- it must exist and belong to
+        the game's Season AND League (#331 review round 22/23) -- before
+        either teams' registrations are checked against it; a Team's
+        registration must sit at this EXACT LeagueSeason, not merely one
+        under the same permanent League. A legacy regular game with no
+        ``league_season_id`` falls back to the season(+division) check. An
+        EXHIBITION only requires both teams to remain active participants of
+        the game's Season (it may cross Leagues).
+
+        move_game/publish_game both call this before mutating, and
+        decide_reschedule's approve path calls move_game/publish_game in
+        turn, so the reschedule-approval workflow inherits every guard here
+        with no separate implementation to keep in sync."""
         if game.game_type == GameType.EXHIBITION.value:
             if not game.season_id:
                 return
@@ -1288,6 +1669,56 @@ class SetupService:
                 "or moved until it is repaired.",
                 {"reason": "regular_game_missing_league_season",
                  "game_id": game.id})
+        # #331 review round 22: `ls_id` being non-None doesn't mean it
+        # resolves to a real, correctly-scoped row -- round 21's fix only
+        # ever compared League ids, so a dangling reference (the row was
+        # since deleted, or never existed) or one silently reassigned to a
+        # DIFFERENT Season's LeagueSeason for the SAME League both slipped
+        # through undetected. Resolved and validated the same way
+        # _require_batch_team_participation resolves its own target
+        # LeagueSeason -- existence, then Season match -- before either
+        # Team is checked against it.
+        ls = self.store.get_league_season(ls_id)
+        if ls is None:
+            raise ValidationError(
+                "This game's league-season no longer exists; it cannot be "
+                "published or moved until it is repaired.",
+                {"reason": "regular_game_missing_league_season",
+                 "game_id": game.id, "league_season_id": ls_id})
+        if game.season_id and ls.season_id != game.season_id:
+            raise ValidationError(
+                "This game's league-season belongs to a different season; "
+                "it cannot be published or moved until it is repaired.",
+                {"reason": "game_league_season_mismatch", "game_id": game.id,
+                 "season_id": game.season_id, "league_season_id": ls.id,
+                 "league_season_season_id": ls.season_id})
+        # #331 review round 23: a real LeagueSeason at the right Season still
+        # isn't proof the game's own legacy `league_id` agrees with it --
+        # standings (``_standings_for_division``/``_standings_for_league_
+        # season``) already fail closed on exactly this drift when READING,
+        # so the write boundary must refuse to CREATE it. Nothing in normal
+        # operation can produce this split (`create_game` always derives
+        # `league_season_id` from the same `league_id` it stores), so this
+        # only ever fires on a corrupted/hand-edited row -- same threat model
+        # as the dangling/cross-Season checks above.
+        #
+        # #331 review round 24: this comparison is UNCONDITIONAL. Round 23
+        # guarded it behind `game.league_id and ...`, which skipped the check
+        # entirely for a falsy stored League -- and `Game.league_id` is
+        # explicitly Optional with a nullable `games.league_id` column, so
+        # `None` (or `""`) is exactly the corrupted shape the guard let
+        # through. By this point the game is REGULAR (exhibitions returned
+        # far above) and `ls` is a real, Season-matched LeagueSeason, so a
+        # missing League is drift, not a legacy-tolerant case: the correct
+        # invariant is plain equality. The stored value is reported as-is
+        # (including `None`) so remediation sees what is actually on the row.
+        if game.league_id != ls.league_id:
+            raise ValidationError(
+                "This game's league-season belongs to a different league; "
+                "it cannot be published or moved until it is repaired.",
+                {"reason": "game_league_season_mismatch", "game_id": game.id,
+                 "league_id": game.league_id, "league_season_id": ls.id,
+                 "league_season_league_id": ls.league_id})
         # The season+division check runs first: it raises the precise
         # DivisionMismatchError and is the stricter guard for a divisioned game.
         if game.season_id and game.division_id:
@@ -1295,19 +1726,20 @@ class SetupService:
                 game.season_id, game.home_team_id, game.division_id)
             self._require_team_registered(
                 game.season_id, game.away_team_id, game.division_id)
-        # Both teams must be active in the game's exact LeagueSeason (covers the
-        # division-less regular game the check above skips).
-        active_ids = {r.team_id for r
-                      in self.store.registrations_for_league_season(ls_id)
-                      if r.active}
+        # Both teams must be active in the game's exact LeagueSeason (covers
+        # the division-less regular game the check above skips). #331 review
+        # round 22: routed through the same shared per-team resolver
+        # _require_batch_team_participation uses -- resolved directly
+        # against `ls` (this game's own, now fully-validated LeagueSeason) --
+        # rather than round 21's fix, which resolved each Team's registration
+        # via its own permanent League (_require_team_registered) and only
+        # compared League ids afterward: that comparison could never detect
+        # `ls` being a different Season's row for the identical League, since
+        # the registration it found (via the Team's CURRENT permanent
+        # League + `game.season_id`) would share that same League id too.
         for tid in (game.home_team_id, game.away_team_id):
-            if tid is not None and tid not in active_ids:
-                label = (self.store.get_team(tid) or Team(id=tid, name=tid)).name
-                raise ValidationError(
-                    f"{label} is no longer registered in this game's "
-                    "league-season.",
-                    {"reason": "team_not_in_league_season",
-                     "team_id": tid, "league_season_id": ls_id})
+            if tid is not None:
+                self._require_team_in_league_season(game.season_id, ls, tid)
 
     @_transactional
     def assign_season_team_division(self, registration_id: str,
@@ -1492,19 +1924,88 @@ class SetupService:
                 {"reason": "team_transfer_strands_games", "team_id": team_id,
                  "blocked": blocked})
 
-        # Apply — all writes happen only after every check passed.
+        # #331 review round 18: resolve each candidate's target LeagueSeason
+        # and check for a row ALREADY sitting there before any write --
+        # blindly rebinding `reg` onto it would either silently create a
+        # second live row at that exact (team, LeagueSeason) identity
+        # (Memory) or raise a raw unique_violation (SQLite/PostgreSQL)
+        # instead of a structured rejection, and would abandon (rather than
+        # reactivate) any INACTIVE history already sitting there. A
+        # pre-existing ACTIVE row at the target, or two `to_move` candidates
+        # from the SAME season both landing on the same target LeagueSeason
+        # (the team already held concurrent active rows in two OTHER
+        # leagues for that season -- exactly the kind of legacy Rule 7
+        # violation this pre-scan exists to catch), are both unresolvable
+        # conflicts: reject the WHOLE transfer with zero mutation, matching
+        # every other check above, rather than guess which participation is
+        # authoritative.
+        target_conflicts = []
+        resolved_targets = {}  # reg.id -> (target_ls, existing_at_target)
+        claimed_by_season = {}  # season_id -> reg.id of the first claimant
         for reg, season_id in to_move:
             target_ls = self._link_league_season(new_league_id, season_id)
-            reg.league_season_id = target_ls.id
-            reg.division_id = None  # the old Division belonged to the old League
-            self.store.save_season_team_registration(reg)
+            # #331 review round 19: exact-key multiplicity (Memory-only
+            # corrupted duplicate rows at this identical target key) is its
+            # own unconditional conflict -- folded into the same rejection
+            # shape as every other conflict this pre-scan already catches,
+            # rather than trusting a bare first-match lookup to hide it.
+            existing_at_target, _target_key_conflicts = (
+                exact_registration_or_conflict(self.store, target_ls.id, team_id))
+            conflict_with = list(_target_key_conflicts)
+            if not conflict_with:
+                if existing_at_target is not None and existing_at_target.active:
+                    conflict_with = [existing_at_target.id]
+                elif season_id in claimed_by_season:
+                    conflict_with = [claimed_by_season[season_id]]
+                else:
+                    claimed_by_season[season_id] = reg.id
+            if conflict_with:
+                target_conflicts.append(
+                    {"registration_id": reg.id, "season_id": season_id,
+                     "conflicting_registration_ids": conflict_with})
+            resolved_targets[reg.id] = (
+                target_ls, None if _target_key_conflicts else existing_at_target)
+        if target_conflicts:
+            raise ValidationError(
+                "Cannot transfer this team while it already has an active "
+                "registration in the target league for the same season; "
+                "resolve the conflict first.",
+                {"reason": "team_registration_conflict", "team_id": team_id,
+                 "conflicts": target_conflicts})
+
+        # Apply — all writes happen only after every check passed.
+        registrations_moved = []
+        registrations_superseded = []
+        for reg, season_id in to_move:
+            target_ls, existing_at_target = resolved_targets[reg.id]
+            if existing_at_target is not None:
+                # A retained INACTIVE row already sits at the target --
+                # reactivate IT in place and retire `reg` instead of moving
+                # it there, preserving both rows' own identities (mirrors
+                # assign_season_team_league's own supersede branch for the
+                # identical situation).
+                reg.active = False
+                self.store.save_season_team_registration(reg)
+                existing_at_target.active = True
+                existing_at_target.division_id = None
+                self.store.save_season_team_registration(existing_at_target)
+                registrations_superseded.append({
+                    "from_registration_id": reg.id,
+                    "reactivated_registration_id": existing_at_target.id,
+                    "season_id": season_id})
+            else:
+                reg.league_season_id = target_ls.id
+                reg.division_id = None  # the old Division belonged to the old League
+                self.store.save_season_team_registration(reg)
+                registrations_moved.append(reg.id)
         team.league_id = new_league_id
         # Keep Program consistent with the new League when the Team had none.
         team.program_id = team.program_id or league.program_id
         self.store.save_team(team)
         self._audit("team_league_transferred", "team", team.id, actor_id,
                     {"from": old, "to": new_league_id,
-                     "registrations_moved": [r.id for r, _ in to_move]})
+                     "registrations_moved": registrations_moved,
+                     "registrations_superseded": registrations_superseded})
         return team
 
     @_transactional
@@ -1972,13 +2473,67 @@ class SetupService:
                         {"reason": "division_not_in_team_league",
                          "team_id": tid, "division_id": div_id,
                          "league_id": team.league_id})
-            existing = next(
-                (r for r in self.store.registrations_for_season(to_season_id)
-                 if r.team_id == tid), None)
-            if existing is not None and existing.active:
+            # #331 review round 18: resolved by exact (team, target
+            # LeagueSeason) identity -- and, only when the Team has no row
+            # there yet, its SOLE other active registration in this Season,
+            # reused via the same in-place "move" transfer_team_to_league
+            # itself performs -- never the first registration
+            # registrations_for_season happens to return, which could
+            # cannibalize an inactive HISTORICAL row (destroying what
+            # transfer_team_to_league deliberately preserved) or collide
+            # with an already-correct different active one. v1 has no
+            # explicit-selection "reject on league mismatch" of its own (the
+            # target League is always the Team's OWN permanent one), so
+            # reusing the SOLE other active row here — moving it onto the
+            # Team's actual permanent League — is a correction, not a
+            # surprise, mirroring what transfer_team_to_league would do for
+            # the identical drift. More than one other active row is a
+            # genuine conflict rollover can't safely auto-resolve: reject
+            # before any write, exactly like every other pre-write check
+            # above.
+            existing, _is_move, _conflict_ids = (
+                self._resolve_import_row_registration(
+                    to_season_id, tid, team.league_id))
+            if _conflict_ids:
+                raise ValidationError(
+                    f"Team {tid} already has more than one active "
+                    "registration in the target season; resolve the "
+                    "conflict before rolling it forward.",
+                    {"reason": "team_registration_conflict", "team_id": tid,
+                     "affected_registration_ids": _conflict_ids})
+            # #331 review round 18: the resolver's `other_active[0]` move
+            # candidate is active BY CONSTRUCTION (it filters on `r.active`),
+            # so checking `existing.active` alone here -- without also
+            # excluding `_is_move` -- would treat every move candidate as
+            # "already correctly registered" and skip it, silently leaving
+            # the Team registered under the WRONG league forever (the move
+            # branch below would then be unreachable dead code). Only a
+            # non-move `existing` (the row already sitting at the exact
+            # target identity) is a true skip.
+            if existing is not None and existing.active and not _is_move:
                 skipped += 1
                 continue
-            if existing is not None:  # reactivate a prior inactive registration
+            if existing is not None and _is_move:
+                # `existing` is about to move OUT of its current league --
+                # the same guard `assign_season_team_league` and
+                # `commit_teams_players_import` apply before an identical
+                # move: refuse when a committed, non-cancelled game in the
+                # target season still references the row's CURRENT league,
+                # rather than silently stranding that game's league binding.
+                _old_league = self._registration_league_id(existing)
+                _stranded = [
+                    g.id for g in self.store.all_games()
+                    if not g.cancelled and g.season_id == to_season_id
+                    and g.league_id == _old_league
+                    and tid in (g.home_team_id, g.away_team_id)]
+                if _stranded:
+                    raise ValidationError(
+                        f"Team {tid} has a committed game referencing its "
+                        "current league in the target season; resolve it "
+                        "before rolling this team into a different league.",
+                        {"reason": "registration_league_change_strands_games",
+                         "team_id": tid, "affected_game_ids": _stranded})
+            if existing is not None:  # reactivate inactive, or apply the move
                 existing.active = True
                 existing.division_id = div_id
                 existing.league_season_id = target_ls.id
@@ -2070,6 +2625,18 @@ class SetupService:
                 "v2 rollover requires a non-empty selections list; each "
                 "selection needs a target league_id.")
         program_id = src.program_id or None
+        # #331 review round 19: a Team can hold more than one active source
+        # registration in this Season (a Rule 7 violation legacy data / a
+        # write path predating Rule 7 can leave behind) -- two selections
+        # for the SAME team_id in one batch is unresolvable ambiguity,
+        # counted up front so the gate below can reject it before any write
+        # rather than letting `wanted[tid] = ...` silently keep only the
+        # last one.
+        _team_id_counts = {}
+        for sel in selections:
+            if isinstance(sel, dict) and isinstance(sel.get("team_id"), str):
+                _team_id_counts[sel["team_id"]] = (
+                    _team_id_counts.get(sel["team_id"], 0) + 1)
         # Pre-write gate — resolve/validate every selection before any write, so
         # a failure leaves the target season and audit log untouched.
         wanted = {}  # team_id -> (league_id, division_id)
@@ -2084,6 +2651,38 @@ class SetupService:
             if tid not in source_active:
                 raise ValidationError(
                     f"Team {tid} is not registered in the source season.")
+            if _team_id_counts.get(tid, 0) > 1:
+                raise ValidationError(
+                    f"Team {tid} has more than one selection in this "
+                    "rollover batch; submit only one selection per team.",
+                    {"reason": "rollover_duplicate_team_selection",
+                     "team_id": tid})
+            # #331 review round 19: when a selection names its SOURCE
+            # registration explicitly (the frontend's Season rollover panel
+            # always does, #331 review round 19 finding 4), it must resolve
+            # to an ACTIVE row for EXACTLY this team in the source season --
+            # carrying the operator's actual per-row identity all the way to
+            # the write boundary, never trusting team_id alone to mean
+            # "whichever of this team's rows happens to match."
+            # registration_id is optional (back-compat with any caller that
+            # predates this field) -- omitting it keeps the prior team_id-
+            # only contract.
+            reg_id = sel.get("registration_id")
+            if reg_id is not None:
+                if not isinstance(reg_id, str) or _blank(reg_id):
+                    raise ValidationError(
+                        "A selection's registration_id must be a "
+                        "non-empty string when present.")
+                src_reg = self.store.get_season_team_registration(reg_id)
+                if (src_reg is None or src_reg.team_id != tid
+                        or not src_reg.active
+                        or self._season_of_league_season(
+                            src_reg.league_season_id) != from_season_id):
+                    raise ValidationError(
+                        f"Registration {reg_id} is not an active "
+                        f"source-season registration for team {tid}.",
+                        {"reason": "rollover_registration_mismatch",
+                         "team_id": tid, "registration_id": reg_id})
             lid = sel.get("league_id")
             if not isinstance(lid, str) or _blank(lid):
                 raise ValidationError(
@@ -2095,7 +2694,7 @@ class SetupService:
             # Season is a LeagueSeason. Ensure/create that binding (which
             # enforces the shared-Program invariant) in place of the old
             # league.season_id == to_season_id membership check.
-            self._link_league_season(lid, to_season_id)
+            target_ls = self._link_league_season(lid, to_season_id)
             div = sel.get("division_id")
             if div is not None:
                 if not isinstance(div, str):
@@ -2140,22 +2739,62 @@ class SetupService:
             # silently ignored (the team left in its current League) — a
             # contract violation. Catch it in the pre-write gate so the whole
             # batch aborts with zero writes rather than reporting a false skip.
-            existing = next(
-                (r for r in self.store.registrations_for_season(to_season_id)
-                 if r.team_id == tid), None)
-            existing_lid = (self._registration_league_id(existing)
-                            if existing is not None else None)  # #283
+            #
+            # #331 review round 18: resolved by this Team's exact (team,
+            # target LeagueSeason) identity, plus an explicit scan for ANY
+            # OTHER active registration elsewhere in the target Season --
+            # never the first Season-wide row regardless of LeagueSeason,
+            # which could silently miss or misidentify the row a mismatch
+            # check above must catch. Unlike commit_teams_players_import's
+            # own resolver (round 17), v2 rollover never silently MOVES an
+            # existing active registration to match a selection -- that IS
+            # the "selection's league silently ignored" contract violation
+            # the comment above already guards against, just now reachable
+            # even when the wrong-league row wasn't the one the old lookup
+            # happened to find. The rule-7 check just above already proved
+            # lid == team.league_id, so ANY other active row here is
+            # necessarily a Rule 7 violation (legacy data, or a write path
+            # predating Rule 7) -- always a conflict the operator must
+            # resolve explicitly (assign_season_team_league /
+            # transfer_team_to_league), never an implicit rollover side
+            # effect.
+            # #331 review round 19: exact-key multiplicity (Memory-only
+            # corrupted duplicate rows at this identical target key) is its
+            # own unconditional conflict, checked before the "any OTHER
+            # active row" scan below so a corrupted exact-key pair is never
+            # silently absorbed into `other_active` under only one of its
+            # ids while the other goes unmentioned.
+            existing, _target_key_conflicts = exact_registration_or_conflict(
+                self.store, target_ls.id, tid)
+            if _target_key_conflicts:
+                raise ValidationError(
+                    f"Team {tid} already has more than one registration at "
+                    "the target league/season; resolve the conflict before "
+                    "rolling this team forward.",
+                    {"reason": "team_registration_conflict", "team_id": tid,
+                     "affected_registration_ids": _target_key_conflicts})
+            other_active = [
+                r for r in self.store.registrations_for_season(to_season_id)
+                if r.team_id == tid and r.active
+                and r.league_season_id != target_ls.id]
+            if other_active:
+                raise ValidationError(
+                    f"Team {tid} already has an active registration in "
+                    "the target season under a different league; resolve "
+                    "it before rolling this team forward.",
+                    {"reason": "rollover_conflicts_active_registration",
+                     "team_id": tid,
+                     "affected_registration_ids": [r.id for r in other_active]})
             if existing is not None and existing.active and (
-                    (existing_lid or None) != lid
-                    or (existing.division_id or None) != div_id):
+                    (existing.division_id or None) != div_id):
                 raise ValidationError(
                     f"Team {tid} is already registered in the target season "
-                    "under a different league/division than this selection; "
+                    "under a different division than this selection; "
                     "resolve the existing registration first.",
                     {"reason": "rollover_conflicts_active_registration",
                      "team_id": tid, "registration_id": existing.id,
                      "expected_league_id": lid, "expected_division_id": div_id,
-                     "actual_league_id": existing_lid,
+                     "actual_league_id": lid,
                      "actual_division_id": existing.division_id})
             wanted[tid] = (lid, div_id)
 
@@ -2164,9 +2803,28 @@ class SetupService:
             # #283: the registration is stored against the League's LeagueSeason
             # in the target Season (find-or-create; idempotent).
             target_ls = self._link_league_season(lid, to_season_id)
-            existing = next(
-                (r for r in self.store.registrations_for_season(to_season_id)
-                 if r.team_id == tid), None)
+            # #331 review round 18: resolved by the SAME exact (team, target
+            # LeagueSeason) identity the gate above already validated --
+            # never the first Season-wide row regardless of LeagueSeason.
+            # The gate's own scan already proved no OTHER active row exists
+            # for this team in the target Season, so this exact lookup is
+            # unambiguous by construction.
+            #
+            # #331 review round 19: uses the SAME exact-key wrapper the gate
+            # above uses, not the raw store primitive -- nothing in this
+            # single transactional call can change state between the gate
+            # and here, so a conflict at this point should never happen, but
+            # this must still never fall back to guessing a row if it
+            # somehow did (a future refactor bug, not a possibility today).
+            existing, _target_key_conflicts = exact_registration_or_conflict(
+                self.store, target_ls.id, tid)
+            if _target_key_conflicts:
+                raise ValidationError(
+                    f"Team {tid} already has more than one registration at "
+                    "the target league/season; resolve the conflict before "
+                    "rolling this team forward.",
+                    {"reason": "team_registration_conflict", "team_id": tid,
+                     "affected_registration_ids": _target_key_conflicts})
             if existing is not None and existing.active:
                 # Guaranteed an exact League+Division match by the pre-write gate
                 # above — a safe idempotent skip.
@@ -3576,8 +4234,39 @@ class SetupService:
                                       require_division=require_division)
         if reg is not None:
             return reg
-        # No valid registration — surface the precise reason. #283: a team's
-        # registration in a Season is found across the Season's LeagueSeasons.
+        # No valid registration — surface the precise reason. #331 review
+        # round 20: check for a structured conflict FIRST — both the
+        # exact-key shape round 19 established and the season-wide shape
+        # round 20 adds — so a genuinely ambiguous state gets a
+        # deterministic conflict reason, instead of the raw first-match
+        # pick below silently depending on which of several colliding rows
+        # happens to sort first (insertion order must never change the
+        # answer).
+        if season is not None and resolved is not None and resolved.league_id:
+            ls = self.store.league_season_for(resolved.league_id, season.id)
+            if ls is not None:
+                _exact_reg, exact_conflicts = exact_registration_or_conflict(
+                    self.store, ls.id, team_id)
+                if exact_conflicts:
+                    raise DivisionMismatchError(
+                        f"{label} has more than one registration at this "
+                        "exact league/season; resolve the conflict before "
+                        "scheduling.",
+                        {"reason": "team_registration_conflict",
+                         "team_id": team_id, "league_season_id": ls.id,
+                         "affected_registration_ids": exact_conflicts})
+        if season is not None:
+            _season_reg, season_conflicts = team_season_participation(
+                self.store, season.id, team_id)
+            if season_conflicts:
+                raise DivisionMismatchError(
+                    f"{label} has more than one active registration this "
+                    "season; resolve the conflict before scheduling.",
+                    {"reason": "team_registration_conflict",
+                     "team_id": team_id, "season_id": season_id,
+                     "affected_registration_ids": season_conflicts})
+        # #283: a team's registration in a Season is found across the
+        # Season's LeagueSeasons.
         raw = (next((r for r in self.store.registrations_for_season(season_id)
                      if r.team_id == team_id), None)
                if season is not None else None)
@@ -3600,6 +4289,75 @@ class SetupService:
              "season_id": season_id, "division_id": division_id,
              "registered_division_id": raw.division_id})
 
+    def _require_team_in_league_season(self, season_id, league_season, team_id):
+        """Require ``team_id`` to have exactly one active, unambiguous
+        registration in the EXACT ``league_season`` given -- never the
+        Team's own permanent-League LeagueSeason ``team_registration_valid``/
+        ``_require_team_registered`` resolve instead (#331 review round 22).
+        A Team's permanent League can diverge from a Game's or draft's own
+        recorded LeagueSeason -- a stale reference a transfer left behind,
+        or (this round's reproduction) a corrupted/reassigned
+        ``league_season_id`` on the Game itself -- and comparing only
+        League ids afterward cannot detect that the registration found
+        isn't actually AT this exact LeagueSeason, merely that it happens
+        to share the same League.
+
+        Shares ``_require_batch_team_participation``'s own two-layer
+        resolution: ``exact_registration_or_conflict`` (unconditional on
+        active state) and ``team_season_participation`` (season-wide,
+        active-only) must both hold. The caller resolves/validates
+        ``league_season`` itself first (existence, and that it belongs to
+        ``season_id``) -- this method trusts it as given.
+
+        Raises ``DivisionMismatchError`` with a structured reason; returns
+        the registration on success."""
+        team = self.store.get_team(team_id)
+        label = team.name if team is not None else team_id
+        exact_reg, exact_conflicts = exact_registration_or_conflict(
+            self.store, league_season.id, team_id)
+        if exact_conflicts:
+            raise DivisionMismatchError(
+                f"{label} has more than one registration at this exact "
+                "league/season; resolve the conflict before scheduling.",
+                {"reason": "team_registration_conflict", "team_id": team_id,
+                 "league_season_id": league_season.id,
+                 "affected_registration_ids": exact_conflicts})
+        season_reg, season_conflicts = team_season_participation(
+            self.store, season_id, team_id)
+        if season_conflicts:
+            raise DivisionMismatchError(
+                f"{label} has more than one active registration this "
+                "season; resolve the conflict before scheduling.",
+                {"reason": "team_registration_conflict", "team_id": team_id,
+                 "season_id": season_id,
+                 "affected_registration_ids": season_conflicts})
+        registration = (
+            exact_reg if exact_reg is not None and exact_reg.active
+            and season_reg is not None and season_reg.id == exact_reg.id
+            else None)
+        if registration is None:
+            if season_reg is None:
+                raise DivisionMismatchError(
+                    f"{label} is not registered in this season.",
+                    {"reason": "team_not_registered", "team_id": team_id,
+                     "season_id": season_id})
+            raise DivisionMismatchError(
+                f"{label} is not registered in this league-season.",
+                {"reason": "team_not_in_league_season", "team_id": team_id,
+                 "season_id": season_id, "league_season_id": league_season.id,
+                 "registered_league_season_id": season_reg.league_season_id})
+        if (team is None or not team.league_id
+                or team.league_id != league_season.league_id):
+            raise DivisionMismatchError(
+                f"{label}'s registration does not match its permanent "
+                "League.",
+                {"reason": "registration_cross_league", "team_id": team_id,
+                 "league_season_id": league_season.id,
+                 "league_id": league_season.league_id,
+                 "team_league_id": (
+                     team.league_id if team is not None else None)})
+        return registration
+
     def _require_batch_team_participation(self, season_id, league_season_id,
                                           rows):
         """Require every proposed row to belong to one exact LeagueSeason.
@@ -3616,6 +4374,14 @@ class SetupService:
         reference it exactly, require any Division to belong to it, and require
         each Team's permanent League to match it. This is the same fail-closed
         competition identity later enforced by publish/move.
+
+        #331 review round 20: "reference it exactly" is enforced two ways —
+        ``exact_registration_or_conflict`` rejects a Team with 2+ rows
+        colliding at this exact key (regardless of active state), and
+        ``team_season_participation`` additionally rejects a Team whose
+        one unambiguous row here ISN'T also its only active registration
+        this Season (a stray active row under a different League). Both
+        must hold for a row to be trusted.
         """
         league_season = (
             self.store.get_league_season(league_season_id)
@@ -3634,12 +4400,6 @@ class SetupService:
                  "league_season_id": league_season.id,
                  "league_season_season_id": league_season.season_id})
 
-        active = {
-            r.team_id: r
-            for r in self.store.registrations_for_league_season(
-                league_season.id)
-            if r.active
-        }
         for row in rows:
             division_id = row.get("division_id")
             if division_id is not None:
@@ -3657,41 +4417,17 @@ class SetupService:
                              if division is not None else None)})
 
             for team_id in (row["home_team_id"], row["away_team_id"]):
-                team = self.store.get_team(team_id)
-                label = team.name if team is not None else team_id
-                registration = active.get(team_id)
-                if registration is None:
-                    raw = next((
-                        r for r in self.store.registrations_for_season(
-                            season_id)
-                        if r.team_id == team_id and r.active), None)
-                    if raw is None:
-                        raise DivisionMismatchError(
-                            f"{label} is not registered in this season.",
-                            {"reason": "team_not_registered",
-                             "team_id": team_id, "season_id": season_id})
-                    raise DivisionMismatchError(
-                        f"{label} is not registered in this draft's "
-                        "league-season.",
-                        {"reason": "team_not_in_league_season",
-                         "team_id": team_id,
-                         "season_id": season_id,
-                         "league_season_id": league_season.id,
-                         "registered_league_season_id":
-                             raw.league_season_id})
-                if (team is None or not team.league_id
-                        or team.league_id != league_season.league_id):
-                    raise DivisionMismatchError(
-                        f"{label}'s registration does not match its permanent "
-                        "League.",
-                        {"reason": "registration_cross_league",
-                         "team_id": team_id,
-                         "league_season_id": league_season.id,
-                         "league_id": league_season.league_id,
-                         "team_league_id": (
-                             team.league_id if team is not None else None)})
+                # #331 review round 22: shared with _revalidate_game_
+                # participation's own divisionless branch via
+                # _require_team_in_league_season -- see that method's
+                # docstring for the two-layer (exact-key + season-wide)
+                # contract this delegates to.
+                registration = self._require_team_in_league_season(
+                    season_id, league_season, team_id)
                 if (division_id is not None
                         and registration.division_id != division_id):
+                    team = self.store.get_team(team_id)
+                    label = team.name if team is not None else team_id
                     raise DivisionMismatchError(
                         f"{label} is not registered in this division.",
                         {"reason": "team_wrong_division",
@@ -4690,7 +5426,20 @@ class SetupService:
         # relegation in the sheet updates it in place, mirroring
         # transfer_team_to_league's field change).
         if existing is None:
-            obj = Team(id=self.store.next_id("team"), external_ref=code,
+            # #331 review round 14 finding 3: reserve the id via next_id
+            # ("team") FIRST (blocks a concurrent creator until it commits/
+            # rolls back), then re-check under that lock before inserting —
+            # commit_hierarchy_import's own {code: obj} snapshot (and its
+            # _preflight_reassignment_safety pass) both ran before this call,
+            # so a row this recheck now finds is one a DIFFERENT concurrent
+            # writer created in that gap: the whole batch's snapshot is
+            # stale, not just this one row. Raise rather than silently
+            # adopting it in place (see _HierarchyTeamOrPlayerDrifted's own
+            # docstring for why that would bypass the preflight check).
+            _reserved_team_id = self.store.next_id("team")
+            if any(t.external_ref == code for t in self.store.all_teams()):
+                raise _HierarchyTeamOrPlayerDrifted()
+            obj = Team(id=_reserved_team_id, external_ref=code,
                        name=name, program_id=program_id, club_id=club_id,
                        league_id=league_id)
             self.store.add_team(obj)
@@ -4758,6 +5507,24 @@ class SetupService:
         # import rule: an absent cell is "leave as-is", never a retirement).
         canonical_email = self._validate_email(email)
         canonical_name = self._validate_player_name(name)
+        if existing is not None:
+            # #331 review round 15 finding 2 — re-fetch the Player under its
+            # ROW LOCK before reading any of its fields, mirroring
+            # upsert_imported_team's identical #201 fix (which locks the
+            # Team the same way before its own field/league write). The
+            # caller (commit_hierarchy_import) already guarantees `existing`
+            # is a fresh, locked object via its own pre-lock pass before
+            # calling this method, so this re-fetch is a no-op there (the
+            # same row locked again) — but it keeps this method safe to call
+            # on its own, not just as part of that caller's larger batch
+            # discipline. A Player deleted out from under the import is
+            # dropped to the create path below (its own reserve-then-recheck
+            # already discovers and safely adopts a concurrently recreated
+            # row instead of duplicating it), never treated as a still-live
+            # target for a save that would resurrect it (Memory), silently
+            # match zero rows while still reporting success (SQLite), or
+            # lose a concurrent update (PostgreSQL).
+            existing = self.store.get_player_for_update(existing.id)
         # Enforce active-team jersey uniqueness on the IMPORTED target state
         # before any write (#269), so a conflicting row aborts the whole
         # one-transaction batch with zero committed players. An import never
@@ -4772,7 +5539,14 @@ class SetupService:
         values = {"name": canonical_name, "team_id": team_id,
                   "position": position, "jersey_number": jersey_number}
         if existing is None:
-            obj = Player(id=self.store.next_id("player"), external_ref=code,
+            # #331 review round 14 finding 3: same mechanism as
+            # upsert_imported_team above -- reserve first, recheck under
+            # that lock, raise (don't silently adopt) if a DIFFERENT
+            # concurrent writer already created this player_code.
+            _reserved_player_id = self.store.next_id("player")
+            if any(p.external_ref == code for p in self.store.all_players()):
+                raise _HierarchyTeamOrPlayerDrifted()
+            obj = Player(id=_reserved_player_id, external_ref=code,
                         **values)
             self.store.add_player(obj)
             self._audit("player_created", "player", obj.id, actor_id,
@@ -4810,22 +5584,41 @@ class SetupService:
                                      league_id: str, division_id: Optional[str],
                                      actor_id: Optional[str] = None,
                                      import_batch_id: Optional[str] = None):
-        """Upsert a SeasonTeamRegistration by its (season_id, team_id)
-        identity (#260) — it has no external_ref of its own. Mirrors
-        ``register_team_for_season``'s Rule 5 reactivation (an inactive
-        prior row is reactivated in place, never duplicated), but unlike
-        that interactive method — which rejects an already-active row as a
-        duplicate — an ACTIVE existing row is simply updated in place:
-        re-importing the same or corrected registration data must never
-        error.
+        """Upsert a SeasonTeamRegistration by its exact (team, target
+        LeagueSeason) identity (#260, #331 review round 18) — it has no
+        external_ref of its own. Mirrors ``register_team_for_season``'s
+        Rule 5 reactivation (an inactive prior row AT THE EXACT TARGET is
+        reactivated in place, never duplicated), but unlike that
+        interactive method — which rejects an already-active row as a
+        duplicate — an ACTIVE existing row at the exact target is simply
+        updated in place: re-importing the same or corrected registration
+        data must never error.
+
+        Resolved via the SAME exact-identity helper commit_teams_players_
+        import's gate/apply share (round 17) — never the first
+        registration ``registrations_for_season`` happens to return, which
+        could cannibalize an inactive HISTORICAL row (destroying what
+        ``transfer_team_to_league`` deliberately preserved) or collide
+        with an already-correct different active one. Raises on an
+        unresolvable conflict (more than one active row this call's own
+        target can't unambiguously absorb) as a backstop — the caller's
+        own pre-write gate (``_preflight_reassignment_safety``) is
+        expected to have already predicted and rejected this via the same
+        resolver before any row in the batch is written.
         """
         self._require_active_season(season_id)  # #159 read-only guard
         # #283: a registration is stored against a LeagueSeason. Resolve (create
         # if needed) the imported League's participation in the Season; a change
         # of League is now a change of the registration's LeagueSeason.
         ls = self._link_league_season(league_id, season_id)
-        reg = next((r for r in self.store.registrations_for_season(season_id)
-                    if r.team_id == team_id), None)
+        reg, _is_move, _conflict_ids = self._resolve_import_row_registration(
+            season_id, team_id, league_id)
+        if _conflict_ids:
+            raise ValidationError(
+                "This team already has more than one active registration "
+                "in this season; resolve the conflict before importing.",
+                {"reason": "team_registration_conflict", "team_id": team_id,
+                 "affected_registration_ids": _conflict_ids})
         if reg is None:
             reg = SeasonTeamRegistration(
                 id=self.store.next_id("streg"), league_season_id=ls.id,
@@ -5432,6 +6225,46 @@ class SetupService:
                     self.store.save_session(sess)
 
     # -- CSV import commit (#93) --------------------------------------------
+    def _find_or_create_import_club(self, club_name: str, actor_id, batch_id):
+        """Find-or-create a Club by exact name match for the pilot-onboarding
+        CSV imports (#93/#94), shared by EVERY call site so a race between
+        different import types -- not just two commits of the same type --
+        still converges on one Club (#331 review round 13 finding 2: round
+        12 fixed this race but only inside
+        commit_officials_availability_import; a second, unprotected copy of
+        the same find-or-create in commit_teams_players_import could still
+        create a duplicate, and a cross-import race -- one of each type
+        landing on the identical new club_name -- was never provably safe
+        with two independent implementations of "the same" fix).
+
+        Race-safe via double-checked locking over next_id("club")'s existing
+        cross-connection counter-row lock (#331 review round 12 finding 1):
+        Club has no unique-by-name index -- asserting one would settle a
+        global-uniqueness product question no import commit gets to decide
+        on its own, see migration 048's own comment -- so a bare
+        check-then-create has no row to lock for a brand-new name.
+        Reserving the id FIRST blocks a concurrent creator until THIS
+        transaction commits or rolls back; the re-check that follows is
+        then guaranteed fresh. A reservation that goes unused (the re-check
+        finds the row after all) is a harmless gap in the "club" id
+        sequence -- ids are opaque strings.
+
+        Returns ``(club, created)``; callers own their own
+        ``counts["clubs_created"]`` bookkeeping from ``created``.
+        """
+        club = next((c for c in self.store.all_clubs() if c.name == club_name), None)
+        if club is not None:
+            return club, False
+        reserved_id = self.store.next_id("club")
+        club = next((c for c in self.store.all_clubs() if c.name == club_name), None)
+        if club is not None:
+            return club, False
+        club = Club(id=reserved_id, name=club_name)
+        self.store.add_club(club)
+        self._audit("club_created", "club", club.id, actor_id,
+                    {"import_batch_id": batch_id})
+        return club, True
+
     def commit_teams_players_import(self, season_id: str, sheets: dict,
                                     actor_id: Optional[str] = None) -> dict:
         """Commit step 2 of the pilot onboarding import wizard: teams+players.
@@ -5502,330 +6335,734 @@ class SetupService:
                     f"Unknown position '{value}' for player_code "
                     f"{row.get('player_code')}.")
 
-        counts = {"teams_created": 0, "teams_updated": 0,
-                  "players_created": 0, "players_updated": 0,
-                  "clubs_created": 0, "divisions_created": 0}
         # Generated up front (not after the row loops) so every row-level
         # audit entry below can be tagged with it, letting the Activity feed
         # group a batch's individual creates/updates under its summary (#102).
         batch_id = self.store.next_id("importbatch")
 
-        with self.store.transaction():
-            # #159 — acquire the archived-Season row lock as the FIRST statement
-            # inside the single transaction that holds every import write, and
-            # derive Season-owned values from that same locked read. On
-            # PostgreSQL the FOR UPDATE lock is then held through all the
-            # Team/Division/registration/Player/contact/audit writes, so a
-            # concurrent archive either commits before this import (which then
-            # fails season_archived with zero mutation) or blocks until this
-            # import commits — never a write into an already-archived Season.
-            _season = self._require_active_season(season_id)
-            # The permanent program every imported team belongs to (#180): the
-            # program of the season being imported into.
-            season_league_id = _season.program_id
-            # Pre-write integrity gate (#180 review): before ANY write, prove the
-            # import won't silently re-home a permanent Team across leagues or
-            # strand committed games by moving a registration's division. A
-            # violation returns a structured error with zero writes.
-            if (not season_league_id
-                    or self.store.get_program(season_league_id) is None):
-                return {"committed": False, "summary": result["summary"],
-                        "errors": [{"sheet": "teams",
-                            "reason": "season_league_missing",
-                            "message": ("The import target season is not linked "
-                                        "to a valid league."),
-                            "season_id": season_id}],
-                        "warnings": result["warnings"]}
-            gate_errors = []
-            for row in team_rows:
-                code = _clean(row.get("team_code"))
-                existing = next((t for t in self.store.all_teams()
-                                 if t.external_ref == code), None)
-                if existing is None:
-                    continue
-                team_regs = [r for r in self.store.all_season_team_registrations()
-                             if r.team_id == existing.id]
-                # (1) The import must never move a permanent Team's program.
-                if (existing.program_id or None) != season_league_id:
-                    if existing.program_id is None:
-                        # A league-less team is repaired to the target league
-                        # only if EVERY retained registration already resolves
-                        # there; otherwise its history would go cross-league.
-                        stray = [r.id for r in team_regs
-                                 if self._registration_program(r) != season_league_id]
-                        if stray:
+        # #331 review round 14 finding 2: counts must reset PER ATTEMPT, not
+        # once before the retry loop -- a _TeamLockPlanDrifted retry rolls
+        # back every write from the failed attempt, but a Python-level
+        # counter increment survives that rollback unless reset here too,
+        # which would double-count rows the fresh attempt reprocesses.
+        for attempt in range(3):
+            counts = {"teams_created": 0, "teams_updated": 0,
+                      "players_created": 0, "players_updated": 0,
+                      "clubs_created": 0, "divisions_created": 0}
+            try:
+                # #331 review round 15 finding 1: an existing Team's permanent
+                # League must be row-locked BEFORE the Season guard -- the
+                # SAME canonical Team -> League -> Season order
+                # register_team_for_season already follows (#159). Locking a
+                # League only once inside the transaction below (e.g. when
+                # binding a new Division to it) would lock League AFTER
+                # Season, inverting the order delete_league/transfer_team_
+                # to_league rely on and risking a PostgreSQL deadlock.
+                # Unlocked pre-read (necessarily stale-tolerant, verified
+                # under lock and retried via _TeamLockPlanDrifted on
+                # mismatch -- the same idiom this file's other lock-plan
+                # fixes already use): every Team this batch's team_code rows
+                # currently resolve to.
+                _codes_in_batch = {_clean(row.get("team_code")) for row in team_rows}
+                _candidate_team_ids = sorted(
+                    t.id for t in self.store.all_teams()
+                    if t.external_ref in _codes_in_batch)
+                with self.store.transaction():
+                    # Lock every candidate Team row, in a deterministic
+                    # (id-sorted) order, before anything else. A row we hold
+                    # locked can't be moved by a concurrent transfer_team_
+                    # to_league/delete_team, so its league_id is trustworthy
+                    # for the rest of this attempt -- and IS the set of
+                    # League ids that need pre-locking next.
+                    _locked_teams_by_id = {}
+                    for _tid in _candidate_team_ids:
+                        _t = self.store.get_team_for_update(_tid)
+                        if _t is not None:
+                            _locked_teams_by_id[_tid] = _t
+                    _candidate_league_ids = sorted({
+                        t.league_id for t in _locked_teams_by_id.values()
+                        if t.league_id})
+                    for _lid in _candidate_league_ids:
+                        self._lock_league_for_binding(_lid)
+                    # #159 — acquire the archived-Season row lock as the FIRST statement
+                    # inside the single transaction that holds every import write, and
+                    # derive Season-owned values from that same locked read. On
+                    # PostgreSQL the FOR UPDATE lock is then held through all the
+                    # Team/Division/registration/Player/contact/audit writes, so a
+                    # concurrent archive either commits before this import (which then
+                    # fails season_archived with zero mutation) or blocks until this
+                    # import commits — never a write into an already-archived Season.
+                    _season = self._require_active_season(season_id)
+                    # The permanent program every imported team belongs to (#180): the
+                    # program of the season being imported into.
+                    season_league_id = _season.program_id
+                    # Pre-write integrity gate (#180 review): before ANY write, prove the
+                    # import won't silently re-home a permanent Team across leagues or
+                    # strand committed games by moving a registration's division. A
+                    # violation returns a structured error with zero writes.
+                    if (not season_league_id
+                            or self.store.get_program(season_league_id) is None):
+                        return {"committed": False, "summary": result["summary"],
+                                "errors": [{"sheet": "teams",
+                                    "reason": "season_league_missing",
+                                    "message": ("The import target season is not linked "
+                                                "to a valid league."),
+                                    "season_id": season_id}],
+                                "warnings": result["warnings"]}
+                    # Snapshot of every Team known to exist BEFORE the gate_errors
+                    # pass below runs (#331 review round 14 finding 2), reused for
+                    # both that pass's own existing-lookup AND, later, to detect a
+                    # team_code that only became visible AFTER this snapshot was
+                    # taken -- a concurrent import for a DIFFERENT Season creating
+                    # it in the gap between this snapshot and this attempt's later
+                    # double-checked-locking recheck. See _TeamLockPlanDrifted's
+                    # docstring for the full mechanism this closes.
+                    _teams_at_gate_check = {t.external_ref: t for t in self.store.all_teams()
+                                            if t.external_ref}
+                    # #331 review round 15 finding 1: verify the League
+                    # pre-lock above actually covers every Team this batch
+                    # will read as "existing" -- if a code we expected to be
+                    # absent/at a locked id now resolves to a DIFFERENT,
+                    # unlocked Team (deleted-and-recreated between the
+                    # unlocked pre-read and the lock acquisition, or simply
+                    # created there for a genuinely new code), retry with a
+                    # fresh pre-read/lock plan rather than trust a League we
+                    # never actually locked.
+                    for _code in _codes_in_batch:
+                        _gate_team = _teams_at_gate_check.get(_code)
+                        if _gate_team is not None and _gate_team.id not in _locked_teams_by_id:
+                            raise _TeamLockPlanDrifted()
+                    # Snapshot of every Division known to exist for this
+                    # Season BEFORE any row's apply can create one (#331
+                    # review round 15 finding 1), so both the gate-check
+                    # prediction below and same-upload cross-row conflict
+                    # tracking see ONE consistent "what already exists" view
+                    # -- not a view that changes mid-pass as earlier rows'
+                    # own (not-yet-run) apply creates divisions later rows
+                    # would otherwise see. Grouped by name, not a last-wins
+                    # {name: division} dict (#331 review round 16
+                    # reproduction 3): Division names are not unique within
+                    # a Season, so two Divisions can share a name under
+                    # different permanent Leagues -- a dict collapse let
+                    # gate's snapshot and apply's own live next() lookup
+                    # pick DIFFERENT rows for the identical ambiguous name.
+                    _divisions_by_name = {}
+                    for _d in self.store.divisions_for_season(season_id):
+                        _divisions_by_name.setdefault(_d.name, []).append(_d)
+                    gate_errors = []
+                    # #331 review round 16 reproduction 1: the per-existing-
+                    # Team loop below (a) never even runs for a brand-new
+                    # Team's row, and (b) previously recorded a not-yet-
+                    # existing division_name's predicted League only from
+                    # the FIRST row visited, in team_rows upload order --
+                    # so a new Team's row, entirely unseen by any gate,
+                    # could get applied FIRST (falling back to the Season's
+                    # ambient default League with nothing to compare
+                    # against), and a LATER existing Team's row would then
+                    # silently reuse that already-created Division via
+                    # apply's own live divisions_for_season() re-query,
+                    # regardless of its own real permanent League --
+                    # reversing the two rows' upload order made the defect
+                    # disappear, proving it was order-dependent rather than
+                    # a real conflict. Collected here across the WHOLE
+                    # batch -- every row, new Team or existing -- before
+                    # any row is decided, so the result never depends on
+                    # which row a loop visits first.
+                    _new_division_prefs = {}
+                    for row in team_rows:
+                        _name_raw = row.get("division_name")
+                        if _blank(_name_raw):
+                            continue
+                        _name = _clean(_name_raw)
+                        if _name in _divisions_by_name:
+                            continue
+                        _code = _clean(row.get("team_code"))
+                        _existing = _teams_at_gate_check.get(_code)
+                        _league_pref = _existing.league_id if _existing is not None else None
+                        if _league_pref:
+                            _new_division_prefs.setdefault(_name, set()).add(_league_pref)
+                    for _name, _prefs in _new_division_prefs.items():
+                        if len(_prefs) > 1:
+                            gate_errors.append({
+                                "sheet": "teams", "team_code": None,
+                                "reason": "import_new_division_league_conflict",
+                                "message": (f"Division '{_name}' would be "
+                                            "created for more than one "
+                                            "permanent league in this same "
+                                            "import; give each team's row a "
+                                            "consistent division or resolve "
+                                            "their leagues first."),
+                                "division_name": _name})
+                    _new_division_target_league = {
+                        _name: next(iter(_prefs))
+                        for _name, _prefs in _new_division_prefs.items()
+                        if len(_prefs) == 1}
+                    # #331 review round 16 reproduction 3: checked for EVERY
+                    # row (new Team or existing alike, mirroring the pass
+                    # above) since apply's own division resolution must
+                    # pick the identical row this validated, never a
+                    # first/last-wins guess that can silently diverge.
+                    for row in team_rows:
+                        _name_raw = row.get("division_name")
+                        if _blank(_name_raw):
+                            continue
+                        _name = _clean(_name_raw)
+                        _candidates = _divisions_by_name.get(_name)
+                        if not _candidates or len(_candidates) < 2:
+                            continue
+                        _code = _clean(row.get("team_code"))
+                        _existing = _teams_at_gate_check.get(_code)
+                        _league_pref = _existing.league_id if _existing is not None else None
+                        _, _ambiguous = self._pick_division_candidate(
+                            _candidates, _league_pref)
+                        if _ambiguous:
+                            gate_errors.append({
+                                "sheet": "teams", "team_code": _code,
+                                "reason": "import_division_name_ambiguous",
+                                "message": (f"Division '{_name}' exists "
+                                            f"under more than one league in "
+                                            f"this season and team {_code}'s "
+                                            "own league doesn't resolve it "
+                                            "to exactly one; name a "
+                                            "different division or resolve "
+                                            "the ambiguity first."),
+                                "division_name": _name})
+                    for row in team_rows:
+                        code = _clean(row.get("team_code"))
+                        existing = _teams_at_gate_check.get(code)
+                        if existing is None:
+                            continue
+                        team_regs = [r for r in self.store.all_season_team_registrations()
+                                     if r.team_id == existing.id]
+                        # (1) The import must never move a permanent Team's program.
+                        if (existing.program_id or None) != season_league_id:
+                            if existing.program_id is None:
+                                # A league-less team is repaired to the target league
+                                # only if EVERY retained registration already resolves
+                                # there; otherwise its history would go cross-league.
+                                stray = [r.id for r in team_regs
+                                         if self._registration_program(r) != season_league_id]
+                                if stray:
+                                    gate_errors.append({
+                                        "sheet": "teams", "team_code": code,
+                                        "reason": "team_league_ambiguous",
+                                        "message": (f"Team {code} has registrations in "
+                                                    "another league; assign its permanent "
+                                                    "league before importing."),
+                                        "affected_registration_ids": stray})
+                            else:
+                                gate_errors.append({
+                                    "sheet": "teams", "team_code": code,
+                                    "reason": "team_league_move_blocked",
+                                    "message": (f"Team {code} already belongs to a "
+                                                "different league; the import can't "
+                                                "re-home it."),
+                                    "affected_registration_ids": [r.id for r in team_regs],
+                                    "affected_game_ids": [
+                                        g.id for g in self.store.all_games()
+                                        if existing.id in (g.home_team_id, g.away_team_id)]})
+                        # (1b) #331 review round 14 finding 2, widened round 15
+                        # finding 1, round 16 reproduction 1: the SAME
+                        # invariant as (1), but at the narrower permanent-
+                        # League grain -- two Seasons can share one Program
+                        # yet carry distinct permanent Leagues, a case (1)
+                        # alone cannot see since it only compares Program
+                        # ids. Resolved via the ONE shared, whole-batch-
+                        # frozen resolver apply below also calls, rather
+                        # than this loop's own separate (and, round 16
+                        # found, still-incomplete) prediction -- same-upload
+                        # new-Division-League conflicts and same-name
+                        # Division ambiguity were already fully resolved,
+                        # for every row including brand-new Teams', in the
+                        # two whole-batch pre-passes above.
+                        division, target_league_id, _ambiguous = (
+                            self._resolve_row_division_and_league(
+                                row.get("division_name"), existing.league_id,
+                                _divisions_by_name, _new_division_target_league,
+                                season_id))
+                        if _ambiguous:
+                            continue  # already reported by the pre-pass above
+                        if (target_league_id is not None
+                                and (existing.league_id or None) != target_league_id):
+                            if existing.league_id is None:
+                                stray = [r.id for r in team_regs
+                                         if self._registration_league_id(r) != target_league_id]
+                                if stray:
+                                    gate_errors.append({
+                                        "sheet": "teams", "team_code": code,
+                                        "reason": "team_permanent_league_ambiguous",
+                                        "message": (f"Team {code} has registrations in "
+                                                    "another permanent league; assign its "
+                                                    "permanent league before importing."),
+                                        "affected_registration_ids": stray})
+                            else:
+                                gate_errors.append({
+                                    "sheet": "teams", "team_code": code,
+                                    "reason": "team_permanent_league_move_blocked",
+                                    "message": (f"Team {code} already belongs to a "
+                                                "different permanent league; the import "
+                                                "can't re-home it."),
+                                    "affected_registration_ids": [r.id for r in team_regs],
+                                    "affected_game_ids": [
+                                        g.id for g in self.store.all_games()
+                                        if existing.id in (g.home_team_id, g.away_team_id)]})
+                        # (2) ANY change to a registration's division must not strand
+                        # committed games — the same guard assign_season_team_division
+                        # enforces. The target is resolved for every row, including
+                        # None for a blank division (which would CLEAR the division), so
+                        # a blank re-import can't quietly unassign a team that still has
+                        # scheduled games. Applies to inactive/historical registrations
+                        # too (a re-import reactivates and may re-place them). Uses the
+                        # SAME `division` the shared resolver above already picked
+                        # (#331 review round 16 reproduction 3) rather than a second,
+                        # separately-queried next() lookup that could silently pick a
+                        # DIFFERENT same-named Division than (1b) just validated.
+                        div_name = row.get("division_name")
+                        # #331 review round 17: resolved by exact (team, target
+                        # LeagueSeason) identity -- and, only when the Team has no
+                        # row there yet, its SOLE other active registration in this
+                        # Season, reused via the same in-place "move"
+                        # transfer_team_to_league itself performs -- never the
+                        # first registration `registrations_for_season` happens to
+                        # return, which could cannibalize an inactive HISTORICAL
+                        # row (destroying what transfer_team_to_league deliberately
+                        # preserved) or collide with an already-correct different
+                        # active one. See _resolve_import_row_registration.
+                        reg, _is_move, _conflict_ids = (
+                            self._resolve_import_row_registration(
+                                season_id, existing.id, target_league_id))
+                        if _conflict_ids:
+                            # The Team already holds more active registrations in
+                            # this Season than this row's own target can
+                            # unambiguously absorb -- never guess which
+                            # participation is authoritative or rebind one active
+                            # row onto another's unique key; reject before any
+                            # write and let the operator resolve it directly.
                             gate_errors.append({
                                 "sheet": "teams", "team_code": code,
-                                "reason": "team_league_ambiguous",
-                                "message": (f"Team {code} has registrations in "
-                                            "another league; assign its permanent "
-                                            "league before importing."),
-                                "affected_registration_ids": stray})
-                    else:
-                        gate_errors.append({
-                            "sheet": "teams", "team_code": code,
-                            "reason": "team_league_move_blocked",
-                            "message": (f"Team {code} already belongs to a "
-                                        "different league; the import can't "
-                                        "re-home it."),
-                            "affected_registration_ids": [r.id for r in team_regs],
-                            "affected_game_ids": [
-                                g.id for g in self.store.all_games()
-                                if existing.id in (g.home_team_id, g.away_team_id)]})
-                # (2) ANY change to a registration's division must not strand
-                # committed games — the same guard assign_season_team_division
-                # enforces. The target is resolved for every row, including
-                # None for a blank division (which would CLEAR the division), so
-                # a blank re-import can't quietly unassign a team that still has
-                # scheduled games. Applies to inactive/historical registrations
-                # too (a re-import reactivates and may re-place them).
-                div_name = row.get("division_name")
-                reg = next(  # #283: find the team's registration in this Season
-                    (r for r in self.store.registrations_for_season(season_id)
-                     if r.team_id == existing.id), None)
-                if reg is not None:
-                    if _blank(div_name):
-                        target_div_id = None
-                    else:
-                        match = next(
-                            (d for d in self.store.divisions_for_season(season_id)
-                             if d.name == _clean(div_name)), None)
-                        # A not-yet-created named division is necessarily a
-                        # different placement than the current one.
-                        target_div_id = match.id if match else object()
-                    if target_div_id != reg.division_id:
-                        stranded = self._games_scheduled_for_team_in_season(
-                            season_id, existing.id)
-                        if stranded:
-                            gate_errors.append({
-                                "sheet": "teams", "team_code": code,
-                                "reason": "registration_division_move_strands_games",
-                                "message": (f"Re-importing team {code} would move "
-                                            "or clear its division while it has "
-                                            "scheduled games; resolve them first."),
-                                "affected_game_ids": stranded})
-            if gate_errors:
-                return {"committed": False, "summary": result["summary"],
-                        "errors": gate_errors, "warnings": result["warnings"]}
+                                "reason": "team_registration_conflict",
+                                "message": (f"Team {code} has more than one "
+                                            "active registration in this season; "
+                                            "resolve the conflict before "
+                                            "importing."),
+                                "affected_registration_ids": _conflict_ids,
+                                "affected_game_ids":
+                                    self._games_scheduled_for_team_in_season(
+                                        season_id, existing.id)})
+                        elif reg is not None:
+                            # #331 review round 17: skipped when `reg` is about to
+                            # MOVE into the target LeagueSeason (_is_move) -- its
+                            # old division belongs to a DIFFERENT LeagueSeason's
+                            # own division pool, so comparing it to the new
+                            # target's is meaningless (transfer_team_to_league
+                            # itself unconditionally clears the division on a
+                            # cross-league move, gated only by the League-change
+                            # guard below, never a division comparison).
+                            if not _is_move:
+                                if _blank(div_name):
+                                    target_div_id = None
+                                else:
+                                    # A not-yet-created named division is necessarily a
+                                    # different placement than the current one.
+                                    target_div_id = division.id if division else object()
+                                if target_div_id != reg.division_id:
+                                    stranded = self._games_scheduled_for_team_in_season(
+                                        season_id, existing.id)
+                                    if stranded:
+                                        gate_errors.append({
+                                            "sheet": "teams", "team_code": code,
+                                            "reason": "registration_division_move_strands_games",
+                                            "message": (f"Re-importing team {code} would move "
+                                                        "or clear its division while it has "
+                                                        "scheduled games; resolve them first."),
+                                            "affected_game_ids": stranded})
+                            # (3) #331 review round 16 reproduction 2, round 17: the
+                            # STORED registration itself can already be wrong --
+                            # pointing at a League other than the one this row (and
+                            # (1b) above) resolves to -- entirely independent of
+                            # whether Team.league_id itself is already correct. A
+                            # pre-round-16 import (or any other write path predating
+                            # this invariant) can leave exactly this behind: an
+                            # active registration with a matching division_id (so
+                            # the check above never fires) but a stale
+                            # league_season_id. Repaired with the SAME lifecycle
+                            # semantics assign_season_team_league already uses
+                            # (never merely folded into apply's raw-save condition,
+                            # which would silently move a registration out of a
+                            # League committed games still reference): zero
+                            # mutation and a structured rejection when a
+                            # non-cancelled Game in the CURRENT (soon-to-be-stale)
+                            # league would be stranded, otherwise the repair
+                            # proceeds in apply below (which rewrites
+                            # league_season_id once this gate has cleared it). A
+                            # no-op for a non-move `reg` (already in the target
+                            # LeagueSeason by construction), so this only ever
+                            # fires for the `_is_move` case above.
+                            _current_reg_league = self._registration_league_id(reg)
+                            if (target_league_id is not None
+                                    and _current_reg_league != target_league_id):
+                                _league_stranded = [
+                                    g.id for g in self.store.all_games()
+                                    if not g.cancelled and g.season_id == season_id
+                                    and g.league_id == _current_reg_league
+                                    and existing.id in (g.home_team_id, g.away_team_id)]
+                                if _league_stranded:
+                                    gate_errors.append({
+                                        "sheet": "teams", "team_code": code,
+                                        "reason": "registration_league_change_strands_games",
+                                        "message": (f"Re-importing team {code} would move "
+                                                    "its registration to a different "
+                                                    "league while committed games "
+                                                    "reference the current one; resolve "
+                                                    "them first."),
+                                        "affected_game_ids": _league_stranded})
+                    if gate_errors:
+                        return {"committed": False, "summary": result["summary"],
+                                "errors": gate_errors, "warnings": result["warnings"]}
 
-            team_code_to_id = {}
-            for row in team_rows:
-                team_code = _clean(row.get("team_code"))
-                team_name = _clean(row.get("team_name"))
+                    team_code_to_id = {}
+                    for row in team_rows:
+                        team_code = _clean(row.get("team_code"))
+                        team_name = _clean(row.get("team_name"))
 
-                club_id = None
-                club_name_raw = row.get("club_name")
-                if not _no_club(club_name_raw):
-                    club_name = _clean(club_name_raw)
-                    club = next((c for c in self.store.all_clubs()
-                                if c.name == club_name), None)
-                    if club is None:
-                        club = Club(id=self.store.next_id("club"), name=club_name)
-                        self.store.add_club(club)
-                        self._audit("club_created", "club", club.id, actor_id,
-                                    {"import_batch_id": batch_id})
-                        counts["clubs_created"] += 1
-                    club_id = club.id
+                        club_id = None
+                        club_name_raw = row.get("club_name")
+                        if not _no_club(club_name_raw):
+                            club_name = _clean(club_name_raw)
+                            # #331 review round 13 finding 2: shared with
+                            # commit_officials_availability_import -- see
+                            # _find_or_create_import_club's own docstring for why a
+                            # bare check-then-create here (this method's own copy,
+                            # unprotected until now) could still duplicate a Club
+                            # racing a DIFFERENT Season's import, or an officials
+                            # import, on the identical new name.
+                            club, created = self._find_or_create_import_club(
+                                club_name, actor_id, batch_id)
+                            if created:
+                                counts["clubs_created"] += 1
+                            club_id = club.id
 
-                division = None
-                division_name_raw = row.get("division_name")
-                if not _blank(division_name_raw):
-                    division_name = _clean(division_name_raw)
-                    division = next(
-                        (d for d in self.store.divisions_for_season(season_id)
-                         if d.name == division_name),
-                        None)
-                    if division is None:
-                        # #283: a Division belongs to a LeagueSeason. This simple
-                        # onboarding import carries no per-division League, so use
-                        # the Season's LeagueSeason, auto-provisioning a default
-                        # League when the Season has none yet (mirrors
-                        # create_division so imported rows are never orphaned with
-                        # a null league_season_id).
-                        _ls = self._import_default_league_season(season_id)
-                        division = Division(id=self.store.next_id("division"),
-                                            league_season_id=_ls.id,
-                                            name=division_name)
-                        self.store.add_division(division)
-                        self._audit("division_created", "division", division.id,
-                                    actor_id, {"season_id": season_id,
-                                              "import_batch_id": batch_id})
-                        counts["divisions_created"] += 1
+                        # #331 review round 15 finding 1: Team identity is
+                        # resolved BEFORE Division/LeagueSeason (moved up
+                        # from below), so a not-yet-created Division/
+                        # LeagueSeason can be bound to the Team's OWN
+                        # permanent League when it has one -- an ambient
+                        # Season-wide default has no relationship to this
+                        # specific Team's identity and is exactly what let
+                        # the registration disagree with Team.league_id.
+                        team = next((t for t in self.store.all_teams()
+                                    if t.external_ref == team_code), None)
+                        if team is None:
+                            # #331 review round 13 finding 2: this method's own copy
+                            # of the same unlocked check-then-create shape Club had
+                            # (see _find_or_create_import_club's docstring) --
+                            # team_code is documented above as a globally stable
+                            # external ref, but this method only locks its OWN
+                            # target Season, so two imports for DIFFERENT Seasons
+                            # never serialize against each other here and could
+                            # each create their own duplicate Team for an identical
+                            # new team_code. Same fix, same mechanism: reserve the
+                            # id via next_id("team") first (blocks a concurrent
+                            # creator until it commits/rolls back), then re-check
+                            # under that lock before deciding create-vs-update.
+                            _reserved_team_id = self.store.next_id("team")
+                            team = next((t for t in self.store.all_teams()
+                                        if t.external_ref == team_code), None)
+                        # #331 review round 14 finding 2, strengthened round 15
+                        # finding 1 with id-verification (not just code
+                        # presence, mirroring the Rink lock-plan fix): a Team
+                        # this row resolves to must be the IDENTICAL row
+                        # gate_errors validated above -- a matching code but a
+                        # DIFFERENT id means the original was deleted and a
+                        # new one recreated under the same external_ref in the
+                        # gap between the gate snapshot and this row's
+                        # resolution (a code entirely absent from the snapshot
+                        # is the same signal: a concurrent import for a
+                        # DIFFERENT Season created it there). Either way none
+                        # of the (1)/(1b) guards above ever evaluated the Team
+                        # apply is about to use -- retry the whole attempt
+                        # with a fresh snapshot/lock plan, which will
+                        # correctly gate and lock this Team's real current
+                        # state before any write.
+                        _gate_team = _teams_at_gate_check.get(team_code)
+                        if team is not None and (_gate_team is None
+                                                  or _gate_team.id != team.id):
+                            raise _TeamLockPlanDrifted()
+                        _existing_team_league_id = team.league_id if team is not None else None
 
-                division_id = division.id if division else None
+                        # #331 review round 16 reproduction 1/3: resolved via
+                        # the ONE shared resolver gate validation above also
+                        # called, against the SAME frozen _divisions_by_name
+                        # and _new_division_target_league -- never apply's
+                        # own independent live divisions_for_season()
+                        # re-query, which could see (and silently adopt) a
+                        # Division an EARLIER row in THIS SAME apply loop
+                        # just created, unconstrained by any gate that ever
+                        # evaluated that earlier row's own permanent League.
+                        division, _target_league_id, _ambiguous = (
+                            self._resolve_row_division_and_league(
+                                row.get("division_name"), _existing_team_league_id,
+                                _divisions_by_name, _new_division_target_league,
+                                season_id))
+                        assert not _ambiguous, (
+                            "gate_errors above must already have rejected "
+                            "any ambiguous division before apply runs")
+                        if division is None and not _blank(row.get("division_name")):
+                            # #283: a Division belongs to a LeagueSeason. This simple
+                            # onboarding import carries no per-division League of its
+                            # own, so bind the resolved target League into this
+                            # Season (#331 review round 15 finding 1, round 16
+                            # generalized to the whole batch's cross-row consensus)
+                            # -- auto-provisioning a default League only when nothing
+                            # in the batch expressed a preference, mirroring
+                            # create_division so imported rows are never orphaned
+                            # with a null league_season_id.
+                            _ls = self._bind_import_league_season(
+                                season_id, _target_league_id)
+                            division = Division(id=self.store.next_id("division"),
+                                                league_season_id=_ls.id,
+                                                name=_clean(row.get("division_name")))
+                            self.store.add_division(division)
+                            self._audit("division_created", "division", division.id,
+                                        actor_id, {"season_id": season_id,
+                                                  "import_batch_id": batch_id})
+                            counts["divisions_created"] += 1
+                            # A LATER row in this same apply loop naming the
+                            # identical name must reuse THIS row, never re-derive
+                            # (and never re-create a duplicate) -- safe to mutate
+                            # this frozen-for-reads snapshot because gate_errors
+                            # above already proved every row naming this name
+                            # agrees on _target_league_id, so the single division
+                            # just created is unambiguously the right one for all
+                            # of them regardless of upload order.
+                            _divisions_by_name.setdefault(division.name, []).append(division)
 
-                # #180/#283: a team's participation is converged onto its
-                # permanent League + a SeasonTeamRegistration, never the legacy
-                # Team.division_id. The team is a permanent member of THIS
-                # import season's League (auto-provisioned if the Season had
-                # none); the imported division lives on the registration.
-                _import_ls = (self.store.get_league_season(division.league_season_id)
-                              if division is not None
-                              else self._import_default_league_season(season_id))
-                _import_league_id = _import_ls.league_id if _import_ls else None
-                team = next((t for t in self.store.all_teams()
-                            if t.external_ref == team_code), None)
-                if team is not None:
-                    team.name = team_name
-                    team.club_id = club_id
-                    if season_league_id:
-                        team.program_id = season_league_id
-                    if _import_league_id and not team.league_id:
-                        team.league_id = _import_league_id
-                    self.store.save_team(team)
-                    self._audit("team_updated", "team", team.id, actor_id,
-                                {"club_id": club_id, "league_id": team.program_id,
-                                 "import_batch_id": batch_id})
-                    counts["teams_updated"] += 1
-                else:
-                    team = Team(id=self.store.next_id("team"), name=team_name,
-                               club_id=club_id, program_id=season_league_id,
-                               league_id=_import_league_id,
-                               external_ref=team_code)
-                    self.store.add_team(team)
-                    self._audit("team_created", "team", team.id, actor_id,
-                                {"club_id": club_id, "league_id": season_league_id,
-                                 "import_batch_id": batch_id})
-                    counts["teams_created"] += 1
-                team_code_to_id[team_code] = team.id
+                        division_id = division.id if division else None
 
-                # Idempotently upsert THIS season's registration with the
-                # imported division; never touch another season's row.
-                # #283: a registration is stored against a LeagueSeason — the
-                # chosen Division's LeagueSeason, else the Season's sole one.
-                if division is not None:
-                    reg_ls_id = division.league_season_id
-                else:
-                    reg_ls_id = _import_ls.id if _import_ls else None
-                reg = next(
-                    (r for r in self.store.registrations_for_season(season_id)
-                     if r.team_id == team.id), None)
-                if reg is not None:
-                    if not reg.active or reg.division_id != division_id:
-                        reg.active = True
-                        reg.division_id = division_id
-                        reg.league_season_id = reg_ls_id
-                        self.store.save_season_team_registration(reg)
-                        self._audit("season_team_registration_updated",
-                                    "season_team_registration", reg.id, actor_id,
-                                    {"season_id": season_id, "team_id": team.id,
-                                     "division_id": division_id,
-                                     "import_batch_id": batch_id})
-                else:
-                    reg = SeasonTeamRegistration(
-                        id=self.store.next_id("streg"),
-                        league_season_id=reg_ls_id,
-                        team_id=team.id, division_id=division_id,
-                        active=True)
-                    self.store.add_season_team_registration(reg)
-                    self._audit("season_team_registered",
-                                "season_team_registration", reg.id, actor_id,
-                                {"season_id": season_id, "team_id": team.id,
-                                 "division_id": division_id,
-                                 "import_batch_id": batch_id})
+                        # #180/#283: a team's participation is converged onto its
+                        # permanent League + a SeasonTeamRegistration, never the legacy
+                        # Team.division_id. The team is a permanent member of THIS
+                        # import season's League -- its OWN permanent League when it
+                        # has one, else auto-provisioned (#331 review round 15 finding
+                        # 1); the imported division lives on the registration.
+                        _import_ls = (self.store.get_league_season(division.league_season_id)
+                                      if division is not None
+                                      else self._bind_import_league_season(
+                                          season_id, _target_league_id))
+                        _import_league_id = _import_ls.league_id if _import_ls else None
+                        if team is not None:
+                            team.name = team_name
+                            team.club_id = club_id
+                            if season_league_id:
+                                team.program_id = season_league_id
+                            if _import_league_id and not team.league_id:
+                                team.league_id = _import_league_id
+                            self.store.save_team(team)
+                            self._audit("team_updated", "team", team.id, actor_id,
+                                        {"club_id": club_id, "league_id": team.program_id,
+                                         "import_batch_id": batch_id})
+                            counts["teams_updated"] += 1
+                        else:
+                            team = Team(id=_reserved_team_id, name=team_name,
+                                       club_id=club_id, program_id=season_league_id,
+                                       league_id=_import_league_id,
+                                       external_ref=team_code)
+                            self.store.add_team(team)
+                            self._audit("team_created", "team", team.id, actor_id,
+                                        {"club_id": club_id, "league_id": season_league_id,
+                                         "import_batch_id": batch_id})
+                            counts["teams_created"] += 1
+                        team_code_to_id[team_code] = team.id
 
-            # Swap-safe apply (#292): release every existing player's jersey
-            # whose final slot moves BEFORE any per-row write, so a valid
-            # same-team swap (A 7→8, B 8→7) commits without a transient
-            # uniqueness failure. A blank jersey cell keeps the current number
-            # (final == current → not released).
-            by_code = {p.external_ref: p for p in self.store.all_players()
-                       if p.external_ref is not None}
+                        # Idempotently upsert THIS season's registration with the
+                        # imported division; never touch another season's row.
+                        # #283: a registration is stored against a LeagueSeason — the
+                        # chosen Division's LeagueSeason, else the Season's sole one.
+                        if division is not None:
+                            reg_ls_id = division.league_season_id
+                        else:
+                            reg_ls_id = _import_ls.id if _import_ls else None
+                        # #331 review round 17: resolved by the SAME exact
+                        # (team, target LeagueSeason) identity gate validated
+                        # above (never the first registration
+                        # `registrations_for_season` happens to return, which
+                        # could cannibalize an inactive HISTORICAL row or
+                        # collide with an already-correct different active
+                        # one) -- see _resolve_import_row_registration. The
+                        # conflict case can never actually occur here: gate
+                        # already rejected the whole batch before any write
+                        # whenever this row's team_registration_conflict fires.
+                        reg, _is_move, _conflict_ids = (
+                            self._resolve_import_row_registration(
+                                season_id, team.id, _import_league_id))
+                        assert not _conflict_ids, (
+                            "gate_errors above must already have rejected any "
+                            "team_registration_conflict before apply runs")
+                        if reg is not None:
+                            # #331 review round 16 reproduction 2, round 17:
+                            # league_season_id is now part of the trigger, not
+                            # just the write -- a repeat row with an already-
+                            # active, already-division-matching registration
+                            # used to skip this branch entirely even when
+                            # league_season_id had drifted, silently reporting
+                            # success while leaving the stale League in place.
+                            # Safe to include unconditionally here (never
+                            # "merely" added to a raw save with no guard)
+                            # because gate check (3) above already rejected
+                            # this exact row, before any write, whenever the
+                            # drift/move it is about to perform would strand a
+                            # committed Game. When `_is_move` is True, this is
+                            # also where the row's league_season_id actually
+                            # gets rewritten -- the SAME in-place "move" gate's
+                            # (3) already validated as safe.
+                            if (not reg.active or reg.division_id != division_id
+                                    or reg.league_season_id != reg_ls_id):
+                                reg.active = True
+                                reg.division_id = division_id
+                                reg.league_season_id = reg_ls_id
+                                self.store.save_season_team_registration(reg)
+                                self._audit("season_team_registration_updated",
+                                            "season_team_registration", reg.id, actor_id,
+                                            {"season_id": season_id, "team_id": team.id,
+                                             "division_id": division_id,
+                                             "league_season_id": reg_ls_id,
+                                             "import_batch_id": batch_id})
+                        else:
+                            reg = SeasonTeamRegistration(
+                                id=self.store.next_id("streg"),
+                                league_season_id=reg_ls_id,
+                                team_id=team.id, division_id=division_id,
+                                active=True)
+                            self.store.add_season_team_registration(reg)
+                            self._audit("season_team_registered",
+                                        "season_team_registration", reg.id, actor_id,
+                                        {"season_id": season_id, "team_id": team.id,
+                                         "division_id": division_id,
+                                         "import_batch_id": batch_id})
 
-            def _final_slot(row):
-                existing = by_code.get(_clean(row.get("player_code")))
-                team_id = team_code_to_id.get(_clean(row.get("team_code")))
-                raw = row.get("jersey_number")
-                jersey = (int(_clean(raw)) if not _blank(raw)
-                          else (existing.jersey_number if existing else None))
-                return existing, team_id, jersey
-            released = self.release_batch_player_jerseys(
-                _final_slot(row) for row in player_rows)
+                    # Swap-safe apply (#292): release every existing player's jersey
+                    # whose final slot moves BEFORE any per-row write, so a valid
+                    # same-team swap (A 7→8, B 8→7) commits without a transient
+                    # uniqueness failure. A blank jersey cell keeps the current number
+                    # (final == current → not released).
+                    by_code = {p.external_ref: p for p in self.store.all_players()
+                               if p.external_ref is not None}
 
-            for row in player_rows:
-                player_code = _clean(row.get("player_code"))
-                full_name = self._validate_player_name(
-                    (f"{_clean(row.get('first_name'))} "
-                     f"{_clean(row.get('last_name'))}").strip())
-                # validate_import already guarantees this team_code matches a
-                # row in THIS SAME upload's teams sheet; .get() is just a
-                # defensive belt-and-suspenders check against a bug elsewhere.
-                team_id = team_code_to_id.get(_clean(row.get("team_code")))
-                if team_id is None:
-                    raise ValidationError(
-                        f"Unknown team_code for player_code {player_code}.")
+                    def _final_slot(row):
+                        existing = by_code.get(_clean(row.get("player_code")))
+                        team_id = team_code_to_id.get(_clean(row.get("team_code")))
+                        raw = row.get("jersey_number")
+                        jersey = (int(_clean(raw)) if not _blank(raw)
+                                  else (existing.jersey_number if existing else None))
+                        return existing, team_id, jersey
+                    released = self.release_batch_player_jerseys(
+                        _final_slot(row) for row in player_rows)
 
-                jersey_raw = row.get("jersey_number")
-                jersey_number = (int(_clean(jersey_raw)) if not _blank(jersey_raw)
-                                else None)
-                self._validate_jersey_number(jersey_number)
-                position_raw = row.get("position")
-                position = (Position(_clean(position_raw))
-                           if not _blank(position_raw) else None)
-                email_raw = row.get("email")
-                email = _clean(email_raw) if not _blank(email_raw) else None
+                    for row in player_rows:
+                        player_code = _clean(row.get("player_code"))
+                        full_name = self._validate_player_name(
+                            (f"{_clean(row.get('first_name'))} "
+                             f"{_clean(row.get('last_name'))}").strip())
+                        # validate_import already guarantees this team_code matches a
+                        # row in THIS SAME upload's teams sheet; .get() is just a
+                        # defensive belt-and-suspenders check against a bug elsewhere.
+                        team_id = team_code_to_id.get(_clean(row.get("team_code")))
+                        if team_id is None:
+                            raise ValidationError(
+                                f"Unknown team_code for player_code {player_code}.")
 
-                player = next((p for p in self.store.all_players()
-                              if p.external_ref == player_code), None)
-                if player is not None:
-                    # Partial-field-overwrite: only fields the sheet actually
-                    # supplies this time are updated. A blank jersey cell keeps
-                    # the existing number — resolved from the ORIGINAL captured
-                    # before the swap-safe release (#292), never the transient
-                    # NULL the release wrote, so a Team move with a blank cell
-                    # never erases the number. The uniqueness check uses the
-                    # resulting number on the resulting team (#269), before any
-                    # write — a collision aborts the whole batch, zero rows.
-                    original_jersey = released.get(player.id, player.jersey_number)
-                    target_jersey = (jersey_number if jersey_number is not None
-                                     else original_jersey)
-                    if player.is_active:
-                        self._assert_jersey_available(
-                            team_id, target_jersey, exclude_player_id=player.id)
-                    player.name = full_name
-                    player.team_id = team_id
-                    player.jersey_number = target_jersey
-                    if position is not None:
-                        player.position = position
-                    self.store.save_player(player)
-                    self._audit("player_updated", "player", player.id, actor_id,
-                                {"team_id": team_id, "import_batch_id": batch_id})
-                    counts["players_updated"] += 1
-                else:
-                    # A brand-new imported player is active, so its number must
-                    # be free among the team's active players (#269).
-                    self._assert_jersey_available(team_id, jersey_number)
-                    # The domain model requires a Position with no default,
-                    # but #92 doesn't require the CSV to supply one — default
-                    # a brand-new player to FORWARD as an explicit judgment
-                    # call; may want revisiting.
-                    player = Player(id=self.store.next_id("player"), team_id=team_id,
-                                    name=full_name,
-                                    position=position or Position.FORWARD,
-                                    jersey_number=jersey_number,
-                                    external_ref=player_code)
-                    self.store.add_player(player)
-                    self._audit("player_added", "player", player.id, actor_id,
-                                {"team_id": team_id, "import_batch_id": batch_id})
-                    counts["players_created"] += 1
+                        jersey_raw = row.get("jersey_number")
+                        jersey_number = (int(_clean(jersey_raw)) if not _blank(jersey_raw)
+                                        else None)
+                        self._validate_jersey_number(jersey_number)
+                        position_raw = row.get("position")
+                        position = (Position(_clean(position_raw))
+                                   if not _blank(position_raw) else None)
+                        email_raw = row.get("email")
+                        email = _clean(email_raw) if not _blank(email_raw) else None
 
-                # A blank cell parsed to None above → no-op (leave any existing
-                # contact untouched). A supplied address validates, updates AND
-                # reactivates the single player:<id> EMAIL contact through the
-                # shared set/retire path, so a re-import revives a contact a
-                # prior edit had retired instead of leaving it active=False
-                # (#268 review).
-                if email is not None:
-                    self._set_email_contact(f"player:{player.id}", email)
+                        player = next((p for p in self.store.all_players()
+                                      if p.external_ref == player_code), None)
+                        if player is None:
+                            # #331 review round 13 finding 2: same gap, same fix as
+                            # Team above -- player_code is documented as a globally
+                            # stable external ref but only THIS Season's row is
+                            # locked, so two different-Season imports could each
+                            # create their own duplicate Player for an identical
+                            # new player_code.
+                            _reserved_player_id = self.store.next_id("player")
+                            player = next((p for p in self.store.all_players()
+                                          if p.external_ref == player_code), None)
+                        if player is not None:
+                            # Partial-field-overwrite: only fields the sheet actually
+                            # supplies this time are updated. A blank jersey cell keeps
+                            # the existing number — resolved from the ORIGINAL captured
+                            # before the swap-safe release (#292), never the transient
+                            # NULL the release wrote, so a Team move with a blank cell
+                            # never erases the number. The uniqueness check uses the
+                            # resulting number on the resulting team (#269), before any
+                            # write — a collision aborts the whole batch, zero rows.
+                            original_jersey = released.get(player.id, player.jersey_number)
+                            target_jersey = (jersey_number if jersey_number is not None
+                                             else original_jersey)
+                            if player.is_active:
+                                self._assert_jersey_available(
+                                    team_id, target_jersey, exclude_player_id=player.id)
+                            player.name = full_name
+                            player.team_id = team_id
+                            player.jersey_number = target_jersey
+                            if position is not None:
+                                player.position = position
+                            self.store.save_player(player)
+                            self._audit("player_updated", "player", player.id, actor_id,
+                                        {"team_id": team_id, "import_batch_id": batch_id})
+                            counts["players_updated"] += 1
+                        else:
+                            # A brand-new imported player is active, so its number must
+                            # be free among the team's active players (#269).
+                            self._assert_jersey_available(team_id, jersey_number)
+                            # The domain model requires a Position with no default,
+                            # but #92 doesn't require the CSV to supply one — default
+                            # a brand-new player to FORWARD as an explicit judgment
+                            # call; may want revisiting.
+                            player = Player(id=_reserved_player_id, team_id=team_id,
+                                            name=full_name,
+                                            position=position or Position.FORWARD,
+                                            jersey_number=jersey_number,
+                                            external_ref=player_code)
+                            self.store.add_player(player)
+                            self._audit("player_added", "player", player.id, actor_id,
+                                        {"team_id": team_id, "import_batch_id": batch_id})
+                            counts["players_created"] += 1
 
-            # skipped/errors are always 0 here by construction: the
-            # all-or-nothing gate above means the only way to reach this line
-            # is a fully clean validate_import result — any error blocks the
-            # transaction before an audit row is ever written. Present anyway
-            # for a stable import_committed detail shape across #93-#95.
-            self._audit("import_committed", "import_batch", batch_id, actor_id,
-                        {"import_type": "teams_players", "season_id": season_id,
-                         "skipped": 0, "errors": 0, **counts})
+                        # A blank cell parsed to None above → no-op (leave any existing
+                        # contact untouched). A supplied address validates, updates AND
+                        # reactivates the single player:<id> EMAIL contact through the
+                        # shared set/retire path, so a re-import revives a contact a
+                        # prior edit had retired instead of leaving it active=False
+                        # (#268 review).
+                        if email is not None:
+                            self._set_email_contact(f"player:{player.id}", email)
+
+                    # skipped/errors are always 0 here by construction: the
+                    # all-or-nothing gate above means the only way to reach this line
+                    # is a fully clean validate_import result — any error blocks the
+                    # transaction before an audit row is ever written. Present anyway
+                    # for a stable import_committed detail shape across #93-#95.
+                    self._audit("import_committed", "import_batch", batch_id, actor_id,
+                                {"import_type": "teams_players", "season_id": season_id,
+                                 "skipped": 0, "errors": 0, **counts})
+                break  # committed cleanly
+            except _TeamLockPlanDrifted:
+                # A team_code resolved to a real Team outside this
+                # attempt's gate-checked snapshot (#331 review round 14
+                # finding 2) -- retry with a fresh snapshot, which will
+                # correctly gate it.
+                if attempt == 2:
+                    raise ConcurrencyConflictError(
+                        "A team referenced by this import was created "
+                        "concurrently; please retry.",
+                        {"reason": "team_import_raced"})
 
         return {
             "committed": True,
@@ -5903,123 +7140,140 @@ class SetupService:
                 "warnings": officials_result["warnings"] + avail_result["warnings"],
             }
 
-        counts = {"officials_created": 0, "officials_updated": 0,
-                  "availability_created": 0, "availability_updated": 0,
-                  "clubs_created": 0}
         # See commit_teams_players_import's identical note: generated up
         # front so every row-level audit entry can be tagged with it (#102).
         batch_id = self.store.next_id("importbatch")
 
-        with self.store.transaction():
-            official_code_to_id = {}
-            for row in officials_rows:
-                official_code = _clean(row.get("official_code"))
-                name = _clean(row.get("name"))
-                email_raw = row.get("email")
-                email = _clean(email_raw) if not _blank(email_raw) else None
+        # Retry the whole batch if the unique-index backstop rejects an
+        # INSERT (#331 review round 11 finding 2): unlike
+        # commit_teams_players_import, there is no Season row to lock, so a
+        # brand-new official_code or availability (official, start, end)
+        # tuple has nothing to serialize check-then-create against two
+        # concurrent commits landing the same key. Migration 047's unique
+        # indexes are the authoritative backstop; a race-losing INSERT rolls
+        # the whole attempt back (self.store.transaction() translates it to
+        # IntegrityConflictError) and the retry's fresh absence checks see
+        # the winner's row and correctly take the update path instead of
+        # creating a second one -- mirrors commit_ice_availability's
+        # identical retry loop.
+        for attempt in range(3):
+            counts = {"officials_created": 0, "officials_updated": 0,
+                      "availability_created": 0, "availability_updated": 0,
+                      "clubs_created": 0}
+            try:
+                with self.store.transaction():
+                    official_code_to_id = {}
+                    for row in officials_rows:
+                        official_code = _clean(row.get("official_code"))
+                        name = _clean(row.get("name"))
+                        email_raw = row.get("email")
+                        email = _clean(email_raw) if not _blank(email_raw) else None
 
-                club_id = None
-                club_name_raw = row.get("home_club_name")
-                if not _no_club(club_name_raw):
-                    club_name = _clean(club_name_raw)
-                    club = next((c for c in self.store.all_clubs()
-                                if c.name == club_name), None)
-                    if club is None:
-                        club = Club(id=self.store.next_id("club"), name=club_name)
-                        self.store.add_club(club)
-                        self._audit("club_created", "club", club.id, actor_id,
-                                    {"import_batch_id": batch_id})
-                        counts["clubs_created"] += 1
-                    club_id = club.id
+                        club_id = None
+                        club_name_raw = row.get("home_club_name")
+                        if not _no_club(club_name_raw):
+                            club_name = _clean(club_name_raw)
+                            # #331 review round 13 finding 2: shared with
+                            # commit_teams_players_import -- see
+                            # _find_or_create_import_club's own docstring.
+                            club, created = self._find_or_create_import_club(
+                                club_name, actor_id, batch_id)
+                            if created:
+                                counts["clubs_created"] += 1
+                            club_id = club.id
 
-                official = next((o for o in self.store.all_officials()
+                        official = next((o for o in self.store.all_officials()
+                                         if o.external_ref == official_code), None)
+                        if official is not None:
+                            official.name = name
+                            official.home_club_id = club_id
+                            self.store.save_official(official)
+                            self._audit("official_updated", "official", official.id,
+                                        actor_id, {"home_club_id": club_id,
+                                                  "import_batch_id": batch_id})
+                            counts["officials_updated"] += 1
+                        else:
+                            official = Official(id=self.store.next_id("official"),
+                                                name=name, home_club_id=club_id,
+                                                external_ref=official_code)
+                            self.store.add_official(official)
+                            self._audit("official_created", "official", official.id,
+                                        actor_id, {"import_batch_id": batch_id})
+                            counts["officials_created"] += 1
+                        official_code_to_id[official_code] = official.id
+
+                        if email is not None:
+                            recipient_ref = f"official:{official.id}"
+                            existing = self.store.get_contact_destination(
+                                recipient_ref, NotificationChannel.EMAIL)
+                            if existing is not None:
+                                existing.destination = email
+                                self.store.save_contact_destination(existing)
+                            else:
+                                self.store.add_contact_destination(ContactDestination(
+                                    id=self.store.next_id("contact"),
+                                    recipient_ref=recipient_ref,
+                                    channel=NotificationChannel.EMAIL,
+                                    destination=email))
+
+                    for row in availability_rows:
+                        official_code = _clean(row.get("official_code"))
+                        official_id = official_code_to_id.get(official_code)
+                        if official_id is None:
+                            # Not in this upload's officials sheet — validation only
+                            # let this through because official_code matched an
+                            # existing_external_ref, i.e. an official created by a
+                            # PRIOR commit (#94's key new capability over #93).
+                            existing = next(
+                                (o for o in self.store.all_officials()
                                  if o.external_ref == official_code), None)
-                if official is not None:
-                    official.name = name
-                    official.home_club_id = club_id
-                    self.store.save_official(official)
-                    self._audit("official_updated", "official", official.id,
-                                actor_id, {"home_club_id": club_id,
-                                          "import_batch_id": batch_id})
-                    counts["officials_updated"] += 1
-                else:
-                    official = Official(id=self.store.next_id("official"),
-                                        name=name, home_club_id=club_id,
-                                        external_ref=official_code)
-                    self.store.add_official(official)
-                    self._audit("official_created", "official", official.id,
-                                actor_id, {"import_batch_id": batch_id})
-                    counts["officials_created"] += 1
-                official_code_to_id[official_code] = official.id
+                            official_id = existing.id if existing else None
+                        if official_id is None:
+                            raise ValidationError(
+                                f"Unknown official_code {official_code} for "
+                                f"official_availability row.")
 
-                if email is not None:
-                    recipient_ref = f"official:{official.id}"
-                    existing = self.store.get_contact_destination(
-                        recipient_ref, NotificationChannel.EMAIL)
-                    if existing is not None:
-                        existing.destination = email
-                        self.store.save_contact_destination(existing)
-                    else:
-                        self.store.add_contact_destination(ContactDestination(
-                            id=self.store.next_id("contact"),
-                            recipient_ref=recipient_ref,
-                            channel=NotificationChannel.EMAIL,
-                            destination=email))
+                        start = _parse_iso_utc(row.get("start_time"))
+                        end = _parse_iso_utc(row.get("end_time"))
+                        status_raw = _clean(row.get("status"))
+                        note_raw = row.get("note")
+                        note = _clean(note_raw) if not _blank(note_raw) else None
 
-            for row in availability_rows:
-                official_code = _clean(row.get("official_code"))
-                official_id = official_code_to_id.get(official_code)
-                if official_id is None:
-                    # Not in this upload's officials sheet — validation only
-                    # let this through because official_code matched an
-                    # existing_external_ref, i.e. an official created by a
-                    # PRIOR commit (#94's key new capability over #93).
-                    existing = next(
-                        (o for o in self.store.all_officials()
-                         if o.external_ref == official_code), None)
-                    official_id = existing.id if existing else None
-                if official_id is None:
-                    raise ValidationError(
-                        f"Unknown official_code {official_code} for "
-                        f"official_availability row.")
+                        existing_window = next(
+                            (a for a in self.store.availability_for_official(official_id)
+                             if a.start_time == start and a.end_time == end), None)
+                        if existing_window is not None:
+                            existing_window.status = OfficialAvailabilityStatus(status_raw)
+                            existing_window.note = note
+                            self.store.save_official_availability(existing_window)
+                            self._audit("official_availability_updated",
+                                        "official_availability", existing_window.id,
+                                        actor_id, {"official_id": official_id,
+                                                  "status": status_raw,
+                                                  "import_batch_id": batch_id})
+                            counts["availability_updated"] += 1
+                        else:
+                            self.set_official_availability(
+                                official_id, start, end, status_raw, note=note,
+                                actor_id=actor_id,
+                                extra_detail={"import_batch_id": batch_id})
+                            counts["availability_created"] += 1
 
-                start = _parse_iso_utc(row.get("start_time"))
-                end = _parse_iso_utc(row.get("end_time"))
-                status_raw = _clean(row.get("status"))
-                note_raw = row.get("note")
-                note = _clean(note_raw) if not _blank(note_raw) else None
-
-                existing_window = next(
-                    (a for a in self.store.availability_for_official(official_id)
-                     if a.start_time == start and a.end_time == end), None)
-                if existing_window is not None:
-                    existing_window.status = OfficialAvailabilityStatus(status_raw)
-                    existing_window.note = note
-                    self.store.save_official_availability(existing_window)
-                    self._audit("official_availability_updated",
-                                "official_availability", existing_window.id,
-                                actor_id, {"official_id": official_id,
-                                          "status": status_raw,
-                                          "import_batch_id": batch_id})
-                    counts["availability_updated"] += 1
-                else:
-                    self.set_official_availability(
-                        official_id, start, end, status_raw, note=note,
-                        actor_id=actor_id,
-                        extra_detail={"import_batch_id": batch_id})
-                    counts["availability_created"] += 1
-
-            # skipped/errors are always 0 here by construction — see the
-            # identical note on commit_teams_players_import's import_committed
-            # audit row above.
-            self._audit("import_committed", "import_batch", batch_id, actor_id,
-                        {"import_type": "officials_availability",
-                         "officials_created": counts["officials_created"],
-                         "officials_updated": counts["officials_updated"],
-                         "availability_created": counts["availability_created"],
-                         "availability_updated": counts["availability_updated"],
-                         "clubs_created": counts["clubs_created"],
-                         "skipped": 0, "errors": 0})
+                    # skipped/errors are always 0 here by construction — see the
+                    # identical note on commit_teams_players_import's import_committed
+                    # audit row above.
+                    self._audit("import_committed", "import_batch", batch_id, actor_id,
+                                {"import_type": "officials_availability",
+                                 "officials_created": counts["officials_created"],
+                                 "officials_updated": counts["officials_updated"],
+                                 "availability_created": counts["availability_created"],
+                                 "availability_updated": counts["availability_updated"],
+                                 "clubs_created": counts["clubs_created"],
+                                 "skipped": 0, "errors": 0})
+                break  # committed cleanly
+            except IntegrityConflictError:
+                if attempt == 2:
+                    raise
 
         return {
             "committed": True,
@@ -6102,10 +7356,16 @@ class SetupService:
         game on ``practice``/``maintenance``/etc ice), so silently changing
         ``slot_type`` out from under an allocated slot would leave the game
         record pointing at ice that's no longer game-bookable, even with
-        ``status`` correctly preserved. A pre-write gate below therefore
-        rejects the ENTIRE commit — before any writes, same all-or-nothing
-        guarantee as everything else here — if an incoming row would change
-        the ``slot_type`` of a slot a game already uses.
+        ``status`` correctly preserved. This is checked FRESH under the rink
+        lock, folded into the overlap gate below rather than run as a
+        separate pre-transaction preflight (#331 review round 12 finding 2):
+        ``create_game`` takes this SAME rink lock before allocating a slot,
+        so a lock-free preflight read can already be stale — observing no
+        game yet — by the time this transaction acquires the lock and a
+        concurrent ``create_game`` has since committed. The same TOCTOU class
+        the overlap gate below was already written to avoid (#158 review).
+        Rejects the ENTIRE commit, before any write, if an incoming row would
+        change the ``slot_type`` of a slot a game already uses.
 
         Overlap handling is split by SOURCE. Overlaps WITHIN this upload
         (two rows in the same ``ice_slots`` sheet) stay ``validate_import``'s
@@ -6133,196 +7393,278 @@ class SetupService:
         rink_rows = list(sheets.get("rinks") or [])
         slot_rows = list(sheets.get("ice_slots") or [])
 
-        # Pre-write gate (mirrors #93's Position check): create_game requires
-        # a booked slot's slot_type to stay GAME (it refuses to schedule onto
-        # practice/maintenance/etc ice). Silently changing slot_type on a
-        # slot a game already uses would leave that game pointing at ice
-        # that's no longer game-bookable, even though the status-preserving
-        # guard below correctly leaves `status` alone (review fix). Block the
-        # WHOLE commit before any writes if any row would do this — the same
-        # all-or-nothing guarantee as everything else here.
-        for row in slot_rows:
-            rink_code = _clean(row.get("rink_code"))
-            existing_rink = next((r for r in self.store.all_rinks()
-                                 if r.external_ref == rink_code), None)
-            if existing_rink is None:
-                continue  # a brand-new rink can't yet have a booked slot
-            start = _parse_iso_utc(row.get("start_time"))
-            end = _parse_iso_utc(row.get("end_time"))
-            new_slot_type = IceSlotType(_clean(row.get("slot_type")))
-            existing_slot = next(
-                (s for s in self.store.all_ice_slots()
-                 if s.rink_id == existing_rink.id and s.start_time == start
-                 and s.end_time == end), None)
-            if existing_slot is None:
-                continue
-            if (existing_slot.slot_type != new_slot_type
-                    and self.store.game_using_ice_slot(existing_slot.id) is not None):
-                raise ValidationError(
-                    f"Ice slot {existing_slot.id} on rink_code {rink_code} "
-                    f"has a game scheduled on it; slot_type cannot change "
-                    f"from {existing_slot.slot_type.value} to "
-                    f"{new_slot_type.value}.")
-
-        counts = {"rinks_created": 0, "rinks_updated": 0,
-                  "ice_slots_created": 0, "ice_slots_updated": 0,
-                  "venues_created": 0}
         # See commit_teams_players_import's identical note: generated up
         # front so every row-level audit entry can be tagged with it (#102).
         batch_id = self.store.next_id("importbatch")
 
-        with self.store.transaction():
-            # Row-lock every rink this import already has (matched by
-            # external_ref), in ascending id order, before any slot read or
-            # write. commit_ice_availability locks its accessible rinks in the
-            # same order, so a concurrent builder commit (or a second import) on
-            # a shared rink serializes here instead of racing or deadlocking, and
-            # the overlap snapshot below then reads state no locked-out writer can
-            # still grow underneath it (#158 review).
-            _existing_rink_by_code = {r.external_ref: r
-                                      for r in self.store.all_rinks()
-                                      if r.external_ref}
-            _codes = {_clean(row.get("rink_code")) for row in rink_rows}
-            for _rid in sorted(_existing_rink_by_code[c].id for c in _codes
-                               if c in _existing_rink_by_code):
-                self.store.get_rink_for_update(_rid)
+        # Retry the whole batch if the unique-index backstop rejects an
+        # INSERT (#331 review round 11 finding 2): the row-lock loop just
+        # below only covers rinks this import ALREADY has -- a brand-new
+        # rink_code has nothing to lock, so two concurrent commits can each
+        # see it absent and both attempt to create their own Rink. Migration
+        # 048's unique index is the authoritative backstop; a race-losing
+        # Rink INSERT rolls the whole attempt back and the retry's fresh
+        # by-external_ref lookup sees the winner's row and correctly takes
+        # the update path instead of creating a second one -- mirrors
+        # commit_ice_availability's and
+        # commit_officials_availability_import's identical retry loops. The
+        # separate Venue-by-name match is a structurally identical unlocked
+        # check-then-create to commit_officials_availability_import's Club-
+        # by-name match (also out of this scope) and is not independently
+        # closed by this index -- see migration 048's own comment.
+        for attempt in range(3):
+            counts = {"rinks_created": 0, "rinks_updated": 0,
+                      "ice_slots_created": 0, "ice_slots_updated": 0,
+                      "venues_created": 0}
+            try:
+                with self.store.transaction():
+                    # Row-lock every rink this import already has (matched by
+                    # external_ref), in ascending id order, before any slot read or
+                    # write. commit_ice_availability locks its accessible rinks in the
+                    # same order, so a concurrent builder commit (or a second import) on
+                    # a shared rink serializes here instead of racing or deadlocking, and
+                    # the overlap snapshot below then reads state no locked-out writer can
+                    # still grow underneath it (#158 review).
+                    _existing_rink_by_code = {r.external_ref: r
+                                              for r in self.store.all_rinks()
+                                              if r.external_ref}
+                    _codes = {_clean(row.get("rink_code")) for row in rink_rows}
+                    _planned_ids = sorted(_existing_rink_by_code[c].id for c in _codes
+                                         if c in _existing_rink_by_code)
+                    _locked_by_id = {_rid: self.store.get_rink_for_update(_rid)
+                                     for _rid in _planned_ids}
 
-            # Overlap gate, under the locks and BEFORE any write (mirrors the
-            # slot_type gate's all-or-nothing placement so it rolls back cleanly
-            # on every backend, including InMemoryStore's no-op transaction). A
-            # new slot on an EXISTING rink must not physically overlap ice already
-            # persisted there by another writer — a concurrent
-            # commit_ice_availability batch or an earlier import. Migration 045's
-            # (rink, start, end) unique index catches only an exact-tuple
-            # duplicate (which takes the update path below), so a NON-exact
-            # overlap (an imported 22:30-23:30 against a committed 22:00-23:00)
-            # would otherwise leave both rows alive. Slots on rinks this import
-            # is creating have no persisted ice to clash with; overlaps *within
-            # this upload* aren't persisted yet, so they stay validate_import's
-            # warning-only concern (#158 review).
-            _persisted_by_rink = {}
-            for _s in self.store.all_ice_slots():
-                _persisted_by_rink.setdefault(_s.rink_id, []).append(_s)
-            for row in slot_rows:
-                _rink = _existing_rink_by_code.get(_clean(row.get("rink_code")))
-                if _rink is None:
-                    continue  # a brand-new rink can't yet have persisted ice
-                _start = _parse_iso_utc(row.get("start_time"))
-                _end = _parse_iso_utc(row.get("end_time"))
-                _persisted = _persisted_by_rink.get(_rink.id, [])
-                if any(s.start_time == _start and s.end_time == _end
-                       for s in _persisted):
-                    continue  # exact tuple -> update path, not a new overlap
-                _clash = next((s for s in _persisted if intervals_overlap(
-                    _start, _end, s.start_time, s.end_time)), None)
-                if _clash is not None:
-                    raise ScheduleConflictError(
-                        f"Imported ice slot {_start.isoformat()} to "
-                        f"{_end.isoformat()} on rink_code "
-                        f"{_clean(row.get('rink_code'))} overlaps persisted slot "
-                        f"{_clash.id} on the same rink.",
-                        {"reason": "ice_slot_overlap", "rink_id": _rink.id,
-                         "rink_code": _clean(row.get("rink_code")),
-                         "conflict_slot_id": _clash.id})
+                    # Freeze the rink_code -> Rink mapping this attempt will use
+                    # for BOTH the gates below AND the apply/write phase,
+                    # verified against the IDs this attempt actually locked --
+                    # not just code presence (#331 review round 14 finding 1).
+                    # Round 13's own recheck asked only "did a code that was
+                    # absent become present", which misses two narrower windows:
+                    # (a) a code can stay PRESENT throughout but silently REMAP
+                    # to a different, never-locked Rink id -- e.g. the planned
+                    # Rink is deleted (delete_rink permits this once it has no
+                    # dependent slots/games) and a new Rink is created under the
+                    # same external_ref, racing this attempt's lock acquisition;
+                    # get_rink_for_update on the now-deleted id simply returns
+                    # None, which round 13's loop silently discarded instead of
+                    # treating as drift. (b) a genuinely-new code can materialize,
+                    # unlocked, in the gap between this recheck and a LATER fresh
+                    # lookup -- which is exactly what the apply phase used to do
+                    # below (its own independent all_rinks() scan by code, re-run
+                    # per row instead of reusing this snapshot). Comparing every
+                    # code's fresh id against what this attempt actually locked,
+                    # ONCE here, and then having every downstream read go through
+                    # this frozen mapping rather than re-querying, closes both
+                    # windows at once: nothing that changes Rink state after this
+                    # point can be silently adopted by either the gates or the
+                    # write. A code with no fresh Rink at all (never existed, or
+                    # deleted with nothing recreated in its place) is frozen to
+                    # None -- the apply phase below then reserves+inserts it,
+                    # under migration 048's unique external_ref index, exactly
+                    # as it already does for a code new from the start.
+                    _fresh_rink_by_code = {r.external_ref: r
+                                           for r in self.store.all_rinks()
+                                           if r.external_ref}
+                    _rink_plan = {}
+                    for c in _codes:
+                        _fresh = _fresh_rink_by_code.get(c)
+                        if _fresh is None:
+                            _rink_plan[c] = None
+                        elif _locked_by_id.get(_fresh.id) is not None:
+                            _rink_plan[c] = _fresh
+                        else:
+                            raise _RinkLockPlanDrifted()
 
-            rink_code_to_id = {}
-            for row in rink_rows:
-                rink_code = _clean(row.get("rink_code"))
-                venue_name = _clean(row.get("venue_name"))
-                rink_name_raw = row.get("rink_name")
-                # rink_name isn't in validate_import's required fields for
-                # "rinks" (only venue_name/rink_code are). A brand-new rink
-                # defaults its name to the code so it's never blank (an
-                # explicit judgment call mirroring #93's position-default,
-                # may want revisiting); an EXISTING rink's name is a
-                # partial-field-overwrite — a repeat row that omits
-                # rink_name must leave the current name alone rather than
-                # clobbering it back to the code (review fix).
-                rink_name_supplied = not _blank(rink_name_raw)
-                rink_name = _clean(rink_name_raw) if rink_name_supplied else None
-                address_raw = row.get("address")
-                address = _clean(address_raw) if not _blank(address_raw) else ""
+                    # Overlap gate, under the locks and BEFORE any write (mirrors the
+                    # slot_type gate's all-or-nothing placement so it rolls back cleanly
+                    # on every backend, including InMemoryStore's no-op transaction). A
+                    # new slot on an EXISTING rink must not physically overlap ice already
+                    # persisted there by another writer — a concurrent
+                    # commit_ice_availability batch or an earlier import. Migration 045's
+                    # (rink, start, end) unique index catches only an exact-tuple
+                    # duplicate (which takes the update path below), so a NON-exact
+                    # overlap (an imported 22:30-23:30 against a committed 22:00-23:00)
+                    # would otherwise leave both rows alive. Slots on rinks this import
+                    # is creating have no persisted ice to clash with; overlaps *within
+                    # this upload* aren't persisted yet, so they stay validate_import's
+                    # warning-only concern (#158 review).
+                    _persisted_by_rink = {}
+                    for _s in self.store.all_ice_slots():
+                        _persisted_by_rink.setdefault(_s.rink_id, []).append(_s)
+                    for row in slot_rows:
+                        _rink = _rink_plan.get(_clean(row.get("rink_code")))
+                        if _rink is None:
+                            continue  # a brand-new rink can't yet have persisted ice
+                        _start = _parse_iso_utc(row.get("start_time"))
+                        _end = _parse_iso_utc(row.get("end_time"))
+                        _persisted = _persisted_by_rink.get(_rink.id, [])
+                        _exact = next((s for s in _persisted
+                                      if s.start_time == _start and s.end_time == _end),
+                                     None)
+                        if _exact is not None:
+                            # Exact tuple -> update path, not a new overlap. The
+                            # booked-slot slot_type gate lives HERE, under the
+                            # rink lock (see this function's docstring, "#331
+                            # review round 12 finding 2") rather than at an
+                            # earlier, lock-free preflight -- create_game takes
+                            # this identical rink lock before allocating a
+                            # slot, so only a check made fresh at this exact
+                            # point can't be stale relative to a concurrent
+                            # commit.
+                            _new_slot_type = IceSlotType(_clean(row.get("slot_type")))
+                            if (_exact.slot_type != _new_slot_type
+                                    and self.store.game_using_ice_slot(_exact.id)
+                                        is not None):
+                                raise ValidationError(
+                                    f"Ice slot {_exact.id} on rink_code "
+                                    f"{_clean(row.get('rink_code'))} has a game "
+                                    f"scheduled on it; slot_type cannot change "
+                                    f"from {_exact.slot_type.value} to "
+                                    f"{_new_slot_type.value}.")
+                            continue
+                        _clash = next((s for s in _persisted if intervals_overlap(
+                            _start, _end, s.start_time, s.end_time)), None)
+                        if _clash is not None:
+                            raise ScheduleConflictError(
+                                f"Imported ice slot {_start.isoformat()} to "
+                                f"{_end.isoformat()} on rink_code "
+                                f"{_clean(row.get('rink_code'))} overlaps persisted slot "
+                                f"{_clash.id} on the same rink.",
+                                {"reason": "ice_slot_overlap", "rink_id": _rink.id,
+                                 "rink_code": _clean(row.get("rink_code")),
+                                 "conflict_slot_id": _clash.id})
 
-                venue = next((v for v in self.store.all_venues()
-                             if v.name == venue_name), None)
-                if venue is None:
-                    venue = Venue(id=self.store.next_id("venue"), name=venue_name,
-                                  address=address)
-                    self.store.add_venue(venue)
-                    self._audit("venue_created", "venue", venue.id, actor_id,
-                                {"import_batch_id": batch_id})
-                    counts["venues_created"] += 1
+                    rink_code_to_id = {}
+                    for row in rink_rows:
+                        rink_code = _clean(row.get("rink_code"))
+                        venue_name = _clean(row.get("venue_name"))
+                        rink_name_raw = row.get("rink_name")
+                        # rink_name isn't in validate_import's required fields for
+                        # "rinks" (only venue_name/rink_code are). A brand-new rink
+                        # defaults its name to the code so it's never blank (an
+                        # explicit judgment call mirroring #93's position-default,
+                        # may want revisiting); an EXISTING rink's name is a
+                        # partial-field-overwrite — a repeat row that omits
+                        # rink_name must leave the current name alone rather than
+                        # clobbering it back to the code (review fix).
+                        rink_name_supplied = not _blank(rink_name_raw)
+                        rink_name = _clean(rink_name_raw) if rink_name_supplied else None
+                        address_raw = row.get("address")
+                        address = _clean(address_raw) if not _blank(address_raw) else ""
 
-                rink = next((r for r in self.store.all_rinks()
-                            if r.external_ref == rink_code), None)
-                if rink is not None:
-                    if rink_name_supplied:
-                        rink.name = rink_name
-                    rink.venue_id = venue.id
-                    self.store.save_rink(rink)
-                    self._audit("rink_updated", "rink", rink.id, actor_id,
-                                {"venue_id": venue.id, "import_batch_id": batch_id})
-                    counts["rinks_updated"] += 1
-                else:
-                    rink = Rink(id=self.store.next_id("rink"), venue_id=venue.id,
-                               name=rink_name if rink_name_supplied else rink_code,
-                               external_ref=rink_code)
-                    self.store.add_rink(rink)
-                    self._audit("rink_created", "rink", rink.id, actor_id,
-                                {"venue_id": venue.id, "import_batch_id": batch_id})
-                    counts["rinks_created"] += 1
-                rink_code_to_id[rink_code] = rink.id
+                        venue = next((v for v in self.store.all_venues()
+                                     if v.name == venue_name), None)
+                        if venue is None:
+                            # #331 review round 12 finding 1: same gap, same
+                            # fix as the Club match in
+                            # commit_officials_availability_import above (see
+                            # that comment for the full mechanism). Venue has
+                            # no unique-by-name index -- migration 048's own
+                            # comment named this exact interleaving as
+                            # deliberately open, product-decision-gated scope;
+                            # closed here structurally instead, via
+                            # next_id("venue")'s existing cross-connection
+                            # lock rather than a new constraint.
+                            _reserved_venue_id = self.store.next_id("venue")
+                            venue = next((v for v in self.store.all_venues()
+                                         if v.name == venue_name), None)
+                            if venue is None:
+                                venue = Venue(id=_reserved_venue_id, name=venue_name,
+                                              address=address)
+                                self.store.add_venue(venue)
+                                self._audit("venue_created", "venue", venue.id,
+                                            actor_id,
+                                            {"import_batch_id": batch_id})
+                                counts["venues_created"] += 1
 
-            for row in slot_rows:
-                rink_code = _clean(row.get("rink_code"))
-                # validate_import already guarantees this rink_code matches a
-                # row in THIS SAME upload's rinks sheet; .get() is just a
-                # defensive belt-and-suspenders check against a bug elsewhere.
-                rink_id = rink_code_to_id.get(rink_code)
-                if rink_id is None:
-                    raise ValidationError(
-                        f"Unknown rink_code {rink_code} for ice_slots row.")
+                        # Resolve against the frozen, lock-verified _rink_plan
+                        # (#331 review round 14 finding 1), NOT a fresh
+                        # all_rinks() scan here: a fresh scan at this later
+                        # point could silently adopt a Rink that never went
+                        # through either gate above -- the same unlocked-
+                        # adoption bug the plan freeze exists to close.
+                        rink = _rink_plan.get(rink_code)
+                        if rink is not None:
+                            if rink_name_supplied:
+                                rink.name = rink_name
+                            rink.venue_id = venue.id
+                            self.store.save_rink(rink)
+                            self._audit("rink_updated", "rink", rink.id, actor_id,
+                                        {"venue_id": venue.id, "import_batch_id": batch_id})
+                            counts["rinks_updated"] += 1
+                        else:
+                            rink = Rink(id=self.store.next_id("rink"), venue_id=venue.id,
+                                       name=rink_name if rink_name_supplied else rink_code,
+                                       external_ref=rink_code)
+                            self.store.add_rink(rink)
+                            self._audit("rink_created", "rink", rink.id, actor_id,
+                                        {"venue_id": venue.id, "import_batch_id": batch_id})
+                            counts["rinks_created"] += 1
+                        rink_code_to_id[rink_code] = rink.id
 
-                start = _parse_iso_utc(row.get("start_time"))
-                end = _parse_iso_utc(row.get("end_time"))
-                slot_type = IceSlotType(_clean(row.get("slot_type")))
+                    for row in slot_rows:
+                        rink_code = _clean(row.get("rink_code"))
+                        # validate_import already guarantees this rink_code matches a
+                        # row in THIS SAME upload's rinks sheet; .get() is just a
+                        # defensive belt-and-suspenders check against a bug elsewhere.
+                        rink_id = rink_code_to_id.get(rink_code)
+                        if rink_id is None:
+                            raise ValidationError(
+                                f"Unknown rink_code {rink_code} for ice_slots row.")
 
-                existing_slot = next(
-                    (s for s in self.store.all_ice_slots()
-                     if s.rink_id == rink_id and s.start_time == start
-                     and s.end_time == end), None)
-                if existing_slot is not None:
-                    existing_slot.slot_type = slot_type
-                    if self.store.game_using_ice_slot(existing_slot.id) is None:
-                        existing_slot.status = (
-                            IceSlotStatus.AVAILABLE
-                            if slot_type == IceSlotType.GAME
-                            else IceSlotStatus.BLOCKED)
-                    self.store.save_ice_slot(existing_slot)
-                    self._audit("ice_slot_updated", "ice_slot", existing_slot.id,
-                                actor_id, {"rink_id": rink_id,
-                                          "slot_type": slot_type.value,
-                                          "import_batch_id": batch_id})
-                    counts["ice_slots_updated"] += 1
-                else:
-                    status = (IceSlotStatus.AVAILABLE
-                             if slot_type == IceSlotType.GAME
-                             else IceSlotStatus.BLOCKED)
-                    slot = IceSlot(id=self.store.next_id("slot"), rink_id=rink_id,
-                                  start_time=start, end_time=end,
-                                  slot_type=slot_type, status=status)
-                    self.store.add_ice_slot(slot)
-                    self._audit("ice_slot_created", "ice_slot", slot.id, actor_id,
-                                {"rink_id": rink_id, "slot_type": slot_type.value,
-                                 "import_batch_id": batch_id})
-                    counts["ice_slots_created"] += 1
+                        start = _parse_iso_utc(row.get("start_time"))
+                        end = _parse_iso_utc(row.get("end_time"))
+                        slot_type = IceSlotType(_clean(row.get("slot_type")))
 
-            # skipped/errors are always 0 here by construction — see the
-            # identical note on commit_teams_players_import's import_committed
-            # audit row above.
-            self._audit("import_committed", "import_batch", batch_id, actor_id,
-                        {"import_type": "rinks_ice_slots", "skipped": 0,
-                         "errors": 0, **counts})
+                        existing_slot = next(
+                            (s for s in self.store.all_ice_slots()
+                             if s.rink_id == rink_id and s.start_time == start
+                             and s.end_time == end), None)
+                        if existing_slot is not None:
+                            existing_slot.slot_type = slot_type
+                            if self.store.game_using_ice_slot(existing_slot.id) is None:
+                                existing_slot.status = (
+                                    IceSlotStatus.AVAILABLE
+                                    if slot_type == IceSlotType.GAME
+                                    else IceSlotStatus.BLOCKED)
+                            self.store.save_ice_slot(existing_slot)
+                            self._audit("ice_slot_updated", "ice_slot", existing_slot.id,
+                                        actor_id, {"rink_id": rink_id,
+                                                  "slot_type": slot_type.value,
+                                                  "import_batch_id": batch_id})
+                            counts["ice_slots_updated"] += 1
+                        else:
+                            status = (IceSlotStatus.AVAILABLE
+                                     if slot_type == IceSlotType.GAME
+                                     else IceSlotStatus.BLOCKED)
+                            slot = IceSlot(id=self.store.next_id("slot"), rink_id=rink_id,
+                                          start_time=start, end_time=end,
+                                          slot_type=slot_type, status=status)
+                            self.store.add_ice_slot(slot)
+                            self._audit("ice_slot_created", "ice_slot", slot.id, actor_id,
+                                        {"rink_id": rink_id, "slot_type": slot_type.value,
+                                         "import_batch_id": batch_id})
+                            counts["ice_slots_created"] += 1
+
+                    # skipped/errors are always 0 here by construction — see the
+                    # identical note on commit_teams_players_import's import_committed
+                    # audit row above.
+                    self._audit("import_committed", "import_batch", batch_id, actor_id,
+                                {"import_type": "rinks_ice_slots", "skipped": 0,
+                                 "errors": 0, **counts})
+                break  # committed cleanly
+            except _RinkLockPlanDrifted:
+                # A requested rink_code resolved to a real Rink outside this
+                # attempt's lock plan (#331 review round 13 finding 1) — retry
+                # with a fresh snapshot, which will lock and gate it correctly.
+                if attempt == 2:
+                    raise ConcurrencyConflictError(
+                        "A rink referenced by this import was created "
+                        "concurrently; please retry.",
+                        {"reason": "rink_import_raced"})
+            except IntegrityConflictError:
+                if attempt == 2:
+                    raise
 
         return {
             "committed": True,

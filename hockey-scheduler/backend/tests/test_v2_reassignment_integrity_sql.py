@@ -277,6 +277,348 @@ class GameRegistrationLeagueSqlTest(_SqlIntegrityBase):
         self._run(case)
 
 
+class ParticipationSeasonWideConflictSqlTest(_SqlIntegrityBase):
+    """#331 review round 20 finding 1: a Team with an active registration
+    in one League PLUS an active stray in a DIFFERENT League, in the same
+    Season -- unlike the exact-key duplicate corruption
+    test_exact_registration_identity.py covers (blocked by SQL's own
+    ux_team_league_season unique index, Memory-only reachable), THIS shape
+    is constructible on every backend: the two rows sit at two genuinely
+    different LeagueSeason keys, so no unique index has anything to say
+    about it. Proven here on the real SqlStore (SQLite always, PostgreSQL
+    when TEST_DATABASE_URL is set) so the reviewer's explicit "Memory,
+    SQLite, and PostgreSQL" bar is met on the actual production store, not
+    just the in-memory one."""
+
+    def test_register_team_for_season_rejects_active_stray_elsewhere_zero_mutation(self):
+        def case(api, store):
+            org, program = self._org_program(api)
+            season = api.create_season(program["id"], "Fall", actor_id=ADMIN)
+            l1 = api.create_league(season["id"], "L1", actor_id=ADMIN)
+            l2 = api.create_league(season["id"], "L2", actor_id=ADMIN)
+            club = api.create_club("C", actor_id=ADMIN)
+            team = api.create_team(club["id"], None, "T", actor_id=ADMIN,
+                                   program_id=program["id"], league_id=l1["id"])
+            ls2 = store.league_season_for(l2["id"], season["id"])
+            stray = SeasonTeamRegistration(
+                id=store.next_id("streg"), league_season_id=ls2.id,
+                team_id=team["id"], division_id=None, active=True)
+            store.add_season_team_registration(stray)
+
+            audits_before = len(store.all_setup_audit())
+            res = api.register_team_for_season(
+                season["id"], team["id"], actor_id=ADMIN, league_id=l1["id"])
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "team_registration_conflict", res)
+            self.assertEqual(res["error"]["details"]["affected_registration_ids"],
+                             [stray.id])
+            self.assertEqual(len(store.all_setup_audit()), audits_before)
+            self.assertEqual(
+                len(store.registrations_for_season(season["id"])), 1)
+            still_active = store.get_season_team_registration(stray.id)
+            self.assertTrue(still_active.active)
+
+        self._run(case)
+
+    def test_create_game_rejects_team_with_valid_plus_active_stray_zero_mutation(self):
+        def case(api, store):
+            org, program = self._org_program(api)
+            season = api.create_season(program["id"], "Fall", actor_id=ADMIN)
+            l1 = api.create_league(season["id"], "L1", actor_id=ADMIN)
+            l2 = api.create_league(season["id"], "L2", actor_id=ADMIN)
+            club = api.create_club("C", actor_id=ADMIN)
+            team_a = api.create_team(club["id"], None, "A", actor_id=ADMIN,
+                                     program_id=program["id"], league_id=l1["id"])
+            team_b = api.create_team(club["id"], None, "B", actor_id=ADMIN,
+                                     program_id=program["id"], league_id=l1["id"])
+            api.register_team_for_season(season["id"], team_a["id"],
+                                         actor_id=ADMIN, league_id=l1["id"])
+            api.register_team_for_season(season["id"], team_b["id"],
+                                         actor_id=ADMIN, league_id=l1["id"])
+            # team_a picks up an active stray under l2 -- injected directly,
+            # the same "legacy data / a write path predating this review"
+            # shape every sibling test in this file uses (no live v2 write
+            # path can build it once round_team_for_season's own guard,
+            # proven above, is in place).
+            ls2 = store.league_season_for(l2["id"], season["id"])
+            stray = SeasonTeamRegistration(
+                id=store.next_id("streg"), league_season_id=ls2.id,
+                team_id=team_a["id"], division_id=None, active=True)
+            store.add_season_team_registration(stray)
+            slot = self._game_slot(api, org, program, season["id"])
+
+            audits_before = len(store.all_setup_audit())
+            res = api.create_game(season["id"], None, team_a["id"], team_b["id"],
+                                  slot["id"], actor_id=ADMIN, league_id=l1["id"])
+            self.assertIn("error", res, res)
+            self.assertEqual(store.all_games(), [])
+            self.assertEqual(store.get_ice_slot(slot["id"]).status,
+                             IceSlotStatus.AVAILABLE)
+            self.assertEqual(len(store.all_setup_audit()), audits_before)
+
+        self._run(case)
+
+
+class GameLeagueSeasonIdentitySqlTest(_SqlIntegrityBase):
+    """#331 review round 22: ``_revalidate_game_participation``'s
+    division-less branch (round 21) compared only the resolved
+    registration's permanent League id against ``game.league_season_id``'s
+    OWN League id -- never confirming ``league_season_id`` resolves to a
+    real row, nor that it belongs to the game's Season. Both gaps are
+    reachable on a real SQL backend: a dangling id (the row was deleted, or
+    the id never existed) needs no unique-index bypass at all, and a SAME-
+    League-different-Season LeagueSeason is genuinely constructible (no
+    unique index spans two different Seasons). Proven here on SQLite always
+    and PostgreSQL when ``TEST_DATABASE_URL`` is set, for both ``move_game``
+    and ``publish_game``, zero mutation on rejection."""
+
+    def _fixture(self, api, store):
+        org, program = self._org_program(api)
+        season = api.create_season(program["id"], "Fall", actor_id=ADMIN)
+        league = api.create_league(season["id"], "L", actor_id=ADMIN)
+        club = api.create_club("C", actor_id=ADMIN)
+        home = api.create_team(club["id"], None, "Home", actor_id=ADMIN,
+                               program_id=program["id"], league_id=league["id"])
+        away = api.create_team(club["id"], None, "Away", actor_id=ADMIN,
+                               program_id=program["id"], league_id=league["id"])
+        api.register_team_for_season(season["id"], home["id"], actor_id=ADMIN,
+                                     league_id=league["id"])
+        api.register_team_for_season(season["id"], away["id"], actor_id=ADMIN,
+                                     league_id=league["id"])
+        org2, venue_program = org, program
+        venue = api.create_venue("V", organization_id=org2["id"],
+                                 league_id=venue_program["id"], actor_id=ADMIN)
+        api.grant_season_venue_access(season["id"], venue["id"], actor_id=ADMIN)
+        rink = api.create_rink(venue["id"], "R", actor_id=ADMIN)
+        slot1 = api.create_ice_slot(
+            rink["id"], "2026-09-01T18:30:00+00:00",
+            "2026-09-01T20:00:00+00:00", "game", actor_id=ADMIN)
+        slot2 = api.create_ice_slot(
+            rink["id"], "2026-09-02T18:30:00+00:00",
+            "2026-09-02T20:00:00+00:00", "game", actor_id=ADMIN)
+        game = api.create_game(season["id"], None, home["id"], away["id"],
+                               slot1["id"], actor_id=ADMIN, league_id=league["id"])
+        self.assertNotIn("error", game, game)
+        return program, season, league, slot1, slot2, game
+
+    def _corrupt(self, store, game_id, new_league_season_id):
+        game = store.get_game(game_id)
+        game.league_season_id = new_league_season_id
+        store.save_game(game)
+
+    def test_move_rejects_a_dangling_league_season_id_zero_mutation(self):
+        def case(api, store):
+            program, season, league, slot1, slot2, game = self._fixture(api, store)
+            self._corrupt(store, game["id"], "leagueseason_does_not_exist")
+            audits_before = len(store.all_setup_audit())
+            res = api.move_game(game["id"], slot2["id"], actor_id=ADMIN)
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "regular_game_missing_league_season", res)
+            self.assertEqual(store.get_game(game["id"]).ice_slot_id, slot1["id"])
+            self.assertEqual(len(store.all_setup_audit()), audits_before)
+
+        self._run(case)
+
+    def test_publish_rejects_a_dangling_league_season_id_zero_mutation(self):
+        def case(api, store):
+            program, season, league, slot1, slot2, game = self._fixture(api, store)
+            self._corrupt(store, game["id"], "leagueseason_does_not_exist")
+            audits_before = len(store.all_setup_audit())
+            res = api.publish_game(game["id"], actor_id=ADMIN)
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "regular_game_missing_league_season", res)
+            self.assertFalse(store.get_game(game["id"]).published)
+            self.assertEqual(len(store.all_setup_audit()), audits_before)
+
+        self._run(case)
+
+    def test_move_rejects_a_league_season_from_a_different_season_zero_mutation(self):
+        def case(api, store):
+            program, season, league, slot1, slot2, game = self._fixture(api, store)
+            other_season = api.create_season(program["id"], "Other", actor_id=ADMIN)
+            other_ls = api.setup.create_league_season(
+                league["id"], other_season["id"], actor_id=ADMIN)
+            self._corrupt(store, game["id"], other_ls.id)
+            audits_before = len(store.all_setup_audit())
+            res = api.move_game(game["id"], slot2["id"], actor_id=ADMIN)
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "game_league_season_mismatch", res)
+            self.assertEqual(store.get_game(game["id"]).ice_slot_id, slot1["id"])
+            self.assertEqual(len(store.all_setup_audit()), audits_before)
+
+        self._run(case)
+
+    def test_publish_rejects_a_league_season_from_a_different_season_zero_mutation(self):
+        def case(api, store):
+            program, season, league, slot1, slot2, game = self._fixture(api, store)
+            other_season = api.create_season(program["id"], "Other", actor_id=ADMIN)
+            other_ls = api.setup.create_league_season(
+                league["id"], other_season["id"], actor_id=ADMIN)
+            self._corrupt(store, game["id"], other_ls.id)
+            audits_before = len(store.all_setup_audit())
+            res = api.publish_game(game["id"], actor_id=ADMIN)
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "game_league_season_mismatch", res)
+            self.assertFalse(store.get_game(game["id"]).published)
+            self.assertEqual(len(store.all_setup_audit()), audits_before)
+
+        self._run(case)
+
+
+class GameLeagueIdIdentitySqlTest(_SqlIntegrityBase):
+    """#331 review round 23: round 22 validated the game's own LeagueSeason
+    exists and belongs to the game's Season, and that both Teams are
+    registered exactly there -- but never checked the game's own legacy
+    ``league_id`` against ``league_season.league_id``. Standings already
+    fail closed on exactly this drift when reading (``_standings_for_
+    division``/``_standings_for_league_season``); nothing stopped move/
+    publish from committing it. No unique index spans a Game's `league_id`
+    and its LeagueSeason's `league_id`, so this is reachable on every SQL
+    backend by corrupting `league_id` alone -- proven here on SQLite always
+    and PostgreSQL when ``TEST_DATABASE_URL`` is set, zero mutation on
+    rejection."""
+
+    def _fixture(self, api, store):
+        org, program = self._org_program(api)
+        season = api.create_season(program["id"], "Fall", actor_id=ADMIN)
+        league = api.create_league(season["id"], "L", actor_id=ADMIN)
+        other_league = api.create_league(season["id"], "L2", actor_id=ADMIN)
+        club = api.create_club("C", actor_id=ADMIN)
+        home = api.create_team(club["id"], None, "Home", actor_id=ADMIN,
+                               program_id=program["id"], league_id=league["id"])
+        away = api.create_team(club["id"], None, "Away", actor_id=ADMIN,
+                               program_id=program["id"], league_id=league["id"])
+        api.register_team_for_season(season["id"], home["id"], actor_id=ADMIN,
+                                     league_id=league["id"])
+        api.register_team_for_season(season["id"], away["id"], actor_id=ADMIN,
+                                     league_id=league["id"])
+        venue = api.create_venue("V", organization_id=org["id"],
+                                 league_id=program["id"], actor_id=ADMIN)
+        api.grant_season_venue_access(season["id"], venue["id"], actor_id=ADMIN)
+        rink = api.create_rink(venue["id"], "R", actor_id=ADMIN)
+        slot1 = api.create_ice_slot(
+            rink["id"], "2026-09-01T18:30:00+00:00",
+            "2026-09-01T20:00:00+00:00", "game", actor_id=ADMIN)
+        slot2 = api.create_ice_slot(
+            rink["id"], "2026-09-02T18:30:00+00:00",
+            "2026-09-02T20:00:00+00:00", "game", actor_id=ADMIN)
+        game = api.create_game(season["id"], None, home["id"], away["id"],
+                               slot1["id"], actor_id=ADMIN, league_id=league["id"])
+        self.assertNotIn("error", game, game)
+        return program, season, league, other_league, slot1, slot2, game
+
+    def _corrupt(self, store, game_id, new_league_id):
+        game = store.get_game(game_id)
+        game.league_id = new_league_id
+        store.save_game(game)
+
+    def test_move_rejects_a_disagreeing_league_id_zero_mutation(self):
+        def case(api, store):
+            (program, season, league, other_league, slot1, slot2,
+             game) = self._fixture(api, store)
+            self._corrupt(store, game["id"], other_league["id"])
+            audits_before = len(store.all_setup_audit())
+            res = api.move_game(game["id"], slot2["id"], actor_id=ADMIN)
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "game_league_season_mismatch", res)
+            self.assertEqual(res["error"]["details"]["league_id"],
+                             other_league["id"])
+            self.assertEqual(store.get_game(game["id"]).ice_slot_id, slot1["id"])
+            self.assertEqual(len(store.all_setup_audit()), audits_before)
+
+        self._run(case)
+
+    def test_publish_rejects_a_disagreeing_league_id_zero_mutation(self):
+        def case(api, store):
+            (program, season, league, other_league, slot1, slot2,
+             game) = self._fixture(api, store)
+            self._corrupt(store, game["id"], other_league["id"])
+            audits_before = len(store.all_setup_audit())
+            res = api.publish_game(game["id"], actor_id=ADMIN)
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "game_league_season_mismatch", res)
+            self.assertFalse(store.get_game(game["id"]).published)
+            self.assertEqual(len(store.all_setup_audit()), audits_before)
+
+        self._run(case)
+
+    # -- #331 review round 24: a FALSY stored League on a real SQL backend --
+    # ``games.league_id TEXT`` is nullable on both SQLite and PostgreSQL, so
+    # a NULL League is a genuinely storable row there -- no unique index or
+    # NOT NULL constraint makes it impossible. Round 23's truthiness guard
+    # skipped the parity check for exactly this value; these prove the now-
+    # unconditional equality rejects it on the real backends.
+
+    def _state(self, store):
+        return {
+            "games": {g.id: dict(vars(g)) for g in store.all_games()},
+            "slots": {s.id: s.status.value for s in store.all_ice_slots()},
+            "audit": len(store.all_setup_audit()),
+            "notifications": len(store.all_notifications_feed()),
+            "deliveries": len(store.all_notification_deliveries()),
+        }
+
+    def test_move_rejects_a_null_league_id_zero_mutation(self):
+        def case(api, store):
+            (program, season, league, other_league, slot1, slot2,
+             game) = self._fixture(api, store)
+            self._corrupt(store, game["id"], None)
+            before = self._state(store)
+            res = api.move_game(game["id"], slot2["id"], actor_id=ADMIN)
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "game_league_season_mismatch", res)
+            self.assertIsNone(res["error"]["details"]["league_id"], res)
+            self.assertEqual(res["error"]["details"]["league_season_league_id"],
+                             league["id"], res)
+            self.assertEqual(self._state(store), before)
+
+        self._run(case)
+
+    def test_publish_rejects_a_null_league_id_zero_mutation(self):
+        def case(api, store):
+            (program, season, league, other_league, slot1, slot2,
+             game) = self._fixture(api, store)
+            self._corrupt(store, game["id"], None)
+            before = self._state(store)
+            res = api.publish_game(game["id"], actor_id=ADMIN)
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "game_league_season_mismatch", res)
+            self.assertIsNone(res["error"]["details"]["league_id"], res)
+            self.assertEqual(self._state(store), before)
+
+        self._run(case)
+
+    def test_batch_draft_publish_rejects_a_null_league_id_zero_mutation(self):
+        # One invalid target must roll the WHOLE batch back on a real SQL
+        # backend -- the valid peer stays a draft on an AVAILABLE slot.
+        def case(api, store):
+            (program, season, league, other_league, slot1, slot2,
+             game) = self._fixture(api, store)
+            peer = api.create_game(
+                season["id"], None,
+                store.get_game(game["id"]).away_team_id,
+                store.get_game(game["id"]).home_team_id,
+                slot2["id"], actor_id=ADMIN, league_id=league["id"])
+            self.assertNotIn("error", peer, peer)
+            for gid, null_it in ((game["id"], True), (peer["id"], False)):
+                g = store.get_game(gid)
+                g.is_draft = True
+                if null_it:
+                    g.league_id = None
+                store.save_game(g)
+            before = self._state(store)
+            res = api.publish_draft_games(
+                game_ids=[game["id"], peer["id"]], actor_id=ADMIN)
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "game_league_season_mismatch", res)
+            self.assertEqual(self._state(store), before)
+            peer_after = store.get_game(peer["id"])
+            self.assertTrue(peer_after.is_draft, "peer left the draft state")
+            self.assertFalse(peer_after.published, "peer was published")
+
+        self._run(case)
+
+
 class AssignClubOptionalSqlTest(_SqlIntegrityBase):
     """Club is optional on a Team in both v1 and v2 (#233 Slice D)."""
 
@@ -403,6 +745,397 @@ class RollForwardConflictSqlTest(_SqlIntegrityBase):
             self.assertNotIn("error", res, res)
             self.assertEqual(res["rolled_forward"], 0, res)
             self.assertEqual(res["skipped"], 1, res)
+
+        self._run(case)
+
+    # -- #331 review round 18: exact-identity resolution in the target season
+
+    def test_inactive_sibling_in_another_league_creates_distinct_active_row(self):
+        def case(api, store):
+            s1, s2, l1t, l2t, team_a, team_b = self._two_league_target(api)
+            # l2t has never been linked into s2 -- force the binding (a
+            # throwaway Division is the public way to do it) so the
+            # injected stale row below has a real LeagueSeason to sit at.
+            api.create_division(s2["id"], "L2t Div", league_id=l2t["id"],
+                                actor_id=ADMIN)
+            # A retained INACTIVE row from a former league sits at the
+            # target season already (history from a prior unregister/
+            # transfer cycle) -- NOT at team_a's real permanent league l1t.
+            reg_stale = SeasonTeamRegistration(
+                id=store.next_id("streg"),
+                league_season_id=store.league_season_for(
+                    l2t["id"], s2["id"]).id,
+                team_id=team_a["id"], division_id=None, active=False)
+            store.add_season_team_registration(reg_stale)
+
+            res = api.roll_forward_registrations_v2(
+                s1["id"], s2["id"],
+                selections=[{"team_id": team_a["id"], "league_id": l1t["id"]}],
+                actor_id=ADMIN)
+            self.assertNotIn("error", res, res)
+            self.assertEqual(res["rolled_forward"], 1, res)
+            active = [r for r in store.registrations_for_season(s2["id"])
+                     if r.active]
+            self.assertEqual(len(active), 1)
+            self.assertEqual(
+                active[0].league_season_id,
+                store.league_season_for(l1t["id"], s2["id"]).id)
+            untouched = store.get_season_team_registration(reg_stale.id)
+            self.assertFalse(untouched.active)
+            self.assertEqual(untouched.league_season_id,
+                             reg_stale.league_season_id)
+
+        self._run(case)
+
+    def test_active_row_in_another_league_always_rejected_game_free(self):
+        def case(api, store):
+            # v2 never silently MOVES an existing active registration to
+            # match a selection (unlike v1/hierarchy import/
+            # commit_teams_players_import's shared resolver) -- a mismatch
+            # is always a contract violation the operator must resolve
+            # explicitly, regardless of whether a game is even present to
+            # strand. Proven here with NO game at all: this is not "safe to
+            # auto-move but we're conservative", the rejection is
+            # unconditional by design.
+            s1, s2, l1t, l2t, team_a, team_b = self._two_league_target(api)
+            api.create_division(s2["id"], "L2t Div", league_id=l2t["id"],
+                                actor_id=ADMIN)
+            reg_other = SeasonTeamRegistration(
+                id=store.next_id("streg"),
+                league_season_id=store.league_season_for(
+                    l2t["id"], s2["id"]).id,
+                team_id=team_a["id"], division_id=None, active=True)
+            store.add_season_team_registration(reg_other)
+
+            audits_before = len(store.all_setup_audit())
+            res = api.roll_forward_registrations_v2(
+                s1["id"], s2["id"],
+                selections=[{"team_id": team_a["id"], "league_id": l1t["id"]}],
+                actor_id=ADMIN)
+            self.assertEqual(res["error"]["code"], "validation_error", res)
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "rollover_conflicts_active_registration", res)
+            self.assertEqual(
+                res["error"]["details"]["affected_registration_ids"],
+                [reg_other.id])
+            self.assertEqual(len(store.all_setup_audit()), audits_before)
+            still_active = store.get_season_team_registration(reg_other.id)
+            self.assertTrue(still_active.active)
+            self.assertEqual(still_active.league_season_id,
+                             reg_other.league_season_id)
+
+        self._run(case)
+
+    def test_active_row_in_another_league_rejected_same_way_with_committed_game(self):
+        def case(api, store):
+            # The SAME rejection (never a "strands_games" variant) whether
+            # or not a committed game references the stale row -- v2 never
+            # attempts the move that would strand it in the first place, so
+            # it never needs game-awareness to stay safe.
+            s1, s2, l1t, l2t, team_a, team_b = self._two_league_target(api)
+            api.create_division(s2["id"], "L2t Div", league_id=l2t["id"],
+                                actor_id=ADMIN)
+            reg_other = SeasonTeamRegistration(
+                id=store.next_id("streg"),
+                league_season_id=store.league_season_for(
+                    l2t["id"], s2["id"]).id,
+                team_id=team_a["id"], division_id=None, active=True)
+            store.add_season_team_registration(reg_other)
+            store.add_game(Game(
+                id=store.next_id("game"), home_team_id=team_a["id"],
+                away_team_id=None,
+                start_time=datetime(2026, 9, 1, tzinfo=timezone.utc),
+                season_id=s2["id"], league_id=l2t["id"], cancelled=False))
+
+            audits_before = len(store.all_setup_audit())
+            res = api.roll_forward_registrations_v2(
+                s1["id"], s2["id"],
+                selections=[{"team_id": team_a["id"], "league_id": l1t["id"]}],
+                actor_id=ADMIN)
+            self.assertEqual(res["error"]["code"], "validation_error", res)
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "rollover_conflicts_active_registration", res)
+            self.assertEqual(len(store.all_setup_audit()), audits_before)
+
+        self._run(case)
+
+    # -- #331 review round 19: explicit registration_id identity ------------
+
+    def test_explicit_registration_id_matching_the_source_row_still_rolls(self):
+        def case(api, store):
+            s1, s2, l1t, l2t, team_a, team_b = self._two_league_target(api)
+            src_reg = next(r for r in store.registrations_for_season(s1["id"])
+                          if r.team_id == team_a["id"])
+            res = api.roll_forward_registrations_v2(
+                s1["id"], s2["id"],
+                selections=[{"team_id": team_a["id"], "league_id": l1t["id"],
+                             "registration_id": src_reg.id}],
+                actor_id=ADMIN)
+            self.assertNotIn("error", res, res)
+            self.assertEqual(res["rolled_forward"], 1, res)
+
+        self._run(case)
+
+    def test_registration_id_for_a_different_team_rejected_zero_mutation(self):
+        def case(api, store):
+            # #331 review round 19 finding 4: the frontend's Season rollover
+            # panel now sends the SOURCE registration id it rendered a row
+            # for, keyed independently of team_id (two rows for one team must
+            # never collide on a shared DOM/selection key). The backend must
+            # cross-check it against team_id, not trust team_id alone --
+            # otherwise a stale/mismatched registration_id (a bug, or a
+            # tampered request) would silently pass unnoticed.
+            s1, s2, l1t, l2t, team_a, team_b = self._two_league_target(api)
+            team_b_reg = next(
+                r for r in store.registrations_for_season(s1["id"])
+                if r.team_id == team_b["id"])
+            audits_before = len(store.all_setup_audit())
+            res = api.roll_forward_registrations_v2(
+                s1["id"], s2["id"],
+                selections=[{"team_id": team_a["id"], "league_id": l1t["id"],
+                             "registration_id": team_b_reg.id}],
+                actor_id=ADMIN)
+            self.assertEqual(res["error"]["code"], "validation_error", res)
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "rollover_registration_mismatch", res)
+            self.assertEqual(res["error"]["details"]["team_id"], team_a["id"])
+            active = {r.team_id: r for r in
+                      store.registrations_for_season(s2["id"]) if r.active}
+            self.assertEqual(active, {})
+            self.assertEqual(len(store.all_setup_audit()), audits_before)
+
+        self._run(case)
+
+    def test_inactive_registration_id_rejected_zero_mutation(self):
+        def case(api, store):
+            s1, s2, l1t, l2t, team_a, team_b = self._two_league_target(api)
+            # team_a keeps its own real ACTIVE source registration (so it
+            # still passes the "is this team registered in the source
+            # season at all" gate) -- a SEPARATE, inactive row is what the
+            # selection actually names, so this exercises the registration_
+            # id cross-check specifically, not the earlier not-in-source-
+            # season check.
+            l3 = api.create_league(s1["id"], "L3", actor_id=ADMIN)
+            api.create_division(s1["id"], "L3 Div", league_id=l3["id"],
+                                actor_id=ADMIN)
+            inactive_reg = SeasonTeamRegistration(
+                id=store.next_id("streg"),
+                league_season_id=store.league_season_for(l3["id"], s1["id"]).id,
+                team_id=team_a["id"], division_id=None, active=False)
+            store.add_season_team_registration(inactive_reg)
+            audits_before = len(store.all_setup_audit())
+            res = api.roll_forward_registrations_v2(
+                s1["id"], s2["id"],
+                selections=[{"team_id": team_a["id"], "league_id": l1t["id"],
+                             "registration_id": inactive_reg.id}],
+                actor_id=ADMIN)
+            self.assertEqual(res["error"]["code"], "validation_error", res)
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "rollover_registration_mismatch", res)
+            active = {r.team_id: r for r in
+                      store.registrations_for_season(s2["id"]) if r.active}
+            self.assertEqual(active, {})
+            self.assertEqual(len(store.all_setup_audit()), audits_before)
+
+        self._run(case)
+
+    def test_duplicate_team_selection_in_one_batch_rejected_zero_mutation(self):
+        def case(api, store):
+            # #331 review round 19 finding 4: two selections for the SAME
+            # team_id (e.g. two source rows for a Team with a Rule 7
+            # violation, both checked in the UI) is unresolvable ambiguity
+            # -- the old `wanted[tid] = ...` aggregation silently kept only
+            # the LAST one; this must reject the whole batch instead.
+            s1, s2, l1t, l2t, team_a, team_b = self._two_league_target(api)
+            audits_before = len(store.all_setup_audit())
+            res = api.roll_forward_registrations_v2(
+                s1["id"], s2["id"],
+                selections=[
+                    {"team_id": team_a["id"], "league_id": l1t["id"]},
+                    {"team_id": team_a["id"], "league_id": l1t["id"],
+                     "division_id": None},
+                ],
+                actor_id=ADMIN)
+            self.assertEqual(res["error"]["code"], "validation_error", res)
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "rollover_duplicate_team_selection", res)
+            self.assertEqual(res["error"]["details"]["team_id"], team_a["id"])
+            active = {r.team_id: r for r in
+                      store.registrations_for_season(s2["id"]) if r.active}
+            self.assertEqual(active, {})
+            self.assertEqual(len(store.all_setup_audit()), audits_before)
+
+        self._run(case)
+
+
+class TransferRetainedTargetSqlTest(_SqlIntegrityBase):
+    """#331 review round 18: _transfer_team_to_league_inner must never
+    blindly rebind a Team's active registration onto its target
+    LeagueSeason -- a retained/duplicate row may already sit there (history
+    from a prior assignment/transfer cycle, or legacy Rule 7 drift). Proven
+    on the REAL SQL store so a collision surfaces as the structured
+    rejection this function documents ("Apply -- all writes happen only
+    after every check passed"), never a raw unique_violation."""
+
+    def _team_with_two_leagues(self, api):
+        org, program = self._org_program(api)
+        season = api.create_season(program["id"], "Fall", actor_id=ADMIN)
+        l1 = api.create_league(season["id"], "L1", actor_id=ADMIN)
+        l2 = api.create_league(season["id"], "L2", actor_id=ADMIN)
+        club = api.create_club("C", actor_id=ADMIN)
+        team = api.create_team(club["id"], None, "T", actor_id=ADMIN,
+                               program_id=program["id"], league_id=l1["id"])
+        reg_l1 = api.register_team_for_season(
+            season["id"], team["id"], actor_id=ADMIN, league_id=l1["id"])
+        return season, l1, l2, team, reg_l1
+
+    def test_reactivates_retained_inactive_row_at_target(self):
+        def case(api, store):
+            season, l1, l2, team, reg_l1 = self._team_with_two_leagues(api)
+            # A retained INACTIVE row already sits at the target League --
+            # history from a prior cycle no current write path can leave
+            # behind starting fresh, so inject it directly.
+            reg_l2 = SeasonTeamRegistration(
+                id=store.next_id("streg"),
+                league_season_id=store.league_season_for(
+                    l2["id"], season["id"]).id,
+                team_id=team["id"], division_id=None, active=False)
+            store.add_season_team_registration(reg_l2)
+
+            res = api.transfer_team_to_league(team["id"], l2["id"],
+                                              actor_id=ADMIN)
+            self.assertNotIn("error", res, res)
+            self.assertEqual(store.get_team(team["id"]).league_id, l2["id"])
+            # The RETAINED row was reactivated in place (same id) ...
+            reactivated = store.get_season_team_registration(reg_l2.id)
+            self.assertTrue(reactivated.active)
+            self.assertEqual(
+                _reg_league(store, reactivated), l2["id"])
+            # ... and the SOURCE row was retired (deactivated), not deleted
+            # or rebound onto the target's unique key.
+            retired = store.get_season_team_registration(reg_l1["id"])
+            self.assertFalse(retired.active)
+            self.assertEqual(_reg_league(store, retired), l1["id"])
+            # No third row was created.
+            self.assertEqual(
+                len(store.registrations_for_season(season["id"])), 2)
+
+        self._run(case)
+
+    def test_rejects_when_target_already_has_an_active_row_zero_mutation(self):
+        def case(api, store):
+            season, l1, l2, team, reg_l1 = self._team_with_two_leagues(api)
+            # The team ALREADY has a second active row at the target League
+            # -- a legacy Rule 7 violation (two concurrent active
+            # registrations for one team in one season) no current write
+            # path can produce starting fresh. Moving reg_l1 onto it would
+            # either silently duplicate (Memory) or raise a raw
+            # unique_violation (SQL) instead of a structured rejection.
+            reg_l2 = SeasonTeamRegistration(
+                id=store.next_id("streg"),
+                league_season_id=store.league_season_for(
+                    l2["id"], season["id"]).id,
+                team_id=team["id"], division_id=None, active=True)
+            store.add_season_team_registration(reg_l2)
+
+            audits_before = len(store.all_setup_audit())
+            res = api.transfer_team_to_league(team["id"], l2["id"],
+                                              actor_id=ADMIN)
+            self.assertEqual(res["error"]["code"], "validation_error", res)
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "team_registration_conflict", res)
+            # Zero mutation: Team's permanent league unchanged, both rows
+            # exactly as they were, no audit written.
+            self.assertEqual(store.get_team(team["id"]).league_id, l1["id"])
+            still_l1 = store.get_season_team_registration(reg_l1["id"])
+            self.assertTrue(still_l1.active)
+            self.assertEqual(_reg_league(store, still_l1), l1["id"])
+            still_l2 = store.get_season_team_registration(reg_l2.id)
+            self.assertTrue(still_l2.active)
+            self.assertEqual(_reg_league(store, still_l2), l2["id"])
+            self.assertEqual(len(store.all_setup_audit()), audits_before)
+
+        self._run(case)
+
+
+class AssignLeagueRetainedTargetSqlTest(_SqlIntegrityBase):
+    """#331 review round 18: assign_season_team_league must never blindly
+    rebind onto a retained/duplicate row at the target LeagueSeason either
+    -- the same defect class as TransferRetainedTargetSqlTest above, for the
+    sibling reassignment entry point."""
+
+    def _reg_with_two_leagues(self, api, store):
+        org, program = self._org_program(api)
+        season = api.create_season(program["id"], "Fall", actor_id=ADMIN)
+        l1 = api.create_league(season["id"], "L1", actor_id=ADMIN)
+        l2 = api.create_league(season["id"], "L2", actor_id=ADMIN)
+        club = api.create_club("C", actor_id=ADMIN)
+        # No permanent league on the Team -- assign_season_team_league's own
+        # rule-7 guard would otherwise refuse to move a pinned Team's
+        # registration away from its permanent league before this test's
+        # target logic is even reached. create_team now REQUIRES a
+        # resolvable league, so a league-less Team (legacy data predating
+        # rule 2, or any other write path that never backfilled one) has to
+        # be injected directly -- the same technique
+        # AssignLeagueGameStrandSqlTest uses above.
+        team_obj = Team(id=store.next_id("team"), name="T", club_id=club["id"],
+                        program_id=program["id"])
+        store.add_team(team_obj)
+        team = {"id": team_obj.id}
+        reg_l1_obj = SeasonTeamRegistration(
+            id=store.next_id("streg"),
+            league_season_id=store.league_season_for(l1["id"], season["id"]).id,
+            team_id=team["id"], division_id=None, active=True)
+        store.add_season_team_registration(reg_l1_obj)
+        reg_l1 = {"id": reg_l1_obj.id}
+        return season, l1, l2, team, reg_l1
+
+    def test_reactivates_retained_inactive_row_and_retires_source(self):
+        def case(api, store):
+            season, l1, l2, team, reg_l1 = self._reg_with_two_leagues(api, store)
+            reg_l2 = SeasonTeamRegistration(
+                id=store.next_id("streg"),
+                league_season_id=store.league_season_for(
+                    l2["id"], season["id"]).id,
+                team_id=team["id"], division_id=None, active=False)
+            store.add_season_team_registration(reg_l2)
+
+            res = api.assign_season_team_league(reg_l1["id"], l2["id"],
+                                                actor_id=ADMIN)
+            self.assertNotIn("error", res, res)
+            self.assertEqual(res["id"], reg_l2.id)  # the RETAINED row, reused
+            reactivated = store.get_season_team_registration(reg_l2.id)
+            self.assertTrue(reactivated.active)
+            self.assertEqual(_reg_league(store, reactivated), l2["id"])
+            retired = store.get_season_team_registration(reg_l1["id"])
+            self.assertFalse(retired.active)
+            self.assertEqual(
+                len(store.registrations_for_season(season["id"])), 2)
+
+        self._run(case)
+
+    def test_rejects_when_target_already_has_an_active_row_zero_mutation(self):
+        def case(api, store):
+            season, l1, l2, team, reg_l1 = self._reg_with_two_leagues(api, store)
+            reg_l2 = SeasonTeamRegistration(
+                id=store.next_id("streg"),
+                league_season_id=store.league_season_for(
+                    l2["id"], season["id"]).id,
+                team_id=team["id"], division_id=None, active=True)
+            store.add_season_team_registration(reg_l2)
+
+            audits_before = len(store.all_setup_audit())
+            res = api.assign_season_team_league(reg_l1["id"], l2["id"],
+                                                actor_id=ADMIN)
+            self.assertEqual(res["error"]["code"], "validation_error", res)
+            self.assertEqual(res["error"]["details"]["reason"],
+                             "team_registration_conflict", res)
+            still_l1 = store.get_season_team_registration(reg_l1["id"])
+            self.assertTrue(still_l1.active)
+            self.assertEqual(_reg_league(store, still_l1), l1["id"])
+            still_l2 = store.get_season_team_registration(reg_l2.id)
+            self.assertTrue(still_l2.active)
+            self.assertEqual(len(store.all_setup_audit()), audits_before)
 
         self._run(case)
 

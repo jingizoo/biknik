@@ -11,6 +11,34 @@
   --purple: #5856d6;
 }
 
+/* Setup-progress card (#331 review round 3 finding 4): the sitewide --muted
+   (3.26:1 on white), button.primary's white-on-blue (~3.65:1), the "Done"/
+   "To do" badge text colors (3.91:1 / 4.50:1), and .banner.alert's white-
+   on-red (~3.3:1) all fail WCAG 2.2 AA for normal text -- being pre-
+   existing conventions this card reuses doesn't waive #330's explicit
+   requirement for the card's OWN surface. Scoped to .sp-card (every
+   renderSetupProgressCard() state carries this class) so every other
+   screen reusing these same shared classes/tokens is unaffected. Colors
+   reuse an existing passing token in the same hue where one already exists
+   in the needed role (.badge.blue/.badge.gray's own text colors); no
+   sitewide token passes as a SOLID FILL + white text (only as a light tint
+   + dark text, the badge convention), so button.primary/.banner.alert get
+   a same-hue value computed to clear 4.5:1 instead. */
+.sp-card { --muted: #6b6b70; }
+.sp-card button.primary { background: #0a64c4; }
+.sp-card .badge.green { background: #e3f9e8; color: #167029; }
+.sp-card .badge.gray { background: #ececf1; color: #57575c; }
+.sp-card .banner.alert { background: #c0271b; }
+
+/* Visually hidden but still announced by screen readers (#331 review round
+   5 finding 5) -- the standard clip-based pattern, not display:none/
+   visibility:hidden, both of which remove the element from the
+   accessibility tree entirely. */
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+}
+
 * { box-sizing: border-box; }
 
 body {

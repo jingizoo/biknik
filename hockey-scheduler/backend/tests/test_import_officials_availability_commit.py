@@ -10,6 +10,7 @@ here.
 """
 
 import json
+import os
 import threading
 import unittest
 import urllib.error
@@ -20,7 +21,7 @@ from http.server import ThreadingHTTPServer
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import NotificationChannel
+from hockey_scheduler.domain import NotificationChannel, Official
 from hockey_scheduler.services import SetupService
 from hockey_scheduler.store import InMemoryStore, SqlStore
 
@@ -64,6 +65,29 @@ NO_CLUB_OFFICIALS_CSV = (
 
 def _valid_sheets_csv():
     return {"officials_csv": OFFICIALS_CSV, "official_availability_csv": AVAILABILITY_CSV}
+
+
+RACE_OFFICIAL_CSV = (
+    "official_code,name\n"
+    "RACE1,Race Official\n"
+)
+
+RACE_AVAILABILITY_CSV = (
+    "official_code,start_time,end_time,status\n"
+    "RACE1,2026-08-01T18:00:00+00:00,2026-08-01T20:00:00+00:00,available\n"
+)
+
+# #331 review round 12 finding 1: DISTINCT official_codes so the Official
+# unique index (migration 047) never contends -- the only shared identity
+# under race is the brand-new home_club_name both rows resolve to.
+RACE_CLUB_OFFICIAL_A_CSV = (
+    "official_code,name,home_club_name\n"
+    "RACE_CLUB_A,Race Official A,Race Club\n"
+)
+RACE_CLUB_OFFICIAL_B_CSV = (
+    "official_code,name,home_club_name\n"
+    "RACE_CLUB_B,Race Official B,Race Club\n"
+)
 
 
 class ImportOfficialsAvailabilityCommitServiceContract:
@@ -431,6 +455,244 @@ class ImportOfficialsAvailabilityCommitHttpTest(unittest.TestCase):
         official_row = [a for a in audit if a.action == "official_created"][-1]
         self.assertEqual(official_row.actor_id, admin_uid)
         self.assertNotEqual(official_row.actor_id, "attacker")
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class PostgresOfficialsAvailabilityImportRaceTest(unittest.TestCase):
+    """#331 review round 11 finding 2: unlike commit_teams_players_import's
+    Season row lock, commit_officials_availability_import has no row to
+    lock for a brand-new official_code or availability window -- two
+    concurrent commits landing the identical key must not both succeed in
+    creating their own duplicate row. Each thread drives its OWN
+    ApiService(SqlStore(...)) -- a separate connection and process-local
+    RLock -- so passing here depends on the real PostgreSQL unique-index
+    backstop (migration 047), not the in-process lock a shared store
+    instance would provide for free.
+
+    Memory/SQLite parity for the same "identical input committed twice
+    does not duplicate" property is already covered by
+    test_idempotent_repeat_commit_updates_not_duplicates above, which runs
+    on both backends via ImportOfficialsAvailabilityCommitServiceContract
+    -- no separate parity test is added here to avoid duplicating it."""
+
+    def setUp(self):
+        self.url = os.environ["TEST_DATABASE_URL"]
+        SqlStore(self.url).clear_all_data()
+
+    def test_identical_official_and_window_commits_do_not_duplicate(self):
+        store_a, store_b = SqlStore(self.url), SqlStore(self.url)
+        api_a, api_b = ApiService(store_a), ApiService(store_b)
+
+        barrier = threading.Barrier(2)
+        # Pause each side's OWN connection right before it generates a new
+        # Official's id -- reached only after its own absence-check read
+        # already ran and found nothing, exactly the review's required
+        # "after their initial absence observation before either writes"
+        # ordering. Deliberately NOT hooked any later than this (e.g. at
+        # add_official itself): next_id() upserts a shared per-prefix row
+        # in `counters`, so pausing AFTER it already ran would leave one
+        # side holding that row's lock while blocked on this very barrier
+        # waiting for the other side -- which can't arrive because ITS OWN
+        # next_id() call is blocked on that same lock. A real circular
+        # wait, self-inflicted by the test, not the production code (the
+        # same class of bug already fixed once in this PR's history for
+        # the forced cancel-vs-commit race). Filtered to the "official"
+        # prefix only, so the unrelated next_id("importbatch") call before
+        # the retry loop starts isn't paused too.
+        def _pausing(store):
+            real = store.next_id
+            def _wrapped(prefix):
+                if prefix == "official":
+                    barrier.wait(timeout=10)
+                return real(prefix)
+            return _wrapped
+        store_a.next_id = _pausing(store_a)
+        store_b.next_id = _pausing(store_b)
+
+        results = {}
+
+        def run(api, key):
+            try:
+                results[key] = api.commit_officials_availability_import(
+                    {"officials_csv": RACE_OFFICIAL_CSV,
+                     "official_availability_csv": RACE_AVAILABILITY_CSV},
+                    actor_id=key)
+            except Exception as exc:
+                results[key] = exc
+
+        ta = threading.Thread(target=run, args=(api_a, "a"))
+        tb = threading.Thread(target=run, args=(api_b, "b"))
+        ta.start(); tb.start()
+        ta.join(20); tb.join(20)
+
+        self.assertFalse(ta.is_alive(), "thread a hung")
+        self.assertFalse(tb.is_alive(), "thread b hung")
+        for key, res in results.items():
+            self.assertNotIsInstance(
+                res, Exception,
+                f"commit {key} raised instead of committing or retrying "
+                f"cleanly: {res!r}")
+            self.assertTrue(res.get("committed"), f"commit {key}: {res}")
+
+        fresh = SqlStore(self.url)
+        officials = [o for o in fresh.all_officials() if o.external_ref == "RACE1"]
+        self.assertEqual(
+            len(officials), 1,
+            "expected exactly one Official for RACE1, got "
+            f"{[o.id for o in officials]}")
+        windows = fresh.availability_for_official(officials[0].id)
+        self.assertEqual(
+            len(windows), 1,
+            f"expected exactly one availability window, got {[w.id for w in windows]}")
+        audit_batches = [a for a in fresh.all_setup_audit()
+                        if a.action == "import_committed"]
+        self.assertEqual(
+            len(audit_batches), 2,
+            "expected one import_committed audit row per commit call "
+            f"(one create, one retried-then-update), got {len(audit_batches)}")
+
+    def test_identical_window_commits_for_a_pre_existing_official_do_not_duplicate(self):
+        """The test above races next_id("official") specifically, so its
+        losing side's retry finds the Official ALREADY there and never
+        contends on the window itself -- it cannot tell apart a working
+        official_availability unique index (migration 047's second index)
+        from a missing one. This test isolates that half: the Official is
+        pre-seeded (existing for BOTH threads from the start, never raced),
+        so the ONLY contended write left is the availability window for an
+        identical (official, start, end) -- exactly the review's own
+        "even a pre-existing Official can receive two identical windows"
+        sentence."""
+        seed_store = SqlStore(self.url)
+        seed_official = Official(id=seed_store.next_id("official"),
+                                 name="Race Official", external_ref="RACE1")
+        seed_store.add_official(seed_official)
+
+        store_a, store_b = SqlStore(self.url), SqlStore(self.url)
+        api_a, api_b = ApiService(store_a), ApiService(store_b)
+
+        barrier = threading.Barrier(2)
+        # Same reasoning as above, keyed to "oavail" (OfficialAvailability's
+        # id prefix) instead of "official" -- reached only after each side's
+        # own (official_id, start, end) absence-check already ran and found
+        # nothing.
+        def _pausing(store):
+            real = store.next_id
+            def _wrapped(prefix):
+                if prefix == "oavail":
+                    barrier.wait(timeout=10)
+                return real(prefix)
+            return _wrapped
+        store_a.next_id = _pausing(store_a)
+        store_b.next_id = _pausing(store_b)
+
+        results = {}
+
+        def run(api, key):
+            try:
+                results[key] = api.commit_officials_availability_import(
+                    {"official_availability_csv": RACE_AVAILABILITY_CSV},
+                    actor_id=key)
+            except Exception as exc:
+                results[key] = exc
+
+        ta = threading.Thread(target=run, args=(api_a, "a"))
+        tb = threading.Thread(target=run, args=(api_b, "b"))
+        ta.start(); tb.start()
+        ta.join(20); tb.join(20)
+
+        self.assertFalse(ta.is_alive(), "thread a hung")
+        self.assertFalse(tb.is_alive(), "thread b hung")
+        for key, res in results.items():
+            self.assertNotIsInstance(
+                res, Exception,
+                f"commit {key} raised instead of committing or retrying "
+                f"cleanly: {res!r}")
+            self.assertTrue(res.get("committed"), f"commit {key}: {res}")
+
+        fresh = SqlStore(self.url)
+        officials = [o for o in fresh.all_officials() if o.external_ref == "RACE1"]
+        self.assertEqual(
+            len(officials), 1,
+            "the pre-seeded Official must stay singular, got "
+            f"{[o.id for o in officials]}")
+        windows = fresh.availability_for_official(officials[0].id)
+        self.assertEqual(
+            len(windows), 1,
+            f"expected exactly one availability window, got {[w.id for w in windows]}")
+
+    def test_identical_new_home_club_name_commits_do_not_duplicate_club(self):
+        """#331 review round 12 finding 1: migration 047's indexes protect
+        the Official row itself, but the Club it's found-or-created FROM has
+        no unique-by-name backstop of its own. Two concurrent commits that
+        each resolve a brand-new home_club_name can each see it absent and
+        each create their own duplicate Club -- and since that doesn't
+        violate any DB constraint, the existing retry loop never fires: the
+        LOSER's later Official lookup (a DIFFERENT official_code here, so
+        IT never contends) just proceeds normally and points its own new
+        Official at its own orphaned Club, never discovering the winner's.
+        This test uses two distinct official_codes specifically so the
+        Official index can't be what saves it -- only the fix under test
+        (double-checked locking over next_id("club")'s own cross-connection
+        counter-row lock, see the comment at that call site) can."""
+        store_a, store_b = SqlStore(self.url), SqlStore(self.url)
+        api_a, api_b = ApiService(store_a), ApiService(store_b)
+
+        barrier = threading.Barrier(2)
+        # Pause each side's OWN connection right before it generates a new
+        # Club's id -- reached only after its own Club absence-check already
+        # ran and found nothing. Not hooked any later (e.g. add_club
+        # itself): next_id() upserts the shared per-prefix "club" counter
+        # row, so pausing after it already ran risks the same self-inflicted
+        # circular wait this file's other race tests document at length.
+        def _pausing(store):
+            real = store.next_id
+            def _wrapped(prefix):
+                if prefix == "club":
+                    barrier.wait(timeout=10)
+                return real(prefix)
+            return _wrapped
+        store_a.next_id = _pausing(store_a)
+        store_b.next_id = _pausing(store_b)
+
+        results = {}
+
+        def run(api, key, csv):
+            try:
+                results[key] = api.commit_officials_availability_import(
+                    {"officials_csv": csv}, actor_id=key)
+            except Exception as exc:
+                results[key] = exc
+
+        ta = threading.Thread(target=run, args=(api_a, "a", RACE_CLUB_OFFICIAL_A_CSV))
+        tb = threading.Thread(target=run, args=(api_b, "b", RACE_CLUB_OFFICIAL_B_CSV))
+        ta.start(); tb.start()
+        ta.join(20); tb.join(20)
+
+        self.assertFalse(ta.is_alive(), "thread a hung")
+        self.assertFalse(tb.is_alive(), "thread b hung")
+        for key, res in results.items():
+            self.assertNotIsInstance(
+                res, Exception,
+                f"commit {key} raised instead of committing or retrying "
+                f"cleanly: {res!r}")
+            self.assertTrue(res.get("committed"), f"commit {key}: {res}")
+
+        fresh = SqlStore(self.url)
+        clubs = [c for c in fresh.all_clubs() if c.name == "Race Club"]
+        self.assertEqual(
+            len(clubs), 1,
+            f"expected exactly one Club named 'Race Club', got {[c.id for c in clubs]}")
+        official_a = next(o for o in fresh.all_officials()
+                          if o.external_ref == "RACE_CLUB_A")
+        official_b = next(o for o in fresh.all_officials()
+                          if o.external_ref == "RACE_CLUB_B")
+        self.assertEqual(
+            official_a.home_club_id, clubs[0].id,
+            "official A must point at the surviving Club, not an orphan")
+        self.assertEqual(
+            official_b.home_club_id, clubs[0].id,
+            "official B must point at the surviving Club, not an orphan")
 
 
 if __name__ == "__main__":

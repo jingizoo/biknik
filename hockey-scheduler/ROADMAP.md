@@ -202,15 +202,19 @@ publish-gated and privacy-safe.
    package, #324, confirming all four of #158's acceptance bullets are met).
 3. **#204** — task-oriented operator UX, accessibility and design consistency,
    built on the permanent-hierarchy context and the new Player/Game workflows.
-   **Reordered ahead of #206** (plan update): the first deliverable is a
-   bounded requirements package (#324) — role-specific operator journeys,
+   **Reordered ahead of #206** (plan update): the bounded requirements
+   package (#324) landed first — role-specific operator journeys,
    task-oriented IA, persistent Program/Season/League context, one primary
    action per screen, loading/empty/stale/error/retry/confirmation states,
    desktop + 390px behavior, a full WCAG 2.2 AA conformance matrix, and
-   operator validation + measurable success criteria — landing before any
-   implementation code. Home/Tasks plus a guided Setup hub is the first
-   implementation PR once that package is validated; Schedule/Facilities UX
-   follows.
+   operator validation + measurable success criteria. **Scope split approved
+   by @jingizoo (2026-07-27):** #330 / PR #331 is the bounded first
+   implementation slice, delivering the Program-scoped setup-progress
+   contract and Home/Tasks card, deep-links into existing Setup screens, and
+   role-home regression coverage. It does not complete the guided Setup/IA
+   milestone. #345 carries the remaining guided Setup, IA, context-filtering,
+   state/error, breakpoint, accessibility, and operator-validation acceptance
+   work. #345 remains next; Schedule/Facilities UX follows it.
 4. **#287** — substitute matching engine, **bounded pre-#205 deliverable**:
    **documentation and design artifacts only, plus a non-production UX
    prototype** (mockups/clickable prototype of the policy-config screen and
@@ -228,8 +232,8 @@ publish-gated and privacy-safe.
    eligibility) waits for #205, per Release 2 above.
 5. **#206** — planner scenarios, fairness, locks, repair and explanations
    (realigned: schedule within a `LeagueSeason`/Division; regular Games never
-   cross Leagues). Resumes after #204's requirements package, its first
-   implementation PR, and the bounded #287 substitute PR land.
+   cross Leagues). Resumes after #204's #330 / PR #331 bounded slice, #345,
+   the Schedule/Facilities UX slice, and the bounded #287 substitute PR land.
 6. **#146** — remaining bounded UX polish where it does not conflict with #204.
 
 **Exit gate:** a DB-valid schedule is physically operable at the rink; operators
@@ -281,11 +285,20 @@ authoritative **per-Release** order remains the numbered lists in
 Releases 0–4 above.
 
 **Currently active** (Release 4, UX-first per plan update): #204
-requirements package (#324, in review) → Home/Tasks + guided Setup hub PR
-→ Schedule/Facilities UX PR → bounded #287 pre-#205 deliverable
-(documentation/design + a non-production UX prototype only — no schema,
-persistence, API mutations, notifications, or runtime state transitions;
-see Release 4 above for the exact boundary) → #206 resumes.
+requirements package (#324) → bounded Home/Tasks first slice (#330 /
+PR #331) → guided Setup, seven-area IA, accessibility, and operator
+validation completion (#345) → Schedule/Facilities UX PR → bounded #287
+pre-#205 deliverable (documentation/design + a non-production UX prototype
+only — no schema, persistence, API mutations, notifications, or runtime
+state transitions; see Release 4 above for the exact boundary) → #206
+resumes.
+
+Owner-directed split (2026-07-27): PR #331 may merge as the technically
+clean first slice. #345 is the immediate next critical deliverable and
+retains every unfinished guided Setup/IA/accessibility/responsive/state/
+role-journey criterion plus the three moderated operator-validation
+sessions. No Schedule/Facilities, #287, or #206 work advances ahead of
+#345.
 
 Done since this section was last accurate: #267 (login security, PR #286);
 #277 (turnover/curfew policy, PR #318/#319); #313/#315 (recurring ice

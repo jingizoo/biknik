@@ -7,8 +7,12 @@
     "context-switcher": "node context-switcher.js",
     "setup-claim": "node setup-claim.js",
     "onboarding-wizard": "node onboarding-wizard.js",
+    "home-tasks-hub": "node home-tasks-hub.js",
+    "role-home-journeys": "node role-home-journeys.js",
     "hierarchy-import": "node hierarchy-import.js",
     "season-participation": "node season-participation.js",
+    "hierarchy-duplicate-registration": "node hierarchy-duplicate-registration.js",
+    "setup-progress-conflict-attention": "node setup-progress-conflict-attention.js",
     "season-rollover": "node season-rollover.js",
     "team-division-participation": "node team-division-participation.js",
     "scheduler-empty-state": "node scheduler-empty-state.js",
@@ -38,6 +42,7 @@
     "season-fmt-unit": "node season-fmt-unit.js"
   },
   "devDependencies": {
+    "axe-core": "^4.12.1",
     "playwright": "^1.48.0"
   }
 }

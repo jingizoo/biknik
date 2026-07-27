@@ -105,6 +105,8 @@ from .integrity_checks import (
     assert_no_duplicate_ice_slot_times,
     assert_no_duplicate_result_games,
     assert_no_duplicate_roster_players,
+    assert_no_duplicate_rink_external_refs,
+    assert_officials_availability_import_constraints_ready,
     assert_result_games_exist,
     assert_results_have_game,
     assert_roster_refs_exist,
@@ -382,6 +384,9 @@ _PRE_MIGRATION_CHECKS = {
     "041_iceslot_venue_fks": assert_iceslot_venue_fks_ready,
     "042_program_org_fks": assert_program_org_fks_ready,
     "045_ice_slot_unique_time": assert_no_duplicate_ice_slot_times,
+    "047_official_import_unique_keys":
+        assert_officials_availability_import_constraints_ready,
+    "048_rink_external_ref_unique": assert_no_duplicate_rink_external_refs,
 }
 
 
@@ -1153,6 +1158,15 @@ class SqlStore:
             SeasonTeamRegistration,
             "league_season_id = ? AND team_id = ?", (league_season_id, team_id))
         return rows[0] if rows else None
+    def registrations_for_team_in_league_season(self, league_season_id, team_id):
+        """Every row at this EXACT (team, LeagueSeason) key (#331 review
+        round 19) -- always 0 or 1 here, since ``ux_team_league_season``
+        (migration 035) makes a second impossible to insert, but returning a
+        list gives InMemoryStore's own (unenforced) equivalent a uniform
+        contract callers can share."""
+        return self._query(
+            SeasonTeamRegistration,
+            "league_season_id = ? AND team_id = ?", (league_season_id, team_id))
     def registrations_for_season(self, season_id):
         """Every registration in a Season, across all its LeagueSeasons (#283
         convenience for whole-Season reads)."""

@@ -191,6 +191,69 @@ class V2OnboardingStatusTest(unittest.TestCase):
         status = api.get_onboarding_status_v2("demo")
         self.assertIn("invalid_registrations", _codes(status), status)
 
+    def test_same_program_cross_league_registration_is_invalid_not_schedulable(self):
+        """#331 review round 18: unlike test_invalid_registrations_are_reported
+        (a League that doesn't resolve at all), this registration's League
+        is completely real and IN the season -- it just isn't the Team's OWN
+        permanent League (Rule 7). transfer_team_to_league deliberately
+        leaves a Season's active registration frozen at the Team's OLD
+        League while Team.league_id moves on (history preservation); this
+        same-Program cross-League drift must be reported invalid and never
+        counted toward `schedulable`, since create_game/team_registration_
+        valid (the shared live-scheduling resolver) would reject it too."""
+        api = self._api()
+        org, program, season = self._base(api)
+        league_a = api.create_league(season["id"], "League A", actor_id="admin")
+        league_b = api.create_league(season["id"], "League B", actor_id="admin")
+        team = api.create_team(self._club["id"], None, "T", actor_id="admin",
+                               league_id=league_a["id"])
+
+        # A stale ACTIVE row under League B -- a REAL, in-season League, just
+        # not the Team's own -- injected directly (no current write path
+        # leaves this behind in a fresh season).
+        from hockey_scheduler.domain import SeasonTeamRegistration
+        ls_b = api.store.league_season_for(league_b["id"], season["id"])
+        stray_id = api.store.next_id("streg")
+        api.store.add_season_team_registration(SeasonTeamRegistration(
+            id=stray_id, league_season_id=ls_b.id,
+            team_id=team["id"], division_id=None, active=True))
+
+        status = api.get_onboarding_status_v2("demo")
+        self.assertIn("invalid_registrations", _codes(status), status)
+        self.assertIn("no_participation", _codes(status), status)
+        self.assertFalse(status["ready_to_schedule"], status)
+        participation_step = next(
+            s for s in status["steps"] if s["key"] == "participation")
+        self.assertIn("0 schedulable", participation_step["detail"])
+
+        # #331 review round 20: registering the Team into its OWN permanent
+        # League A is no longer accepted while the stale League B row is
+        # still active -- live participation means EXACTLY one active
+        # registration this Season, full stop.
+        blocked = api.register_team_for_season(
+            season["id"], team["id"], actor_id="admin", league_id=league_a["id"])
+        self.assertEqual(blocked["error"]["details"]["reason"],
+                         "team_registration_conflict", blocked)
+        still_blocked = api.get_onboarding_status_v2("demo")
+        self.assertIn("no_participation", _codes(still_blocked), still_blocked)
+        self.assertIn("invalid_registrations", _codes(still_blocked), still_blocked)
+
+        # The operator explicitly resolves the stray first -- deactivating
+        # it via the same "Remove" action Season participation's own UI
+        # already offers -- and only THEN does League A's registration
+        # succeed, clearing both no_participation AND invalid_registrations
+        # (an inactive row is history, not live data either endpoint
+        # evaluates as a current blocker).
+        removed = api.unregister_team_from_season(stray_id, actor_id="admin")
+        self.assertNotIn("error", removed, removed)
+        registered = api.register_team_for_season(
+            season["id"], team["id"], actor_id="admin", league_id=league_a["id"])
+        self.assertNotIn("error", registered, registered)
+        after = api.get_onboarding_status_v2("demo")
+        self.assertNotIn("no_participation", _codes(after), after)
+        self.assertNotIn("invalid_registrations", _codes(after), after)
+        self.assertTrue(after["ready_to_schedule"], after)
+
     def test_repair_via_v2_after_direct_injection(self):
         """#233 B2b review r2: the same defect a direct-injection test proves
         the readiness detects (test_invalid_registrations_are_reported) must

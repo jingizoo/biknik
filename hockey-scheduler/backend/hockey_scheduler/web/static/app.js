@@ -45,6 +45,43 @@ let newFeedUrl = null;             // freshly-minted feed URL, shown once (#82)
 // scoped user can neither select nor enumerate an unrelated context). A saved
 // DISPLAY context only — existing screens are not filtered by it yet.
 let contextOptions = null;         // {programs:[{id,name,seasons:[...]}], selected:{program_id,season_id,read_only}}
+// Monotonic "context generation" (#331 review round 7), bumped by every
+// successful setActiveContext() call. #159's context switcher can move the
+// active Program/Season out from under a view that cached something scoped
+// to the PREVIOUS selection (the Import wizard's chosen Season, an open Ice
+// Builder's whole form+preview) -- a plain boolean/timestamp can't tell
+// "still the same selection" apart from "changed and changed back", but an
+// always-incrementing counter can: a view stamps the revision it was last
+// bound under, and a mismatch against the current one is unambiguous proof
+// something needs rebinding, however many switches happened in between.
+let contextRevision = 0;
+// Monotonic count of context-SWITCH ATTEMPTS (#331 review round 8), distinct
+// from contextRevision above: this bumps on every CALL to setActiveContext(),
+// whether or not its POST ultimately succeeds, so a rapid A->B->C (each
+// started before the previous one's round trip resolved) can tell which is
+// the LATEST attempt -- only it may apply its eventual POST/refresh/render
+// result; an earlier one that resolves later must recognize it's been
+// superseded and do nothing further, on success OR failure.
+let contextSwitchSeq = 0;
+// Monotonic op tokens for Import/Ice Builder's own async operations (#331
+// review round 10), distinct from contextRevision/contextSwitchSeq above:
+// those only ever detect the ACTIVE CONTEXT changing underneath a request.
+// A stale response can just as easily be wrong within the SAME context --
+// canceling and reopening the Ice Builder, editing its form (or an
+// exclusion) while a Preview/Commit is in flight, or simply firing two
+// Validates/Previews back to back and having them resolve out of order --
+// none of which touch contextRevision at all. Each bumps on EVERY event
+// that makes a not-yet-resolved Preview/Validate/Commit response
+// obsolete -- issuing a newer one of the same kind, opening/canceling the
+// builder, or editing the live form/exclusions/sheets -- and each handler
+// snapshots the current value immediately before its own vulnerable
+// `await` and rechecks it after, the exact same idiom contextRevision
+// itself already uses. A single global counter per surface is enough:
+// there is only ever one live `iceBuilder`/`importState` at a time, so
+// nothing here needs a per-instance identity separate from "the latest
+// token issued."
+let iceOperationSeq = 0;
+let importOperationSeq = 0;
 let publicState = { schedule: null, standings: null, division: null, game: null,
   feedUrl: null, feedLabel: null };  // feedUrl/feedLabel: freshly-minted public calendar subscription (#33)
 let publicTab = "schedule";        // "schedule" | "standings" (#83)
@@ -111,6 +148,17 @@ let gCheckout = null;        // {jid, game_id} while a junior's "Can't Play" con
 let gOpp = null;             // {jid, game_id} of the junior's opportunity detail open
 let gOppDetail = null;       // fetched detail payload for gOpp
 let activityExpandedBatches = new Set();  // import_batch_ids expanded in Activity (#102)
+let setupProgress = null;  // fetched /api/v2/setup/progress payload, Home/Tasks hub (#330)
+let setupProgressError = false;  // the fetch above failed (distinct from "no data")
+// Discards a stale /api/v2/setup/progress response (#330 review round 1
+// finding 4): a NEWER render() call — e.g. after a context switch — may
+// already have committed its own result while an OLDER call's fetch is
+// still in flight. No existing generation-counter/AbortController
+// convention exists elsewhere in this file to reuse (the closest precedent,
+// the CSV import flow's snapshot-before/compare-after style, depends on
+// re-derivable DOM form state that doesn't fit a server-resolved context
+// fetch), so a minimal monotonic sequence number is used directly instead.
+let setupProgressFetchSeq = 0;
 let setupView = "hierarchy";  // "hierarchy" | "records" — Setup sub-view (#165)
 let readinessCheck = null;  // /api/readiness snapshot for the Pilot Readiness card (#104)
 let importState = {         // Pilot onboarding import wizard (#96)
@@ -121,6 +169,9 @@ let importState = {         // Pilot onboarding import wizard (#96)
   validatedKey: null,        // snapshot of sheetsText at the last successful validate;
                              // Commit refuses to run if the current text has drifted
   committed: null,           // last commit result (or {error})
+  contextRevision: null,     // #331 review round 7 -- the contextRevision this
+                             // seasonId/report/validatedKey/committed were last
+                             // bound under; a mismatch means they're stale.
 };
 
 const DAY_MS = 86400000;
@@ -485,6 +536,408 @@ function coachTeamGames(ov, teamId) {
 function nextUpcomingGame(games) {
   return games.filter((g) => g.result_status !== "final")
     .slice().sort((a, b) => new Date(a.start_time) - new Date(b.start_time))[0] || null;
+}
+
+/* ---------- Home/Tasks hub setup-progress card (#204/#330) ---------- */
+// The hub's single primary action (§4 of the operator-UX requirements): a
+// dynamic "Continue setup" naming the actual next incomplete Setup workflow
+// this caller's role can actually execute AND that is actually safe to run
+// given the resolved Season (the backend already filters `next` to a
+// role-actionable, prerequisite-clear workflow — #330 review round 1
+// finding 1, #331 review round 3 finding 1), with the other workflows this
+// caller's role can manage listed below as a non-competing secondary list
+// (also role-filtered as of round 3 -- an Arena Manager never receives
+// League-Admin-only completion detail here either). A workflow that's
+// permitted but blocked on the Season (no Season resolved, or the resolved
+// one archived) surfaces as actionable guidance instead — `next_blocked` —
+// never a CTA that would just fail. Renders the required success state
+// once the WHOLE Program's setup is done (`complete`); renders nothing if
+// there's simply nothing left for THIS role to act on AND nothing blocked
+// to explain either, while other, not-this-role's workflows remain (three
+// different claims — see get_setup_progress's docstring).
+function renderSetupProgressCard(progress, hadError, loading) {
+  // Per-card loading boundary (#331 review round 2 finding 3): the caller
+  // paints this skeleton immediately, before the real fetch even starts, so
+  // a slow setup-progress request only delays this one card, never the rest
+  // of the Dashboard (see loadSetupProgressCard()).
+  //
+  // #331 review round 5 finding 5: the loading state used to be a bare,
+  // heading-less <div class="skeleton"> -- invisible to a screen-reader
+  // user (no busy cue, no label) and unscannable by axe helpers that
+  // locate this card by its own heading (KNOWN_CARD_HEADINGS in the e2e
+  // suite). It now carries a real <h3> (so it's a first-class state, not
+  // structurally excluded) plus a visually-hidden label; #sp-card-slot
+  // itself (render()'s own wrapper, persisting across every re-render of
+  // this function's output) carries the actual aria-busy/aria-live
+  // semantics, so this is just the content that live region announces.
+  if (loading) {
+    return `<div class="dash-card sp-card" style="margin-bottom:16px">
+      <div class="dash-card-head"><h3>Setup progress</h3></div>
+      <div class="skeleton"><span class="sr-only">Loading setup progress…</span></div>
+    </div>`;
+  }
+  if (hadError) {
+    // sp-card scopes the color overrides below (#331 review round 3
+    // finding 4): .banner.alert's own white-on-red is a sitewide convention
+    // used well below WCAG AA (~3.3:1) -- fixed here without touching the
+    // shared class every other screen using .banner.alert still relies on.
+    // role="alert" (#331 review round 5 finding 5): an assertive
+    // announcement distinct from the outer #sp-card-slot's own polite live
+    // region -- a failed fetch is more urgent/actionable than routine
+    // content settling and should interrupt rather than wait its turn.
+    return `<div class="dash-card sp-card" style="margin-bottom:16px">
+      <div class="dash-card-head"><h3>Setup progress unavailable</h3></div>
+      <div class="banner alert" role="alert"><p>Could not load your setup progress.</p></div>
+      <div class="actions">
+        <button class="act primary" data-setup-progress-retry>Retry</button>
+      </div>
+    </div>`;
+  }
+  if (!progress || !progress.program_id) return "";
+  if (progress.complete) {
+    // "Imports and onboarding" stays reachable even once every REQUIRED
+    // workflow is done (#331 review round 2 finding 2) -- it's an
+    // always-available alternative entry point (decision 9), not something
+    // that should vanish once its own "optional" status is the only one
+    // left. "Go to Schedule" stays the single primary action per #204's
+    // one-primary-action-per-screen principle; Import data is secondary.
+    // The backend now omits "import" from `workflows` entirely for a role
+    // that cannot manage it (#331 review round 3 finding 5 -- MANAGE_SETUP,
+    // League Admin only), so rendering the button only when found redacts
+    // it for Arena Manager instead of routing them to a surface they cannot
+    // use, rather than falling back to a generic always-shown label.
+    const importWf = progress.workflows.find((w) => w.key === "import");
+    // #331 review round 21 finding 2: `complete` and a workflow's own
+    // `attention` are independent by design (round 19's docstring) -- a
+    // Team can be genuinely, validly participating (this workflow reads
+    // "done") while some OTHER row still needs cleanup. The success card
+    // used to render unconditionally here whenever `complete` was true,
+    // silently dropping every workflow's `attention` on the floor -- the
+    // one place in this whole function that never read the field at all.
+    // Reuses the exact na-row/amber markup `next_blocked` below already
+    // renders in this same card, rather than introducing an unreviewed
+    // color combination.
+    const attentionRows = progress.workflows.filter((w) => w.attention).map((w) => `
+      <div class="na-row">
+        <div class="na-ico amber">⚠️</div>
+        <div class="na-body"><div class="na-title">${esc(w.label)}</div>
+          <div class="na-sub">${esc(w.attention.detail)}</div></div>
+      </div>`).join("");
+    return `<div class="dash-card sp-card" style="margin-bottom:16px">
+      <div class="dash-card-head"><h3>✓ All setup steps complete</h3></div>
+      <p class="muted">Every Setup workflow is done for ${esc(progress.program.name)}.</p>
+      ${attentionRows}
+      <div class="actions">
+        <button class="act primary" data-goto="calendar">Go to Schedule</button>
+        ${importWf ? `<button class="act ghost" data-setup-progress-action="import"
+          >${esc(importWf.primary_action)}</button>` : ""}
+      </div>
+    </div>`;
+  }
+  const rows = progress.workflows.map((w) => {
+    // "optional" (Imports and onboarding, #331 review round 1 finding 5) is
+    // a standing alternative entry point, not a required step -- its badge
+    // must read as neither "Done" nor a to-do nag.
+    const cls = w.status === "done" ? "green"
+      : w.status === "optional" ? "blue" : "gray";
+    const text = w.status === "done" ? "Done"
+      : w.status === "optional" ? "Optional" : "To do";
+    // #331 review round 21 finding 2: surfaces `attention` here too --
+    // reusing the existing `.li-sub.conflict` convention (draft scheduler)
+    // -- so a workflow reading "To do" because its only registration(s)
+    // are ambiguous shows THAT reason, not just the generic done/todo
+    // detail text alone.
+    const attentionLine = w.attention
+      ? `<div class="li-sub conflict">⚠️ ${esc(w.attention.detail)}</div>` : "";
+    return `<div class="li">
+      <span class="badge ${cls}">${text}</span>
+      <div class="li-main"><div class="li-title">${esc(w.label)}</div>
+        <div class="li-sub">${esc(w.detail)}</div>${attentionLine}</div>
+    </div>`;
+  }).join("");
+  const next = progress.next;
+  if (next) {
+    // #331 review round 21 finding 2: `next` is the same workflow object
+    // `rows` renders below, carrying its own `attention` when present (e.g.
+    // "participation" reading "No team registered to play yet" while a
+    // registration DOES exist, just ambiguously -- this workflow's own
+    // attention names that instead of leaving the generic detail as the
+    // only signal).
+    const nextAttention = next.attention ? `
+      <div class="na-row">
+        <div class="na-ico amber">⚠️</div>
+        <div class="na-body"><div class="na-title">${esc(next.label)}</div>
+          <div class="na-sub">${esc(next.attention.detail)}</div></div>
+      </div>` : "";
+    return `<div class="dash-card sp-card" style="margin-bottom:16px">
+      <div class="dash-card-head"><span class="dch-dot"></span><h3>Continue setup</h3></div>
+      <div class="na-row">
+        <div class="na-ico blue">📋</div>
+        <div class="na-body"><div class="na-title">${esc(next.label)}</div>
+          <div class="na-sub">${esc(next.detail)}</div></div>
+      </div>
+      ${nextAttention}
+      <div class="actions">
+        <button class="act primary" data-setup-progress-action="${esc(next.key)}"
+          >${esc(next.primary_action)}</button>
+      </div>
+      <div class="section-title">Setup workflows</div>
+      ${rows}
+    </div>`;
+  }
+  // Nothing is both permitted AND safe to execute right now (#331 review
+  // round 3 finding 1). Two different reasons look the same to a naive
+  // "next is null" check but must not be conflated: `next_blocked` names a
+  // workflow this caller COULD act on except for an unmet Season
+  // prerequisite (guidance to surface, not a CTA that would just fail), vs.
+  // truly nothing left for this role while other, not-this-role's workflows
+  // remain (renders nothing -- see get_setup_progress's docstring).
+  const blocked = progress.next_blocked;
+  if (!blocked) return "";
+  return `<div class="dash-card sp-card" style="margin-bottom:16px">
+    <div class="dash-card-head"><span class="dch-dot"></span><h3>Continue setup</h3></div>
+    <div class="na-row">
+      <div class="na-ico amber">⚠️</div>
+      <div class="na-body"><div class="na-title">${esc(blocked.label)}</div>
+        <div class="na-sub">${esc(blocked.detail)}</div></div>
+    </div>
+    <div class="section-title">Setup workflows</div>
+    ${rows}
+  </div>`;
+}
+// Fetches and paints the setup-progress card independently of the rest of
+// the Dashboard (#331 review round 2 finding 3): render() paints an
+// immediate loading skeleton into #sp-card-slot and calls this
+// fire-and-forget rather than awaiting the fetch inline, so a slow request
+// only delays this one card's own content, never the Dashboard's first
+// paint. Also the card's own Retry action, so retrying only re-fetches
+// this one thing instead of the whole Dashboard (overview/standings too).
+async function loadSetupProgressCard() {
+  const mySeq = ++setupProgressFetchSeq;
+  // aria-busy (#331 review round 5 finding 5): re-asserted here, not just
+  // left over from render()'s initial paint, so a RETRY (the slot's own
+  // aria-busy already flipped back to "false" after the failed fetch that
+  // preceded it) is exposed as busy again too, not just the very first load.
+  const busySlot = document.getElementById("sp-card-slot");
+  if (busySlot) busySlot.setAttribute("aria-busy", "true");
+  const sp = await getJSON("/api/v2/setup/progress");
+  if (mySeq !== setupProgressFetchSeq) return;  // a newer load already won
+  if (sp && !sp.error) { setupProgress = sp; setupProgressError = false; }
+  else { setupProgress = null; setupProgressError = true; }
+  const slot = document.getElementById("sp-card-slot");
+  if (!slot) return;  // navigated away from Dashboard before this resolved
+  slot.innerHTML = renderSetupProgressCard(setupProgress, setupProgressError, false);
+  slot.setAttribute("aria-busy", "false");
+  const spAction = slot.querySelector("[data-setup-progress-action]");
+  if (spAction) spAction.onclick = () =>
+    goToSetupWorkflow(spAction.dataset.setupProgressAction);
+  const spRetry = slot.querySelector("[data-setup-progress-retry]");
+  if (spRetry) spRetry.onclick = () => loadSetupProgressCard();
+  // The complete state's "Go to Schedule" button uses the generic
+  // data-goto convention (c.querySelectorAll("[data-goto]") in render()),
+  // which only wires elements present at render()'s OWN paint -- this slot
+  // didn't have this button yet then (it was still the loading skeleton),
+  // so it needs the same wiring here too.
+  slot.querySelectorAll("[data-goto]").forEach((b) =>
+    b.onclick = () => switchTab(b.dataset.goto));
+}
+// Each workflow's real entry point (#330 review round 1 finding 3), not the
+// generic Setup tab: season/team/player open the matching create drawer
+// directly (mirrors the existing topbar "jump to Setup and open a drawer"
+// shortcut at the bottom of this file — drawer state must be set BEFORE
+// switchTab("setup"), since switchTab only clears `drawer` when leaving
+// Setup, not when entering it); facilities opens the Ice Availability
+// Builder, which renders from the Calendar view, not Setup; participation
+// has no dedicated drawer (it's an inline action inside the Setup hierarchy
+// tree) so it lands on that tree; import lands on the standalone Import tab.
+// Drawer opens already move focus to the drawer's first field (existing
+// render() behavior); the plain view switches below additionally focus the
+// destination's own heading so keyboard/screen-reader users land somewhere
+// meaningful, not silently at the top of the page.
+async function goToSetupWorkflow(key) {
+  if (key === "facilities") {
+    // Bump here too (#331 review round 10), same reasoning as the manual
+    // "Build ice" button's own onclick: this is a SECOND place a fresh
+    // builder instance gets created, and a Preview/Commit held from a
+    // PREVIOUS one (canceled, or left over from before this hub-driven
+    // navigation) must not be mistaken for belonging to this new one.
+    iceOperationSeq += 1;
+    iceBuilder = { form: null, preview: null };
+    switchTab("calendar");
+    focusContentHeading();
+    return;
+  }
+  if (key === "league_season" || key === "teams" || key === "roster") {
+    const kind = key === "league_season" ? "season"
+      : key === "teams" ? "team" : "player";
+    // Seed the parent field from the ACTIVE Program (#331 review round 5
+    // finding 4): left empty, drawerField()'s own fallback picks
+    // rows[0] -- whichever Program/League/Team happens to sort first
+    // GLOBALLY (these fields' option lists span every Program, unfiltered
+    // -- #159's contextOptions is a display-only selection today, existing
+    // screens are not filtered by it), not the one this hub is scoped to.
+    // A valid submit against that silent wrong default would create data
+    // under a DIFFERENT Program than the one the operator is acting from.
+    // Awaited BEFORE opening the drawer (a single, cheap fetch) rather
+    // than reading the module-level permLeaguesByProgram/leagueTeams
+    // caches, which are only populated as a side effect of the Setup
+    // view's OWN last render and can be stale or entirely unpopulated at
+    // the moment this hub CTA is clicked straight from the Dashboard.
+    //
+    // Fail CLOSED, not open (#331 review round 6): a hierarchy-fetch
+    // failure, or the active Program changing mid-flight (the operator
+    // uses the unrelated context switcher while this await is still
+    // resolving), must never open the drawer with drawerValues left at
+    // {} -- that's exactly what re-triggers drawerField()'s own first-
+    // GLOBAL-option fallback, recreating the wrong-Program write risk
+    // this whole fix exists to close. mySeq guards against a NEWER
+    // goToSetupWorkflow call (a rapid re-click) superseding this one;
+    // contextSeededDrawerValues() itself separately guards against the
+    // context SWITCHER changing contextOptions.selected while its own
+    // fetch is in flight (a different trigger, so a different check).
+    const mySeq = ++drawerSeedFetchSeq;
+    const seeded = await contextSeededDrawerValues(kind);
+    if (mySeq !== drawerSeedFetchSeq) return;  // a newer navigation already won
+    if (!seeded.ok) {
+      toast = "Couldn't load what's needed to open that — try again.";
+      toastIsError = true;
+      return render();
+    }
+    drawer = { kind }; drawerError = ""; drawerValues = seeded.values;
+    switchTab("setup");
+    return;
+  }
+  if (key === "participation") {
+    setupView = "hierarchy";
+    switchTab("setup");
+    focusParticipationRegisterControl();
+    return;
+  }
+  if (key === "import") {
+    switchTab("import");
+    focusContentHeading();
+    return;
+  }
+  switchTab("setup");
+  focusContentHeading();
+}
+// Monotonic guard for the two async drawer-seeding steps below (#331 review
+// round 6), mirroring setupProgressFetchSeq's own pattern for the same
+// class of problem: a rapid re-click of a hub CTA before its first
+// in-flight seed fetch resolves must never let the OLDER call's result win
+// and open a (by then stale) drawer after a newer navigation already did.
+let drawerSeedFetchSeq = 0;
+// The correct parent-field seed for a hub-driven create drawer (#331 review
+// round 5 finding 4), scoped to the ACTIVE Program (#159's
+// contextOptions.selected) via a FRESH, targeted fetch of the canonical
+// Program->League->Team hierarchy -- NOT the module-level
+// permLeaguesByProgram/leagueTeams caches (only populated as a side effect
+// of the Setup view's OWN last render, so stale or entirely empty when this
+// hub CTA is clicked straight from the Dashboard), and NOT a change to the
+// shared drawer field definitions' own option lists, which stay
+// global/unfiltered (the general Setup screen's own "+ Add" entry points
+// are not Program-scoped by design; contextOptions is documented as
+// "existing screens are not filtered by it yet"). Seeding only the DEFAULT
+// selected value is enough to close the actual bug -- a silent wrong-
+// Program default on first open -- while an operator who deliberately wants
+// a different Program can still change the select same as always.
+//
+// Returns {ok, values}, not a bare values object (#331 review round 6):
+// {ok: true, values: {}} means "resolved cleanly, nothing to seed" (a
+// legitimate empty state -- no active Program, or the active Program
+// genuinely has no candidate of its own yet, e.g. a fresh Program with zero
+// permanent Leagues/Teams so far; drawerField() falls back to its ordinary
+// first-option behavior, or its own "create one first" empty state, same as
+// any other entry point into the same drawer). {ok: false} means "do NOT
+// open the drawer at all" -- either the hierarchy fetch itself failed
+// (network/server error, surfaced via getJSON's own {error} shape), or the
+// active Program changed while this fetch was in flight (the operator used
+// the context switcher mid-request): re-checking programId AFTER the await,
+// against the value captured BEFORE it, is the point -- that captured value
+// is exactly what could have gone stale out from under this call. Silently
+// falling through to {} in either failure case would open the drawer with
+// nothing seeded, hitting drawerField()'s own first-GLOBAL-option fallback
+// -- exactly the wrong-Program write risk this whole fix exists to close,
+// just moved one layer deeper.
+async function contextSeededDrawerValues(kind) {
+  const programId = contextOptions && contextOptions.selected
+    && contextOptions.selected.program_id;
+  // Captured BEFORE the await below (#331 review round 8), compared after it
+  // against contextRevision -- not contextOptions.selected.program_id, which
+  // setActiveContext() doesn't update until ITS OWN POST succeeds. A switch
+  // merely ATTEMPTED (not yet confirmed) while this fetch was in flight used
+  // to still read as "unchanged" here and let this seed win; contextRevision
+  // now bumps the instant a switch is attempted (setActiveContext()'s own
+  // first bump, before its POST), so comparing against it closes that gap.
+  const seededRevision = contextRevision;
+  if (!programId) return { ok: true, values: {} };
+  if (kind === "season") return { ok: true, values: { "f-season-league": programId } };
+  const hvr = await getJSON("/api/v2/setup/hierarchy");
+  const stillCurrent = contextRevision === seededRevision;
+  if (!hvr || hvr.error || !stillCurrent) return { ok: false };
+  const program = (hvr.programs || []).find((p) => p.id === programId);
+  if (!program) return { ok: true, values: {} };
+  if (kind === "team") {
+    const lgs = program.leagues || [];
+    return { ok: true, values: lgs.length ? { "f-team-perm-league": lgs[0].id } : {} };
+  }
+  if (kind === "player") {
+    const teams = (program.leagues || []).flatMap((lg) => lg.teams || [])
+      .concat(program.teams_without_league || []);
+    return { ok: true, values: teams.length ? { "f-player-team": teams[0].id } : {} };
+  }
+  return { ok: true, values: {} };
+}
+// Best-effort focus landing for a plain view switch (no drawer of its own to
+// auto-focus) — the first heading-ish element in the freshly rendered view,
+// falling back to the #content region itself for a destination with no
+// heading of its own (e.g. the Setup hierarchy tree), so focus always lands
+// somewhere real rather than silently staying nowhere. switchTab() kicks off
+// render() without awaiting it, and render() itself is async (it awaits its
+// own overview fetch) — so neither target necessarily exists yet on the very
+// next tick. Poll briefly instead of a single setTimeout(0), which raced
+// that fetch and could fire before the real content painted (#331 review
+// round 1 finding 4).
+function focusContentHeading(attempt) {
+  const content = document.getElementById("content");
+  const heading = content && content.querySelector(
+    "h1, h2, h3, .section-title");
+  if (heading) { heading.setAttribute("tabindex", "-1"); heading.focus(); return; }
+  const stillLoading = content && content.querySelector(".skeleton");
+  if (content && !stillLoading && content.firstElementChild) {
+    content.setAttribute("tabindex", "-1");
+    content.setAttribute("aria-label", "Page content");
+    content.focus();
+    return;
+  }
+  if ((attempt || 0) < 40) setTimeout(() => focusContentHeading((attempt || 0) + 1), 50);
+}
+
+// Destination focus for "participation" (#331 review round 2 finding 4):
+// landing generically on the Setup hierarchy tree isn't enough -- focus
+// must reach the ACTUAL registration control for the currently-selected
+// Season (contextOptions.selected.season_id, #159), the same "Register" add
+// row renderSetupHierarchy's league sections render per (season, league)
+// (data-reg-add/data-reg-add-season). Same poll-while-loading shape as
+// focusContentHeading() (switchTab()'s render() is async, so neither
+// target necessarily exists yet on the next tick), but once loading has
+// genuinely finished with no matching control -- no league yet, or every
+// permanent team is already registered for this Season -- falls back to
+// focusContentHeading()'s generic content-region landing rather than
+// polling forever for something that will never appear.
+function focusParticipationRegisterControl(attempt) {
+  const seasonId = contextOptions && contextOptions.selected
+    && contextOptions.selected.season_id;
+  const btn = seasonId && document.querySelector(
+    `[data-reg-add][data-reg-add-season="${CSS.escape(seasonId)}"]`);
+  if (btn) { btn.focus(); return; }
+  const content = document.getElementById("content");
+  const stillLoading = !content || content.querySelector(".skeleton");
+  if (stillLoading && (attempt || 0) < 40) {
+    setTimeout(() => focusParticipationRegisterControl((attempt || 0) + 1), 50);
+    return;
+  }
+  focusContentHeading();
 }
 
 function renderDashboard(ov, standings) {
@@ -1955,8 +2408,33 @@ function renderSeasonParticipation(hv, ov, sv) {
 
     const seasonBlocks = seasons.map((s) => {
       const regs = (seasonRegs[s.id] || []).filter((r) => r.active);
-      const regByTeam = {};
-      regs.forEach((r) => { regByTeam[r.team_id] = r; });
+      // #331 review round 19: keyed by registration id, never re-derived
+      // from (team_id, league_id) — round 18's fix (see below), which still
+      // collapses two ACTIVE rows sharing the exact same target (the Memory
+      // multiplicity round 19 finding 1 now rejects at every write path,
+      // still reachable as legacy/injected data). get_setup_hierarchy_v2
+      // already emits one distinct tree entry per registration in that case
+      // (teams_by_div/teams_direct_by_league append one (team, reg) pair
+      // per registration, so a Team with two rows at one target appears
+      // TWICE), so trusting each entry's own registration_id — rather than
+      // re-deriving "the" registration from the team/league it happens to
+      // sit under — is what makes both rows independently addressable
+      // instead of two identical-looking rows that are secretly the same
+      // control twice.
+      const regsById = {};
+      regs.forEach((r) => { regsById[r.id] = r; });
+      // #331 review round 20: a duplicate-target pair (finding 1's Memory-only
+      // corruption) renders as two rows with the SAME visible team name and
+      // the SAME accessible name on their Save/Remove controls (identical
+      // `t.name`/`s.name`, the only inputs the aria-label was built from) —
+      // reachable and independently addressable via the reg-id keying above,
+      // but indistinguishable to a screen reader. Counted per (team_id,
+      // league_id) so the common single-row case stays exactly as before.
+      const dupKeyCounts = {};
+      regs.forEach((r) => {
+        const k = `${r.team_id}::${r.league_id}`;
+        dupKeyCounts[k] = (dupKeyCounts[k] || 0) + 1;
+      });
       const registeredTeamIds = new Set(regs.map((r) => r.team_id));
       const leagues = s.leagues || [];
       // Cache each League's Division options for the cascade handlers wired
@@ -2055,19 +2533,35 @@ function renderSeasonParticipation(hv, ov, sv) {
         const divs = lv.divisions || [];
         const divOptsFor = (selId) => divs.map((d) => opt(d.id, d.name, d.id === selId)).join("");
         // A registered team's row: its own League+Division cascade (both
-        // scoped to this season) plus Save/Remove. `reg` is looked up by team
-        // id — structurally guaranteed present since t only appears here
-        // because a valid registration resolved it into this League/Division.
+        // scoped to this season) plus Save/Remove. `reg` is looked up by
+        // THIS tree entry's own registration_id — #331 review round 19:
+        // never re-derived from (team id, league id), which collapses to
+        // one winning row when a Team has two ACTIVE registrations at the
+        // exact same target (round 18's fix only separated DIFFERENT
+        // League targets). Trusting the id `t` already carries is what lets
+        // two such rows — same team, same league, genuinely different
+        // registrations — render as independently addressable controls
+        // instead of one control duplicated twice.
         const regRow = (t, divId) => {
-          const reg = regByTeam[t.id];
+          const reg = regsById[t.registration_id];
           if (!reg) return "";
+          // #331 review round 20: when two rows share this exact (team,
+          // league) target, their visible name and their controls' accessible
+          // names would otherwise be byte-for-byte identical (both built from
+          // the same t.name/s.name) -- indistinguishable to a screen reader
+          // even though the controls underneath are independently addressable
+          // by registration id. Only the duplicate case gets the suffix; the
+          // ordinary single-row case is unchanged.
+          const dup = dupKeyCounts[`${t.id}::${lv.id}`] > 1;
+          const distinguisher = dup ? ` (registration ${esc(reg.id)})` : "";
           return `<div class="tn-leaf reg-row">
-            <span class="tn-label">👥 ${esc(t.name)}</span>
+            <span class="tn-label">👥 ${esc(t.name)}${dup ? ` <code>${esc(reg.id)}</code>` : ""}</span>
             <select id="reg-league-${esc(reg.id)}" data-reg-league-for="${esc(reg.id)}">${leagueOptsFor(lv.id)}</select>
             <select id="reg-div-${esc(reg.id)}" data-reg-div-for="${esc(reg.id)}"><option value="">No division</option>${divOptsFor(divId)}</select>
-            <button class="act" data-reg-save="${esc(reg.id)}" data-reg-orig-league="${esc(lv.id)}" data-reg-orig-div="${esc(divId || "")}">Save</button>
+            <button class="act" data-reg-save="${esc(reg.id)}" data-reg-orig-league="${esc(lv.id)}" data-reg-orig-div="${esc(divId || "")}"${
+              dup ? ` aria-label="Save ${esc(t.name)}${distinguisher} in ${esc(s.name)}"` : ""}>Save</button>
             <button class="icon-btn danger" data-reg-remove="${esc(reg.id)}"
-              title="Remove from season" aria-label="Remove ${esc(t.name)} from ${esc(s.name)}">${ICONS.circleMinus}</button></div>`;
+              title="Remove from season" aria-label="Remove ${esc(t.name)}${distinguisher} from ${esc(s.name)}">${ICONS.circleMinus}</button></div>`;
         };
         const divRows = divs.map((d) => (d.teams || []).map((t) => regRow(t, d.id)).join("")).join("");
         const twdRows = (lv.teams_without_division || []).map((t) => regRow(t, "")).join("");
@@ -2076,10 +2570,10 @@ function renderSeasonParticipation(hv, ov, sv) {
         const available = permanentTeams.filter((t) => !registeredTeamIds.has(t.id));
         const addCtl = available.length
           ? `<div class="tn-leaf reg-add">
-              <select id="reg-team-${esc(lv.id)}"><option value="">Add a program team…</option>${
+              <select id="reg-team-${esc(s.id)}-${esc(lv.id)}"><option value="">Add a program team…</option>${
                 available.map((t) => opt(t.id, t.name)).join("")}</select>
-              <select id="reg-league-add-${esc(lv.id)}" data-reg-league-add="${esc(lv.id)}">${leagueOptsFor(lv.id)}</select>
-              <select id="reg-div-add-${esc(lv.id)}"><option value="">No division</option>${divOptsFor("")}</select>
+              <select id="reg-league-add-${esc(s.id)}-${esc(lv.id)}" data-reg-league-add="${esc(s.id)}-${esc(lv.id)}">${leagueOptsFor(lv.id)}</select>
+              <select id="reg-div-add-${esc(s.id)}-${esc(lv.id)}"><option value="">No division</option>${divOptsFor("")}</select>
               <button class="act primary" data-reg-add="${esc(lv.id)}" data-reg-add-season="${esc(s.id)}">Register</button></div>`
           : (permanentTeams.length
               ? `<div class="tn-empty">Every program team is registered for this season.</div>`
@@ -2186,13 +2680,25 @@ function renderRollover(hv, ov) {
     const srcRegs = (seasonRegs[fromId] || []).filter((r) => r.active);
     const targetActive = new Set((seasonRegs[toId] || [])
       .filter((r) => r.active).map((r) => r.team_id));
-    const eligible = [], already = [], ineligible = [];
+    // #331 review round 19: a Team can hold more than one active SOURCE
+    // registration in the same Season (a Rule 7 violation legacy data / a
+    // write path predating Rule 7 can leave behind, or -- Memory only --
+    // two rows at the exact same key, the corruption finding 1 this same
+    // round closes off at every write path). `eligible` keeps each row's
+    // OWN registration alongside its team, never just the team, so two
+    // rows for one team render as genuinely distinct, independently
+    // selectable entries instead of colliding on a team-id-only key.
+    // `already` still dedupes by team (informational only, never a pick
+    // target) so a team with two source rows doesn't list itself twice.
+    const eligible = [], ineligible = [];
+    const alreadyByTeam = new Map();
     srcRegs.forEach((r) => {
       const team = teamById(r.team_id);
-      if (!team) ineligible.push(r);
-      else if (targetActive.has(r.team_id)) already.push(team);
-      else eligible.push(team);
+      if (!team) { ineligible.push(r); return; }
+      if (targetActive.has(r.team_id)) { alreadyByTeam.set(team.id, team); return; }
+      eligible.push({ reg: r, team });
     });
+    const already = [...alreadyByTeam.values()];
     // Every carried team must land under a concrete target-season League — the
     // v2 rollover has no division-only mode, so a null-league selection can
     // never be sent (#233 Slice C2). Rows start unchecked (no implicit bulk
@@ -2205,18 +2711,24 @@ function renderRollover(hv, ov) {
     // backend rejects any other. So each row's target League is FIXED to the
     // team's permanent League (never a free picker), and its Division options
     // are that League's divisions in the target season.
-    const carryRows = eligible.map((team) => {
+    // #331 review round 19: every per-row control keys off the SOURCE
+    // registration's own id, never team.id -- two rows for the same team
+    // (see the eligible/already split above) must never collide on a
+    // shared data-rollover-* value. data-rollover-team stays on the
+    // checkbox alongside it so the commit handler can still report which
+    // team a picked row belongs to without re-deriving it from the DOM.
+    const carryRows = eligible.map(({ reg, team }) => {
       const perm = teamPermLeague[team.id];
       const permInTo = perm && toLeagues.find((lv) => lv.id === perm.id);
       const leagueCell = perm
-        ? `<select class="reg-league" data-rollover-league="${esc(team.id)}"><option value="${esc(perm.id)}" selected>${esc(perm.name)}</option></select>`
-        : `<select class="reg-league" data-rollover-league="${esc(team.id)}"><option value="">No permanent league</option></select>`;
+        ? `<select class="reg-league" data-rollover-league="${esc(reg.id)}"><option value="${esc(perm.id)}" selected>${esc(perm.name)}</option></select>`
+        : `<select class="reg-league" data-rollover-league="${esc(reg.id)}"><option value="">No permanent league</option></select>`;
       const initialDivs = permInTo ? (permInTo.divisions || []) : [];
       return `<div class="tn-leaf reg-row">
-        <label class="ro-pick"><input type="checkbox" data-rollover-pick="${esc(team.id)}">
+        <label class="ro-pick"><input type="checkbox" data-rollover-pick="${esc(reg.id)}" data-rollover-team="${esc(team.id)}">
           <span class="tn-label">👥 ${esc(team.name)}</span></label>
         ${leagueCell}
-        <select class="reg-div" data-rollover-div="${esc(team.id)}"><option value="">No division</option>${
+        <select class="reg-div" data-rollover-div="${esc(reg.id)}"><option value="">No division</option>${
           initialDivs.map((d) => opt(d.id, d.name)).join("")}</select>
         <span class="ro-row-err" hidden>This team has no permanent league</span></div>`;
     }).join("");
@@ -2275,9 +2787,14 @@ function updateRolloverCommitState(c) {
   if (!commit) return;
   let anyChecked = false, allAssigned = true;
   c.querySelectorAll("[data-rollover-pick]").forEach((cb) => {
-    const league = c.querySelector(`[data-rollover-league="${cb.dataset.rolloverPick}"]`);
-    const assigned = !!(league && league.value);
+    // #331 review round 19: scoped to THIS row, not a global attribute-value
+    // lookup -- two rows can share the same data-rollover-league VALUE
+    // (both showing the same permanent-league option) even now that the
+    // data-rollover-pick/-league/-div KEY is the row's own registration id,
+    // so a value-based query is never safe here regardless of keying.
     const row = cb.closest(".reg-row");
+    const league = row && row.querySelector("[data-rollover-league]");
+    const assigned = !!(league && league.value);
     const err = row && row.querySelector(".ro-row-err");
     if (cb.checked) {
       anyChecked = true;
@@ -2751,7 +3268,28 @@ const IB_WEEKDAYS = [[0, "Mon"], [1, "Tue"], [2, "Wed"], [3, "Thu"],
 
 function defaultIceForm(ov) {
   const seasons = ov.seasons || [];
-  const active = seasons.find((s) => s.status === "active") || seasons[0] || null;
+  // Prefer the #159 ACTIVE Season selection over "the first active/global
+  // Season" (#331 review round 5 finding 4): `seasons` here spans every
+  // Program (GET /api/demo/overview is unfiltered), so picking the first
+  // status==="active" row could default the builder onto a DIFFERENT
+  // Program's Season than the one the Home/Tasks hub CTA was scoped to. A
+  // committed submit against that silent wrong default would generate ice
+  // for the wrong Program.
+  //
+  // Fails CLOSED, not to that same global-first Season, when none is
+  // actively selected -- a Program-only context, or no context at all
+  // (#331 review round 8: this used to fall back to `seasons.find(active)
+  // || seasons[0]` for exactly that case, the identical unsafe default
+  // Import's own Season select was already fixed to refuse in round 7).
+  // renderIceBuilder()'s own <select> below renders an explicit disabled
+  // placeholder rather than letting a native <select> silently pick its
+  // first option when none is marked `selected`, the same fail-closed
+  // pairing Import already uses. A stale/deleted selected id ALSO resolves
+  // to nothing here (`selected` stays undefined), never a silent fallback.
+  const selectedId = contextOptions && contextOptions.selected
+    && contextOptions.selected.season_id;
+  const selected = selectedId ? seasons.find((s) => s.id === selectedId) : null;
+  const active = selected || null;
   const rinks = ov.rinks || [];
   return {
     season_id: active ? active.id : "",
@@ -2787,10 +3325,36 @@ function ibLocalOffset(iso) {
 function ibDateOnly(v) { return v ? String(v).slice(0, 10) : "—"; }
 
 function renderIceBuilder(ov) {
-  const f = iceBuilder.form || (iceBuilder.form = defaultIceForm(ov));
+  // Rebind to the active Program/Season on any context revision (#331
+  // review round 7): a form/preview cached from BEFORE the operator
+  // switched Program via the #159 switcher is exactly the same
+  // committable wrong-Program risk as Import's own stale Season (both
+  // send season_id verbatim to their commit endpoint, and the switcher is
+  // display-only -- nothing else validates "matches the active
+  // context"). Rinks are ALSO Program/Venue-scoped, so a context change
+  // discards the WHOLE form, not just season_id -- defaultIceForm(ov)
+  // already prefers the active Season the same way Import's own re-seed
+  // does. Clearing preview too makes it uncommittable the same way an
+  // edited form already does (Create is bound to the previewed
+  // template's own fingerprint, see its onclick below): with no preview,
+  // Create has nothing to send.
+  if (iceBuilder.contextRevision !== contextRevision) {
+    iceBuilder.form = defaultIceForm(ov);
+    iceBuilder.preview = null;
+    iceBuilder.contextRevision = contextRevision;
+  }
+  const f = iceBuilder.form;
   const seasons = ov.seasons || [];
   const season = seasons.find((s) => s.id === f.season_id) || null;
-  const seasonOpts = seasons.map((s) =>
+  // No selected `<option>` (#331 review round 8, mirroring Import's own
+  // round 7 fix) when f.season_id is unset -- fails CLOSED to an explicit,
+  // disabled placeholder rather than the native <select>'s own "no option
+  // marked selected -> pick the first one" default, which would silently
+  // reintroduce a global-first Season exactly like defaultIceForm() now
+  // deliberately omits above.
+  const seasonOpts = (!f.season_id
+      ? `<option value="" selected disabled>— select a season —</option>` : "")
+    + seasons.map((s) =>
     `<option value="${esc(s.id)}" ${s.id === f.season_id ? "selected" : ""}>${esc(s.name)}</option>`).join("");
   const venues = ov.venues || [];
   const rinkCheck = (r) =>
@@ -4663,9 +5227,28 @@ function importCommitState(type) {
 }
 
 function renderImportRows(items, cls) {
+  // #331 review round 18: several structured errors/warnings name the
+  // EXACT conflicting row ids (`affected_registration_ids`,
+  // `affected_game_ids`) so an operator can resolve them precisely instead
+  // of guessing which of several rows for the same team/season is at
+  // fault -- team_registration_conflict is the round-18 motivating case
+  // (two active registrations for one team, only distinguishable by their
+  // League, which Season participation's own rows now render — see
+  // renderSeasonParticipation), but this stays reason-agnostic like the
+  // rest of this renderer: any entry carrying either id list gets it shown,
+  // with no reason-specific branch to leave uncovered later.
+  const idList = (it) => {
+    const regIds = it.affected_registration_ids || [];
+    const gameIds = it.affected_game_ids || [];
+    if (!regIds.length && !gameIds.length) return "";
+    const parts = [];
+    if (regIds.length) parts.push(`registration(s) ${regIds.map((id) => `<code>${esc(id)}</code>`).join(", ")}`);
+    if (gameIds.length) parts.push(`game(s) ${gameIds.map((id) => `<code>${esc(id)}</code>`).join(", ")}`);
+    return `<div class="li-sub muted">Affected: ${parts.join(" · ")}</div>`;
+  };
   return items.map((it) => `<div class="li"><div class="li-main">
     <div class="li-title">${esc(it.sheet || "")}${it.row != null ? ` — row ${it.row}` : ""}${it.field ? ` (${esc(it.field)})` : ""}</div>
-    <div class="li-sub ${cls}">${cls === "error" ? "⚠" : "ℹ"} ${esc(it.message)}</div></div></div>`).join("");
+    <div class="li-sub ${cls}">${cls === "error" ? "⚠" : "ℹ"} ${esc(it.message)}</div>${idList(it)}</div></div>`).join("");
 }
 
 function renderImportReport(report, type) {
@@ -4733,11 +5316,18 @@ function renderImport(ov) {
     data-import-type="${t.key}">${esc(t.label)}</button>`).join("");
 
   const seasons = ov.seasons || [];
+  // No selected `<option>` (#331 review round 7) when importState.seasonId
+  // is unset -- fails CLOSED to an explicit, disabled placeholder rather
+  // than the native <select>'s own "no option marked selected -> pick the
+  // first one" default, which would silently reintroduce a global-first
+  // Season exactly like the fallback this state now deliberately omits.
   const seasonField = !type.needsSeason ? "" : !seasons.length
     ? `<label>Season <span class="req">*</span></label>
        <div class="drawer-note">Create a season first.</div>`
     : `<label>Season <span class="req">*</span></label>
-       <select id="import-season">${seasons.map((s) => `<option value="${esc(s.id)}"`
+       <select id="import-season">${!importState.seasonId
+          ? `<option value="" selected disabled>— select a season —</option>` : ""}
+         ${seasons.map((s) => `<option value="${esc(s.id)}"`
           + `${s.id === importState.seasonId ? " selected" : ""}>${esc(s.name)}</option>`).join("")}</select>`;
 
   const sheetFields = type.sheets.map((s) => `<div class="import-field-head">
@@ -5699,12 +6289,34 @@ async function render() {
       schedulerState.summary = (dr && dr.summary) || null;
       reconcileDraftSelection(drafts, previousDrafts);
     }
-    // Import wizard (#96): default the season picker once seasons exist,
-    // same pattern as schedulerState.division/standingsDivision above —
-    // the state default belongs here in the impure orchestrator, not
-    // inside renderImport() itself, which stays a pure string-builder.
-    if (view === "import" && !importState.seasonId && ov.seasons[0]) {
-      importState.seasonId = ov.seasons[0].id;
+    // Import wizard (#96): bind the season picker to the ACTIVE #159
+    // Season, not "the first Season that happens to exist" (#331 review
+    // round 7) — `ov.seasons` is unfiltered (every Program), and
+    // goToSetupWorkflow("import") does no seeding of its own (it only
+    // switches tabs), so the old fallback was a silent, COMMITTABLE
+    // cross-Program default: needsSeason import types send seasonId
+    // verbatim to commit_import, and #159's context is display-only, not
+    // a backend filter, so nothing else would have caught it. Re-binds on
+    // ANY context revision, not just the first visit, since the operator
+    // can reach Import once and then switch Program via the switcher
+    // while still on this view. Fails CLOSED, not to a fresh global
+    // default, when no Season is actively selected (a Program-only
+    // context) — importCommitState() already refuses to enable Commit
+    // without a real importState.seasonId, and renderImport()'s own
+    // season <select> below renders no `selected` option in that case,
+    // so a native browser default can't silently stand in for one either.
+    // A stale Season also makes any ALREADY-validated report/committed
+    // result suspect (it was reviewed by a person looking at a different
+    // Program), so those are invalidated here too, not just re-seeded —
+    // the operator must re-validate against whatever Season they land on
+    // under the new context before Commit can enable again.
+    if (view === "import" && importState.contextRevision !== contextRevision) {
+      importState.seasonId = (contextOptions && contextOptions.selected
+        && contextOptions.selected.season_id) || null;
+      importState.report = null;
+      importState.validatedKey = null;
+      importState.committed = null;
+      importState.contextRevision = contextRevision;
     }
     // Account/session admin, League-Admin only (#78).
     if (view === "users" && hasPerm("manage_users")) {
@@ -5760,6 +6372,14 @@ async function render() {
     if (view === "dashboard" && ov.divisions[0]) {
       standings = await getJSON(`/api/standings/${ov.divisions[0].id}`);
     }
+    // Home/Tasks hub setup-progress card (#330) — only for a role that can
+    // act on Setup (League Admin/Arena Manager); a Coach also lands on
+    // "dashboard" (canSeeOpsConsole) but has nothing to do with this. The
+    // fetch itself happens independently, in loadSetupProgressCard() below
+    // (#331 review round 2 finding 3) — not awaited inline here, so it
+    // never blocks the rest of the Dashboard from painting.
+    setupProgress = null;
+    setupProgressError = false;
   } catch (e) {
     setChrome(ov);
     c.innerHTML = `<div class="banner alert"><h2>Could not load data</h2>
@@ -5791,8 +6411,25 @@ async function render() {
         || "You don't have access to this game's roster.")}</p></div>`;
     return;
   }
+  // Per-card loading boundary (#331 review round 2 finding 3): the card's
+  // own fetch is NOT part of this render() cycle's await chain (see
+  // loadSetupProgressCard()) -- paint an immediate loading skeleton into
+  // its slot here, in step with the rest of the Dashboard, then let that
+  // fetch fill the slot in on its own schedule.
+  const showSetupCard = view === "dashboard"
+    && (hasPerm("manage_setup") || hasPerm("manage_arena"));
+  // role="status"/aria-live="polite" (#331 review round 5 finding 5): this
+  // wrapper persists across every re-render of renderSetupProgressCard()'s
+  // OWN output (loadSetupProgressCard() only ever replaces its innerHTML),
+  // so it is the one stable point a screen reader can watch to have
+  // loading -> success/blocked/error, and a later retry's own settle,
+  // announced automatically. aria-busy starts true (a fetch is about to
+  // start, per the loading skeleton painted on the same line) and
+  // loadSetupProgressCard() clears it once real content lands.
   c.innerHTML =
-    view === "dashboard" ? renderDashboard(ov, standings)
+    view === "dashboard" ? (showSetupCard
+        ? `<div id="sp-card-slot" role="status" aria-live="polite" aria-busy="true">${renderSetupProgressCard(null, false, true)}</div>` : "")
+      + renderDashboard(ov, standings)
     : view === "setup" ? renderSetup(sv, hv, ov)
     : view === "import" ? renderImport(ov)
     : view === "calendar" ? renderCalendar(ov)
@@ -5817,6 +6454,12 @@ async function render() {
 
   wireModal(c);
   c.querySelectorAll("[data-goto]").forEach((b) => b.onclick = () => switchTab(b.dataset.goto));
+  // Home/Tasks hub setup-progress card (#330): its own fetch, content, and
+  // click-handler wiring all happen independently in loadSetupProgressCard
+  // (#331 review round 2 finding 3) -- the slot painted above is only ever
+  // the loading skeleton at this point, so there's nothing of the card's
+  // own to wire here yet.
+  if (showSetupCard) loadSetupProgressCard();
   // Administration → Danger zone (#256): opens the guarded factory-reset modal.
   const frBtn = c.querySelector("[data-factory-reset]");
   if (frBtn) frBtn.onclick = () => { if (canFactoryReset()) startFactoryReset(); };
@@ -5906,12 +6549,19 @@ async function render() {
   // remove it. Each posts to the v2 registration routes then re-renders; the
   // toast reflects the server's structured error (e.g. a team with scheduled
   // games can't be removed/reassigned).
+  // IDs below are keyed by Season+League together, not League alone (#331
+  // review round 3 finding 2): two Seasons sharing one League used to render
+  // IDENTICAL element ids for their own "Register" add-rows, so querying by
+  // League id alone returned whichever Season's row happened to come first
+  // in DOM order -- silently reading (and submitting) the WRONG Season's
+  // chosen team/league/division.
   c.querySelectorAll("[data-reg-add]").forEach((b) => b.onclick = async () => {
     const lvId = b.dataset.regAdd;
     const sid = b.dataset.regAddSeason;
-    const team = c.querySelector(`#reg-team-${lvId}`);
-    const league = c.querySelector(`#reg-league-add-${lvId}`);
-    const div = c.querySelector(`#reg-div-add-${lvId}`);
+    const key = `${sid}-${lvId}`;
+    const team = c.querySelector(`#reg-team-${key}`);
+    const league = c.querySelector(`#reg-league-add-${key}`);
+    const div = c.querySelector(`#reg-div-add-${key}`);
     if (!team || !team.value) { toast = "Choose a program team to register."; toastIsError = true; return render(); }
     if (!league || !league.value) { toast = "Choose a league to register the team under."; toastIsError = true; return render(); }
     toast = "";
@@ -5922,9 +6572,12 @@ async function render() {
   });
   // A "Register" control's League select rescopes its own Division select to
   // the newly-chosen League's divisions (never guessing a same-named one).
+  // data-reg-league-add already carries the same Season+League composite key
+  // as the ids above (#331 review round 3 finding 2), so this stays scoped
+  // to the exact same row even when another Season shares this League.
   c.querySelectorAll("[data-reg-league-add]").forEach((sel) => sel.onchange = () => {
-    const lvId = sel.dataset.regLeagueAdd;
-    const divSel = c.querySelector(`#reg-div-add-${lvId}`);
+    const key = sel.dataset.regLeagueAdd;
+    const divSel = c.querySelector(`#reg-div-add-${key}`);
     if (!divSel) return;
     const divs = leagueDivisions[sel.value] || [];
     divSel.innerHTML = `<option value="">No division</option>${divs.map((d) => opt(d.id, d.name)).join("")}`;
@@ -6082,8 +6735,12 @@ async function render() {
   c.querySelectorAll("[data-rollover-pick]").forEach((cb) =>
     cb.onchange = () => updateRolloverCommitState(c));
   c.querySelectorAll("[data-rollover-league]").forEach((sel) => sel.onchange = () => {
-    const teamId = sel.dataset.rolloverLeague;
-    const divSel = c.querySelector(`[data-rollover-div="${teamId}"]`);
+    // #331 review round 19: scoped to THIS row -- two rows can share the
+    // same permanent-league VALUE (see updateRolloverCommitState above),
+    // so a value-based query would rescope the wrong row's Division select
+    // whenever that happens.
+    const row = sel.closest(".reg-row");
+    const divSel = row && row.querySelector("[data-rollover-div]");
     if (divSel) {
       const divs = leagueDivisions[sel.value] || [];
       divSel.innerHTML = `<option value="">No division</option>${divs.map((d) => opt(d.id, d.name)).join("")}`;
@@ -6099,11 +6756,19 @@ async function render() {
       const selections = [];
       c.querySelectorAll("[data-rollover-pick]").forEach((cb) => {
         if (!cb.checked) return;
-        const league = c.querySelector(`[data-rollover-league="${cb.dataset.rolloverPick}"]`);
-        const div = c.querySelector(`[data-rollover-div="${cb.dataset.rolloverPick}"]`);
+        // #331 review round 19: scoped to THIS row (never a value-matched
+        // global query -- two rows can share the same league VALUE, see
+        // updateRolloverCommitState above), and the outgoing selection now
+        // names its SOURCE registration explicitly rather than leaving the
+        // backend to guess which of a team's possibly-several source rows
+        // this selection meant.
+        const row = cb.closest(".reg-row");
+        const league = row && row.querySelector("[data-rollover-league]");
+        const div = row && row.querySelector("[data-rollover-div]");
         if (league && league.value) {
-          selections.push({ team_id: cb.dataset.rolloverPick, league_id: league.value,
-                             division_id: (div && div.value) || null });
+          selections.push({
+            team_id: cb.dataset.rolloverTeam, registration_id: cb.dataset.rolloverPick,
+            league_id: league.value, division_id: (div && div.value) || null });
         }
       });
       // Defensive: the button is disabled unless every checked team has a
@@ -6615,6 +7280,15 @@ async function render() {
     importState.report = null;
     importState.validatedKey = null;
     importState.committed = null;
+    // #331 review round 10: importState.type is a small, reusable string (not
+    // a monotonic counter like contextRevision), so switching away and back
+    // to the SAME type before a stale Validate/Commit resolves would make
+    // `importState.type !== type.key` coincidentally pass again -- and if the
+    // freshly re-rendered sheets happen to hold the same text too (e.g. both
+    // empty), importSnapshotKey() could coincidentally match as well. Bump
+    // unconditionally so a type switch is always recognized as a fresh
+    // operation, the same as it would be for the Ice Builder.
+    importOperationSeq += 1;
     toast = "";
     render();
   });
@@ -6630,12 +7304,30 @@ async function render() {
     importState.report = null;
     importState.validatedKey = null;
     importState.committed = null;
+    // #331 review round 10, same reasoning as the type switch above: loading
+    // sample data resets the sheets to a fixed, reusable string, so a second
+    // load (or a load that lands on content matching an earlier snapshot)
+    // must still be treated as a fresh operation, not left to chance on
+    // whether importSnapshotKey() happens to differ.
+    importOperationSeq += 1;
     toast = "Sample data loaded — click Validate to preview it.";
     toastIsError = true;  // instructional, not a completed action — don't auto-clear
     render();
   };
   const importSeason = c.querySelector("#import-season");
-  if (importSeason) importSeason.onchange = () => { importState.seasonId = importSeason.value; };
+  // #331 review round 11: a Commit captured for the PREVIOUSLY selected
+  // Season can still be in flight when the operator switches to a different
+  // Season in the same context -- contextRevision alone doesn't catch this
+  // (no context change), so without an operation bump here the late response
+  // would apply its result (or clear report/validatedKey) onto the NEWLY
+  // selected Season's own UI even though the write it actually reports on
+  // targeted the OLD Season. Validate's own dry-run body deliberately stays
+  // season-agnostic (unchanged) -- this only invalidates RESPONSE ownership,
+  // same as every other same-context operation-boundary event above.
+  if (importSeason) importSeason.onchange = () => {
+    importState.seasonId = importSeason.value;
+    importOperationSeq += 1;
+  };
   // Builds the POST body straight from the LIVE textarea DOM — always, for
   // both Validate and Commit. importState.sheetsText is a display cache
   // only (kept in sync below by each textarea's own `input` handler so a
@@ -6691,9 +7383,29 @@ async function render() {
     // response's report to the NEW sample text and misreport it as
     // already-validated).
     const requestKey = importSnapshotKey(type);
+    // Snapshot the context generation too (#331 review round 9): the checks
+    // above only ever detected the SHEETS changing under a slow response,
+    // never a context switch -- importState.report/validatedKey are cleared
+    // at switch time (invalidateContextScopedMutations()), but nothing
+    // stopped an ALREADY-IN-FLIGHT Validate that started before the switch
+    // from landing afterward and reattaching a report/validatedKey the
+    // operator never reviewed under the NEW context, silently re-enabling
+    // Commit with no fresh B validation. type/text are deliberately still
+    // checked too: a context switch clears report/validatedKey/committed
+    // only, not sheetsText or the type selector, so either kind of
+    // staleness needs its own check.
+    const requestRevision = contextRevision;
+    // A newer identical-input Validate click (#331 review round 10) changes
+    // none of the checks above -- same type, same text, same context -- so
+    // without its own token an OLDER response released after a NEWER one
+    // could still overwrite it (e.g. the newer click's own request failed
+    // and THIS one happens to succeed, silently re-enabling Commit against
+    // a review the operator's own latest click already superseded).
+    const requestOp = ++importOperationSeq;
     importState.committed = null;
     const res = await post("/api/import/dry-run", body);
-    if (importState.type !== type.key || importSnapshotKey(type) !== requestKey) return;
+    if (importState.type !== type.key || importSnapshotKey(type) !== requestKey
+        || contextRevision !== requestRevision || requestOp !== importOperationSeq) return;
     toast = "";
     importState.report = res;
     importState.validatedKey = (res && !res.error) ? requestKey : null;
@@ -6712,14 +7424,21 @@ async function render() {
       toastIsError = true;
       return render();
     }
+    const requestRevision = contextRevision;  // #331 review round 9, consistency with Validate above
+    const requestOp = ++importOperationSeq;  // #331 review round 10, same reasoning as Validate above
     const body = buildImportBody(type);
     if (type.needsSeason) body.season_id = importState.seasonId;
     const res = await post(type.commitPath, body);
     // Same stale-response guard as Validate above — discard this response
-    // if the sheets or the selected type changed while the request was in
-    // flight, rather than showing a commit result for content that's no
-    // longer what's on screen.
-    if (importState.type !== type.key || importSnapshotKey(type) !== requestKey) return;
+    // if the sheets, the selected type, the context, or a newer operation
+    // superseded it while the request was in flight, rather than showing a
+    // commit result for content that's no longer what's on screen (#331
+    // review round 9 added the context leg, round 10 the operation leg --
+    // the commit ITSELF already went to whichever season_id this click
+    // actually captured, so this only guards what the client does with the
+    // RESPONSE, same as the others below it).
+    if (importState.type !== type.key || importSnapshotKey(type) !== requestKey
+        || contextRevision !== requestRevision || requestOp !== importOperationSeq) return;
     toast = "";
     importState.committed = res;
     if (res && res.committed) { importState.report = null; importState.validatedKey = null; }
@@ -6897,9 +7616,20 @@ async function render() {
   });
   // Ice Availability Builder (#158): open/cancel, preview, commit, exclusions.
   const ibOpen = c.querySelector("[data-ice-builder-open]");
-  if (ibOpen) ibOpen.onclick = () => { iceBuilder = { form: null, preview: null }; toast = ""; render(); };
+  // Opening a builder bumps iceOperationSeq (#331 review round 10): a
+  // Preview/Commit issued by a PRIOR builder instance -- canceled, then
+  // this one opened fresh -- must never be mistaken for current just
+  // because contextRevision hasn't changed (same context throughout) and
+  // `iceBuilder` is non-null again by the time it resolves.
+  if (ibOpen) ibOpen.onclick = () => {
+    iceOperationSeq += 1;
+    iceBuilder = { form: null, preview: null }; toast = ""; render();
+  };
   const ibCancel = c.querySelector("[data-ib-cancel]");
-  if (ibCancel) ibCancel.onclick = () => { iceBuilder = null; toast = ""; render(); };
+  if (ibCancel) ibCancel.onclick = () => {
+    iceOperationSeq += 1;
+    iceBuilder = null; toast = ""; render();
+  };
   // Any change to the template (season, rinks, weekdays, per-day times, dates,
   // buffers) INVALIDATES a shown preview, so Create can never post a form
   // edited after Preview — the create button re-reads the live form, and the
@@ -6911,26 +7641,115 @@ async function render() {
     if (e.target && e.target.id === "ib-excl") return;  // staging input, not the template
     const isWeekday = e.target.classList && e.target.classList.contains("ib-weekday");
     const hadPreview = !!iceBuilder.preview;
+    // Bump unconditionally, not only when clearing an existing preview
+    // (#331 review round 10): a Preview issued BEFORE this edit but still
+    // in flight when it lands must be recognized as stale even if no
+    // preview existed yet to clear -- otherwise it would still write its
+    // now-outdated slots onto the freshly-edited form once it resolves.
+    iceOperationSeq += 1;
     iceBuilder.form = readIceBuilderForm(c);
     if (hadPreview) { iceBuilder.preview = null; toast = ""; }
     if (hadPreview || isWeekday) render();
   });
-  c.querySelectorAll("[data-ib-preview]").forEach((b) => b.onclick = async () => {
-    toast = "";
+  // #331 review round 11: text/date/time controls fire `input` continuously
+  // WHILE FOCUSED but don't fire `change` until blur -- a Preview/Commit held
+  // in flight across an edit the operator hasn't blurred yet would still see
+  // iceOperationSeq unchanged (only `change` bumped it), so the stale
+  // response passes the guard above and render() replaces what's live in the
+  // focused field with the old value readIceBuilderForm() captured at click
+  // time. Bump the op token on every keystroke too, so that response is
+  // discarded before it ever reaches render() -- and if a preview panel is
+  // already showing, drop its DOM node DIRECTLY rather than calling the full
+  // render() this listener's own edit is trying to avoid mid-keystroke
+  // (matches the drawer-removal idiom from round 8: a full render() here
+  // would also rebuild the very field the operator is still typing in and
+  // steal focus/cursor out from under them).
+  if (ibFormEl) ibFormEl.addEventListener("input", (e) => {
+    if (!iceBuilder) return;
+    if (e.target && e.target.id === "ib-excl") return;  // staging input, not the template
+    iceOperationSeq += 1;
     iceBuilder.form = readIceBuilderForm(c);
-    iceBuilder.preview = await post("/api/setup/ice-availability/preview", iceBuilder.form);
+    if (iceBuilder.preview) {
+      iceBuilder.preview = null;
+      const pv = c.querySelector(".ib-preview");
+      if (pv) pv.remove();
+    }
+  });
+  c.querySelectorAll("[data-ib-preview]").forEach((b) => b.onclick = async () => {
+    // A context/identity switch invalidated (round 8) or fully closed
+    // (identity switch, round 8) the builder between this button's last
+    // render and this click -- see invalidateContextScopedMutations()'s and
+    // resetTransientUiState()'s own comments. Guards the same way the form
+    // `change` listener above already does.
+    if (!iceBuilder) return;
+    toast = "";
+    // Snapshot the context generation (#331 review round 9): unlike the
+    // guard above, this one covers the AWAIT below, not just the click.
+    // iceBuilder.preview was previously assigned straight from the response
+    // with no staleness check at all -- a held preview held across a switch
+    // and then released restores stale (even other-context) slots into a
+    // preview that looks live, re-enabling Create. Re-check `iceBuilder`
+    // itself too: an identity switch nulls it wholesale, and a plain context
+    // switch could in principle let a new builder exist by the time this
+    // resolves.
+    const requestRevision = contextRevision;
+    // Snapshot the op token too (#331 review round 10): contextRevision
+    // alone only catches a CONTEXT change, not e.g. canceling and
+    // reopening the builder, editing the form, or a second Preview click
+    // -- all same-context events that must also obsolete this one. Each of
+    // those bumps iceOperationSeq at the point it happens; a mismatch here
+    // means one of them happened while this request was in flight.
+    const requestOp = ++iceOperationSeq;
+    iceBuilder.form = readIceBuilderForm(c);
+    const preview = await post("/api/setup/ice-availability/preview", iceBuilder.form);
+    if (!iceBuilder || contextRevision !== requestRevision || requestOp !== iceOperationSeq) return;
+    iceBuilder.preview = preview;
     render();
   });
   const ibCommit = c.querySelector("[data-ib-commit]");
   if (ibCommit) ibCommit.onclick = async () => {
+    if (!iceBuilder) return;
     toast = "";
     // Bind the commit to the previewed template: send the fingerprint the
     // preview returned so the server refuses a form edited since (belt to the
     // frontend's suspenders, which already drops the preview on any edit).
     const fingerprint = iceBuilder.preview && iceBuilder.preview.template_fingerprint;
+    // No preview to bind to -- a context switch cleared it since this button
+    // was rendered (#331 review round 8: invalidateContextScopedMutations()
+    // clears iceBuilder.preview the instant a switch is even attempted, well
+    // before this button's own DOM node is removed by the next render). Bail
+    // out client-side rather than sending a doomed request with a null
+    // fingerprint and relying on the server's own rejection of it — the same
+    // belt-and-suspenders Import's own Commit handler already applies below.
+    if (!fingerprint) {
+      toast = "The preview changed — refresh it before creating.";
+      toastIsError = true;
+      return render();
+    }
+    // Snapshot the context generation (#331 review round 9): the commit
+    // itself is already correctly bound to whatever template this click
+    // captured -- the fingerprint check above is the authoritative guard for
+    // THAT, and the server independently rejects a mismatched fingerprint --
+    // but the RESPONSE handling below reaches into the live `iceBuilder`,
+    // including nulling it out on success or writing a fresh preview into it
+    // on a mismatch. If a context or identity switch happened while this
+    // request was in flight, the operator may already be looking at a
+    // brand-new B-context builder by the time it resolves; without this
+    // check an A-context commit's late response would wipe out that
+    // in-progress B builder, attach an A-context re-preview onto it, or
+    // crash outright against a `null` left by an identity switch.
+    const requestRevision = contextRevision;
+    // #331 review round 10, same reasoning as Preview above: contextRevision
+    // alone doesn't catch a same-context cancel/reopen of the builder --
+    // without this, a stale Commit success landing after the operator
+    // canceled and reopened a fresh builder in the SAME context would still
+    // pass the guard below and null out that brand-new builder out from
+    // under them.
+    const requestOp = ++iceOperationSeq;
     iceBuilder.form = readIceBuilderForm(c);
     const res = await post("/api/setup/ice-availability/commit",
       { ...iceBuilder.form, template_fingerprint: fingerprint });
+    if (!iceBuilder || contextRevision !== requestRevision || requestOp !== iceOperationSeq) return;
     const reason = res && res.error && res.error.details && res.error.details.reason;
     if (res && !res.error) {
       toast = `Created ${res.totals.created} ice slot(s).`; iceBuilder = null;
@@ -6940,7 +7759,17 @@ async function render() {
       // preview so the operator reviews the CURRENT slots before creating again;
       // never commit the stale set.
       toast = "The schedule changed since preview — showing the updated proposal. Review, then create again.";
-      iceBuilder.preview = await post("/api/setup/ice-availability/preview", iceBuilder.form);
+      // Same guard around this second await (#331 review round 9/10) -- a
+      // switch, cancel/reopen, or edit could just as easily land during the
+      // re-preview as during the commit above. This re-preview counts as
+      // its own fresh operation (a new ++, not a re-read of requestOp):
+      // a genuinely independent Preview click racing it must still be able
+      // to supersede it.
+      const rePreviewRevision = contextRevision;
+      const rePreviewOp = ++iceOperationSeq;
+      const rePreview = await post("/api/setup/ice-availability/preview", iceBuilder.form);
+      if (!iceBuilder || contextRevision !== rePreviewRevision || rePreviewOp !== iceOperationSeq) return;
+      iceBuilder.preview = rePreview;
     } else {
       iceBuilder.preview = res;
     }
@@ -6948,18 +7777,22 @@ async function render() {
   };
   const ibExclAdd = c.querySelector("[data-ib-excl-add]");
   if (ibExclAdd) ibExclAdd.onclick = () => {
+    if (!iceBuilder) return;
     iceBuilder.form = readIceBuilderForm(c);
     const el = c.querySelector("#ib-excl");
     const d = el && el.value;
     if (d && !iceBuilder.form.exclusion_dates.includes(d)) iceBuilder.form.exclusion_dates.push(d);
     iceBuilder.preview = null;   // exclusions changed the template — re-preview
+    iceOperationSeq += 1;  // #331 review round 10, same reasoning as the form change listener above
     render();
   };
   c.querySelectorAll("[data-ib-excl-remove]").forEach((b) => b.onclick = () => {
+    if (!iceBuilder) return;
     iceBuilder.form = readIceBuilderForm(c);
     iceBuilder.form.exclusion_dates =
       iceBuilder.form.exclusion_dates.filter((x) => x !== b.dataset.ibExclRemove);
     iceBuilder.preview = null;   // exclusions changed the template — re-preview
+    iceOperationSeq += 1;  // #331 review round 10, same reasoning as the form change listener above
     render();
   });
   c.querySelectorAll("[data-filter]").forEach((sel) => sel.onchange = (e) => {
@@ -7039,7 +7872,7 @@ async function render() {
 }
 
 function switchTab(next) {
-  view = next; toast = ""; if (next !== "calendar") { wizard = null; conflict = null; movingGameId = null; pendingMove = null; }
+  view = next; toast = ""; if (next !== "calendar") { wizard = null; conflict = null; movingGameId = null; pendingMove = null; iceBuilder = null; }
   if (next !== "setup") { drawer = null; drawerError = ""; drawerValues = {}; pendingReassign = null; }
   // A pending checkout confirmation doesn't survive leaving Home (#107) —
   // same reset discipline as drawer/wizard above, so a stale "are you
@@ -7198,16 +8031,138 @@ async function restoreContextDeepLink() {
   }
   syncContextHash();
 }
+// Make every context-scoped mutation control uncommittable the instant a
+// context switch is even ATTEMPTED (#331 review round 8), not once its own
+// POST resolves -- the native <select> already shows the new choice before
+// setActiveContext()'s very first line runs, so a drawer submit, an Import
+// Commit, or an Ice Builder Create landing in the gap before that POST
+// settles must find nothing left to send, not race the network to get there
+// first. Also called from resetTransientUiState() (a no-reload sign-out/
+// sign-in/persona switch is the identity-bound flavor of the identical gap).
+//
+// Import's Commit handler already re-checks importState.validatedKey fresh
+// against the live DOM at click time (pre-existing belt-and-suspenders, see
+// its own comment below); clearing it here is enough on its own to make that
+// handler bail out with no request sent, however the click landed. Ice
+// Builder's Create gets the identical treatment (clearing iceBuilder.preview,
+// the source of the fingerprint its own handler now refuses to commit
+// without, below).
+//
+// An open drawer is different: submitSetup() does not re-verify anything
+// about the drawer before posting, so the only airtight guard is removing
+// its submit control from the DOM before a click can reach it -- directly,
+// not via the full render() pipeline, which would also rebuild #ctx-select's
+// own option list from the STILL-OLD contextOptions.selected (not updated
+// until setActiveContext()'s POST succeeds) and visibly snap the switcher
+// back to the prior choice for the duration of the round trip.
+//
+// importState.seasonId and iceBuilder.form are deliberately left alone here:
+// round 7's existing contextRevision-mismatch check in render() and
+// renderIceBuilder() already re-seeds both once the NEW canonical context is
+// confirmed (setActiveContext()'s second bump, below) -- reseeding them here
+// too would only seed from the STILL-OLD selection this function runs
+// before that POST updates.
+function invalidateContextScopedMutations() {
+  importState.report = null;
+  importState.validatedKey = null;
+  importState.committed = null;
+  if (iceBuilder) iceBuilder.preview = null;
+  if (drawer) {
+    document.querySelectorAll(".drawer-scrim, .drawer").forEach((el) => el.remove());
+    drawer = null; drawerError = ""; drawerValues = {};
+  }
+  // Belt-and-suspenders alongside the contextRevision bump the caller does
+  // separately (#331 review round 10): a context switch is itself one of
+  // the events that should obsolete any in-flight Validate/Preview/Commit,
+  // same as an in-context edit or a newer request of the same kind does.
+  iceOperationSeq += 1;
+  importOperationSeq += 1;
+}
+// Coalescing queue for context-switch POSTs (#331 review round 9): every
+// setActiveContext() call used to send its own /api/context POST
+// immediately, so a rapid A->B->C could leave all three genuinely in flight
+// at once. contextSwitchSeq (above) already makes the BROWSER ignore a
+// superseded response, but each POST still reaches ContextService.set(),
+// which persists ActiveContext as a plain unconditional last-write-wins
+// with no generation/ordering guard at all -- whichever of the three
+// requests the SERVER happens to finish processing last wins there,
+// regardless of which one the browser ends up displaying. The operator
+// could see C in the header while the server -- and everything that reads
+// its OWN persisted context, starting with /api/v2/setup/progress -- is
+// scoped to a completely different Program. Fixed by never letting more
+// than one /api/context POST be in flight at once: a switch requested
+// while one is already outstanding is queued (overwriting any earlier
+// still-queued one, since only the LATEST intent is ever worth sending),
+// and is sent immediately once the in-flight one settles, before that
+// response gets any chance to reconcile anything. With at most one such
+// POST ever in flight, the server's own last-write-wins persistence is
+// trivially equivalent to "last intent wins" -- there is no window left
+// for the two to disagree, on any backend.
+let contextSwitchInFlight = false;
+let contextSwitchQueued = null;  // {programId, seasonId, mySeq} -- the one pending switch not yet sent, if any
+
 // Persist a switcher pick, then reflect it in the hash and re-render.
 async function setActiveContext(programId, seasonId) {
+  const mySeq = ++contextSwitchSeq;
+  // Invalidate SYNCHRONOUSLY, before anything below (#331 review round 8) --
+  // see invalidateContextScopedMutations()'s own comment for why.
+  // contextRevision bumps here too, not just after success further down:
+  // contextSeededDrawerValues()'s own in-flight-hierarchy-fetch guard and
+  // round 7's render()-time rebind checks both compare against this counter,
+  // which must already read "changed" the instant a switch is ATTEMPTED, not
+  // only once it's confirmed.
+  invalidateContextScopedMutations();
+  contextRevision += 1;
+  if (contextSwitchInFlight) {
+    contextSwitchQueued = { programId, seasonId, mySeq };
+    return;
+  }
+  await sendContextSwitch(mySeq, programId, seasonId);
+}
+async function sendContextSwitch(mySeq, programId, seasonId) {
+  contextSwitchInFlight = true;
   const r = await post("/api/context",
     { program_id: programId, season_id: seasonId || null });
+  contextSwitchInFlight = false;
+  // A newer intent queued while this POST was in flight is strictly more
+  // current than whatever this response says -- send it immediately, before
+  // doing ANYTHING with this response (including reconciling a failure), so
+  // the server only ever receives requests in the operator's own real order
+  // (#331 review round 9). resetTransientUiState() clears this on an
+  // identity change, so an old identity's pending switch can never fire
+  // under a new one.
+  if (contextSwitchQueued) {
+    const next = contextSwitchQueued;
+    contextSwitchQueued = null;
+    return sendContextSwitch(next.mySeq, next.programId, next.seasonId);
+  }
+  // Superseded some other way -- e.g. resetTransientUiState() bumped
+  // contextSwitchSeq directly on an identity change while this POST (the
+  // OLD identity's own) was still in flight.
+  if (mySeq !== contextSwitchSeq) return;
   if (!r || r.error) {
     // Generic, no existence oracle (the backend returns the same not-found
     // whether it doesn't exist or isn't ours). Refresh options in case the
-    // authorized set shifted underneath us.
+    // authorized set shifted underneath us. Everything invalidated above
+    // STAYS invalidated -- reconciling the canonical context on failure must
+    // never restore a stale enabled action (#331 review round 8), and must
+    // converge on whatever the server actually has, never a context this
+    // failed POST never got the server to accept (#331 review round 9).
     toast = "That Program/Season isn't available."; toastIsError = true;
     await loadContextOptions();
+    if (mySeq !== contextSwitchSeq || contextSwitchQueued) return;
+    // loadContextOptions() just proved canonical truth -- sync the hash to
+    // it even on THIS failure path (#331 review round 10). This request's
+    // own target was rejected, but that does not mean the hash is already
+    // correct: if an EARLIER sibling in the same coalesced burst succeeded
+    // (this one was queued behind it and its own success reconciliation
+    // was skipped in favor of dequeuing straight to this one, per the
+    // comment above), the server is already sitting on THAT sibling's
+    // context while the hash still shows whatever was live before the
+    // whole burst started. Without this, a reload runs
+    // restoreContextDeepLink(), treats the stale hash as an intentional
+    // deep link, and silently POSTs the persisted context back to it.
+    syncContextHash();
     render();
     return;
   }
@@ -7220,6 +8175,13 @@ async function setActiveContext(programId, seasonId) {
     contextOptions.selected = { program_id: r.program_id,
       season_id: r.season_id, read_only: !!r.read_only };
   }
+  // Second bump (#331 review round 8): the FIRST bump above only made the
+  // PRIOR selection's mutations uncommittable at intent time, before
+  // contextOptions.selected itself had changed. A SECOND bump, now that the
+  // canonical NEW selection is known, is what makes the render() below
+  // actually rebind Import/Ice Builder to it instead of finding its own
+  // stamp already "current" (from the first bump) and skipping the reseed.
+  contextRevision += 1;
   syncContextHash();
   // Then reconcile the whole option set from a fresh GET so the label/status/
   // read-only badge reflect canonical state at POST time — a Season may have
@@ -7229,6 +8191,7 @@ async function setActiveContext(programId, seasonId) {
   // in case the canonical selection differs from the POST echo (a concurrent
   // change), so the hash always matches what is rendered.
   await loadContextOptions();
+  if (mySeq !== contextSwitchSeq) return;  // superseded during the refetch
   syncContextHash();
   toast = "";
   render();
@@ -7474,6 +8437,50 @@ function resetTransientUiState() {
   // shouldn't survive an identity switch regardless. Never held a password.
   newAccountForm = { username: "", role: "", team_id: "", player_id: "", official_id: "" };
   newAccountError = "";
+  // Import wizard / Ice Availability Builder / hub create-drawer (#331
+  // review round 8): round 7 bound these to contextRevision, which closes a
+  // Program/Season switch under the SAME identity, but this function's own
+  // job is the identity switching -- a persona swap via the demo role-switch
+  // dropdown, or a sign-out immediately followed by a different sign-in,
+  // with no page reload in between. An in-progress paste (sheetsText can
+  // hold real player names/emails), a validated Import report, or a live
+  // Ice preview/Create action must not survive into the next signed-in
+  // identity, lower-privileged or not -- resetTransientUiState() already
+  // fires on exactly this transition (the prevId !== nextId guard in
+  // setUser() below), so it's the correct, already-identity-gated place for
+  // this too. Reset importState to its own module-level initial shape
+  // (mirrored here, not imported, since it's a plain object literal) and
+  // fully CLOSE the Ice Builder (iceBuilder = null, its own "not open"
+  // sentinel — see its declaration comment) rather than just clearing its
+  // preview: the next identity, even if equally privileged, didn't open it.
+  // Both Ice Builder click handlers guard against iceBuilder being null
+  // (round 8) for exactly this reason. The drawer gets the identical
+  // synchronous DOM removal invalidateContextScopedMutations() uses and for
+  // the identical reason: submitSetup() doesn't itself re-check anything
+  // about the drawer before posting, so the only airtight guard is removing
+  // its submit control from the DOM before a click can reach it. Bumping
+  // contextRevision last means a render() of either view (if the NEXT
+  // identity can even reach it) re-seeds fresh rather than finding an
+  // already-"current" stamp and skipping the reseed.
+  importState = { type: "teams_players", seasonId: null, sheetsText: {},
+    report: null, validatedKey: null, committed: null, contextRevision: null };
+  iceBuilder = null;
+  if (drawer) {
+    document.querySelectorAll(".drawer-scrim, .drawer").forEach((el) => el.remove());
+    drawer = null; drawerError = ""; drawerValues = {};
+  }
+  contextRevision += 1;
+  // A context switch this identity initiated but had not yet gotten a POST
+  // out for (queued behind one already in flight, see setActiveContext()'s
+  // own comment) belongs to nobody now -- discard it rather than letting it
+  // fire against the NEXT signed-in identity's session once the in-flight
+  // request settles (#331 review round 9). Bumping contextSwitchSeq too
+  // means that in-flight request's OWN completion -- necessarily still the
+  // OLD identity's -- recognizes on arrival that it's been superseded and
+  // skips its own reconciliation entirely, the same way an ordinary
+  // superseded switch already does.
+  contextSwitchQueued = null;
+  contextSwitchSeq += 1;
 }
 function setUser(user) {
   const prevId = currentUser ? currentUser.username : null;
@@ -7522,6 +8529,13 @@ function setUser(user) {
   // otherwise leave a viewer/coach/player/official staring at a Setup screen
   // whose tab gateChrome just hid out from under them.
   if (view === "setup" && !(hasPerm("manage_setup") || hasPerm("manage_arena"))) view = "dashboard";
+  // #331 review round 8: same reasoning for Import — renderImport() already
+  // self-guards with its own "Operators only" banner rather than the
+  // previous operator's actual state (importState is cleared regardless,
+  // above), but bouncing off the view entirely is still correct so a
+  // lower-privileged persona lands on ITS OWN home/dashboard instead of a
+  // dead-end banner for a nav item its own sidebar no longer shows.
+  if (view === "import" && !hasPerm("manage_arena")) view = "dashboard";
   if (isPlayerUser && view === "dashboard") view = "player_home";
   else if (isGuardianUser && view === "dashboard") view = "guardian_home";
   else if (isOfficialUser && view === "dashboard") view = "inbox";

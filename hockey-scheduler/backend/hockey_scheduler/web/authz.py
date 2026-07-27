@@ -249,6 +249,14 @@ def required_permission(path: str):
     # only like its v1 sibling, and the v2 setup routes mirror v1's authz.
     if path == "/api/v2/onboarding/status":
         return Permission.MANAGE_SETUP
+    # Home/Tasks hub setup-progress read (#330): the six-workflow completion
+    # summary behind the hub's "Continue setup" action. MANAGE_ARENA, not the
+    # League-Admin-only MANAGE_SETUP above — the hub is also the Arena
+    # Manager's landing (#330 IA crosswalk), and both roles hold MANAGE_ARENA.
+    # Must precede the generic "/api/v2/setup/" prefix fallback below, whose
+    # unmatched-entity default is the stricter MANAGE_SETUP.
+    if path == "/api/v2/setup/progress":
+        return Permission.MANAGE_ARENA
     if path.startswith("/api/v2/setup/"):
         return _v2_setup_permission(path[len("/api/v2/setup/"):])
 

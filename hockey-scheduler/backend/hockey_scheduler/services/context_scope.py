@@ -21,6 +21,7 @@ the new Program/Season *projection* on top of that canonical identity.
 
 from ..domain import Role
 from . import scope_bridge
+from .league_scope import exact_registration_or_conflict
 from .subject_scope import own_team_id as _own_team_id
 
 # Roles that see every Program under the current account model (#211): the two
@@ -46,7 +47,13 @@ def _team_season_ids(store, team):
     if team is None:
         return out
     for ls in store.league_seasons_for_league(team.league_id):
-        reg = store.registration_for_team_in_league_season(ls.id, team.id)
+        # #331 review round 19: fail CLOSED on exact-key multiplicity. This
+        # is a read-only visibility gate with no caller to report a
+        # structured conflict to -- an ambiguous key must never grant
+        # access, and must never vary with insertion order (a corrupted
+        # duplicate row must not let which one happens to load first decide
+        # whether a scoped Coach/Player/Guardian can see this Season).
+        reg, _conflicts = exact_registration_or_conflict(store, ls.id, team.id)
         if reg is not None and reg.active:
             out.add(ls.season_id)
     return out

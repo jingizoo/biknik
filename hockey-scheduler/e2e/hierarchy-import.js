@@ -11,8 +11,10 @@
 // setup reads for verification — never a raw API call for the behavior being
 // accepted. Fails on browser console/page errors.
 const { chromium } = require("playwright");
-const { spawn } = require("child_process");
+const { spawn, spawnSync } = require("child_process");
+const fs = require("fs");
 const http = require("http");
+const os = require("os");
 const path = require("path");
 
 const HOST = "127.0.0.1";
@@ -22,6 +24,49 @@ const VIEWPORTS = [
   { label: "desktop", width: 1440, height: 900, port: 8135 },
   { label: "phone", width: 390, height: 844, port: 8136 },
 ];
+
+// #331 review round 19: plants a SECOND active SeasonTeamRegistration for an
+// already-imported Team directly into the SAME durable SQLite file the
+// running server uses, from a separate process (no write contention with the
+// server — the identical technique season-participation.js's own
+// injectSecondActiveRegistration uses). Reproduces the "stray active row
+// under a different league" shape no CURRENT write path can leave behind for
+// a Team that already has a permanent league (register_team_for_season/
+// assign_season_team_league/transfer_team_to_league all enforce rule 7) —
+// legacy data / a write path predating rule 7 is the realistic cause.
+function injectSecondActiveRegistration(databasePath, { seasonId, leagueId, teamId }) {
+  const script = `
+import os
+from hockey_scheduler.store import create_store
+from hockey_scheduler.domain import SeasonTeamRegistration
+
+store = create_store(os.environ["FIXTURE_DB_PATH"])
+try:
+    ls = store.league_season_for(os.environ["FIXTURE_LEAGUE_ID"], os.environ["FIXTURE_SEASON_ID"])
+    reg_id = store.next_id("streg")
+    store.add_season_team_registration(SeasonTeamRegistration(
+        id=reg_id, league_season_id=ls.id,
+        team_id=os.environ["FIXTURE_TEAM_ID"], division_id=None, active=True))
+    print(reg_id)
+finally:
+    store.close()
+`;
+  const result = spawnSync(process.env.PYTHON || "python3", ["-c", script], {
+    cwd: BACKEND_DIR,
+    env: {
+      ...process.env,
+      FIXTURE_DB_PATH: databasePath,
+      FIXTURE_SEASON_ID: seasonId,
+      FIXTURE_LEAGUE_ID: leagueId,
+      FIXTURE_TEAM_ID: teamId,
+    },
+    encoding: "utf8",
+  });
+  if (result.status !== 0) {
+    throw new Error(`Second-registration fixture injection failed (exit ${result.status}): ${result.stderr}`);
+  }
+  return result.stdout.trim();
+}
 
 // The locked Q1-Q7 order/content (#260 review) — asserted verbatim below.
 const WIZARD_QUESTIONS = [
@@ -160,11 +205,20 @@ async function readRecordCounts(page) {
 
 async function checkViewport(browser, viewport) {
   const base = `http://${HOST}:${viewport.port}`;
+  // A durable SQLite file (not the in-memory default) so section (6) below
+  // can inject a second active registration directly into the same file
+  // from a separate process (#331 review round 19, mirroring season-
+  // participation.js). Demo mode still boots to a clean slate against it
+  // (DemoState.__init__ calls reset(seed=False)), so every scenario above
+  // behaves identically to the in-memory store it replaces.
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "hockey-hierarchy-"));
+  const databasePath = path.join(tempDir, `hierarchy-${viewport.label}.sqlite`);
   const server = spawn(
     process.env.PYTHON || "python3",
     ["-u", "-m", "hockey_scheduler.web.server", "--host", HOST,
       "--port", String(viewport.port)],
-    { cwd: BACKEND_DIR, stdio: ["ignore", "pipe", "pipe"] },
+    { cwd: BACKEND_DIR, env: { ...process.env, DATABASE_URL: databasePath },
+      stdio: ["ignore", "pipe", "pipe"] },
   );
   let serverOutput = "";
   server.stdout.on("data", (data) => { serverOutput += data.toString(); });
@@ -401,11 +455,96 @@ async function checkViewport(browser, viewport) {
         throw new Error(`[${viewport.label}] hierarchy data appeared in browser storage`);
       }
     }
+    // (6) A REAL team_registration_conflict through the actual hierarchy
+    // panel (#331 review round 19). The round-18 coverage this replaces
+    // called app.js's renderImportRows() directly via page.evaluate — that
+    // function is never in this panel's own render path at all; the real
+    // "Validate hierarchy"/"Commit hierarchy" buttons render through
+    // hierarchy-import.js's OWN hierarchyResultHtml(), a completely
+    // separate implementation that never surfaced affected_registration_ids
+    // (round 18's fix never touched this file). This section instead
+    // manufactures a genuine conflict — a stray active registration under a
+    // second league, planted directly into the running server's own
+    // durable SQLite file (no current write path can leave this behind for
+    // a Team with a permanent league already set) — and drives the SAME
+    // real Validate button the fresh-commit section above used, so the
+    // assertions below prove the actual production render path, not a
+    // stand-in for it.
+    const fixtureIds = await page.evaluate(async () => {
+      const getJson = async (url) => (await fetch(url, { credentials: "same-origin" })).json();
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      const overview = await getJson("/api/v2/setup/overview");
+      const season = (overview.seasons || []).find((s) => s.name === "Browser Season");
+      const league = (overview.leagues || []).find((l) => l.name === "Browser League");
+      const team = (overview.teams || []).find((t) => t.name === "Browser Team");
+      const regsResp = await getJson(`/api/v2/setup/seasons/${season.id}/team-registrations`);
+      const existingReg = (regsResp.registrations || [])
+        .find((r) => r.team_id === team.id && r.active);
+      // A second league bound to the SAME season — fixture setup (not the
+      // behavior under test), so a direct API call is appropriate here the
+      // same way this file's own overview/verify reads already are.
+      const otherLeague = await post("/api/v2/setup/league",
+        { season_id: season.id, name: "Browser Other League" });
+      return {
+        seasonId: season.id, leagueId: league.id, teamId: team.id,
+        existingRegId: existingReg.id, otherLeagueId: otherLeague.id,
+      };
+    });
+    const strayRegId = injectSecondActiveRegistration(databasePath, {
+      seasonId: fixtureIds.seasonId, leagueId: fixtureIds.otherLeagueId,
+      teamId: fixtureIds.teamId,
+    });
+
+    // Undo section (5)'s BOGUSLEAGUE corruption of registrations_csv — this
+    // section needs the ORIGINAL valid row (still naming BROWSERTEAM's real
+    // league) so the conflict comes from the planted stray row alone.
+    await page.fill('[data-hierarchy-sheet="registrations_csv"]', SHEETS.registrations_csv);
+    // resolve_team_registration_for_import's conflict scan runs only from
+    // commit_hierarchy_import's own _preflight_reassignment_safety (called
+    // at COMMIT time) — validate_hierarchy_import (the dry-run path) never
+    // calls it, so Validate genuinely passes here despite the planted
+    // conflict; Commit is what actually catches it. Validate must still run
+    // first regardless — it's the only thing that flips Commit's own
+    // `disabled` off (hierarchyImportState.report.ok + a matching
+    // validatedKey snapshot).
+    const revalidateAfterInjectResponse = page.waitForResponse((response) =>
+      response.url() === `${base}/api/import/commit/teams-players`
+      && response.request().method() === "POST"
+      && response.request().postData().includes('"dry_run":true'));
+    await page.click("[data-hierarchy-validate]");
+    await revalidateAfterInjectResponse;
+    await page.getByRole("heading", { name: "Hierarchy validation passed" }).waitFor();
+    await page.waitForSelector("[data-hierarchy-commit]:not([disabled])");
+    const conflictCommitResponse = page.waitForResponse((response) =>
+      response.url() === `${base}/api/import/commit/teams-players`
+      && response.request().method() === "POST"
+      && response.request().postData().includes('"dry_run":false'));
+    await page.click("[data-hierarchy-commit]");
+    await conflictCommitResponse;
+    await page.getByRole("heading", { name: "Validation blocked the batch" }).waitFor();
+    const conflictHtml = await page.evaluate(() =>
+      document.querySelector("#hierarchy-import-panel").innerHTML);
+    if (!conflictHtml.includes(`<code>${fixtureIds.existingRegId}</code>`)
+        || !conflictHtml.includes(`<code>${strayRegId}</code>`)) {
+      throw new Error(`[${viewport.label}] team_registration_conflict did not name both `
+        + `affected registrations (${fixtureIds.existingRegId}, ${strayRegId}) in the real `
+        + `hierarchy panel's rendered DOM: ${conflictHtml}`);
+    }
+    const afterConflict = await readRecordCounts(page);
+    if (JSON.stringify(afterConflict) !== JSON.stringify(beforeInvalid)) {
+      throw new Error(`[${viewport.label}] rejected commit changed persisted records: `
+        + `before=${JSON.stringify(beforeInvalid)} after=${JSON.stringify(afterConflict)}`);
+    }
+
     if (errors.length) {
       throw new Error(`[${viewport.label}] console/page errors:\n${errors.join("\n")}`);
     }
     console.log(`[${viewport.label}] OK — wizard order/visibility, fresh commit, `
-      + "idempotent repeat, and invalid-row rollback all verified.");
+      + "idempotent repeat, invalid-row rollback, and a real team_registration_conflict's "
+      + "affected ids rendered through the actual hierarchy panel all verified.");
   } catch (error) {
     throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {
