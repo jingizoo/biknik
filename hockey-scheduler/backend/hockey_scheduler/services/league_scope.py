@@ -194,6 +194,38 @@ def exact_registration_or_conflict(store, league_season_id, team_id):
     return (rows[0] if rows else None), []
 
 
+def exact_league_season_or_conflict(store, league_id, season_id):
+    """The ``LeagueSeason`` binding at this EXACT ``(league_id, season_id)``
+    key, or the ids of every row found there when more than one exists (#345).
+
+    The League-axis twin of :func:`exact_registration_or_conflict`, and it
+    exists for the identical reason. SQL's ``ux_league_season`` unique index
+    (migration 035) makes a second row at one exact key impossible to INSERT, so
+    on SQLite/PostgreSQL this can only ever find 0 or 1. ``InMemoryStore``
+    enforces nothing on ``save_league_season``, and its own
+    ``league_season_for`` returns whichever matching row happens to iterate
+    first -- silently hiding a second one. The persistent League context must
+    never let a corrupted duplicate decide whether a Season+League selection is
+    valid, nor let that decision vary with insertion order.
+
+    Returns ``(binding_or_None, conflicting_ids)``: 0 rows -> ``(None, [])``;
+    exactly 1 -> ``(that row, [])``; 2+ -> ``(None, [every row's id])``. The
+    co-existence of two rows at one exact key IS the corrupted state, so it
+    fails closed unconditionally rather than picking a winner.
+
+    Strictly READ-ONLY: it resolves an existing binding and never creates one.
+    A caller that needs a binding to exist must go through
+    ``setup_service.create_league_season``, which is authorized and audited.
+    """
+    if league_id is None or season_id is None:
+        return None, []
+    rows = [ls for ls in store.league_seasons_for_league(league_id)
+            if ls.season_id == season_id]
+    if len(rows) > 1:
+        return None, sorted(ls.id for ls in rows)
+    return (rows[0] if rows else None), []
+
+
 def team_season_participation(store, season_id, team_id):
     """Every ACTIVE ``SeasonTeamRegistration`` for this Team in this Season,
     across every League (#331 review round 20) -- the season-wide

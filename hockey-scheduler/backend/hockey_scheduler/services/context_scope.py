@@ -19,9 +19,10 @@ the web scope guards use, so the two gates can never drift. This module only add
 the new Program/Season *projection* on top of that canonical identity.
 """
 
-from ..domain import Role
+from ..domain import GameType, Role
 from . import scope_bridge
-from .league_scope import exact_registration_or_conflict
+from .league_scope import (
+    exact_league_season_or_conflict, exact_registration_or_conflict)
 from .subject_scope import own_team_id as _own_team_id
 
 # Roles that see every Program under the current account model (#211): the two
@@ -134,3 +135,131 @@ def authorized_season_ids(store, role, scope, program_id, user_id):
     if role == Role.GUARDIAN:
         return _guardian_program_seasons(store, user_id)[1] & program_seasons
     return set()
+
+
+def _official_league_ids(store, official_id):
+    """The Leagues an Official's ASSIGNMENTS actually grant (#345 review).
+
+    Derived from each assigned Game's own FROZEN competition identity —
+    ``game.league_season_id``, the single source of truth #283 Slice E
+    established — and never from either Team's mutable permanent
+    ``Team.league_id``.
+
+    The distinction is the whole point, and reading the Team was a real defect:
+    a Team transfer deliberately changes ``Team.league_id`` WITHOUT rewriting
+    historical Games, so a Team-derived projection hands the Official whichever
+    League their opponent happens to sit in today. After a transfer that both
+    granted a League the assignment never covered and revoked the League the
+    assignment actually grants — a scoped role enumerating outside its scope,
+    which is exactly what this module exists to prevent.
+
+    Fails CLOSED, contributing nothing for a Game whose identity is missing or
+    drifted: an exhibition (no owning LeagueSeason by definition), a regular
+    Game with no ``league_season_id``, a dangling binding, or a binding that
+    disagrees with the Game's own denormalized ``season_id``/``league_id``. A
+    read-only visibility gate has no caller to report a structured conflict to,
+    so an untrustworthy identity must never widen what the Official can see.
+
+    Strictly READ-ONLY: it resolves existing bindings and never creates or
+    repairs one, even when it detects drift.
+    """
+    leagues = set()
+    if not official_id:
+        return leagues
+    for a in store.assignments_for_official(official_id):
+        game = store.get_game(a.game_id)
+        if game is None:
+            continue
+        # Exhibitions carry no owning League at all (#283 Slice D), so an
+        # assignment to one grants no League view.
+        if (game.game_type or GameType.REGULAR.value) != GameType.REGULAR.value:
+            continue
+        if not game.league_season_id:
+            continue
+        ls = store.get_league_season(game.league_season_id)
+        if ls is None:
+            continue
+        # The binding must agree with the Game's own columns. They cannot drift
+        # through any supported write path, so disagreement means corrupted or
+        # legacy data -- fail closed rather than trust either side.
+        if game.season_id and ls.season_id != game.season_id:
+            continue
+        if game.league_id and ls.league_id != game.league_id:
+            continue
+        if ls.league_id:
+            leagues.add(ls.league_id)
+    return leagues
+
+
+def _own_league_ids(store, role, scope, user_id):
+    """The permanent League ids a SCOPED account's own subject belongs to.
+
+    Coach/Player resolve through the same canonical ``own_team_id`` identity the
+    web scope guards use, so the League projection can never drift from the Team
+    projection above. Guardian resolves through its VERIFIED links only. Both are
+    genuinely Team-derived: their entitlement follows the Team wherever it goes,
+    so reading the Team's CURRENT permanent League is correct for them — unlike
+    an Official, whose entitlement is per-Game and therefore resolves through
+    :func:`_official_league_ids` against each Game's frozen identity instead."""
+    leagues = set()
+    if role in (Role.COACH, Role.PLAYER):
+        team_id = _own_team_id(role, scope, store)
+        team = store.get_team(team_id) if team_id else None
+        if team is not None and team.league_id:
+            leagues.add(team.league_id)
+        return leagues
+    if role == Role.GUARDIAN:
+        for link in store.guardian_links_for(user_id or ""):
+            if not getattr(link, "verified", False):
+                continue
+            player = store.get_player(link.player_id)
+            if player is None or not player.team_id:
+                continue
+            team = store.get_team(player.team_id)
+            if team is not None and team.league_id:
+                leagues.add(team.league_id)
+        return leagues
+    if role == Role.OFFICIAL:
+        return _official_league_ids(store, (scope or {}).get("official_id"))
+    return leagues
+
+
+def authorized_league_ids(store, role, scope, program_id, user_id,
+                          season_id=None):
+    """The permanent League ids the account may see/select within ``program_id``
+    (#345), optionally narrowed to those BOUND to ``season_id``.
+
+    League is the third persistent context axis. This mirrors
+    ``authorized_season_ids`` exactly in shape and discipline, so all three axes
+    are filtered by one consistent rule set:
+
+    * the candidate set is always the Leagues permanently under ``program_id``,
+      so a League from another Program can never appear regardless of role —
+      the cross-Program invariant is enforced by construction here, not only by
+      the selection-time check in the service;
+    * global roles (League Admin, Arena Manager, Viewer) see all of them;
+    * a scoped role sees only the League(s) its own subject belongs to,
+      intersected with the Program's — so a scoped Coach/Player/Guardian/
+      Official can neither select nor ENUMERATE a League outside their scope;
+    * anything unrecognized fails closed (empty).
+
+    When ``season_id`` is given, the result is further narrowed to Leagues with
+    an EXISTING ``LeagueSeason`` binding to that Season, resolved through
+    :func:`exact_league_season_or_conflict` so an ambiguous binding fails closed
+    rather than granting access on whichever duplicate row sorts first. This is
+    a read-only projection: it never creates a binding.
+    """
+    if program_id is None:
+        return set()
+    program_leagues = {lg.id for lg in store.leagues_for_program(program_id)}
+    if role in _GLOBAL_ROLES:
+        allowed = program_leagues
+    elif role in (Role.COACH, Role.PLAYER, Role.OFFICIAL, Role.GUARDIAN):
+        allowed = _own_league_ids(store, role, scope, user_id) & program_leagues
+    else:
+        return set()
+    if season_id is None:
+        return allowed
+    return {lid for lid in allowed
+            if exact_league_season_or_conflict(store, lid, season_id)[0]
+            is not None}
