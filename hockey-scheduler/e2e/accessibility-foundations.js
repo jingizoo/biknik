@@ -274,22 +274,16 @@ async function checkViewport(browser, viewport) {
     await trigger.focus();
     await trigger.click();
     await page.waitForSelector(".drawer, .modal", { timeout: 10000 });
-    // Put focus inside the dialog explicitly: the app does not yet move it
-    // there on open (see the header note), and containment is what this
-    // asserts. Focusing the first control here is the test standing in for
-    // a user who has tabbed/clicked into the dialog.
-    await page.evaluate(() => {
-      const d = document.querySelector(".modal, .drawer");
-      const f = d && d.querySelector('a[href], button:not([disabled]), '
-        + 'input:not([disabled]), select:not([disabled]), '
-        + 'textarea:not([disabled]), [tabindex]:not([tabindex="-1"])');
-      if (f) f.focus();
+    // Focus must ENTER the dialog on open, and specifically onto the dialog
+    // CONTAINER -- not a form control, whose focus/blur/change events are what
+    // destabilised the held-response journeys in the first attempt.
+    await page.waitForFunction(() => {
+      const el = document.activeElement;
+      return !!(el && el.matches && el.matches(".modal, .drawer"));
+    }, null, { timeout: 5000 }).catch(async () => {
+      fail(`focus on open: expected focus to land on the dialog CONTAINER, `
+        + `got ${JSON.stringify(await activeInfo(page))}`);
     });
-    const seeded = await activeInfo(page);
-    if (!seeded || !seeded.inDialog) {
-      fail(`focus containment: could not place focus inside the dialog to `
-        + `begin with, got ${JSON.stringify(seeded)}`);
-    }
 
     // Tab forward well past the number of controls in the dialog; focus must
     // never leave it. 40 is comfortably more than any dialog's control count,
@@ -313,10 +307,189 @@ async function checkViewport(browser, viewport) {
       }
     }
 
-    // Escape still closes it (pre-existing behaviour, kept working).
+    // Escape closes it AND returns focus to the element that opened it.
     await page.keyboard.press("Escape");
     await page.waitForFunction(() =>
       !document.querySelector(".drawer, .modal"), null, { timeout: 10000 });
+    await page.waitForFunction(() => {
+      const el = document.activeElement;
+      return !!(el && el.matches
+        && el.matches('.topbar [data-open-drawer="ice-slot"]'));
+    }, null, { timeout: 5000 }).catch(async () => {
+      fail(`focus restore (Escape): expected focus back on the Add Ice `
+        + `trigger, got ${JSON.stringify(await activeInfo(page))}`);
+    });
+
+    // Close BUTTON restores too -- a different close path from Escape.
+    await trigger.click();
+    await page.waitForSelector(".drawer, .modal", { timeout: 10000 });
+    await page.waitForFunction(() => {
+      const el = document.activeElement;
+      return !!(el && el.matches && el.matches(".modal, .drawer"));
+    }, null, { timeout: 5000 });
+    await page.click(".drawer-x[data-drawer-close]");
+    await page.waitForFunction(() =>
+      !document.querySelector(".drawer, .modal"), null, { timeout: 10000 });
+    await page.waitForFunction(() => {
+      const el = document.activeElement;
+      return !!(el && el.matches
+        && el.matches('.topbar [data-open-drawer="ice-slot"]'));
+    }, null, { timeout: 5000 }).catch(async () => {
+      fail(`focus restore (close button): expected focus back on the Add Ice `
+        + `trigger, got ${JSON.stringify(await activeInfo(page))}`);
+    });
+
+    // Removed trigger: if the element that opened the dialog is gone by the
+    // time it closes, focus must land on the view-level fallback rather than
+    // being dropped to <body>.
+    await trigger.click();
+    await page.waitForSelector(".drawer, .modal", { timeout: 10000 });
+    await page.evaluate(() => {
+      const t = document.querySelector('.topbar [data-open-drawer="ice-slot"]');
+      if (t) t.remove();
+    });
+    await page.keyboard.press("Escape");
+    await page.waitForFunction(() =>
+      !document.querySelector(".drawer, .modal"), null, { timeout: 10000 });
+    // The dialog leaves the DOM as soon as innerHTML is rewritten, which is
+    // BEFORE the end-of-render restore runs -- poll for focus to settle
+    // rather than reading it one-shot the instant the node disappears.
+    await page.waitForFunction(() => {
+      const el = document.activeElement;
+      return !!(el && el !== document.body);
+    }, null, { timeout: 5000 }).catch(async () => {
+      fail(`focus restore (removed trigger): focus was left on <body> instead `
+        + `of the view fallback, got ${JSON.stringify(await activeInfo(page))}`);
+    });
+
+    // ---- (3b) re-render, no-steal, and modal-over-drawer nesting ----------
+    // Everything above opens from the TOPBAR, whose trigger lives outside
+    // #content and therefore survives every render. The Setup view is where
+    // the harder cases are: its triggers are inside #content, so the render
+    // that paints the dialog destroys them.
+    await page.click('.tab[data-tab="setup"]');
+    await page.waitForFunction(() => document.body.dataset.view === "setup",
+      null, { timeout: 10000 });
+    // Setup opens on the Hierarchy sub-view; the per-entity cards (and their
+    // "+ New" / delete controls) live under Records.
+    await page.click('[data-setup-view="records"]');
+    const CLUB_NEW = '.setup-card .sc-new[data-drawer="club"]';
+    await page.waitForSelector(CLUB_NEW, { timeout: 10000 });
+    const drawerContainerFocused = (label) => page.waitForFunction(() => {
+      const el = document.activeElement;
+      return !!(el && el.matches && el.matches(".drawer[role=dialog]"));
+    }, null, { timeout: 5000 }).catch(async () => {
+      fail(`${label}: expected focus on the drawer container, got `
+        + `${JSON.stringify(await activeInfo(page))}`);
+    });
+
+    await page.click(CLUB_NEW);
+    await page.waitForSelector(".drawer", { timeout: 10000 });
+    await drawerContainerFocused("focus on open (in-view trigger)");
+
+    // (a) A RE-RENDER while the dialog stays open must not strand focus.
+    // render() rewrites #content wholesale, so the container focus was just
+    // put on is destroyed on every subsequent render -- focus falls to
+    // <body>. Submitting the Club drawer with its required name empty takes
+    // app.js's CLIENT-SIDE validation branch: drawerError is set and
+    // render() re-runs with the drawer still open, and no request is made
+    // (so this cannot log a console error and mask itself).
+    await page.click('[data-drawer-submit="club"]');
+    await page.waitForSelector(".drawer .drawer-err", { timeout: 10000 });
+    await drawerContainerFocused("re-render while open");
+
+    // Now complete the create for real. This both leaves a row with a delete
+    // control -- the only way to open a modal OVER a drawer below, since the
+    // Records cards start empty -- and exercises restore on the ordinary
+    // success path: the trigger lives inside #content, so the node captured
+    // at open time was destroyed by the renders since, and focus can only get
+    // back to it by re-resolving the selector.
+    await page.fill("#f-club", "A11y Focus Club");
+    await page.click('[data-drawer-submit="club"]');
+    await page.waitForFunction(() => !document.querySelector(".drawer"),
+      null, { timeout: 10000 });
+    await page.waitForFunction((sel) => {
+      const el = document.activeElement;
+      return !!(el && el.matches && el.matches(sel));
+    }, CLUB_NEW, { timeout: 5000 }).catch(async () => {
+      fail(`restore (in-view trigger, re-resolved after re-render): expected `
+        + `focus back on ${CLUB_NEW}, got ${JSON.stringify(await activeInfo(page))}`);
+    });
+
+    // (b) Closing must NOT steal focus that is already somewhere real. This
+    // is the rule home-tasks-hub's context-switch case (I) depends on: a
+    // switch that dismisses an open drawer from the control the operator is
+    // still on has to leave them there, not yank them back to the trigger of
+    // a drawer that no longer exists. The skip link is a stable target
+    // outside the dialog, inside .web.
+    await page.evaluate(() => document.getElementById("skip-link").focus());
+    await page.keyboard.press("Escape");
+    await page.waitForFunction(() => !document.querySelector(".drawer"),
+      null, { timeout: 10000 });
+    const afterNoSteal = await activeInfo(page);
+    if (!afterNoSteal || !afterNoSteal.isSkip) {
+      fail(`close must not steal focus: focus was on #skip-link (outside the `
+        + `dialog) when the drawer closed, so it had to stay there; got `
+        + `${JSON.stringify(afterNoSteal)}`);
+    }
+
+    // (c) Modal over drawer. The modal is appended after the drawer, so it is
+    // topmost and owns focus; closing it returns to the drawer underneath;
+    // closing THAT returns to the drawer's own trigger -- proving the nested
+    // open never overwrote the outermost return target.
+    await page.click(CLUB_NEW);
+    await page.waitForSelector(".drawer", { timeout: 10000 });
+    await drawerContainerFocused("focus on open (before nesting)");
+    // The drawer scrim (z-index 40) covers the rows behind it, so a real
+    // mouse cannot reach a delete control while the drawer is open. Dispatch
+    // the pointerdown the capture-phase trigger listener watches for, then
+    // invoke the handler directly -- this drives the identical app code path
+    // a click would, including the trigger capture, without fighting
+    // hit-testing for a state combination the app itself allows.
+    const openedNested = await page.evaluate(() => {
+      const del = document.querySelector('#content [data-del="club"]');
+      if (!del) return false;
+      del.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+      del.click();
+      return true;
+    });
+    if (!openedNested) {
+      fail('modal over drawer: found no [data-del="club"] control in the '
+        + "Records view to open a confirm modal with, though the Club create "
+        + "above reported success");
+    }
+    await page.waitForSelector(".modal", { timeout: 10000 });
+    await page.waitForFunction(() => {
+      const el = document.activeElement;
+      return !!(el && el.matches && el.matches(".modal[role=dialog]"));
+    }, null, { timeout: 5000 }).catch(async () => {
+      fail(`modal over drawer: expected the topmost dialog (the modal) to own `
+        + `focus, got ${JSON.stringify(await activeInfo(page))}`);
+    });
+    if (!(await page.$(".drawer"))) {
+      fail("modal over drawer: the drawer should still be open underneath");
+    }
+    // First Escape closes only the modal (app.js checks `modal` before
+    // `drawer`); focus returns to the drawer still open underneath.
+    await page.keyboard.press("Escape");
+    await page.waitForFunction(() => !document.querySelector(".modal"),
+      null, { timeout: 10000 });
+    await drawerContainerFocused("modal closed, drawer still open");
+    // Second Escape closes the drawer. Focus must land on the drawer's OWN
+    // trigger -- not the delete control that opened the nested modal, and not
+    // the view heading. The original node was destroyed by the renders above,
+    // so this also exercises re-resolving the trigger by selector.
+    await page.keyboard.press("Escape");
+    await page.waitForFunction(() => !document.querySelector(".drawer"),
+      null, { timeout: 10000 });
+    await page.waitForFunction((sel) => {
+      const el = document.activeElement;
+      return !!(el && el.matches && el.matches(sel));
+    }, CLUB_NEW, { timeout: 5000 }).catch(async () => {
+      fail(`nested restore: expected focus back on the drawer's own trigger `
+        + `(${CLUB_NEW}) after the modal-over-drawer sequence, got `
+        + `${JSON.stringify(await activeInfo(page))}`);
+    });
 
     // ---- (4) shell states: title + skip link follow the VISIBLE surface ---
     // #345 review blocker: the title used to be owned by a successful
@@ -419,8 +592,14 @@ async function checkViewport(browser, viewport) {
       + `in 2 keystrokes where tabbing the sidebar takes ${tabsWithoutSkip}; `
       + `page titles track the view on a full page boot (no switchTab), on the `
       + `onboarding landing that bypasses the base render, and across nav `
-      + `clicks; an open dialog contains Tab and Shift+Tab and still closes on `
-      + `Escape; and across authenticated -> sign out -> failed login -> `
+      + `clicks; an open dialog takes focus on its CONTAINER, contains Tab and `
+      + `Shift+Tab, keeps focus anchored across a re-render that rebuilds it, `
+      + `and restores to its trigger on Escape and on the close button -- `
+      + `including an in-view trigger re-resolved after the render destroyed `
+      + `it, a removed trigger falling back off <body>, a modal opened OVER a `
+      + `drawer returning to the drawer and then to the drawer's own trigger, `
+      + `and a close that must NOT steal focus already held outside the `
+      + `dialog; and across authenticated -> sign out -> failed login -> `
       + `public portal, the title always names the visible surface and no `
       + `skip link is ever exposed pointing into a hidden shell.`);
   } catch (e) {

@@ -106,11 +106,14 @@ something real rather than a guess:
   plus a descriptive `aria-label` on non-native clickable rows; a global
   Escape-closes-anything handler and a global Enter/Space-activates-any-
   `role="button"` handler (`app.js`, #118 Phases 5-6); `:focus-visible` rings
-  that never leave `outline:none` bare (`styles.css:907-908`). Real gaps: the
-  app's only two dialog shapes (`.modal`, the Setup `.drawer`) are both
-  `aria-modal="true"` but **neither implements a focus trap** — only the
-  drawer moves initial focus to its first control, and nothing returns focus
-  to the trigger on close; labeling is inconsistent (bound `<label for>` on
+  that never leave `outline:none` bare (`styles.css:907-908`). As originally
+  surveyed, the app's only two dialog shapes (`.modal`, the Setup `.drawer`)
+  were both `aria-modal="true"` but **neither implemented a focus trap** —
+  only the drawer moved initial focus to its first control, and nothing
+  returned focus to the trigger on close. **#345 closed that** (see the
+  priority list below for the implemented shape), along with the missing
+  skip link and static page title. Remaining gaps: labeling is inconsistent
+  (bound `<label for>` on
   static HTML, `aria-label` on JS-templated controls, with no stated rule for
   which to use when); there is **no automated accessibility check in CI**
   today (confirmed: zero `axe`/`a11y` references in `.github/workflows/`);
@@ -426,20 +429,62 @@ screen):
 - **Dialog focus management** (SC 2.1.2 No Keyboard Trap, SC 2.4.3 Focus
   Order): every surface marked `aria-modal="true"` must implement a real
   focus trap — Tab/Shift+Tab cycles only within the dialog, initial focus
-  lands on the first control or a heading, and focus returns to the
-  triggering element on close. **Currently failing**: neither existing
-  dialog shape (`.modal`, the Setup `.drawer`) does this — the drawer sets
-  initial focus only; nothing cycles or returns it. New dialogs in the
-  redesign must not repeat the gap.
-- **Bypass blocks** (SC 2.4.1): no "skip to main content" link exists in
-  `index.html` today, despite a persistent sidebar repeated on every view.
-  **Currently failing** — add one as part of the nav rebuild.
+  lands inside it, and focus returns to the triggering element on close.
+  **Implemented (#345)** — `syncOverlayFocus()` in `app.js` is the single
+  owner of dialog focus for both shapes (`.modal`, the Setup `.drawer`).
+  The shape, and the reasons for it, are worth stating because this app's
+  render model makes the naive version wrong:
+
+  - **Focus lands on the dialog CONTAINER**, which carries `tabindex="-1"`,
+    not on its first form control. A screen reader then announces the
+    dialog's role and accessible name on entry, and no data-bound input
+    ever receives a synthetic focus/change event. This replaced an
+    unconditional `if (drawer) { firstField.focus(); }` that ran from
+    *every* render — which dragged focus back to field 1 out from under an
+    operator who had tabbed onward.
+  - **Once per dialog instance, keyed off app state.** `overlayKey()`
+    derives a logical identity from `modal`/`drawer` rather than the DOM
+    node, because `render()` rewrites `#content` wholesale and so replaces
+    the dialog node on every pass. The move is queued in a
+    `requestAnimationFrame` that re-checks the key at fire time, so a
+    dialog that closed or changed before the frame ran never steals focus.
+  - **Re-anchored, not re-focused, after a re-render.** Because the node is
+    rebuilt each render, focus falls to `<body>`; leaving it there silently
+    loses the keyboard. When focus is *orphaned* (null, `<body>`, or a
+    detached node) it is put back on the rebuilt container. When something
+    real still holds it, it is left alone.
+  - **Restore is conditional and selector-backed.** On close, focus returns
+    to the trigger only if the close orphaned it — a context switch that
+    dismisses a drawer from the control the operator is still on must leave
+    them there. The trigger is re-found by a selector built from its `id`
+    or `data-*` attributes (requiring a unique match), because an in-view
+    trigger's node was destroyed by the render that painted the dialog; a
+    trigger that is genuinely gone falls back to the view heading.
+  - **Nesting**: a modal opened over a drawer is topmost and owns focus;
+    closing it returns focus to the drawer, and closing the drawer returns
+    to the drawer's own trigger — the nested open never overwrites the
+    outermost return target.
+
+  Covered at desktop and 390×844 by `e2e/accessibility-foundations.js`.
+- **Bypass blocks** (SC 2.4.1): a "skip to main content" link must exist,
+  given a persistent sidebar repeated on every view. **Implemented
+  (#345)** — `#skip-link` is the first focusable element inside `.web`,
+  visually hidden until focused, targeting `#content` (which carries
+  `tabindex="-1"` so the fragment link moves focus, not just scroll). It
+  lives *inside* `.web` deliberately: `body.signed-out .web` hides only the
+  authenticated shell, so a link outside it stayed focusable while its
+  target was hidden on the sign-in card and public portal.
 - **Per-view page titling** (SC 2.4.2): the `<title>` (`index.html:6`) is
   static across every view of this single-page app. W3C's own guidance for
   SPAs calls for the title (or an equivalent programmatic announcement) to
-  change with each distinct view. **Currently failing** — update
-  `document.title` (or use a live-region view-change announcement) on
-  `switchTab()`.
+  change with each distinct view. **Implemented (#345)** —
+  `setShellTitle()` in `app.js` titles the surface that is actually
+  *visible*, not just the authenticated view: the sign-in card and the
+  anonymous public portal set their own titles synchronously from
+  `showLogin()`/`showPublicGuest()`, and `render()` titles its destination
+  before its awaited overview load and before both early returns, so a
+  backend error or a restricted view never leaves the previous view's
+  title on screen.
 - **Dragging alternative** (SC 2.5.7, new in 2.2): the draggable ice slot
   interaction (`app.js:2437`) needs a confirmed non-drag alternative (e.g.
   a "Move" menu action) — not confirmed present in the current codebase.
@@ -504,14 +549,14 @@ is genuinely inapplicable, with why.
 | SC | Name | Level | Status |
 | --- | --- | --- | --- |
 | 2.1.1 | Keyboard | A | Partial — `role="button" tabindex="0"` retrofits + global Enter/Space activator cover most controls, but the draggable ice slot's keyboard-equivalent is unconfirmed (see 2.5.1/2.5.7 below), so not *all* functionality is verified keyboard-operable yet |
-| 2.1.2 | No Keyboard Trap | A | Gap — see priority list (correct citation for dialog escapability) |
+| 2.1.2 | No Keyboard Trap | A | Met for dialogs (#345) — Tab and Shift+Tab cycle within the open dialog and Escape always closes it, so the containment is escapable, not a trap. Asserted for 40 presses in each direction at desktop and 390×844 (`e2e/accessibility-foundations.js`) |
 | 2.1.4 | Character Key Shortcuts | A | N/A — no single-key shortcuts today; constraint if the redesign adds any |
 | 2.2.1 | Timing Adjustable | A | Verify — session/auth timeout extension mechanism not audited here |
 | 2.2.2 | Pause, Stop, Hide | A | N/A — no auto-advancing/continuously auto-refreshing content observed |
 | 2.3.1 | Three Flashes | A | N/A — no flashing content anywhere |
-| 2.4.1 | Bypass Blocks | A | Gap — see priority list (no skip-to-content link) |
-| 2.4.2 | Page Titled | A | Gap — `<title>Hockey Scheduler — Operator Console</title>` (`index.html:6`) is static across every view; W3C's own guidance for single-page apps calls for the title (or an equivalent programmatic announcement) to change with each distinct view, which this app does not do today. Added to the priority regression list above |
-| 2.4.3 | Focus Order | A | Gap — see priority list (dialog focus management) |
+| 2.4.1 | Bypass Blocks | A | Met (#345) — `#skip-link` is the first tab stop, becomes visible on focus, meets the 24×24 target minimum, and moves focus (not just scroll) to `#content`; measured at 2 keystrokes versus 23 to tab the sidebar |
+| 2.4.2 | Page Titled | A | Met (#345) — `setShellTitle()` gives each view its own `<View> — Hockey Scheduler` title, and the sign-in card and public portal set theirs synchronously, so the title always names the surface that is visible. Asserted on a full page boot, on the onboarding landing that bypasses the base render, across nav clicks, and across authenticated → sign out → failed login → public |
+| 2.4.3 | Focus Order | A | Met for dialogs (#345) — focus moves into the dialog on open and back to the triggering control on close (re-resolved by selector when the render rebuilt it), so the order is never left on `<body>` or behind the dialog. Non-dialog focus order across the redesigned screens is still to be audited |
 | 2.4.4 | Link Purpose (In Context) | A | Verify — icon-only links' `aria-label` needs to read sensibly out of context |
 | 2.4.5 | Multiple Ways | AA | Verify — the sidebar nav is one way to locate content; URL-hash deep-linking is a state-restoration mechanism, not a second user-facing way to *find* content, so it doesn't independently satisfy this SC. A genuine second locating mechanism (search, a site-map-style index) is not confirmed to exist — name one or accept single-path status pending review |
 | 2.4.6 | Headings and Labels | AA | Verify — needs a heading-level audit once the new hub/workflow screens exist |

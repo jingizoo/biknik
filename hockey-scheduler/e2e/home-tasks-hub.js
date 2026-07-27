@@ -1494,15 +1494,53 @@ async function checkRoleScenarios(browser, viewport) {
     }
     // The retry's successfully-opened drawer must land keyboard focus, not
     // just the correct value (#331 review round 6 comment 2's explicit
-    // "include keyboard focus after retry"). This is pre-existing,
-    // unconditional behavior (the drawer-wiring autofocus at app.js's
-    // "if (drawer) { const first = ... .focus(); }") -- asserted here for
-    // the first time on THIS specific path since it was never previously
-    // exercised by a genuine fetch-failure-then-retry drawer open.
-    const retryFocusId = await page.evaluate(() => (document.activeElement || {}).id);
-    if (retryFocusId !== "f-team-club") {
-      fail(`retry: expected keyboard focus on the drawer's first field `
-        + `(#f-team-club), got #${retryFocusId}`);
+    // "include keyboard focus after retry").
+    //
+    // #345 focus lifecycle: the TARGET changed, the requirement did not.
+    // This used to assert `document.activeElement.id === "f-team-club"`,
+    // which described the then-current implementation -- app.js's
+    // unconditional `if (drawer) { firstField.focus(); }` re-running from
+    // every render. That autofocus is gone: it fought the new lifecycle for
+    // ownership and dragged focus back to field 1 on every re-render of an
+    // open drawer. Focus now lands on the dialog CONTAINER once per open, so
+    // a screen reader announces "dialog, <name>" on entry and no data-bound
+    // input ever receives a synthetic focus/change.
+    //
+    // Round 6 asked that the retry's drawer land keyboard focus. Both halves
+    // below are strictly stronger than the id check they replace: (a) focus
+    // is the drawer container ITSELF, not merely somewhere inside it, and
+    // (b) tabbing forward from where focus landed actually reaches the first
+    // field -- so the fields remain keyboard-reachable from the new landing
+    // point rather than being assumed so.
+    const retryFocus = await page.evaluate(() => {
+      const el = document.activeElement;
+      if (!el) return { desc: "null" };
+      return {
+        isDrawerContainer: !!(el.matches && el.matches(".drawer[role=dialog]")),
+        desc: el.id ? `#${el.id}` : (el.className || el.tagName),
+      };
+    });
+    if (!retryFocus.isDrawerContainer) {
+      fail(`retry: expected keyboard focus on the drawer container itself `
+        + `(.drawer[role=dialog]), got ${retryFocus.desc}`);
+    }
+    // Bounded: the drawer's close button precedes the body in DOM order, so
+    // the first field is a small, fixed number of stops away. Looping to a
+    // cap (rather than pressing exactly twice) keeps this from breaking on an
+    // unrelated header control while still failing if the field is genuinely
+    // unreachable from the container.
+    let reachedFirstField = false;
+    for (let i = 0; i < 4 && !reachedFirstField; i++) {
+      await page.keyboard.press("Tab");
+      reachedFirstField = await page.evaluate(() =>
+        (document.activeElement || {}).id === "f-team-club");
+    }
+    if (!reachedFirstField) {
+      const landed = await page.evaluate(() =>
+        (document.activeElement || {}).outerHTML || null);
+      fail(`retry: tabbing forward from the focused drawer container never `
+        + `reached the drawer's first field (#f-team-club); focus stopped `
+        + `at: ${landed}`);
     }
     await page.keyboard.press("Escape");
     await page.waitForFunction(() => !document.querySelector(".drawer"),
