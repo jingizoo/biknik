@@ -45,8 +45,14 @@
 // genuinely overlapping real clicks (hold a Standings fetch, navigate out
 // via the PERSISTENT #public-signin-link and back in via the persistent
 // #guest-public-link to start a second, newer render, THEN release the
-// obsolete first one and prove it changed nothing). The Restricted
-// early-return now carries role="alert" too. FOCUS: since
+// obsolete first one). The held request resolves to a DELIBERATELY
+// DISTINCT stale fixture (not the live backend, which would return
+// identical data both times and make the check non-falsifiable) so
+// releasing it is a real test: falsifiability verified directly by
+// temporarily disabling both mySeq guards in the schedule/standings fetch
+// path, confirming this exact leg then fails with the stale fixture's
+// heading, and restoring them. The Restricted early-return now carries
+// role="alert" too. FOCUS: since
 // #public-content itself is never replaced (only its children are),
 // focusing the box once (only when the interaction that triggered this
 // render started INSIDE it) keeps focus connected and visible across every
@@ -516,21 +522,29 @@ async function checkViewport(browser, viewport) {
     await page.waitForSelector(".hero h2", { timeout: 10000 });
     checkpointErrors("public schedule (return for surface 4)");
 
-    // The FIRST request this route sees is held indefinitely (released only
-    // once a NEWER render has already settled); every later one resolves
-    // immediately. #public-content's own segment tabs vanish the instant
-    // loading starts, but the PERSISTENT shell controls outside that region
-    // (#public-signin-link in .public-topbar, #guest-public-link on the
-    // sign-in card) do not -- navigating out to Sign-in and back in starts a
-    // genuinely second, overlapping renderPublicGuest() call via two real
-    // clicks while the first request is still in flight. This is the exact
-    // real-click path #345 review identified.
+    // The FIRST request this route sees is held indefinitely, then resolved
+    // with a DELIBERATELY DISTINCT, distinguishable stale payload -- not
+    // passed through to the live backend, which would return the SAME real
+    // data both times and make a stale response indistinguishable from a
+    // correctly-ignored one. Every LATER request resolves immediately via
+    // the real backend. #public-content's own segment tabs vanish the
+    // instant loading starts, but the PERSISTENT shell controls outside
+    // that region (#public-signin-link in .public-topbar, #guest-public-
+    // link on the sign-in card) do not -- navigating out to Sign-in and
+    // back in starts a genuinely second, overlapping renderPublicGuest()
+    // call via two real clicks while the first request is still in flight.
+    const STALE_FIXTURE = { league_name: "STALE SCHEDULE — must never render", divisions: [], fixtures: [] };
     let releaseHeldFetch;
     const heldFetch = new Promise((resolve) => { releaseHeldFetch = resolve; });
     let publicFetchCount = 0;
     await page.route("**/api/public/schedule", async (route) => {
       publicFetchCount += 1;
-      if (publicFetchCount === 1) await heldFetch;
+      if (publicFetchCount === 1) {
+        await heldFetch;
+        return route.fulfill({
+          status: 200, contentType: "application/json", body: JSON.stringify(STALE_FIXTURE),
+        });
+      }
       await route.continue();
     });
     await page.click('[data-public-tab="standings"]');
@@ -588,18 +602,24 @@ async function checkViewport(browser, viewport) {
       };
     });
     const settledFingerprint = await fingerprint();
-    if (!settledFingerprint.heading || settledFingerprint.ariaBusy !== "false"
+    // The heading must be the REAL data (captured from the live API before
+    // this section even started), never the stale fixture's -- this is the
+    // exact identity check that makes the release below falsifiable: if
+    // app.js's mySeq !== publicRenderSeq guards were removed, releasing the
+    // held first fetch would overwrite this with "STALE SCHEDULE...".
+    if (settledFingerprint.heading !== expectedPublicHeading || settledFingerprint.ariaBusy !== "false"
         || settledFingerprint.activeId !== "public-signin-link"
         || settledFingerprint.title !== "Public Schedule — Hockey Scheduler") {
       fail(`forced loading: the second, newer render (via Staff sign-in -> `
-        + `guest link) did not settle with real content, aria-busy="false", `
-        + `focus on #public-signin-link (never <body>), and the correct `
-        + `title, got ${JSON.stringify(settledFingerprint)}`);
+        + `guest link) did not settle with the REAL "${expectedPublicHeading}" `
+        + `heading, aria-busy="false", focus on #public-signin-link (never `
+        + `<body>), and the correct title, got ${JSON.stringify(settledFingerprint)}`);
     }
-    // NOW release the obsolete FIRST (Standings) fetch. publicRenderSeq
-    // already moved on to this second render, so releasing it must be a
-    // complete no-op -- the settled content/focus/title above must be
-    // totally unaffected once it finally resolves.
+    // NOW release the obsolete FIRST (Standings) fetch -- it resolves with
+    // the deliberately distinct STALE_FIXTURE payload. publicRenderSeq
+    // already moved on to this second, newer render, so this must be a
+    // complete no-op: the heading must still be the REAL data, not
+    // STALE_FIXTURE's "STALE SCHEDULE — must never render".
     releaseHeldFetch();
     await page.waitForTimeout(300);  // give the obsolete response's own (discarded) handler a chance to run
     const afterObsoleteRelease = await fingerprint();
