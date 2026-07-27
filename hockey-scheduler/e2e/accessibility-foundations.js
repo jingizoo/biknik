@@ -318,6 +318,99 @@ async function checkViewport(browser, viewport) {
     await page.waitForFunction(() =>
       !document.querySelector(".drawer, .modal"), null, { timeout: 10000 });
 
+    // ---- (4) shell states: title + skip link follow the VISIBLE surface ---
+    // #345 review blocker: the title used to be owned by a successful
+    // authenticated render(), and the skip link lived outside .web -- so after
+    // Sign out and on the anonymous public portal the title stayed on the
+    // previous authenticated view while a focusable "Skip to main content"
+    // pointed at a hidden #content. Walk the real transitions and assert both.
+    const shellState = () => page.evaluate(() => {
+      const sk = document.getElementById("skip-link");
+      const content = document.getElementById("content");
+      const visible = (el) => !!(el && el.getClientRects().length > 0);
+      return {
+        title: document.title,
+        skipVisible: visible(sk),
+        skipTargetVisible: visible(content),
+        // A skip link that is reachable while its target is hidden is the
+        // exact defect; capture it as one boolean for a clear failure.
+        danglingSkip: visible(sk) && !visible(content),
+        loginVisible: visible(document.querySelector("#login-screen")),
+        publicVisible: visible(document.querySelector("#public-screen")),
+      };
+    });
+    const expectShell = async (label, want) => {
+      const got = await shellState();
+      if (got.danglingSkip) {
+        fail(`shell state (${label}): a focusable skip link is exposed while `
+          + `its #content target is hidden -- ${JSON.stringify(got)}`);
+      }
+      if (got.title !== want.title) {
+        fail(`shell state (${label}): expected title "${want.title}", got `
+          + `"${got.title}" -- ${JSON.stringify(got)}`);
+      }
+      if (want.skipVisible !== undefined && got.skipVisible !== want.skipVisible) {
+        fail(`shell state (${label}): expected skipVisible=${want.skipVisible}, `
+          + `got ${JSON.stringify(got)}`);
+      }
+      return got;
+    };
+
+    // Authenticated landing, then navigate away, so the pre-signout title is
+    // definitely NOT the one the signed-out screen should show.
+    await page.click('.tab[data-tab="standings"]');
+    await page.waitForFunction(() => /^Standings —/.test(document.title),
+      null, { timeout: 10000 });
+    await expectShell("authenticated Standings",
+      { title: "Standings — Hockey Scheduler", skipVisible: true });
+
+    // Sign out -> the sign-in card.
+    await page.click("#signout-btn");
+    await page.waitForFunction(() =>
+      document.body.classList.contains("signed-out"), null, { timeout: 10000 });
+    await page.waitForFunction(() => /^Sign in —/.test(document.title),
+      null, { timeout: 10000 }).catch(async () => {
+      fail(`shell state (signed out): title is "${await page.evaluate(() =>
+        document.title)}" -- signing out must retitle to the visible surface`);
+    });
+    await expectShell("signed out", { title: "Sign in — Hockey Scheduler",
+      skipVisible: false });
+
+    // A FAILED login keeps the sign-in surface and its title.
+    await page.fill("#login-user", "admin");
+    await page.fill("#login-pass", "definitely-not-the-password");
+    await page.click(".login-submit");
+    await page.waitForFunction(() => {
+      const e = document.getElementById("login-error");
+      return !!(e && !e.hidden && e.textContent.trim());
+    }, null, { timeout: 10000 });
+    await expectShell("failed login", { title: "Sign in — Hockey Scheduler",
+      skipVisible: false });
+
+    // Anonymous public portal.
+    await page.click("#guest-public-link");
+    await page.waitForFunction(() => {
+      const s = document.getElementById("public-screen");
+      return !!(s && !s.hidden);
+    }, null, { timeout: 10000 });
+    await page.waitForFunction(() => /^Public Schedule —/.test(document.title),
+      null, { timeout: 10000 }).catch(async () => {
+      fail(`shell state (public): title is "${await page.evaluate(() =>
+        document.title)}" -- the public portal must own its own title`);
+    });
+    await expectShell("anonymous public",
+      { title: "Public Schedule — Hockey Scheduler", skipVisible: false });
+
+    // NOT covered here: the public -> "Staff sign in" leg. That control is
+    // visible and clickable in isolation, but becomes unclickable when this
+    // leg runs at the end of the full journey (after the dialog/Escape and
+    // sign-out sections), and I did not want to ship either a flaky step or a
+    // fake one that dispatches the handler directly instead of clicking. The
+    // blocker itself is fully covered by the four transitions above --
+    // authenticated -> signed out -> failed login -> public -- each asserting
+    // the title names the visible surface and no skip link points into a
+    // hidden shell. Tracked as remaining coverage on #345.
+
     if (errors.length) {
       fail(`browser errors:\n${errors.join("\n")}`);
     }
@@ -327,7 +420,9 @@ async function checkViewport(browser, viewport) {
       + `page titles track the view on a full page boot (no switchTab), on the `
       + `onboarding landing that bypasses the base render, and across nav `
       + `clicks; an open dialog contains Tab and Shift+Tab and still closes on `
-      + `Escape.`);
+      + `Escape; and across authenticated -> sign out -> failed login -> `
+      + `public portal, the title always names the visible surface and no `
+      + `skip link is ever exposed pointing into a hidden shell.`);
   } catch (e) {
     if (serverOutput.trim()) {
       console.error("--- demo server output ---\n" + serverOutput.trim());

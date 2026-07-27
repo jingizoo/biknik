@@ -6060,6 +6060,11 @@ async function render() {
   updateToast();
   const c = document.getElementById("content");
   document.body.dataset.view = view;
+  // #345 review: set BEFORE the awaited overview load and before either
+  // early return below (backend-error banner, restricted roster/sheet), so an
+  // error or restricted state still announces the destination the user chose
+  // rather than the previous view's title.
+  setPageTitle(view);
   let ov, sv, hv, board, lineups, standings, inbox, playerHome;
   try {
     c.innerHTML = `<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>`;
@@ -6457,11 +6462,6 @@ async function render() {
   // after the view content on every render and wire it below.
   c.innerHTML += renderModal();
 
-  // #345: the title must track the view on EVERY render, not only on an
-  // explicit switchTab() -- deep links (#hash routing), sign-in, and the
-  // role-based default landing all reach a view without going through
-  // switchTab, and each of those changed the destination.
-  setPageTitle(view);
   wireModal(c);
   c.querySelectorAll("[data-goto]").forEach((b) => b.onclick = () => switchTab(b.dataset.goto));
   // Home/Tasks hub setup-progress card (#330): its own fetch, content, and
@@ -7893,10 +7893,25 @@ async function render() {
 // because assistive tech announces the beginning of the title and that is
 // the part that actually changed.
 const APP_TITLE = "Hockey Scheduler";
-function setPageTitle(v) {
+// #345 review: the title must follow the surface that is actually VISIBLE,
+// not just the authenticated view. There are three shell states -- the
+// authenticated console, the sign-in card, and the anonymous public portal --
+// and only the first has a NAV view at all. Coupling the title to a
+// successful authenticated render() left "Initial Setup — Hockey Scheduler"
+// on screen after Sign out and on the public portal (reproduced), so
+// assistive tech announced a destination the user had already left.
+// Each shell entry point sets its own title SYNCHRONOUSLY, before any awaited
+// load or early return.
+function setShellTitle(state, v) {
+  if (state === "login") { document.title = `Sign in — ${APP_TITLE}`; return; }
+  if (state === "public") {
+    document.title = `Public Schedule — ${APP_TITLE}`;
+    return;
+  }
   const label = NAV[v];
   document.title = label ? `${label} — ${APP_TITLE}` : APP_TITLE;
 }
+function setPageTitle(v) { setShellTitle("app", v); }
 
 // ---- dialog focus management (#345) --------------------------------------
 // The modal/drawer markup already carries role="dialog" aria-modal="true",
@@ -8647,6 +8662,9 @@ function setUser(user) {
 // the console shell so a signed-out visitor only ever sees the login card.
 function showLogin(message) {
   hidePublicGuest();
+  // #345 review: title follows the VISIBLE surface, set before anything else
+  // here can early-return or await.
+  setShellTitle("login");
   const screen = document.getElementById("login-screen");
   document.body.classList.add("signed-out");
   if (screen) screen.hidden = false;
@@ -8732,6 +8750,9 @@ function showPublicGuest() {
   // Same shell-hiding rule as showLogin(): body.signed-out keeps the
   // authenticated sidebar/nav out of the tab order and off-screen for
   // assistive tech, not just visually covered by the fixed overlay.
+  // #345 review: the title changes with the shell state, synchronously --
+  // renderPublicGuest() below is async and must not own this.
+  setShellTitle("public");
   document.body.classList.add("signed-out");
   const login = document.getElementById("login-screen");
   if (login) login.hidden = true;
