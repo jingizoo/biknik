@@ -204,13 +204,6 @@ async function checkViewport(browser, viewport) {
     // the page's own in-memory `hv`/`seasonRegs`/`leagueDivisions` state.
     const refreshSetup = async (marker) => {
       await page.click('.tab[data-tab="setup"]');
-    // Setup now LANDS on the six-workflow hub (#345 batch 2). Select the
-    // Hierarchy sub-view through the real toggle -- never by setting
-    // setupView directly -- and assert the segment is actually active
-    // BEFORE waiting on any domain control, so a future default change
-    // fails here with "wrong sub-view" instead of an opaque selector
-    // timeout on a control that was simply never rendered.
-    await enterSetupHierarchy(page);
       // Setup now LANDS on the six-workflow hub (#345 batch 2). Select the
       // Hierarchy sub-view through the real toggle -- never by setting
       // setupView directly -- and assert the segment is actually active
