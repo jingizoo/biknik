@@ -367,8 +367,7 @@ select.player-picker {
   color: var(--blue); background: #e3f0ff; border-radius: 6px; padding: 1px 5px; }
 .gs-assign { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
 .gs-assign select { padding: 8px 10px; border: 1px solid var(--sep); border-radius: 8px; font-size: 13px; background: #fff; }
-@media (max-width: 680px) { .gs-off-grid { grid-template-columns: 1fr; } }
-@media (max-width: 680px) { .gs-grid { grid-template-columns: 1fr; } }
+@media (max-width: 720px) { .gs-off-grid { grid-template-columns: 1fr; } .gs-grid { grid-template-columns: 1fr; } }
 @media print {
   body { background: #fff !important; }
   .sidebar, .topbar, .tabs, .tabbar, .phone-chrome, .no-print, .gs-toolbar,
@@ -820,7 +819,7 @@ button.act.danger { background: #ffe5e3; color: #c0271b; }
    warning so an operator can scan the full list and spot every collision. */
 .ib-slot-duplicate { background: #f0f0f2; color: #6b6b76; }
 .ib-slot-conflict { background: #fdecec; color: #b3261e; font-weight: 600; }
-@media (max-width: 460px) {
+@media (max-width: 480px) {
   .ib-grid2 { grid-template-columns: 1fr; }
   .ib-day-row { flex-direction: column; gap: 4px; }
   .mo-cell { min-height: 52px; }
