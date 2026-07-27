@@ -1200,3 +1200,34 @@ details.tn > .tn-sum:hover { background: #f6f7fb; }
   .cd-edit { padding: 9px 13px; font-size: 13px; }
   .linklike { padding: 6px 2px; display: inline-block; }
 }
+
+/* Setup workflow hub (#345 batch 2) — the six focused workflows that replace
+   the undifferentiated Setup mega-page as the default route in. Reuses the
+   existing card/section tokens so the hub reads as part of Setup rather than
+   a separate design. */
+.swf-grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); }
+.swf-card { background: var(--card); border: 1px solid var(--sep); border-radius: 12px;
+  padding: 14px; display: flex; flex-direction: column; gap: 8px; }
+.swf-head { display: flex; align-items: center; gap: 8px; }
+.swf-head .swf-ico { font-size: 18px; }
+.swf-title { font-size: 15px; font-weight: 700; margin: 0; }
+/* The optional workflow (Decision 9) is marked as such wherever it appears,
+   so "not done" is never misread as "outstanding work". */
+.swf-optional { margin-left: auto; font-size: 11px; font-weight: 700; letter-spacing: .02em;
+  text-transform: uppercase; color: var(--muted); border: 1px solid var(--sep);
+  border-radius: 999px; padding: 2px 8px; }
+.swf-purpose { margin: 0; font-size: 13px; color: var(--muted); line-height: 1.45; }
+.swf-optional-note { margin: 0; font-size: 13px; color: var(--muted); line-height: 1.45; }
+.swf-stats { display: flex; flex-wrap: wrap; gap: 12px; font-size: 13px; color: var(--muted); }
+.swf-stat strong { color: var(--fg); font-size: 15px; }
+.swf-card .swf-open { margin-top: auto; align-self: flex-start; }
+.swf-landing { display: flex; flex-direction: column; gap: 12px; max-width: 720px; }
+.swf-landing-title { margin: 0; font-size: 20px; }
+.swf-back { align-self: flex-start; }
+/* One primary action per screen: the demoted controls sit beside it as ghost
+   buttons, and the tertiary row below as plain links. */
+.swf-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.swf-tertiary { display: flex; flex-wrap: wrap; gap: 12px; font-size: 13px; }
+.swf-detail { border-top: 1px solid var(--sep); padding-top: 12px;
+  display: flex; flex-wrap: wrap; gap: 12px; align-items: baseline; }
+.swf-detail .section-title { margin: 0; }

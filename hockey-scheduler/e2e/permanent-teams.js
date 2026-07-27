@@ -124,6 +124,11 @@ async function checkViewport(browser, viewport) {
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
     await page.click('.tab[data-tab="setup"]');
+    // Setup now LANDS on the six-workflow hub (#345 batch 2), so a journey
+    // that works against the Hierarchy tree must select that sub-view
+    // explicitly -- the same deliberate navigation the Records-based
+    // journeys already do for their own sub-view.
+    await page.click('[data-setup-view="hierarchy"]');
     await page.click('[data-setup-view="records"]');
     await page.waitForSelector(".setup-card", { timeout: 10000 });
 
@@ -323,6 +328,7 @@ async function checkViewport(browser, viewport) {
     await page.waitForFunction(() => !document.querySelector(".drawer[role=dialog]"), null, { timeout: 5000 });
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.click('.tab[data-tab="setup"]');
+    await page.click('[data-setup-view="hierarchy"]');
     await page.click('[data-setup-view="records"]');
     await page.waitForSelector(".setup-card", { timeout: 10000 });
     const orglessRow = await page.evaluate(() => {
@@ -419,6 +425,7 @@ async function checkArenaManager(browser, viewport) {
     await page.waitForSelector("#content > *", { timeout: 10000 });
 
     await page.click('.tab[data-tab="setup"]');
+    await page.click('[data-setup-view="hierarchy"]');
     await page.click('[data-setup-view="hierarchy"]');
     await page.waitForSelector(".setup-trees", { timeout: 10000 });
     if (!(await page.$$eval(".setup-trees .tree-panel", (els) => els.length)))
@@ -531,6 +538,7 @@ async function checkNoSetupAccess(browser, viewport) {
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
     await page.click('.tab[data-tab="setup"]');
+    await page.click('[data-setup-view="hierarchy"]');
     await page.waitForSelector(".setup-trees, .setup-card", { timeout: 10000 });
     if ((await page.evaluate(() => document.body.dataset.view)) !== "setup")
       fail(`did not actually land on the Setup view as League Admin`);
@@ -613,6 +621,7 @@ async function checkSliceB(browser, viewport) {
     // Create a Team from the drawer, choosing the permanent League. The POST
     // must carry league_id (the Slice B assignment).
     await page.click('.tab[data-tab="setup"]');
+    await page.click('[data-setup-view="hierarchy"]');
     await page.click('[data-setup-view="records"]');
     await page.waitForSelector(".setup-card", { timeout: 10000 });
     const teamReq = page.waitForRequest((r) =>

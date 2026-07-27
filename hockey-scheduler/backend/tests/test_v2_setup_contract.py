@@ -1059,6 +1059,102 @@ class V2SetupContractTest(unittest.TestCase):
         self.assertEqual(status, 400, resp)
         self.assertEqual(resp["error"]["code"], "validation_error", resp)
 
+    # -- exact Season+League Division write contract (#345 review) ----------
+    def _two_season_league_http(self, c):
+        """One Program, two Seasons, ONE permanent League bound to BOTH — the
+        shape the review requires and the distinct-league-per-season fixture
+        used elsewhere in this file/setup-workflow-hub.js cannot produce.
+
+        No v2 HTTP route creates a second binding for an EXISTING League
+        (only the delete route exists, ``.../league-season/<id>/delete``) —
+        binding happens as a side effect of a team registration/rollover, not
+        as its own request. Reaching into ``self.srv.STATE.api`` to set up
+        that second binding directly follows this file's own established
+        precedent (e.g. the league-delete test above reads
+        ``self.srv.STATE.api.store...`` directly); the request under actual
+        test below is still made over real HTTP."""
+        program = self._v2(c, "program", {"name": "DivCtx Prog", "country": "US"})
+        s1 = self._v2(c, "season", {"program_id": program["id"], "name": "S1"})
+        s2 = self._v2(c, "season", {"program_id": program["id"], "name": "S2"})
+        league = self._v2(c, "league", {"season_id": s1["id"], "name": "Shared"})
+        self.srv.STATE.api.setup.create_league_season(
+            league["id"], s2["id"], actor_id="fixture")
+        return program, s1, s2, league
+
+    def test_v2_division_season_id_persists_exact_binding(self):
+        c = self._admin()
+        program, s1, s2, league = self._two_season_league_http(c)
+        status, div = self._req(
+            c, "POST", "/api/v2/setup/division",
+            {"league_id": league["id"], "name": "Gold", "season_id": s2["id"]})
+        self.assertEqual(status, 200, div)
+        self.assertEqual(set(div), DIVISION_KEYS, div)
+        self.assertEqual(div["season_id"], s2["id"], div)
+        self.assertEqual(div["league_id"], league["id"], div)
+
+    def test_v2_division_ambiguous_without_season_id_still_fails(self):
+        c = self._admin()
+        program, s1, s2, league = self._two_season_league_http(c)
+        status, resp = self._req(
+            c, "POST", "/api/v2/setup/division",
+            {"league_id": league["id"], "name": "Gold"})
+        self.assertEqual(status, 400, resp)
+        self.assertEqual(resp["error"]["details"]["reason"],
+                         "ambiguous_season_for_league", resp)
+
+    def test_v2_division_season_program_mismatch_fails_closed(self):
+        c = self._admin()
+        program, s1, s2, league = self._two_season_league_http(c)
+        other_program = self._v2(c, "program", {"name": "Other Prog", "country": "US"})
+        other_season = self._v2(c, "season",
+                                {"program_id": other_program["id"], "name": "Other S"})
+        status, resp = self._req(
+            c, "POST", "/api/v2/setup/division",
+            {"league_id": league["id"], "name": "Gold",
+             "season_id": other_season["id"]})
+        self.assertEqual(status, 400, resp)
+        self.assertEqual(resp["error"]["details"]["reason"],
+                         "league_season_program_mismatch", resp)
+
+    def test_v2_division_season_not_bound_fails_closed(self):
+        c = self._admin()
+        program, s1, s2, league = self._two_season_league_http(c)
+        s3 = self._v2(c, "season", {"program_id": program["id"], "name": "S3"})
+        status, resp = self._req(
+            c, "POST", "/api/v2/setup/division",
+            {"league_id": league["id"], "name": "Gold", "season_id": s3["id"]})
+        self.assertEqual(status, 400, resp)
+        self.assertEqual(resp["error"]["details"]["reason"],
+                         "league_not_in_season", resp)
+
+    def test_v2_division_archived_season_fails_closed(self):
+        c = self._admin()
+        program, s1, s2, league = self._two_season_league_http(c)
+        status, _ = self._req(
+            c, "POST", f"/api/v2/setup/seasons/{s2['id']}/archive",
+            {"reason": "done"})
+        self.assertEqual(status, 200)
+        status, resp = self._req(
+            c, "POST", "/api/v2/setup/division",
+            {"league_id": league["id"], "name": "Gold", "season_id": s2["id"]})
+        self.assertEqual(status, 400, resp)
+        self.assertEqual(resp["error"]["details"]["reason"],
+                         "season_archived", resp)
+
+    def test_v2_division_backward_compatible_without_season_id(self):
+        # A single-binding League with NO season_id in the request behaves
+        # exactly as before this contract existed: same response key set.
+        c = self._admin()
+        program = self._v2(c, "program", {"name": "Solo Prog", "country": "US"})
+        season = self._v2(c, "season", {"program_id": program["id"], "name": "Solo S"})
+        league = self._v2(c, "league", {"season_id": season["id"], "name": "Solo"})
+        status, div = self._req(
+            c, "POST", "/api/v2/setup/division",
+            {"league_id": league["id"], "name": "Gold"})
+        self.assertEqual(status, 200, div)
+        self.assertEqual(set(div), DIVISION_KEYS, div)
+        self.assertEqual(div["season_id"], season["id"], div)
+
     def test_v2_registration_requires_league(self):
         c = self._admin()
         org = self._v2(c, "organization", {"name": "R Org", "short_name": "RO"})

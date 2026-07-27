@@ -1101,6 +1101,75 @@ class SeasonArchiveRaceTest(unittest.TestCase):
             self.assertIsNone(binding, results)
             self.assertEqual(divs, [], results)
 
+    def test_unbind_vs_create_division_under_league_season_id_is_linearizable(self):
+        # #345: create_division_under_league's new season_id path re-fetches
+        # the SAME binding under the Season lock before inserting, exactly
+        # like the sole-binding legacy path above. The case above can never
+        # exercise it: it uses a League with exactly one binding, but the
+        # season_id path only exists to disambiguate a League bound to
+        # SEVERAL Seasons (never producible by this file's or
+        # setup-workflow-hub.js's usual one-League-per-Season fixtures).
+        store0 = SqlStore(self.url)
+        api0 = ApiService(store0)
+        pid = api0.create_program("Prog2", "US", "UTC")["id"]
+        s1 = api0.create_season(pid, "S1")["id"]
+        s2 = api0.create_season(pid, "S2")["id"]
+        lid = api0.create_league(s1, "Shared")["id"]
+        api0.setup.create_league_season(lid, s2, actor_id="seed")
+        ls2_id = store0.league_season_for(lid, s2).id
+        api_unbind = ApiService(SqlStore(self.url))
+        api_div = ApiService(SqlStore(self.url))
+        barrier = threading.Barrier(2)
+        results = {}
+
+        def run(fn, key):
+            barrier.wait()
+            try:
+                fn(); results[key] = "ok"
+            except HasDependenciesError:
+                results[key] = "blocked"
+            except ValidationError as exc:
+                results[key] = exc.details.get("reason") or "validation"
+            except NotFoundError:
+                results[key] = "not_found"
+            except Exception as exc:
+                results[key] = f"ERR:{exc}"
+
+        ta = threading.Thread(target=run, args=(
+            lambda: api_unbind.setup.delete_league_season(
+                ls2_id, actor_id="u"), "unbind"))
+        tb = threading.Thread(target=run, args=(
+            lambda: api_div.setup.create_division_under_league(
+                lid, "D1", season_id=s2, actor_id="d"), "create"))
+        ta.start(); tb.start(); ta.join(15); tb.join(15)
+
+        check = SqlStore(self.url)
+        orphaned = [d for d in check.all_divisions()
+                    if check.get_league_season(d.league_season_id) is None]
+        self.assertEqual(orphaned, [], results)
+        binding = check.get_league_season(ls2_id)
+        divs = [d for d in check.all_divisions() if d.league_season_id == ls2_id]
+        if results["create"] == "ok":
+            # Create won → Division exists under the S2 binding, unbind blocked.
+            self.assertEqual(results["unbind"], "blocked", results)
+            self.assertIsNotNone(binding, results)
+            self.assertEqual(len(divs), 1, results)
+        else:
+            # Unbind won → the S2 binding is gone, create fails closed via
+            # EITHER the pre-lock resolution (never found it:
+            # league_not_in_season) or the post-lock re-fetch safety net
+            # (found it, then it vanished: league_has_no_season), depending
+            # on exact interleaving — both are the same "zero Division, zero
+            # orphan" outcome the sole-binding case above proves.
+            self.assertIn(results["create"],
+                         ("league_not_in_season", "league_has_no_season"), results)
+            self.assertEqual(results["unbind"], "ok", results)
+            self.assertIsNone(binding, results)
+            self.assertEqual(divs, [], results)
+            # The League's OTHER binding (S1) is completely unaffected.
+            ls1 = check.league_season_for(lid, s1)
+            self.assertIsNotNone(ls1, results)
+
     def test_unbind_vs_unbind_exactly_one_wins(self):
         # #159 review: two concurrent delete_league_season on the SAME binding
         # both re-fetch it under the shared Season-row lock, so exactly one
