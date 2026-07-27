@@ -1,9 +1,15 @@
 """Persistent League context — the third axis of the active-context backend (#345).
 
-#345 promotes League into the persistent Program/Season context bar. This is the
-BACKEND foundation only: the service/store/scope layer, deliberately not wired to
-HTTP or the context bar (that is a separate following slice), so nothing here
-touches ``api/service.py``, ``web/server.py``, or any browser asset.
+#345 promotes League into the persistent Program/Season context bar. This file is
+the BACKEND foundation: the service/store/scope layer.
+
+It originally asserted the axis was deliberately NOT wired to transport. #360 is
+the slice that wires it through authenticated HTTP, so the one assertion that
+encoded "unwired" (the rendered-payload key set) now states the wired contract
+instead — see ``LeagueContextBackwardCompatibilityTest``. The transport-level
+proof lives in ``test_context_league_http.py``; everything here stays
+service-level, and the context bar / browser assets remain untouched by both
+slices.
 
 The League axis inherits every guarantee the Program/Season axes already carry —
 view-preference-not-authority, non-oracle rejection, ignore-don't-rewrite on an
@@ -809,10 +815,16 @@ class LeagueContextBackwardCompatibilityTest(unittest.TestCase):
                 self.assertIsNone(svc.resolve_with_league("u1", *ADMIN)[2], label)
                 _close(store)
 
-    def test_http_context_payload_is_unchanged_by_the_league_column(self):
-        """The rendered context payload is built from the Program/Season DTOs,
-        not from the ActiveContext row, so adding `league_id` must not leak a
-        new field into the existing (unwired) HTTP contract."""
+    def test_context_payload_carries_the_league_additively(self):
+        """#360 supersedes this slice's "unwired" assertion ON PURPOSE.
+
+        PR #356 (this file's original slice) asserted the rendered payload was
+        UNCHANGED by the new column, because the League axis was deliberately
+        not wired to transport yet. #360 is the slice that wires it, so the
+        contract is now: the two pre-existing axes keep their exact keys and
+        values, and `league_id`/`league` are ADDED. Both new keys are always
+        present — only their value varies — so a client never has to
+        distinguish "absent" from "null"."""
         for label, store in _backends():
             with self.subTest(backend=label):
                 api = ApiService(store)
@@ -822,8 +834,33 @@ class LeagueContextBackwardCompatibilityTest(unittest.TestCase):
                 view = api.get_active_context("u1", *ADMIN)
                 self.assertEqual(
                     set(view),
-                    {"program_id", "season_id", "read_only", "program", "season"},
+                    {"program_id", "season_id", "league_id", "read_only",
+                     "program", "season", "league"},
                     label)
+                # The pre-existing axes are untouched, and the League is the one
+                # that was actually saved — rendered as a full object, not just
+                # an id, exactly like Program/Season.
+                self.assertEqual((view["program_id"], view["season_id"]),
+                                 (pid, sid), label)
+                self.assertEqual(view["league_id"], lid, label)
+                self.assertEqual(view["league"]["id"], lid, label)
+                _close(store)
+
+    def test_context_payload_keeps_league_keys_present_when_none_is_selected(self):
+        """A null League is a first-class state, not an error or an absence: the
+        keys stay present and null for a Season-without-League selection."""
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                pid, sid, lid = _program_season_league(api)
+                ContextService(store).set("u1", *ADMIN, pid, sid)
+                view = api.get_active_context("u1", *ADMIN)
+                self.assertIn("league_id", view, label)
+                self.assertIn("league", view, label)
+                self.assertIsNone(view["league_id"], label)
+                self.assertIsNone(view["league"], label)
+                self.assertEqual((view["program_id"], view["season_id"]),
+                                 (pid, sid), label)
                 _close(store)
 
     def test_legacy_positional_construction_still_means_the_same_thing(self):

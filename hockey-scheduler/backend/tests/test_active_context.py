@@ -156,10 +156,14 @@ class ContextResolveSetTest(unittest.TestCase):
         for label, store in _backends():
             with self.subTest(backend=label):
                 api = ApiService(store)
+                # The empty context carries every axis as null — including the
+                # League added by #360. Asserted as the WHOLE dict on purpose:
+                # an unexpected extra key here would be a contract leak.
                 self.assertEqual(
                     api.get_active_context("u1", *ADMIN),
-                    {"program_id": None, "season_id": None, "read_only": False,
-                     "program": None, "season": None}, label)
+                    {"program_id": None, "season_id": None, "league_id": None,
+                     "read_only": False,
+                     "program": None, "season": None, "league": None}, label)
                 _close(store)
 
     def test_fallback_prefers_latest_active_season_semantically(self):
@@ -582,7 +586,8 @@ class ContextOptionsTest(unittest.TestCase):
                 self.assertEqual(o["programs"], [], (label, o))
                 self.assertEqual(
                     o["selected"],
-                    {"program_id": None, "season_id": None, "read_only": False},
+                    {"program_id": None, "season_id": None, "league_id": None,
+                     "read_only": False},
                     o)
                 _close(store)
 
