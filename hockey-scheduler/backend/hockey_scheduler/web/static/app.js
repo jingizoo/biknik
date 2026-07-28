@@ -902,7 +902,15 @@ async function contextSeededDrawerValues(kind) {
   }
   if (kind === "team") {
     const lgs = program.leagues || [];
-    return { ok: true, values: lgs.length ? { "f-team-perm-league": lgs[0].id } : {} };
+    // #364: prefer the operator's active League selection as the default
+    // (still an ordinary, changeable <select> field, unlike Division's
+    // fail-closed LeagueSeason pairing above) -- falls back to the first
+    // League when none is active or the active one isn't under this
+    // Program, same as before this change.
+    const activeLeagueId = contextOptions.selected && contextOptions.selected.league_id;
+    const preferred = activeLeagueId && lgs.find((lg) => lg.id === activeLeagueId);
+    const league = preferred || lgs[0];
+    return { ok: true, values: lgs.length ? { "f-team-perm-league": league.id } : {} };
   }
   if (kind === "player") {
     const teams = (program.leagues || []).flatMap((lg) => lg.teams || [])
@@ -949,10 +957,25 @@ async function contextSeededDrawerValues(kind) {
     const inSeason = (svr.leagues || [])
       .filter((lg) => (lg.season_ids || []).indexOf(seasonId) !== -1);
     if (!inSeason.length) return { ok: false, noLeagueInSeason: true };
+    // #364: prefer the operator's own ACTIVE League selection over an
+    // arbitrary first match, the same "never invent an unrelated choice"
+    // rule the context service itself applies (ContextService's own League
+    // resolution drops to None rather than guessing). A League selected in
+    // context that is genuinely not IN this season's own eligible set is a
+    // stale/mismatched selection -- fail closed rather than silently
+    // substituting a DIFFERENT League than the one the operator has active,
+    // which would be exactly the "committed under a League they didn't
+    // choose" defect this whole seeding path exists to prevent.
+    const activeLeagueId = contextOptions.selected.league_id;
+    let league = inSeason[0];
+    if (activeLeagueId) {
+      league = inSeason.find((lg) => lg.id === activeLeagueId) || null;
+      if (!league) return { ok: false, leagueNotInSeason: true };
+    }
     // f-div-season carries the exact active Season through to submit (#345),
     // so a League bound to several Seasons commits into this one instead of
     // the ambiguous legacy sole-binding path.
-    return { ok: true, values: { "f-div-league": inSeason[0].id, "f-div-season": seasonId } };
+    return { ok: true, values: { "f-div-league": league.id, "f-div-season": seasonId } };
   }
   // Rink and ice-slot deliberately fall through to the unseeded return below.
   // Their parents are a Venue and a Rink -- shared facilities with no Program
@@ -7157,7 +7180,9 @@ async function render() {
           ? "Pick a season in the context bar first — this is created inside one."
           : seeded.noLeagueInSeason
             ? "That season has no leagues yet — add one before adding divisions."
-            : "Couldn't load what's needed to open that — try again.";
+            : seeded.leagueNotInSeason
+              ? "Your active League isn't in this season — switch the context bar's League or clear it before adding divisions."
+              : "Couldn't load what's needed to open that — try again.";
       toastIsError = true;
       return render();
     }
@@ -8712,18 +8737,24 @@ function b64urlDecode(s) {
   while (s.length % 4) s += "=";
   return atob(s);
 }
-function encodeContextHash(programId, seasonId) {
+// v2 (#345/#364) adds the League axis as `l`. A v1 hash (no `l` field at
+// all, from a bookmark/share link minted before this change) still decodes
+// correctly -- `l` reads as `undefined` -> `null` below, the exact "no
+// League selected" first-class state -- so an old link is honored, not
+// rejected. encodeContextHash always writes the current (v2) shape; only
+// decode needs to understand both.
+function encodeContextHash(programId, seasonId, leagueId) {
   try {
     return "#ctx=" + b64urlEncode(
-      JSON.stringify({ v: 1, p: programId || null, s: seasonId || null }));
+      JSON.stringify({ v: 2, p: programId || null, s: seasonId || null, l: leagueId || null }));
   } catch (_) { return ""; }
 }
 function decodeContextHash(hash) {
   if (!hash || hash.indexOf("#ctx=") !== 0) return null;
   try {
     const o = JSON.parse(b64urlDecode(hash.slice(5)));
-    if (!o || o.v !== 1 || !o.p) return null;
-    return { program_id: o.p, season_id: o.s || null };
+    if (!o || (o.v !== 1 && o.v !== 2) || !o.p) return null;
+    return { program_id: o.p, season_id: o.s || null, league_id: o.l || null };
   } catch (_) { return null; }
 }
 // Reflect the current selection in the URL (replaceState, like the #public
@@ -8732,7 +8763,7 @@ function syncContextHash() {
   if (!currentUser || location.hash === "#public") return;
   const sel = contextOptions && contextOptions.selected;
   const want = (sel && sel.program_id)
-    ? encodeContextHash(sel.program_id, sel.season_id) : "";
+    ? encodeContextHash(sel.program_id, sel.season_id, sel.league_id) : "";
   if (location.hash !== want) {
     history.replaceState(null, "", location.pathname + location.search + want);
   }
@@ -8756,12 +8787,13 @@ async function restoreContextDeepLink() {
   const sel = (contextOptions && contextOptions.selected) || {};
   if (!link
       || (link.program_id === sel.program_id
-          && (link.season_id || null) === (sel.season_id || null))) {
+          && (link.season_id || null) === (sel.season_id || null)
+          && (link.league_id || null) === (sel.league_id || null))) {
     syncContextHash();
     return;
   }
   const r = await post("/api/context",
-    { program_id: link.program_id, season_id: link.season_id });
+    { program_id: link.program_id, season_id: link.season_id, league_id: link.league_id });
   if (r && !r.error) {
     // Re-fetch the whole option set (not just patch `selected`): the Season we
     // adopted may have been archived/reopened, or newly created/authorized,
@@ -8847,10 +8879,18 @@ function invalidateContextScopedMutations() {
 // trivially equivalent to "last intent wins" -- there is no window left
 // for the two to disagree, on any backend.
 let contextSwitchInFlight = false;
-let contextSwitchQueued = null;  // {programId, seasonId, mySeq} -- the one pending switch not yet sent, if any
+let contextSwitchQueued = null;  // {programId, seasonId, leagueId, mySeq} -- the one pending switch not yet sent, if any
 
 // Persist a switcher pick, then reflect it in the hash and re-render.
-async function setActiveContext(programId, seasonId) {
+// `leagueId` is the third axis (#345/#364), additive like the backend's own
+// resolve_with_league/set_with_league -- every existing two-argument call
+// site (the Program/Season <select>'s own onchange) still means exactly what
+// it did before: omitting it is `undefined`, which the POST below already
+// normalizes to `null` (no League), never silently reinterpreted as "keep
+// whatever League was active." Explicit no-League is likewise `null`, not
+// omission, so a League select reset to "No League" clears it rather than
+// leaving the previous League to survive a Program/Season-only switch.
+async function setActiveContext(programId, seasonId, leagueId) {
   const mySeq = ++contextSwitchSeq;
   // Invalidate SYNCHRONOUSLY, before anything below (#331 review round 8) --
   // see invalidateContextScopedMutations()'s own comment for why.
@@ -8862,15 +8902,15 @@ async function setActiveContext(programId, seasonId) {
   invalidateContextScopedMutations();
   contextRevision += 1;
   if (contextSwitchInFlight) {
-    contextSwitchQueued = { programId, seasonId, mySeq };
+    contextSwitchQueued = { programId, seasonId, leagueId, mySeq };
     return;
   }
-  await sendContextSwitch(mySeq, programId, seasonId);
+  await sendContextSwitch(mySeq, programId, seasonId, leagueId);
 }
-async function sendContextSwitch(mySeq, programId, seasonId) {
+async function sendContextSwitch(mySeq, programId, seasonId, leagueId) {
   contextSwitchInFlight = true;
   const r = await post("/api/context",
-    { program_id: programId, season_id: seasonId || null });
+    { program_id: programId, season_id: seasonId || null, league_id: leagueId || null });
   contextSwitchInFlight = false;
   // A newer intent queued while this POST was in flight is strictly more
   // current than whatever this response says -- send it immediately, before
@@ -8882,7 +8922,7 @@ async function sendContextSwitch(mySeq, programId, seasonId) {
   if (contextSwitchQueued) {
     const next = contextSwitchQueued;
     contextSwitchQueued = null;
-    return sendContextSwitch(next.mySeq, next.programId, next.seasonId);
+    return sendContextSwitch(next.mySeq, next.programId, next.seasonId, next.leagueId);
   }
   // Superseded some other way -- e.g. resetTransientUiState() bumped
   // contextSwitchSeq directly on an identity change while this POST (the
@@ -8896,7 +8936,7 @@ async function sendContextSwitch(mySeq, programId, seasonId) {
     // never restore a stale enabled action (#331 review round 8), and must
     // converge on whatever the server actually has, never a context this
     // failed POST never got the server to accept (#331 review round 9).
-    toast = "That Program/Season isn't available."; toastIsError = true;
+    toast = "That Program/Season/League isn't available."; toastIsError = true;
     await loadContextOptions();
     if (mySeq !== contextSwitchSeq || contextSwitchQueued) return;
     // loadContextOptions() just proved canonical truth -- sync the hash to
@@ -8921,7 +8961,7 @@ async function sendContextSwitch(mySeq, programId, seasonId) {
   // load) and adopt it over what we just persisted.
   if (contextOptions) {
     contextOptions.selected = { program_id: r.program_id,
-      season_id: r.season_id, read_only: !!r.read_only };
+      season_id: r.season_id, league_id: r.league_id, read_only: !!r.read_only };
   }
   // Second bump (#331 review round 8): the FIRST bump above only made the
   // PRIOR selection's mutations uncommittable at intent time, before
@@ -8975,7 +9015,7 @@ function renderContextSwitcher() {
   const opts = contextOptions;
   const show = !!(currentUser && opts && opts.programs && opts.programs.length);
   wrap.hidden = !show;
-  if (!show) return;
+  if (!show) { renderLeagueSelect(null, null); return; }
   const { entries, multi } = contextEntries(opts);
   const sel = opts.selected || {};
   const curValue = (sel.program_id || "") + "|" + (sel.season_id || "");
@@ -8991,23 +9031,53 @@ function renderContextSwitcher() {
     // Omitting it left every seasonless single-Program account with the
     // indistinguishable label "Program overview (no season)".
     chip.textContent = `${e.programName} · ${e.label}`;
-    return;
-  }
-  chip.hidden = true; select.hidden = false;
-  const optionTag = (e) => `<option value="${esc(e.value)}"`
-    + `${e.value === curValue ? " selected" : ""}>${esc(e.label)}</option>`;
-  if (multi) {
-    const groups = [];
-    opts.programs.forEach((p) => {
-      const items = entries.filter((e) => e.programId === p.id).map(optionTag);
-      groups.push(`<optgroup label="${esc(p.name)}">${items.join("")}</optgroup>`);
-    });
-    select.innerHTML = groups.join("");
   } else {
-    select.innerHTML = entries.map(optionTag).join("");
+    chip.hidden = true; select.hidden = false;
+    const optionTag = (e) => `<option value="${esc(e.value)}"`
+      + `${e.value === curValue ? " selected" : ""}>${esc(e.label)}</option>`;
+    if (multi) {
+      const groups = [];
+      opts.programs.forEach((p) => {
+        const items = entries.filter((e) => e.programId === p.id).map(optionTag);
+        groups.push(`<optgroup label="${esc(p.name)}">${items.join("")}</optgroup>`);
+      });
+      select.innerHTML = groups.join("");
+    } else {
+      select.innerHTML = entries.map(optionTag).join("");
+    }
   }
+  // The League select's own visibility/options are independent of whether the
+  // Program/Season half collapsed to a chip above (#345/#364) -- a single-
+  // Program/single-Season account can still have several Leagues to choose
+  // from, and a multi-Program account's ACTIVE Program might have none.
+  renderLeagueSelect(opts, sel);
 }
-// Wire the native select once. A native <select> gives the full keyboard /
+// The League select is a SEPARATE, Program-scoped control (#345/#364, the
+// third context axis): its options come from the ACTIVE Program's own
+// `leagues` list only (never every Program's, unlike the Program/Season
+// entries above, which enumerate every authorized Program at once).
+// Switching Program re-renders this with a fresh option set -- an active
+// League that does not belong to the new Program cannot survive, by
+// construction (it is simply never in the new list to select), mirroring
+// set_with_league's own cross-Program rejection rather than merely hiding a
+// now-invalid choice. Hidden entirely when the active Program has no
+// Leagues at all -- "nothing to choose from" is a different UI state than
+// "Leagues exist but none is chosen" (the explicit "No League" option).
+function renderLeagueSelect(opts, sel) {
+  const leagueSelect = document.getElementById("ctx-league-select");
+  if (!leagueSelect) return;
+  const program = opts && sel
+    && (opts.programs || []).find((p) => p.id === sel.program_id);
+  const leagues = (program && program.leagues) || [];
+  if (!leagues.length) { leagueSelect.hidden = true; leagueSelect.innerHTML = ""; return; }
+  leagueSelect.hidden = false;
+  const curLeagueId = sel.league_id || "";
+  const optionTag = (id, label) => `<option value="${esc(id)}"`
+    + `${id === curLeagueId ? " selected" : ""}>${esc(label)}</option>`;
+  leagueSelect.innerHTML = [optionTag("", "No League")]
+    .concat(leagues.map((lg) => optionTag(lg.id, lg.name))).join("");
+}
+// Wire the native selects once. A native <select> gives the full keyboard /
 // screen-reader contract (focus, Arrow/Home/End, type-ahead, Enter/Escape) for
 // free, so no custom menu-radio handling is needed.
 const ctxSelect = document.getElementById("ctx-select");
@@ -9016,7 +9086,42 @@ if (ctxSelect) ctxSelect.onchange = (e) => {
   const bar = raw.indexOf("|");
   const p = bar >= 0 ? raw.slice(0, bar) : raw;
   const s = bar >= 0 ? raw.slice(bar + 1) : "";
-  setActiveContext(p, s || null);
+  const sel = (contextOptions && contextOptions.selected) || {};
+  // A same-Program Season change CARRIES the active League forward (#345/
+  // #364): options_with_league's own docstring calls a Program-scoped League
+  // "a legitimate way to move to a Season+League pair" precisely so this
+  // reverse direction also reaches an existing binding -- e.g. a League bound
+  // to both S1 and S2 must be reachable by switching S1 -> S2 while it is
+  // active, not just by re-picking the League after. set_with_league
+  // validates Program/Season/League together in one transaction and writes
+  // NOTHING on any failure, so an invalid carry (League not bound to the new
+  // Season) leaves the prior context untouched -- never a half-applied
+  // Season-changed-but-League-silently-dropped state. A Program change always
+  // drops the League instead of attempting the carry: authorized_league_ids
+  // never authorizes a cross-Program League, so carrying one forward would
+  // just guarantee a doomed request.
+  const carryLeague = p === sel.program_id ? (sel.league_id || null) : null;
+  setActiveContext(p, s || null, carryLeague);
+};
+const ctxLeagueSelect = document.getElementById("ctx-league-select");
+if (ctxLeagueSelect) ctxLeagueSelect.onchange = (e) => {
+  const sel = (contextOptions && contextOptions.selected) || {};
+  // Selecting a League CARRIES the active Season forward and asks
+  // set_with_league to validate the (Season, League) pair together, rather
+  // than pre-clearing Season to the one combination guaranteed valid
+  // (Program+League alone): options_with_league's docstring is explicit that
+  // a Program-scoped League "not bound to the currently-selected Season is
+  // still offered... because selecting it is a legitimate way to move to a
+  // Season+League pair -- the binding requirement is enforced at selection
+  // time." set_with_league's NotFoundError is DELIBERATELY one generic
+  // reason for every rejection cause (its own docstring: distinguishing them
+  // "would leak exactly what the scope rules exist to hide"), so a rejected
+  // carry cannot be attributed to "the Season" specifically -- but rejection
+  // already leaves the prior context untouched (validated before any write)
+  // and the existing failure path (toast + loadContextOptions + render)
+  // snaps both selects back to the true persisted state, so no client-side
+  // guess at which Seasons a League is bound to is needed.
+  setActiveContext(sel.program_id, sel.season_id || null, e.target.value || null);
 };
 
 // Sign out ends the server session and returns to the sign-in screen (#71).
