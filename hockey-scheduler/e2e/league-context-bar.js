@@ -426,30 +426,41 @@ async function checkCore(browser, viewport) {
       throw new Error(`[${L}] bogus League id left in the URL hash`);
     }
 
-    // (I) The League select is reachable by KEYBOARD ALONE, with a real,
-    // browser-computed visible focus indicator (tabToSelect throws otherwise)
-    // -- real Tab traversal from a blurred, defined starting point, never
-    // page.focus() (established #345 review convention: it bypasses the real
-    // Tab order and never triggers :focus-visible, so it proves neither leg
-    // this asserts). The value change itself is driven through
-    // page.selectOption rather than an arrow-key press on the already-
-    // keyboard-focused control: this sandbox's headless Chromium does not
-    // commit an arrow-key-driven value change on a closed native <select>
-    // (confirmed against context-switcher.js's own PRE-EXISTING, already-
-    // merged ArrowUp keyboard test -- it times out identically in this same
-    // environment), so asserting through it here would make this file's own
-    // local pass/fail meaningless without proving anything extra about this
-    // control specifically.
+    // (I) The League select is operable by KEYBOARD ALONE: real Tab
+    // traversal to a real, browser-computed visible focus indicator
+    // (tabToSelect throws otherwise -- never page.focus(), the established
+    // #345 review convention, since it bypasses the real Tab order and never
+    // triggers :focus-visible), THEN a real native <select> keyboard
+    // interaction -- type-ahead (pressing the first letter of the target
+    // option's own label, e.g. "D" for "Dual League") -- commits the value
+    // change and fires a genuine `change` event, exactly like a sighted
+    // keyboard user or a screen-reader user would operate it. This is
+    // deliberately NOT page.selectOption/a synthetic value assignment: it is
+    // a real KeyboardEvent the browser itself resolves into a selection, so
+    // this assertion is dead if the onchange wiring (or the select itself)
+    // is ever removed -- the DOM value would still change (browser-native
+    // type-ahead needs no JS), but the persisted server-side context below
+    // would then never update and the wait would time out and fail.
+    // (A bare ArrowDown on a CLOSED select, by contrast, does not reliably
+    // commit a value in every headless Chromium build -- type-ahead does,
+    // confirmed directly against this exact select/fixture shape.)
     await apiPost(page, "/api/context", { program_id: f.zulu, season_id: f.s1, league_id: null });
     await clearHash(page);
     await reloadShell(page);
     await tabToSelect(page, "#ctx-league-select", 200);
-    await page.selectOption("#ctx-league-select", f.dual);
+    const kbBeforeVal = await ctxLeagueSel(page);
+    await page.keyboard.press("D"); // "Dual League" -- the only option starting with D
+    await page.waitForFunction((b) => document.getElementById("ctx-league-select").value !== b,
+      kbBeforeVal, { timeout: 10000 });
+    const kbAfterVal = await ctxLeagueSel(page);
+    if (kbAfterVal !== f.dual) {
+      throw new Error(`[${L}] keyboard type-ahead selected the wrong League: got ${kbAfterVal}, expected ${f.dual}`);
+    }
     const kbDeadline = Date.now() + 10000;
     for (;;) {
       const c = await ctxNow(page);
       if (c.league_id === f.dual) break;
-      if (Date.now() > kbDeadline) throw new Error(`[${L}] League change on the keyboard-focused select did not persist`);
+      if (Date.now() > kbDeadline) throw new Error(`[${L}] keyboard-driven League change did not persist`);
       await new Promise((r) => setTimeout(r, 100));
     }
 
@@ -497,9 +508,53 @@ async function checkCore(browser, viewport) {
     }
     await page.keyboard.press("Escape");
 
+    // (L) #364 review: zero horizontal overflow, both selects still reachable
+    // by keyboard with a real visible focus indicator, and zero console/page
+    // errors for MAXIMUM-PERMISSION roles specifically (the widest nav +
+    // action set, and the two roles the review's own reproduction and fix
+    // requirement name) with an active League selected -- not just Viewer,
+    // which (J) already covers with a narrower nav/action set. Checked on
+    // League Admin's CURRENT rendered state (still on Setup from (K), the
+    // widest surface -- no reload here: this fixture's Program/org satisfies
+    // enough onboarding prerequisites to open Setup directly, but not enough
+    // for a fresh page load to skip landing back on the onboarding wizard
+    // instead, which is a separate, unrelated flow this check has no reason
+    // to depend on). Arena Manager gets its own fresh account, reload, and
+    // check on the Dashboard, its own primary landing -- Arena Manager never
+    // triggers that wizard regardless of onboarding completeness.
+    let overflowL = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth);
+    if (overflowL) throw new Error(`[${L}] League Admin: context bar causes horizontal page overflow`);
+    await tabToSelect(page, "#ctx-league-select", 200);
+
+    const arenaAcct = await page.evaluate(async () => {
+      const r = await fetch("/api/accounts", {
+        method: "POST", credentials: "same-origin", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: `lcb_arena_${Date.now()}`, password: "demo", role: "arena_manager", scope: {} }),
+      });
+      return (await r.json()).username;
+    });
+    if ((await loginAs(page, arenaAcct)).status !== 200) throw new Error(`[${L}] arena manager login failed`);
+    if ((await apiPost(page, "/api/context",
+      { program_id: f.zulu, season_id: f.s2, league_id: f.dual })).status !== 200) {
+      throw new Error(`[${L}] arena manager could not select the active League`);
+    }
+    await clearHash(page);
+    await reloadShell(page);
+    overflowL = await page.evaluate(() => document.documentElement.scrollWidth > document.documentElement.clientWidth);
+    if (overflowL) throw new Error(`[${L}] Arena Manager: context bar causes horizontal page overflow`);
+    await tabToSelect(page, "#ctx-league-select", 200);
+    const bothVisible = await page.evaluate(() => {
+      const prog = document.getElementById("ctx-select");
+      const lg = document.getElementById("ctx-league-select");
+      const visible = (el) => !!el && el.offsetParent !== null;
+      return visible(prog) && visible(lg);
+    });
+    if (!bothVisible) throw new Error(`[${L}] Arena Manager: both context selects must remain visible/reachable`);
+
     if (errors.length) throw new Error(`[${L}] console/page errors:\n${errors.join("\n")}`);
     console.log(`[${L}] OK — render, persist/round-trip, dual-Season carry-forward, atomic rejection, `
-      + `explicit No League, cross-Program clear, v1/bogus hash handling, keyboard, drawer seeding, no overflow.`);
+      + `explicit No League, cross-Program clear, v1/bogus hash handling, keyboard, drawer seeding, no overflow `
+      + `(incl. max-permission roles with an active League).`);
   } catch (error) {
     throw new Error(`${error.message}\n--- server output ---\n${out}`);
   } finally {
