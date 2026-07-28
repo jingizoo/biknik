@@ -305,7 +305,14 @@ body[data-view="onboarding"] .content {
   padding: 16px 0 4px;
 }
 
-@media (max-width: 760px) {
+/* 720 is the approved tablet token (#345), retokenized from the old 760px.
+   This block is pure LAYOUT — it collapses the hero to one column and tightens
+   content padding — so it needs no non-layout exception. Retokenizing is not a
+   no-op, and the effect is bounded and stated rather than glossed: in the
+   721-760px band the hero keeps its two-column
+   `minmax(0, 1fr) 260px` grid instead of stacking. The flexible first track
+   floors at 0, so the wider layout cannot overflow in that band. */
+@media (max-width: 720px) {
   body[data-view="onboarding"] .content {
     padding-left: 12px;
     padding-right: 12px;
