@@ -309,8 +309,26 @@ body.signed-out .web { display: none; }
   .web { flex-direction: column; }
   .sidebar { width: 100%; flex: none; height: auto; position: static; }
   .side-nav { flex-direction: row; overflow-x: auto; padding: 8px; gap: 8px; }
-  .nav-group { flex-direction: row; align-items: center; gap: 2px; }
-  .nav-group-label { display: none; }
+  /* `position: relative` is load-bearing, not cosmetic: it makes each group
+     the containing block for its own absolutely-positioned label below.
+     Without it the label resolves against the INITIAL containing block, so it
+     escapes `.side-nav`'s `overflow-x: auto` and is laid out at its static
+     position — up to ~1000px to the right for the last areas — dragging the
+     whole DOCUMENT's scrollWidth out to match and producing a real horizontal
+     page overflow at 390px. */
+  .nav-group { flex-direction: row; align-items: center; gap: 2px; position: relative; }
+  /* Visually hide the area label in the horizontal strip, but keep it IN the
+     accessibility tree (#345): each `.nav-group` is `role="group"
+     aria-labelledby` this element, so `display: none` here would strip every
+     area's accessible name at exactly the width where the visual grouping is
+     already gone — leaving a screen-reader user a flat run of destinations
+     with no idea which of the seven areas each belongs to. Same clip-rect
+     technique as the shared `.sr-only` helper (styles.css), inlined rather
+     than by class so the markup carries one label element at both widths. */
+  .nav-group-label {
+    position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+  }
   /* The unrelated bottom-tab-bar component's `.tab { flex: 1 0 auto }`
      (styles.css) still matches these buttons via the shared class — with
      .side-nav now a horizontal row, that width:100%/flex-basis:auto pair

@@ -102,7 +102,7 @@ function fail(msg) { throw new Error(msg); }
 // must not change -- so the index has to be navigated back to explicitly
 // rather than assumed.
 async function openSetupHub(page, step) {
-  await page.click('.tab[data-tab="setup"]');
+  await page.click('.tab[data-tab="setup"]:not([data-setup-workflow-nav])');
   await page.waitForFunction(() => document.body.dataset.view === "setup",
     null, { timeout: 10000 }).catch(async () => fail(
       `[${step}] clicking the Setup tab never reached the setup view (was `
@@ -141,7 +141,7 @@ async function checkViewport(browser, viewport) {
     // ---- (1) Setup lands on the workflow hub, not the mega-page ----------
     // Deliberately NOT openSetupHub(): clicking the toggle would make this
     // assertion vacuous. The point is the DEFAULT sub-view.
-    await page.click('.tab[data-tab="setup"]');
+    await page.click('.tab[data-tab="setup"]:not([data-setup-workflow-nav])');
     await page.waitForFunction(() => document.body.dataset.view === "setup",
       null, { timeout: 10000 });
     await page.waitForSelector(".swf-grid", { timeout: 10000 });

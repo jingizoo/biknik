@@ -719,7 +719,7 @@ async function checkViewport(browser, viewport) {
     // Setup is reachable (manage_arena), but only its arena-side Records
     // carry a "+ New" -- League-structure entities ("unrelated
     // administration") must show none.
-    await page.click('.tab[data-tab="setup"]');
+    await page.click('.tab[data-tab="setup"]:not([data-setup-workflow-nav])');
     await waitForView(page, "setup");
     await page.click('[data-setup-view="records"]');
     await page.waitForSelector(".setup-card", { timeout: 10000 });

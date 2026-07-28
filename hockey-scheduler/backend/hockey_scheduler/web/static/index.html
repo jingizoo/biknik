@@ -34,22 +34,46 @@
           <div class="brand-sub">Operator Console</div></div>
       </div>
 
-      <!-- Grouped by task, not by implementation area (#145): Home for
-           every role's own landing/task list, Schedule for anything
-           game/calendar-shaped, People for roster + account management,
-           Operations for day-to-day comms/monitoring, Admin Setup for
-           one-time league/arena configuration. -->
+      <!-- The approved SEVEN-AREA information architecture (#345, crosswalk in
+           docs/product/operator-ux-requirements.md § "Task-oriented navigation
+           and setup"), replacing the five task groups #145 introduced.
+
+           This is a GROUPING/LABELLING change only: every destination, its
+           `data-tab` route key, its per-role visibility gate, and its deep-link
+           behavior are carried over untouched — no destination was added,
+           removed, renamed, or moved between roles.
+
+           Each group carries `data-nav-area` (the stable machine-readable area
+           key, so the crosswalk can be asserted against the real production DOM
+           rather than a test-local copy) and `role="group"` +
+           `aria-labelledby`, so every destination is announced inside a named
+           area. The name is on a real element rather than the label text alone
+           because the ≤880px layout visually hides these labels; being
+           `aria-labelledby`-referenced keeps the area name in the
+           accessibility tree at every width. The mobile presentation is a
+           horizontal scroll strip, NOT a collapsible accordion, so there is no
+           expanded/collapsed state to expose.
+
+           FACILITIES is intentionally empty today. The crosswalk maps the
+           single `setup` destination to "Facilities + Administration" — it
+           splits only once the six Setup workflows become separately
+           addressable ("Venues, rinks and ice" → Facilities, the other five →
+           Administration). Splitting it is explicitly out of scope here, and a
+           destination may belong to exactly one area, so `setup` sits under
+           Administration (where five of its six workflows land) and Facilities
+           stays declared-but-unpopulated. The existing empty-group rule in
+           app.js hides it rather than leaving an orphaned heading. -->
       <nav class="side-nav">
-        <div class="nav-group">
-          <div class="nav-group-label">Home</div>
+        <div class="nav-group" data-nav-area="home_tasks" role="group" aria-labelledby="nav-area-home-tasks">
+          <div class="nav-group-label" id="nav-area-home-tasks">Home/Tasks</div>
           <button class="tab active" data-tab="dashboard"><span class="nav-dot"></span><span class="nav-label">Dashboard</span></button>
           <button class="tab" data-tab="player_home" style="display:none"><span class="nav-dot"></span><span class="nav-label">Home</span></button>
           <button class="tab" data-tab="guardian_home" style="display:none"><span class="nav-dot"></span><span class="nav-label">My Players</span></button>
           <button class="tab" data-tab="inbox" style="display:none"><span class="nav-dot"></span><span class="nav-label">My Assignments</span></button>
           <button class="tab" data-tab="activity"><span class="nav-dot"></span><span class="nav-label">Activity</span></button>
         </div>
-        <div class="nav-group">
-          <div class="nav-group-label">Schedule</div>
+        <div class="nav-group" data-nav-area="schedule" role="group" aria-labelledby="nav-area-schedule">
+          <div class="nav-group-label" id="nav-area-schedule">Schedule</div>
           <button class="tab" data-tab="calendar"><span class="nav-dot"></span><span class="nav-label">Arena Calendar</span></button>
           <button class="tab" data-tab="games"><span class="nav-dot"></span><span class="nav-label">Games</span></button>
           <button class="tab" data-tab="scheduler" style="display:none"><span class="nav-dot"></span><span class="nav-label">Scheduler</span></button>
@@ -57,21 +81,38 @@
           <button class="tab" data-tab="sheet"><span class="nav-dot"></span><span class="nav-label">Game Sheet</span></button>
           <button class="tab" data-tab="public"><span class="nav-dot"></span><span class="nav-label">Public</span></button>
         </div>
-        <div class="nav-group">
-          <div class="nav-group-label">People</div>
+        <div class="nav-group" data-nav-area="teams_people" role="group" aria-labelledby="nav-area-teams-people">
+          <div class="nav-group-label" id="nav-area-teams-people">Teams &amp; People</div>
           <button class="tab" data-tab="roster"><span class="nav-dot"></span><span class="nav-label">Roster</span></button>
-          <button class="tab" data-tab="users" style="display:none"><span class="nav-dot"></span><span class="nav-label">Users</span></button>
         </div>
-        <div class="nav-group">
-          <div class="nav-group-label">Operations</div>
+        <div class="nav-group" data-nav-area="facilities" role="group" aria-labelledby="nav-area-facilities">
+          <div class="nav-group-label" id="nav-area-facilities">Facilities</div>
+          <!-- The crosswalk's Setup split: "Venues, rinks and ice" → Facilities,
+               the other five workflows → Administration. This is a COMPOSITE
+               destination — the same `setup` view plus a `setupWorkflow` half —
+               so it declares its workflow via data-setup-workflow-nav and opens
+               through openSetupWorkflowLanding(), NOT switchTab() (which clears
+               that half) and NOT goToSetupWorkflow() (which jumps straight to
+               the Calendar Ice Builder, the landing's own primary action rather
+               than the summary-first landing the IA requires). Gated on
+               manage_arena, matching SETUP_WORKFLOWS.facilities.perm, so the
+               Arena Manager whose primary journey this is reaches it. -->
+          <button class="tab" data-tab="setup" data-setup-workflow-nav="facilities" style="display:none"><span class="nav-dot"></span><span class="nav-label">Venues, rinks and ice</span></button>
+        </div>
+        <div class="nav-group" data-nav-area="communications" role="group" aria-labelledby="nav-area-communications">
+          <div class="nav-group-label" id="nav-area-communications">Communications</div>
           <button class="tab" data-tab="notifications"><span class="nav-dot"></span><span class="nav-label">Notifications</span><span class="nav-badge" id="notif-badge" style="display:none"></span></button>
           <button class="tab" data-tab="delivery" style="display:none"><span class="nav-dot"></span><span class="nav-label">Delivery</span></button>
-          <button class="tab" data-tab="readiness" style="display:none"><span class="nav-dot"></span><span class="nav-label">Pilot Readiness</span></button>
-          <button class="tab" data-tab="import" style="display:none"><span class="nav-dot"></span><span class="nav-label">Import</span></button>
         </div>
-        <div class="nav-group">
-          <div class="nav-group-label">Admin Setup</div>
+        <div class="nav-group" data-nav-area="reports" role="group" aria-labelledby="nav-area-reports">
+          <div class="nav-group-label" id="nav-area-reports">Reports</div>
+          <button class="tab" data-tab="readiness" style="display:none"><span class="nav-dot"></span><span class="nav-label">Pilot Readiness</span></button>
+        </div>
+        <div class="nav-group" data-nav-area="administration" role="group" aria-labelledby="nav-area-administration">
+          <div class="nav-group-label" id="nav-area-administration">Administration</div>
+          <button class="tab" data-tab="users" style="display:none"><span class="nav-dot"></span><span class="nav-label">Users</span></button>
           <button class="tab" data-tab="onboarding" style="display:none"><span class="nav-dot"></span><span class="nav-label">Initial Setup</span><span class="nav-badge" id="onboarding-badge" hidden></span></button>
+          <button class="tab" data-tab="import" style="display:none"><span class="nav-dot"></span><span class="nav-label">Import</span></button>
           <button class="tab" data-tab="setup"><span class="nav-dot"></span><span class="nav-label">Setup</span></button>
         </div>
       </nav>

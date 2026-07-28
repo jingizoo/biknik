@@ -2985,6 +2985,44 @@ function setupWorkflowsFor() {
   return SETUP_WORKFLOWS.filter((w) => !w.perm || hasPerm(w.perm));
 }
 
+// The ONE permission-aware transition into a Setup workflow LANDING (#345),
+// shared by the Setup hub's own cards and by the Facilities nav destination.
+//
+// It deliberately does NOT route through switchTab(): that helper clears
+// `setupWorkflow` unconditionally (so the top-level Setup destination always
+// returns to the workflow index), which would wipe the very half of this
+// composite destination the caller is trying to establish. Both halves —
+// `view` and `setupWorkflow` — are set together here, before the single
+// render, so the landing can never be reached in a half-applied state.
+//
+// Fails CLOSED on a key this caller may not open: `setupWorkflowsFor()`
+// already filters by each workflow's own `perm` (Facilities is `manage_arena`,
+// which is exactly the permission the Arena Manager whose primary journey this
+// is holds), so an unpermitted or unknown key is refused rather than rendering
+// a landing whose actions would all be denied. Returns whether it navigated,
+// so a caller can tell "not permitted" from "done".
+function openSetupWorkflowLanding(key) {
+  const workflow = key
+    ? setupWorkflowsFor().find((w) => w.key === key) : null;
+  if (key && !workflow) return false;
+  view = "setup";
+  setupWorkflow = key || null;
+  toast = "";
+  // The SAME per-destination reset switchTab() applies. Bypassing switchTab is
+  // deliberate (it would clear the `setupWorkflow` half being established), but
+  // that must not mean bypassing the transient-state discipline too: without
+  // this, arriving from the Calendar carried a live Ice Builder over, and from
+  // Player/Guardian Home a pending checkout confirmation.
+  resetTransientViewState("setup");
+  syncActiveNav();
+  setPageTitle("setup");
+  render();
+  // Land keyboard focus on the destination's own heading rather than leaving
+  // it on a control the render just replaced.
+  focusContentHeading();
+  return true;
+}
+
 function setupSummaryHtml(w, sv, ov) {
   // Guard the payload, not each accessor: renderSetup can be reached before
   // (or without) a successful overview load -- an early return, a failed
@@ -3039,7 +3077,7 @@ function renderSetupWorkflowLanding(w, sv, ov) {
   const tertiary = (w.tertiary || []).map((a) =>
     `<button class="linklike" ${attr(a)}>${esc(a.label)}</button>`).join("");
   return `
-    <div class="swf-landing">
+    <div class="swf-landing" data-setup-workflow-landing="${esc(w.key)}">
       <button class="linklike swf-back" data-setup-workflow="">← All setup workflows</button>
       <h2 class="swf-landing-title">${w.icon} ${esc(w.title)}</h2>
       <p class="swf-purpose">${esc(w.purpose)}</p>
@@ -7088,13 +7126,11 @@ async function render() {
   // state; the actions delegate to the SAME handlers the rest of Setup uses,
   // so a workflow landing can never drift from the behaviour of the control
   // it fronts.
+  // Delegates to the SAME permission-aware transition the Facilities nav
+  // destination uses, so a landing opened from the hub and one opened from the
+  // sidebar are byte-for-byte the same state (#345 review).
   c.querySelectorAll("[data-setup-workflow]").forEach((b) => b.onclick = () => {
-    setupWorkflow = b.dataset.setupWorkflow || null;
-    toast = "";
-    render();
-    // Land keyboard focus on the destination's own heading rather than
-    // leaving it on a control that the render just replaced.
-    focusContentHeading();
+    openSetupWorkflowLanding(b.dataset.setupWorkflow || null);
   });
   // Primary actions route through goToSetupWorkflow -- the seeded, fail-closed
   // path -- rather than opening a raw drawer, so a landing's primary action
@@ -8520,27 +8556,83 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
+// Per-view transient UI state that must NOT survive a destination change,
+// factored out of switchTab() (#345 review) so every transition into a
+// destination applies the identical discipline.
+//
+// This exists because it already drifted once: openSetupWorkflowLanding()
+// deliberately bypasses switchTab() (which would clear the `setupWorkflow`
+// half it is establishing), and in doing so it silently skipped ALL of the
+// resets below — so navigating to Facilities from the Calendar carried a live
+// Ice Builder/move/conflict across, and from Player or Guardian Home carried a
+// pending checkout confirmation across. A stale overlay rendering over a
+// different destination is exactly what these guards exist to prevent, so the
+// rule now lives in one place both callers use rather than being re-derived.
+//
+// `next` is the destination's VIEW half; the conditions are unchanged from
+// their original sites, including preserving an open drawer for `setup` (the
+// topbar "+ Add Ice"/"＋ New" shortcuts set `drawer` and THEN switch to setup,
+// so clearing it here would break them).
+function resetTransientViewState(next) {
+  if (next !== "calendar") {
+    wizard = null; conflict = null; movingGameId = null; pendingMove = null;
+    iceBuilder = null;
+  }
+  if (next !== "setup") {
+    drawer = null; drawerError = ""; drawerValues = {}; pendingReassign = null;
+  }
+  // A pending checkout confirmation doesn't survive leaving Home (#107) —
+  // so a stale "are you sure?" never reappears over changed attendance state.
+  if (next !== "player_home") {
+    checkoutConfirm = null; oppDetailGame = null; oppDetail = null;
+  }
+  // Same discipline for the guardian surface (#26): leaving "My Players"
+  // clears any open junior checkout confirm / opportunity detail.
+  if (next !== "guardian_home") { gCheckout = null; gOpp = null; gOppDetail = null; }
+}
+
 function switchTab(next) {
-  view = next; toast = ""; if (next !== "calendar") { wizard = null; conflict = null; movingGameId = null; pendingMove = null; iceBuilder = null; }
-  if (next !== "setup") { drawer = null; drawerError = ""; drawerValues = {}; pendingReassign = null; }
+  view = next; toast = "";
+  resetTransientViewState(next);
   // Clicking the top-level Setup destination always returns to the workflow
   // INDEX (#345 batch 2), never to whichever landing happened to be open last
   // -- same reset discipline the drawer/wizard state above gets, and for the
   // same reason: a nav click means "take me to Setup", not "resume where I
   // was three screens deep". Unconditional, so it also clears on re-entry.
   setupWorkflow = null;
-  // A pending checkout confirmation doesn't survive leaving Home (#107) —
-  // same reset discipline as drawer/wizard above, so a stale "are you
-  // sure?" never reappears over changed attendance state.
-  if (next !== "player_home") { checkoutConfirm = null; oppDetailGame = null; oppDetail = null; }
-  // Same discipline for the guardian surface (#26): leaving "My Players"
-  // clears any open junior checkout confirm / opportunity detail.
-  if (next !== "guardian_home") { gCheckout = null; gOpp = null; gOppDetail = null; }
-  document.querySelectorAll(".tab").forEach((x) => x.classList.toggle("active", x.dataset.tab === next));
+  syncActiveNav(next);
   setPageTitle(next);
   render();
 }
-document.querySelectorAll(".tab").forEach((b) => b.onclick = () => switchTab(b.dataset.tab));
+
+// Active-destination highlight, shared by switchTab() and
+// openSetupWorkflowLanding() so the two transitions can never disagree.
+//
+// #345: two nav entries now carry data-tab="setup" — Administration's plain
+// Setup (the workflow index) and Facilities (the "Venues, rinks and ice"
+// landing). They are distinct destinations sharing one view, so matching on
+// `data-tab` alone would light BOTH whenever either is open. The composite
+// identity is (view, setupWorkflow), and a nav entry declares its own workflow
+// half via data-setup-workflow-nav; an entry without that attribute means "no
+// workflow", which is exactly the index's state.
+function syncActiveNav(next) {
+  const activeView = next || view;
+  document.querySelectorAll(".tab").forEach((x) => {
+    const wants = x.dataset.setupWorkflowNav || null;
+    x.classList.toggle(
+      "active",
+      x.dataset.tab === activeView
+        && (activeView !== "setup" || wants === (setupWorkflow || null)));
+  });
+}
+document.querySelectorAll(".tab").forEach((b) => b.onclick = () => {
+  // A nav entry that declares a workflow half is a composite destination and
+  // goes through the shared landing opener; switchTab() would clear the very
+  // state it needs. Everything else is an ordinary view switch.
+  const workflow = b.dataset.setupWorkflowNav;
+  if (workflow) { openSetupWorkflowLanding(workflow); return; }
+  switchTab(b.dataset.tab);
+});
 // Topbar command actions (web shell) — outside #content, wired once.
 document.querySelectorAll(".topbar [data-goto]").forEach((b) => b.onclick = () => switchTab(b.dataset.goto));
 // Topbar shortcut: jump to Setup and open a create drawer directly (#44).
@@ -9028,7 +9120,18 @@ function gateChrome() {
   // manage_arena has nothing to manage there — the tab itself isn't a
   // dead end (setupCard/renderSetupHierarchy already hide per-entity
   // actions), but it shouldn't be reachable at all for such a role.
-  toggle('.tab[data-tab="setup"]', hasPerm("manage_setup") || hasPerm("manage_arena"));
+  //
+  // #345: scoped with :not([data-setup-workflow-nav]) so this gate governs
+  // ONLY Administration's plain Setup (the workflow index). The Facilities
+  // entry below shares data-tab="setup" but is a different destination with a
+  // different, narrower permission — an unscoped selector would silently
+  // re-grant it to every manage_setup role.
+  toggle('.tab[data-tab="setup"]:not([data-setup-workflow-nav])',
+         hasPerm("manage_setup") || hasPerm("manage_arena"));
+  // Facilities → "Venues, rinks and ice" (#345). manage_arena exactly matches
+  // SETUP_WORKFLOWS.facilities.perm, which is also what openSetupWorkflowLanding()
+  // fails closed on — so the nav gate and the transition guard cannot drift.
+  toggle('.tab[data-setup-workflow-nav="facilities"]', hasPerm("manage_arena"));
   // Reset wipes and reseeds all demo data — shown only in demo mode and only to
   // a League Admin (MANAGE_SETUP), matching the server, which hard-disables the
   // reset route in production (#215).
@@ -9043,8 +9146,12 @@ function gateChrome() {
   toggle('.tab[data-tab="activity"]', canSeeOpsConsole());
   toggle('.tab[data-tab="roster"]', canReadAnyPrivateGame());
   toggle('.tab[data-tab="sheet"]', canReadAnyPrivateGame());
-  // Hide a nav group once all of its tabs are hidden, so its section label
-  // (Home / Schedule / People / …) doesn't hang orphaned above nothing.
+  // Hide a nav area once all of its destinations are hidden, so its label
+  // (Home/Tasks, Schedule, Teams & People, …) doesn't hang orphaned above
+  // nothing. #345: this also covers Facilities, which is declared in the
+  // seven-area IA but carries no destination until the `setup` split makes
+  // "Venues, rinks and ice" separately addressable — an area with zero tabs
+  // is hidden by exactly the same rule as one whose tabs a role cannot see.
   document.querySelectorAll(".nav-group").forEach((g) => {
     const anyTab = Array.from(g.querySelectorAll(".tab"))
       .some((t) => t.style.display !== "none");
