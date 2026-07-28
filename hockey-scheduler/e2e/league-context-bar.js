@@ -16,11 +16,23 @@
 // to that (Season, League) pair -- the binding is validated at selection
 // time by set_with_league itself (one generic non-oracle reason for every
 // rejection cause, by design). Symmetrically, a same-Program Season change
-// carries the active League forward for the same reason. Neither direction
-// ever guesses "the" binding when the carried axis doesn't match: the merged
-// contract exposes no per-League season list, so a mismatched pair is simply
-// rejected, atomically (set_with_league writes nothing until every axis
-// validates), and both selects snap back to the true persisted state.
+// carries the active League forward for the same reason.
+//
+// What happens when the carried axis DOESN'T match a binding is the #364 owner
+// ruling, and the browser has no say in it: the SERVER owns the canonical
+// tuple (ContextService._canonical_league_season), so the Season that comes
+// back may legitimately differ from the one that was sent, and the client must
+// render what it was given rather than what it asked for. Keep the current
+// Season when it genuinely binds (rule 1); otherwise, when the League has
+// EXACTLY ONE valid authorized ACTIVE binding in the Program, move atomically
+// to that Season (rule 2 -- checkCore's leg (M)); otherwise refuse generically
+// with zero mutation and never tie-break a Season on the operator's behalf
+// (rule 3 -- leg (D)). Legs (D) and (M) are what pin those two apart, and (M)
+// additionally proves the move is agreed by every surface that could
+// contradict it (persisted row, both controls, hash, reload, rendered screen)
+// rather than merely returning 200. Every refusal is ONE generic non-oracle
+// reason, atomic (set_with_league writes nothing until every axis validates),
+// with both selects snapping back to the true persisted state.
 //
 // Scope decisions (recorded here, not just the PR body, so a future reader
 // of this file sees the boundary without cross-referencing GitHub):
@@ -171,6 +183,44 @@ const ctxNow = async (page) => (await apiGet(page, "/api/context")).json;
 // later reload must trust that POST's own effect -- avoids exercising that
 // (correct, intentional) adoption behavior by accident.
 const clearHash = (page) => page.evaluate(() => history.replaceState(null, "", location.pathname + location.search));
+// The persisted server row is only eventually consistent with a UI action --
+// the switcher's POST is fired from an onchange handler nobody awaits -- so
+// every "did this actually commit?" assertion polls the real HTTP boundary
+// rather than sleeping a guessed interval. Returns the context that matched,
+// and reports the LAST one seen on timeout so a failure names the actual
+// divergence instead of just "timed out".
+async function waitForContext(page, matches, message, timeoutMs) {
+  const deadline = Date.now() + (timeoutMs || 10000);
+  for (;;) {
+    const now = await ctxNow(page);
+    if (matches(now)) return now;
+    if (Date.now() > deadline) throw new Error(`${message}: ${JSON.stringify(now)}`);
+    await new Promise((r) => setTimeout(r, 100));
+  }
+}
+// The inverse of encodeCtx: what the app itself actually wrote into the URL.
+function decodeCtx(hash) {
+  const m = /^#ctx=(.+)$/.exec(hash || "");
+  if (!m) return null;
+  const b64 = m[1].replace(/-/g, "+").replace(/_/g, "/");
+  try { return JSON.parse(Buffer.from(b64, "base64").toString("utf8")); }
+  catch (_) { return null; }
+}
+// Both context controls as a USER sees them: the committed value AND the
+// visible label of the option actually showing. Value alone would still pass
+// if the option list were never repainted (a stale label over a fresh value is
+// exactly the bar/view contradiction #364 exists to rule out); a hidden
+// control reports null so "the League select vanished" can never read as
+// agreement.
+const ctxRendered = (page) => page.evaluate(() => {
+  const pick = (id) => {
+    const el = document.getElementById(id);
+    if (!el || el.hidden || el.offsetParent === null) return null;
+    const opt = el.selectedOptions && el.selectedOptions[0];
+    return { value: el.value, label: opt ? (opt.textContent || "").trim() : null };
+  };
+  return { prog: pick("ctx-select"), league: pick("ctx-league-select") };
+});
 
 // Real keyboard-only reachability (#345 review culture: page.focus() bypasses
 // the actual Tab order and never triggers :focus-visible, so it proves
@@ -349,20 +399,26 @@ async function checkCore(browser, viewport) {
       throw new Error(`[${L}] S2+League round-trip lost the Season half on reload`);
     }
 
-    // (D) Atomic rejection: Solo League is bound to S1 only. Switching to S3
-    // (no binding at all) while Solo is active must be rejected WHOLESALE --
-    // set_with_league validates every axis before writing anything, so the
-    // prior (S1, Solo) context must survive completely unchanged, both
-    // selects must snap back, and a generic toast (no existence oracle) must
-    // appear.
+    // (D) Atomic rejection, which under the #364 owner ruling is now the
+    // AMBIGUOUS case specifically. Dual League is bound to BOTH S1 and S2.
+    // Switching to S3 (which binds nothing) while Dual is active leaves the
+    // server holding SEVERAL valid bindings with the current Season not among
+    // them -- rule 3, which deliberately never tie-breaks a Season on the
+    // operator's behalf, because a deterministic pick would silently move them
+    // into a Season they never chose and never saw. It must be refused
+    // WHOLESALE: set_with_league validates every axis before writing anything,
+    // so the prior (S1, Dual) context survives completely unchanged, both
+    // selects snap back, and ONE generic toast (no existence oracle) appears.
+    // Contrast (M) below, where the League has EXACTLY ONE valid binding and
+    // the server therefore MOVES the Season instead of refusing -- the two
+    // legs together are what pin rule 2 and rule 3 apart. (A League bound to
+    // exactly one Season, e.g. Solo League here, is NOT a rejection case any
+    // more: it is (M)'s canonical move.)
     await page.selectOption("#ctx-select", `${f.zulu}|${f.s1}`);
-    await page.waitForFunction((v) => document.getElementById("ctx-league-select").value === v,
-      f.dual, { timeout: 10000 });
-    await page.selectOption("#ctx-league-select", f.solo);
-    await page.waitForFunction((v) => document.getElementById("ctx-league-select").value === v,
-      f.solo, { timeout: 10000 });
-    const beforeReject = await ctxNow(page);
-    if (beforeReject.league_id !== f.solo) throw new Error(`[${L}] setup for (D) did not land on Solo League`);
+    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
+      `${f.zulu}|${f.s1}`, { timeout: 10000 });
+    await waitForContext(page, (c) => c.season_id === f.s1 && c.league_id === f.dual,
+      `[${L}] setup for (D) did not land on (S1, Dual League)`);
     await page.selectOption("#ctx-select", `${f.zulu}|${f.s3}`);
     await page.waitForFunction(() => {
       const t = document.getElementById("toast-root");
@@ -370,12 +426,22 @@ async function checkCore(browser, viewport) {
     }, null, { timeout: 10000 });
     await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
       `${f.zulu}|${f.s1}`, { timeout: 10000 });
-    if ((await ctxLeagueSel(page)) !== f.solo) {
-      throw new Error(`[${L}] League select did not snap back to Solo League after the rejected carry`);
+    if ((await ctxLeagueSel(page)) !== f.dual) {
+      throw new Error(`[${L}] League select did not snap back to Dual League after the ambiguous carry`);
     }
     const afterReject = await ctxNow(page);
-    if (afterReject.season_id !== f.s1 || afterReject.league_id !== f.solo) {
+    if (afterReject.season_id !== f.s1 || afterReject.league_id !== f.dual) {
       throw new Error(`[${L}] rejected Season change was not fully atomic: ${JSON.stringify(afterReject)}`);
+    }
+    // ...and it never invented a binding to make the ambiguity go away.
+    // Resolution is read-only over LeagueSeason (#364): S3 must still bind
+    // nothing, so re-selecting it is refused identically the second time.
+    await page.selectOption("#ctx-select", `${f.zulu}|${f.s3}`);
+    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
+      `${f.zulu}|${f.s1}`, { timeout: 10000 });
+    const afterReject2 = await ctxNow(page);
+    if (afterReject2.season_id !== f.s1 || afterReject2.league_id !== f.dual) {
+      throw new Error(`[${L}] a refused resolution created a binding: ${JSON.stringify(afterReject2)}`);
     }
 
     // (E) Explicit "No League" is first-class: selecting it clears league_id
@@ -551,10 +617,154 @@ async function checkCore(browser, viewport) {
     });
     if (!bothVisible) throw new Error(`[${L}] Arena Manager: both context selects must remain visible/reachable`);
 
+    // (M) The #364 owner ruling itself, end to end through the REAL context
+    // bar: the SERVER owns the canonical (Season, League) tuple, and the
+    // returned Season may legitimately DIFFER from the one the browser sent.
+    //
+    // Starting on active S2, choosing Solo League -- bound ONLY to S1 -- is a
+    // legitimate operator intent. Rule 1 does not apply (no S2 binding), rule 2
+    // does: exactly one valid authorized ACTIVE binding, so the server moves
+    // atomically to (S1, Solo League). Two failure modes this must rule out,
+    // both of which a green "the POST returned 200" assertion would miss:
+    // refusing the pick outright (the pre-#364 behavior, which left the primary
+    // League control unable to commit), and committing the League while leaving
+    // the operator parked on S2 with a League that is not in it.
+    //
+    // So the proof is AGREEMENT ACROSS EVERY SURFACE THAT CAN DISAGREE, not a
+    // return value: the persisted row read back over HTTP through the page's
+    // own fetch, BOTH context controls' rendered values AND their visible
+    // labels, the URL hash, all of that again after a full page RELOAD, and
+    // finally the rendered screen itself.
+    const agreeOnS1Solo = async (stage) => {
+      await waitForContext(page, (c) => c.program_id === f.zulu && c.season_id === f.s1
+        && c.league_id === f.solo,
+        `[${L}] (M) ${stage}: persisted server context is not (S1, Solo League)`);
+      // The bar repaints from a SECOND round-trip (loadContextOptions) that
+      // lands after the POST commits, so the controls are polled to their
+      // SETTLED state instead of sampled the instant the server row changed.
+      // A fixed sleep would either flake or quietly mask a real repaint lag;
+      // a bounded poll that reports the last state it saw does neither -- a
+      // bar that never converges still fails, and names what it was stuck on.
+      const deadline = Date.now() + 10000;
+      let bar;
+      for (;;) {
+        bar = await ctxRendered(page);
+        if (bar.prog && bar.league && bar.prog.value === `${f.zulu}|${f.s1}`
+          && bar.league.value === f.solo) break;
+        if (Date.now() > deadline) {
+          throw new Error(`[${L}] (M) ${stage}: the context bar never settled on `
+            + `(S1, Solo League) -- last read ${JSON.stringify(bar)}`);
+        }
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      // Same snapshot, now the VISIBLE labels: a fresh value under a stale
+      // option list would still be a bar/view contradiction to a real reader.
+      if (!/^S1 2026\b/.test(bar.prog.label || "")) {
+        throw new Error(`[${L}] (M) ${stage}: the Program/Season control shows the wrong Season `
+          + `label: ${JSON.stringify(bar.prog)}`);
+      }
+      if (bar.league.label !== "Solo League") {
+        throw new Error(`[${L}] (M) ${stage}: the League control shows the wrong League `
+          + `label: ${JSON.stringify(bar.league)}`);
+      }
+      // syncContextHash() runs off the POST echo, strictly before the repaint
+      // just awaited, so by now the hash is settled too -- no second poll.
+      const hash = decodeCtx(await page.evaluate(() => location.hash));
+      if (!hash || hash.p !== f.zulu || hash.s !== f.s1 || hash.l !== f.solo) {
+        throw new Error(`[${L}] (M) ${stage}: the URL hash disagrees with the committed tuple: ${JSON.stringify(hash)}`);
+      }
+    };
+
+    // A fresh page load lands League Admin on the "Initial Setup" wizard,
+    // whose view returns before render() ever paints the context bar -- the
+    // same onboarding-flow dependency (L) above deliberately refuses to lean
+    // on. Re-entering the real six-workflow Setup hub after each reload is
+    // what makes the reload legs below assert the CONTEXT BAR rather than the
+    // wizard's absence of one. It is plain navigation: it never POSTs a
+    // context, so nothing here can manufacture the tuple being proven.
+    const enterSetupHub = async () => {
+      await page.click('.tab[data-tab="setup"]:not([data-setup-workflow-nav])');
+      await page.waitForFunction(
+        () => !!document.querySelector('[data-setup-workflow="participation"]'), null, { timeout: 15000 });
+    };
+
+    // Begin on active S2 with Dual League -- a real, fully-populated tuple, so
+    // the move below has to change BOTH axes and cannot be confused with a
+    // control that merely started out empty. League Admin throughout: the
+    // context row is per-user, so the rendered-screen half at the end must be
+    // the SAME account that made the keyboard pick, not a second session.
+    if ((await loginAs(page, "admin")).status !== 200) throw new Error(`[${L}] admin re-login (M) failed`);
+    if ((await apiPost(page, "/api/context",
+      { program_id: f.zulu, season_id: f.s2, league_id: f.dual })).status !== 200) {
+      throw new Error(`[${L}] (M) could not set up the starting (S2, Dual League) context`);
+    }
+    await clearHash(page);
+    await reloadShell(page);
+    await enterSetupHub();
+    await page.waitForFunction((v) => document.getElementById("ctx-league-select").value === v,
+      f.dual, { timeout: 10000 });
+    const startBar = await ctxRendered(page);
+    if (!startBar.prog || startBar.prog.value !== `${f.zulu}|${f.s2}`
+      || !/^S2 2027\b/.test(startBar.prog.label)) {
+      throw new Error(`[${L}] (M) did not begin on active S2: ${JSON.stringify(startBar)}`);
+    }
+
+    // The League change is driven by REAL keyboard activation -- Tab to the
+    // control (through the genuine tab order, with a browser-computed visible
+    // focus indicator) then native <select> type-ahead, "S" for "Solo League",
+    // the only option whose label starts with S. This is deliberately NOT
+    // page.selectOption: the browser itself resolves the keystroke into a
+    // selection and fires a genuine `change` event, so if the onchange wiring
+    // is ever removed the DOM value would still move (type-ahead needs no JS)
+    // while nothing below would ever commit -- the assertions fail, as they
+    // must. Consistent with (I) above.
+    await tabToSelect(page, "#ctx-league-select", 200);
+    await page.keyboard.press("S");
+    await page.waitForFunction((v) => document.getElementById("ctx-league-select").value === v,
+      f.solo, { timeout: 10000 });
+    await agreeOnS1Solo("after the keyboard-driven League change");
+    // The canonical MOVE is a success, not a recovered failure: the generic
+    // refusal toast must never have been shown for it.
+    const moveToast = (await page.locator("#toast-root").textContent()) || "";
+    if (/isn't available/i.test(moveToast)) {
+      throw new Error(`[${L}] (M) the canonical Season move surfaced a rejection toast: "${moveToast}"`);
+    }
+
+    // ...and all of it survives a full page load from scratch.
+    await reloadShell(page);
+    await enterSetupHub();
+    await page.waitForFunction((v) => document.getElementById("ctx-league-select").value === v,
+      f.solo, { timeout: 10000 });
+    await agreeOnS1Solo("after a full page reload");
+
+    // Finally the RENDERED SCREEN, which must not contradict the bar. The
+    // Division drawer seeds from the active (Season, League) through
+    // contextSeededDrawerValues and FAILS CLOSED (`leagueNotInSeason`, no
+    // drawer at all) when the active League is not in the active Season -- so
+    // if the bar said (S1, Solo) while the view still believed S2, this drawer
+    // would never open. That it opens seeded with exactly S1 + Solo League is
+    // the two halves agreeing, from the view's own independent lookup.
+    await page.click('[data-setup-workflow="participation"]');
+    await page.waitForFunction(
+      () => !!document.querySelector('[data-setup-workflow-act="division"]'), null, { timeout: 10000 });
+    await page.click('[data-setup-workflow-act="division"]');
+    await page.waitForSelector('.drawer[role="dialog"]', { timeout: 10000 });
+    const movedLeague = await page.$eval("#f-div-league", (el) => el.value).catch(() => null);
+    const movedSeason = await page.$eval("#f-div-season", (el) => el.value).catch(() => null);
+    if (movedLeague !== f.solo || movedSeason !== f.s1) {
+      throw new Error(`[${L}] (M) the view contradicts the context bar -- Division drawer seeded `
+        + `league=${movedLeague} season=${movedSeason}, expected league=${f.solo} season=${f.s1}`);
+    }
+    await page.keyboard.press("Escape");
+    // The bar itself is still on the canonical tuple after all that screen
+    // work -- no surface drifted back to the requested-but-not-canonical S2.
+    await agreeOnS1Solo("after exercising the rendered screen");
+
     if (errors.length) throw new Error(`[${L}] console/page errors:\n${errors.join("\n")}`);
-    console.log(`[${L}] OK — render, persist/round-trip, dual-Season carry-forward, atomic rejection, `
-      + `explicit No League, cross-Program clear, v1/bogus hash handling, keyboard, drawer seeding, no overflow `
-      + `(incl. max-permission roles with an active League).`);
+    console.log(`[${L}] OK — render, persist/round-trip, dual-Season carry-forward, atomic rejection of the `
+      + `ambiguous case, server-owned canonical Season move (S2 -> S1) agreed by server/both controls/hash/`
+      + `reload/rendered screen, explicit No League, cross-Program clear, v1/bogus hash handling, keyboard, `
+      + `drawer seeding, no overflow (incl. max-permission roles with an active League).`);
   } catch (error) {
     throw new Error(`${error.message}\n--- server output ---\n${out}`);
   } finally {

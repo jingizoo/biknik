@@ -49,6 +49,7 @@ from ..domain import ActiveContext, SeasonStatus
 from ..domain.errors import (
     ConcurrencyConflictError, NotFoundError, ValidationError)
 from . import context_scope
+from .league_scope import exact_league_season_or_conflict
 
 # The context authorization + selection runs under one SERIALIZABLE snapshot so a
 # request can never observe a hybrid of pre- and post-revocation scope (#159). A
@@ -323,6 +324,84 @@ class ContextService:
                     _detached(sel_league))
         return self._snapshot(work)
 
+    # Every League-selection refusal uses this ONE message/reason, whatever the
+    # underlying cause (#364 owner ruling): nonexistent, cross-Program,
+    # unauthorized, deleted, archived-only, unbound, revoked, or ambiguous. The
+    # sameness is the security property -- distinguishing them would turn the
+    # context bar into an existence oracle for records the caller may not see.
+    _LEAGUE_REFUSED = ("League not found or not accessible for this context.",
+                       {"reason": "league_not_accessible"})
+
+    def _canonical_league_season(self, role, scope, user_id, program_id,
+                                 season_id, league_id):
+        """The SERVER-owned canonical ``(season_id, league)`` for a League
+        selection — MUST run inside the transaction (#364 owner ruling).
+
+        The browser submits League *intent* only; it never infers a binding and
+        never reads one out of global overview data. Resolution here is the sole
+        authority, in the ruling's exact order:
+
+        1. the current Season is kept when it is itself a valid binding for the
+           selected League;
+        2. otherwise, when the League has EXACTLY ONE valid authorized ACTIVE
+           Season binding in this Program, move atomically to that Season;
+        3. zero valid bindings, or several with the current Season not among
+           them, refuse generically with zero mutation.
+
+        Rule 3 deliberately does NOT tie-break. A deterministic pick (first by
+        date/id) would silently move an operator into a Season they never chose
+        and never saw — the same invisible-default class of defect as the
+        wrong-Program writes this module already exists to prevent.
+
+        ARCHIVED Seasons are never auto-selected by rule 2, matching
+        ``_fallback``'s own existing rule: an archived Season is honored when it
+        is *explicitly* chosen (read-only history) but is never something the
+        system moves you into on your behalf. An archived-only League therefore
+        refuses via rule 3, indistinguishably from any other refusal.
+        """
+        # Program-scoped authorization first, WITHOUT Season narrowing: this is
+        # what makes cross-Program / unauthorized / deleted collapse into the
+        # single non-oracle refusal before any binding is considered.
+        allowed = context_scope.authorized_league_ids(
+            self.store, role, scope, program_id, user_id)
+        league = self.store.get_league(league_id)
+        if league_id not in allowed or league is None:
+            raise NotFoundError(*self._LEAGUE_REFUSED)
+
+        # -- rule 1: keep the current Season when it genuinely binds ----------
+        if season_id is not None:
+            binding, conflicts = exact_league_season_or_conflict(
+                self.store, league_id, season_id)
+            if binding is not None:
+                return season_id, league
+            if conflicts:
+                # Duplicate rows at one exact (league, season) key is corrupted
+                # state; never let insertion order decide a committed context.
+                raise NotFoundError(*self._LEAGUE_REFUSED)
+
+        # -- rule 2: exactly one valid authorized ACTIVE binding --------------
+        authorized_seasons = context_scope.authorized_season_ids(
+            self.store, role, scope, program_id, user_id)
+        candidates = {}
+        for ls in self.store.league_seasons_for_league(league_id):
+            if ls.season_id not in authorized_seasons:
+                continue          # outside this caller's scope, or another Program
+            candidate = self.store.get_season(ls.season_id)
+            if candidate is None or candidate.status == SeasonStatus.ARCHIVED:
+                continue          # deleted, or read-only history (never auto-entered)
+            # Re-resolved through the exact-key primitive so an ambiguous
+            # binding cannot contribute a candidate.
+            exact, dupes = exact_league_season_or_conflict(
+                self.store, league_id, candidate.id)
+            if exact is None or dupes:
+                continue
+            candidates[candidate.id] = candidate
+        if len(candidates) == 1:
+            return next(iter(candidates)), league
+
+        # -- rule 3: zero, or ambiguous -> refuse, mutate nothing -------------
+        raise NotFoundError(*self._LEAGUE_REFUSED)
+
     def set_with_league(self, user_id: Optional[str], role, scope,
                         program_id, season_id, league_id=None):
         """Record a Program/Season/League selection and return the exact
@@ -340,9 +419,16 @@ class ContextService:
         see. That single reason is the point: distinguishing them would leak
         exactly what the scope rules exist to hide.
 
-        When both a Season and a League are given they must name an EXISTING
-        ``LeagueSeason``. This never creates one: an unbound pair is refused, and
-        binding a League to a Season stays the authorized, audited job of
+        When both a Season and a League are given, the SERVER resolves the
+        canonical tuple (#364 owner ruling) via :meth:`_canonical_league_season`
+        — keeping the current Season when it binds, else moving atomically to
+        the League's single valid authorized active Season binding, else
+        refusing with zero mutation. **The returned Season may therefore differ
+        from the requested one**, and callers must render only what is returned
+        rather than what they sent.
+
+        This never CREATES a binding: an unbound pair is refused, and binding a
+        League to a Season stays the authorized, audited job of
         ``setup_service.create_league_season``.
         """
         if not user_id:
@@ -353,6 +439,14 @@ class ContextService:
                                   {"reason": "field_required"})
 
         def work():
+            # `sid` is a LOCAL working copy of the requested season_id, never a
+            # rebinding of the enclosing parameter. Two reasons, both real:
+            # assigning the closure variable would make Python treat it as local
+            # throughout `work` (an UnboundLocalError on the reads above), and
+            # `_snapshot` RE-RUNS `work` on a serialization conflict — a mutated
+            # season_id would make the retry resolve from the already-resolved
+            # Season instead of the operator's original request.
+            sid = season_id
             programs = context_scope.authorized_program_ids(
                 self.store, role, scope, user_id)
             program = (self.store.get_program(program_id)
@@ -361,32 +455,54 @@ class ContextService:
                 raise NotFoundError("Program not found or not accessible.",
                                     {"reason": "program_not_accessible"})
             season = None
-            if season_id is not None:
+            if sid is not None:
                 seasons = context_scope.authorized_season_ids(
                     self.store, role, scope, program_id, user_id)
-                season = self.store.get_season(season_id)
-                if season_id not in seasons or season is None:
+                season = self.store.get_season(sid)
+                if sid not in seasons or season is None:
                     raise NotFoundError("Season not found or not accessible.",
                                         {"reason": "season_not_accessible"})
             league = None
-            if league_id is not None:
-                # `authorized_league_ids` already restricts to Leagues under this
-                # Program (cross-Program rejection by construction) and, with a
-                # Season, to those carrying an exact existing binding — resolved
-                # fail-closed, so an ambiguous duplicate refuses rather than
-                # picking a winner. One membership test therefore covers
-                # nonexistent / cross-Program / unauthorized / unbound alike, and
-                # they are indistinguishable to the caller by design.
+            if league_id is not None and sid is not None:
+                # SERVER-owned canonical resolution (#364 owner ruling). The
+                # selected Season may legitimately change here — a League bound
+                # only to another Season is a VALID choice the operator is
+                # allowed to make, and refusing it (the prior behavior) left the
+                # primary League control unable to commit. Every refusal path
+                # raises before the write below, so a rejected selection mutates
+                # nothing.
+                resolved_sid, league = self._canonical_league_season(
+                    role, scope, user_id, program_id, sid, league_id)
+                if resolved_sid != sid:
+                    # Re-validate the Season we are MOVING TO through the same
+                    # authorization gate the requested one passed, so an atomic
+                    # move can never land somewhere the caller may not go.
+                    seasons = context_scope.authorized_season_ids(
+                        self.store, role, scope, program_id, user_id)
+                    moved = self.store.get_season(resolved_sid)
+                    if resolved_sid not in seasons or moved is None:
+                        raise NotFoundError(*self._LEAGUE_REFUSED)
+                    sid, season = resolved_sid, moved
+            elif league_id is not None:
+                # Program-only + League: no Season is selected, so there is no
+                # binding to satisfy and nothing to move. Deliberately NOT
+                # auto-selecting a Season here — Program-only is a first-class
+                # state, and inventing a Season for an operator who explicitly
+                # has none would be exactly the "chose on their behalf" the
+                # ruling forbids for the ambiguous case. Flagged for the owner
+                # in this PR rather than decided silently.
                 allowed = context_scope.authorized_league_ids(
-                    self.store, role, scope, program_id, user_id,
-                    season_id=season_id)
+                    self.store, role, scope, program_id, user_id)
                 league = self.store.get_league(league_id)
                 if league_id not in allowed or league is None:
-                    raise NotFoundError(
-                        "League not found or not accessible for this context.",
-                        {"reason": "league_not_accessible"})
+                    raise NotFoundError(*self._LEAGUE_REFUSED)
+            # One write, of the CANONICAL tuple. Validation and this write share
+            # the single serializable snapshot `_snapshot` opened around `work`,
+            # so a concurrent unbind / archive / revocation / competing context
+            # write either orders wholly before this (and is seen, and refuses)
+            # or wholly after it — never a half-applied or stale tuple.
             self.store.set_active_context(ActiveContext(
-                id=user_id, program_id=program_id, season_id=season_id,
+                id=user_id, program_id=program_id, season_id=sid,
                 updated_at=self.clock(), league_id=league_id))
             return (_detached(program), _detached(season), _detached(league))
 

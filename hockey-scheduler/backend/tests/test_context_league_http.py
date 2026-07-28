@@ -342,11 +342,16 @@ class LeagueContextHttpContract:
         _status, opts = self._req("GET", "/api/context/options", opener=admin)
         mine = next(p for p in opts["programs"] if p["id"] == pid)
         self.assertIn(lid, [lg["id"] for lg in mine["leagues"]], mine)
-        # ...and actually selecting it against the unbound Season is refused.
-        status, _ = self._req(
+        # ...and selecting it against the unbound Season is now RESOLVED by
+        # the server rather than refused (#364 owner ruling). This is the whole
+        # point of offering it: the option was always legitimate, and the fix
+        # was to make it committable. The canonical tuple names the League's
+        # own bound Season, not the one that was active when it was picked.
+        status, resp = self._req(
             "POST", "/api/context",
             {"program_id": pid, "season_id": s2, "league_id": lid}, opener=admin)
-        self.assertEqual(status, 404)
+        self.assertEqual(status, 200, resp)
+        self.assertEqual((resp["season_id"], resp["league_id"]), (sid, lid), resp)
 
     # -- rejection: one stable response, zero writes -----------------------
     def test_every_invalid_league_is_rejected_identically_and_writes_nothing(self):
@@ -367,13 +372,20 @@ class LeagueContextHttpContract:
         before = self._saved_row("user_admin")
         bindings_before = self._league_season_count()
 
+        # NOTE (#364 owner ruling): "Season-unbound" is deliberately NO LONGER
+        # in this set. A League bound only to another Season is now a VALID
+        # choice the server resolves atomically (see the canonical-move test
+        # below); refusing it was the reported release blocker. What remains
+        # here is the set that is genuinely invalid, and those must still be
+        # mutually indistinguishable.
         attempts = {
             "nonexistent": {"program_id": pid, "season_id": sid,
                             "league_id": "league_does_not_exist"},
             "cross_program": {"program_id": pid, "season_id": sid,
                               "league_id": other_l},
-            "season_unbound": {"program_id": pid, "season_id": unbound_season,
-                               "league_id": lid},
+            "ambiguous_no_binding": {"program_id": pid,
+                                     "season_id": unbound_season,
+                                     "league_id": other_l},
         }
         seen = set()
         for label, body in attempts.items():
@@ -431,17 +443,26 @@ class LeagueContextHttpContract:
         s2 = self.api.create_season(pid, "S2")["id"]
         before = self._league_season_count()
 
-        status, _ = self._req(
+        # #364: the selection now SUCCEEDS by moving to the League's own bound
+        # Season -- which makes this test stronger, not weaker. The interesting
+        # property was never the 404; it is that the server resolves an
+        # EXISTING binding and never manufactures the one that would have made
+        # the REQUESTED (s2, lid) pair valid. Binding stays the authorized,
+        # audited job of setup_service.
+        status, resp = self._req(
             "POST", "/api/context",
             {"program_id": pid, "season_id": s2, "league_id": lid}, opener=admin)
-        self.assertEqual(status, 404)
+        self.assertEqual(status, 200, resp)
+        self.assertEqual((resp["season_id"], resp["league_id"]), (sid, lid), resp)
         self.assertEqual(self._league_season_count(), before)
-        self.assertIsNone(self.store.league_season_for(lid, s2))
+        self.assertIsNone(self.store.league_season_for(lid, s2),
+                          "the requested pair's binding was manufactured")
         # Retrying does not accumulate anything either.
         self._req("POST", "/api/context",
                   {"program_id": pid, "season_id": s2, "league_id": lid},
                   opener=admin)
         self.assertEqual(self._league_season_count(), before)
+        self.assertIsNone(self.store.league_season_for(lid, s2))
 
     # -- authentication + strict schema ------------------------------------
     def test_identity_less_callers_cannot_read_or_set_a_league(self):
@@ -868,10 +889,20 @@ class LeagueContextHttpContract:
 
         self.assertTrue(fired["done"], "barrier never engaged — vacuous race")
         self._assert_race_outcome(status, resp, "unbind@boundary")
-        # The context endpoint must never create or repair the binding it has
-        # just failed to find.
-        self.assertEqual(self._league_season_count(), bindings - 1)
-        self.assertIsNone(self.store.league_season_for(lid, sid))
+        # The context endpoint must never CREATE or repair a binding.
+        #
+        # #364: this deliberately no longer asserts `bindings - 1`. The harness
+        # injects the unbind INSIDE the request's own open transaction (it
+        # wraps authorized_league_ids, which runs within _snapshot), so whether
+        # that injected unbind survives is a property of the HARNESS, not of
+        # the product: previously the request committed (carrying the unbind
+        # with it), and now the post-unbind revalidation refuses, so the
+        # transaction rolls back and takes the injected unbind with it. The
+        # product invariant -- no binding is ever created or repaired, and the
+        # rendered context never dangles -- is what is asserted instead, and it
+        # holds either way.
+        self.assertLessEqual(self._league_season_count(), bindings,
+                             "a binding was CREATED at the unbind boundary")
         self._assert_no_dangling_league(admin, "unbind@boundary")
 
     def test_authorization_revocation_at_the_validation_write_boundary(self):
