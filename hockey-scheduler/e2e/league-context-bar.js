@@ -760,11 +760,81 @@ async function checkCore(browser, viewport) {
     // work -- no surface drifted back to the requested-but-not-canonical S2.
     await agreeOnS1Solo("after exercising the rendered screen");
 
+    // (N) The PROGRAM-ONLY path through the same canonical contract (#364
+    // re-review). Reachable from the shipped UI and previously the one branch
+    // that bypassed resolution entirely: choosing "Program overview (no
+    // season)" and then a League used to persist (Program, null, League) --
+    // an ACTIVE LEAGUE WITH NO BINDING behind it. With no current Season rule
+    // 1 cannot match, so rule 2 must take the unique valid binding.
+    //
+    // Deliberately reuses agreeOnS1Solo: the canonical end state is the SAME
+    // tuple (S1, Solo League) whether it was reached from active S2 or from a
+    // null Season. Two entry paths, one canonical destination -- which is the
+    // property the ruling actually asserts.
+    // Reaching a GENUINE Program-only state takes two steps, and the reason is
+    // itself worth pinning: a same-Program Season change CARRIES the active
+    // League forward, so picking "Program overview" while Solo League is active
+    // posts (Program, null, Solo) -- which now canonicalizes straight back to
+    // (S1, Solo). Correct, but it means the League must be cleared FIRST.
+    await page.selectOption("#ctx-league-select", "")
+      .catch(() => { throw new Error(`[${L}] (N) could not select "No League"`); });
+    await waitForContext(page, (c) => c.league_id === null,
+      `[${L}] (N) "No League" did not clear the active League`);
+    await page.selectOption("#ctx-select", `${f.zulu}|`);
+    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
+      `${f.zulu}|`, { timeout: 10000 })
+      .catch(() => { throw new Error(`[${L}] (N) the Season control never settled on Program-only`); });
+    await waitForContext(page, (c) => c.program_id === f.zulu && c.season_id === null
+      && c.league_id === null,
+      `[${L}] (N) setup did not land on a genuine Program-only context`);
+
+    // Real keyboard again: Tab to the League control, type-ahead "S".
+    await tabToSelect(page, "#ctx-league-select", 200);
+    await page.keyboard.press("S");
+    await page.waitForFunction((v) => document.getElementById("ctx-league-select").value === v,
+      f.solo, { timeout: 10000 })
+      .catch(() => { throw new Error(`[${L}] (N) the League control never reached Solo League by keyboard`); });
+    await agreeOnS1Solo("after a Program-only keyboard League pick");
+    const programOnlyToast = (await page.locator("#toast-root").textContent()) || "";
+    if (/isn't available/i.test(programOnlyToast)) {
+      throw new Error(`[${L}] (N) the Program-only canonicalization surfaced a rejection toast: `
+        + `"${programOnlyToast}"`);
+    }
+    await reloadShell(page);
+    await enterSetupHub();
+    await page.waitForFunction((v) => document.getElementById("ctx-league-select").value === v,
+      f.solo, { timeout: 10000 });
+    await agreeOnS1Solo("after reloading the Program-only canonicalization");
+
+    // ...and the AMBIGUOUS Program-only pick is refused rather than guessed:
+    // Dual League binds two Seasons, so from a null Season there is no unique
+    // candidate. The prior canonical tuple must survive completely.
+    // Same two-step as above, and for the same reason: clear the League first,
+    // or the carry-forward canonicalizes right back to (S1, Solo).
+    await page.selectOption("#ctx-league-select", "");
+    await waitForContext(page, (c) => c.league_id === null,
+      `[${L}] (N) could not clear the League before the ambiguous pick`);
+    await page.selectOption("#ctx-select", `${f.zulu}|`);
+    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
+      `${f.zulu}|`, { timeout: 10000 })
+      .catch(() => { throw new Error(`[${L}] (N) Season control never settled on Program-only (ambiguous setup)`); });
+    await page.selectOption("#ctx-league-select", f.dual);
+    await page.waitForFunction(() => {
+      const t = document.getElementById("toast-root");
+      return t && /isn't available/i.test(t.textContent || "");
+    }, null, { timeout: 10000 });
+    const afterAmbiguous = await ctxNow(page);
+    if (afterAmbiguous.league_id === f.dual) {
+      throw new Error(`[${L}] (N) an ambiguous Program-only League pick was committed: `
+        + `${JSON.stringify(afterAmbiguous)}`);
+    }
+
     if (errors.length) throw new Error(`[${L}] console/page errors:\n${errors.join("\n")}`);
     console.log(`[${L}] OK — render, persist/round-trip, dual-Season carry-forward, atomic rejection of the `
       + `ambiguous case, server-owned canonical Season move (S2 -> S1) agreed by server/both controls/hash/`
       + `reload/rendered screen, explicit No League, cross-Program clear, v1/bogus hash handling, keyboard, `
-      + `drawer seeding, no overflow (incl. max-permission roles with an active League).`);
+      + `drawer seeding, Program-only canonicalization + its ambiguous refusal, no overflow `
+      + `(incl. max-permission roles with an active League).`);
   } catch (error) {
     throw new Error(`${error.message}\n--- server output ---\n${out}`);
   } finally {

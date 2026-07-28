@@ -319,11 +319,15 @@ class CanonicalLeagueContextHttpContract:
                          "a bound current Season must be kept")
         self._assert_agrees(admin, resp, "keep-current")
 
-    def test_program_only_with_a_league_does_not_auto_select_a_season(self):
-        """Program-only is a first-class state: sending ``season_id: null`` with
-        a League validates the League under the Program and leaves the Season
-        null. Inventing one would be exactly the "chose on the operator's
-        behalf" the ruling forbids."""
+    def test_program_only_with_a_league_canonicalizes_over_http(self):
+        """``season_id: null`` + a League is canonicalized like any other League
+        selection (#364 re-review), through the real authenticated boundary.
+
+        **Reversed from an earlier revision** which asserted the null Season was
+        left as-is. That codified the defect: it let the endpoint persist and
+        render an active League with no `LeagueSeason` behind it. Rule 1 cannot
+        match without a current Season, so rule 2 takes the unique valid
+        binding."""
         admin = self._login("admin")
         pid, s1, s2, gold = self._world()
 
@@ -332,8 +336,37 @@ class CanonicalLeagueContextHttpContract:
             {"program_id": pid, "season_id": None, "league_id": gold},
             opener=admin)
         self.assertEqual(status, 200, resp)
-        self.assertEqual(self._triple(resp), (pid, None, gold), resp)
+        self.assertEqual(self._triple(resp), (pid, s1, gold), resp)
         self._assert_agrees(admin, resp, "program-only-league")
+
+    def test_program_only_with_an_ambiguous_league_is_refused_over_http(self):
+        """Rule 3 from a null Season: several valid bindings and no current
+        Season to prefer must refuse generically and mutate nothing."""
+        admin = self._login("admin")
+        pid, s1, s2, gold = self._world()
+        # Bind Gold to BOTH seasons, so a null Season has no unique candidate.
+        self.api.setup.create_league_season(gold, s2)
+        ok, base = self._req(
+            "POST", "/api/context",
+            {"program_id": pid, "season_id": s1, "league_id": gold}, opener=admin)
+        self.assertEqual(ok, 200, base)
+        before = self.store.get_active_context(ADMIN_USER)
+
+        status, resp = self._req(
+            "POST", "/api/context",
+            {"program_id": pid, "season_id": None, "league_id": gold},
+            opener=admin)
+        self.assertEqual(status, 404, resp)
+        self.assertEqual(resp["error"]["details"].get("reason"),
+                         "league_not_accessible", resp)
+        after = self.store.get_active_context(ADMIN_USER)
+        # updated_at included deliberately: a compensating "rewrite the same
+        # values with a fresh clock" is invisible to the id triple alone.
+        self.assertEqual(
+            (after.program_id, after.season_id, after.league_id, after.updated_at),
+            (before.program_id, before.season_id, before.league_id,
+             before.updated_at),
+            "an ambiguous Program-only League selection mutated the saved row")
 
     def test_an_explicitly_chosen_archived_season_and_league_still_commits(self):
         """Archived is never AUTO-entered, but an explicit archived pair remains
@@ -372,8 +405,16 @@ class CanonicalLeagueContextHttpContract:
                          "league_id": gold}, (pid, s1, gold)),
             ("ambiguous-refused", {"program_id": pid, "season_id": s3,
                                    "league_id": silver}, None),
-            ("program-only", {"program_id": pid, "season_id": None,
-                              "league_id": silver}, (pid, None, silver)),
+            # #364 re-review: a null Season is canonicalized like any other
+            # League selection. `silver` binds BOTH s1 and s2, so from a null
+            # Season it is genuinely ambiguous and must refuse; `gold` binds
+            # only s1, so it resolves to that unique binding. Covering both
+            # here is what proves the null-Season path runs the SAME rules
+            # rather than a permissive shortcut.
+            ("program-only-ambiguous", {"program_id": pid, "season_id": None,
+                                        "league_id": silver}, None),
+            ("program-only-unique", {"program_id": pid, "season_id": None,
+                                     "league_id": gold}, (pid, s1, gold)),
             ("clear-all", {"program_id": pid, "season_id": s2}, (pid, s2, None)),
         ]
         last_good = None

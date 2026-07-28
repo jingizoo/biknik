@@ -491,11 +491,18 @@ class LeagueContextRevocationRaceTest(_RaceAssertions, unittest.TestCase):
                     self.assertEqual(_reason(out["error"]),
                                      "league_not_accessible",
                                      (backend.label, repr(out["error"])))
-                # Exactly two consistent rows: the untouched prior selection, or
-                # the League that WAS authorized when it committed.
+                # Exactly two consistent rows: the untouched prior selection,
+                # or the League that WAS authorized when it committed.
+                #
+                # #364 re-review: the committed row is now (pid, S1, gold), NOT
+                # (pid, None, gold). A null Season no longer bypasses canonical
+                # resolution -- rule 2 takes Gold's unique valid binding -- so a
+                # commit through this race lands the whole canonical tuple. The
+                # prior selection remains genuinely Program-only because it was
+                # made with no League at all.
                 self.assertIn(
                     self._triple(row),
-                    ((w["pid"], None, None), (w["pid"], None, w["gold"])),
+                    ((w["pid"], None, None), (w["pid"], w["sid"], w["gold"])),
                     f"{backend.label}: persisted {self._triple(row)}")
                 # Gold is out of scope by read time, so it must not resolve —
                 # whether or not it is still sitting in the saved row.

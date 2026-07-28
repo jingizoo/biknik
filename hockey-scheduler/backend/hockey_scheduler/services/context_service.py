@@ -463,14 +463,30 @@ class ContextService:
                     raise NotFoundError("Season not found or not accessible.",
                                         {"reason": "season_not_accessible"})
             league = None
-            if league_id is not None and sid is not None:
-                # SERVER-owned canonical resolution (#364 owner ruling). The
-                # selected Season may legitimately change here — a League bound
-                # only to another Season is a VALID choice the operator is
-                # allowed to make, and refusing it (the prior behavior) left the
-                # primary League control unable to commit. Every refusal path
-                # raises before the write below, so a rejected selection mutates
-                # nothing.
+            if league_id is not None:
+                # SERVER-owned canonical resolution (#364 owner ruling), for
+                # EVERY non-null League — including `sid is None`.
+                #
+                # #364 re-review: this deliberately no longer special-cases the
+                # Program-only path. An earlier revision skipped canonicalization
+                # when no Season was selected, on the reasoning that Program-only
+                # is a first-class state and picking a Season for the operator
+                # would be "choosing on their behalf". That was wrong, for a
+                # reason worth keeping written down: the ruling applies whenever
+                # a LEAGUE is selected. With no current Season rule 1 simply
+                # cannot match, so rule 2 must take the unique valid binding
+                # (a unique binding is not a guess) and rule 3 must reject the
+                # zero/ambiguous cases. Skipping it let the context persist and
+                # render an ACTIVE LEAGUE WITH NO `LeagueSeason` AT ALL, which
+                # is precisely the canonical-tuple invariant #367 and #365 are
+                # built on. It was reachable from the shipped UI: pick "Program
+                # overview (no season)", then pick a League.
+                #
+                # Program-only stays first-class only where it is genuinely
+                # Program-only -- i.e. when `league_id` is null too, which never
+                # enters this branch. An explicitly supplied archived Season
+                # still behaves as before (honored read-only history), because
+                # that is rule 1's exact-binding path, not rule 2's auto-move.
                 resolved_sid, league = self._canonical_league_season(
                     role, scope, user_id, program_id, sid, league_id)
                 if resolved_sid != sid:
@@ -483,19 +499,6 @@ class ContextService:
                     if resolved_sid not in seasons or moved is None:
                         raise NotFoundError(*self._LEAGUE_REFUSED)
                     sid, season = resolved_sid, moved
-            elif league_id is not None:
-                # Program-only + League: no Season is selected, so there is no
-                # binding to satisfy and nothing to move. Deliberately NOT
-                # auto-selecting a Season here — Program-only is a first-class
-                # state, and inventing a Season for an operator who explicitly
-                # has none would be exactly the "chose on their behalf" the
-                # ruling forbids for the ambiguous case. Flagged for the owner
-                # in this PR rather than decided silently.
-                allowed = context_scope.authorized_league_ids(
-                    self.store, role, scope, program_id, user_id)
-                league = self.store.get_league(league_id)
-                if league_id not in allowed or league is None:
-                    raise NotFoundError(*self._LEAGUE_REFUSED)
             # One write, of the CANONICAL tuple. Validation and this write share
             # the single serializable snapshot `_snapshot` opened around `work`,
             # so a concurrent unbind / archive / revocation / competing context
