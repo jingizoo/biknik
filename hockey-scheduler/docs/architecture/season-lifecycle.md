@@ -171,21 +171,44 @@ again. "Which team does this caller act for" is resolved by
 use, so the two gates can never drift; `context_scope` adds only the new
 Program/Season projection on top of that shared identity.
 
-- **`GET /api/context`** → the effective `{program_id, season_id, read_only,
-  program, season}`: the saved selection when its Program is still authorized+
-  present and its Season (if any) still authorized+present; else a deterministic
-  authorized fallback; else empty. Fallback prefers an authorized **active**
-  Season (chosen by **semantically parsed** start_date — latest wins, id
-  tiebreak, a null date never beats a dated one), and otherwise a **Program-only**
-  context (null Season) so new/empty Programs remain selectable. `read_only` is
-  true iff the resolved Season is archived.
-- **`POST /api/context`** `{program_id, season_id?}` (strict body: `program_id`
-  required, `season_id` optional/nullable, no unknown fields) records a
-  selection. `season_id` may be null (Program-only). An **archived** Season is
+- **`GET /api/context`** → the effective `{program_id, season_id, league_id,
+  read_only, program, season, league}`: the saved selection when its Program is
+  still authorized+present and its Season (if any) still authorized+present; else
+  a deterministic authorized fallback; else empty. Fallback prefers an authorized
+  **active** Season (chosen by **semantically parsed** start_date — latest wins,
+  id tiebreak, a null date never beats a dated one), and otherwise a
+  **Program-only** context (null Season) so new/empty Programs remain selectable.
+  `read_only` is true iff the resolved Season is archived.
+
+  `league_id`/`league` are the **third axis** (#345, wired to HTTP by #360),
+  added **additively**: both keys are ALWAYS present, so a client never has to
+  distinguish "absent" from "null", and the Program/Season half is byte-identical
+  to the pre-#360 payload. A null League is a **first-class state** (Program-only,
+  and Season-without-League), never an error. The League resolves through
+  `ContextService.resolve_with_league`, under the *same* single serializable
+  snapshot as the other two axes, so it can never contradict the Program/Season
+  it is rendered beside.
+- **`POST /api/context`** `{program_id, season_id?, league_id?}` (strict body:
+  `program_id` required, `season_id`/`league_id` optional/nullable, no unknown
+  fields) records a selection. `season_id` may be null (Program-only). Omitting
+  `league_id` is **meaningful, not a no-op**: it selects "no League", which is
+  exactly what the pre-#360 two-field body always did — a League is never carried
+  onto a Program/Season it was not chosen for. An **archived** Season is
   accepted as a **read-only historical** context — honored, never silently
   swapped for an active one — while writes against it stay blocked by the Season
   read-only guard above. An unauthorized **or** non-existent Program/Season both
-  return the *same* generic `not_found` (no existence oracle). `set_active_context`
+  return the *same* generic `not_found` (no existence oracle).
+
+  A League is held to two extra rules, both enforced at selection time: it must
+  belong to the selected **Program**, and a Season+League pair must name an
+  **existing `LeagueSeason`** binding. Every invalid League — nonexistent,
+  cross-Program, unauthorized, deleted, Season-unbound, or **ambiguous** (a
+  duplicate binding fails closed rather than picking a winner) — returns ONE
+  indistinguishable `not_found`, for the same no-oracle reason as the other two
+  axes, and changes **zero** context rows. The endpoint resolves a `LeagueSeason`
+  strictly read-only: it **never creates or repairs** one, so a view preference
+  can never manufacture competition structure — binding stays the authorized,
+  audited job of `setup_service.create_league_season`. `set_active_context`
   is an atomic `INSERT .. ON CONFLICT (id) DO UPDATE`, so re-selecting the same
   context is idempotent and two concurrent first writes for one user both succeed
   (exactly one row, last-committed wins) rather than racing the primary key into a
@@ -239,15 +262,24 @@ next to the control in its normal closed state (not hidden inside a dropdown or 
 hover tooltip). It is one consistent control for every role.
 
 - **`GET /api/context/options`** → `{programs: [{id, name, seasons: [{id, name,
-  status, read_only, start_date}]}], selected: {program_id, season_id,
-  read_only}}`, filtered through the **same** `context_scope` rules as get/set
-  (`ContextService.options` runs under the same one serializable snapshot). So
+  status, read_only, start_date}], leagues: [{id, name}]}], selected:
+  {program_id, season_id, league_id, read_only}}`, filtered through the **same**
+  `context_scope` rules as get/set (`ContextService.options_with_league` runs
+  under the same one serializable snapshot). So
   the switcher only ever offers a context the caller could actually select — it
   never enumerates an unrelated Program/Season from the (unfiltered) overview.
   A **Program-overview (no-season)** choice is offered for **every** authorized
   Program — even when that Program has Seasons — in addition to one entry per
   authorized Season (archived ones flagged read-only). `selected` is guaranteed
   to be one of the options. Session-only, like the other context endpoints.
+
+  `leagues` (#345/#360) is **Program-scoped, not Season-scoped**, deliberately: a
+  League that exists under the Program but is not bound to the currently-selected
+  Season is still offered, because selecting it is a legitimate way to move to a
+  Season+League pair. The binding requirement is enforced at **selection time**,
+  where it can report a precise reason, rather than silently by omission here. A
+  League carries no `read_only` — that is a property of the Season's lifecycle,
+  not of the permanent League.
 - **One control, every role — a native `<select>`.** The switcher renders as a
   native `<select>` (grouped by Program via `<optgroup>` when more than one
   Program is authorized) so it gets the full keyboard / screen-reader contract —

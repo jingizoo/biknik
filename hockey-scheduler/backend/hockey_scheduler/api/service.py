@@ -178,39 +178,72 @@ class ApiService:
         self.guardians = GuardianService(self.store, self.roster.clock)
         self.context = ContextService(self.store, self.roster.clock)
 
-    # -- active Program/Season context (#159) ------------------------------
-    def _context_view(self, program, season) -> dict:
-        """Render the *exact* Program/Season the service validated in one
+    # -- active Program/Season/League context (#159, League axis #345) ------
+    def _context_view(self, program, season, league=None) -> dict:
+        """Render the *exact* Program/Season/League the service validated in one
         transactional snapshot — never a re-fetch. Each object is serialized
-        exactly ONCE, and every payload field (``program_id``/``season_id`` and
-        ``read_only``) is derived from that single serialized DTO, so they can
-        never disagree: a non-null id always has its object, and ``read_only``
-        always matches the serialized Season ``status``. The service also hands
-        back objects detached from the store's live rows, so even a concurrent
-        in-place archive/reopen cannot mutate them between these reads (#159)."""
+        exactly ONCE, and every payload field (``program_id``/``season_id``/
+        ``league_id`` and ``read_only``) is derived from that single serialized
+        DTO, so they can never disagree: a non-null id always has its object, and
+        ``read_only`` always matches the serialized Season ``status``. The service
+        also hands back objects detached from the store's live rows, so even a
+        concurrent in-place archive/reopen cannot mutate them between these
+        reads (#159).
+
+        ``league`` is the third axis (#345), added ADDITIVELY: it defaults to
+        None so the Program/Season rendering is byte-identical when no League is
+        selected, and ``league_id``/``league`` are simply null then. A null
+        League is a first-class state (Program-only, and Season-without-League),
+        never an error — so the two new keys are ALWAYS present, and only their
+        value varies."""
         program_dto = _serialize(program) if program else None
         season_dto = _serialize(season) if season else None
+        league_dto = _serialize(league) if league else None
         read_only = (season_dto is not None
                      and season_dto.get("status") == SeasonStatus.ARCHIVED.value)
         return {
             "program_id": program_dto["id"] if program_dto else None,
             "season_id": season_dto["id"] if season_dto else None,
+            "league_id": league_dto["id"] if league_dto else None,
             "read_only": read_only,
             "program": program_dto,
             "season": season_dto,
+            "league": league_dto,
         }
 
     @catch
     def get_active_context(self, user_id, role, scope) -> dict:
-        program, season = self.context.resolve(user_id, role, scope)
-        return self._context_view(program, season)
+        """The caller's active context, all three axes (#159, League #345).
+
+        Resolved through ``resolve_with_league``, whose Program/Season half is
+        documented to be exactly what the two-axis ``resolve`` returns for the
+        same arguments — so this stays a pure ADDITION to the payload, not a
+        change to the existing two axes. Deliberately ONE method rather than a
+        separate League-aware variant: a non-League read would have to render
+        ``league_id: null`` even for a user who HAS a League saved, which is
+        worse than not exposing it at all. All three come from one serializable
+        snapshot, so the League can never contradict the Program/Season beside
+        it."""
+        program, season, league = self.context.resolve_with_league(
+            user_id, role, scope)
+        return self._context_view(program, season, league)
 
     @catch
     def set_active_context(self, user_id, role, scope,
-                           program_id, season_id) -> dict:
-        program, season = self.context.set(
-            user_id, role, scope, program_id, season_id)
-        return self._context_view(program, season)
+                           program_id, season_id, league_id=None) -> dict:
+        """Record a Program/Season(/League) selection.
+
+        ``league_id`` is appended LAST and defaults to None (#345) so the
+        pre-existing five-positional-argument callers keep their exact meaning —
+        their fourth/fifth arguments stay program_id/season_id and can never be
+        silently reinterpreted. Passing None routes to the same written row the
+        two-axis ``ContextService.set`` produced (``league_id`` NULL), so the
+        legacy behavior — including CLEARING a previously-saved League rather
+        than carrying it onto a Program/Season it was not chosen for — is
+        preserved exactly."""
+        program, season, league = self.context.set_with_league(
+            user_id, role, scope, program_id, season_id, league_id)
+        return self._context_view(program, season, league)
 
     def _season_option(self, season) -> dict:
         """A Season as the switcher needs it: id + name + lifecycle, with the
@@ -224,25 +257,42 @@ class ApiService:
             "read_only": dto.get("status") == SeasonStatus.ARCHIVED.value,
         }
 
+    def _league_option(self, league) -> dict:
+        """A League as the switcher needs it: id + name. No ``read_only`` — that
+        is a property of the SEASON's lifecycle, not of the permanent League."""
+        dto = _serialize(league)
+        return {"id": dto["id"], "name": dto["name"]}
+
     @catch
     def get_context_options(self, user_id, role, scope) -> dict:
-        """The AUTHORIZED Program/Season options for the context switcher (#159),
-        filtered through the SAME scope rules as get/set — never the unfiltered
-        overview, so a scoped account can neither select nor enumerate an
-        unrelated context. Each Program lists only its authorized Seasons (active
-        + archived-as-read-only) and is itself Program-only-selectable. ``selected``
-        is the current resolved context, guaranteed to be one of these options."""
-        programs, sel_program, sel_season = self.context.options(
-            user_id, role, scope)
+        """The AUTHORIZED Program/Season/League options for the context switcher
+        (#159, League axis #345), filtered through the SAME scope rules as
+        get/set — never the unfiltered overview, so a scoped account can neither
+        select nor enumerate an unrelated context. Each Program lists only its
+        authorized Seasons (active + archived-as-read-only) and its authorized
+        Leagues, and is itself Program-only-selectable. ``selected`` is the
+        current resolved context, guaranteed to be one of these options.
+
+        ``leagues`` is Program-scoped, not Season-scoped — deliberately, and
+        documented on ``ContextService.options_with_league``: a League that
+        exists under the Program but is not bound to the currently-selected
+        Season is still OFFERED, because selecting it is a legitimate way to move
+        to a Season+League pair. The binding requirement is enforced at selection
+        time, where it can report a precise reason, rather than silently by
+        omission here."""
+        programs, sel_program, sel_season, sel_league = (
+            self.context.options_with_league(user_id, role, scope))
         return {
             "programs": [{
                 "id": _serialize(program)["id"],
                 "name": _serialize(program)["name"],
                 "seasons": [self._season_option(s) for s in seasons],
-            } for (program, seasons) in programs],
+                "leagues": [self._league_option(lg) for lg in leagues],
+            } for (program, seasons, leagues) in programs],
             "selected": {
                 "program_id": sel_program.id if sel_program else None,
                 "season_id": sel_season.id if sel_season else None,
+                "league_id": sel_league.id if sel_league else None,
                 "read_only": (sel_season is not None
                               and sel_season.status == SeasonStatus.ARCHIVED),
             },

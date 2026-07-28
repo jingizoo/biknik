@@ -147,6 +147,16 @@ def _assert_context_consistent(t, c, label):
         t.assertEqual(                                       # read_only ⟺ status
             c["read_only"],
             c["season"]["status"] == SeasonStatus.ARCHIVED.value, (label, c))
+    # The League axis (#345, wired by #360) obeys the same snapshot rule: it is
+    # resolved inside the SAME transaction as the other two and rendered from
+    # the object that was validated, so its id can never dangle either. A null
+    # League is legitimate (Program-only, Season-without-League, or a League the
+    # concurrent mutation invalidated), so only the pairing is asserted.
+    if c["league_id"] is None:
+        t.assertIsNone(c["league"], (label, c))
+    else:
+        t.assertIsNotNone(c["league"], (label, c))
+        t.assertEqual(c["league"]["id"], c["league_id"], (label, c))
 
 
 class ContextResolveSetTest(unittest.TestCase):
@@ -156,10 +166,14 @@ class ContextResolveSetTest(unittest.TestCase):
         for label, store in _backends():
             with self.subTest(backend=label):
                 api = ApiService(store)
+                # The empty context carries every axis as null — including the
+                # League added by #360. Asserted as the WHOLE dict on purpose:
+                # an unexpected extra key here would be a contract leak.
                 self.assertEqual(
                     api.get_active_context("u1", *ADMIN),
-                    {"program_id": None, "season_id": None, "read_only": False,
-                     "program": None, "season": None}, label)
+                    {"program_id": None, "season_id": None, "league_id": None,
+                     "read_only": False,
+                     "program": None, "season": None, "league": None}, label)
                 _close(store)
 
     def test_fallback_prefers_latest_active_season_semantically(self):
@@ -582,7 +596,8 @@ class ContextOptionsTest(unittest.TestCase):
                 self.assertEqual(o["programs"], [], (label, o))
                 self.assertEqual(
                     o["selected"],
-                    {"program_id": None, "season_id": None, "read_only": False},
+                    {"program_id": None, "season_id": None, "league_id": None,
+                     "read_only": False},
                     o)
                 _close(store)
 
@@ -662,15 +677,27 @@ class ContextSnapshotConsistencyTest(unittest.TestCase):
 
     def _mutate_after(self, api, method_name, mutate):
         """Land ``mutate`` right after the validated snapshot is produced — the
-        exact window a re-fetch would have observed a concurrent commit."""
+        exact window a re-fetch would have observed a concurrent commit.
+
+        Returns a ``fired`` dict the caller MUST assert on. Without that check
+        this helper fails open: if the facade stops calling ``method_name`` the
+        wrapper simply never runs, the mutation never lands, and the assertions
+        below all pass while proving nothing. That is exactly what happened when
+        #360 moved ``get``/``set_active_context`` onto the ``*_with_league``
+        entry points — the suite stayed green on a test that had gone vacuous.
+        A silently-vacuous race test is worse than a failing one, so the
+        non-vacuity check is part of the helper's contract now."""
         orig = getattr(api.context, method_name)
+        fired = {"done": False}
 
         def wrapper(*a, **k):
             r = orig(*a, **k)          # validated snapshot; its transaction closed
+            fired["done"] = True
             mutate()                   # concurrent-style commit lands NOW
             return r
 
         setattr(api.context, method_name, wrapper)
+        return fired
 
     def test_get_is_snapshot_consistent_under_concurrent_mutation(self):
         for kind in _MUTATIONS:
@@ -681,10 +708,12 @@ class ContextSnapshotConsistencyTest(unittest.TestCase):
                     if kind == "reopen":
                         _archive(store, sid)               # start archived → reopen
                     api.set_active_context("u", *ADMIN, pid, sid)
-                    self._mutate_after(api, "resolve",
-                                       _mutation(store, pid, sid, kind))
+                    fired = self._mutate_after(
+                        api, "resolve_with_league",
+                        _mutation(store, pid, sid, kind))
                     _assert_context_consistent(
                         self, api.get_active_context("u", *ADMIN), (kind, label))
+                    self.assertTrue(fired["done"], (kind, label))  # not vacuous
                     _close(store)
 
     def test_post_is_snapshot_consistent_and_grants_no_authority(self):
@@ -695,10 +724,12 @@ class ContextSnapshotConsistencyTest(unittest.TestCase):
                     pid, sid = _program_season(api, "P1", "S1")
                     if kind == "reopen":
                         _archive(store, sid)
-                    self._mutate_after(api, "set",
-                                       _mutation(store, pid, sid, kind))
+                    fired = self._mutate_after(
+                        api, "set_with_league",
+                        _mutation(store, pid, sid, kind))
                     c = api.set_active_context("u", *ADMIN, pid, sid)
                     _assert_context_consistent(self, c, (kind, label))
+                    self.assertTrue(fired["done"], (kind, label))  # not vacuous
                     # The stored preference is NOT rewritten by the race (it still
                     # records the user's exact choice — a dangling row grants no
                     # authority), and a later resolve renders a consistent view.
@@ -940,7 +971,14 @@ class ContextSnapshotConsistencyPgTest(unittest.TestCase):
         api = ApiService(reader)
         paused = threading.Event()
         release = threading.Event()
-        method = "resolve" if verb == "GET" else "set"
+        # Patch the seam the FACADE actually calls. Since #360 wired the League
+        # axis to HTTP, get/set_active_context go through the *_with_league
+        # entry points; patching the two-axis `resolve`/`set` would silently
+        # never fire, and this barrier would hang rather than fail loudly about
+        # the real cause. Pausing here still means exactly what it always did:
+        # after the service has validated and DETACHED its objects (its
+        # transaction closed), before the facade renders them.
+        method = "resolve_with_league" if verb == "GET" else "set_with_league"
         orig = getattr(api.context, method)
 
         def paused_boundary(*a, **k):

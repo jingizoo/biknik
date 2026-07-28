@@ -930,12 +930,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/demo/overview":
             return self._send_api(api.get_demo_overview())
         if path == "/api/context":
-            # The signed-in user's active Program/Season selection (#159),
-            # filtered through their real role/scope. Per-user, so it requires a
-            # real SESSION-backed account — never the operator permission gate
-            # (switching context grants nothing), but also never the identity-less
-            # demo X-Demo-Role / headerless-admin fallbacks (they have no user to
-            # own a context and must not enumerate one).
+            # The signed-in user's active Program/Season/League selection (#159,
+            # League axis #345), filtered through their real role/scope.
+            # Per-user, so it requires a real SESSION-backed account — never the
+            # operator permission gate (switching context grants nothing), but
+            # also never the identity-less demo X-Demo-Role / headerless-admin
+            # fallbacks (they have no user to own a context and must not
+            # enumerate one).
             role, scope, user_id, err = self._resolve_role()
             if err is not None:
                 code, payload = err
@@ -946,10 +947,11 @@ class Handler(BaseHTTPRequestHandler):
                     "message": "A signed-in account is required."}}, 401)
             return self._send_api(api.get_active_context(user_id, role, scope))
         if path == "/api/context/options":
-            # The AUTHORIZED Program/Season options for the switcher (#159),
-            # filtered through the same role/scope rules as /api/context — so a
-            # scoped account can neither select nor enumerate an unrelated
-            # context. Same session-only gate (no identity-less demo fallbacks).
+            # The AUTHORIZED Program/Season/League options for the switcher
+            # (#159, League axis #345), filtered through the same role/scope
+            # rules as /api/context — so a scoped account can neither select nor
+            # enumerate an unrelated context. Same session-only gate (no
+            # identity-less demo fallbacks).
             role, scope, user_id, err = self._resolve_role()
             if err is not None:
                 code, payload = err
@@ -1880,13 +1882,20 @@ class Handler(BaseHTTPRequestHandler):
                 api.decline_substitute(gid, jid, actor_id=guid))
 
         if path == "/api/context":
-            # Set the signed-in user's active Program/Season (#159), filtered
-            # through their real role/scope. Per-user: requires a real SESSION-
-            # backed account (never the operator permission gate below, but also
-            # never the identity-less demo X-Demo-Role / headerless-admin
-            # fallbacks — they must fail authentication at the boundary, not reach
-            # the service with no identity). Strict body: program_id required,
-            # season_id optional and nullable (Program-only), no unknown fields.
+            # Set the signed-in user's active Program/Season/League (#159, League
+            # axis #345), filtered through their real role/scope. Per-user:
+            # requires a real SESSION-backed account (never the operator
+            # permission gate below, but also never the identity-less demo
+            # X-Demo-Role / headerless-admin fallbacks — they must fail
+            # authentication at the boundary, not reach the service with no
+            # identity). Strict body: program_id required; season_id and
+            # league_id optional and nullable, no unknown fields.
+            #
+            # league_id is ADDITIVE and its OMISSION is meaningful: a body
+            # without it selects "no League", exactly as the two-axis contract
+            # always behaved (a League is never carried onto a Program/Season it
+            # was not chosen for). It is deliberately NOT required, so every
+            # existing two-field caller keeps working byte-identically.
             role, scope, user_id, err = self._resolve_role()
             if err is not None:
                 code, payload = err
@@ -1896,15 +1905,18 @@ class Handler(BaseHTTPRequestHandler):
                     "code": "unauthorized",
                     "message": "A signed-in account is required."}}, 401)
             try:
-                check_body(body, allowed={"program_id", "season_id"},
+                check_body(body,
+                           allowed={"program_id", "season_id", "league_id"},
                            required=("program_id",),
                            types={"program_id": str,
-                                  "season_id": (str, type(None))})
+                                  "season_id": (str, type(None)),
+                                  "league_id": (str, type(None))})
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
             return self._send_api(api.set_active_context(
                 user_id, role, scope,
-                body.get("program_id"), body.get("season_id")))
+                body.get("program_id"), body.get("season_id"),
+                body.get("league_id")))
 
         # Authorize the acting role at the HTTP boundary (#24/#50). A session
         # cookie is authoritative; the X-Demo-Role header is a dev fallback.
