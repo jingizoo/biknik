@@ -13,19 +13,28 @@
 // and a plain code comment mentioning an unrelated pixel value never causes
 // a false positive.
 //
-// Deliberately narrow to this one stylesheet, matching the batch's own
-// scope — see this PR's description for the additional non-conforming
-// widths found in onboarding.css/setup.css, which are NOT covered here and
-// are flagged separately rather than silently fixed or silently ignored.
+// Scope: EVERY production stylesheet the app ships, not just styles.css.
+//
+// The earlier version deliberately scanned styles.css alone and recorded, in
+// this very comment, that onboarding.css and setup.css carried non-conforming
+// widths which were "flagged separately rather than silently fixed". That is
+// exactly how those two survived: a contract that names its own blind spot
+// still has the blind spot, and CI stayed green with 760px and 520px live in
+// shipped CSS. Both are retokenized now (720 and 480), and the checker covers
+// all four stylesheets so the gap cannot silently reopen.
 //
 // Self-tests its own extraction against synthetic fixtures before checking
-// the real file (same convention as check-v1-route-contract.js), so a
+// the real files (same convention as check-v1-route-contract.js), so a
 // broken checker fails loudly rather than silently passing everything.
 const fs = require("fs");
 const path = require("path");
 
-const STYLES_CSS = path.resolve(__dirname, "..", "backend", "hockey_scheduler",
-  "web", "static", "styles.css");
+const STATIC_DIR = path.resolve(__dirname, "..", "backend", "hockey_scheduler",
+  "web", "static");
+// Every stylesheet served to a browser. A new one added here without being
+// listed would escape the contract, so the list is asserted non-empty and
+// each entry is required to exist.
+const STYLESHEETS = ["styles.css", "web.css", "onboarding.css", "setup.css"];
 
 const APPROVED_WIDTHS = new Set([480, 720, 880, 1040]);
 
@@ -108,16 +117,43 @@ function selfTest() {
 
 function main() {
   selfTest();
-  const source = fs.readFileSync(STYLES_CSS, "utf8");
-  const violations = checkSource(source);
-  if (violations.length) {
-    console.error("Breakpoint contract violations in styles.css:");
-    violations.forEach((v) => console.error(`  - ${v}`));
+  if (!STYLESHEETS.length) {
+    console.error("Breakpoint contract: the stylesheet list is empty, so this "
+      + "check would pass vacuously.");
     process.exitCode = 1;
     return;
   }
-  console.log("Breakpoint contract OK — every @media width in styles.css " +
-    "is one of the four approved tokens (480/720/880/1040).");
+  const failures = [];
+  const inventory = [];
+  for (const name of STYLESHEETS) {
+    const file = path.join(STATIC_DIR, name);
+    if (!fs.existsSync(file)) {
+      // A listed-but-missing stylesheet means the list drifted from reality;
+      // failing loudly beats quietly checking three of four files.
+      failures.push(`${name}: listed in STYLESHEETS but not found on disk`);
+      continue;
+    }
+    const source = fs.readFileSync(file, "utf8");
+    checkSource(source).forEach((v) => failures.push(`${name}: ${v}`));
+    const widths = new Set();
+    extractMediaPreludes(source).forEach((prelude) => {
+      const re = /(?:min|max)-width\s*:\s*(\d+)px/g;
+      let m;
+      while ((m = re.exec(prelude))) widths.add(Number(m[1]));
+    });
+    inventory.push(`${name}: ${widths.size
+      ? [...widths].sort((a, b) => a - b).join(", ") : "(no width queries)"}`);
+  }
+  if (failures.length) {
+    console.error("Breakpoint contract violations:");
+    failures.forEach((v) => console.error(`  - ${v}`));
+    process.exitCode = 1;
+    return;
+  }
+  console.log("Breakpoint contract OK — every @media width in every shipped "
+    + "stylesheet is one of the four approved tokens (480/720/880/1040).");
+  console.log("Final query inventory:");
+  inventory.forEach((line) => console.log(`  ${line}`));
 }
 
 main();

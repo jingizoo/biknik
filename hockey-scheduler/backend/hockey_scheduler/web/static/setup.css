@@ -124,7 +124,15 @@ button:disabled {
 
 [hidden] { display: none !important; }
 
-@media (max-width: 520px) {
+/* 480 is the approved phone token (#345), retokenized from the old 520px.
+   This block is pure LAYOUT — the sign-in card goes full-bleed — so it needs
+   no non-layout exception. Retokenizing is not a no-op, and the effect is
+   bounded and stated rather than glossed: in the 481-520px band the card
+   keeps its border, radius and shadow inside the shell's padding instead of
+   going full-bleed. It cannot overflow there — the card is
+   `width: min(100%, 520px)` (a property, not a breakpoint), so at 481px it
+   renders 441px wide inside 20px shell padding. */
+@media (max-width: 480px) {
   .setup-shell { padding: 0; place-items: stretch; }
   .setup-card {
     min-height: 100vh;
