@@ -957,9 +957,9 @@ class LeagueContextHttpContract:
         PostgreSQL gets a second, INDEPENDENT connection — the only backend
         where another writer can actually commit while this request holds an
         open transaction. Memory/SQLite deliberately reuse the live store,
-        because that IS their real production shape: one process-wide store
-        shared by every request thread, serialized by one lock. Handing them a
-        second connection would fake a concurrency their engine does not have.
+        because that IS their production shape: one process-wide store shared
+        by every request thread, serialized by one lock. Handing them a second
+        connection would fake a concurrency their engine does not have.
         """
         if self.is_postgres():
             store = SqlStore(self.database_url())
@@ -967,23 +967,30 @@ class LeagueContextHttpContract:
             return store
         return self.store
 
-    def _competing_writer_race(self, do_request, mutate_with, label):
+    def _competing_writer_race(self, do_request, mutate, label):
         """Pause the request at the League validate->write seam, then run a REAL
-        second thread that tries to mutate concurrently.
+        second thread that mutates concurrently.
 
-        Returns ``(fired, wrote_while_paused, result)``. ``wrote_while_paused``
-        is the actual observed behaviour, not an assumption:
+        Three separate facts are established, because any one of them alone can
+        be satisfied vacuously:
 
-        * PostgreSQL, independent connection -> True. It really does commit
-          while the request sits mid-transaction, which is the only way to
-          exercise the serializable-snapshot path.
-        * Memory/SQLite -> False. The writer BLOCKS on the process lock and
-          cannot interleave. That is evidence of serialization rather than a
-          claim about it in a comment — the earlier version asserted this
-          property in prose and tested nothing.
+        1. the writer thread actually STARTED, and actually REACHED the point
+           immediately before its first locking store operation. Without this,
+           "it didn't finish in N seconds" is indistinguishable from "it was
+           never scheduled" — which is the vacuous-scheduling class this work
+           exists to eliminate;
+        2. the backend exhibited its real concurrency SHAPE — blocked on
+           Memory/SQLite, committed-while-paused on PostgreSQL;
+        3. the mutation actually took EFFECT (asserted per-leg by the caller
+           against exact pre/post state, not inferred from the callback
+           returning).
+
+        ``mutate`` is called as ``mutate(store, attempting)`` and MUST set
+        ``attempting`` immediately before its first locking operation.
         """
         paused, release = threading.Event(), threading.Event()
-        writer_done = threading.Event()
+        started, attempting, completed = (threading.Event(), threading.Event(),
+                                          threading.Event())
         fired = {"done": False}
         original = context_scope.authorized_league_ids
 
@@ -992,7 +999,7 @@ class LeagueContextHttpContract:
             if not fired["done"]:
                 fired["done"] = True
                 paused.set()
-                release.wait(20)
+                release.wait(25)
             return result
 
         context_scope.authorized_league_ids = wrapper
@@ -1005,74 +1012,145 @@ class LeagueContextHttpContract:
             out["r"] = do_request()
 
         def writer():
+            started.set()
             try:
-                mutate_with(self._writer_store())
+                mutate(self._writer_store(), attempting)
             except Exception as exc:            # recorded, never swallowed
                 writer_error["e"] = exc
             finally:
-                writer_done.set()
+                completed.set()
 
-        rt = threading.Thread(target=request)
+        rt = threading.Thread(target=request, name=f"req-{label}")
+        wt = threading.Thread(target=writer, name=f"writer-{label}")
         rt.start()
         try:
-            self.assertTrue(paused.wait(20),
-                            f"[{label}] request never reached the seam")
-            wt = threading.Thread(target=writer)
+            self.assertTrue(paused.wait(25),
+                            f"[{label}] request never reached the League seam")
             wt.start()
-            # Did the competing writer get through while we hold the window?
-            wrote_while_paused = writer_done.wait(2.0)
+            # (1) The writer genuinely ran and genuinely got to the lock.
+            self.assertTrue(started.wait(15),
+                            f"[{label}] competing writer thread never started")
+            self.assertTrue(
+                attempting.wait(15),
+                f"[{label}] competing writer never reached its first locking "
+                f"store operation — a 'blocked' verdict here would be vacuous")
+            # (2) Only NOW is a timeout meaningful: the writer is provably at
+            # the lock, so not-completing means contention, not non-scheduling.
+            completed_while_paused = completed.wait(2.0)
         finally:
             release.set()
             rt.join(30)
         wt.join(30)
+        self.assertFalse(rt.is_alive(), f"[{label}] request thread hung")
+        self.assertFalse(wt.is_alive(), f"[{label}] writer thread hung")
         self.assertNotIn("e", writer_error,
                          f"[{label}] competing writer raised: "
                          f"{writer_error.get('e')}")
-        return fired["done"], wrote_while_paused, out.get("r")
+        self.assertIn("r", out, f"[{label}] request produced no result")
+        self.assertTrue(fired["done"], f"[{label}] seam never engaged")
+        return completed_while_paused, out["r"]
 
-    def _assert_competing_writer_shape(self, wrote_while_paused, label):
-        """Assert the backend's real concurrency shape, both directions."""
+    def _assert_competing_writer_shape(self, completed_while_paused, label):
+        """The backend's real concurrency shape, asserted in both directions.
+        Only meaningful because the helper already proved the writer reached
+        the lock."""
         if self.is_postgres():
             self.assertTrue(
-                wrote_while_paused,
+                completed_while_paused,
                 f"[{label}] PostgreSQL: the independent connection did NOT "
                 f"commit while the request was paused, so this leg never "
                 f"exercised a concurrent commit")
         else:
             self.assertFalse(
-                wrote_while_paused,
-                f"[{label}] Memory/SQLite: a competing writer interleaved "
-                f"with an open transaction, which breaks the process-lock "
-                f"serialization this backend relies on")
+                completed_while_paused,
+                f"[{label}] Memory/SQLite: a writer that had reached the lock "
+                f"completed while a transaction was open, breaking the "
+                f"process-lock serialization this backend relies on")
 
-    def _unbind_with(self, league_id, season_id):
-        def mutate(store):
-            ls = store.league_season_for(league_id, season_id)
-            if ls is not None:
-                with store.transaction():
-                    store.delete_league_season(ls.id)
+    # -- writer callbacks: each signals `attempting`, none can silently no-op
+    def _unbind_writer(self, league_season_id):
+        def mutate(store, attempting):
+            attempting.set()                    # about to take the lock
+            with store.transaction():
+                store.delete_league_season(league_season_id)
         return mutate
 
-    def _revoke_with(self, assignment_ids):
-        def mutate(store):
+    def _revoke_writer(self, assignment_ids):
+        def mutate(store, attempting):
+            attempting.set()
             with store.transaction():
                 for aid in assignment_ids:
                     store.remove_official_assignment(aid)
         return mutate
 
+    # -- per-leg pre/post state proofs -------------------------------------
+    def _unbind_race(self, do_request, lid, sid, label):
+        """Run an unbind race and prove the unbind ACTUALLY happened."""
+        ls = self.store.league_season_for(lid, sid)
+        self.assertIsNotNone(ls, f"[{label}] fixture: binding missing up front")
+        before = self._league_season_count()
+        completed, result = self._competing_writer_race(
+            do_request, self._unbind_writer(ls.id), label)
+        self._assert_competing_writer_shape(completed, label)
+        # (3) The mutation took effect — exactly once.
+        self.assertIsNone(self.store.league_season_for(lid, sid),
+                          f"[{label}] the binding was never actually removed")
+        self.assertEqual(self._league_season_count(), before - 1,
+                         f"[{label}] binding count did not change exactly once")
+        return result
+
+    def _revoke_race(self, do_request, official_id, label):
+        """Run a revocation race and prove the revocation ACTUALLY happened."""
+        ids = [a.id for a in self.store.assignments_for_official(official_id)]
+        self.assertTrue(ids, f"[{label}] fixture: no assignments up front")
+        bindings = self._league_season_count()
+        completed, result = self._competing_writer_race(
+            do_request, self._revoke_writer(ids), label)
+        self._assert_competing_writer_shape(completed, label)
+        remaining = {a.id for a in self.store.assignments_for_official(official_id)}
+        self.assertEqual(remaining & set(ids), set(),
+                         f"[{label}] assignments were never actually removed")
+        # Revocation must not touch competition structure.
+        self.assertEqual(self._league_season_count(), bindings,
+                         f"[{label}] a revocation changed the binding table")
+        return result
+
+    def _assert_post_unbind_http(self, opener, label, saved_user=None,
+                                 saved_expected=None):
+        """Independent read-back through real HTTP after an unbind race."""
+        rendered = self._assert_no_dangling_league(opener, label)
+        self.assertIsNone(rendered["league_id"],
+                          f"[{label}] a League rendered after its binding was "
+                          f"removed: {rendered}")
+        self.assertIsNone(rendered["league"], (label, rendered))
+        if saved_user is not None:      # a read must never rewrite the choice
+            self.assertEqual(self._saved_league(saved_user), saved_expected,
+                             f"[{label}] the saved preference was rewritten")
+
+    def _assert_post_revoke_http(self, opener, program_id, label,
+                                 saved_user=None, saved_expected=None):
+        """Independent read-back through real HTTP after a revocation race."""
+        self.assertEqual(self._offered_leagues(opener, program_id), set(),
+                         f"[{label}] a revoked League is still ENUMERATED")
+        rendered = self._assert_no_dangling_league(opener, label)
+        self.assertIsNone(rendered["league_id"],
+                          f"[{label}] a revoked League still renders: {rendered}")
+        if saved_user is not None:
+            self.assertEqual(self._saved_league(saved_user), saved_expected,
+                             f"[{label}] the saved preference was rewritten")
+
     def test_competing_unbind_versus_post(self):
         admin = self._login("admin")
         pid, sid, lid = self._program_season_league()
-        fired, wrote, result = self._competing_writer_race(
+        poster = self._login("admin")
+        result = self._unbind_race(
             lambda: self._req(
                 "POST", "/api/context",
                 {"program_id": pid, "season_id": sid, "league_id": lid},
-                opener=self._login("admin")),
-            self._unbind_with(lid, sid), "unbind/POST")
-        self.assertTrue(fired, "barrier never engaged — vacuous race")
-        self._assert_competing_writer_shape(wrote, "unbind/POST")
+                opener=poster),
+            lid, sid, "unbind/POST")
         self._assert_race_outcome(result[0], result[1], "unbind/POST")
-        self._assert_no_dangling_league(admin, "unbind/POST")
+        self._assert_post_unbind_http(admin, "unbind/POST")
 
     def test_competing_unbind_versus_get(self):
         admin = self._login("admin")
@@ -1080,35 +1158,29 @@ class LeagueContextHttpContract:
         self._req("POST", "/api/context",
                   {"program_id": pid, "season_id": sid, "league_id": lid},
                   opener=admin)
-        fired, wrote, result = self._competing_writer_race(
-            lambda: self._req("GET", "/api/context", opener=self._login("admin")),
-            self._unbind_with(lid, sid), "unbind/GET")
-        self.assertTrue(fired, "barrier never engaged — vacuous race")
-        self._assert_competing_writer_shape(wrote, "unbind/GET")
+        reader = self._login("admin")
+        result = self._unbind_race(
+            lambda: self._req("GET", "/api/context", opener=reader),
+            lid, sid, "unbind/GET")
         self.assertEqual(result[0], 200, result[1])
         if result[1]["league_id"] is not None:
             self.assertEqual(result[1]["league"]["id"], result[1]["league_id"])
-        self.assertEqual(self._saved_league("user_admin"), lid)  # not rewritten
+        self._assert_post_unbind_http(admin, "unbind/GET",
+                                      saved_user="user_admin",
+                                      saved_expected=lid)
 
     def test_competing_revocation_versus_post(self):
         fx = self._transfer_scenario()
         official = self._account("off_cw_post", Role.OFFICIAL,
                                  {"official_id": fx["oid"]})
-        ids = [a.id for a in self.store.assignments_for_official(fx["oid"])]
-        bindings = self._league_season_count()
-        fired, wrote, result = self._competing_writer_race(
+        result = self._revoke_race(
             lambda: self._req(
                 "POST", "/api/context",
                 {"program_id": fx["pid"], "season_id": fx["sid"],
                  "league_id": fx["gold"]}, opener=official),
-            self._revoke_with(ids), "revoke/POST")
-        self.assertTrue(fired, "barrier never engaged — vacuous race")
-        self._assert_competing_writer_shape(wrote, "revoke/POST")
+            fx["oid"], "revoke/POST")
         self._assert_race_outcome(result[0], result[1], "revoke/POST")
-        self.assertEqual(self._league_season_count(), bindings)
-        self.assertEqual(self._offered_leagues(official, fx["pid"]), set())
-        rendered = self._assert_no_dangling_league(official, "revoke/POST")
-        self.assertIsNone(rendered["league_id"], rendered)
+        self._assert_post_revoke_http(official, fx["pid"], "revoke/POST")
 
     def test_competing_revocation_versus_get(self):
         fx = self._transfer_scenario()
@@ -1119,17 +1191,15 @@ class LeagueContextHttpContract:
             {"program_id": fx["pid"], "season_id": fx["sid"],
              "league_id": fx["gold"]}, opener=official)
         self.assertEqual(status, 200, got)
-        ids = [a.id for a in self.store.assignments_for_official(fx["oid"])]
-        fired, wrote, result = self._competing_writer_race(
+        result = self._revoke_race(
             lambda: self._req("GET", "/api/context", opener=official),
-            self._revoke_with(ids), "revoke/GET")
-        self.assertTrue(fired, "barrier never engaged — vacuous race")
-        self._assert_competing_writer_shape(wrote, "revoke/GET")
+            fx["oid"], "revoke/GET")
         self.assertEqual(result[0], 200, result[1])
         if result[1]["league_id"] is not None:
             self.assertEqual(result[1]["league"]["id"], result[1]["league_id"])
-        # Ignored, never rewritten, even when authority vanished mid-read.
-        self.assertEqual(self._saved_league("user_off_cw_get"), fx["gold"])
+        self._assert_post_revoke_http(official, fx["pid"], "revoke/GET",
+                                      saved_user="user_off_cw_get",
+                                      saved_expected=fx["gold"])
 
 
 class MemoryLeagueContextHttpTest(LeagueContextHttpContract, unittest.TestCase):
