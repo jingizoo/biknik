@@ -33,11 +33,18 @@
 // canonical phone (390x844) and desktop (1440x900): no horizontal page
 // overflow, zero console/page errors.
 const { chromium } = require("playwright");
+const { spawn } = require("child_process");
 const fs = require("fs");
+const http = require("http");
 const path = require("path");
 
 const STATIC_DIR = path.resolve(__dirname, "..", "backend", "hockey_scheduler",
   "web", "static");
+const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
+const HOST = "127.0.0.1";
+// Not shared with any other journey's port (highest in use is 8352).
+const IMPORTS_PORT = 8361;
+const READY_TIMEOUT_MS = 15000;
 const sheet = (name) => path.join(STATIC_DIR, name);
 
 // The exact stylesheet sets the production pages link (asserted in
@@ -130,14 +137,21 @@ const SETUP_HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"></head><bod
   </div></div>
 </body></html>`;
 
-// Every control the ≤480 rules promise to lift to 16px (iOS Safari auto-zooms
-// any focused form control below 16px). Sources: web.css `@media (max-width:
-// 480px)` and styles.css' two `@media (max-width: 480px)` blocks.
+// EVERY focusable form control the ≤480 rules govern — iOS Safari auto-zooms
+// the page on focus for any of them below 16px. Sources: web.css `@media
+// (max-width: 480px)` and styles.css' two `@media (max-width: 480px)` blocks.
+//
+// `.import-form textarea` is in this list, not exempted from it. It was held
+// at 14px, which still auto-zooms, on a real production control that
+// renderImport() puts in front of an operator during Workflow 6 — so an
+// exception here would have been an exception to the requirement, not to a
+// test. The `checkImportsWorkflowInputSize` leg below additionally proves the
+// rendered control in the live app, not just this fixture.
 const SIXTEEN_PX_INPUTS = [
   ".login-field input", ".side-switch select", ".avail-form input",
   ".avail-form select", ".cd-input", ".drawer-body input",
   ".drawer-body select", ".cal-filters select", ".import-form select",
-  ".ctx-select",
+  ".import-form textarea", ".ctx-select",
 ];
 const INPUTS_HTML = `<!DOCTYPE html><html><head><meta charset="utf-8"></head>
 <body class="web-body"><div class="web"><div class="sidebar">
@@ -577,8 +591,6 @@ async function checkMobileInputSizes(browser, width, expectLifted) {
           const el = document.querySelector(s);
           out[s] = el ? getComputedStyle(el).fontSize : null;
         }
-        out[".import-form textarea"] = getComputedStyle(
-          document.querySelector(".import-form textarea")).fontSize;
         return out;
       }, SIXTEEN_PX_INPUTS);
 
@@ -601,17 +613,140 @@ async function checkMobileInputSizes(browser, width, expectLifted) {
             `token, so the ≤480px 16px rule is unfalsifiable for it.`);
         }
       }
-      // Recorded, not asserted at 16: styles.css deliberately holds the import
-      // textarea at 14px. That is a real pre-existing iOS auto-zoom gap, and
-      // it is NOT in this slice's scope (font sizing is not one of the four
-      // approved width tokens). Printed so it stays visible instead of being
-      // quietly excluded from a "16px mobile inputs" claim.
       if (expectLifted) {
-        console.log(`  ${label}: ${SIXTEEN_PX_INPUTS.length} controls at 16px;` +
-          ` .import-form textarea is ${sizes[".import-form textarea"]} ` +
-          `(deliberate pre-existing exception, out of scope here).`);
+        console.log(`  ${label}: all ${SIXTEEN_PX_INPUTS.length} governed ` +
+          `controls at exactly 16px (no exemptions).`);
       }
     });
+}
+
+// ---------------------------------------------------------------------------
+// The 16px rule on the REAL Imports workflow, not a fixture.
+//
+// The fixture legs above prove the CSS rule computes to 16px. This proves the
+// rule reaches the control an operator actually focuses: the textareas
+// renderImport() creates inside Workflow 6. That distinction is not academic —
+// this control shipped at 14px (which still auto-zooms on iOS) precisely
+// because no test drove the live workflow at phone width.
+//
+// Reached by a real Tab walk rather than .focus(), because keyboard reach is
+// the thing being claimed.
+// ---------------------------------------------------------------------------
+function waitForServer(url, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve, reject) => {
+    const tick = () => {
+      http.get(url, (res) => { res.resume(); resolve(); }).on("error", () => {
+        if (Date.now() > deadline) {
+          reject(new Error(`server never became ready at ${url}`));
+        } else setTimeout(tick, 200);
+      });
+    };
+    tick();
+  });
+}
+
+async function checkImportsWorkflowInputSize(browser) {
+  const label = "Imports workflow @390x844";
+  const base = `http://${HOST}:${IMPORTS_PORT}`;
+  const server = spawn(process.env.PYTHON || "python3",
+    ["-u", "-m", "hockey_scheduler.web.server", "--host", HOST,
+      "--port", String(IMPORTS_PORT)],
+    { cwd: BACKEND_DIR, stdio: ["ignore", "pipe", "pipe"] });
+  let serverOutput = "";
+  server.stdout.on("data", (d) => { serverOutput += d.toString(); });
+  server.stderr.on("data", (d) => { serverOutput += d.toString(); });
+
+  const context = await browser.newContext({
+    viewport: { width: 390, height: 844 },
+  });
+  const page = await context.newPage();
+  const errors = [];
+  page.on("pageerror", (e) => errors.push(`[pageerror] ${e.message}`));
+  page.on("console", (m) => {
+    if (m.type() === "error") errors.push(`[console] ${m.text()}`);
+  });
+
+  try {
+    await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
+    await page.goto(base, { waitUntil: "domcontentloaded" });
+    await page.waitForSelector("#content > *", { timeout: 10000 });
+    await page.click('.tab[data-tab="import"]');
+    // The Imports view paints once, then RE-renders when its own async
+    // overview/progress fetches land — so nodes found immediately after the
+    // click can be replaced out from under a later query. Wait for the network
+    // to settle and for the textareas to exist in that settled DOM before
+    // measuring anything.
+    await page.waitForLoadState("networkidle");
+    await page.waitForFunction(
+      () => document.querySelectorAll(".import-form textarea").length > 0,
+      null, { timeout: 10000 });
+
+    const total = await page.evaluate(() =>
+      document.querySelectorAll(".import-form textarea").length);
+    if (!total) {
+      fail(`${label}: the Imports workflow rendered no textarea, so this ` +
+        `leg would prove nothing.`);
+    }
+
+    const reached = [];
+    for (let i = 0; i < 400 && reached.length < total; i += 1) {
+      await page.keyboard.press("Tab");
+      const hit = await page.evaluate(() => {
+        const a = document.activeElement;
+        if (!a || a.tagName !== "TEXTAREA" || !a.closest(".import-form")) {
+          return null;
+        }
+        const cs = getComputedStyle(a);
+        const r = a.getBoundingClientRect();
+        return {
+          id: a.id, fontSize: cs.fontSize, display: cs.display,
+          visibility: cs.visibility, w: a.offsetWidth, h: a.offsetHeight,
+          insideViewport: r.left >= -1 && r.right <= window.innerWidth + 1,
+        };
+      });
+      if (hit && !reached.some((f) => f.id === hit.id)) reached.push(hit);
+    }
+    if (reached.length !== total) {
+      fail(`${label}: a real Tab walk reached ${reached.length} of ${total} ` +
+        `rendered Imports textareas — the control an operator must type into ` +
+        `is not keyboard-reachable.`);
+    }
+    for (const t of reached) {
+      if (t.fontSize !== "16px") {
+        fail(`${label}: the rendered Imports control #${t.id} computes to ` +
+          `${t.fontSize}. Below 16px, iOS Safari auto-zooms the page on ` +
+          `focus, in the middle of a core import task.`);
+      }
+      if (t.display === "none" || t.visibility === "hidden" || !t.w || !t.h) {
+        fail(`${label}: #${t.id} is not the visible production control ` +
+          `(display "${t.display}", visibility "${t.visibility}", ` +
+          `${t.w}x${t.h}) — asserting a font size on a hidden node proves ` +
+          `nothing.`);
+      }
+      if (!t.insideViewport) {
+        fail(`${label}: #${t.id} extends outside the 390px viewport.`);
+      }
+    }
+    const overflow = await page.evaluate(() => ({
+      scrollWidth: document.documentElement.scrollWidth,
+      clientWidth: document.documentElement.clientWidth,
+    }));
+    if (overflow.scrollWidth > overflow.clientWidth) {
+      fail(`${label}: horizontal page overflow -- scrollWidth ` +
+        `${overflow.scrollWidth} > clientWidth ${overflow.clientWidth}`);
+    }
+    console.log(`  ${label}: ${reached.length} rendered Imports textarea(s) ` +
+      `(${reached.map((t) => `#${t.id}`).join(", ")}) reached by a real Tab ` +
+      `walk, all at 16px, visible, no page overflow.`);
+  } finally {
+    await context.close();
+    server.kill("SIGTERM");
+  }
+  if (errors.length) {
+    fail(`${label}: console/page errors: ${errors.join("; ")}\n` +
+      `server tail: ${serverOutput.slice(-600)}`);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -679,12 +814,18 @@ async function checkNoOverflowNoErrors(browser, label, width, height) {
     await checkNoOverflowNoErrors(browser, "phone 390x844", 390, 844);
     await checkNoOverflowNoErrors(browser, "desktop 1440x900", 1440, 900);
 
+    // The 16px rule on the LIVE Imports workflow, against a real server.
+    await checkImportsWorkflowInputSize(browser);
+
     console.log("Breakpoint boundaries OK -- all four approved tokens switch "
       + "at the right width (480 Ice Builder/sign-in card/16px inputs, 720 "
       + "Game Sheet/onboarding hero, 880 app shell + nav strip, 1040 "
-      + "dashboard grids), the collapsed seven-area nav clips/hides nothing "
-      + "and is fully Tab-reachable at 879 and 390, and there is no "
-      + "horizontal overflow or console/page error at 390x844 or 1440x900.");
+      + "dashboard grids), every governed mobile form control computes to "
+      + "exactly 16px with no exemptions, the live Imports workflow's real "
+      + "textareas are Tab-reachable at 16px on a 390x844 phone, the "
+      + "collapsed seven-area nav clips/hides nothing and is fully "
+      + "Tab-reachable at 879 and 390, and there is no horizontal overflow "
+      + "or console/page error at 390x844 or 1440x900.");
   } finally {
     await browser.close();
   }

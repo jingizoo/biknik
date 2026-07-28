@@ -1191,8 +1191,14 @@ details.tn > .tn-sum:hover { background: #f6f7fb; }
      classes are .avail-form/.cd-input/.drawer-body below.) */
   .avail-form input, .avail-form select, .cd-input,
   .drawer-body input, .drawer-body select,
-  .cal-filters select, .import-form select { font-size: 16px; }
-  .import-form textarea { font-size: 14px; }
+  .cal-filters select, .import-form select,
+  /* The Imports textarea is a real production control rendered by
+     renderImport() inside Workflow 6, so it is subject to the same iOS
+     auto-zoom rule as every other focusable form control here. It was held at
+     14px, which still zooms — 14 < 16 — so a core import task auto-zoomed on
+     focus at phone width. It keeps its 12px monospace base ABOVE the token,
+     where auto-zoom does not apply and the denser text fits more CSV. */
+  .import-form textarea { font-size: 16px; }
   /* Touch-first tap targets (#118 Phase 6): these were sized for a mouse
      pointer (~21px tall) — grow them toward the ~44px minimum recommended
      for touch on the viewport width where touch is the only input. */
