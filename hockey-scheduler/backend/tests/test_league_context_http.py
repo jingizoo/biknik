@@ -32,7 +32,14 @@ Why each group exists:
 * **Refusal** — one generic ``league_not_accessible``, indistinguishable across
   causes (an existence oracle would leak records the caller may not see), and
   GET is byte-identical before and after. A refusal that quietly moved the
-  Season would be far worse than the blocker #364 fixed.
+  Season would be far worse than the blocker #364 fixed. Run twice over: once
+  from a non-null Season, and once — separately and completely — from
+  ``season_id: null`` across all three shapes rule 2 can fail on (zero binding,
+  ambiguous, archived-only). The null matrix is not redundant: the defect #364
+  fixed was a ``season_id is None`` bypass, which no non-null refusal can
+  falsify. Both matrices compare the WHOLE stored row (``updated_at`` included,
+  so a compensating rewrite is visible) and the ``LeagueSeason`` table (so a
+  refusal that repaired itself into validity is visible).
 * **Authentication** — a per-user context still requires a real session; the
   identity-less demo fallbacks must fail at the boundary and write nothing.
 
@@ -43,6 +50,7 @@ guarantee a store's transaction semantics can differ on. PostgreSQL SKIPS
 visibly when unconfigured rather than silently passing.
 """
 
+import dataclasses
 import json
 import os
 import tempfile
@@ -68,6 +76,13 @@ CONTEXT_KEYS = {"program_id", "season_id", "league_id", "read_only",
                 "program", "season", "league"}
 # The ONE reason every League refusal must carry (#364 owner ruling).
 REFUSED = (404, "not_found", "league_not_accessible")
+# Every persisted field of the context row. Asserted as a SET before the
+# no-mutation comparison so the comparison can never silently narrow to a
+# subset of the row (the original defect was exactly an assertion that claimed
+# more than it checked); a new field on ``ActiveContext`` fails here loudly
+# instead of quietly dropping out of the "unchanged" proof.
+ACTIVE_CONTEXT_FIELDS = {"id", "program_id", "season_id", "league_id",
+                         "updated_at"}
 
 
 class CanonicalLeagueContextHttpContract:
@@ -166,6 +181,31 @@ class CanonicalLeagueContextHttpContract:
     def _bindings(self, league_id):
         return {ls.season_id for ls in self.store.league_seasons_for_league(
             league_id)}
+
+    def _row(self, user_id=ADMIN_USER):
+        """The COMPLETE persisted context row as a detached plain dict —
+        ``updated_at`` included, not just the three ids.
+
+        Two reasons for the shape. (1) An id-only comparison cannot catch a
+        *compensating* write: a server that re-saved the same Program/Season/
+        League with a fresh clock has mutated the row a refusal promised not to
+        touch, and only the timestamp shows it. (2) ``InMemoryStore.
+        get_active_context`` hands back its LIVE row object, so holding the
+        object itself would compare a row to itself and pass no matter what
+        happened in between; ``asdict`` snapshots the values now."""
+        row = self.store.get_active_context(user_id)
+        return None if row is None else dataclasses.asdict(row)
+
+    def _binding_rows(self, *league_ids):
+        """Every ``LeagueSeason`` of these Leagues, as sorted id triples.
+
+        Compared before/after a refusal to prove resolution never CREATES or
+        repairs a binding to make its own answer valid. The binding ``id`` is
+        included, not only ``season_id``, so a delete-then-recreate of the same
+        pair is caught too."""
+        return {lid: sorted((ls.id, ls.league_id, ls.season_id)
+                            for ls in self.store.league_seasons_for_league(lid))
+                for lid in league_ids}
 
     def _saved(self, user_id=ADMIN_USER):
         """The persisted context as a plain triple, treating "no row at all" as
@@ -339,34 +379,104 @@ class CanonicalLeagueContextHttpContract:
         self.assertEqual(self._triple(resp), (pid, s1, gold), resp)
         self._assert_agrees(admin, resp, "program-only-league")
 
-    def test_program_only_with_an_ambiguous_league_is_refused_over_http(self):
-        """Rule 3 from a null Season: several valid bindings and no current
-        Season to prefer must refuse generically and mutate nothing."""
-        admin = self._login("admin")
-        pid, s1, s2, gold = self._world()
-        # Bind Gold to BOTH seasons, so a null Season has no unique candidate.
-        self.api.setup.create_league_season(gold, s2)
-        ok, base = self._req(
-            "POST", "/api/context",
-            {"program_id": pid, "season_id": s1, "league_id": gold}, opener=admin)
-        self.assertEqual(ok, 200, base)
-        before = self.store.get_active_context(ADMIN_USER)
+    def test_null_season_league_refusal_matrix_over_http(self):
+        """Rule 3 from a NULL Season over authenticated HTTP, across all three
+        candidate shapes rule 2 can fail on:
 
-        status, resp = self._req(
+        * **zero** — a permanent League in this Program with no ``LeagueSeason``
+          at all;
+        * **ambiguous** — two valid active bindings and no current Season to
+          prefer, so there is nothing to tie-break on (and tie-breaking is
+          forbidden);
+        * **archived-only** — the League's ONLY binding is an archived Season,
+          which rule 2 must never auto-enter.
+
+        Each leg asserts, exactly: 404 with the one generic
+        ``league_not_accessible``; the same ``(status, code, reason, message)``
+        as the other two, checked by collecting them into a set of size one;
+        the COMPLETE stored row unchanged including ``updated_at``; the
+        LeagueSeason set of all four Leagues unchanged; and a following GET
+        rendering byte-identically to the pre-refusal GET.
+
+        **Supersedes** an earlier revision that built only the ambiguous shape
+        while its docstring implied the matrix, compared only the three ids
+        (blind to a compensating same-values-fresh-clock rewrite), and never
+        looked at the binding table (blind to a refusal that "repaired" itself
+        into validity). This matters specifically here because the defect #364
+        fixed was a ``season_id is None`` BYPASS: refusal tests that always send
+        a non-null Season cannot falsify a future null-only shortcut, so the
+        null-Season path needs its own complete matrix rather than inheriting
+        confidence from the non-null one."""
+        admin = self._login("admin")
+        pid, s1, s2, gold = self._world()      # gold: the UNIQUE-binding control
+        # ambiguous: Silver binds both active Seasons.
+        silver = self.api.create_league(s1, "Silver")["id"]
+        self.api.setup.create_league_season(silver, s2, actor_id=ACTOR)
+        # archived-only: Bronze's single binding is read-only history.
+        old = self.api.create_season(pid, "S-old")["id"]
+        bronze = self.api.create_league(old, "Bronze")["id"]
+        self.api.setup.archive_season(old, actor_id=ACTOR)
+        # zero: a permanent League whose only binding was explicitly removed.
+        # Unbinding (not "never binding") is how a real zero-binding League
+        # arises, since the season-oriented create always binds.
+        unbound = self.api.create_league(s1, "Unbound")["id"]
+        self.api.setup.delete_league_season(
+            self.store.league_season_for(unbound, s1).id, actor_id=ACTOR)
+        # The fixture is only meaningful if the shapes are really these shapes.
+        self.assertEqual(self._bindings(unbound), set(), "zero fixture is bound")
+        self.assertEqual(self._bindings(silver), {s1, s2}, "ambiguous fixture")
+        self.assertEqual(self._bindings(bronze), {old}, "archived-only fixture")
+
+        # A known-good prior context — established through the boundary and via
+        # the canonical move itself — so "unchanged" is proven against a real
+        # populated row rather than against absence.
+        _s, baseline = self._req(
+            "POST", "/api/context",
+            {"program_id": pid, "season_id": s2, "league_id": gold},
+            opener=admin)
+        self.assertEqual(self._triple(baseline), (pid, s1, gold), baseline)
+        _s, before_get = self._req("GET", "/api/context", opener=admin)
+        before_row = self._row()
+        self.assertEqual(set(before_row), ACTIVE_CONTEXT_FIELDS, before_row)
+        leagues = (gold, silver, bronze, unbound)
+        before_bindings = self._binding_rows(*leagues)
+
+        seen = set()
+        for label, league_id in (("zero", unbound), ("ambiguous", silver),
+                                 ("archived_only", bronze)):
+            status, resp = self._req(
+                "POST", "/api/context",
+                {"program_id": pid, "season_id": None, "league_id": league_id},
+                opener=admin)
+            err = resp.get("error", {})
+            seen.add((status, err.get("code"),
+                      err.get("details", {}).get("reason"), err.get("message")))
+            self.assertEqual(
+                (status, err.get("code"),
+                 err.get("details", {}).get("reason")), REFUSED, (label, resp))
+            self.assertEqual(self._row(), before_row,
+                             f"a null-Season {label} refusal mutated the stored "
+                             f"row (updated_at included)")
+            self.assertEqual(self._binding_rows(*leagues), before_bindings,
+                             f"a null-Season {label} refusal touched the "
+                             f"LeagueSeason table")
+            _s, after_get = self._req("GET", "/api/context", opener=admin)
+            self.assertEqual(after_get, before_get,
+                             f"{label} changed what GET renders")
+            self.assertEqual(self._triple(after_get), (pid, s1, gold),
+                             (label, after_get))
+        self.assertEqual(len(seen), 1,
+                         f"null-Season refusals are distinguishable: {seen}")
+        # The control: the very same null-Season request shape SUCCEEDS for the
+        # League with one valid binding, so the three refusals above are the
+        # rules firing and not a null Season being rejected wholesale.
+        status, ok = self._req(
             "POST", "/api/context",
             {"program_id": pid, "season_id": None, "league_id": gold},
             opener=admin)
-        self.assertEqual(status, 404, resp)
-        self.assertEqual(resp["error"]["details"].get("reason"),
-                         "league_not_accessible", resp)
-        after = self.store.get_active_context(ADMIN_USER)
-        # updated_at included deliberately: a compensating "rewrite the same
-        # values with a fresh clock" is invisible to the id triple alone.
-        self.assertEqual(
-            (after.program_id, after.season_id, after.league_id, after.updated_at),
-            (before.program_id, before.season_id, before.league_id,
-             before.updated_at),
-            "an ambiguous Program-only League selection mutated the saved row")
+        self.assertEqual(status, 200, ok)
+        self.assertEqual(self._triple(ok), (pid, s1, gold), ok)
+        self._assert_agrees(admin, ok, "null-season-unique")
 
     def test_an_explicitly_chosen_archived_season_and_league_still_commits(self):
         """Archived is never AUTO-entered, but an explicit archived pair remains
@@ -434,13 +544,20 @@ class CanonicalLeagueContextHttpContract:
 
     # -- refusal: one generic reason, zero movement ------------------------
     def test_every_refusal_is_generic_and_leaves_the_context_untouched(self):
-        """Ambiguous / archived-only / unbound-and-nonexistent / cross-Program
-        all answer IDENTICALLY, and GET is byte-identical before and after.
+        """Four causes — ambiguous, archived-only, cross-Program, and a League id
+        that does not exist — all answer IDENTICALLY, and GET is byte-identical
+        before and after.
 
         Sameness is the security property: a distinguishable refusal would turn
         the context bar into an existence oracle for records the caller may not
         see. Zero movement is the #364 property: a refusal that moved the Season
-        anyway would be worse than the blocker the ruling fixed."""
+        anyway would be worse than the blocker the ruling fixed — checked on the
+        whole stored row (``updated_at`` included) and on the LeagueSeason table.
+
+        Every attempt here carries a NON-null Season, which is exactly why it
+        cannot stand in for
+        :meth:`test_null_season_league_refusal_matrix_over_http`: a null-Season
+        shortcut would leave all four of these passing."""
         admin = self._login("admin")
         pid, s1, s2, gold = self._world()
         s3 = self.api.create_season(pid, "S3")["id"]
@@ -466,9 +583,11 @@ class CanonicalLeagueContextHttpContract:
             opener=admin)
         self.assertEqual(self._triple(baseline), (pid, s1, gold), baseline)
         _s, before_get = self._req("GET", "/api/context", opener=admin)
-        before_row = self._saved()
-        bindings_before = {lg: self._bindings(lg)
-                           for lg in (gold, silver, bronze, other_l)}
+        # The WHOLE row, not the id triple: a refusal that rewrote the same
+        # values with a fresh clock still mutated a row it promised not to.
+        before_row = self._row()
+        self.assertEqual(set(before_row), ACTIVE_CONTEXT_FIELDS, before_row)
+        bindings_before = self._binding_rows(gold, silver, bronze, other_l)
 
         attempts = {
             "ambiguous": {"program_id": pid, "season_id": s3,
@@ -489,7 +608,7 @@ class CanonicalLeagueContextHttpContract:
             self.assertEqual(
                 (status, err.get("code"),
                  err.get("details", {}).get("reason")), REFUSED, (label, resp))
-            self.assertEqual(self._saved(), before_row,
+            self.assertEqual(self._row(), before_row,
                              f"{label} moved the saved context")
             _s, after_get = self._req("GET", "/api/context", opener=admin)
             self.assertEqual(after_get, before_get,
@@ -497,8 +616,7 @@ class CanonicalLeagueContextHttpContract:
         self.assertEqual(len(seen), 1,
                          f"refusals are distinguishable: {seen}")
         # And no refusal manufactured the binding that would have made it valid.
-        self.assertEqual({lg: self._bindings(lg)
-                          for lg in (gold, silver, bronze, other_l)},
+        self.assertEqual(self._binding_rows(gold, silver, bronze, other_l),
                          bindings_before, "a refusal created a LeagueSeason")
 
     # -- authentication ----------------------------------------------------

@@ -808,9 +808,63 @@ async function checkCore(browser, viewport) {
 
     // ...and the AMBIGUOUS Program-only pick is refused rather than guessed:
     // Dual League binds two Seasons, so from a null Season there is no unique
-    // candidate. The prior canonical tuple must survive completely.
+    // candidate. The prior canonical tuple must survive COMPLETELY.
     // Same two-step as above, and for the same reason: clear the League first,
     // or the carry-forward canonicalizes right back to (S1, Solo).
+    //
+    // "Completely" is asserted as a whole-surface BEFORE/AFTER snapshot, not
+    // as a spot-check on league_id (#364 re-review). The defect this leg
+    // exists to falsify was a `season_id is None` shortcut past resolution,
+    // and a shortcut that declines to commit Dual League while quietly
+    // rewriting the Program, moving the Season, clearing another axis, or
+    // leaving the bar/hash describing a tuple the server never holds would
+    // sail straight past "league_id !== dual". So the EXACT prior state of
+    // every surface that could contradict a refusal is captured immediately
+    // before the pick -- the server tuple through the page's own fetch, BOTH
+    // controls' rendered value AND visible label, and the raw URL hash -- and
+    // each one must read back identical afterwards, alongside the generic
+    // refusal toast.
+    //
+    // Snapshots and comparisons run against a SETTLED state on both sides
+    // (see settledSurfaces): a sample taken mid-repaint would compare the
+    // refusal against something the operator never actually saw, and could
+    // "match" a transient rather than the real prior state.
+    const ctxTuple = (c) => ({
+      program_id: c.program_id || null, season_id: c.season_id || null,
+      league_id: c.league_id || null, read_only: !!c.read_only,
+    });
+    // Poll the three surfaces to a settled agreement on `wantTuple` and
+    // return exactly what was read there. Polled for the same reason
+    // agreeOnS1Solo polls: the bar repaints from a SECOND round-trip
+    // (loadContextOptions), and syncContextHash runs on that same path --
+    // including on the failure path, so "the hash is stale" is a real,
+    // reachable defect this must be able to see rather than race.
+    const settledSurfaces = async (wantTuple, wantProgValue, wantLeagueValue, stage) => {
+      const deadline = Date.now() + 10000;
+      let last = null;
+      for (;;) {
+        const ctx = ctxTuple(await ctxNow(page));
+        const bar = await ctxRendered(page);
+        const hash = await page.evaluate(() => location.hash);
+        const decoded = decodeCtx(hash);
+        last = { ctx, bar, hash };
+        if (ctx.program_id === wantTuple.program_id
+          && ctx.season_id === wantTuple.season_id
+          && ctx.league_id === wantTuple.league_id
+          && bar.prog && bar.prog.value === wantProgValue
+          && bar.league && bar.league.value === wantLeagueValue
+          && decoded && decoded.p === wantTuple.program_id
+          && (decoded.s || null) === wantTuple.season_id
+          && (decoded.l || null) === wantTuple.league_id) return last;
+        if (Date.now() > deadline) {
+          throw new Error(`[${L}] ${stage}: server/bar/hash never settled on `
+            + `${JSON.stringify(wantTuple)} with prog="${wantProgValue}" league="${wantLeagueValue}" `
+            + `-- last read ${JSON.stringify(last)}`);
+        }
+        await new Promise((r) => setTimeout(r, 100));
+      }
+    };
+
     await page.selectOption("#ctx-league-select", "");
     await waitForContext(page, (c) => c.league_id === null,
       `[${L}] (N) could not clear the League before the ambiguous pick`);
@@ -818,22 +872,56 @@ async function checkCore(browser, viewport) {
     await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
       `${f.zulu}|`, { timeout: 10000 })
       .catch(() => { throw new Error(`[${L}] (N) Season control never settled on Program-only (ambiguous setup)`); });
+    const ambiguousBefore = await settledSurfaces(
+      { program_id: f.zulu, season_id: null, league_id: null, read_only: false },
+      `${f.zulu}|`, "", "(N) the Program-only baseline for the ambiguous pick");
+
     await page.selectOption("#ctx-league-select", f.dual);
     await page.waitForFunction(() => {
       const t = document.getElementById("toast-root");
       return t && /isn't available/i.test(t.textContent || "");
-    }, null, { timeout: 10000 });
-    const afterAmbiguous = await ctxNow(page);
-    if (afterAmbiguous.league_id === f.dual) {
-      throw new Error(`[${L}] (N) an ambiguous Program-only League pick was committed: `
-        + `${JSON.stringify(afterAmbiguous)}`);
+    }, null, { timeout: 10000 })
+      .catch(() => {
+        throw new Error(`[${L}] (N) the ambiguous Program-only pick did not surface the generic refusal toast`);
+      });
+    // The persisted row must not have moved AT ALL -- read the instant the
+    // refusal surfaced, before any repaint could paper over a write.
+    const afterAmbiguous = ctxTuple(await ctxNow(page));
+    if (JSON.stringify(afterAmbiguous) !== JSON.stringify(ambiguousBefore.ctx)) {
+      throw new Error(`[${L}] (N) an ambiguous Program-only League pick mutated the persisted context: `
+        + `before ${JSON.stringify(ambiguousBefore.ctx)}, after ${JSON.stringify(afterAmbiguous)}`);
+    }
+    // ...and every surface comes back to rest on exactly the captured prior
+    // state -- both controls and the hash, compared to the snapshot rather
+    // than to a re-derived expectation, so nothing here can drift with the
+    // thing it is checking.
+    const ambiguousAfter = await settledSurfaces(
+      ambiguousBefore.ctx, ambiguousBefore.bar.prog.value, ambiguousBefore.bar.league.value,
+      "(N) the surfaces after the refused ambiguous Program-only pick");
+    if (JSON.stringify(ambiguousAfter.bar) !== JSON.stringify(ambiguousBefore.bar)) {
+      throw new Error(`[${L}] (N) the refusal changed what the context bar renders: `
+        + `before ${JSON.stringify(ambiguousBefore.bar)}, after ${JSON.stringify(ambiguousAfter.bar)}`);
+    }
+    if (ambiguousAfter.hash !== ambiguousBefore.hash) {
+      throw new Error(`[${L}] (N) the refusal changed the URL hash: `
+        + `before "${ambiguousBefore.hash}", after "${ambiguousAfter.hash}"`);
+    }
+    // Nothing landed LATE either: re-read the server row once the bar and the
+    // hash have both settled, so a write that arrives after the refusal
+    // surfaced (or one made by the failure path's own reconciliation) still
+    // fails this leg.
+    const afterAmbiguousSettled = ctxTuple(await ctxNow(page));
+    if (JSON.stringify(afterAmbiguousSettled) !== JSON.stringify(ambiguousBefore.ctx)) {
+      throw new Error(`[${L}] (N) the persisted context drifted after the refusal settled: `
+        + `before ${JSON.stringify(ambiguousBefore.ctx)}, after ${JSON.stringify(afterAmbiguousSettled)}`);
     }
 
     if (errors.length) throw new Error(`[${L}] console/page errors:\n${errors.join("\n")}`);
     console.log(`[${L}] OK — render, persist/round-trip, dual-Season carry-forward, atomic rejection of the `
       + `ambiguous case, server-owned canonical Season move (S2 -> S1) agreed by server/both controls/hash/`
       + `reload/rendered screen, explicit No League, cross-Program clear, v1/bogus hash handling, keyboard, `
-      + `drawer seeding, Program-only canonicalization + its ambiguous refusal, no overflow `
+      + `drawer seeding, Program-only canonicalization + its ambiguous refusal proven inert on the persisted `
+      + `row/both controls (value and label)/hash against a settled before-snapshot, no overflow `
       + `(incl. max-permission roles with an active League).`);
   } catch (error) {
     throw new Error(`${error.message}\n--- server output ---\n${out}`);
