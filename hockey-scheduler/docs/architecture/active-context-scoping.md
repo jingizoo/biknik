@@ -1,4 +1,4 @@
-# Active-context scoping — the read contracts (#345 / #367 / #369)
+# Active-context scoping — the data contracts (#345 / #367 / #369)
 
 Part of epic #345 (persistent Program/Season/League context). #366 built the
 context **bar**: an atomic, persisted, authorization-filtered selection of a
@@ -6,6 +6,11 @@ context **bar**: an atomic, persisted, authorization-filtered selection of a
 the reads that actually serve the Home, Dashboard, Standings and Setup surfaces
 *respect* that tuple, so a client-side join over a globally-scoped payload stops
 being the only thing standing between an operator and another Program's data.
+
+Mostly reads — but not only. The #369 review established that scoping a read
+without gating the matching **write** leaves the boundary open from the other
+side: a caller who cannot *see* another creator's Venue could still POST a Rink
+under it. See “Scoping the read is not enough: the parent-id WRITE gate”.
 
 ## The tuple, and where it comes from
 
@@ -171,8 +176,9 @@ role, so a record linked to nothing is simply not Dashboard data.
 **Fails closed with no exception.** When no Program resolves at all, every key
 comes back empty. A scoped account with a missing, revoked or unassigned link
 gets the same empty shape whether or not other Programs exist in the
-installation. Pre-Program bootstrap reference data is served by the Setup
-contract below instead.
+installation. Pre-Program reference data is served by the Setup contract's
+creator-owned `pending_link_*` lists below instead — and that is the *only*
+route to it, on a brand-new install as much as on an established one.
 
 **`setup_audit` is filtered by parent chain, against the whole tuple.** Each row
 is resolved through its own `entity_type` (`season`, `division`, `team`,
@@ -391,19 +397,106 @@ reopen the disclosure the ruling reversed. The test resolves the seed's actor
 against the seeded accounts, so a rename on either side fails there rather than
 silently orphaning the demo data again.
 
-### Bootstrap vs. denial
+### Bootstrap is not an exception (reversed)
 
-These two look similar and must not be conflated:
+An earlier revision drew a line here between "bootstrap" and "denial" and gave
+the first one a bypass: when the store held **zero Programs anywhere**, a
+scoped caller fell through to the full unfiltered shape, exactly as an
+unscoped (`role=None`) call does, on the reasoning that such an install has no
+"other Program" to leak from. **That carve-out is reversed.** It is neither the
+owner-approved creator-owned contract nor a separately authorized install-admin
+boundary, and the reasoning does not hold: a Program-less installation is
+precisely where *pre-Program* rows accumulate — Clubs, Organizations, Venues,
+Rinks, IceSlots and Officials, the last of which are people's names — so two
+setup-capable accounts on the same fresh install could each enumerate
+everything the other had entered, and an account authorized for nothing could
+enumerate all of it. **Absence of a Program is not an authorization.**
 
-- **Bootstrap** — the store has *zero* Programs anywhere. There is no "other
-  Program" to leak from, so `get_setup_overview_v2` returns the full unfiltered
-  shape, exactly as an unscoped (`role=None`) call does. This is what lets a
-  brand-new install create its first records.
-- **Denial** — the caller resolves no Program but other Programs *do* exist.
-  Every derived-join set is naturally empty (nothing can validate against a
-  Program that never resolved), so the scoped lists come back empty — and the
-  `pending_link_*` lists hold only that caller's OWN unlinked creations, which
-  is nothing at all for an identity that has created nothing.
+There is therefore **one rule, not two**. An authenticated caller that resolves
+no active Program gets the same answer whether or not any Program exists
+anywhere:
+
+- every derived-join set is naturally empty (nothing can validate against a
+  Program that never resolved), so the scoped lists come back empty;
+- the `pending_link_*` lists hold only that caller's **own** unlinked
+  creations — nothing at all for an identity that has created nothing.
+
+Collapsing the two cases into one code path is itself the safeguard: there is
+no "but the install is empty" branch left for a future change to widen.
+
+**This does not deadlock a new installation.** The operator bootstrapping a
+brand-new install *is* the account that created the rows it is working on, so
+they come back through `pending_link_*` and `withPendingLink` unions them into
+the Setup Records cards and every create drawer picker — create-then-link is
+unchanged. The moment that operator creates the first Program,
+`ContextService._fallback` selects it (it is the only authorized Program, no
+explicit selection needed) and the normal scoped chains take over. What
+changes is only that a *second* operator's pre-Program rows stay that
+operator's.
+
+The one contract deliberately left alone is the identity-less legacy call:
+`get_setup_overview_v2()` with `role=None` is still fully unfiltered, because
+several internal call sites read the whole installation view through it. The
+blocker — and this rule — is about **authenticated** callers.
+
+Regression: `backend/tests/test_zero_program_bootstrap_scoping.py` (facade
+across Memory/SQLite/optional PostgreSQL, plus authenticated HTTP on a
+cold-boot `STATE.reset(seed=False)` install).
+
+### Scoping the read is not enough: the parent-id WRITE gate
+
+Four setup creates take a parent id straight from the request body — Rink→Venue,
+IceSlot→Rink, Venue→Organization, Official→home Club. Scoping the *read* and
+redacting the resolved parent **name** out of `pending_link_*` closed the
+read-side oracle and left the write itself wide open. Two disclosures survive
+name redaction:
+
+- **success vs. not-found is itself an existence oracle** over sequential ids
+  (`venue_9` accepted, `venue_99` refused); and
+- **the write really lands.** Another creator's private setup graph silently
+  grows a Rink, its Rink grows ice, its Organization grows a Venue, its Club
+  grows an Official carrying a person's name.
+
+So the parent id is validated before the facade call, on **both** API versions
+(`/api/setup/` is not a bypass), by `Handler._reject_parent_outside_scope` →
+`ApiService.writable_setup_parent_ids`. The accepted set is computed from the
+read itself, so the write gate cannot drift into a weaker policy, and has
+**three** sources:
+
+| source | why |
+| --- | --- |
+| the ACTIVE scoped list | the ordinary case — the active-tuple ceiling as the read applies it |
+| this caller's `pending_link_*` | its create-then-link chain: a Rink under a Venue it just made, before any grant exists |
+| rows this caller **created** | see below — required, not a convenience |
+
+The third source is not optional. *Create an Organization → create a Program it
+operates → add that Organization's first Venue* is an ordinary flow, and at the
+moment of the Venue create the Organization is in **neither** of the first two
+lists: operating a Program is a real Program link (so it is correctly not
+pending), while the caller's context still points at another Program (so it is
+correctly not scoped). It falls between them, though the caller made it moments
+ago. Omitting this source cost 20 backend failures.
+
+Creator-ownership is the same authenticated, unforgeable signal the pending-link
+contract already rests on (`_creator_created_ids`: CREATE actions only, real
+account ids only, so probing an id can never become permission to use it). It is
+**strictly narrower than authorization** — a `_GLOBAL_ROLE` like League Admin is
+authorized for every Program yet has still created only its own rows — which is
+exactly why this is not the authorized-set alternative the ruling rejected.
+
+Refusals reuse the facade's own `"<Label> <id> not found."` wording, so an
+inaccessible parent is byte-identical to one that never existed, and only the
+caller's own input is echoed back. The gate fails **closed**: an unresolvable
+identity or an errored overview refuses rather than falling through to the
+write. A falsy parent id is not this gate's business — that stays the facade's
+own validation error.
+
+Regression: `backend/tests/test_setup_parent_write_scope.py` (v1 parity, the
+global-role case, and the operator-org flow from both sides) plus
+`test_http_writing_under_a_guessed_parent_id_is_refused_outright` in
+`backend/tests/test_pending_link_ownership.py` — which is the **reversal** of an
+assertion that previously required only that the probe creates come back with
+the name withheld.
 
 ## Venues have no League axis
 

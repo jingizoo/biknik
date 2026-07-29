@@ -303,12 +303,21 @@ class LeagueFilteredOverviewV2Test(unittest.TestCase):
                 self._assert_no_reversed_keys(ov, label)
                 _close(store)
 
-    # -- 2. zero Programs anywhere: bootstrap matches the no-role shape ------
-    def test_bootstrap_with_zero_programs_matches_the_unfiltered_norole_shape(self):
-        """A brand-new install with LITERALLY no Program yet: even a real
-        role/scope must fall through to the exact same unfiltered shape as
-        ``role=None`` — there is no "other Program" for such an install to
-        leak, so this is a bootstrap read, not a denial."""
+    # -- 2. zero Programs anywhere: still SCOPED, not a bootstrap bypass -----
+    def test_zero_programs_anywhere_keeps_an_authenticated_read_scoped(self):
+        """REVERSED (#369 review blocker). This test previously asserted the
+        opposite — that a brand-new install with LITERALLY no Program made a
+        real role/scope fall through to the same unfiltered shape as
+        ``role=None``, on the reasoning that such an install has no "other
+        Program" to leak. It does have something to leak: its pre-Program
+        Clubs, Venues and Officials, each created by SOME account. Absence of
+        a Program is not an authorization, so an authenticated caller stays
+        scoped here exactly as it does when Programs exist.
+
+        Kept deliberately narrow: this is the shape assertion on a truly empty
+        store, where the two shapes still coincide because there is nothing at
+        all to divide. ``test_zero_program_bootstrap_scoping.py`` is where the
+        contract is proven with real rows and two real accounts."""
         for label, store in _backends():
             with self.subTest(backend=label):
                 api = ApiService(store)
@@ -318,9 +327,31 @@ class LeagueFilteredOverviewV2Test(unittest.TestCase):
                     "someone", Role.COACH, {"team_id": "team_does_not_exist"})
                 self.assertNotIn("error", with_role, with_role)
 
-                self.assertEqual(with_role, no_role, label)
                 for key in _ALL_OVERVIEW_KEYS + _ALL_PENDING_KEYS:
                     self.assertEqual(no_role[key], [], (label, key))
+                    self.assertEqual(with_role[key], [], (label, key))
+
+                # A pre-Program row, owned by an account that is NOT the
+                # caller above: the scoped read must not start answering with
+                # the installation's contents just because no Program exists.
+                club = api.create_club("Pre-Program Club",
+                                       actor_id="user_someone_else")
+                self.assertNotIn("error", club, club)
+                official = api.create_official("Pre-Program Official",
+                                               actor_id="user_someone_else")
+                self.assertNotIn("error", official, official)
+                after = api.get_setup_overview_v2(
+                    "someone", Role.COACH, {"team_id": "team_does_not_exist"})
+                self.assertNotIn("error", after, after)
+                for key in _ALL_OVERVIEW_KEYS + _ALL_PENDING_KEYS:
+                    self.assertEqual(
+                        after[key], [],
+                        f"[{label}] a zero-Program installation published "
+                        f"{key} to a caller that owns none of it")
+                # ...while the identity-less legacy call is unchanged.
+                self.assertEqual(
+                    self._ids(api.get_setup_overview_v2(), "clubs"),
+                    {club["id"]}, label)
                 _close(store)
 
     # -- 3. every role in the matrix narrows to its OWN active tuple ---------

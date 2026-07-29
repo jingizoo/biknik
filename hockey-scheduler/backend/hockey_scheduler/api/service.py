@@ -4780,6 +4780,63 @@ class ApiService:
     _PENDING_LINK_ENTITY_TYPES = ("club", "organization", "official",
                                   "venue", "rink", "ice_slot")
 
+    # The four setup-create PARENT relations a caller supplies by id
+    # (rink->venue, ice-slot->rink, venue->organization, official->club),
+    # mapped to the `get_setup_overview_v2` lists that name what this caller
+    # may already reach for that entity kind. See `writable_setup_parent_ids`.
+    _SETUP_PARENT_KEYS = {
+        "venue": ("venues", "pending_link_venues"),
+        "rink": ("rinks", "pending_link_rinks"),
+        "organization": ("organizations", "pending_link_organizations"),
+        "club": ("clubs", "pending_link_clubs"),
+    }
+
+    def writable_setup_parent_ids(self, kind, user_id, role, scope):
+        """Ids of `kind` this caller may attach a NEW child to, or ``None``
+        if that cannot be determined (the caller must then refuse).
+
+        The write gate for the four parent-by-id creates (#369 review). It
+        lives here, beside the read it mirrors, so the set a caller may WRITE
+        under is computed from the same pass that decides what it may READ
+        and cannot drift into a second, weaker policy.
+
+        Three sources, and each is load-bearing:
+
+        * the ACTIVE scoped list -- the ordinary case, the active-tuple
+          ceiling exactly as the read applies it;
+        * this caller's own ``pending_link_*`` -- its create-then-link chain,
+          where a parent is linked to no Program yet (a Rink under a Venue it
+          just made, before any grant exists);
+        * rows this caller CREATED, whatever their link state. Without this
+          the gate refuses a legitimate flow it must allow: create an
+          Organization, create a Program it OPERATES, then add that
+          Organization's first Venue. Operating a Program is a real Program
+          link, so the row is correctly absent from ``pending_link_*``; and
+          while the caller's context still points at some OTHER Program it is
+          equally correctly absent from the scoped list. It falls between the
+          two -- visible in neither, though the caller made it moments ago.
+          Creator-ownership is the same authenticated, unforgeable signal the
+          pending-link contract already rests on (``_creator_created_ids``:
+          CREATE actions only, real account ids only, so a probe can never
+          become permission), and it is strictly narrower than authorization:
+          a global role is authorized for every Program but has still created
+          only its own rows, which is why the ruling's rejected
+          authorized-set alternative is not what this is.
+
+        What stays refused is the whole of the reported IDOR: another
+        creator's pending row, a foreign Program's linked row, a guessed id
+        that never existed, and a deactivated creator's orphans. None of
+        those are in any of the three sources.
+        """
+        overview = self.get_setup_overview_v2(user_id, role, scope)
+        if not isinstance(overview, dict) or "error" in overview:
+            return None
+        scoped_key, pending_key = self._SETUP_PARENT_KEYS[kind]
+        ids = {row["id"] for row in overview.get(scoped_key) or []}
+        ids |= {row["id"] for row in overview.get(pending_key) or []}
+        ids |= self._creator_created_ids(user_id).get(kind, set())
+        return ids
+
     def _creator_created_ids(self, user_id):
         """``{entity_type: {entity_id, ...}}`` for the rows ``user_id``
         CREATED, from the audit trail (#367 owner ruling's "separately
@@ -4893,16 +4950,38 @@ class ApiService:
         so touching a record cannot become a way to start seeing it; and
         ``user_id=None`` (an identity-less caller) owns nothing.
 
-        Zero-Program bootstrap (a brand-new install with no Program created
-        yet at all) is the one case that still returns the full unfiltered
-        legacy shape, matching ``role=None`` — there is no "other Program"
-        for such an install to leak. A role authorized for zero Programs
-        while OTHER Programs already exist in the installation instead gets
-        the fully scoped-empty shape (every derived-join set is naturally
-        empty, since nothing can validate against a Program that never
-        resolved), with only its OWN pending creations alongside — this is
-        the actual case #369 review flags as a leak (a scoped account
-        enumerating installation-wide names), now closed.
+        **A zero-Program installation is not an exception to any of that**,
+        and an earlier revision's carve-out saying otherwise is REVERSED.
+        That revision let any authenticated caller whose context resolved no
+        Program fall through to the fully unfiltered legacy shape whenever
+        the store happened to hold zero Programs, reasoning that a brand-new
+        install has no "other Program" to leak from. The reasoning does not
+        hold: an install with no Program still accumulates pre-Program setup
+        rows — Clubs, Organizations, Venues, Rinks, IceSlots and Officials,
+        the last of which carry people's personal names — so two
+        setup-capable accounts on the same fresh install could each
+        enumerate everything the other had created, and an account holding
+        the read permission but authorized for nothing could enumerate all
+        of it. Absence of a Program is not an authorization, and this was
+        neither the owner-approved creator-owned contract nor a separately
+        authorized install-admin boundary.
+
+        So an authenticated caller with zero Programs now gets exactly what
+        an authenticated caller denied by scope gets: the scoped-empty shape
+        plus its OWN ``pending_link_*`` rows. That is all a bootstrap ever
+        needed — the operator building a brand-new install IS the account
+        that created the rows it is working on, so create-then-link keeps
+        working end to end, and the first Program's creation immediately
+        resolves a real active context (``ContextService._fallback`` selects
+        the only authorized Program) from which the normal scoped chains
+        take over. No install-bootstrap authorization is introduced, because
+        none is needed to keep the flow working; a second operator's
+        pre-Program rows simply stay that operator's.
+
+        A role authorized for zero Programs while OTHER Programs exist gets
+        the identical answer, deliberately: the two cases are now one code
+        path, so no future "but the install is empty" special case can
+        reopen the hole.
 
         Called with no arguments (``role`` left ``None``, the default),
         returns the full, unfiltered installation view exactly as before
@@ -4914,13 +4993,19 @@ class ApiService:
         scoped = role is not None
         active_program = active_season = active_league = None
         if scoped:
+            # An authenticated caller is ALWAYS scoped -- including on an
+            # installation with zero Programs. There is deliberately no
+            # "brand-new install" fall-through to the unfiltered shape here:
+            # a Program-less install still holds pre-Program Clubs,
+            # Organizations, Venues, Rinks, IceSlots and Officials (personal
+            # names), and the absence of a Program never authorized a second
+            # setup-capable account to enumerate them. Such a caller gets the
+            # scoped-empty shape plus its OWN pending_link_* rows, which is
+            # exactly what a create-then-link bootstrap needs. See the
+            # docstring; the regression lives in
+            # tests/test_zero_program_bootstrap_scoping.py.
             active_program, active_season, active_league = (
                 self.context.resolve_with_league(user_id, role, scope))
-            if active_program is None and not self.store.all_programs():
-                # Brand-new install, zero Programs anywhere: nothing exists
-                # yet for any Program to leak, so this is a bootstrap read,
-                # not a denial -- fall through to the unfiltered shape.
-                scoped = False
 
         if not scoped:
             programs = self.store.all_programs()

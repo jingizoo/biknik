@@ -783,11 +783,24 @@ class PendingLinkOwnershipHttpTest(unittest.TestCase):
                 f"a newly-created account inherited a deactivated creator's "
                 f"{key} row")
 
-    def test_http_probing_a_guessed_parent_id_discloses_no_name(self):
+    def test_http_writing_under_a_guessed_parent_id_is_refused_outright(self):
         """The probe over real sessions and real authorization: an ARENA
-        MANAGER — the identity the ruling names, holding MANAGE_ARENA and
-        nothing more — creates children under another session's never-linked
-        parent ids and gets no name back."""
+        MANAGER — the identity the ruling names — tries to create children
+        under another session's never-linked parent ids, and every one is
+        REFUSED.
+
+        This assertion was reversed in the #369 review round. It previously
+        required only that the probe creates come back with the parent's NAME
+        withheld; the review established that redaction was the wrong remedy,
+        because withholding the name leaves two disclosures intact. Whether
+        the create SUCCEEDS is itself an existence oracle over sequential ids
+        (``venue_9`` accepted, ``venue_99`` not), and — the part no redaction
+        can address — the write really happens: another creator's private
+        setup graph silently grows a Rink, its Rink grows ice, its
+        Organization grows a Venue, its Club grows an Official carrying a
+        person's name. The remedy is that the write never lands at all, so
+        that is what is asserted here now.
+        """
         admin = self._login("admin")
         secret_venue = self._post(admin, "venue",
                                   {"name": "HTTP-PROBE-SECRET-VENUE"})
@@ -804,41 +817,70 @@ class PendingLinkOwnershipHttpTest(unittest.TestCase):
         # this one role, the Official/home-club one included. That is the
         # personal-data case the ruling singles out.
         arena = self._login("arena")
-        probe_official = self._post(arena, "official",
-                                    {"name": "probe-official",
-                                     "home_club_id": secret_club["id"]})
-        probe_rink = self._post(arena, "rink",
-                                {"venue_id": secret_venue["id"],
-                                 "name": "probe-rink"})
-        probe_slot = self._post(arena, "ice-slot",
-                                {"rink_id": secret_rink["id"],
-                                 "start_time": "2027-06-01T10:00:00+00:00",
-                                 "end_time": "2027-06-01T11:00:00+00:00"})
-        probe_venue = self._post(arena, "venue",
-                                 {"name": "probe-venue",
-                                  "organization_id": secret_org["id"]})
-        ov = self._overview(arena)
+        before = self._overview(admin)
+        slot_times = {"start_time": "2027-06-01T10:00:00+00:00",
+                      "end_time": "2027-06-01T11:00:00+00:00"}
+        # (route, body key naming the parent, the owner's real id, the noun
+        # the facade uses when that kind of parent genuinely does not exist)
+        probes = [
+            ("official", "home_club_id", secret_club["id"], "Club",
+             {"name": "probe-official"}),
+            ("rink", "venue_id", secret_venue["id"], "Venue",
+             {"name": "probe-rink"}),
+            ("ice-slot", "rink_id", secret_rink["id"], "Rink", slot_times),
+            ("venue", "organization_id", secret_org["id"], "Organization",
+             {"name": "probe-venue"}),
+        ]
+        for entity, key, parent_id, label, rest in probes:
+            status, resp = self._req(arena, "POST",
+                                     f"/api/v2/setup/{entity}",
+                                     {key: parent_id, **rest})
+            self.assertEqual(
+                status, 404,
+                f"an Arena Manager wrote a {entity} into another creator's "
+                f"private setup graph under {key}={parent_id}: {resp}")
+            self.assertEqual(resp["error"]["message"],
+                             f"{label} {parent_id} not found.", resp)
+            # Identical to a parent id that never existed, so the refusal
+            # cannot be used to probe which sequential ids are real. Compared
+            # after substituting the id, which is the only field either
+            # response is allowed to differ in (it echoes back the caller's
+            # own input, never new information).
+            ghost_id = f"{key[:-3]}_does_not_exist"
+            ghost_status, ghost_resp = self._req(
+                arena, "POST", f"/api/v2/setup/{entity}",
+                {key: ghost_id, **rest})
+            self.assertEqual(
+                (ghost_status, ghost_resp),
+                (status, {"error": {"code": resp["error"]["code"],
+                                    "message": f"{label} {ghost_id} "
+                                               "not found."}}),
+                f"the inaccessible-{key} refusal is distinguishable from the "
+                f"nonexistent one: {resp} vs {ghost_resp}")
 
-        blob = json.dumps(ov)
+        # Nothing landed: the owner's graph is byte-for-byte what it was.
+        self.assertEqual(
+            json.dumps(self._overview(admin), sort_keys=True),
+            json.dumps(before, sort_keys=True),
+            "a refused cross-creator write still mutated the owner's setup "
+            "graph")
+
+        # ...and no name leaked into the prober's own view either.
+        blob = json.dumps(self._overview(arena))
         for name in ("HTTP-PROBE-SECRET-VENUE", "HTTP-PROBE-SECRET-RINK",
                      "HTTP-PROBE-SECRET-ORG", "HTTP-PROBE-SECRET-CLUB"):
             self.assertNotIn(
                 name, blob,
-                f"an Arena Manager read {name!r} back out of its own "
-                "pending-link rows by creating a child under a guessed "
-                "parent id")
-        row = next(r for r in ov["pending_link_rinks"]
-                   if r["id"] == probe_rink["id"])
-        self.assertIsNone(row["venue_name"], row)
-        row = next(r for r in ov["pending_link_ice_slots"]
-                   if r["id"] == probe_slot["id"])
-        self.assertIsNone(row["rink_name"], row)
-        row = next(r for r in ov["pending_link_venues"]
-                   if r["id"] == probe_venue["id"])
-        self.assertIsNone(row["organization_name"], row)
-        row = next(r for r in ov["pending_link_officials"]
-                   if r["id"] == probe_official["id"])
-        self.assertIsNone(row["home_club_name"], row)
+                f"an Arena Manager read {name!r} back out of its own rows")
+
+        # Positive control: the SAME creates succeed under parents this
+        # caller made itself, so the refusals above are a scope decision and
+        # not a blanket "Arena Managers cannot create".
+        own_venue = self._post(arena, "venue", {"name": "arena-own-venue"})
+        own_rink = self._post(arena, "rink", {"venue_id": own_venue["id"],
+                                              "name": "arena-own-rink"})
+        self._post(arena, "ice-slot", dict(rink_id=own_rink["id"],
+                                           **slot_times))
 
     def test_http_the_demo_seed_is_attributed_to_a_real_account(self):
         """The ruling's demo-seed condition, asserted at the only layer that

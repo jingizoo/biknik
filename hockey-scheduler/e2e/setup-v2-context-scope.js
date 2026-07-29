@@ -487,10 +487,16 @@ async function assertRecordsScope(page, self, other, expected, step) {
     ? present("Rinks", name) : absent("Rinks", name)));
   other.rinks.forEach((name) => absent("Rinks", name));
 
-  // 5. The `unassigned_*` bootstrap contract: a record linked to NO Program
-  //    at all is nobody's data yet, so it stays visible from EVERY Program's
-  //    Records (unioned in by app.js's withUnassigned). It must regress
-  //    neither into "invisible everywhere" nor back into "leaks like before".
+  // 5. The creator-owned `pending_link_*` contract (this comment used to
+  //    describe the REVERSED `unassigned_*` one, down to a `withUnassigned`
+  //    helper that no longer exists). A record linked to NO Program at all is
+  //    not "nobody's data": it stays visible to the account that CREATED it,
+  //    from every Program that account works in, and to nobody else. This
+  //    journey drives a single admin session, which is that account -- so
+  //    these two must be present here, and must regress neither into
+  //    "invisible everywhere" nor back into "visible to everyone". The
+  //    "and to nobody else" half needs two real sessions and lives in
+  //    test_pending_link_ownership.py / test_zero_program_bootstrap_scoping.py.
   present("Clubs", FREE_CLUB);
   present("Venues", FREE_VENUE);
 

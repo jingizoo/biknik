@@ -152,6 +152,26 @@ ERROR_HTTP_STATUS = {
 # schema check (#271) can't drift from what the service accepts.
 _AVAILABILITY_VALUES = frozenset(s.value for s in AvailabilityStatus)
 
+# The four setup-create PARENT relations a caller supplies by id (#369
+# review): rink→venue, ice-slot→rink, venue→organization, official→club.
+# Each maps its parent entity kind to the exact noun the facade's own
+# ``NotFoundError`` uses for a genuinely missing parent (see
+# ``setup_service.create_rink``/``create_ice_slot``/``create_venue``/
+# ``create_official``) -- reusing that wording verbatim is what makes an
+# inaccessible parent byte-identical to a nonexistent one.
+#
+# WHICH ids are reachable is not decided here: ``ApiService.
+# writable_setup_parent_ids`` answers that beside the read it mirrors, so the
+# write gate cannot drift into a second, weaker policy than the read.
+#
+# See ``Handler._reject_parent_outside_scope``.
+_SETUP_PARENT_LISTS = {
+    "venue": "Venue",
+    "rink": "Rink",
+    "organization": "Organization",
+    "club": "Club",
+}
+
 
 # Method-405 routing table (#271). Two ordered lists of compiled path patterns
 # transcribed from the ``do_GET``/``do_POST`` dispatch below (an explicitly
@@ -2140,7 +2160,8 @@ class Handler(BaseHTTPRequestHandler):
         # (_serialize) responses — NO v1 adapter mapping. Checked before the v1
         # prefix so /api/v2/setup/ never falls through to /api/setup/.
         if path.startswith("/api/v2/setup/"):
-            return self._handle_setup_v2(path[len("/api/v2/setup/"):], body, user_id)
+            return self._handle_setup_v2(path[len("/api/v2/setup/"):], body,
+                                         user_id, role, scope)
 
         # Ice Availability Builder (#158): preview then idempotently commit a
         # recurring block of AVAILABLE Game ice for a Season. Checked BEFORE the
@@ -2192,7 +2213,8 @@ class Handler(BaseHTTPRequestHandler):
 
         # Setup create endpoints — operator creates real records via the API.
         if path.startswith("/api/setup/"):
-            return self._handle_setup(path[len("/api/setup/"):], body, user_id)
+            return self._handle_setup(path[len("/api/setup/"):], body,
+                                      user_id, role, scope)
 
         # Pilot onboarding import dry-run (#92): validates CSV-shaped rows and
         # always returns 200 with the report itself (ok true/false) — nothing
@@ -2584,12 +2606,85 @@ class Handler(BaseHTTPRequestHandler):
             "code": "not_found",
             "message": f"Unknown reassignment {entity}/assign-{target}."}}, 404)
 
-    def _handle_setup(self, entity: str, body: dict, actor_id: str):
+    def _reject_parent_outside_scope(self, kind: str, parent_id,
+                                     role, scope, user_id) -> bool:
+        """Refuse a create whose caller-supplied PARENT id is not one this
+        caller may already see. Sends the refusal and returns True when it
+        refuses; returns False (nothing sent, nothing written) otherwise.
+
+        #369 review — the cross-owner write IDOR. Redacting the resolved
+        parent NAME out of ``pending_link_*`` closed the read-side oracle but
+        left the write itself wide open: every create route below took its
+        parent id verbatim from the request body, so an operator authorized
+        for zero of the relevant Programs could still POST a Rink under
+        another creator's guessed ``venue_N``, an IceSlot under a foreign
+        ``rink_N``, a Venue under a foreign ``org_N`` or an Official homed at
+        a foreign ``club_N``. Two things leak even with the name withheld:
+        success-versus-not-found is itself an existence oracle over
+        sequential ids, and the attacker MUTATES another creator's pending
+        setup graph (its Venue grows a Rink, its Rink grows ice). Creator-
+        owned visibility cannot be secure while crafted writes may attach
+        children to foreign creator-owned parents, so the parent id is
+        validated here, BEFORE the facade call.
+
+        The acceptance rule is computed by
+        ``ApiService.writable_setup_parent_ids`` from the read itself rather
+        than re-derived here, so the write gate can never drift from what the
+        caller can see: the ACTIVE scoped list for that entity kind, UNION
+        this caller's own pending-link list, UNION the rows this caller
+        CREATED. See that method for why the third source is required rather
+        than merely convenient. Everything else — another creator's pending
+        row, a foreign Program's linked row, a guessed id that never existed,
+        a deactivated creator's orphaned row — is refused.
+
+        The refusal is BYTE-IDENTICAL to the nonexistent case, because both
+        take this exact path: a foreign parent is not in the accessible set,
+        and neither is a nonexistent one. The message is the same
+        ``"<Label> <id> not found."`` ``NotFoundError`` the facade itself
+        raises for a genuinely missing parent (``setup_service.create_rink``
+        et al), so an honest 404 is unchanged on the wire and an
+        inaccessible parent is indistinguishable from one that was never
+        there. Only the caller's OWN id is echoed back — never new
+        information.
+
+        Fails CLOSED: an unresolvable identity or an errored overview refuses
+        rather than falling through to the write. A falsy ``parent_id`` is
+        NOT this gate's business (there is no id to leak and no record to
+        probe) — a required-but-missing parent stays the facade's own
+        validation/not-found error, unchanged.
+
+        Bootstrap needs no exception here. An authenticated read is scoped
+        even on an installation with zero Programs (that carve-out was
+        removed in this same round), and the operator building a fresh
+        install is by definition the account that created its rows — so the
+        creator-owned source above carries the whole bootstrap chain, and a
+        SECOND setup-capable account on that same empty install is still
+        correctly refused.
+        """
+        if not parent_id:
+            return False
+        label = _SETUP_PARENT_LISTS[kind]
+        accessible = None
+        if role is not None:
+            accessible = STATE.api.writable_setup_parent_ids(
+                kind, user_id, role, scope)
+        if accessible is not None and parent_id in accessible:
+            return False
+        self._send_json({"error": {
+            "code": "not_found",
+            "message": f"{label} {parent_id} not found."}}, 404)
+        return True
+
+    def _handle_setup(self, entity: str, body: dict, actor_id: str,
+                      role=None, scope=None):
         """Dispatch /api/setup/<entity> to the matching facade create method.
 
         ``actor_id`` is always the caller's server-resolved session user id
         (#136) — never a client-supplied body field, so the setup audit
-        trail can't be forged.
+        trail can't be forged. ``role``/``scope`` come from the SAME
+        ``_resolve_role()`` call that produced ``actor_id`` and are used only
+        by ``_reject_parent_outside_scope`` (#369 review), so the write gate
+        reads the identical identity the audit trail records.
         """
         api = STATE.api
         b = body
@@ -2745,13 +2840,27 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(api.create_organization(
                 b.get("name"), b.get("short_name", ""), actor_id))
         if entity == "venue":
+            # #369 review: the caller-supplied parent must be one this caller
+            # can already see, or the create is refused exactly as if the id
+            # did not exist (see _reject_parent_outside_scope). Same gate on
+            # both API versions — v1 is not a bypass.
+            if self._reject_parent_outside_scope(
+                    "organization", b.get("organization_id"),
+                    role, scope, actor_id):
+                return
             return self._send_api(api.create_venue(
                 b.get("name"), b.get("address", ""), b.get("timezone", "UTC"),
                 b.get("organization_id") or None, b.get("league_id") or None, actor_id))
         if entity == "rink":
+            if self._reject_parent_outside_scope(
+                    "venue", b.get("venue_id"), role, scope, actor_id):
+                return
             return self._send_api(api.create_rink(
                 b.get("venue_id"), b.get("name"), actor_id))
         if entity == "ice-slot":
+            if self._reject_parent_outside_scope(
+                    "rink", b.get("rink_id"), role, scope, actor_id):
+                return
             return self._send_api(api.create_ice_slot(
                 b.get("rink_id"), b.get("start_time"), b.get("end_time"),
                 b.get("slot_type", "game"), actor_id))
@@ -2765,6 +2874,9 @@ class Handler(BaseHTTPRequestHandler):
                 allow_division_override=bool(b.get("allow_division_override")),
                 actor_id=actor_id)))
         if entity == "official":
+            if self._reject_parent_outside_scope(
+                    "club", b.get("home_club_id"), role, scope, actor_id):
+                return
             return self._send_api(api.create_official(
                 b.get("name"), b.get("home_club_id"), actor_id))
         if entity == "player":
@@ -2879,7 +2991,8 @@ class Handler(BaseHTTPRequestHandler):
             "code": "not_found",
             "message": f"Unknown reassignment {entity}/assign-{target}."}}, 404)
 
-    def _handle_setup_v2(self, entity: str, body: dict, actor_id: str):
+    def _handle_setup_v2(self, entity: str, body: dict, actor_id: str,
+                         role=None, scope=None):
         """Dispatch /api/v2/setup/<entity> to the canonical facade (#233 Slice C2).
 
         The canonical write surface: canonical body keys (program_id /
@@ -2888,7 +3001,9 @@ class Handler(BaseHTTPRequestHandler):
         validation is REQUIRED on the v2 routes where the target model demands it
         (League on division / registration / game); a missing one is a
         validation_error rather than a silent v1-style derivation. ``actor_id`` is
-        always the server-resolved session user (#136).
+        always the server-resolved session user (#136); ``role``/``scope`` come
+        from that same ``_resolve_role()`` call and feed
+        ``_reject_parent_outside_scope`` (#369 review) only.
         """
         api = STATE.api
         b = body
@@ -3129,13 +3244,26 @@ class Handler(BaseHTTPRequestHandler):
             # v2 omits league_id — venue↔program is a legacy v1-only relation
             # (Slice E decouples it); the v2 route never accepts it in the request
             # and strips it from the response (canonical Venue is org-owned only).
+            # #369 review: the caller-supplied parent must be one this caller can
+            # already see, or the create is refused exactly as if the id did not
+            # exist (see _reject_parent_outside_scope).
+            if self._reject_parent_outside_scope(
+                    "organization", b.get("organization_id"),
+                    role, scope, actor_id):
+                return
             return self._send_api(_v2p.venue_to_v2(api.create_venue(
                 b.get("name"), b.get("address", ""), b.get("timezone", "UTC"),
                 b.get("organization_id") or None, None, actor_id)))
         if entity == "rink":
+            if self._reject_parent_outside_scope(
+                    "venue", b.get("venue_id"), role, scope, actor_id):
+                return
             return self._send_api(api.create_rink(
                 b.get("venue_id"), b.get("name"), actor_id))
         if entity == "ice-slot":
+            if self._reject_parent_outside_scope(
+                    "rink", b.get("rink_id"), role, scope, actor_id):
+                return
             return self._send_api(api.create_ice_slot(
                 b.get("rink_id"), b.get("start_time"), b.get("end_time"),
                 b.get("slot_type", "game"), actor_id))
@@ -3155,6 +3283,9 @@ class Handler(BaseHTTPRequestHandler):
                 actor_id=actor_id, league_id=b.get("league_id") or None,
                 game_type=game_type))
         if entity == "official":
+            if self._reject_parent_outside_scope(
+                    "club", b.get("home_club_id"), role, scope, actor_id):
+                return
             return self._send_api(api.create_official(
                 b.get("name"), b.get("home_club_id"), actor_id))
         if entity == "player":
