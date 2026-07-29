@@ -1105,6 +1105,14 @@ class SetupProgressHttpTest(unittest.TestCase):
         self.assertEqual(status, 200, league)
         status, club = self._req(admin, "POST", "/api/v2/setup/club", {"name": "Club"})
         self.assertEqual(status, 200, club)
+        # #367 prerequisite: a Team's League must belong to the ACTIVE Program,
+        # so move there before populating it. The deliberate Program-ONLY
+        # context (season_id: None) this test actually exercises is still set
+        # below -- that is the state under test, not this setup step.
+        status, _ = self._req(admin, "POST", "/api/context",
+                              {"program_id": program["id"],
+                               "season_id": season["id"]})
+        self.assertEqual(status, 200)
         status, _ = self._req(admin, "POST", "/api/v2/setup/team",
                               {"club_id": club["id"], "league_id": league["id"], "name": "Team"})
         self.assertEqual(status, 200)
@@ -1184,6 +1192,13 @@ class SetupProgressHttpTest(unittest.TestCase):
         self.assertEqual(status, 200, league_a)
         status, club = self._req(admin, "POST", "/api/v2/setup/club", {"name": "Club"})
         self.assertEqual(status, 200, club)
+        # #367 prerequisite: move to the Program being built before populating
+        # it -- a Team's League must belong to the ACTIVE Program, and this
+        # class shares one store across test methods.
+        status, _ = self._req(admin, "POST", "/api/context",
+                              {"program_id": program["id"],
+                               "season_id": season_a["id"]})
+        self.assertEqual(status, 200)
         status, team = self._req(admin, "POST", "/api/v2/setup/team",
                                  {"club_id": club["id"], "league_id": league_a["id"],
                                   "name": "Team"})

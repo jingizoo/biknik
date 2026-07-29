@@ -2257,6 +2257,13 @@ class SchedulerHttpTest(unittest.TestCase):
             "season_id": season["id"], "level_id": level["id"],
             "name": "HCC Division"})
         club = post("/api/setup/club", {"name": "HCC Club"})
+        # #367 prerequisite: a Team's League must belong to the caller's ACTIVE
+        # Program. This class shares one server/store across test methods, so
+        # the context can still resolve to a Program an earlier test created;
+        # move to the one being built here before populating it. (`league` is
+        # the legacy-vocabulary PROGRAM created above -- /api/setup/league.)
+        post("/api/context",
+             {"program_id": league["id"], "season_id": season["id"]})
         t0 = post("/api/v2/setup/team",
                   {"club_id": club["id"], "league_id": level["id"], "name": "HCC A"})
         t1 = post("/api/v2/setup/team",
