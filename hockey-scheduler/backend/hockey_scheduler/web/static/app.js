@@ -9651,6 +9651,28 @@ function resetTransientUiState() {
   // superseded switch already does.
   contextSwitchQueued = null;
   contextSwitchSeq += 1;
+  // ...and the same for a switch whose POST has already LEFT but has not yet
+  // been ANSWERED. #369 made sendContextSwitch() publish the intended
+  // selection into location.hash BEFORE its POST, so the hash can never lag
+  // an already-mutated server. The flip side is that an unacknowledged switch
+  // now leaves the DEPARTING identity's raw intent sitting in the URL.
+  // Bumping contextSwitchSeq above only makes that POST's own completion skip
+  // its reconciliation; it does nothing about the hash. So the next
+  // identity's boot runs restoreContextDeepLink(), sees hash != its persisted
+  // selection, applies deep-link-wins, and re-POSTs the OLD identity's
+  // never-acknowledged choice as the NEW identity's context -- precisely the
+  // cross-identity leak discarding contextSwitchQueued above exists to
+  // prevent, just carried by a stronger vehicle.
+  //
+  // contextOptions.selected is still the last SERVER-CONFIRMED selection
+  // (sendContextSwitch only overwrites it after its POST resolves), so
+  // syncContextHash() here rewinds the hash to the context the server
+  // actually holds. Guarded on contextSwitchInFlight so this is a no-op on an
+  // ordinary identity transition: a COMPLETED switch's hash already equals
+  // contextOptions.selected, and inheriting a CONFIRMED context across a
+  // persona switch is the pre-existing, intended deep-link behavior -- only
+  // the unconfirmed phantom is withdrawn.
+  if (contextSwitchInFlight) syncContextHash();
 }
 function setUser(user) {
   const prevId = currentUser ? currentUser.username : null;

@@ -90,6 +90,41 @@ function stopServer(server) {
   });
 }
 
+// Each check function wraps its failures with the demo server's own output.
+// Building a bare `new Error(...)` for that threw away the ORIGINAL stack and
+// left every failure pointing at the wrapper's own `throw` line instead of
+// the assertion that actually failed -- for a bare Playwright timeout
+// ("Timeout 10000ms exceeded.") that erased the only clue there was. Keep the
+// original stack attached.
+function withServerOutput(error, serverOutput) {
+  const message = `${error && error.message ? error.message : error}`
+    + `\n--- demo server output ---\n${serverOutput}`;
+  const wrapped = new Error(message);
+  wrapped.stack = `${message}\n--- original stack ---\n`
+    + `${error && error.stack ? error.stack : "(no stack)"}`;
+  return wrapped;
+}
+
+// Labelled wait: `page.waitForFunction` alone reports only "Timeout 10000ms
+// exceeded.", which names neither the condition nor the step. Mirrors the
+// helper in context-switcher.js.
+async function waitFor(page, label, fn, arg, timeoutMs) {
+  try {
+    await page.waitForFunction(fn, arg, { timeout: timeoutMs || 10000 });
+  } catch (error) {
+    throw new Error(`timed out waiting for: ${label}\n${error.message}`);
+  }
+}
+
+// Same, for selector waits.
+async function waitForSel(page, label, selector, options) {
+  try {
+    await page.waitForSelector(selector, Object.assign({ timeout: 10000 }, options || {}));
+  } catch (error) {
+    throw new Error(`timed out waiting for: ${label} (selector ${selector})\n${error.message}`);
+  }
+}
+
 // Read the rendered Home/Tasks card into a plain object for assertions.
 function cardState(page) {
   return page.evaluate((headings) => {
@@ -165,27 +200,27 @@ async function assertCardHasNoA11yViolations(page, viewportLabel, stateLabel) {
 }
 
 async function reachDashboard(page) {
-  await page.waitForFunction(
+  await waitFor(page, "boot to settle on the onboarding wizard or the Dashboard",
     () => document.body.dataset.view === "onboarding"
-      || document.body.dataset.view === "dashboard", null, { timeout: 10000 });
+      || document.body.dataset.view === "dashboard", null, 10000);
   if (await page.evaluate(() => document.body.dataset.view) === "onboarding") {
     await page.click('[data-onboarding-goto="dashboard"]');
   }
-  await page.waitForFunction(
-    () => document.body.dataset.view === "dashboard", null, { timeout: 10000 });
+  await waitFor(page, "the Dashboard view (body.dataset.view === 'dashboard')",
+    () => document.body.dataset.view === "dashboard", null, 10000);
 }
 
 // Wait past the Dashboard's loading skeleton for the real card (any h3) or,
 // once setup is fully done, for the plain Dashboard content with no card.
 async function waitForCardSettled(page) {
-  await page.waitForFunction(() => {
+  await waitFor(page, "the setup-progress card's own loading skeleton to clear", () => {
     // #331 review round 2 finding 3: the card now loads independently of
     // the rest of the Dashboard, so ".dash-stats" existing no longer means
     // the card's own fetch has resolved too -- check its slot specifically.
     const slot = document.getElementById("sp-card-slot");
     if (slot) return !slot.querySelector(".skeleton");
     return !!document.querySelector(".dash-stats");  // no slot at all (no permission) -- Dashboard itself settled
-  }, null, { timeout: 10000 });
+  }, null, 10000);
 }
 
 // Waits specifically for the complete-state heading, rather than relying on
@@ -194,11 +229,12 @@ async function waitForCardSettled(page) {
 // PRIOR state (e.g. the error state) had no skeleton of its own either --
 // this waits for the actual expected outcome instead of a proxy for it.
 async function waitForCompleteHeading(page) {
-  await page.waitForFunction((headings) => {
-    const h3 = Array.from(document.querySelectorAll(".dash-card h3")).find(
-      (el) => headings.some((h) => el.textContent.trim().startsWith(h)));
-    return !!(h3 && h3.textContent.includes("All setup steps complete"));
-  }, KNOWN_CARD_HEADINGS, { timeout: 10000 });
+  await waitFor(page, `the card's complete-state heading ("All setup steps complete")`,
+    (headings) => {
+      const h3 = Array.from(document.querySelectorAll(".dash-card h3")).find(
+        (el) => headings.some((h) => el.textContent.trim().startsWith(h)));
+      return !!(h3 && h3.textContent.includes("All setup steps complete"));
+    }, KNOWN_CARD_HEADINGS, 10000);
 }
 
 // Destination focus management (#331 review round 1 finding 4): a non-drawer
@@ -212,12 +248,13 @@ async function waitForCompleteHeading(page) {
 // content is later replaced, and focus resets to <body> for good, so a
 // bounded poll surfaces that failure clearly instead of racily passing.
 async function assertFocusLandedInContent(page) {
-  await page.waitForFunction(() => {
-    const active = document.activeElement;
-    const content = document.getElementById("content");
-    return !!(active && active.getAttribute("tabindex") === "-1"
-      && content && content.contains(active));
-  }, null, { timeout: 10000 });
+  await waitFor(page, `keyboard focus to land on a tabindex="-1" heading inside #content`,
+    () => {
+      const active = document.activeElement;
+      const content = document.getElementById("content");
+      return !!(active && active.getAttribute("tabindex") === "-1"
+        && content && content.contains(active));
+    }, null, 10000);
 }
 
 // Context-switch race coverage deliberately leaves an OLD request in flight
@@ -259,7 +296,11 @@ async function selectContextAndWaitForStableView(page, base, {
       + `requested Program/Season: POST=${JSON.stringify(persisted)}, `
       + `options=${JSON.stringify(selected)}`);
   }
-  await page.waitForFunction(
+  await waitFor(page,
+    `the ${viewName} view to hold steady across two paints after switching to `
+      + `${contextValue} (bound select ${selector} === ${seasonId}`
+      + `${requiredSelectors.length ? `, required ${requiredSelectors.join("/")}` : ""}`
+      + `${absentSelectors.length ? `, absent ${absentSelectors.join("/")}` : ""})`,
     ({ viewName, selector, seasonId, contextValue,
       requiredSelectors, absentSelectors }) =>
       new Promise((resolve) => {
@@ -287,8 +328,7 @@ async function selectContextAndWaitForStableView(page, base, {
       }),
     { viewName, selector, seasonId, contextValue,
       requiredSelectors, absentSelectors },
-    { timeout: 10000 }
-  );
+    10000);
 }
 
 async function apiPost(page, p, body) {
@@ -934,7 +974,7 @@ async function checkViewport(browser, viewport) {
       + `with a keyboard-operable Schedule link, and recovers via Retry from `
       + `a failed fetch.`);
   } catch (error) {
-    throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
+    throw withServerOutput(error, serverOutput);
   } finally {
     await context.close();
     await stopServer(server);
@@ -1610,8 +1650,9 @@ async function checkRoleScenarios(browser, viewport) {
     await new Promise((r) => setTimeout(r, 200));
     const switchValue = `${e.progE1}|`;
     await page.selectOption("#ctx-select", switchValue);
-    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
-      switchValue, { timeout: 10000 });
+    await waitFor(page,
+      `the context switcher to settle on ${switchValue} (#ctx-select.value)`,
+      (v) => document.getElementById("ctx-select").value === v, switchValue, 10000);
     releaseHierarchy();
     await page.unroute("**/api/v2/setup/hierarchy");
     await page.waitForFunction(
@@ -1668,8 +1709,9 @@ async function checkRoleScenarios(browser, viewport) {
     await freshLoad();
     const switchToE3 = `${e3.progE3}|`;
     await page.selectOption("#ctx-select", switchToE3);
-    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
-      switchToE3, { timeout: 10000 });
+    await waitFor(page,
+      `the context switcher to settle on ${switchToE3} (#ctx-select.value)`,
+      (v) => document.getElementById("ctx-select").value === v, switchToE3, 10000);
     await freshLoad();
     s = await cardState(page);
     if (!s || s.nextTitle !== "Permanent teams") {
@@ -1915,9 +1957,9 @@ async function checkRoleScenarios(browser, viewport) {
     // documents).
     const switchToF2ProgramOnly = `${f.progF2}|`;
     await page.selectOption("#ctx-select", switchToF2ProgramOnly);
-    await page.waitForFunction(
-      (v) => document.getElementById("ctx-select").value === v,
-      switchToF2ProgramOnly, { timeout: 10000 });
+    await waitFor(page,
+      `the context switcher to settle on ${switchToF2ProgramOnly} (#ctx-select.value)`,
+      (v) => document.getElementById("ctx-select").value === v, switchToF2ProgramOnly, 10000);
     await page.waitForFunction(
       () => {
         const form = document.querySelector(".import-form");
@@ -2098,8 +2140,9 @@ async function checkRoleScenarios(browser, viewport) {
     releaseContextH1();
     await page.unroute("**/api/v2/setup/hierarchy");
     await page.unroute("**/api/context");
-    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
-      switchToH2, { timeout: 10000 });
+    await waitFor(page,
+      `the context switcher to settle on ${switchToH2} (#ctx-select.value)`,
+      (v) => document.getElementById("ctx-select").value === v, switchToH2, 10000);
     // #ctx-select's own value is an EARLY signal within a render() cycle
     // (renderContextSwitcher() runs partway through it, same gap steps
     // F/G/K's own comments document elsewhere in this file) -- but here BOTH
@@ -2133,8 +2176,9 @@ async function checkRoleScenarios(browser, viewport) {
     releaseHierarchyH2b();
     await page.unroute("**/api/v2/setup/hierarchy");
     await page.unroute("**/api/context");
-    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
-      switchToH2, { timeout: 10000 });
+    await waitFor(page,
+      `the context switcher to settle on ${switchToH2} (#ctx-select.value)`,
+      (v) => document.getElementById("ctx-select").value === v, switchToH2, 10000);
     // Same reasoning as sub-case 1 above: wait for the network (both
     // renders' own fetch chains) to actually go quiet, not a fixed delay,
     // before asserting against #content.
@@ -2167,8 +2211,9 @@ async function checkRoleScenarios(browser, viewport) {
     await page.focus("#f-team-perm-league");
     await page.focus("#ctx-select");
     await page.selectOption("#ctx-select", switchToH2);
-    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
-      switchToH2, { timeout: 10000 });
+    await waitFor(page,
+      `the context switcher to settle on ${switchToH2} (#ctx-select.value)`,
+      (v) => document.getElementById("ctx-select").value === v, switchToH2, 10000);
     if (await page.$(".drawer") || await page.$(".drawer-scrim")) {
       fail("(I) expected the open drawer to be DISMISSED immediately after "
         + "a keyboard-driven context switch, not still present");
@@ -3453,8 +3498,9 @@ async function checkRoleScenarios(browser, viewport) {
     releaseL3();
     await page.unroute("**/api/context");
     page.off("request", trackL);
-    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
-      switchToL3, { timeout: 10000 });
+    await waitFor(page,
+      `the context switcher to settle on ${switchToL3} (#ctx-select.value)`,
+      (v) => document.getElementById("ctx-select").value === v, switchToL3, 10000);
     await page.waitForLoadState("networkidle").catch(() => {});
     if (seenRequestsL.length !== 2 || seenRequestsL.includes(l.progL1)) {
       fail(`(L) expected L1 to NEVER reach the network across the whole `
@@ -3511,8 +3557,9 @@ async function checkRoleScenarios(browser, viewport) {
         (document.querySelector("#toast-root .toast-msg") || {}).textContent || ""),
       null, { timeout: 10000 });
     await page.unroute("**/api/context");
-    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
-      switchToL3, { timeout: 10000 });
+    await waitFor(page,
+      `the context switcher to settle on ${switchToL3} (#ctx-select.value)`,
+      (v) => document.getElementById("ctx-select").value === v, switchToL3, 10000);
     const lServerContextAfterFailure = await apiGet(page, "/api/context");
     if (!lServerContextAfterFailure || lServerContextAfterFailure.program_id !== l.progL3) {
       fail(`(L, failure convergence) expected the server's own context to `
@@ -3593,8 +3640,9 @@ async function checkRoleScenarios(browser, viewport) {
         (document.querySelector("#toast-root .toast-msg") || {}).textContent || ""),
       null, { timeout: 10000 });  // LH3's own dequeued request lands and is rejected
     await page.unroute("**/api/context");
-    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
-      switchToLH2, { timeout: 10000 });
+    await waitFor(page,
+      `the context switcher to settle on ${switchToLH2} (#ctx-select.value)`,
+      (v) => document.getElementById("ctx-select").value === v, switchToLH2, 10000);
     const lhServerContext = await apiGet(page, "/api/context");
     if (!lhServerContext || lhServerContext.program_id !== lh.progLH2) {
       fail(`(L, hash sync) expected the server's own context to be LH2 `
@@ -3724,9 +3772,13 @@ async function checkRoleScenarios(browser, viewport) {
     // scenario is that the queued switch never gets a chance to be sent
     // under the identity that queued it, let alone the one it lands under.
     await page.selectOption("#role-switch", "arena");
-    await page.waitForFunction(
+    await waitFor(page,
+      "(L, identity supersession) the persona switch to arena to complete "
+        + "(sidebar #user-name === 'arena'); signIn() only renders it AFTER "
+        + "loadContextOptions() + restoreContextDeepLink() both resolve, so a "
+        + "stall here means boot is blocked on an /api/context round trip",
       () => (document.getElementById("user-name") || {}).textContent === "arena",
-      null, { timeout: 10000 });
+      null, 10000);
     releaseLI2();
     await page.unroute("**/api/context");
     page.off("request", trackLI);
@@ -3798,15 +3850,17 @@ async function checkRoleScenarios(browser, viewport) {
         .catch(() => null);
       await page.click('.tab[data-tab="import"]');
       await hierarchyCodesResp;
-      await page.waitForSelector("[data-import-sample]", { timeout: 10000 });
+      await waitForSel(page, "(M seed) the Import wizard's sample-data control",
+        "[data-import-sample]");
       // Wait for the Import view's OWN re-render to bind M1's Season, same
       // gap steps F/G/J/K/L's own comments document elsewhere in this file
       // -- needed here now (round 9) because Commit's own enabled state
       // below additionally requires importState.seasonId, not just a valid
       // report.
-      await page.waitForFunction(
+      await waitFor(page,
+        "(M seed) #import-season to rebind to M1's Season " + m.seasonM1,
         (v) => (document.getElementById("import-season") || {}).value === v,
-        m.seasonM1, { timeout: 10000 });
+        m.seasonM1, 10000);
       // Load the app's own known-valid sample (same proven flow as step
       // J's own Validate coverage above) rather than hand-typed text, so
       // Commit reliably becomes enabled below -- it still reads as
@@ -3818,35 +3872,43 @@ async function checkRoleScenarios(browser, viewport) {
         r.url() === `${base}/api/import/dry-run` && r.request().method() === "POST");
       await page.click("[data-import-validate]");
       await mValidateResp;
-      await page.waitForFunction(() => {
-        const btn = document.querySelector("[data-import-commit]");
-        return !!(btn && !btn.disabled);
-      }, null, { timeout: 10000 });
+      await waitFor(page,
+        "(M seed) Import's Commit to become enabled from a real validated report",
+        () => {
+          const btn = document.querySelector("[data-import-commit]");
+          return !!(btn && !btn.disabled);
+        }, null, 10000);
       await page.click('.tab[data-tab="calendar"]');
-      await page.waitForFunction(() => document.body.dataset.view === "calendar",
-        null, { timeout: 10000 });
-      await page.waitForSelector("[data-ice-builder-open]", { timeout: 10000 });
+      await waitFor(page, "(M seed) the calendar view",
+        () => document.body.dataset.view === "calendar", null, 10000);
+      await waitForSel(page, "(M seed) the Ice Builder entry point",
+        "[data-ice-builder-open]");
       await page.click("[data-ice-builder-open]");
-      await page.waitForFunction(
+      await waitFor(page,
+        "(M seed) #ib-season to bind M1's Season " + m.seasonM1,
         (v) => (document.getElementById("ib-season") || {}).value === v,
-        m.seasonM1, { timeout: 10000 });
+        m.seasonM1, 10000);
       await page.check(`.ib-rink[value="${m.rinkM1}"]`);
       const previewResp = page.waitForResponse((r) =>
         r.url() === `${base}/api/setup/ice-availability/preview` && r.request().method() === "POST");
       await page.click("[data-ib-preview]");
       await previewResp;
-      await page.waitForSelector("[data-ib-commit]", { timeout: 10000 });
+      await waitForSel(page, "(M seed) the Ice Builder's live Create control",
+        "[data-ib-commit]");
     };
     const assertMClearedFor = async (label) => {
-      await page.waitForFunction(() => !document.querySelector(".skeleton"),
-        null, { timeout: 10000 });
+      await waitFor(page,
+        `(M, ${label}) the post-identity-switch render to settle (no skeleton)`,
+        () => !document.querySelector(".skeleton"), null, 10000);
       if (await page.$("[data-ib-commit]") || await page.$(".ib-form")) {
         fail(`(M, ${label}) expected the Ice Builder to be fully closed for `
           + `the newly signed-in identity, not still showing the prior `
           + `identity's open form/preview`);
       }
       await page.click('.tab[data-tab="import"]');
-      await page.waitForSelector("[data-import-sample]", { timeout: 10000 });
+      await waitForSel(page,
+        `(M, ${label}) the Import wizard to render for the new identity`,
+        "[data-import-sample]");
       const textAfter = await page.evaluate(() => {
         const el = document.querySelector('textarea[id^="import-"]');
         return el ? el.value : null;
@@ -3879,8 +3941,9 @@ async function checkRoleScenarios(browser, viewport) {
     // since Legs 1/2's admin<->arena pair (both manage_arena) can never
     // exercise it.
     const assertMHiddenForLowerPrivilege = async (label) => {
-      await page.waitForFunction(() => !document.querySelector(".skeleton"),
-        null, { timeout: 10000 });
+      await waitFor(page,
+        `(M, ${label}) the post-identity-switch render to settle (no skeleton)`,
+        () => !document.querySelector(".skeleton"), null, 10000);
       if (await page.$("[data-ib-commit]") || await page.$(".ib-form")) {
         fail(`(M, ${label}) expected no leftover Ice Builder form/preview `
           + `to be reachable by a role without manage_arena`);
@@ -3909,9 +3972,10 @@ async function checkRoleScenarios(browser, viewport) {
     await freshLoad();
     await seedImportAndIceForM();
     await page.selectOption("#role-switch", "arena");
-    await page.waitForFunction(
+    await waitFor(page,
+      "(M, persona switch) the role-switch dropdown to land on arena (#user-name)",
       () => (document.getElementById("user-name") || {}).textContent === "arena",
-      null, { timeout: 10000 });
+      null, 10000);
     await assertMClearedFor("persona switch");
 
     // -- Leg 2: a real sign-out immediately followed by a DIFFERENT
@@ -3926,11 +3990,14 @@ async function checkRoleScenarios(browser, viewport) {
     await seedImportAndIceForM();
     await page.waitForLoadState("networkidle").catch(() => {});
     await page.click("#signout-btn");
-    await page.waitForSelector('[data-persona="arena"]', { state: "visible", timeout: 10000 });
+    await waitForSel(page,
+      "(M, sign-out/sign-in) the arena persona button on the login screen",
+      '[data-persona="arena"]', { state: "visible" });
     await page.click('[data-persona="arena"]');
-    await page.waitForFunction(
+    await waitFor(page,
+      "(M, sign-out/sign-in) the arena sign-in to complete (#user-name)",
       () => (document.getElementById("user-name") || {}).textContent === "arena",
-      null, { timeout: 10000 });
+      null, 10000);
     await assertMClearedFor("sign-out/sign-in");
     // Restore the admin session this file's remaining teardown expects.
     await logout(page);
@@ -3946,11 +4013,14 @@ async function checkRoleScenarios(browser, viewport) {
     await seedImportAndIceForM();
     await page.waitForLoadState("networkidle").catch(() => {});
     await page.click("#signout-btn");
-    await page.waitForSelector('[data-persona="coach"]', { state: "visible", timeout: 10000 });
+    await waitForSel(page,
+      "(M, lower privilege) the coach persona button on the login screen",
+      '[data-persona="coach"]', { state: "visible" });
     await page.click('[data-persona="coach"]');
-    await page.waitForFunction(
+    await waitFor(page,
+      "(M, lower privilege) the coach sign-in to complete (#user-name)",
       () => (document.getElementById("user-name") || {}).textContent === "coach",
-      null, { timeout: 10000 });
+      null, 10000);
     await assertMHiddenForLowerPrivilege("sign-out/sign-in to lower privilege");
     // Restore the admin session this file's remaining teardown expects.
     await logout(page);
@@ -3969,7 +4039,7 @@ async function checkRoleScenarios(browser, viewport) {
       + `and that seeding fails closed (no drawer, an actionable retry) on `
       + `a hierarchy-fetch error or a Program switch mid-flight.`);
   } catch (error) {
-    throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
+    throw withServerOutput(error, serverOutput);
   } finally {
     await context.close();
     await stopServer(server);
@@ -4098,7 +4168,7 @@ async function checkImportLeagueConflict(browser, viewport) {
       + `conflict is rejected with a structured error, never a false `
       + `Committed success state.`);
   } catch (error) {
-    throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
+    throw withServerOutput(error, serverOutput);
   } finally {
     await context.close();
     await stopServer(server);
@@ -4211,7 +4281,7 @@ async function checkImportAmbiguousDivisionRejection(browser, viewport) {
       + `two different leagues is rejected with a structured error for a `
       + `league-less team's row, never a false Committed success state.`);
   } catch (error) {
-    throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
+    throw withServerOutput(error, serverOutput);
   } finally {
     await context.close();
     await stopServer(server);
@@ -4234,7 +4304,10 @@ async function main() {
     console.log("Home/Tasks hub browser journey passed.");
   } catch (error) {
     console.error("Home/Tasks hub browser journey FAILED.");
-    console.error(error && error.message ? error.message : error);
+    // Print the stack, not just the message: a bare Playwright timeout
+    // ("Timeout 10000ms exceeded.") names neither the assertion nor the
+    // line, which makes a failure here undiagnosable from CI output alone.
+    console.error(error && error.stack ? error.stack : (error && error.message) || error);
     process.exitCode = 1;
   } finally {
     if (browser) await browser.close();
