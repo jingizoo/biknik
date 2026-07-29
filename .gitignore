@@ -4,3 +4,13 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 output/
+
+# Terraform
+terraform/.terraform/
+terraform/.terraform.lock.hcl
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/*.tfvars
+!terraform/*.tfvars.example
+terraform/crash.log
+terraform/wallet.zip
