@@ -331,8 +331,15 @@ class V2SetupContractTest(unittest.TestCase):
         # test methods, so pin the context to THIS test's own Program
         # explicitly rather than relying on whichever one the auto-fallback
         # happens to pick.
+        #
+        # #367 owner ruling: the active SEASON is a ceiling here too, so the
+        # Season is pinned as well -- a Program-only context would (by
+        # design, and asserted in test_league_filtered_overview_v2.py)
+        # return no seasons and no divisions at all, and this contract test
+        # is about the canonical DTO SHAPE, not the scoping rule.
         status, _ = self._req(c, "POST", "/api/context",
-                              {"program_id": program["id"]})
+                              {"program_id": program["id"],
+                               "season_id": season["id"]})
         self.assertEqual(status, 200)
 
         status, ov = self._req(c, "GET", "/api/v2/setup/overview")
@@ -362,11 +369,13 @@ class V2SetupContractTest(unittest.TestCase):
         self.assertEqual(t["league_id"], league["id"])
 
         # #369 review: a Venue is only in the strictly-scoped `venues` list
-        # once it has a SeasonVenueAccess grant into the active Program's
-        # seasons -- a just-created, not-yet-granted Venue like this one
-        # lives in the additive `unassigned_venues` bootstrap bucket instead
-        # (still safe to disclose: it is linked to no Program at all).
-        v = next(x for x in ov["venues"] + ov["unassigned_venues"]
+        # once it has a SeasonVenueAccess grant into the ACTIVE Season -- a
+        # just-created, not-yet-granted Venue like this one reaches the
+        # payload through `pending_link_venues` instead (#367 owner ruling:
+        # it is linked to no Program at all AND this caller created it, so
+        # it is offered to this caller's create-then-link flow and to nobody
+        # else).
+        v = next(x for x in ov["venues"] + ov["pending_link_venues"]
                 if x["id"] == venue["id"])
         self.assertEqual(v["organization_id"], org["id"])
         # Canonical Venue is org-owned only — the temporary program link is NOT
