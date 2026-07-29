@@ -32,7 +32,7 @@ Two consequences worth stating plainly:
 
 ## Per-surface rules
 
-The four reads deliberately do **not** apply the same narrowing. The axis a
+These reads deliberately do **not** apply the same narrowing. The axis a
 surface narrows on follows what that surface is *for*, and the differences are
 the contract — not drift.
 
@@ -42,6 +42,17 @@ the contract — not drift.
 | `get_demo_overview` (Dashboard) | mandatory | **hard ceiling** | narrows within the Season |
 | `get_standings` | must match active | must match when one is active | must match when one is selected |
 | `get_setup_overview_v2` (Setup) | **the ceiling** | not a further filter | narrows divisions + teams |
+| `list_players` (`/api/players`) | mandatory | — | — |
+
+`list_players` is the one to remember when adding a Setup collection, because it
+is easy to miss: it is not part of any overview DTO, it predates this work, and
+it was still answering installation-wide long after the payload-shaped reads were
+ceilinged. It returns player **names**, and on its MANAGE_SETUP route their
+**emails** — which is exactly why the route already refuses to be folded into an
+unauthenticated payload. A cross-Program answer there is the same disclosure by
+another door. It narrows to Teams in the active Program whenever a role is
+supplied; passing an explicit `team_id` still scopes to that Team, and the
+no-context form stays unfiltered for internal callers.
 
 ### `get_setup_progress` — Home / Tasks hub
 
