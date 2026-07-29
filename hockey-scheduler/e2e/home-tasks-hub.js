@@ -494,6 +494,9 @@ async function checkViewport(browser, viewport) {
       const league = await post("/api/v2/setup/league",
         { season_id: season.id, name: "Adult League" });
       const club = await post("/api/v2/setup/club", { name: "Club" });
+      // #367 prereq: a Team's League must belong to the ACTIVE Program;
+      // this journey builds several Programs, so move to this one first.
+      await post("/api/context", { program_id: program.id, season_id: season.id });
       const team = await post("/api/v2/setup/team",
         { club_id: club.id, league_id: league.id, name: "Team A" });
       return { programId: program.id, seasonId: season.id, leagueId: league.id,
@@ -1055,6 +1058,9 @@ async function checkRoleScenarios(browser, viewport) {
       const s1 = await post("/api/v2/setup/season", { program_id: program.id, name: "S1" });
       const league = await post("/api/v2/setup/league", { season_id: s1.id, name: "Shared League" });
       const club = await post("/api/v2/setup/club", { name: "Club" });
+      // #367 prereq: a Team's League must belong to the ACTIVE Program;
+      // this journey builds several Programs, so move to this one first.
+      await post("/api/context", { program_id: program.id, season_id: s1.id });
       const teamA = await post("/api/v2/setup/team",
         { league_id: league.id, club_id: club.id, name: "Team A" });
       const teamB = await post("/api/v2/setup/team",
@@ -1217,6 +1223,12 @@ async function checkRoleScenarios(browser, viewport) {
     const b2League = await apiPost(page, "/api/v2/setup/league",
       { season_id: b2Season.id, name: "League" });
     const b2Club = await apiPost(page, "/api/v2/setup/club", { name: "Club" });
+    // #367 prereq: a Team's League must belong to the ACTIVE Program. Move to
+    // Program B WITH its Season first so the create is accepted; the
+    // Program-ONLY context (season_id: null) this scenario actually exercises
+    // is then set below -- that is the state under test, not this setup step.
+    await apiPost(page, "/api/context",
+      { program_id: b.id, season_id: b2Season.id });
     await apiPost(page, "/api/v2/setup/team",
       { league_id: b2League.id, club_id: b2Club.id, name: "Team" });
     await apiPost(page, "/api/context", { program_id: b.id, season_id: null });
@@ -1259,6 +1271,9 @@ async function checkRoleScenarios(browser, viewport) {
       const league = await post("/api/v2/setup/league",
         { season_id: season.id, name: "League" });
       const club = await post("/api/v2/setup/club", { name: "Club" });
+      // #367 prereq: a Team's League must belong to the ACTIVE Program;
+      // this journey builds several Programs, so move to this one first.
+      await post("/api/context", { program_id: program.id, season_id: season.id });
       const team = await post("/api/v2/setup/team",
         { league_id: league.id, club_id: club.id, name: "Team" });
       await post(`/api/v2/setup/seasons/${season.id}/team-registrations`,
@@ -1358,6 +1373,9 @@ async function checkRoleScenarios(browser, viewport) {
       const leagueA = await post("/api/v2/setup/league",
         { season_id: seasonA.id, name: "League A" });
       const clubA = await post("/api/v2/setup/club", { name: "Club A" });
+      // #367 prereq: a Team's League must belong to the ACTIVE Program;
+      // this journey builds several Programs, so move to this one first.
+      await post("/api/context", { program_id: progA.id, season_id: seasonA.id });
       const teamA = await post("/api/v2/setup/team",
         { league_id: leagueA.id, club_id: clubA.id, name: "Team A" });
       // Program B: created SECOND, starts with nothing -- built up one
@@ -1797,6 +1815,9 @@ async function checkRoleScenarios(browser, viewport) {
       const leagueF1 = await post("/api/v2/setup/league",
         { season_id: seasonF1.id, name: "League F1" });
       const clubF1 = await post("/api/v2/setup/club", { name: "Club F1" });
+      // #367 prereq: a Team's League must belong to the ACTIVE Program;
+      // this journey builds several Programs, so move to this one first.
+      await post("/api/context", { program_id: progF1.id, season_id: seasonF1.id });
       const teamF1 = await post("/api/v2/setup/team",
         { league_id: leagueF1.id, club_id: clubF1.id, name: "Team F1" });
       await post(`/api/v2/setup/seasons/${seasonF1.id}/team-registrations`,

@@ -145,7 +145,81 @@ async function checkViewport(browser, viewport) {
 
   // Grants seasonId access to venueId through the real "Allowed venues"
   // control (Setup > Hierarchy > Season participation), never a raw fetch.
+  // #367 prerequisite: the Setup Hierarchy tree is scoped to the ACTIVE
+  // Program, so a Season's "Allowed venues" control only exists while that
+  // Season's Program is active. This journey works both Programs in turn, so
+  // the two helpers below move to the owning Program themselves rather than
+  // every call site having to remember.
+  // #367 prerequisite: creating a Team now requires its League to belong to
+  // the caller's ACTIVE Program, so this journey -- which deliberately builds
+  // TWO Programs in one session -- must move to each Program before
+  // populating it. Without this the second Program's Teams are refused and
+  // the failure surfaces much later as missing fixture data.
+  const activate = async (programId, seasonId) => {
+    const res = await page.evaluate(async (i) => {
+      const r = await fetch("/api/context", {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ program_id: i.p, season_id: i.s }),
+      });
+      return { status: r.status, body: await r.json().catch(() => ({})) };
+    }, { p: programId, s: seasonId });
+    if (res.status !== 200) {
+      throw new Error(`[${viewport.label}] could not activate `
+        + `${programId}/${seasonId}: ${res.status} ${JSON.stringify(res.body)}`);
+    }
+    // Drop the URL's "#ctx=" deep link, which this raw POST just invalidated.
+    // app.js keeps that hash in sync only through setActiveContext() (the
+    // #ctx-select switcher), so after a raw write it still encodes the
+    // PREVIOUS context -- and bootstrap()'s restoreContextDeepLink() treats a
+    // hash that disagrees with the persisted selection as an intentional deep
+    // link and POSTs it back, which is documented, deliberate behavior that
+    // context-switcher.js step (D) asserts. Left in place it silently reverts
+    // this switch on the very next reload. With no hash there is no link to
+    // adopt, so boot restores the persisted selection -- exactly what we just
+    // wrote -- and syncContextHash() re-stamps the URL from it.
+    await page.evaluate(() => history.replaceState(
+      null, "", location.pathname + location.search));
+  };
+
+  const seasonProgram = {};
+  const activateForSeason = async (seasonId) => {
+    const programId = seasonProgram[seasonId];
+    if (!programId) return;
+    await activate(programId, seasonId);
+    const persisted = await page.evaluate(async () =>
+      (await (await fetch("/api/context", { credentials: "same-origin" })).json()));
+    if (persisted.program_id !== programId) {
+      throw new Error(`[${viewport.label}] activation did not persist: asked `
+        + `${programId}/${seasonId}, server reports `
+        + `${persisted.program_id}/${persisted.season_id}`);
+    }
+    // The context was written by a raw fetch, so the client has no idea it
+    // changed -- reload and re-enter Setup > Hierarchy so the tree is actually
+    // rebuilt for the Program we just moved to.
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForSelector("#content > *", { timeout: 10000 });
+    await page.click('.tab[data-tab="setup"]');
+    await page.click('[data-setup-view="hierarchy"]');
+    // Wait for CONTENT, not mere existence: #season-participation appears as
+    // soon as the Setup tree paints at all, so waiting on the container alone
+    // proves navigation happened and nothing about WHICH Program's tree is in
+    // it. THIS Season's own node is rendered from hv.programs -- the
+    // Program-scoped hierarchy -- so it appears only once the tree has been
+    // rebuilt for the Program we just moved to, which is the real precondition
+    // both callers need. Anchored on the Season's delete button (the same
+    // handle allowedVenueNamesFor scopes from) rather than its "Add a venue"
+    // select, which disappears once every Venue is already allowed -- Season A
+    // ends this journey holding both, so that control is not a signal that
+    // survives the states this journey actually reaches.
+    await page.waitForFunction((sid) => {
+      const panel = document.getElementById("season-participation");
+      return !!(panel && panel.querySelector(
+        `[data-del="season"][data-del-id="${sid}"]`));
+    }, seasonId, { timeout: 10000 });
+  };
   const grantViaUi = async (seasonId, venueId) => {
+    await activateForSeason(seasonId);
     const vaSelId = `#va-add-${seasonId}`;
     await page.waitForSelector(vaSelId, { timeout: 10000 });
     const options = await page.$$eval(`${vaSelId} option`, (opts) => opts.map((o) => o.value));
@@ -384,6 +458,8 @@ async function checkViewport(browser, viewport) {
       { "f-div-league": leagueA.id, "f-div": "Gold" }, "/api/v2/setup/division");
     const clubA = await createViaDrawer("club",
       { "f-club": "Adult Club" }, "/api/v2/setup/club");
+
+    await activate(programA.id, seasonA.id);
     const teamA1 = await createViaDrawer("team",
       { "f-team-club": clubA.id, "f-team-perm-league": leagueA.id, "f-team": "Adult D1" },
       "/api/v2/setup/team");
@@ -407,6 +483,9 @@ async function checkViewport(browser, viewport) {
       { "f-season-league": programB.id, "f-season": "2026-27 Varsity" }, "/api/v2/setup/season");
     const leagueB = await createViaDrawer("level",
       { "f-level-season": seasonB.id, "f-level": "Varsity League" }, "/api/v2/setup/league");
+    await activate(programB.id, seasonB.id);
+    seasonProgram[seasonA.id] = programA.id;
+    seasonProgram[seasonB.id] = programB.id;
     const teamB1 = await createViaDrawer("team",
       { "f-team-club": "", "f-team-perm-league": leagueB.id, "f-team": "Varsity Home" },
       "/api/v2/setup/team");
@@ -517,7 +596,9 @@ async function checkViewport(browser, viewport) {
     // Season's OWN "Allowed venues" subsection (scoped from its delete button
     // in the Season's own <details> node, not a page-wide count) and check
     // the exact venue-name set it lists (#258 review).
-    const allowedVenueNamesFor = async (seasonId) => page.evaluate((sid) => {
+    const allowedVenueNamesFor = async (seasonId) => {
+      await activateForSeason(seasonId);
+      return page.evaluate((sid) => {
       // Season nodes are duplicated across trees (Competition structure AND
       // Season participation); only the latter — scoped by its own
       // #season-participation container — carries the venueAccessSection
@@ -535,6 +616,7 @@ async function checkViewport(browser, viewport) {
         btn.closest(".tn-leaf").querySelector(".tn-label").textContent.trim()
           .replace(/^\S+\s*/, ""));  // drop the leading emoji glyph
     }, seasonId);
+    };
 
     const namesA = await allowedVenueNamesFor(seasonA.id);
     const namesB = await allowedVenueNamesFor(seasonB.id);

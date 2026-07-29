@@ -94,6 +94,20 @@ class V2SetupContractTest(unittest.TestCase):
         status, resp = self._req(c, "POST", f"/api/v2/setup/{entity}", body)
         self.assertEqual(status, 200, (entity, resp))
         self.assertNotIn("error", resp, (entity, resp))
+        # #367 prerequisite: creating a Team now requires its League to belong
+        # to the caller's ACTIVE Program, so a fixture that builds a second
+        # Program in this shared store must actually MOVE there before
+        # populating it -- otherwise the context still resolves to whichever
+        # Program the fallback picked and the create is (correctly) refused.
+        # Every fixture here creates its Season immediately after its Program,
+        # so activating on Season creation keeps the whole class aligned with
+        # one edit and mirrors what an operator does: you set up the Season you
+        # just made. Deliberately NOT hidden inside the request helper for
+        # other entities -- only Season implies "I am now working here".
+        if entity == "season" and body.get("program_id") and resp.get("id"):
+            self._req(c, "POST", "/api/context",
+                      {"program_id": body["program_id"],
+                       "season_id": resp["id"]})
         return resp
 
     # -- exact canonical key sets, end to end -------------------------------

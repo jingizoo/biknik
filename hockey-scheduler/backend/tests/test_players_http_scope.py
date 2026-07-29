@@ -112,6 +112,20 @@ class PlayersHttpScopeTest(unittest.TestCase):
                   {"username": "admin", "password": "demo"})
         return c
 
+    def _use(self, c, program_id, season_id):
+        """Switch the session's active Program/Season.
+
+        The v2 Team create binds `league_id` to the ACTIVE Program (#367
+        prerequisite, merged as PR #371), so a fixture that builds Teams in
+        more than one Program has to say which one it is working in -- exactly
+        as an operator would. Switching here rather than exempting the fixture
+        keeps that guard at full strength.
+        """
+        status, resp = self._req(c, "POST", "/api/context",
+                                 {"program_id": program_id,
+                                  "season_id": season_id})
+        self.assertEqual(status, 200, resp)
+
     def _v2(self, c, entity, body):
         status, resp = self._req(c, "POST", f"/api/v2/setup/{entity}", body)
         self.assertEqual(status, 200, (entity, resp))
@@ -166,6 +180,7 @@ class PlayersHttpScopeTest(unittest.TestCase):
                             "sort_order": 2})
         club = self._v2(c, "club", {"name": "PS Club"})
 
+        self._use(c, program["id"], season["id"])
         team_a = self._v2(c, "team",
                          {"league_id": league_a["id"], "club_id": club["id"],
                           "name": "PS Team A"})
@@ -205,6 +220,7 @@ class PlayersHttpScopeTest(unittest.TestCase):
         league_f = self._v2(c, "league",
                            {"season_id": season2["id"], "name": "PS Foreign L"})
         club2 = self._v2(c, "club", {"name": "PS Foreign Club"})
+        self._use(c, program2["id"], season2["id"])
         team_foreign = self._v2(c, "team",
                                {"league_id": league_f["id"], "club_id": club2["id"],
                                 "name": "PS Foreign Team"})
@@ -213,6 +229,7 @@ class PlayersHttpScopeTest(unittest.TestCase):
 
         # A Team created, then deleted (no player attached, so the delete
         # itself is unblocked by dependents).
+        self._use(c, program["id"], season["id"])
         team_deleted = self._v2(c, "team",
                                {"league_id": league_a["id"], "club_id": club["id"],
                                 "name": "PS Deleted Team"})
