@@ -4,3 +4,8 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 output/
+
+# Installed dependencies are machine-local and must never be tracked; a
+# worktree that symlinks them in would otherwise leak an absolute path (#367).
+node_modules/
+hockey-scheduler/e2e/node_modules
