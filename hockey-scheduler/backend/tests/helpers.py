@@ -50,6 +50,57 @@ def suspend_program_org_fks(store):
         store.conn.execute("PRAGMA foreign_keys = OFF")
 
 
+def fresh_sql_store(url):
+    """A migrated, EMPTY ``SqlStore`` on ``url``, tolerant of whatever a
+    previously-run test module left in a shared database (#369).
+
+    ``run_parallel.py`` gives each worker its own PostgreSQL database but runs
+    that worker's modules SERIALLY against it, so a module inherits the last
+    one's leftovers. The obvious ``SqlStore(url).clear_all_data()`` cannot
+    always recover: ``SqlStore.__init__`` runs ``migrate()`` FIRST, and some
+    modules deliberately plant rows that a later migration's integrity check
+    rejects — e.g. ``test_iceslot_venue_fks`` seeds rinks/slots/games/access
+    rows pointing at parents that do not exist, which makes
+    ``assert_iceslot_venue_fks_ready`` raise ``MigrationDataError`` before
+    ``clear_all_data`` is ever reachable. The module never cleans up after
+    itself, so every module scheduled behind it in the same worker inherits a
+    database it cannot even open.
+
+    That hazard is ordering-dependent and therefore invisible until module
+    sharding shifts: ``test_active_context_league`` has used the plain
+    construct-then-clear idiom safely only because round-robin sharding happens
+    to place it first in its worker. Adding modules re-shards everything, so
+    this helper makes the recovery explicit instead of leaving it to luck.
+
+    Drops the schema outright when a plain open fails, then re-migrates — so
+    the caller always gets a clean, fully-migrated store regardless of what
+    came before.
+    """
+    from hockey_scheduler.store import SqlStore
+    from hockey_scheduler.store.db import connect
+    try:
+        store = SqlStore(url)
+    except Exception:
+        # Unopenable: tear the schema down at the raw-connection level (no
+        # SqlStore can be constructed to do it for us) and re-migrate.
+        conn, dialect, _path = connect(url)
+        cur = conn.cursor()
+        if dialect.backend == "postgres":
+            cur.execute("DROP SCHEMA public CASCADE")
+            cur.execute("CREATE SCHEMA public")
+        else:
+            cur.execute("PRAGMA writable_schema = ON")
+            for (name,) in cur.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'").fetchall():
+                cur.execute(f'DROP TABLE IF EXISTS "{name}"')
+            cur.execute("PRAGMA writable_schema = OFF")
+        conn.commit()
+        conn.close()
+        store = SqlStore(url)
+    store.clear_all_data()
+    return store
+
+
 def cookie_from_set_cookie(set_cookie_header, name):
     """Extract a single cookie's ``name=value`` from a Set-Cookie header.
 

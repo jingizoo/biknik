@@ -77,7 +77,7 @@ from datetime import datetime, timezone
 from http.cookiejar import CookieJar
 from http.server import ThreadingHTTPServer
 
-from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
+from helpers import BACKEND, fresh_sql_store  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.domain import GuardianLink, Role, SeasonStatus, SetupAuditLog
@@ -106,8 +106,10 @@ def _backends():
     yield "sqlite", SqlStore(":memory:")
     url = os.environ.get("TEST_DATABASE_URL")
     if url:
-        SqlStore(url).clear_all_data()
-        yield "postgres", SqlStore(url)
+        # fresh_sql_store (not a bare SqlStore) so a database polluted by an
+        # earlier module in this same serial worker is recovered rather than
+        # failing to open at all -- see helpers.fresh_sql_store (#369).
+        yield "postgres", fresh_sql_store(url)
 
 
 def _close(store):
