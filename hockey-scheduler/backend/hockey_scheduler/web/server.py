@@ -1037,7 +1037,23 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/v2/setup/hierarchy":
             if self._operator_only("/api/v2/setup/player"):
                 return
-            role, scope, user_id, _err = self._resolve_role()
+            # Honour the resolve error instead of discarding it. An earlier
+            # revision took `_err` and threw it away, which failed OPEN on
+            # exactly the path that matters: if the session expired, was
+            # revoked, or its account was deactivated between the
+            # authorization read above and this one, the resolve yields
+            # role=None -- and role=None is the service's LEGACY no-context
+            # form, which returns the INSTALLATION-WIDE tree. A dying session
+            # would therefore have widened the read rather than refused it,
+            # defeating the Program ceiling precisely when it matters most.
+            role, scope, user_id, err = self._resolve_role()
+            if err is not None:
+                code, payload = err
+                return self._send_json(payload, code)
+            if role is None:
+                return self._send_json({"error": {
+                    "code": "unauthorized",
+                    "message": "A signed-in account is required."}}, 401)
             return self._send_api(api.get_setup_hierarchy_v2(
                 user_id, role, scope))
         if path == "/api/v2/setup/progress":

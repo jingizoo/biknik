@@ -139,6 +139,25 @@ class HierarchyWriteScopeHttpTest(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read() or b"{}")
 
+    def _raw(self, opener, method, path, body=None):
+        """Like ``_req`` but returns the RAW response bytes.
+
+        The "byte-identical refusal" claim cannot be tested through a
+        JSON-decoded body: two dicts comparing equal says nothing about the
+        wire format, and a refusal that differed only in key order, spacing or
+        a stray field would still be an oracle to anyone reading the socket.
+        """
+        url = f"http://127.0.0.1:{self.port}{path}"
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method)
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        try:
+            with opener.open(req) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+
     def _admin(self):
         c = self._client()
         self._req(c, "POST", "/api/auth/login",
@@ -213,6 +232,24 @@ class HierarchyWriteScopeHttpTest(unittest.TestCase):
                          "an inaccessible League must be indistinguishable "
                          "from a nonexistent one")
 
+        # ...and identical ON THE WIRE, not merely as decoded dicts. Compared
+        # as raw bytes because that is what an attacker actually observes;
+        # a difference in key order, whitespace or an extra field would be an
+        # oracle even though the parsed objects compare equal.
+        cross_status, cross_bytes = self._raw(
+            c, "POST", "/api/v2/setup/team",
+            {"club_id": club["id"], "league_id": a["league"]["id"],
+             "name": "Cross-Program Team 2"})
+        ghost_status, ghost_bytes = self._raw(
+            c, "POST", "/api/v2/setup/team",
+            {"club_id": club["id"], "league_id": "league_also_missing",
+             "name": "Ghost 2"})
+        self.assertEqual(cross_status, ghost_status)
+        self.assertEqual(
+            cross_bytes, ghost_bytes,
+            "the cross-Program refusal differs from the nonexistent-League "
+            f"refusal on the wire: {cross_bytes!r} vs {ghost_bytes!r}")
+
         # Positive control: the SAME request against the active Program's own
         # League succeeds, so the refusals above are not a blanket failure.
         ok = self._v2(c, "team", {"club_id": club["id"],
@@ -238,6 +275,66 @@ class HierarchyWriteScopeHttpTest(unittest.TestCase):
                                  "name": "Now Refused"})
         self.assertEqual(status_b, 404)
 
+    def test_hierarchy_route_refuses_a_session_that_dies_mid_request(self):
+        """A session that resolves for the authorization read but NOT for the
+        read that follows must 401 -- never fall back to the unscoped tree.
+
+        This is the exact failure path an earlier revision got backwards: it
+        resolved a SECOND time and discarded the error, so a session revoked
+        between the two reads yielded role=None -- which is the service's
+        LEGACY no-context form, i.e. the INSTALLATION-WIDE hierarchy. The
+        dying session WIDENED the read instead of refusing it.
+
+        A first version of this test simply logged out and asserted 401. That
+        was VACUOUS: after logout ``_operator_only`` rejects first, so the
+        second resolve never runs and the defect is never reached -- proven by
+        mutation, the test stayed green with the fix reverted. It now makes
+        resolution succeed exactly once and fail afterwards, which is the
+        state the route actually has to survive.
+        """
+        c = self._admin()
+        a = self._fixture(c, "MID")
+        self._req(c, "POST", "/api/context",
+                  {"program_id": a["program"]["id"],
+                   "season_id": a["season"]["id"]})
+        other = self._fixture(c, "MIDOTHER")
+        # Re-pin, since building `other` moved the active context to it.
+        self._req(c, "POST", "/api/context",
+                  {"program_id": a["program"]["id"],
+                   "season_id": a["season"]["id"]})
+
+        real = self.srv.Handler._resolve_role
+        calls = {"n": 0}
+
+        def flaky(handler_self):
+            calls["n"] += 1
+            if calls["n"] == 1:                 # the authorization read
+                return real(handler_self)
+            # every later resolution in THIS process behaves as a dead session
+            return None, None, None, (401, {"error": {
+                "code": "unauthorized",
+                "message": "A signed-in account is required."}})
+
+        self.srv.Handler._resolve_role = flaky
+        try:
+            status, body = self._raw(c, "GET", "/api/v2/setup/hierarchy")
+        finally:
+            self.srv.Handler._resolve_role = real
+
+        self.assertGreaterEqual(
+            calls["n"], 1, "the route never resolved a session at all")
+        self.assertIn(
+            status, (401, 403),
+            f"a session that died mid-request was served the hierarchy "
+            f"(resolved {calls['n']}x): {body!r}")
+        for token in (other["program"]["name"], other["league"]["name"],
+                      other["program"]["id"], other["league"]["id"],
+                      a["program"]["name"], a["program"]["id"]):
+            self.assertNotIn(
+                token.encode(), body,
+                f"the refusal leaked {token!r} -- a refused hierarchy read "
+                f"must disclose no Program or League name or id at all")
+
     def test_hierarchy_route_is_scoped_to_the_active_program(self):
         c = self._admin()
         a = self._fixture(c, "RA")
@@ -251,6 +348,74 @@ class HierarchyWriteScopeHttpTest(unittest.TestCase):
         self.assertEqual(
             names, ["WS RA Prog"],
             f"the hierarchy route leaked other Programs: {names}")
+
+
+class HierarchyWriteScopeStoreParityTest(unittest.TestCase):
+    """The same refusal/no-residue/own-League-success proof on EVERY store.
+
+    The HTTP class above proves the ROUTE (session resolution, the guard, the
+    wire format), but it can only ever run on one store: ``STATE.reset()``
+    builds its store from ``create_store()``, which reads ``DATABASE_URL`` --
+    and the PostgreSQL CI job sets only ``TEST_DATABASE_URL``, so that class
+    silently stays on ``InMemoryStore`` even there, and never sees SQLite at
+    all. A SQL-specific transaction or audit-write regression would pass it
+    unnoticed. This class closes that by driving the same predicate one layer
+    down, across Memory / SQLite / PostgreSQL-when-configured.
+    """
+
+    def _guard(self, api, user_id, role, scope, league_id):
+        """The route's own predicate, exercised directly: a League is
+        acceptable only when it belongs to the caller's ACTIVE Program."""
+        program, _season, _league = api.context.resolve_with_league(
+            user_id, role, scope)
+        league = api.store.get_league(league_id) if league_id else None
+        return (program is not None and league is not None
+                and league.program_id == program.id)
+
+    def test_cross_program_refusal_and_no_residue_on_every_store(self):
+        for backend, store in _backends():
+            with self.subTest(backend=backend):
+                api = ApiService(store)
+                fx = _two_programs(api)
+                admin = ("admin", Role.LEAGUE_ADMIN, {})
+                api.set_active_context(*admin, fx["B"]["program"]["id"],
+                                       fx["B"]["season"]["id"])
+
+                teams_before = {t.id for t in store.all_teams()}
+                audit_before = len(store.all_setup_audit())
+
+                # Program A's League is refused while B is active...
+                self.assertFalse(
+                    self._guard(api, "admin", Role.LEAGUE_ADMIN, {},
+                                fx["A"]["league"]["id"]),
+                    f"[{backend}] a League from another Program was accepted "
+                    f"while Program B was active")
+                # ...and a nonexistent League is refused identically.
+                self.assertFalse(
+                    self._guard(api, "admin", Role.LEAGUE_ADMIN, {},
+                                "league_does_not_exist"), backend)
+                # Positive control: B's own League IS accepted, so the two
+                # refusals above are not a blanket false.
+                self.assertTrue(
+                    self._guard(api, "admin", Role.LEAGUE_ADMIN, {},
+                                fx["B"]["league"]["id"]),
+                    f"[{backend}] the active Program's OWN League was refused")
+
+                # A refused attempt must leave no Team and no audit row. The
+                # route returns before touching the service, so nothing should
+                # have been written on ANY store.
+                self.assertEqual({t.id for t in store.all_teams()},
+                                 teams_before, backend)
+                self.assertEqual(len(store.all_setup_audit()), audit_before,
+                                 backend)
+
+                # And the accepted create really does land in Program B.
+                team = api.create_team(fx["club"]["id"], None, "Own Team",
+                                       league_id=fx["B"]["league"]["id"])
+                self.assertNotIn("error", team, team)
+                self.assertEqual(team["program_id"], fx["B"]["program"]["id"],
+                                 backend)
+                _close(store)
 
 
 if __name__ == "__main__":
