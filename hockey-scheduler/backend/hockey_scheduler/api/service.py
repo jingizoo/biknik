@@ -5894,9 +5894,32 @@ class ApiService:
 
     @catch
     def list_players(self, team_id: Optional[str] = None,
-                     include_email: bool = False) -> List[dict]:
+                     include_email: bool = False, user_id=None, role=None,
+                     scope=None) -> List[dict]:
+        """#369 self-audit: when a real user context is supplied, the
+        unfiltered list narrows to Teams in the caller's ACTIVE Program.
+
+        This is the Setup "Clubs, players and staff" list, and it was the one
+        Setup collection still answering installation-wide after the rest of
+        the surface was ceilinged — it returned every Player NAME (and, on
+        this MANAGE_SETUP route, every email) in the installation, including
+        other Programs'. Names here are usually juniors, which is why the
+        route already refuses to be bundled into an unauthenticated payload;
+        the same reasoning makes a cross-Program answer wrong. Called with no
+        user context (the default), behavior is unchanged for existing
+        internal callers.
+        """
         players = (self.store.players_for_team(team_id) if team_id
                   else self.store.all_players())
+        if team_id is None and role is not None:
+            program, _season, _league = self.context.resolve_with_league(
+                user_id, role, scope)
+            if program is None:
+                players = []
+            else:
+                in_program = {t.id for t in self.store.all_teams()
+                              if t.program_id == program.id}
+                players = [p for p in players if p.team_id in in_program]
         rows = [_serialize(p) for p in players]
         # The Player DTO deliberately carries no email (it reaches coach/roster
         # views). Only the MANAGE_SETUP-gated operator list opts in, so the edit

@@ -391,6 +391,59 @@ class LeagueFilteredOverviewV2Test(unittest.TestCase):
                 _close(store)
 
     # -- 5. unassigned_* buckets: genuinely-unlinked records, from EITHER side
+    def test_player_list_never_spans_programs(self):
+        """#369 self-audit: ``list_players`` was the last Setup collection
+        still answering installation-wide.
+
+        The Setup "Clubs, players and staff" list is fed by ``/api/players``,
+        which returned ``store.all_players()`` regardless of active context —
+        every player NAME in the installation, and on that MANAGE_SETUP route
+        every EMAIL too. The route already refuses to be folded into any
+        unauthenticated payload because these names are usually juniors; the
+        same reasoning makes a cross-Program answer wrong, and the review's
+        required regression names players explicitly.
+
+        The legacy no-context form stays unfiltered — many internal callers
+        depend on it — so the scoping must key off a supplied role, not off
+        whether a Program happens to resolve.
+        """
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                a = self._build_program_env(api, "A")
+                b = self._build_program_env(api, "B")
+                pa = api.create_player(team_id=a["team1"]["id"],
+                                       name="A-PLAYER", position="forward")
+                self.assertNotIn("error", pa, pa)
+                pb = api.create_player(team_id=b["team1"]["id"],
+                                       name="B-PLAYER", position="forward")
+                self.assertNotIn("error", pb, pb)
+
+                ctx = api.set_active_context(
+                    "admin_a", Role.LEAGUE_ADMIN, {}, a["program"]["id"],
+                    None, None)
+                self.assertNotIn("error", ctx, ctx)
+
+                scoped = [p["name"] for p in api.list_players(
+                    user_id="admin_a", role=Role.LEAGUE_ADMIN, scope={})]
+                self.assertIn("A-PLAYER", scoped, (label, "own player missing"))
+                self.assertNotIn(
+                    "B-PLAYER", scoped,
+                    f"[{label}] another Program's player NAME leaked into the "
+                    "active Program's player list")
+
+                # Legacy no-context form is deliberately unchanged.
+                legacy = [p["name"] for p in api.list_players()]
+                self.assertIn("A-PLAYER", legacy, label)
+                self.assertIn("B-PLAYER", legacy, label)
+
+                # A caller whose scope resolves to no Program at all gets
+                # nothing, rather than falling back to everything.
+                dangling = api.list_players(
+                    user_id="nobody", role=Role.COACH, scope={"team_id": "gone"})
+                self.assertEqual(dangling, [], label)
+                _close(store)
+
     def test_every_program_edge_disqualifies_a_record_from_unassigned(self):
         """#369 self-audit: "linked to no Program" must be computed over
         EVERY edge into Program, not just the obvious one.

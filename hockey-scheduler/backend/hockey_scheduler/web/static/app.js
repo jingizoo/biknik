@@ -1520,10 +1520,12 @@ const capWord = (s) => (s ? String(s).charAt(0).toUpperCase() + String(s).slice(
 const REASSIGN = {
   "venue:organization": {
     perm: "manage_arena", noun: "facility owner", nullable: true, risky: false,
-    options: (ov) => (ov.organizations || []).map((o) => [o.id, o.name]) },
+    fromSetupRead: true,
+    options: (sv) => withUnassigned(sv, "organizations").map((o) => [o.id, o.name]) },
   "rink:venue": {
     perm: "manage_arena", noun: "venue", nullable: false, risky: false,
-    options: (ov) => (ov.venues || []).map((v) => [v.id, v.name]) },
+    fromSetupRead: true,
+    options: (sv) => withUnassigned(sv, "venues").map((v) => [v.id, v.name]) },
   "division:level": {
     // Not nullable (#233 B2a review r1): v2 division create/reassign REQUIRES
     // a League, so the panel must never offer "— none —" here — it would
@@ -1537,7 +1539,8 @@ const REASSIGN = {
     // Club is optional on a Team (#233 Slice D): nullable lets the operator
     // unassign a Team's Club from the reassign panel.
     perm: "manage_setup", noun: "club", nullable: true, risky: false,
-    options: (ov) => (ov.clubs || []).map((c) => [c.id, c.name]) },
+    fromSetupRead: true,
+    options: (sv) => withUnassigned(sv, "clubs").map((c) => [c.id, c.name]) },
   // team:league (#283 Slice B): move a Team to a different PERMANENT League —
   // promotion/relegation/transfer (rule 10). Not nullable (a Team is always
   // league-permanent once assigned) and risky (it changes the Team's standing
@@ -1563,7 +1566,8 @@ const REASSIGN = {
   // change regardless of Venue state.
   "league:organization": {
     perm: "manage_setup", noun: "facility owner", displayNoun: "operating organization", nullable: true, risky: false,
-    options: (ov) => (ov.organizations || []).map((o) => [o.id, o.name]) },
+    fromSetupRead: true,
+    options: (sv) => withUnassigned(sv, "organizations").map((o) => [o.id, o.name]) },
 };
 // v2 route + canonical body-key mapping for the reassignments moved to v2
 // (#233 B2a review r1): frontend kind/parent tokens stay frozen (league =
@@ -1594,12 +1598,21 @@ function reassignBtn(kind, parent, rec, curId, seasonId, programId) {
     title="Move to a different ${esc(entNoun(cfg))}">⇄ Move</button>`;
 }
 // The confirm panel: pick a new parent, see a warning for risky moves, commit.
-function reassignPanelHtml(ov) {
+// #369: takes `sv` (the Setup v2 read) as well as `ov`, because the
+// Club/Organization/Venue pickers must come from the Setup surface, not the
+// Dashboard. `ov`'s reference collections are now scoped to what the active
+// Program actually USES, which is right for a Dashboard but wrong for a
+// reassign panel: the whole point of "move this Team to a Club" is to link a
+// Club that is not linked yet, and a just-created Club has no Team, so it is
+// absent from `ov.clubs` by construction. `sv` carries the additive
+// `unassigned_*` buckets for exactly this create-then-link case.
+function reassignPanelHtml(ov, sv) {
   if (!pendingReassign) return "";
   const pr = pendingReassign;
   const cfg = REASSIGN[`${pr.kind}:${pr.parent}`];
   if (!cfg) return "";
-  const rows = (cfg.nullable ? [["", "— none —"]] : []).concat(cfg.options(ov, pr));
+  const rows = (cfg.nullable ? [["", "— none —"]] : []).concat(
+    cfg.options(cfg.fromSetupRead ? (sv || {}) : ov, pr));
   const optsHtml = rows.map(([v, label]) =>
     `<option value="${esc(v)}"${v === (pr.curId || "") ? " selected" : ""}>${esc(label)}</option>`).join("");
   const empty = !rows.length;
@@ -2532,7 +2545,7 @@ function renderSetupHierarchy(sv, hv, ov) {
     ? `<section class="tree-panel na"><div class="tree-head"><span class="tree-title">⚠ Needs assignment</span></div>
         <div class="tree-note">These records can't be scheduled until they're assigned.</div>${naBody}</section>` : "";
 
-  return `${reassignPanelHtml(ov)}<div class="setup-trees">${facility}${permanentTeams}${competition}${renderSeasonParticipation(hv, ov, sv)}${renderRollover(hv, ov)}${roster}${needsAssignment}</div>`;
+  return `${reassignPanelHtml(ov, sv)}<div class="setup-trees">${facility}${permanentTeams}${competition}${renderSeasonParticipation(hv, ov, sv)}${renderRollover(hv, ov)}${roster}${needsAssignment}</div>`;
 }
 
 // Season participation (#180, cut to v2 canonical #233 Slice B2b): permanent

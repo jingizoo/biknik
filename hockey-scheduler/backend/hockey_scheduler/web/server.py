@@ -1218,10 +1218,23 @@ class Handler(BaseHTTPRequestHandler):
             from urllib.parse import parse_qs, urlparse
             qs = parse_qs(urlparse(self.path).query)
             team_id = (qs.get("team_id") or [None])[0]
+            # #369: pass the caller's identity so the unfiltered (no team_id)
+            # form narrows to their ACTIVE Program rather than answering
+            # installation-wide. `_resolve_role` may legitimately yield no
+            # user_id here (the demo X-Demo-Role / headerless-admin operator
+            # fallbacks this route has always accepted); that resolves to no
+            # active context and therefore no rows, which is the correct
+            # fail-closed direction for a list of player names.
+            role, scope, user_id, err = self._resolve_role()
+            if err is not None:
+                code, payload = err
+                return self._send_json(payload, code)
             # This list feeds the operator Player edit drawer (#268), so it
             # opts into the current email — safe here because the route is
             # MANAGE_SETUP-gated (an operator), never a coach/public surface.
-            return self._send_api(api.list_players(team_id, include_email=True))
+            return self._send_api(api.list_players(
+                team_id, include_email=True, user_id=user_id, role=role,
+                scope=scope))
         if path == "/api/reschedule/pending":
             # League-wide "awaiting my decision" queue (#29) — the opponent
             # has already accepted; a league admin/arena manager just needs
