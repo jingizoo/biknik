@@ -104,6 +104,49 @@ class HierarchyReadScopeTest(unittest.TestCase):
                 _close(store)
 
 
+def _foreign_league_registration(api, store, fx):
+    """A LeagueSeason joining Program A's SEASON to Program B's LEAGUE, with a
+    legitimate Program-A Team registered through it.
+
+    The Team is in scope, so the row survives the Team check and is classified
+    by its League instead -- which is how ``league_id`` kept leaking after the
+    Team id was withheld.
+    """
+    from hockey_scheduler.domain.setup_models import (LeagueSeason,
+                                                      SeasonTeamRegistration)
+    team_a = api.create_team(club_id=fx["club"]["id"], name="A-OWN-TEAM",
+                             league_id=fx["A"]["league"]["id"])
+    ls_mixed = LeagueSeason(id=store.next_id("leagueseason"),
+                            league_id=fx["B"]["league"]["id"],
+                            season_id=fx["A"]["season"]["id"])
+    store.add_league_season(ls_mixed)
+    store.add_season_team_registration(SeasonTeamRegistration(
+        id=store.next_id("streg"), league_season_id=ls_mixed.id,
+        team_id=team_a["id"], division_id=None, active=True))
+    return {"id": fx["B"]["league"]["id"], "name": "League B"}
+
+
+def _foreign_division_registration(api, store, fx):
+    """A Program-A Team registered through Program A's OWN LeagueSeason but
+    carrying a Division that belongs to Program B's LeagueSeason.
+
+    Team and League both check out, so the row is classified on the Division
+    -- the third and last verbatim reference.
+    """
+    from hockey_scheduler.domain.setup_models import SeasonTeamRegistration
+    team_a = api.create_team(club_id=fx["club"]["id"], name="A-OWN-TEAM-2",
+                             league_id=fx["A"]["league"]["id"])
+    div_b = api.create_division(fx["B"]["season"]["id"], "DIV-B-CANARY",
+                                league_id=fx["B"]["league"]["id"])
+    ls_a = next(ls for ls in store.all_league_seasons()
+                if ls.season_id == fx["A"]["season"]["id"]
+                and ls.league_id == fx["A"]["league"]["id"])
+    store.add_season_team_registration(SeasonTeamRegistration(
+        id=store.next_id("streg"), league_season_id=ls_a.id,
+        team_id=team_a["id"], division_id=div_b["id"], active=True))
+    return {"id": div_b["id"], "name": "DIV-B-CANARY"}
+
+
 def _cross_program_registration(api, store, fx):
     """Register Program B's Team into Program A's Season directly.
 
@@ -144,6 +187,48 @@ class HierarchyRegistrationLeakTest(unittest.TestCase):
     precisely what a later write needs, and it is joinable back to the foreign
     Program's graph.
     """
+
+    def test_no_foreign_team_league_or_division_id_survives(self):
+        """All three corrupt shapes at once, so no single check can carry the
+        test: a foreign Team, an A-Season/B-League LeagueSeason, and an A
+        registration carrying a Program-B Division."""
+        for backend, store in _backends():
+            with self.subTest(backend=backend):
+                api = ApiService(store)
+                fx = _two_programs(api)
+                admin = ("admin", Role.LEAGUE_ADMIN, {})
+                foreign = [_cross_program_registration(api, store, fx),
+                           _foreign_league_registration(api, store, fx),
+                           _foreign_division_registration(api, store, fx)]
+
+                api.set_active_context(*admin, fx["A"]["program"]["id"],
+                                       fx["A"]["season"]["id"])
+                tree = api.get_setup_hierarchy_v2(*admin)
+                self.assertNotIn("error", tree, tree)
+                blob = json.dumps(tree)
+                for ref in foreign:
+                    self.assertNotIn(
+                        ref["id"], blob,
+                        f"[{backend}] Program A's scoped hierarchy returned "
+                        f"foreign id {ref['id']!r} ({ref['name']}) -- a "
+                        f"joinable identifier from outside the ceiling")
+                    self.assertNotIn(ref["name"], blob, backend)
+
+                # Each repair signal survives, stripped of identifiers.
+                rows = [r for s in tree["programs"][0]["seasons"]
+                        for r in s["needs_assignment"]["registrations"]]
+                self.assertEqual(
+                    len(rows), 3,
+                    f"[{backend}] expected one repair row per corrupt shape; "
+                    f"got {rows}")
+                self.assertTrue(all(r["reason"] for r in rows), rows)
+
+                # Legitimate Program-A structure still renders.
+                self.assertEqual([p["name"] for p in tree["programs"]],
+                                 ["Prog A"], backend)
+                self.assertIn(fx["A"]["league"]["id"], blob,
+                              f"[{backend}] Program A's own League vanished")
+                _close(store)
 
     def test_a_foreign_registration_leaks_no_team_id(self):
         for backend, store in _backends():
@@ -354,6 +439,39 @@ class HierarchyWriteScopeHttpTest(unittest.TestCase):
             id=store.next_id("streg"), league_season_id=ls_a.id,
             team_id=team_b.id, division_id=None, active=True))
 
+        # Shape 2: a LeagueSeason joining A's Season to B's League, carrying a
+        # legitimate Program-A Team (so the Team check passes and the row is
+        # classified on its League instead).
+        from hockey_scheduler.domain.setup_models import LeagueSeason
+        # The Team creates below are legitimate work in their OWN Programs, so
+        # the context is switched explicitly for each -- this PR's write guard
+        # is correct to refuse them otherwise, and is not weakened here.
+        self._set_context(c, a)
+        team_a = self._v2(c, "team", {"club_id": club["id"],
+                                      "league_id": a["league"]["id"],
+                                      "name": "A Own Team"})
+        ls_mixed = LeagueSeason(id=store.next_id("leagueseason"),
+                                league_id=b["league"]["id"],
+                                season_id=a["season"]["id"])
+        store.add_league_season(ls_mixed)
+        store.add_season_team_registration(SeasonTeamRegistration(
+            id=store.next_id("streg"), league_season_id=ls_mixed.id,
+            team_id=team_a["id"], division_id=None, active=True))
+
+        # Shape 3: an A registration carrying a Program-B Division id. The
+        # Division is created in B, where it legitimately belongs.
+        self._set_context(c, b)
+        div_b = self._v2(c, "division", {"league_id": b["league"]["id"],
+                                         "season_id": b["season"]["id"],
+                                         "name": "HTTP-DIV-B-CANARY"})
+        self._set_context(c, a)
+        team_a2 = self._v2(c, "team", {"club_id": club["id"],
+                                       "league_id": a["league"]["id"],
+                                       "name": "A Own Team 2"})
+        store.add_season_team_registration(SeasonTeamRegistration(
+            id=store.next_id("streg"), league_season_id=ls_a.id,
+            team_id=team_a2["id"], division_id=div_b["id"], active=True))
+
         status, _ = self._req(c, "POST", "/api/context",
                               {"program_id": a["program"]["id"],
                                "season_id": a["season"]["id"]})
@@ -362,16 +480,51 @@ class HierarchyWriteScopeHttpTest(unittest.TestCase):
         status, tree = self._req(c, "GET", "/api/v2/setup/hierarchy")
         self.assertEqual(status, 200, tree)
         blob = json.dumps(tree)
-        self.assertNotIn(
-            team_b.id, blob,
-            f"the scoped hierarchy route returned Program B's Team id "
-            f"{team_b.id!r} while Program A was active")
-        self.assertNotIn("HTTP-LEAK-CANARY", blob,
-                         "the foreign Team's name leaked over HTTP")
+        for ref_id, ref_name in (
+                (team_b.id, "HTTP-LEAK-CANARY"),
+                (b["league"]["id"], b["league"]["name"]),
+                (div_b["id"], "HTTP-DIV-B-CANARY")):
+            self.assertNotIn(
+                ref_id, blob,
+                f"the scoped hierarchy route returned foreign id {ref_id!r} "
+                f"({ref_name}) while Program A was active")
+            self.assertNotIn(ref_name, blob,
+                             f"the foreign name {ref_name!r} leaked over HTTP")
         rows = [r for p in tree["programs"] for s in p["seasons"]
                 for r in s["needs_assignment"]["registrations"]]
-        self.assertTrue(rows, "the repair signal disappeared over HTTP")
-        self.assertTrue(all(r["team_id"] is None for r in rows), rows)
+        self.assertEqual(len(rows), 3,
+                         f"expected one repair row per corrupt shape: {rows}")
+        self.assertTrue(all(r["reason"] for r in rows),
+                        f"a repair signal disappeared over HTTP: {rows}")
+        # Each shape loses exactly the reference that is foreign, and keeps the
+        # ones that are not -- a blanket "everything is null" would also pass
+        # if the payload were simply emptied.
+        by_reason = {r["reason"]: r for r in rows}
+        self.assertIsNone(by_reason["team_missing"]["team_id"], rows)
+        self.assertIsNone(
+            by_reason["registration_league_not_in_season"]["league_id"], rows)
+        self.assertIsNotNone(
+            by_reason["registration_league_not_in_season"]["team_id"],
+            f"a legitimate Program-A Team id was withheld too: {rows}")
+        self.assertIsNone(
+            by_reason["registration_league_division_mismatch"]["division_id"],
+            rows)
+        self.assertEqual(
+            by_reason["registration_league_division_mismatch"]["league_id"],
+            a["league"]["id"],
+            f"Program A's OWN League id was withheld: {rows}")
+
+    def _set_context(self, c, fx):
+        """Switch the session to a fixture's Program/Season, asserting it took.
+
+        Used where a test does legitimate work in more than one Program: the
+        write guard binds to the ACTIVE Program, so the fixture switches
+        rather than being exempted from it.
+        """
+        status, resp = self._req(c, "POST", "/api/context",
+                                 {"program_id": fx["program"]["id"],
+                                  "season_id": fx["season"]["id"]})
+        self.assertEqual(status, 200, resp)
 
     def _assert_cross_program_team_create_refused(self, backend):
         """The route-level cross-Program-write proof, parametrized by the

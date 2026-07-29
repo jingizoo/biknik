@@ -4620,10 +4620,38 @@ class ApiService:
                 divs_by_season.setdefault(sid, []).append(d)
         divisions_by_id = {d.id: d for d in divisions}
         teams_by_id = {t.id: t for t in teams}
+        # The ACTIVE PROGRAM's League set, named apart from the per-Season
+        # `league_ids` rebound inside the Season loop below -- that one is the
+        # leagues of ONE Season, and validating against it would blank a
+        # perfectly legitimate League of this Program merely because the row
+        # belongs to a different Season of it.
+        scoped_league_ids = {lg.id for lg in leagues}
+
+        def _scoped_league_ref(league_id):
+            """A League id only when it is one of the ACTIVE Program's.
+
+            `dangling_divs` is built from the already-narrowed `divisions`, so
+            today its League always resolves in scope and this is a no-op --
+            it is here because the ruling requires every emitted reference to
+            be validated independently, and because the Team id leak began
+            exactly as a field that "could not" be foreign until the narrowing
+            around it changed.
+            """
+            if scoped_hierarchy and league_id not in scoped_league_ids:
+                return None
+            return league_id
 
         def _needs_assignment_row(reg, reason, reg_league_id):
-            """One ``needs_assignment.registrations`` row, with the foreign
-            Team id withheld on a scoped read (#371 review).
+            """One ``needs_assignment.registrations`` row, with EVERY foreign
+            reference withheld on a scoped read (#371 review).
+
+            Three independent references, three independent checks. The first
+            round of this fix validated only ``team_id`` and shipped green,
+            leaving ``league_id`` and ``division_id`` verbatim -- and a repair
+            row naming a foreign League or Division discloses precisely what
+            the Team fix existed to stop. Both remaining paths were reachable:
+            a LeagueSeason joining this Program's Season to ANOTHER Program's
+            League, and a registration carrying another Program's Division id.
 
             ``teams_by_id`` is already narrowed to the active Program above, so
             a registration whose team is missing from it names either a Team
@@ -4644,12 +4672,26 @@ class ApiService:
             The legacy unscoped internal form is untouched: several call sites
             read the whole installation through it.
             """
-            team_id = reg.team_id
-            if scoped_hierarchy and team_id not in teams_by_id:
-                team_id = None
+            team_id, league_id = reg.team_id, reg_league_id
+            division_id = reg.division_id
+            if scoped_hierarchy:
+                # EVERY reference is validated independently. Withholding only
+                # the Team id left the other two verbatim, and a repair row
+                # naming a foreign League or Division discloses exactly the
+                # same thing: a joinable identifier from outside the ceiling.
+                # Membership in `divisions_by_id` already implies the Division
+                # resolves through a LeagueSeason of this Program's Seasons and
+                # Leagues (that is how `divisions` was narrowed above), so it
+                # carries the consistency requirement with it.
+                if team_id not in teams_by_id:
+                    team_id = None
+                if league_id not in scoped_league_ids:
+                    league_id = None
+                if division_id not in divisions_by_id:
+                    division_id = None
             return {"registration_id": reg.id, "team_id": team_id,
-                    "league_id": reg_league_id,
-                    "division_id": reg.division_id, "reason": reason}
+                    "league_id": league_id,
+                    "division_id": division_id, "reason": reason}
 
         # Active registrations grouped by their Season, so each Season resolves
         # participation from its own rows.
@@ -4798,8 +4840,9 @@ class ApiService:
                     "needs_assignment": {
                         "divisions_without_league": [
                             {"id": d.id, "name": d.name, "age_group": d.age_group,
-                             "league_id": self._league_id_via(
-                                 ls_by_id, d.league_season_id)}
+                             "league_id": _scoped_league_ref(
+                                 self._league_id_via(
+                                     ls_by_id, d.league_season_id))}
                             for d in dangling_divs],
                         "registrations": needs_assignment_regs,
                     },
