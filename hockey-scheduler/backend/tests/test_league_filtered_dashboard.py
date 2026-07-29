@@ -290,7 +290,7 @@ class DemoOverviewLeagueNarrowingTest(unittest.TestCase):
         slots = [api.create_ice_slot(
                     rink["id"], f"2026-09-0{i}T18:30:00+00:00",
                     f"2026-09-0{i}T20:00:00+00:00")
-                for i in range(1, 5)]
+                for i in range(1, 6)]
         for s in slots:
             self.assertNotIn("error", s, s)
 
@@ -304,15 +304,28 @@ class DemoOverviewLeagueNarrowingTest(unittest.TestCase):
         gy2 = api.create_game(self.season["id"], self.div_y["id"],
                               self.ty2["id"], self.ty3["id"], slots[2]["id"],
                               league_id=self.league_y["id"])
-        # The league-LESS game: an exhibition crossing League X/Y, owning no
-        # LeagueSeason at all -- must be "universally eligible" regardless of
-        # which League is selected (#367's own leagueless-team pattern).
+        # Two league-LESS games (exhibitions own no LeagueSeason at all), and
+        # the difference between them is the whole #367 owner ruling on this
+        # case: "a league-less Exhibition may appear under a selected League
+        # only when at least one participating Team validates into that
+        # League; otherwise omit it."
+        #   * `ge` CROSSES League X and Y, so it is genuinely both Leagues'
+        #     fixture and shows under either selection.
+        #   * `ge_y` is League Y on both sides -- concretely League Y's
+        #     fixture, and it must NOT surface while League X is active.
+        # The previous contract treated every league-less game as universally
+        # eligible, which put `ge_y` (both team NAMES, venue and time) on
+        # League X's Dashboard.
         ge = api.create_game(self.season["id"], None, self.tx1["id"],
                              self.ty1["id"], slots[3]["id"],
                              game_type="exhibition")
-        for g in (gx, gy1, gy2, ge):
+        ge_y = api.create_game(self.season["id"], None, self.ty2["id"],
+                               self.ty3["id"], slots[4]["id"],
+                               game_type="exhibition")
+        for g in (gx, gy1, gy2, ge, ge_y):
             self.assertNotIn("error", g, g)
         self.gx, self.gy1, self.gy2, self.ge = gx, gy1, gy2, ge
+        self.ge_y = ge_y
 
     def _select(self, league_id):
         selection = self.api.set_active_context(
@@ -320,23 +333,40 @@ class DemoOverviewLeagueNarrowingTest(unittest.TestCase):
         self.assertNotIn("error", selection, selection)
         return self.api.get_demo_overview("u1", *ADMIN)
 
-    def test_league_x_shows_only_its_own_plus_the_leagueless_game(self):
+    def test_league_x_shows_only_its_own_plus_a_participating_exhibition(self):
+        """REVERSED by the #367 owner ruling: this used to assert that EVERY
+        league-less game shows under League X. Only the exhibition with a
+        participating League X team does; League Y's own exhibition
+        (`ge_y`, League Y on both sides) must be omitted."""
         view = self._select(self.league_x["id"])
         self.assertEqual(_ids(view["teams"]),
                          {self.tx1["id"], self.tx2["id"]})
         self.assertEqual(_ids(view["divisions"]), {self.div_x["id"]})
         self.assertEqual({r["team_id"] for r in view["registrations"]},
                          {self.tx1["id"], self.tx2["id"]})
+        scheduled = {g["game_id"] for g in view["schedule"]}
+        # Asserted FIRST, ahead of the set equality below, so a regression
+        # here reports the actual rule that broke rather than an anonymous
+        # set diff.
+        self.assertNotIn(
+            self.ge_y["id"], scheduled,
+            "a league-less exhibition played between two League Y teams is "
+            "League Y's fixture -- it must not surface under League X just "
+            "for having no league_id of its own")
         self.assertEqual(
-            {g["game_id"] for g in view["schedule"]},
-            {self.gx["id"], self.ge["id"]},
-            "the league-less exhibition must still show under League X")
+            scheduled, {self.gx["id"], self.ge["id"]},
+            "League X must see its own game plus the exhibition its own team "
+            "plays in -- and nothing else")
+        self.assertNotIn(self.gy1["id"], scheduled)
+        self.assertNotIn(self.gy2["id"], scheduled)
+        # The public fixture list is built from the same predicate, so the
+        # same omission has to hold there (it carries team names too).
         self.assertNotIn(
-            self.gy1["id"], {g["game_id"] for g in view["schedule"]})
-        self.assertNotIn(
-            self.gy2["id"], {g["game_id"] for g in view["schedule"]})
+            self.ty3["name"],
+            {f["home_team_name"] for f in view["public_fixtures"]}
+            | {f["away_team_name"] for f in view["public_fixtures"]})
 
-    def test_league_y_shows_only_its_own_plus_the_leagueless_game(self):
+    def test_league_y_shows_only_its_own_plus_the_leagueless_games(self):
         view = self._select(self.league_y["id"])
         self.assertEqual(
             _ids(view["teams"]),
@@ -347,8 +377,9 @@ class DemoOverviewLeagueNarrowingTest(unittest.TestCase):
             {self.ty1["id"], self.ty2["id"], self.ty3["id"]})
         self.assertEqual(
             {g["game_id"] for g in view["schedule"]},
-            {self.gy1["id"], self.gy2["id"], self.ge["id"]},
-            "the league-less exhibition must still show under League Y")
+            {self.gy1["id"], self.gy2["id"], self.ge["id"], self.ge_y["id"]},
+            "both league-less exhibitions have a participating League Y team, "
+            "so both belong here")
         self.assertNotIn(
             self.gx["id"], {g["game_id"] for g in view["schedule"]})
 
@@ -362,7 +393,231 @@ class DemoOverviewLeagueNarrowingTest(unittest.TestCase):
             _ids(view["divisions"]), {self.div_x["id"], self.div_y["id"]})
         self.assertEqual(
             {g["game_id"] for g in view["schedule"]},
-            {self.gx["id"], self.gy1["id"], self.gy2["id"], self.ge["id"]})
+            {self.gx["id"], self.gy1["id"], self.gy2["id"], self.ge["id"],
+             self.ge_y["id"]},
+            "'No League' is the Program + active-Season union, so every "
+            "exhibition in the Season shows regardless of its participants")
+
+
+def _build_two_league_program(api, tag, actor_id="admin"):
+    """One Program / one Season / TWO sibling Leagues, each with its own
+    Club + Team + Division + registration + Official (home club = that
+    League's Club) and one game. The two Leagues share nothing, so any row
+    of League 2 appearing while League 1 is active is a leak by construction.
+
+    This is the shape the #367 reviewer reproduced with: "with Program A /
+    Season A1 / League A1 active, BOTH get_setup_overview_v2 and
+    get_demo_overview returned Club A2 and Official A2 from sibling League
+    A2."
+    """
+    program = api.create_program(f"{tag} Program", "US", "UTC",
+                                 actor_id=actor_id)
+    season = api.create_season(program["id"], f"{tag} Season",
+                               actor_id=actor_id)
+    venue = api.create_venue(f"{tag} Venue", league_id=program["id"],
+                             actor_id=actor_id)
+    api.grant_season_venue_access(season["id"], venue["id"], actor_id=actor_id)
+    rink = api.create_rink(venue["id"], f"{tag} Rink", actor_id=actor_id)
+    out = {"program": program, "season": season, "venue": venue, "rink": rink,
+           "leagues": {}}
+    for n in (1, 2):
+        league = api.create_league(season["id"], f"{tag} League {n}",
+                                   actor_id=actor_id)
+        division = api.create_division(season["id"], f"{tag} Division {n}",
+                                       league_id=league["id"],
+                                       actor_id=actor_id)
+        club = api.create_club(f"{tag} Club {n}", actor_id=actor_id)
+        home = api.create_team(club_id=club["id"], name=f"{tag} Home {n}",
+                               league_id=league["id"], actor_id=actor_id)
+        away = api.create_team(club_id=club["id"], name=f"{tag} Away {n}",
+                               league_id=league["id"], actor_id=actor_id)
+        for team in (home, away):
+            reg = api.register_team_for_season(
+                season["id"], team["id"], division["id"],
+                league_id=league["id"], actor_id=actor_id)
+            assert "error" not in reg, reg
+        slot = api.create_ice_slot(
+            rink["id"], f"2026-09-0{n}T18:30:00+00:00",
+            f"2026-09-0{n}T20:00:00+00:00", actor_id=actor_id)
+        game = api.create_game(season["id"], division["id"], home["id"],
+                               away["id"], slot["id"],
+                               league_id=league["id"], actor_id=actor_id)
+        assert "error" not in game, game
+        official = api.create_official(f"{tag} Official {n}",
+                                       home_club_id=club["id"],
+                                       actor_id=actor_id)
+        assert "error" not in official, official
+        out["leagues"][n] = {
+            "league": league, "division": division, "club": club,
+            "team_ids": {home["id"], away["id"]}, "game": game, "slot": slot,
+            "official": official,
+        }
+    return out
+
+
+class DemoOverviewLeagueDerivedReferenceTest(unittest.TestCase):
+    """#367 owner ruling / B3: Clubs and Officials are LEAGUE-bound on the
+    Dashboard -- Clubs through their Teams, Officials through an in-scope home
+    Club or an assignment whose Game passes the COMPLETE active Season+League
+    predicate. The reviewer reproduced the leak exactly: with Program A /
+    Season A1 / League A1 active, ``get_demo_overview`` still returned Club A2
+    and Official A2 from sibling League A2 (and, through ``home_club_name``,
+    the association between them).
+
+    The facility side is deliberately NOT League-narrowed in the same breath:
+    Venue/Rink/IceSlot have a Season axis and no competition-League axis, so
+    asserting they stay put under a League selection is what stops a future
+    over-correction from quietly narrowing them too."""
+
+    def test_sibling_leagues_club_and_official_never_cross(self):
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                f = _build_two_league_program(api, "A")
+                l1, l2 = f["leagues"][1], f["leagues"][2]
+
+                for own, other in ((l1, l2), (l2, l1)):
+                    sel = api.set_active_context(
+                        "u1", *ADMIN, f["program"]["id"], f["season"]["id"],
+                        own["league"]["id"])
+                    self.assertNotIn("error", sel, sel)
+                    view = api.get_demo_overview("u1", *ADMIN)
+                    self.assertNotIn("error", view, view)
+
+                    self.assertEqual(
+                        _ids(view["clubs"]), {own["club"]["id"]},
+                        f"[{label}] the sibling League's Club leaked onto the "
+                        "Dashboard")
+                    self.assertEqual(
+                        _ids(view["officials"]), {own["official"]["id"]},
+                        f"[{label}] the sibling League's Official leaked onto "
+                        "the Dashboard")
+                    # ...including the official -> club association, which is
+                    # a second disclosure riding on the same row.
+                    self.assertNotIn(
+                        other["club"]["name"],
+                        {o["home_club_name"] for o in view["officials"]},
+                        f"[{label}] home_club_name disclosed the sibling "
+                        "League's Club")
+                    self.assertEqual(_ids(view["teams"]), own["team_ids"],
+                                     label)
+
+                    # The facility tree has no League axis: it stays exactly
+                    # as wide as the active Season made it, under EITHER
+                    # League selection.
+                    self.assertEqual(_ids(view["venues"]), {f["venue"]["id"]},
+                                     label)
+                    self.assertEqual(_ids(view["rinks"]), {f["rink"]["id"]},
+                                     label)
+                    self.assertEqual(
+                        _ids(view["ice_slots"]),
+                        {l1["slot"]["id"], l2["slot"]["id"]},
+                        f"[{label}] ice inventory was narrowed by the League "
+                        "selection -- it has no competition-League axis")
+
+                # "No League" is the union of both Leagues' Clubs/Officials.
+                sel = api.set_active_context(
+                    "u1", *ADMIN, f["program"]["id"], f["season"]["id"], None)
+                self.assertNotIn("error", sel, sel)
+                view = api.get_demo_overview("u1", *ADMIN)
+                self.assertEqual(
+                    _ids(view["clubs"]),
+                    {l1["club"]["id"], l2["club"]["id"]}, label)
+                self.assertEqual(
+                    _ids(view["officials"]),
+                    {l1["official"]["id"], l2["official"]["id"]}, label)
+                _close(store)
+
+    def test_setup_audit_follows_the_whole_active_tuple(self):
+        """``setup_audit`` resolves each row against the COMPLETE tuple, not
+        the Program alone. Program-level-only filtering (the previous
+        contract) left the sibling League's Division/Team/Game/Club/Official
+        activity -- ids, actions and, for import rows, actor_id and detail --
+        in the feed of a League the caller is not in, while the payload
+        correctly withheld those same entities."""
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                f = _build_two_league_program(api, "A")
+                l1, l2 = f["leagues"][1], f["leagues"][2]
+
+                sel = api.set_active_context(
+                    "u1", *ADMIN, f["program"]["id"], f["season"]["id"],
+                    l1["league"]["id"])
+                self.assertNotIn("error", sel, sel)
+                view = api.get_demo_overview("u1", *ADMIN)
+                ids = {e["entity_id"] for e in view["setup_audit"]}
+
+                # League 1's own activity is present (positive control)...
+                self.assertIn(l1["division"]["id"], ids, label)
+                self.assertIn(l1["club"]["id"], ids, label)
+                self.assertIn(l1["game"]["id"], ids, label)
+                self.assertIn(l1["official"]["id"], ids, label)
+                self.assertTrue(l1["team_ids"] & ids, label)
+                self.assertIn(l1["league"]["id"], ids, label)
+
+                # ...and League 2's is entirely absent, entity for entity.
+                for key, msg in (("division", "division"), ("club", "club"),
+                                 ("game", "game"), ("official", "official"),
+                                 ("league", "league")):
+                    self.assertNotIn(
+                        l2[key]["id"], ids,
+                        f"[{label}] the sibling League's {msg} activity "
+                        "stayed in the audit feed")
+                self.assertTrue(
+                    l2["team_ids"].isdisjoint(ids),
+                    f"[{label}] the sibling League's team activity stayed in "
+                    "the audit feed")
+
+                self.assertEqual(view["setup_audit_count"],
+                                 len(view["setup_audit"]), label)
+                _close(store)
+
+    def test_setup_audit_follows_the_active_season_too(self):
+        """The Season half of the same rule: a sibling SEASON's activity is
+        omitted, including its Season row itself, its venue-access grant and
+        its games -- the axis a Program-level filter re-opened widest."""
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                a = _build_scheduled_program(api, "Prog A")
+                # A second Season in the SAME Program, with its own venue
+                # grant, so there is Season-bound activity to exclude.
+                s2 = api.create_season(a["program_id"], "Season 2")
+                self.assertNotIn("error", s2, s2)
+                grant2 = api.grant_season_venue_access(s2["id"],
+                                                       a["venue_id"])
+                self.assertNotIn("error", grant2, grant2)
+                # The ACTIVE Season's own grant, so the venue-access
+                # assertions below have a positive control and cannot pass
+                # merely because this entity_type never reaches the feed.
+                own_venue = api.create_venue("Prog A Venue 2",
+                                             league_id=a["program_id"])
+                grant1 = api.grant_season_venue_access(a["season_id"],
+                                                       own_venue["id"])
+                self.assertNotIn("error", grant1, grant1)
+
+                sel = api.set_active_context(
+                    "u1", *ADMIN, a["program_id"], a["season_id"])
+                self.assertNotIn("error", sel, sel)
+                view = api.get_demo_overview("u1", *ADMIN)
+                ids = {e["entity_id"] for e in view["setup_audit"]}
+
+                self.assertIn(a["season_id"], ids,
+                              f"[{label}] the ACTIVE Season's own activity "
+                              "must still be there")
+                self.assertIn(grant1["id"], ids,
+                              f"[{label}] the ACTIVE Season's own "
+                              "venue-access grant must still be there")
+                self.assertNotIn(
+                    s2["id"], ids,
+                    f"[{label}] a sibling Season's activity stayed in the "
+                    "audit feed while another Season was active")
+                self.assertNotIn(
+                    grant2["id"], ids,
+                    f"[{label}] a sibling Season's venue-access grant stayed "
+                    "in the audit feed")
+                _close(store)
 
 
 class DemoOverviewFacilityScopeTest(unittest.TestCase):
