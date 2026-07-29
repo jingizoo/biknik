@@ -40,9 +40,31 @@ the contract — not drift.
 |------|---------|--------|--------|
 | `get_setup_progress` (Home / Tasks) | mandatory | resolved | narrows teams, roster, participation only |
 | `get_demo_overview` (Dashboard) | mandatory | **hard ceiling** | narrows within the Season |
-| `get_standings` | must match active | must match when one is active | must match when one is selected |
-| `get_setup_overview_v2` (Setup) | **the ceiling** | not a further filter | narrows divisions + teams |
+| `get_standings` | must match active | **required, must match exactly** | must match when one is selected |
+| `get_setup_overview_v2` (Setup) | **the ceiling** | **hard ceiling** | narrows divisions, teams, clubs, officials |
 | `list_players` (`/api/players`) | mandatory | — | narrows via `Team.league_id` |
+
+## The #367 owner ruling, and what it reversed
+
+Three of the rules above are the ruling's own corrections to what #369 shipped.
+Each one reverses a decision that looked defensible in isolation, so the
+reasoning is recorded here rather than rediscovered:
+
+1. **Apply each axis through the strongest relationship that actually
+   exists** — never a synthetic League foreign key bolted onto an entity that
+   has none. Program is the hard ceiling for every scoped read;
+   **Season-bound** rows must match the active Season (a Program-only context
+   returns EMPTY for them, never the union); **League-bound** rows — Teams,
+   Players, Clubs *through their Teams*, Divisions/registrations/standings,
+   regular Games, and Officials *through an in-scope home Club or assignment* —
+   must match the selected League.
+2. **A league-less Exhibition** may appear under a selected League only when at
+   least one participating Team validates into that League. "It has no
+   `league_id`, so it is universally eligible" is the reasoning that put League
+   B-vs-C exhibitions, both team names included, on League A's Dashboard.
+3. **An unassigned record is not automatically "nobody's data."** Publishing
+   installation-wide `unassigned_*` lists to every scoped operator was itself
+   the disclosure — see [Unjoinable records](#unjoinable-records-and-the-pending-link-contract).
 
 `list_players` is the one to remember when adding a Setup collection, because it
 is easy to miss: it is not part of any overview DTO, it predates this work, and
@@ -96,16 +118,36 @@ A Program-only active context (no Season resolved) narrows every Season-scoped
 collection to **empty**, never falling back to "every Season" — a missing Season
 selection must not silently re-widen the read.
 
+**A league-less Exhibition needs a participating Team in the selected League.**
+An exhibition owns no `LeagueSeason`, and an early revision read that as
+"universally eligible under every League", by analogy with a league-less Team.
+The analogy fails: a league-less Team has no League to disagree with, while an
+exhibition between two League B teams is concretely League B's fixture. Under
+League A it surfaced both team names, the venue and the time. It is in scope only
+when one of its participants is in the already-League-narrowed `teams` set — and
+under "No League" (the Program + active-Season union) every exhibition in the
+Season shows, as it should.
+
 **Clubs, Organizations and Officials are scoped here too.** They carry no direct
 Program foreign key, but no-foreign-key is not authorization to disclose — they
-resolve through the same [derived joins](#derived-joins-and-the-unassigned-buckets)
-the Setup surface uses. Two successive revisions got this wrong in the same way:
-the first returned all three whenever *no* Program resolved, the second kept
-returning them whenever one *did*. Either way a scoped Coach could read another
-Program's Club, Organization and Official names — and the official→club
-association through `home_club_name`. Unlike the Setup surface there is no
-`unassigned_*` counterpart on the Dashboard: this is an operational read with no
-bootstrap role, so a record linked to nothing is simply not Dashboard data.
+resolve through the same [derived joins](#derived-joins-and-the-pending-link-contract)
+the Setup surface uses, and through the *strongest* axis each one actually has:
+
+- **Clubs** are League-bound *through their Teams*, so they derive from the
+  already Program+League-narrowed `teams` set.
+- **Officials** are League-bound through an in-scope home Club, or through an
+  assignment whose Game passes the complete active Season+League predicate —
+  the same one the schedule uses, exhibition rule included.
+- **Organizations** follow the facility axis instead (Season, never League),
+  plus the active Program's own operating Organization.
+
+Three successive revisions got this wrong: the first returned all three whenever
+*no* Program resolved, the second kept returning them whenever one *did*, and the
+third narrowed them to the Program but not the League — so with Program A /
+Season A1 / League Aa active, sibling League A2's Club and Official still came
+back, `home_club_name` and all. Unlike the Setup surface there is no bootstrap
+counterpart on the Dashboard: this is an operational read with no create-flow
+role, so a record linked to nothing is simply not Dashboard data.
 
 **Fails closed with no exception.** When no Program resolves at all, every key
 comes back empty. A scoped account with a missing, revoked or unassigned link
@@ -113,26 +155,48 @@ gets the same empty shape whether or not other Programs exist in the
 installation. Pre-Program bootstrap reference data is served by the Setup
 contract below instead.
 
-**`setup_audit` is filtered by parent chain.** Each row is resolved through its
-own `entity_type` to a Program (`season`, `division`, `team`,
+**`setup_audit` is filtered by parent chain, against the whole tuple.** Each row
+is resolved through its own `entity_type` (`season`, `division`, `team`,
 `season_venue_access`, `game`, `official_assignment`, `calendar_feed_token` via
-its actor, …). A row with **no** resolvable chain — `user_account`, `auth`,
-`guardian_link`, `import_batch`, or any unrecognized future type — is **omitted**
-when scoping is active, never guessed at and never shown globally. An unfiltered
-audit log leaks actor ids and detail dicts across Programs.
+its actor, …) against the **same sets that decide whether the row's own entity is
+returned at all** — `divisions`, `teams`, `in_scope_ls_ids`, `venues`, `rinks`,
+the derived Club/Official sets, `_in_scope_game`. Reusing them is the point: a
+parallel derivation drifted apart once already, leaving a Program-level-only
+audit filter that re-widened every axis the rest of the method narrows, so
+Season A2's divisions and League Ab's teams stayed in the feed by id and action
+while the payload correctly withheld the entities themselves.
+
+A row with **no** resolvable chain — `user_account`, `auth`, `guardian_link`,
+`import_batch`, or any unrecognized future type — is **omitted** when scoping is
+active, never guessed at and never shown globally. An unfiltered audit log leaks
+actor ids and detail dicts across Programs.
 
 ### `get_standings`
 
 The requested Division's validated `LeagueSeason → Season → Program` chain must
 match the **active tuple**, not merely land inside the caller's authorization
-ceiling. Season and League are each enforced only when that axis is actually
-selected, so a Program-only or Season-without-League context narrows less.
+ceiling.
+
+**An active Season is required, and must match exactly.** Standings are
+Season-bound by construction — a Division reaches its Season only through its
+`LeagueSeason` — so a **Program-only context is indistinguishable from "that
+Division does not exist"**, for every Division of that Program. An earlier
+revision enforced the Season axis only `if season is not None`, which read "no
+Season selected" as "every Season" and silently widened the endpoint exactly
+where it should have closed: a caller whose context resolved to Program-only
+(a saved Program-only selection, or a Program whose Seasons are all
+unauthorized) could read any Division's standings in any Season of it.
+
+The League axis *is* still conditional, and that asymmetry is deliberate rather
+than an oversight: "No League" is a first-class **selection** meaning the
+Program + active-Season union across every League, whereas "no Season" is the
+absence of the ceiling this read is bound to.
 
 Every mismatch — nonexistent, cross-Program, cross-Season, cross-League,
-deleted, unbound, revoked, archived, unauthorized — returns the *identical*
-generic empty shape. The sameness is the security property: distinguishing them
-would turn the endpoint into an existence oracle for records the caller may not
-see.
+deleted, unbound, revoked, archived, unauthorized, Program-only — returns the
+*identical* generic empty shape. The sameness is the security property:
+distinguishing them would turn the endpoint into an existence oracle for records
+the caller may not see.
 
 ### `get_setup_overview_v2` — Setup hub, six landings, Setup Records
 
@@ -140,24 +204,56 @@ The **active Program is the ceiling**, and `programs` collapses to just that one
 Program. The context bar (`options_with_league`) is the cross-Program picker;
 this structural surface only ever operates inside whichever Program is active.
 
-Within it, `seasons` and `leagues` are the Program's *full* sets — Season is not
-a further ceiling here, because a management surface needs to see and create
-against every Season in the Program. A selected League narrows `divisions` and
-`teams`; "No League" means every League **in the active Program**, never across
-Programs.
+**The active Season is a hard ceiling here too** — for the hub, all six workflow
+landings and Setup Records alike. `seasons` is the active Season alone, and
+`divisions`, the facility tree and Official assignments narrow with it; a
+Program-only context returns **empty** for all of them. An earlier revision
+resolved the Season and then deliberately ignored it, on the reasoning that a
+management surface "needs to see and create against every Season in the
+Program". The ruling rejects that: seeing another Season means **selecting** it,
+exactly as switching Program or League already does.
 
-## Derived joins, and the `unassigned_*` buckets
+Two axes are deliberately **not** narrowed here, and both are load-bearing:
+
+- **`leagues`** is the active Program's full set. A League is *permanent Program
+  structure* (#283), not Season-bound data, so neither the Season ceiling nor
+  the League selection touches it — the pickers still need the Program's set,
+  and the context bar remains the place a League is chosen. Its per-League
+  `season_ids` binding list is likewise reported whole.
+- **The facility tree** (Venue → Rink → IceSlot and the owning Organization)
+  has a Season axis via `SeasonVenueAccess` and **no competition-League axis at
+  all**, so a League selection never narrows it: under any League it stays
+  active-Season-wide. "No League" is therefore exactly the **Program +
+  active-Season union**. The UI says so in as many words (`setupScopeNote` in
+  `web/static/app.js`, rendered on the hub, every landing and Records), because
+  an operator who cannot see last season's division has to be able to tell a
+  *selection* from a deletion.
+
+A selected League narrows `divisions`, `teams`, and — per the ruling —
+`clubs` (through their Teams) and `officials` (through an in-scope home Club or
+assignment). "No League" means every League **in the active Program**, never
+across Programs.
+
+One client-side consequence worth knowing: the League create drawer's Season
+picker cannot read `sv.seasons`, which now holds at most the active Season — it
+reads the context bar's own authorized Season options instead
+(`contextSeasonOptions`), and creating a Program or Season refreshes those
+options immediately, so "create the Season, then its League" stays one
+uninterrupted flow. That widens no read: those Season names are already
+rendered in `#ctx-select` on the same page.
+
+## Derived joins, and unjoinable records
 
 `Club`, `Organization`, `Official`, `Venue`, `Rink` and `IceSlot` carry no
 direct Program foreign key, but each has a real, validatable chain:
 
 | Entity | In scope when… | Linked to *some* Program when… |
 |--------|----------------|-------------------------------|
-| Club | it has ≥1 Team in the active Program | it has ≥1 Team anywhere |
-| Venue | it has an **active** `SeasonVenueAccess` grant to one of the Program's Seasons, **or** its legacy `league_id` is the active Program | it has **any** grant (active *or* revoked), **or** a non-null `league_id` |
+| Club | it has ≥1 Team in the active Program **and selected League** | it has ≥1 Team anywhere |
+| Venue | it has a `SeasonVenueAccess` grant naming the **active Season**, **or** its legacy `league_id` is the active Program | it has **any** grant (active *or* revoked), **or** a non-null `league_id` |
 | Rink / IceSlot | it cascades from an in-scope Venue | it cascades from a linked Venue |
 | Organization | it owns ≥1 in-scope Venue, **or** it is the active Program's `operator_organization_id` | it owns a linked Venue, **or** it operates **any** Program |
-| Official | its `home_club` is in scope, **or** it has an assignment whose Game sits in one of the Program's Seasons | its `home_club` is linked, **or** it has any resolvable assignment |
+| Official | its `home_club` is in scope, **or** it has an assignment whose Game sits in the **active Season** | its `home_club` is linked, **or** it has any resolvable assignment |
 
 The right-hand column is the one that is easy to get wrong, and getting it wrong
 *is* the leak. A record with a chain to some **other** Program must be omitted;
@@ -172,23 +268,54 @@ Two edges were missed on the first attempt and each leaked a name: a
 revoked it, and `Program.operator_organization_id` ties an Organization to a
 Program without any Venue being involved at all. Both had to be counted as
 links, or the other Program's Venue and operating Organization surfaced in the
-`unassigned_*` buckets. `Venue.league_id` is the third: despite the name it
-stores a **Program** id (see [Venues have no League axis](#venues-have-no-league-axis)).
-
-So each of the six also gets an additive `unassigned_<entity>` list holding
-exactly the records linked to **no** Program at all. Offering those in any
-Program's pickers discloses nothing about any other Program: an unassigned row
-is nobody's data yet. The client unions each pair through one helper
-(`withUnassigned(sv, key)` in `web/static/app.js`), so a fresh record stays
-visible and selectable right up until its first real link narrows it.
+additive list. `Venue.league_id` is the third: despite the name it stores a
+**Program** id (see [Venues have no League axis](#venues-have-no-league-axis)).
 
 > **Subtlety worth keeping.** "Linked to no Program" for an Organization must be
 > computed from *granted* Venues, not from owning any Venue at all. An
 > Organization owning only ungranted Venues has no Program link and belongs in
-> `unassigned_organizations`. Getting this wrong put such an Organization in
-> **neither** list — invisible on the Setup facility tree, taking its
-> (correctly-unassigned) Venues down with it, since a Venue renders under its
-> owner and only a null-owner Venue reaches the orphan section.
+> the unlinked set. Getting this wrong put such an Organization in **neither**
+> list — invisible on the Setup facility tree, taking its (correctly-unlinked)
+> Venues down with it, since a Venue renders under its owner and only a
+> null-owner Venue reaches the orphan section.
+
+### Unjoinable records, and the pending-link contract
+
+An unjoinable record is **not** automatically "nobody's data". #369 shipped an
+additive `unassigned_<entity>` list per kind, holding every record in the
+installation linked to no Program and offered to **every** scoped caller, on the
+reasoning that such a row belongs to no one yet and so discloses nothing. The
+#367 owner ruling reverses that, and the reason is concrete: any Arena Manager —
+including an identity authorized for **zero** Programs — could enumerate every
+never-linked Club, Organization, Venue, Rink, IceSlot and Official in the
+installation by name, and an Official's name is personal data.
+
+Unjoinable rows are therefore **omitted** from scoped reads. What keeps the
+create-then-link flows alive is the narrow, separately-authorized **creator-owned
+contract** the ruling permits: `pending_link_<entity>` carries exactly the rows
+that (a) have no validated link to any Program **and** (b) *this caller*
+created, per the installation's own audit trail (`<entity>_created` with
+`actor_id == user_id` — the write routes record the session account id, which is
+the same id the read resolves its context from). The client unions each pair
+through one helper (`withPendingLink(sv, key)` in `web/static/app.js`), so the
+operator performing a create-then-link keeps seeing their fresh record right up
+until its first real link narrows it — and nobody else ever sees it.
+
+Two restrictions make that an ownership signal rather than a second disclosure
+path, and both are asserted:
+
+- **Only the CREATE entry counts.** Any later write (rename, reassign, delete)
+  is ignored, so poking an id you were never shown can never become permission
+  to enumerate it afterwards.
+- **`user_id=None` owns nothing.** An identity-less caller gets empty lists
+  rather than matching every `actor_id=None` row an internal or seed call path
+  ever wrote.
+
+One consequence to keep in mind when reading demo data: records created by the
+seed (`actor_id="league_admin"`, not an account id) and never linked to
+anything — the seeded club with no teams — are owned by nobody and therefore
+show for nobody. That is the contract working, not a bug; linking such a record
+(or recreating it through the UI) brings it back.
 
 ### Bootstrap vs. denial
 
@@ -200,8 +327,9 @@ These two look similar and must not be conflated:
   brand-new install create its first records.
 - **Denial** — the caller resolves no Program but other Programs *do* exist.
   Every derived-join set is naturally empty (nothing can validate against a
-  Program that never resolved), so the scoped lists come back empty while the
-  `unassigned_*` buckets still work.
+  Program that never resolved), so the scoped lists come back empty — and the
+  `pending_link_*` lists hold only that caller's OWN unlinked creations, which
+  is nothing at all for an identity that has created nothing.
 
 ## Venues have no League axis
 
@@ -231,14 +359,29 @@ discards the response if the context changed — the same monotonic-generation
 idiom already used by `setupProgressFetchSeq`, `drawerSeedFetchSeq` and
 `iceOperationSeq`.
 
+**The guard has to cover module-level state, not just `render()`'s own locals.**
+`ov` and `sv` are locals: a superseded render that bails simply paints nothing.
+`playersList`, `hv`, `leagueTeams`, `seasonRegs` and `seasonVenueAccess` are
+module-level and read at paint time, so a superseded render that assigned one of
+them before bailing could leave the NEWEST render painting its own correctly
+scoped cards next to another Program's player **names**. Every awaited fetch in
+that block is followed by a generation check *before* its assignment. This was a
+real, reproducible mixed-grid defect, not a theoretical one — it is what
+`checkPlayerListRaceGuard` in `e2e/league-filtered-data.js` pins down.
+
 ## Coverage
 
 - `tests/test_league_filtered_setup_progress.py`,
   `test_league_filtered_dashboard.py`, `test_league_filtered_standings.py`,
   `test_league_filtered_overview_v2.py` — each across Memory / SQLite /
-  PostgreSQL and all seven roles, with the two-Program / two-League matrix and
-  the missing / deleted / unbound / revoked / archived / cross-Program
-  negatives.
+  PostgreSQL and all seven roles, with the two-Program / two-League /
+  two-Season matrix and the missing / deleted / unbound / revoked / archived /
+  cross-Program / Program-only negatives. The last two files also carry
+  authenticated-HTTP classes for the contracts that cross the route boundary:
+  the Setup Season ceiling driven by the persisted context, the creator-owned
+  pending-link list keyed on the session's own account id, and the
+  Program-only standings read.
 - `e2e/league-filtered-data.js`, `setup-v2-context-scope.js`,
   `dashboard-season-ceiling.js` — the browser layer at desktop and 390×844,
-  including a delayed-response race proving the newest tuple always wins.
+  including two delayed-response races proving the newest tuple always wins
+  (one for `render()`'s locals, one for its module-level state).
