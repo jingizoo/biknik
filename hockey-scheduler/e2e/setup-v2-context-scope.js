@@ -45,12 +45,17 @@
 //     `unassigned_ice_slots` have no Records surface to assert against here;
 //     slots are still seeded per Program so the fixture matches the
 //     reviewer's wording, and their scoping is asserted at the facade level.
-//   * The `Players` card, which is sourced from its own authenticated
-//     /api/players call (`playersList`) and NOT from this endpoint's payload
-//     -- out of get_setup_overview_v2's contract. Players are seeded per the
-//     reviewer's wording but deliberately named with their own PLAY* prefix
-//     so the grid-wide "no foreign PROG* token anywhere" net below stays
-//     meaningful instead of tripping on an unrelated endpoint's data.
+// The `Players` card USED to be excluded here, on the reasoning that it is
+// sourced from its own /api/players call rather than this endpoint's payload
+// and so sat outside get_setup_overview_v2's contract. That reasoning was the
+// blind spot: the card is on this very screen, the requirement names players
+// among the entities that must not cross Programs, and /api/players was in
+// fact still answering installation-wide -- it later turned out to leak
+// another Program's player names AND emails outright, including through an
+// explicit ?team_id=. Players are now tagged with their Program like every
+// other entity, so the grid-wide "no foreign PROG* token anywhere" net covers
+// the Players card as well. "Fed by a different endpoint" is a reason to
+// assert MORE here, not less.
 //
 // Fails on any unexpected browser console/page error, and on horizontal
 // overflow. Runs the full matrix at desktop (1440x900) and canonical 390x844.
@@ -208,9 +213,9 @@ async function buildFixture(page) {
       return { org, program, season, club, venue, rink };
     };
     // One competition inside a Program: League -> Division -> Team (+ its
-    // season registration and one Player). The Player carries a PLAY* name,
-    // NOT the Program tag -- the Players card is fed by /api/players, a
-    // different endpoint outside this contract (see the header comment).
+    // season registration and one Player). The Player DOES carry the Program
+    // tag, so the grid-wide foreign-token net below covers the Players card
+    // too -- see the header comment for why that changed.
     const buildLeague = async (base, tag, suffix) => {
       const league = await post("/api/v2/setup/league",
         { season_id: base.season.id, name: `${tag}-League-${suffix}` });
@@ -221,7 +226,7 @@ async function buildFixture(page) {
       await post(`/api/v2/setup/seasons/${base.season.id}/team-registrations`,
         { team_id: team.id, league_id: league.id, division_id: division.id });
       await post("/api/v2/setup/player",
-        { team_id: team.id, name: `PLAY${suffix}-Skater`, position: "forward" });
+        { team_id: team.id, name: `${tag}-Player-${suffix}`, position: "forward" });
       return league.id;
     };
 
