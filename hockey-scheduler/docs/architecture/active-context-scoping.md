@@ -71,13 +71,21 @@ A Program-only active context (no Season resolved) narrows every Season-scoped
 collection to **empty**, never falling back to "every Season" — a missing Season
 selection must not silently re-widen the read.
 
+**Clubs, Organizations and Officials are scoped here too.** They carry no direct
+Program foreign key, but no-foreign-key is not authorization to disclose — they
+resolve through the same [derived joins](#derived-joins-and-the-unassigned-buckets)
+the Setup surface uses. Two successive revisions got this wrong in the same way:
+the first returned all three whenever *no* Program resolved, the second kept
+returning them whenever one *did*. Either way a scoped Coach could read another
+Program's Club, Organization and Official names — and the official→club
+association through `home_club_name`. Unlike the Setup surface there is no
+`unassigned_*` counterpart on the Dashboard: this is an operational read with no
+bootstrap role, so a record linked to nothing is simply not Dashboard data.
+
 **Fails closed with no exception.** When no Program resolves at all, every key
 comes back empty. A scoped account with a missing, revoked or unassigned link
 gets the same empty shape whether or not other Programs exist in the
-installation. An earlier revision carved out Clubs/Organizations/Officials here
-on "they have no Program foreign key" grounds; that let a Coach with a deleted
-team enumerate installation-wide names, and no-foreign-key is not authorization
-to disclose. Pre-Program bootstrap reference data is served by the Setup
+installation. Pre-Program bootstrap reference data is served by the Setup
 contract below instead.
 
 **`setup_audit` is filtered by parent chain.** Each row is resolved through its
@@ -118,19 +126,29 @@ Programs.
 `Club`, `Organization`, `Official`, `Venue`, `Rink` and `IceSlot` carry no
 direct Program foreign key, but each has a real, validatable chain:
 
-| Entity | In scope when… |
-|--------|----------------|
-| Club | it has ≥1 Team in the active Program |
-| Venue | it has an **active** `SeasonVenueAccess` grant to one of the Program's Seasons |
-| Rink / IceSlot | it cascades from an in-scope Venue |
-| Organization | it owns ≥1 in-scope Venue |
-| Official | its `home_club` is in scope, **or** it has an assignment whose Game sits in one of the Program's Seasons |
+| Entity | In scope when… | Linked to *some* Program when… |
+|--------|----------------|-------------------------------|
+| Club | it has ≥1 Team in the active Program | it has ≥1 Team anywhere |
+| Venue | it has an **active** `SeasonVenueAccess` grant to one of the Program's Seasons, **or** its legacy `league_id` is the active Program | it has **any** grant (active *or* revoked), **or** a non-null `league_id` |
+| Rink / IceSlot | it cascades from an in-scope Venue | it cascades from a linked Venue |
+| Organization | it owns ≥1 in-scope Venue, **or** it is the active Program's `operator_organization_id` | it owns a linked Venue, **or** it operates **any** Program |
+| Official | its `home_club` is in scope, **or** it has an assignment whose Game sits in one of the Program's Seasons | its `home_club` is linked, **or** it has any resolvable assignment |
 
-A record with a chain to some *other* Program is omitted — that is the leak this
-closes. But a record with a chain to **no** Program at all is a different case:
-a just-created Club has no Team yet, and a just-created Venue has no grant yet.
-Omitting those would deadlock the setup flow — you could never link the very
-record you just created.
+The right-hand column is the one that is easy to get wrong, and getting it wrong
+*is* the leak. A record with a chain to some **other** Program must be omitted;
+a record with a chain to **no** Program is a different case entirely — a
+just-created Club has no Team yet, and a just-created Venue has no grant yet, so
+omitting those would deadlock the setup flow. The two columns therefore have to
+be computed over the *same* edge set, or a record belonging to another Program
+falls through the gap between them.
+
+Two edges were missed on the first attempt and each leaked a name: a
+**revoked** `SeasonVenueAccess` grant still ties a Venue to the Program that
+revoked it, and `Program.operator_organization_id` ties an Organization to a
+Program without any Venue being involved at all. Both had to be counted as
+links, or the other Program's Venue and operating Organization surfaced in the
+`unassigned_*` buckets. `Venue.league_id` is the third: despite the name it
+stores a **Program** id (see [Venues have no League axis](#venues-have-no-league-axis)).
 
 So each of the six also gets an additive `unassigned_<entity>` list holding
 exactly the records linked to **no** Program at all. Offering those in any

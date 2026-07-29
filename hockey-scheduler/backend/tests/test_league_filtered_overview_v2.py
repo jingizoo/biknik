@@ -391,6 +391,80 @@ class LeagueFilteredOverviewV2Test(unittest.TestCase):
                 _close(store)
 
     # -- 5. unassigned_* buckets: genuinely-unlinked records, from EITHER side
+    def test_every_program_edge_disqualifies_a_record_from_unassigned(self):
+        """#369 self-audit: "linked to no Program" must be computed over
+        EVERY edge into Program, not just the obvious one.
+
+        The bucket is only leak-free if the "in scope" and "linked to some
+        Program" predicates share an edge set. Two edges were missed on the
+        first attempt and each disclosed another Program's record by name
+        through ``unassigned_*`` while the caller worked in a different
+        Program:
+
+        * ``Program.operator_organization_id`` — an Organization can reach a
+          Program without owning any Venue at all, so Program B's operating
+          Organization landed in Program A's ``unassigned_organizations``.
+        * a REVOKED ``SeasonVenueAccess`` — history still ties the Venue to
+          the Program that revoked it, so counting only ACTIVE grants put
+          Program B's Venue in Program A's ``unassigned_venues``.
+
+        (``Venue.league_id`` is the third such edge — legacy vocabulary that
+        stores a PROGRAM id — covered by the same assertions below.)
+        """
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                org_a = api.create_organization("Op Org A")
+                prog_a = api.create_program(
+                    "Prog A", operator_organization_id=org_a["id"])
+                season_a = api.create_season(prog_a["id"], "A S")
+                org_b = api.create_organization("Op Org B")
+                prog_b = api.create_program(
+                    "Prog B", operator_organization_id=org_b["id"])
+                season_b = api.create_season(prog_b["id"], "B S")
+
+                # The Venue gets its OWN owner, distinct from either Program's
+                # operating Organization. Without this, `org_b` would be
+                # disqualified from `unassigned_organizations` through the
+                # VENUE edge and the operator-edge assertion below could never
+                # fail — verified by mutation: reverting the operator edge left
+                # this test green until the two owners were separated.
+                venue_owner_b = api.create_organization("B Venue Owner")
+                # Program B's Venue, granted then REVOKED — still B's.
+                venue_b = api.create_venue(
+                    "B Venue", organization_id=venue_owner_b["id"])
+                grant = api.setup.grant_season_venue_access(
+                    season_b["id"], venue_b["id"], actor_id="op")
+                api.setup.revoke_season_venue_access(grant.id, actor_id="op")
+
+                ctx = api.set_active_context(
+                    "admin_a", Role.LEAGUE_ADMIN, {}, prog_a["id"],
+                    season_a["id"], None)
+                self.assertNotIn("error", ctx, ctx)
+                ov = api.get_setup_overview_v2("admin_a", Role.LEAGUE_ADMIN, {})
+                self.assertNotIn("error", ov, ov)
+
+                self.assertNotIn(
+                    org_b["id"], self._ids(ov, "unassigned_organizations"),
+                    f"[{label}] Program B's OPERATING organization leaked into "
+                    "Program A's unassigned_organizations")
+                self.assertNotIn(
+                    venue_b["id"], self._ids(ov, "unassigned_venues"),
+                    f"[{label}] a Venue whose grant was REVOKED by Program B "
+                    "leaked into Program A's unassigned_venues")
+                # It must not be in the SCOPED lists either — it is neither
+                # unassigned nor Program A's.
+                self.assertNotIn(org_b["id"], self._ids(ov, "organizations"),
+                                 (label, "org_b in scoped organizations"))
+                self.assertNotIn(venue_b["id"], self._ids(ov, "venues"),
+                                 (label, "venue_b in scoped venues"))
+                # Positive control: A's OWN operating organization IS in
+                # scope through that same operator edge, so the assertions
+                # above cannot be passing merely because everything is empty.
+                self.assertIn(org_a["id"], self._ids(ov, "organizations"),
+                              (label, "Program A's operating org must show"))
+                _close(store)
+
     def test_unassigned_buckets_show_genuinely_unlinked_records_from_either_program(self):
         """A Club/Organization/Venue/Rink/IceSlot/Official linked to NO
         Program at all shows up in the RIGHT ``unassigned_*`` bucket

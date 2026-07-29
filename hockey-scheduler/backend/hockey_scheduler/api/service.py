@@ -4137,16 +4137,29 @@ class ApiService:
         EMPTY rather than falling back to "every Season", so a missing
         Season selection can never silently re-widen the read.
 
-        Clubs/Organizations/Officials have no Program linkage in the domain
-        model at all and stay unfiltered when a Program DOES resolve
-        (unchanged, undisputed design) — but #369 review also requires the
-        Dashboard to fail CLOSED, with NO exception, when no Program
-        resolves at all: a scoped account with a missing/revoked/unassigned
-        link must get the same empty shape whether or not other Programs
-        exist in the installation, never an installation-wide list of
-        Club/Organization/Official names. (Pre-Program bootstrap reference
-        data is instead served from the explicitly authorized Setup-
-        management contract, ``get_setup_overview_v2``.) Called with no
+        Clubs/Organizations/Officials carry no direct Program FK, but they
+        are NOT therefore unfiltered — #369 review's "apply the same
+        deny-by-default rule to other unjoinable global reference
+        collections" applies here, and each is scoped through the same
+        derived joins ``get_setup_overview_v2`` uses (Club: a Team in the
+        active Program; Organization: owns an in-scope Venue or operates
+        the active Program; Official: home Club in scope, or assigned to a
+        Game in the active Season). An earlier revision of this method
+        returned all three wholesale whenever a Program resolved, on the
+        reasoning that "no foreign key" meant "no scope to apply" — that
+        handed every role, a scoped Coach included, another Program's Club,
+        Organization and Official names, plus the official-to-club
+        association through ``home_club_name``. Unlike the Setup surface
+        there is no ``unassigned_*`` counterpart: this is an operational
+        read with no bootstrap role, so a record linked to nothing is
+        simply not Dashboard data.
+
+        When no Program resolves at all the read fails CLOSED with NO
+        exception: a scoped account with a missing/revoked/unassigned link
+        gets the same empty shape whether or not other Programs exist in
+        the installation. (Pre-Program bootstrap reference data is served
+        from the explicitly authorized Setup-management contract,
+        ``get_setup_overview_v2``.) Called with no
         arguments (``role`` left ``None``, the default), returns the full,
         unfiltered installation view exactly as before #367 — this is what
         every existing internal caller that inspects whole-store state
@@ -4561,15 +4574,58 @@ class ApiService:
                     entry["actor_id"] = a.actor_id
                     entry["detail"] = a.detail
                 setup_audit.append(entry)
+        # #369 review, "apply the same deny-by-default rule to other
+        # unjoinable global reference collections": Clubs/Organizations/
+        # Officials carry no direct Program FK, but each HAS a validatable
+        # chain into the active Program, so returning them wholesale was a
+        # real cross-Program leak -- with Program A active this handed back
+        # Program B's Club, Organization and Official (including the
+        # official -> club association through `home_club_name`), to every
+        # role including a scoped Coach. The chains mirror
+        # get_setup_overview_v2's exactly; the ONE deliberate difference is
+        # that this operational read has no bootstrap need, so there is no
+        # `unassigned_*` counterpart here -- a record linked to nothing is
+        # simply not Dashboard data. `clubs`/`orgs` above stay whole as
+        # NAME-RESOLUTION lookups (labelling a row that is already
+        # independently authorized leaks nothing); only what is RETURNED is
+        # scoped.
+        # `in_scope_season_ids is None` is precisely "no scoping active",
+        # i.e. the legacy no-role call. Do NOT branch on `program is None`
+        # here: that is ALSO true for the legacy path (nothing was ever
+        # resolved), so keying off it silently emptied the unfiltered
+        # contract every internal caller depends on. The scoped-role-with-
+        # no-Program case cannot reach this point at all -- it already
+        # returned the fully-empty shape far above.
+        if in_scope_season_ids is None:
+            ref_clubs = list(clubs.values())
+            ref_orgs = list(orgs.values())
+            ref_officials = list(self.store.all_officials())
+        else:
+            program_club_ids = {t.club_id for t in self.store.all_teams()
+                                if t.club_id and t.program_id == program.id}
+            ref_clubs = [c for c in clubs.values() if c.id in program_club_ids]
+            scoped_org_ids = {v.organization_id for v in venues.values()
+                              if v.organization_id}
+            ref_orgs = [o for o in orgs.values() if o.id in scoped_org_ids]
+            ref_officials = []
+            for o in self.store.all_officials():
+                if o.home_club_id in program_club_ids:
+                    ref_officials.append(o)
+                    continue
+                for a in self.store.assignments_for_official(o.id):
+                    g = self.store.get_game(a.game_id)
+                    if g is not None and g.season_id in in_scope_season_ids:
+                        ref_officials.append(o)
+                        break
         return {
             "league": leagues[0] if leagues else None,
             "leagues": leagues,
             "seasons": seasons,
             "levels": [self._league_dict(lv) for lv in levels.values()],
             "divisions": division_rows,
-            "clubs": [_serialize(c) for c in clubs.values()],
+            "clubs": [_serialize(c) for c in ref_clubs],
             "teams": team_rows,
-            "organizations": [_serialize(o) for o in orgs.values()],
+            "organizations": [_serialize(o) for o in ref_orgs],
             "venues": venue_rows,
             "rinks": rink_rows,
             "ice_slots": slot_rows,
@@ -4577,7 +4633,7 @@ class ApiService:
                 {"id": o.id, "name": o.name,
                  "home_club_name": (clubs[o.home_club_id].name
                                     if o.home_club_id in clubs else None)}
-                for o in self.store.all_officials()
+                for o in ref_officials
             ],
             "schedule": schedule,
             "public_fixtures": public_fixtures,
@@ -4741,14 +4797,43 @@ class ApiService:
             unassigned_clubs = [c for c in all_clubs
                                 if c.id not in club_ids_any]
 
+            # "Linked to SOME Program" must be computed over EVERY edge into
+            # Program, or a record that belongs to another Program falls
+            # through into `unassigned_*` and leaks there. For a Venue that
+            # means three edges, not one:
+            #   * an ACTIVE grant (in scope only when it names one of the
+            #     active Program's Seasons);
+            #   * an INACTIVE/revoked grant -- history still ties the Venue to
+            #     that Program, so it is not "nobody's data";
+            #   * the legacy `Venue.league_id`, which despite its name stores
+            #     a PROGRAM id (integrity_checks.py joins it to
+            #     seasons.program_id). It is in scope for the active Program
+            #     and a foreign link otherwise.
             all_sva = self.store.all_season_venue_access()
-            venue_ids_any = {a.venue_id for a in all_sva if a.active}
+            venue_ids_any = {a.venue_id for a in all_sva}       # active OR revoked
+            # A REVOKED grant to one of THIS Program's Seasons keeps the Venue
+            # in scope, deliberately: revoking only deactivates the row
+            # (history is preserved), the Setup tree renders a "Revoked venue
+            # access" section to manage exactly those rows, and delete_venue
+            # still blocks on them regardless of active status. Scoping to
+            # ACTIVE grants alone made such a Venue vanish from both `venues`
+            # and `unassigned_venues` -- unresolvable name in the very section
+            # that exists to clean it up, and unreachable for the cleanup the
+            # Season/Venue delete path requires first.
             venue_ids_active = {
                 a.venue_id for a in all_sva
-                if a.active and a.season_id in in_scope_season_ids}
-            venues = [v for v in all_venues if v.id in venue_ids_active]
+                if a.season_id in in_scope_season_ids}
+            # `active_program` is None here whenever a SCOPED role resolves no
+            # Program at all (a Coach with a dangling team_id) -- that path
+            # still runs this branch, with every set already empty, so every
+            # active-Program edge below must be guarded rather than assumed.
+            venues = [v for v in all_venues
+                     if v.id in venue_ids_active
+                     or (active_program is not None and v.league_id
+                         and v.league_id == active_program.id)]
+            venue_ids_active = {v.id for v in venues}
             unassigned_venues = [v for v in all_venues
-                                 if v.id not in venue_ids_any]
+                                 if v.id not in venue_ids_any and not v.league_id]
 
             rinks = [r for r in all_rinks if r.venue_id in venue_ids_active]
             unassigned_venue_ids = {v.id for v in unassigned_venues}
@@ -4761,19 +4846,35 @@ class ApiService:
             unassigned_slots = [s for s in all_slots
                                 if s.rink_id in rink_ids_unassigned]
 
-            # An Organization's only route to a Program is through a Venue
-            # that itself has a grant, so "linked to some Program" must be
-            # computed from GRANTED venues (`venue_ids_any`) -- NOT from
-            # merely owning any Venue at all. Owning only ungranted Venues
-            # is not a Program link, and treating it as one put such an
-            # Organization in NEITHER bucket: invisible on the Setup
-            # facility tree, taking its (correctly-unassigned) Venues down
-            # with it, since a Venue renders under its owner and only a
-            # NULL-owner Venue reaches the orphan section.
+            # An Organization reaches a Program by TWO edges, and missing
+            # either one leaks: it can own a Venue the Program uses, and it
+            # can BE a Program's `operator_organization_id`. Leaving the
+            # operator edge out put every other Program's operating
+            # organization into `unassigned_organizations` -- i.e. disclosed
+            # its name while the caller was working in a different Program,
+            # exactly the leak the bucket exists to avoid.
+            #
+            # Note the venue edge for "linked to SOME Program" uses
+            # `venue_ids_any` (any grant, active or revoked, plus the legacy
+            # Program link above); owning only a genuinely unlinked Venue is
+            # NOT a Program link, and treating it as one previously put such
+            # an Organization in NEITHER bucket -- invisible on the Setup
+            # facility tree, taking its Venues down with it, since a Venue
+            # renders under its owner and only a NULL-owner Venue reaches
+            # the orphan section.
+            linked_venue_ids = venue_ids_any | {v.id for v in all_venues
+                                                if v.league_id}
+            operator_org_ids_any = {p.operator_organization_id
+                                    for p in self.store.all_programs()
+                                    if p.operator_organization_id}
             org_ids_any = {v.organization_id for v in all_venues
-                          if v.organization_id and v.id in venue_ids_any}
+                          if v.organization_id and v.id in linked_venue_ids}
+            org_ids_any |= operator_org_ids_any
             org_ids_active = {v.organization_id for v in all_venues
                               if v.organization_id and v.id in venue_ids_active}
+            if (active_program is not None
+                    and active_program.operator_organization_id):
+                org_ids_active.add(active_program.operator_organization_id)
             orgs = [o for o in all_orgs if o.id in org_ids_active]
             unassigned_orgs = [o for o in all_orgs
                                if o.id not in org_ids_any]
