@@ -181,6 +181,8 @@ jobs:
           node --check hockey-scheduler/e2e/context-switcher.js
           node --check hockey-scheduler/e2e/league-context-bar.js
           node --check hockey-scheduler/e2e/league-filtered-data.js
+          node --check hockey-scheduler/e2e/setup-v2-context-scope.js
+          node --check hockey-scheduler/e2e/dashboard-season-ceiling.js
           node --check hockey-scheduler/e2e/player-edit.js
           node --check hockey-scheduler/e2e/player-lifecycle.js
           node --check hockey-scheduler/e2e/season-dates.js
