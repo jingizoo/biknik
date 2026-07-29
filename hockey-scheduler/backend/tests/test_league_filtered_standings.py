@@ -596,6 +596,123 @@ class StandingsActiveContextMatrixTest(unittest.TestCase):
                 _close(store)
 
 
+class StandingsProgramOnlyContextTest(unittest.TestCase):
+    """#367 owner ruling / B4: a scoped standings read REQUIRES an active
+    Season and must match it EXACTLY. A Program-only context returns the
+    generic empty shape for every Division of that Program.
+
+    This reverses the previous rule, which enforced the Season axis only
+    ``if season is not None``. That made "no Season selected" behave as
+    "every Season": a caller whose context resolved to Program-only -- a
+    saved Program-only selection, or a Program whose Seasons are all
+    unauthorized -- could read the standings of ANY Division in that
+    Program, in any Season, and the endpoint silently widened exactly where
+    the rest of the active-context work narrows. Standings are Season-bound
+    by construction (a Division reaches its Season only through its
+    LeagueSeason), so "no ceiling" is never the right reading of "no Season".
+
+    The gate itself (``_division_matches_active_context``) is asserted
+    alongside each response shape: with two REAL Divisions in two Seasons,
+    both would return non-empty standings if the gate accepted them, so an
+    empty response here is enforcement rather than an accident of an empty
+    Division -- but asserting the gate directly is what keeps that true even
+    if the fixture changes.
+    """
+
+    def _two_season_program(self, api):
+        """One Program, two Seasons, one scored Division in each -- both with
+        real registered Teams and a FINAL result, so either is distinguishable
+        from "empty" whenever it IS reachable."""
+        program, club, venue, rink = _make_program(api, "PO")
+        s1 = api.create_season(program["id"], "PO-S1")
+        s2 = api.create_season(program["id"], "PO-S2")
+        for s in (s1, s2):
+            access = api.grant_season_venue_access(s["id"], venue["id"])
+            assert "error" not in access, access
+        lg1 = api.create_league(s1["id"], "PO-L1")
+        lg2 = api.create_league(s2["id"], "PO-L2")
+        d1 = _scored_division_in(api, s1["id"], lg1["id"], club["id"],
+                                 rink["id"], "PO1", "2026-11-01")
+        d2 = _scored_division_in(api, s2["id"], lg2["id"], club["id"],
+                                 rink["id"], "PO2", "2026-11-02")
+        return {"program": program, "s1": s1, "s2": s2, "lg1": lg1,
+                "lg2": lg2, "d1": d1["division"], "d2": d2["division"]}
+
+    def test_program_only_is_indistinguishable_from_nonexistent_for_both_seasons(self):
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                f = self._two_season_program(api)
+                admin = ("admin-po", Role.LEAGUE_ADMIN, {})
+
+                sel = api.set_active_context(
+                    admin[0], admin[1], admin[2], f["program"]["id"], None,
+                    None)
+                self.assertNotIn("error", sel, sel)
+                self.assertIsNone(sel["season_id"], sel)
+
+                program, season, league = api.context.resolve_with_league(*admin)
+                self.assertIsNotNone(program, label)
+                self.assertIsNone(
+                    season,
+                    f"{label}: fixture precondition -- the context must really "
+                    "resolve Program-only for this test to mean anything")
+
+                missing = api.get_standings("division_does_not_exist", *admin)
+                for name, div in (("s1", f["d1"]), ("s2", f["d2"])):
+                    with self.subTest(division=name):
+                        self.assertFalse(
+                            api._division_matches_active_context(
+                                div["id"], program, season, league),
+                            f"{label}/{name}: a Program-only context ACCEPTED "
+                            "a Division -- 'no Season selected' is not 'every "
+                            "Season'")
+                        result = api.get_standings(div["id"], *admin)
+                        self.assertEqual(
+                            result, {"division_id": div["id"],
+                                     "standings": []},
+                            f"{label}/{name}: a Program-only context must "
+                            "return the generic empty shape")
+                        # Identical in SHAPE to a nonexistent id: the response
+                        # must not become an existence oracle either.
+                        self.assertEqual(set(result), set(missing), label)
+                        self.assertEqual(result["standings"],
+                                         missing["standings"], label)
+                _close(store)
+
+    def test_selecting_a_season_enables_exactly_that_seasons_division(self):
+        """The positive half: the same caller, same Program, one selection
+        later. Selecting S1 makes S1's Division readable and leaves S2's
+        exactly as unreadable as it was, and selecting S2 flips it -- so the
+        empty results above are the Season ceiling doing its job, not a
+        broken fixture."""
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                f = self._two_season_program(api)
+                admin = ("admin-po", Role.LEAGUE_ADMIN, {})
+
+                for own, other, season in (("d1", "d2", "s1"),
+                                           ("d2", "d1", "s2")):
+                    with self.subTest(season=season):
+                        sel = api.set_active_context(
+                            admin[0], admin[1], admin[2], f["program"]["id"],
+                            f[season]["id"], None)
+                        self.assertNotIn("error", sel, sel)
+                        readable = api.get_standings(f[own]["id"], *admin)
+                        self.assertNotEqual(
+                            readable["standings"], [],
+                            f"{label}: selecting {season} must make its own "
+                            "Division readable")
+                        blocked = api.get_standings(f[other]["id"], *admin)
+                        self.assertEqual(
+                            blocked, {"division_id": f[other]["id"],
+                                      "standings": []},
+                            f"{label}: the OTHER Season's Division must stay "
+                            "unreadable while {season} is active")
+                _close(store)
+
+
 class StandingsRoleMatrixTest(unittest.TestCase):
     """Every supported role, on every backend.
 
@@ -856,6 +973,65 @@ class StandingsAuthorizationHttpTest(unittest.TestCase):
         status, resp = self._req(admin, "GET", f"/api/standings/{archived_id}")
         self.assertEqual(status, 200, resp)
         self.assertNotEqual(resp["standings"], [])
+
+    def test_http_program_only_context_reads_no_division_then_a_selection_does(self):
+        """B4 over HTTP: with the SAME authenticated League Admin session,
+        a persisted PROGRAM-ONLY context returns the generic empty shape for
+        Divisions in both of the Program's Seasons -- indistinguishable from
+        a nonexistent id -- and selecting one Season then enables exactly
+        that Season's Division. Program-only is written through the real
+        route (``season_id: null``), so this exercises the persisted context
+        the read resolves from, not a facade argument."""
+        api = self.srv.STATE.api
+        program, club, venue, rink = _make_program(api, "HTTP-PO")
+        s1 = api.create_season(program["id"], "HTTP-PO-S1")
+        s2 = api.create_season(program["id"], "HTTP-PO-S2")
+        for s in (s1, s2):
+            self.assertNotIn(
+                "error", api.grant_season_venue_access(s["id"], venue["id"]))
+        lg1 = api.create_league(s1["id"], "HTTP-PO-L1")
+        lg2 = api.create_league(s2["id"], "HTTP-PO-L2")
+        d1 = _scored_division_in(api, s1["id"], lg1["id"], club["id"],
+                                 rink["id"], "HTTPPO1", "2026-11-03")
+        d2 = _scored_division_in(api, s2["id"], lg2["id"], club["id"],
+                                 rink["id"], "HTTPPO2", "2026-11-04")
+
+        admin = self._login("admin")
+        self._set_context(admin, program["id"], None, None)
+        status, ctx = self._req(admin, "GET", "/api/context")
+        self.assertEqual(status, 200, ctx)
+        # Fixture precondition, read back from the route itself: the PERSISTED
+        # context really is Program-only. Without this the empty responses
+        # below could come from an auto-resolved Season that simply matched
+        # neither Division.
+        self.assertEqual(ctx["program_id"], program["id"], ctx)
+        self.assertIsNone(ctx["season_id"], ctx)
+
+        status, missing = self._req(
+            admin, "GET", "/api/standings/division_does_not_exist")
+        self.assertEqual(status, 200, missing)
+        for name, div in (("s1", d1["division"]), ("s2", d2["division"])):
+            with self.subTest(division=name):
+                status, resp = self._req(
+                    admin, "GET", f"/api/standings/{div['id']}")
+                self.assertEqual(status, 200, resp)
+                self.assertEqual(
+                    resp, {"division_id": div["id"], "standings": []},
+                    f"{name}: a Program-only session read a Season-bound "
+                    "Division's standings")
+                self.assertEqual(set(resp), set(missing))
+                self.assertEqual(resp["standings"], missing["standings"])
+
+        # One selection later, exactly one of them opens up.
+        self._set_context(admin, program["id"], s1["id"], None)
+        status, resp = self._req(
+            admin, "GET", f"/api/standings/{d1['division']['id']}")
+        self.assertEqual(status, 200, resp)
+        self.assertNotEqual(resp["standings"], [], resp)
+        status, resp2 = self._req(
+            admin, "GET", f"/api/standings/{d2['division']['id']}")
+        self.assertEqual(status, 200, resp2)
+        self.assertEqual(resp2["standings"], [], resp2)
 
 
 if __name__ == "__main__":

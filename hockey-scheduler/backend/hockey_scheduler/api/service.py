@@ -2946,22 +2946,42 @@ class ApiService:
     def _division_matches_active_context(self, division_id, program, season,
                                          league):
         """Whether ``division_id``'s validated LeagueSeason -> Season ->
-        Program chain matches the ACTIVE resolved tuple (#369 review
-        correction) — Program always required; Season/League required only
-        when that axis is actually selected (a Program-only or
-        Season-without-League active context narrows less). A caller
-        authorized for many Programs/Seasons/Leagues must still be bound to
-        the ONE it is currently active in, not merely "any of them" —
+        Program chain matches the ACTIVE resolved tuple.
+
+        Program is the hard ceiling, and a Season MUST be active and match
+        EXACTLY (#367 owner ruling: "Season-bound rows must match the active
+        Season; a Program-only context returns EMPTY for Season-bound data").
+        Standings are Season-bound by construction — a Division reaches its
+        Season only through its LeagueSeason — so a Program-only context can
+        never satisfy this and returns the generic empty shape for EVERY
+        Division, indistinguishably from a nonexistent one.
+
+        An earlier revision enforced the Season axis only ``if season is not
+        None``, which silently WIDENED the read exactly where it should have
+        closed: a caller whose active context resolved to Program-only (a
+        saved Program-only selection, or a Program whose Seasons are all
+        unauthorized) could read the standings of ANY Division in that
+        Program, in any Season. "No Season selected" is not "every Season" —
+        the same rule ``get_demo_overview`` already applies to its
+        Season-scoped collections.
+
+        The League axis stays conditional, and that is deliberate rather than
+        an inconsistency: "No League" is a first-class SELECTION meaning the
+        Program+active-Season union across every League, whereas "no Season"
+        is the absence of the ceiling this read is bound to.
+
+        A caller authorized for many Programs/Seasons/Leagues must still be
+        bound to the ONE it is currently active in, not merely "any of them" —
         otherwise a global League Admin active in Program A could pull
         Program B's (or another League's) standings just by being globally
         authorized, which is exactly the leak #369 review flags."""
-        if program is None:
+        if program is None or season is None:
             return False
         league_season, div_season = self._division_league_season_chain(
             division_id)
         if league_season is None or div_season.program_id != program.id:
             return False
-        if season is not None and league_season.season_id != season.id:
+        if league_season.season_id != season.id:
             return False
         if league is not None and league_season.league_id != league.id:
             return False
@@ -2990,6 +3010,13 @@ class ApiService:
         to one that doesn't exist at all. Called with no arguments beyond
         ``division_id`` (the default), performs no ownership check —
         unchanged pre-#367 behavior for existing direct/internal callers.
+
+        #367 owner ruling: a scoped read REQUIRES an active Season and must
+        match it exactly. A Program-only context is therefore
+        indistinguishable from "the Division does not exist" for EVERY
+        Division of that Program — see
+        ``_division_matches_active_context``, which is where the whole
+        tuple check lives.
         """
         if role is not None:
             program, season, league = self.context.resolve_with_league(
