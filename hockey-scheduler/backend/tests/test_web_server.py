@@ -39,6 +39,32 @@ _HTTPD = None
 _THREAD = None
 
 
+def _request_signed_in(method, path, body=None):
+    """Like ``_request``, but with a REAL signed-in session rather than the
+    identity-less X-Demo-Role header — #367's ``/api/demo/overview`` needs a
+    real ``user_id`` to resolve a persisted context from, same requirement
+    ``/api/v2/setup/progress``/``/api/context`` already had."""
+    url = f"http://{HOST}:{PORT}/api/auth/login"
+    data = json.dumps({"username": "admin", "password": "demo"}).encode()
+    req = urllib.request.Request(url, data=data, method="POST",
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req) as resp:
+        cookie = resp.headers.get("Set-Cookie", "").split(";", 1)[0]
+    url = f"http://{HOST}:{PORT}{path}"
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={"Cookie": cookie})
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            raw = resp.read()
+            return resp.status, (json.loads(raw) if raw else None)
+    except urllib.error.HTTPError as e:
+        raw = e.read()
+        return e.code, (json.loads(raw) if raw else None)
+
+
 def setUpModule():
     global PORT, _HTTPD, _THREAD
     _HTTPD = ThreadingHTTPServer((HOST, 0), web.Handler)
@@ -68,7 +94,7 @@ class WebServerTest(unittest.TestCase):
         self.assertIsInstance(body["game"]["start_time"], str)
 
     def test_overview_endpoint_ok(self):
-        status, body = _request("GET", "/api/demo/overview")
+        status, body = _request_signed_in("GET", "/api/demo/overview")
         self.assertEqual(status, 200)
         self.assertEqual(body["league"]["name"], "Alpine Ice Hockey League")
 
@@ -112,7 +138,7 @@ class WebServerTest(unittest.TestCase):
     def test_schedule_game_from_available_slot(self):
         # Find an available slot and two teams REGISTERED in U16 Elite (#180 —
         # participation comes from registrations, not the legacy Team.division_id).
-        _, ov = _request("GET", "/api/demo/overview")
+        _, ov = _request_signed_in("GET", "/api/demo/overview")
         slot = next(s for s in ov["ice_slots"] if s["status"] == "available")
         u16_div = next(d for d in ov["divisions"] if d["name"] == "U16 Elite")
         u16 = [r for r in ov["registrations"] if r["division_id"] == u16_div["id"]]
@@ -128,7 +154,7 @@ class WebServerTest(unittest.TestCase):
         bstatus, _ = _request("GET", f"/api/games/{game['id']}/board")
         self.assertEqual(bstatus, 200)
         # The slot is now allocated in the overview.
-        _, ov2 = _request("GET", "/api/demo/overview")
+        _, ov2 = _request_signed_in("GET", "/api/demo/overview")
         allocated = {s["id"] for s in ov2["ice_slots"] if s["status"] == "allocated"}
         self.assertIn(slot["id"], allocated)
 

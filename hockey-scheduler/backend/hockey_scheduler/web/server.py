@@ -928,7 +928,21 @@ class Handler(BaseHTTPRequestHandler):
                     "code": "not_found", "message": "Calendar not found."}}, 404)
             return self._send_ics(ics)
         if path == "/api/demo/overview":
-            return self._send_api(api.get_demo_overview())
+            # #367: Dashboard read, scoped to the caller's persisted active
+            # Program/Season/League context — a per-user read, so it needs a
+            # real session (same requirement as /api/context and
+            # /api/v2/setup/progress), not the identity-less X-Demo-Role/
+            # headerless demo fallbacks alone.
+            role, scope, user_id, err = self._resolve_role()
+            if err is not None:
+                code, payload = err
+                return self._send_json(payload, code)
+            if user_id is None:
+                return self._send_json({"error": {
+                    "code": "unauthorized",
+                    "message": "A signed-in account is required."}}, 401)
+            return self._send_api(
+                api.get_demo_overview(user_id, role, scope))
         if path == "/api/context":
             # The signed-in user's active Program/Season/League selection (#159,
             # League axis #345), filtered through their real role/scope.
@@ -1031,9 +1045,28 @@ class Handler(BaseHTTPRequestHandler):
             # — both League Admin and Arena Manager hold it, and Arena
             # Managers need the facility portion (organizations/venues/rinks)
             # for their own Setup cards; the payload has no PII/roster counts.
-            if self._operator_only("/api/v2/setup/overview"):
-                return
-            return self._send_api(api.get_setup_overview_v2())
+            # #367: now Program-scoped via the persisted active context, so
+            # (like /api/v2/setup/progress) it needs a real session, not the
+            # identity-less X-Demo-Role/headerless demo fallbacks alone.
+            role, scope, user_id, err = self._resolve_role()
+            if err is not None:
+                code, payload = err
+                return self._send_json(payload, code)
+            if user_id is None:
+                return self._send_json({"error": {
+                    "code": "unauthorized",
+                    "message": "A signed-in account is required."}}, 401)
+            if not authorize(role, "/api/v2/setup/overview"):
+                perm = required_permission("/api/v2/setup/overview")
+                return self._send_json({"error": {
+                    "code": "forbidden",
+                    "message": (f"Your role ({ROLE_LABELS[role]}) can't do "
+                                f"this (requires {perm.value})."),
+                    "details": {"role": role.value,
+                                "required": perm.value if perm else None},
+                }}, 403)
+            return self._send_api(
+                api.get_setup_overview_v2(user_id, role, scope))
         if path == "/api/v2/setup/hierarchy":
             if self._operator_only("/api/v2/setup/player"):
                 return
@@ -1324,7 +1357,19 @@ class Handler(BaseHTTPRequestHandler):
                 api.get_substitute_opportunity(jid, mgo.group(2)))
         sd = re.match(r"^/api/standings/([^/]+)$", path)
         if sd:
-            return self._send_api(api.get_standings(sd.group(1)))
+            # #367: the Division's Program must be in the caller's
+            # authorized set (see get_standings's own docstring) — needs a
+            # real session, same requirement as /api/demo/overview above.
+            role, scope, user_id, err = self._resolve_role()
+            if err is not None:
+                code, payload = err
+                return self._send_json(payload, code)
+            if user_id is None:
+                return self._send_json({"error": {
+                    "code": "unauthorized",
+                    "message": "A signed-in account is required."}}, 401)
+            return self._send_api(
+                api.get_standings(sd.group(1), user_id, role, scope))
         # #283 Slice D: LeagueSeason-wide standings (across all its Divisions),
         # keyed by (league_id, season_id). Exhibition games are excluded.
         lss = re.match(

@@ -345,7 +345,10 @@ class V2SetupContractTest(unittest.TestCase):
 
         t = next(x for x in ov["teams"] if x["id"] == team["id"])
         self.assertEqual(t["program_id"], program["id"])
-        self.assertNotIn("league_id", t)
+        # #367: additive — the real competition league_id (Team.league_id,
+        # #283), previously the one clearly-missing parent-id-chain field a
+        # League-aware consumer needs to filter client-side.
+        self.assertEqual(t["league_id"], league["id"])
 
         v = next(x for x in ov["venues"] if x["id"] == venue["id"])
         self.assertEqual(v["organization_id"], org["id"])

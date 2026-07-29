@@ -44,6 +44,20 @@ class ServerAuthzTest(unittest.TestCase):
         with urllib.request.urlopen(f"http://127.0.0.1:{self.port}{path}") as r:
             return r.status, json.loads(r.read() or b"{}")
 
+    def _get_signed_in(self, path):
+        # #367: /api/demo/overview needs a real signed-in session (not just
+        # X-Demo-Role, which carries no user_id to resolve a context from).
+        login = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/api/auth/login",
+            data=json.dumps({"username": "admin", "password": "demo"}).encode(),
+            method="POST", headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(login) as r:
+            cookie = r.headers.get("Set-Cookie", "").split(";", 1)[0]
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}", headers={"Cookie": cookie})
+        with urllib.request.urlopen(req) as r:
+            return r.status, json.loads(r.read() or b"{}")
+
     def _get_h(self, path, role=None, cookie=None):
         url = f"http://127.0.0.1:{self.port}{path}"
         req = urllib.request.Request(url, method="GET")
@@ -94,7 +108,7 @@ class ServerAuthzTest(unittest.TestCase):
         self.assertEqual(status, 403)
         self.assertEqual(body["error"]["code"], "forbidden")
         # And it must not have created the league.
-        _, ov = self._get("/api/demo/overview")
+        _, ov = self._get_signed_in("/api/demo/overview")
         self.assertNotIn("Sneaky", [l["name"] for l in ov["leagues"]])
 
     # -- delivery-queue overview is operator-only (#58) --------------------

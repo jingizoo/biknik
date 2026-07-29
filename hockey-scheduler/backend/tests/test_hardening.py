@@ -127,8 +127,19 @@ class HardeningHttpTest(unittest.TestCase):
     def _admin(self):
         return {"X-Demo-Role": "league_admin", "Content-Type": "application/json"}
 
+    def _session_cookie(self, username="admin"):
+        # #367: /api/demo/overview now needs a real signed-in session (not
+        # just X-Demo-Role, which carries no user_id to resolve a persisted
+        # context from) — log in for real and forward the cookie.
+        _, headers, _ = self._req(
+            "POST", "/api/auth/login", {"username": username, "password": "demo"},
+            {"Content-Type": "application/json"})
+        cookie = headers.get("Set-Cookie", "").split(";", 1)[0]
+        return {"Cookie": cookie}
+
     def _leagues(self):
-        _, _, body = self._req("GET", "/api/demo/overview", None)
+        _, _, body = self._req("GET", "/api/demo/overview", None,
+                               self._session_cookie())
         return json.loads(body)["leagues"]
 
     def test_demo_load_and_clear_roundtrip(self):

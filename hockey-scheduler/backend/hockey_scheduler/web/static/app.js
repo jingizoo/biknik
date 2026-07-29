@@ -2946,6 +2946,23 @@ function updateRolloverCommitState(c) {
 // audit explicitly demotes. That table is a checklist, not a design decision
 // taken here: one `.act.primary` per screen, everything else secondary or
 // tertiary.
+// #367: the selected League's own Teams, when one is active -- mirrors
+// get_setup_progress's server-side narrowing of its "Permanent teams"/
+// "Clubs, players and staff" workflows for the SAME two axes here.
+// get_setup_overview_v2 (`sv`) is deliberately Program-wide for every
+// authorized Program (a structural/management read, never League-narrowed
+// server-side -- see that method's own docstring), so this is a client-side
+// filter using the additive `sv.teams[].league_id` field (Team.league_id,
+// the real competition-League id) -- the same client-side-filter idiom the
+// division drawer already uses against `leagues[].season_ids`. "No League"
+// selected (`league_id` falsy) keeps the full Program-wide set.
+function leagueScopedTeams(sv) {
+  const lid = contextOptions && contextOptions.selected
+    && contextOptions.selected.league_id;
+  const teams = sv.teams || [];
+  return lid ? teams.filter((t) => t.league_id === lid) : teams;
+}
+
 const SETUP_WORKFLOWS = [
   { key: "league_season", title: "League profile and seasons", icon: "🗓️",
     purpose: "The program's identity, and the seasons that give it schedulable time.",
@@ -2962,7 +2979,7 @@ const SETUP_WORKFLOWS = [
     primary: { label: "Add Team", go: "teams" },
     secondary: [{ label: "Clubs", act: "club" }],
     summary: (sv) => [
-      { label: "Teams", n: (sv.teams || []).length },
+      { label: "Teams", n: leagueScopedTeams(sv).length },
       { label: "Clubs", n: (sv.clubs || []).length }] },
   { key: "participation", title: "Season participation and divisions", icon: "🏅",
     purpose: "Which teams play in which league-season, and the divisions that split them.",
@@ -2976,9 +2993,18 @@ const SETUP_WORKFLOWS = [
     perm: "manage_setup",
     primary: { label: "Add Player", go: "roster" },
     secondary: [{ label: "Officials", act: "official" }],
-    summary: (sv) => [
-      { label: "Players", n: (playersList || []).length },
-      { label: "Officials", n: (sv.officials || []).length }] },
+    summary: (sv) => {
+      const lid = contextOptions && contextOptions.selected
+        && contextOptions.selected.league_id;
+      let players = playersList || [];
+      if (lid) {
+        const teamIds = new Set(leagueScopedTeams(sv).map((t) => t.id));
+        players = players.filter((p) => teamIds.has(p.team_id));
+      }
+      return [
+        { label: "Players", n: players.length },
+        { label: "Officials", n: (sv.officials || []).length }];
+    } },
   { key: "facilities", title: "Venues, rinks and ice", icon: "🏟️",
     purpose: "Where games can be played, and the recurring ice that makes them schedulable.",
     perm: "manage_arena",
@@ -6389,10 +6415,21 @@ async function render() {
   // error or restricted state still announces the destination the user chose
   // rather than the previous view's title.
   setPageTitle(view);
+  // #367: snapshotted before any fetch below, so a context switch that lands
+  // WHILE this render() is still awaiting its now-context-scoped reads
+  // (/api/demo/overview, /api/v2/setup/overview, /api/standings/*) can be
+  // detected -- same idiom as importState/iceBuilder's own contextRevision
+  // checks. setActiveContext()/sendContextSwitch() guarantee a fresh render()
+  // always follows a switch (success or failure path), so bailing out here
+  // is safe: the newer render() already in flight (or about to fire) repaints
+  // correctly: this stale one just leaves the loading skeleton up briefly
+  // rather than flashing another Program/Season/League's data.
+  const myRenderContext = contextRevision;
   let ov, sv, hv, board, lineups, standings, inbox, playerHome;
   try {
     c.innerHTML = `<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>`;
     ov = await getJSON("/api/demo/overview");
+    if (contextRevision !== myRenderContext) return;  // #367: superseded, a fresh render() is already coming
     if (ov && ov.error) throw new Error(ov.error.message);
     // Default the working game to the first one this user can actually open —
     // for a coach that's their own team's game, not an arbitrary game[0] that
@@ -6474,6 +6511,7 @@ async function render() {
     // used to crash for them, since it was fetched only under manage_setup).
     if (view === "setup" && (hasPerm("manage_setup") || hasPerm("manage_arena"))) {
       const svr = await getJSON("/api/v2/setup/overview");
+      if (contextRevision !== myRenderContext) return;  // #367: superseded, a fresh render() is already coming
       if (svr && !svr.error) sv = svr;
     }
     // The Competition tree, Setup Player card, and season participation are
@@ -6701,10 +6739,12 @@ async function render() {
       }
       standings = standingsDivision
         ? await getJSON(`/api/standings/${standingsDivision}`) : null;
+      if (contextRevision !== myRenderContext) return;  // #367: superseded, a fresh render() is already coming
     }
     // The Dashboard shows a standings snapshot for the first division.
     if (view === "dashboard" && ov.divisions[0]) {
       standings = await getJSON(`/api/standings/${ov.divisions[0].id}`);
+      if (contextRevision !== myRenderContext) return;  // #367: superseded, a fresh render() is already coming
     }
     // Home/Tasks hub setup-progress card (#330) — only for a role that can
     // act on Setup (League Admin/Arena Manager); a Coach also lands on

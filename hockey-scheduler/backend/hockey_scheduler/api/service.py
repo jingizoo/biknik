@@ -68,6 +68,7 @@ from ..services.league_scope import (
     require_slots_belong_to_locked_season,
     team_registration_valid,
 )
+from ..services.context_scope import authorized_program_ids
 from ..services.notifier import push as _push_notification
 from ..store import InMemoryStore
 from .v1_setup_adapter import program_to_v1, season_to_v1, team_to_v1
@@ -422,8 +423,24 @@ class ApiService:
         fully visible and reachable the whole time, per #330. Recorded as
         decision 9 in ``docs/product/operator-ux-requirements.md``'s
         "Product decisions and sign-off" section.
+
+        #367: also resolves the persisted League (the third #345 context
+        axis, previously ignored here). A selected League narrows
+        "Permanent teams", "Clubs, players and staff", and "Season
+        participation and divisions" to that League's own Teams/LeagueSeason
+        (``Team.league_id`` is the real, permanent competition-League field
+        (#283) -- unrelated to this file's OWN legacy ``league_id``-means-
+        Program naming elsewhere, e.g. ``get_demo_overview``'s team rows).
+        "League profile and seasons" (a Program-wide integrity check: does
+        EVERY Season have a League) and "Venues, rinks and ice" (physical
+        facility resources with no competition-League axis by design, see
+        ``SeasonVenueAccess``) are unaffected by League selection -- narrowing
+        either would not correspond to anything real in the domain model.
+        Explicit "No League" keeps the full Program/Season-wide view,
+        byte-identical to pre-#367 behavior.
         """
-        program, season = self.context.resolve(user_id, role, scope)
+        program, season, league = self.context.resolve_with_league(
+            user_id, role, scope)
         if program is None:
             return {"program_id": None, "program": None, "workflows": [],
                     "next": None, "next_blocked": None, "complete": False}
@@ -435,25 +452,43 @@ class ApiService:
                                   if ls.season_id in season_ids]
         teams = self.store.teams_for_program(program.id)
         team_ids = {t.id for t in teams}
+        # #367: "Permanent teams" and "Clubs, players and staff" narrow to the
+        # selected League's own Teams once one is active -- league-less teams
+        # never included in this narrowed set (unlike the eligibility check
+        # below, which deliberately still counts them). "No League" selected
+        # keeps the full Program-wide set, identical to pre-#367 behavior.
+        league_teams = (
+            [t for t in teams if t.league_id == league.id] if league
+            else teams)
+        league_team_ids = {t.id for t in league_teams}
         # Participation and facilities are inherently per-Season concepts —
         # narrowed to the RESOLVED active Season's own LeagueSeasons/venue
         # access below, never every Season the Program has, so an older
         # Season's registrations or granted ice can't mask required work in
         # a newly-selected Season (#330 review round 1 finding 2). No Season
         # resolved (a Program-only context) means neither can be done yet.
-        season_ls_ids = ({ls.id for ls in program_league_seasons
-                          if ls.season_id == season.id} if season else set())
-        # The resolved Season's own League ids (via its LeagueSeasons) --
-        # used below by _workflow_prerequisite_gap to check whether ANY
-        # Program Team is even eligible to register here (#331 review round
-        # 5 finding 2): a Team with a permanent League can only ever
-        # register into a LeagueSeason of that same League
-        # (register_team_for_season rule 7, team_league_mismatch), so if no
-        # Team's permanent League appears here (and none is league-less),
-        # every possible registration attempt in this Season is a
-        # guaranteed rejection.
-        season_league_ids = ({ls.league_id for ls in program_league_seasons
-                              if ls.season_id == season.id} if season else set())
+        # #367: a selected League further narrows the candidate LeagueSeason
+        # set to that League's own binding for the resolved Season -- "No
+        # League" considers every League's binding, identical to pre-#367
+        # behavior.
+        season_league_seasons = (
+            [ls for ls in program_league_seasons if ls.season_id == season.id]
+            if season else [])
+        if league:
+            season_league_seasons = [
+                ls for ls in season_league_seasons
+                if ls.league_id == league.id]
+        season_ls_ids = {ls.id for ls in season_league_seasons}
+        # The resolved Season's (and, when selected, League's) own League ids
+        # (via its LeagueSeasons) -- used below by
+        # _workflow_prerequisite_gap to check whether ANY Program Team is
+        # even eligible to register here (#331 review round 5 finding 2): a
+        # Team with a permanent League can only ever register into a
+        # LeagueSeason of that same League (register_team_for_season rule 7,
+        # team_league_mismatch), so if no Team's permanent League appears
+        # here (and none is league-less), every possible registration
+        # attempt in this Season is a guaranteed rejection.
+        season_league_ids = {ls.league_id for ls in season_league_seasons}
 
         workflows = []
 
@@ -490,8 +525,11 @@ class ApiService:
             "Add Season")
 
         # 2. Permanent teams — Program-level, no Season dimension at all.
-        add("teams", "Permanent teams", bool(teams),
-            f"{len(teams)} team(s)" if teams else "No team added yet.",
+        # #367: narrowed to the selected League's own Teams when one is
+        # active (league_teams); "No League" keeps the full Program set.
+        add("teams", "Permanent teams", bool(league_teams),
+            f"{len(league_teams)} team(s)" if league_teams
+            else "No team added yet.",
             "Add Team")
 
         # 3. Season participation/divisions: at least one active
@@ -572,8 +610,11 @@ class ApiService:
         # 4. Clubs, players and staff: at least one player on one of this
         # Program's teams. Program-level like Teams — a Player belongs to a
         # Team, never a Season directly.
+        # #367: narrowed to the selected League's own Teams (league_team_ids)
+        # when one is active, matching "Permanent teams" above; "No League"
+        # keeps the full Program set.
         program_players = [p for p in self.store.all_players()
-                           if p.team_id in team_ids]
+                           if p.team_id in league_team_ids]
         add("roster", "Clubs, players and staff", bool(program_players),
             (f"{len(program_players)} player(s)" if program_players
              else "No player added yet."),
@@ -2888,14 +2929,44 @@ class ApiService:
         r = self.store.result_for_game(game_id)
         return _serialize(r) if r is not None else {"game_id": game_id, "status": None}
 
+    def _division_program_id(self, division_id):
+        """The Program a Division belongs to, via its LeagueSeason's Season
+        (#367) — ``None`` if the Division, its LeagueSeason, or Season is
+        missing/dangling."""
+        division = self.store.get_division(division_id)
+        if division is None or not division.league_season_id:
+            return None
+        league_season = self.store.get_league_season(division.league_season_id)
+        if league_season is None:
+            return None
+        season = self.store.get_season(league_season.season_id)
+        return season.program_id if season else None
+
     @catch
-    def get_standings(self, division_id: str) -> dict:
+    def get_standings(self, division_id: str, user_id=None, role=None,
+                      scope=None) -> dict:
         """Standings for a division from FINAL results only (#31).
 
         Points: win = 2, tie = 1, loss = 0. Ranked by points, then goal
         difference, then goals for, then name. Counts every division game
         (operator view); the public variant is filtered to published games.
+
+        #367: when a real user context is supplied (``role`` is not
+        ``None`` — the HTTP route always supplies one now), the Division's
+        Program must be in the caller's authorized set or this returns the
+        same empty shape a nonexistent ``division_id`` already does —
+        generic and non-oracle, so a Division from an inaccessible Program
+        looks identical to one that doesn't exist at all. Called with no
+        arguments beyond ``division_id`` (the default), performs no
+        ownership check — unchanged pre-#367 behavior for existing direct/
+        internal callers.
         """
+        if role is not None:
+            program_id = self._division_program_id(division_id)
+            if (program_id is None
+                    or program_id not in authorized_program_ids(
+                        self.store, role, scope, user_id)):
+                return {"division_id": division_id, "standings": []}
         return self._standings_for_division(division_id, public_only=False)
 
     def _league_season_mismatch_error(self, game, expected_ls_id) -> dict:
@@ -4008,22 +4079,98 @@ class ApiService:
             return False
         return True
 
-    def get_demo_overview(self) -> dict:
+    def get_demo_overview(self, user_id=None, role=None, scope=None) -> dict:
         """Assemble the League/Arena/Schedule/Public view for the E2E demo.
 
         The ``public`` section deliberately contains NO player names or any
         personal data — only fixture information that is safe to show fans.
+
+        #367: when a real user context is supplied (``role`` is not
+        ``None`` — the HTTP route at ``/api/demo/overview`` always supplies
+        one now), every collection with a real Program/Season/League join is
+        scoped to the resolved active context: mandatory Program, further
+        narrowed to the selected Season (else the union of every Season the
+        Program has — the broader "no Season chosen" view) and to the
+        selected League (else every League's data — the "No League" broader
+        view, matching the #364 ruling's own semantics). Venues/Rinks/Ice
+        slots have no competition-League axis at all (physical facility
+        resources are deliberately independent of competition structure —
+        see ``SeasonVenueAccess``) and are scoped by Program+Season only,
+        mirroring ``get_setup_progress``'s own "facilities" workflow.
+        Clubs/Organizations/Officials have no Program linkage in the domain
+        model at all and stay unfiltered regardless. Called with no
+        arguments (``role`` left ``None``, the default), returns the full,
+        unfiltered installation view exactly as before #367 — this is what
+        every existing internal caller that inspects whole-store state
+        (tests exercising other subsystems) keeps using unchanged; only the
+        HTTP route's own per-user Dashboard read opts into scoping.
         """
-        divisions = {d.id: d for d in self.store.all_divisions()}
-        levels = {lv.id: lv for lv in self.store.all_leagues()}
+        program = season = league = None
+        in_scope_season_ids = None  # None == no Program scoping active (legacy)
+        if role is not None:
+            program, season, league = self.context.resolve_with_league(
+                user_id, role, scope)
+            if program is None:
+                return {
+                    "league": None, "leagues": [], "seasons": [], "levels": [],
+                    "divisions": [], "clubs": [], "teams": [],
+                    "organizations": [], "venues": [], "rinks": [],
+                    "ice_slots": [], "officials": [], "schedule": [],
+                    "public_fixtures": [], "registrations": [],
+                    "setup_audit": [], "setup_audit_count": 0,
+                }
+            in_scope_season_ids = (
+                {season.id} if season else
+                {s.id for s in self.store.seasons_for_program(program.id)})
+
+        all_ls = self.store.all_league_seasons()
+        # #367: the League(+Season)-scoped LeagueSeason ids, when Program
+        # scoping is active — narrows Divisions/registrations/games below to
+        # the resolved context. `None` (scoping inactive) keeps every
+        # LeagueSeason, identical to pre-#367 behavior.
+        in_scope_ls_ids = None
+        if in_scope_season_ids is not None:
+            in_scope_ls_ids = {
+                ls.id for ls in all_ls
+                if ls.season_id in in_scope_season_ids
+                and (league is None or ls.league_id == league.id)}
+
+        all_divisions = self.store.all_divisions()
+        if in_scope_ls_ids is not None:
+            all_divisions = [d for d in all_divisions
+                             if d.league_season_id in in_scope_ls_ids]
+        divisions = {d.id: d for d in all_divisions}
+        all_levels = self.store.all_leagues()
+        if program is not None:
+            all_levels = [lv for lv in all_levels if lv.program_id == program.id]
+        levels = {lv.id: lv for lv in all_levels}
         # Division/registration Season + League resolve via LeagueSeason (#283).
-        ls_by_id = {ls.id: ls for ls in self.store.all_league_seasons()}
+        ls_by_id = {ls.id: ls for ls in all_ls}
         clubs = {c.id: c for c in self.store.all_clubs()}
-        teams = {t.id: t for t in self.store.all_teams()}
+        all_teams = self.store.all_teams()
+        if program is not None:
+            all_teams = [
+                t for t in all_teams if t.program_id == program.id
+                and (league is None or t.league_id == league.id)]
+        teams = {t.id: t for t in all_teams}
         orgs = {o.id: o for o in self.store.all_organizations()}
         leagues_by_id = {lg.id: lg for lg in self.store.all_programs()}
-        venues = {v.id: v for v in self.store.all_venues()}
-        rinks = {r.id: r for r in self.store.all_rinks()}
+        # #367: Venues/Rinks/Ice slots have no competition-League axis at all
+        # — scoped by Program+Season only, via active SeasonVenueAccess to
+        # an in-scope Season, never by League (no such join exists).
+        in_scope_venue_ids = None
+        if in_scope_season_ids is not None:
+            in_scope_venue_ids = {
+                a.venue_id for a in self.store.all_season_venue_access()
+                if a.active and a.season_id in in_scope_season_ids}
+        all_venues = self.store.all_venues()
+        if in_scope_venue_ids is not None:
+            all_venues = [v for v in all_venues if v.id in in_scope_venue_ids]
+        venues = {v.id: v for v in all_venues}
+        all_rinks = self.store.all_rinks()
+        if in_scope_venue_ids is not None:
+            all_rinks = [r for r in all_rinks if r.venue_id in in_scope_venue_ids]
+        rinks = {r.id: r for r in all_rinks}
 
         def is_junior(div):
             if div is None:
@@ -4074,19 +4221,35 @@ class ApiService:
             for v in venues.values()
         ]
 
+        # #367: a Game's own `season_id`/`league_id` (real, permanent fields
+        # — #233 Slice C1b, unrelated to any legacy naming elsewhere) are the
+        # direct scoping join. A league-less game (an exhibition, which may
+        # cross League lines by design) still shows regardless of the
+        # selected League, matching how a league-less Team is treated as
+        # universally eligible elsewhere in this file.
+        def _in_scope_game(g):
+            if in_scope_season_ids is None:
+                return True
+            if g.season_id not in in_scope_season_ids:
+                return False
+            return (league is None or g.league_id is None
+                    or g.league_id == league.id)
+
         # Draft games (#86) are proposals under review — they must never surface
         # in the operator slot grid / schedule / calendar until published, so
         # they are excluded from the LABELS here. The dedicated draft-review
         # view lists them.
         game_by_slot = {g.ice_slot_id: g for g in self.store.all_games()
-                        if g.ice_slot_id and not g.is_draft}
+                        if g.ice_slot_id and not g.is_draft
+                        and _in_scope_game(g)}
         # Reserved ice, however, is PHYSICAL (#277 Slice B review): an active
         # committed draft blocks warm-up/resurfacing facility time exactly
         # like a published game — the placement gate counts it — so the
         # reserved derivation looks at EVERY active occupant while the grid
         # label above stays published-only.
         occupant_by_slot = {g.ice_slot_id: g for g in self.store.all_games()
-                            if g.ice_slot_id and not g.cancelled}
+                            if g.ice_slot_id and not g.cancelled
+                            and _in_scope_game(g)}
         slot_rows = []
         # #277 Slice B — reserved-vs-playable visibility: a slot's stored span
         # is PLAYABLE time; the derived reserved facility span around a
@@ -4095,8 +4258,10 @@ class ApiService:
         # the operator surfaces cannot disagree.
         _policy_cache = {}
 
-        for s in sorted(self.store.all_ice_slots(),
-                        key=lambda x: (x.rink_id, x.start_time)):
+        all_slots = self.store.all_ice_slots()
+        if in_scope_venue_ids is not None:
+            all_slots = [s for s in all_slots if s.rink_id in rinks]
+        for s in sorted(all_slots, key=lambda x: (x.rink_id, x.start_time)):
             g = game_by_slot.get(s.id)
             slot_rows.append({
                 "id": s.id, "rink_id": s.rink_id,
@@ -4115,6 +4280,8 @@ class ApiService:
         for g in self.store.all_games():
             if g.is_draft:
                 continue  # unpublished draft — kept out of normal views (#86)
+            if not _in_scope_game(g):
+                continue
             div = divisions.get(g.division_id)
             rstatus = self.roster.compute_roster_status(g.id)
             venue_name = None
@@ -4160,19 +4327,49 @@ class ApiService:
                     "is_junior": is_junior(div),
                 })
 
-        leagues = [program_to_v1(_serialize(x)) for x in self.store.all_programs()]
-        seasons = [season_to_v1(_serialize(x)) for x in self.store.all_seasons()]
-        # `/api/demo/overview` is unauthenticated (do_GET in web/server.py
-        # serves it with no session/permission check) — actor_id/detail must
-        # NOT be exposed for every setup-audit action, only for import
-        # batches (#102's Activity drill-down needs them there). Other
-        # actions' detail dicts can carry things this endpoint has no
-        # business handing to an anonymous caller (e.g. user_account_created
-        # stores {"username", "role"}). Scope the extra fields to exactly
-        # the import-batch summary row and its linked per-row children.
+        # #367: the "leagues"/"league" (legacy-vocabulary Program list) and
+        # "seasons" lists scope to the resolved Program when active — this
+        # is the per-user Dashboard's own single-Program view, not a
+        # cross-Program picker. `None` scoping (role not supplied) keeps
+        # every Program/Season, identical to pre-#367 behavior.
+        all_programs = self.store.all_programs()
+        if program is not None:
+            all_programs = [p for p in all_programs if p.id == program.id]
+        leagues = [program_to_v1(_serialize(x)) for x in all_programs]
+        all_seasons = self.store.all_seasons()
+        if in_scope_season_ids is not None:
+            all_seasons = [s for s in all_seasons if s.id in in_scope_season_ids]
+        seasons = [season_to_v1(_serialize(x)) for x in all_seasons]
+        # `/api/demo/overview` requires a signed-in session as of #367, but
+        # this per-row redaction predates that and is kept as defense in
+        # depth: actor_id/detail must NOT be exposed for every setup-audit
+        # action, only for import batches (#102's Activity drill-down needs
+        # them there). Other actions' detail dicts can carry things no
+        # caller of this endpoint needs (e.g. user_account_created stores
+        # {"username", "role"}). Scope the extra fields to exactly the
+        # import-batch summary row and its linked per-row children.
         def _is_import_related(a):
             return a.entity_type == "import_batch" or (a.detail or {}).get(
                 "import_batch_id") is not None
+        registration_rows = [
+            {"team_id": r.team_id,
+             "season_id": self._season_id_via(ls_by_id, r.league_season_id),
+             "division_id": r.division_id,
+             "league_id": self._league_id_via(ls_by_id, r.league_season_id)}
+            for r in self.store.all_season_team_registrations()
+            if r.active and self._registration_is_operational(r)
+            and (in_scope_ls_ids is None or r.league_season_id in in_scope_ls_ids)
+        ]
+        # #367: the audit log is deliberately left UNFILTERED regardless of
+        # Program scoping — it spans many entity types (games, imports,
+        # calendar feeds, notifications, account changes...) with no single
+        # reliable Program join, and #367's own requirement list does not
+        # name the activity log as one of the surfaces to scope. A "best-
+        # effort" id-membership filter was tried and rejected: it silently
+        # dropped legitimate same-Program activity (e.g. calendar-feed-token
+        # audit rows, which key off an actor id, not any collection scoped
+        # above) — an incomplete filter that HIDES real activity is worse
+        # than an unfiltered list here, so this stays exactly as before.
         setup_audit = []
         for a in self.store.all_setup_audit():
             entry = {"action": a.action, "entity_type": a.entity_type,
@@ -4212,20 +4409,13 @@ class ApiService:
             # picker. `league_id` is the competition (grouping) League the
             # wizard's League picker needs — required on the registration since
             # #233 Slice C2, so always present for an operational row.
-            "registrations": [
-                {"team_id": r.team_id,
-                 "season_id": self._season_id_via(ls_by_id, r.league_season_id),
-                 "division_id": r.division_id,
-                 "league_id": self._league_id_via(ls_by_id, r.league_season_id)}
-                for r in self.store.all_season_team_registrations()
-                if r.active and self._registration_is_operational(r)
-            ],
+            "registrations": registration_rows,
             "setup_audit": setup_audit,
             "setup_audit_count": len(setup_audit),
         }
 
     @catch
-    def get_setup_overview_v2(self) -> dict:
+    def get_setup_overview_v2(self, user_id=None, role=None, scope=None) -> dict:
         """Canonical flat setup-entity lists for the Setup/Records UI (#233 B2a).
 
         The v1 ``get_demo_overview`` stays the (legacy-shaped) source for the
@@ -4238,14 +4428,85 @@ class ApiService:
         E), not part of this structural read. It exposes only structural
         records plus resolved parent names — no rosters, schedule, games or
         PII — so it is gated like the hierarchy read.
+
+        #367: when a real user context is supplied (``role`` is not
+        ``None``), every collection with a real Program join scopes to the
+        caller's full AUTHORIZED set of Programs (``context_scope.
+        authorized_program_ids`` — the same ceiling ``ContextService``
+        itself enforces, not the single currently-ACTIVE Program): this is a
+        structural/management surface (create Programs/Seasons/Leagues/
+        Divisions/Teams/Venues/Rinks), so an operator who just created a new
+        Program, or who manages several, must still see all of them here —
+        narrowing to only the one Program presently active for progress-
+        tracking would hide the very things this surface exists to manage.
+        Both roles that can reach this endpoint (League Admin, Arena
+        Manager) are today's "global" roles (see ``context_scope.
+        _GLOBAL_ROLES``), so this closes the ACTUAL gap (zero scoping at
+        all, any Program in the installation) without changing what either
+        role can see today; it also future-proofs the endpoint for a
+        narrower operator role, exactly as ``context_scope.py``'s own
+        docstring anticipates. Never narrowed further by Season or League:
+        divisions/teams/leagues/seasons show the FULL structure of every
+        authorized Program. Venues/Rinks/Ice slots stay unfiltered (like
+        Clubs/Organizations/Officials below) — the canonical Venue is
+        Organization-owned, not Program-owned, and a just-created Venue has
+        no SeasonVenueAccess grant yet; scoping them by access would hide
+        the very record this page exists to create. Clubs/Organizations/
+        Officials have no Program linkage in the domain model at all and
+        stay unfiltered. Called with no arguments (``role`` left ``None``,
+        the default), returns the full, unfiltered installation view
+        exactly as before #367. Additive DTO change regardless of scoping:
+        ``teams`` rows now also carry the real competition ``league_id``
+        (``Team.league_id``, #283) alongside ``program_id`` — previously
+        omitted, the one clearly-missing parent-id-chain field a
+        League-aware consumer needs to filter client-side.
         """
+        program_ids = None
+        if role is not None:
+            program_ids = set(
+                authorized_program_ids(self.store, role, scope, user_id))
+            if not program_ids:
+                return {
+                    "programs": [], "seasons": [], "leagues": [],
+                    "divisions": [], "teams": [], "clubs": [],
+                    "organizations": [], "officials": [], "venues": [],
+                    "rinks": [], "ice_slots": [],
+                }
+
         programs = self.store.all_programs()
+        if program_ids is not None:
+            programs = [p for p in programs if p.id in program_ids]
         seasons = self.store.all_seasons()
+        if program_ids is not None:
+            seasons = [s for s in seasons if s.program_id in program_ids]
+        in_scope_season_ids = (
+            {s.id for s in seasons} if program_ids is not None else None)
         leagues = self.store.all_leagues()      # grouping League (was Level)
+        if program_ids is not None:
+            leagues = [lg for lg in leagues if lg.program_id in program_ids]
+        ls_by_id = {ls.id: ls for ls in self.store.all_league_seasons()}
+        in_scope_ls_ids = None
+        if in_scope_season_ids is not None:
+            in_scope_ls_ids = {
+                ls.id for ls in ls_by_id.values()
+                if ls.season_id in in_scope_season_ids}
         divisions = self.store.all_divisions()
+        if in_scope_ls_ids is not None:
+            divisions = [d for d in divisions
+                        if d.league_season_id in in_scope_ls_ids]
         teams = self.store.all_teams()
+        if program_ids is not None:
+            teams = [t for t in teams if t.program_id in program_ids]
         clubs = self.store.all_clubs()
         orgs = self.store.all_organizations()
+        # #367: Venues (Organization-owned, not Program-owned — see this
+        # method's own docstring) stay unfiltered here, same as Clubs/
+        # Organizations/Officials. A SeasonVenueAccess-based scope (matching
+        # get_demo_overview's Dashboard/facilities-workflow narrowing) was
+        # tried and rejected for THIS surface: a just-created Venue with no
+        # access grant yet would be invisible on the very Setup Records page
+        # an operator uses to create and manage it. Rinks/Ice slots follow
+        # Venues (unfiltered).
         venues = self.store.all_venues()
         rinks = self.store.all_rinks()
 
@@ -4261,8 +4522,11 @@ class ApiService:
         # fine for that single display field, but ``seasons_by_league`` (#345)
         # additionally carries EVERY binding, because a consumer that needs to
         # know whether a League participates in a SPECIFIC Season (not just
-        # "a" Season) cannot answer that from the lossy singular field).
-        ls_by_id = {ls.id: ls for ls in self.store.all_league_seasons()}
+        # "a" Season) cannot answer that from the lossy singular field). Built
+        # from every LeagueSeason (not the Program-narrowed set above) — an
+        # in-scope League's own bindings are already guaranteed in-Program by
+        # the League/Season/Program invariant, so no extra narrowing changes
+        # the result here.
         season_by_league = {}
         seasons_by_league = {}
         for ls in ls_by_id.values():
@@ -4310,7 +4574,7 @@ class ApiService:
             "divisions": [_division_row_v2(d) for d in divisions],
             "teams": [
                 {"id": t.id, "name": t.name, "club_id": t.club_id,
-                 "program_id": t.program_id,
+                 "program_id": t.program_id, "league_id": t.league_id,
                  "club_name": (clubs_by_id[t.club_id].name
                                if t.club_id in clubs_by_id else None)}
                 for t in teams],
