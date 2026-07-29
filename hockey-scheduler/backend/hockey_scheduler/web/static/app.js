@@ -9178,6 +9178,18 @@ function invalidateContextScopedMutations() {
 // trivially equivalent to "last intent wins" -- there is no window left
 // for the two to disagree, on any backend.
 let contextSwitchInFlight = false;
+// #369: "the URL currently advertises an intent the server has NOT yet
+// confirmed", tracked INDEPENDENTLY of the network-in-flight flag. The two are
+// not the same window and conflating them left a hole: contextSwitchInFlight
+// clears the instant the POST resolves, but on the FAILURE path the rejected
+// intent stays in the hash across the awaited loadContextOptions()
+// reconciliation. An identity change in that window saw the flag already
+// false, left the hash alone, and the next identity's restoreContextDeepLink()
+// adopted the previous identity's REJECTED choice -- persisting it silently
+// whenever the new identity happened to be authorized for it. This flag stays
+// set from the moment intent is published until a syncContextHash() has
+// reconciled the URL with canonical truth, on EVERY success and failure path.
+let contextHashIntentPending = false;
 let contextSwitchQueued = null;  // {programId, seasonId, leagueId, mySeq} -- the one pending switch not yet sent, if any
 
 // Persist a switcher pick, then reflect it in the hash and re-render.
@@ -9211,6 +9223,7 @@ async function sendContextSwitch(mySeq, programId, seasonId, leagueId) {
   // #369: publish the intent to the hash BEFORE the server can act on it, so
   // the hash never lags an already-mutated server. See writeContextHash().
   writeContextHash(encodeContextHash(programId, seasonId || null, leagueId || null));
+  contextHashIntentPending = true;
   const r = await post("/api/context",
     { program_id: programId, season_id: seasonId || null, league_id: leagueId || null });
   contextSwitchInFlight = false;
@@ -9253,6 +9266,7 @@ async function sendContextSwitch(mySeq, programId, seasonId, leagueId) {
     // restoreContextDeepLink(), treats the stale hash as an intentional
     // deep link, and silently POSTs the persisted context back to it.
     syncContextHash();
+    contextHashIntentPending = false;
     render();
     return;
   }
@@ -9283,6 +9297,7 @@ async function sendContextSwitch(mySeq, programId, seasonId, leagueId) {
   await loadContextOptions();
   if (mySeq !== contextSwitchSeq) return;  // superseded during the refetch
   syncContextHash();
+  contextHashIntentPending = false;
   toast = "";
   render();
 }
@@ -9667,12 +9682,26 @@ function resetTransientUiState() {
   // contextOptions.selected is still the last SERVER-CONFIRMED selection
   // (sendContextSwitch only overwrites it after its POST resolves), so
   // syncContextHash() here rewinds the hash to the context the server
-  // actually holds. Guarded on contextSwitchInFlight so this is a no-op on an
-  // ordinary identity transition: a COMPLETED switch's hash already equals
-  // contextOptions.selected, and inheriting a CONFIRMED context across a
-  // persona switch is the pre-existing, intended deep-link behavior -- only
-  // the unconfirmed phantom is withdrawn.
-  if (contextSwitchInFlight) syncContextHash();
+  // actually holds. It is a no-op on an ordinary identity transition: a
+  // reconciled switch's hash already equals contextOptions.selected, and
+  // inheriting a CONFIRMED context across a persona switch is the
+  // pre-existing, intended deep-link behavior -- only an unconfirmed phantom
+  // is withdrawn.
+  //
+  // Keyed on contextHashIntentPending, NOT contextSwitchInFlight. Those are
+  // different windows, and an earlier revision of this guard used the wrong
+  // one: contextSwitchInFlight clears the moment the POST resolves, but on
+  // the REJECTED path the hash still advertises the refused intent across the
+  // awaited loadContextOptions() reconciliation that follows. An identity
+  // change in that window found the flag already false, left the phantom in
+  // the URL, and handed the next identity a rejected choice to adopt --
+  // silently persisted if that identity happened to be authorized for it.
+  // The intent flag stays set until a syncContextHash() has actually
+  // reconciled, on every path, so no window is left uncovered.
+  if (contextHashIntentPending) {
+    syncContextHash();
+    contextHashIntentPending = false;
+  }
 }
 function setUser(user) {
   const prevId = currentUser ? currentUser.username : null;

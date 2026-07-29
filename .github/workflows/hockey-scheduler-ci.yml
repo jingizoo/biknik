@@ -179,6 +179,7 @@ jobs:
           node --check hockey-scheduler/e2e/records-delete.js
           node --check hockey-scheduler/e2e/coach-scope.js
           node --check hockey-scheduler/e2e/context-switcher.js
+          node --check hockey-scheduler/e2e/context-identity-withdrawal.js
           node --check hockey-scheduler/e2e/league-context-bar.js
           node --check hockey-scheduler/e2e/league-filtered-data.js
           node --check hockey-scheduler/e2e/setup-v2-context-scope.js
@@ -230,7 +231,7 @@ jobs:
           - shard: 1
             scripts: "smoke setup-claim onboarding-wizard hierarchy-import season-participation hierarchy-duplicate-registration season-rollover season-dates scheduling-policy breakpoint-boundaries shell-accessibility-coverage seven-area-navigation"
           - shard: 2
-            scripts: "team-division-participation scheduler-empty-state scheduler-already-scheduled allowed-venues venue-access-cleanup venue-sharing permanent-teams player-edit accessibility-foundations setup-workflow-hub setup-v2-context-scope"
+            scripts: "team-division-participation scheduler-empty-state scheduler-already-scheduled allowed-venues venue-access-cleanup venue-sharing permanent-teams player-edit accessibility-foundations setup-workflow-hub setup-v2-context-scope context-identity-withdrawal"
           - shard: 3
             scripts: "safe-destructive destructive-surfaces reset-visibility factory-reset demo-lifecycle api-error-resilience ice-availability-builder context-switcher league-context-bar league-filtered-data dashboard-season-ceiling role-home-journeys role-authorization-matrix"
           - shard: 4
