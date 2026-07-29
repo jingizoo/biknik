@@ -321,9 +321,12 @@ class DemoOverviewLeagueNarrowingTest(unittest.TestCase):
 
 class DemoOverviewFacilityScopeTest(unittest.TestCase):
     """Venues/Rinks/IceSlots have no competition-League axis at all -- they
-    scope by Program + active SeasonVenueAccess only. A Program-only context
-    (no Season selected) is the deliberately BROADER view: the union of ice
-    across every Season the Program has."""
+    scope by Program only, via active SeasonVenueAccess to ANY of the
+    Program's Seasons. Deliberately NEVER narrowed to a single resolved
+    Season (unlike every other collection get_demo_overview scopes): a real
+    CI regression proved a Program with several Seasons, only one of which
+    holds venue access, must still show that inventory even when a
+    different sibling Season is the one currently resolved."""
 
     def test_two_programs_each_see_only_their_own_facility_inventory(self):
         api = ApiService(InMemoryStore())
@@ -355,7 +358,17 @@ class DemoOverviewFacilityScopeTest(unittest.TestCase):
         self.assertEqual(_ids(view_b["rinks"]), {rb["id"]})
         self.assertEqual(_ids(view_b["ice_slots"]), {ib["id"]})
 
-    def test_program_only_context_shows_the_union_across_all_its_seasons(self):
+    def test_facility_inventory_is_program_wide_regardless_of_season_selection(self):
+        """#367 review correction: a real CI regression (an existing,
+        unrelated browser journey building a Program with two Seasons where
+        only ONE holds venue access) proved facility inventory must NOT
+        narrow to whichever single Season happens to be resolved for other
+        purposes — physical resources are a Program-wide operational
+        concern, exactly like get_setup_overview_v2's own treatment of the
+        same three collections. Program-only (no Season chosen) and a
+        specific Season selected must show the IDENTICAL union either way;
+        only switching to a DIFFERENT Program narrows anything (covered by
+        test_two_programs_each_see_only_their_own_facility_inventory)."""
         api = ApiService(InMemoryStore())
         program = api.create_program("Prog", "US", "UTC")
         s1 = api.create_season(program["id"], "Season 1")
@@ -372,19 +385,21 @@ class DemoOverviewFacilityScopeTest(unittest.TestCase):
                                  "2026-10-01T20:00:00+00:00")
         api.grant_season_venue_access(s2["id"], v2["id"])
 
-        # Program-only (no Season chosen): the broader UNION view.
+        # Program-only (no Season chosen): the union across both Seasons.
         api.set_active_context("u1", *ADMIN, program["id"], None)
         view = api.get_demo_overview("u1", *ADMIN)
         self.assertEqual(_ids(view["venues"]), {v1["id"], v2["id"]})
         self.assertEqual(_ids(view["rinks"]), {r1["id"], r2["id"]})
         self.assertEqual(_ids(view["ice_slots"]), {i1["id"], i2["id"]})
 
-        # Selecting Season 1 specifically narrows back down.
+        # Selecting Season 1 specifically must NOT narrow facility inventory
+        # -- Season 2's venue/rink/ice (granted to a DIFFERENT Season in the
+        # SAME Program) still shows, exactly like the Program-only view.
         api.set_active_context("u1", *ADMIN, program["id"], s1["id"])
-        narrowed = api.get_demo_overview("u1", *ADMIN)
-        self.assertEqual(_ids(narrowed["venues"]), {v1["id"]})
-        self.assertEqual(_ids(narrowed["rinks"]), {r1["id"]})
-        self.assertEqual(_ids(narrowed["ice_slots"]), {i1["id"]})
+        with_season = api.get_demo_overview("u1", *ADMIN)
+        self.assertEqual(_ids(with_season["venues"]), {v1["id"], v2["id"]})
+        self.assertEqual(_ids(with_season["rinks"]), {r1["id"], r2["id"]})
+        self.assertEqual(_ids(with_season["ice_slots"]), {i1["id"], i2["id"]})
 
 
 class DemoOverviewAuthGateTest(unittest.TestCase):
@@ -410,12 +425,21 @@ class DemoOverviewAuthGateTest(unittest.TestCase):
 
     def test_zero_authorized_programs_is_a_named_empty_state_not_an_error(self):
         api = ApiService(InMemoryStore())
-        _build_scheduled_program(api, "Prog")  # data exists...
+        _build_scheduled_program(api, "Prog")  # data exists, including a Club...
         # ...but this Coach's team_id resolves to nothing -- zero authorized
         # Programs, per context_scope.authorized_program_ids.
         coach = (Role.COACH, {"team_id": "team_does_not_exist"})
         result = api.get_demo_overview("u1", *coach)
-        self.assertEqual(result, _EMPTY_OVERVIEW, result)
+        # Every Program-dependent collection is empty...
+        program_dependent = dict(_EMPTY_OVERVIEW)
+        program_dependent.pop("clubs")
+        for key, expected in program_dependent.items():
+            self.assertEqual(result[key], expected, (key, result))
+        # ...but Clubs (#367 review correction: no Program dependency in the
+        # domain model at all, same as Organizations/Officials) still shows
+        # real data -- a role authorized for zero Programs must still be
+        # able to see/create this Program-independent reference data.
+        self.assertEqual([c["name"] for c in result["clubs"]], ["Prog Club"])
 
 
 class DemoOverviewNegativeContextStatesTest(unittest.TestCase):

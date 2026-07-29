@@ -152,9 +152,15 @@ class LeagueFilteredOverviewV2Test(unittest.TestCase):
         """A Coach whose ``team_id`` resolves to no Team at all (context_scope
         fails CLOSED — see ``authorized_program_ids``: ``own_team_id`` returns
         the dangling id, ``store.get_team`` returns ``None``, so the pid is
-        ``None`` and the authorized set is empty) gets every key back as an
-        empty list — never an error — even though real data exists in the
-        installation."""
+        ``None`` and the authorized set is empty) gets every PROGRAM-
+        DEPENDENT key back as an empty list — never an error — even though
+        real data exists in the installation. #367 review correction:
+        Clubs/Organizations/Officials/Venues/Rinks/IceSlots have no Program
+        dependency in the domain model at all (see point 5 below) and must
+        stay visible regardless — a role authorized for zero Programs still
+        needs to see/create this Program-independent reference data. Only
+        Clubs has real data from ``_build_stack`` here; the rest are empty
+        because none was created, not because they were filtered out."""
         api = self._api()
         self._build_stack(api, "A")  # real data exists; must still be hidden
 
@@ -162,8 +168,12 @@ class LeagueFilteredOverviewV2Test(unittest.TestCase):
         ov = api.get_setup_overview_v2("coach2", Role.COACH, scope)
         self.assertNotIn("error", ov, ov)
 
-        for key in _ALL_OVERVIEW_KEYS:
+        program_dependent = set(_ALL_OVERVIEW_KEYS) - {
+            "clubs", "organizations", "officials", "venues", "rinks",
+            "ice_slots"}
+        for key in program_dependent:
             self.assertEqual(ov[key], [], key)
+        self.assertEqual([c["name"] for c in ov["clubs"]], ["Club A"])
 
     # -- 5. Venues/Rinks/IceSlots/Clubs/Organizations/Officials stay global --
     def test_reference_data_stays_unfiltered_despite_program_narrowing(self):

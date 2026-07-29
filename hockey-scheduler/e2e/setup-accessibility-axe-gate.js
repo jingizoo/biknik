@@ -25,8 +25,12 @@
 //   11. Forced error: the public schedule's own fetch made to 502 via a
 //       real click that re-triggers it (segment switch), not a synthetic
 //       replay.
-//   12. Restricted early-return: an Official account with zero assignments
-//       lands there from one real "Roster" nav click.
+//   12. Restricted early-return: an Official account assigned to one game
+//       outside the auto-selected default lands there from one real "Roster"
+//       nav click (#367: an Official's authorized Programs come solely from
+//       their own assignments, so with zero assignments there is no longer
+//       any Program/schedule in view at all to even attempt -- see the fixture
+//       setup below for the full reasoning).
 //
 // A SURFACES registry (not ad-hoc calls) tracks which of these were
 // actually scanned -- a missing selector/route throws immediately rather
@@ -299,16 +303,46 @@ async function checkViewport(browser, viewport) {
     checkpointErrors("initial authenticated boot");
 
     // Real fixture data so the public schedule has real content, and a real
-    // unassigned Official for the Restricted surface.
+    // Official for the Restricted surface.
     await apiPost(page, "/api/demo/load", {});
-    const official = await apiPost(page, "/api/v2/setup/official", { name: "Axe Gate No-Assignment" });
+    const official = await apiPost(page, "/api/v2/setup/official", { name: "Axe Gate Restricted Official" });
+    // #367: get_demo_overview now scopes `schedule` (and everything else with a
+    // Program join) to the caller's own authorized Program(s), and an Official's
+    // authorized Programs are derived SOLELY from their own assignments
+    // (services/context_scope.py's `_official_program_seasons`). Pre-#367, this
+    // Official's own zero assignments didn't matter -- `ov.schedule` was every
+    // game ever created in the whole test run, so app.js's own "default the
+    // working game to schedule[0]" (render()'s `currentGame` selection) always
+    // landed on SOME other real game, and fetching ITS private lineups 403'd:
+    // that accidental cross-Program leak was standing in for the Restricted
+    // early-return. Now a truly zero-assignment Official has ZERO authorized
+    // Programs, so `ov.schedule` is correctly empty for them and `currentGame`
+    // is never set at all -- Roster lands on the generic "Select a game from
+    // the Games tab." empty state, never reaching the `.banner.neutral` 403 UI
+    // this surface exists to axe-scan. To keep exercising that real 403 path
+    // under correct scoping (not a stale global-leak substitute), assign this
+    // Official to the LAST game in the demo's own (now correctly single-
+    // Program) schedule: that's enough for one legitimate authorized Program
+    // (so `ov.schedule` is the demo Program's real, non-empty schedule again),
+    // while `currentGame` still defaults to `schedule[0]` -- a DIFFERENT game
+    // this Official is never assigned to -- so its lineups fetch still 403s.
+    const scheduleForRestricted = (await apiGet(page, "/api/demo/overview")).schedule || [];
+    if (!scheduleForRestricted.length) {
+      fail("could not seed the Restricted surface: /api/demo/overview returned no schedule after demo/load");
+    }
+    const restrictedAssignGameId = scheduleForRestricted[scheduleForRestricted.length - 1].game_id;
+    const restrictedAssign = await apiPost(page, `/api/games/${restrictedAssignGameId}/officials/assign`,
+      { official_id: official.id, role: "referee" });
+    if (restrictedAssign.error) {
+      fail(`could not assign the Official to a game for the Restricted surface: ${JSON.stringify(restrictedAssign)}`);
+    }
     const officialUsername = `axe_gate_official_${viewport.port}`;
     const officialAcct = await apiPost(page, "/api/accounts", {
       username: officialUsername, password: "scoped-account-pw",
       role: "official", scope: { official_id: official.id },
     });
     if (officialAcct.status && officialAcct.error) {
-      fail(`could not create the unassigned Official account: ${JSON.stringify(officialAcct)}`);
+      fail(`could not create the Official account: ${JSON.stringify(officialAcct)}`);
     }
 
     // ---- (3) Authenticated Home/Tasks (Dashboard) -------------------------
@@ -462,7 +496,7 @@ async function checkViewport(browser, viewport) {
       + `all ${scanned.size} surfaces: signed-out login, the anonymous `
       + `public schedule, authenticated Home/Tasks, the Setup hub, all six `
       + `Setup workflow landings, a forced public-schedule 502, and the `
-      + `Restricted early-return for an unassigned Official.`);
+      + `Restricted early-return for an Official outside a game's scope.`);
   } catch (e) {
     if (serverOutput.trim()) {
       console.error("--- demo server output ---\n" + serverOutput.trim());

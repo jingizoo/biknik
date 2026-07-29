@@ -165,8 +165,18 @@ async function checkViewport(browser, viewport) {
       const venue = await post("/api/setup/venue", { name: "Main Arena", league_id: league.id });
       await post(`/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
       const rink = await post("/api/setup/rink", { venue_id: venue.id, name: "Rink A" });
-      // A second venue with NO season access.
+      // A second venue with access granted to a DIFFERENT Season of the SAME
+      // Program, never to the ACTIVE `season` above, so it is still reported
+      // as access-missing for it below (#367: get_demo_overview's ov.rinks —
+      // what the builder's checkboxes render from — now scopes a Venue into
+      // the active Program's view via SeasonVenueAccess to ANY of the
+      // Program's Seasons, not just the active one; a venue with literally
+      // ZERO access anywhere in the Program is entirely out of scope and its
+      // rink's checkbox would never render at all, so a plain "no access"
+      // venue can no longer exercise this report through the real UI).
+      const otherSeason = await post("/api/setup/season", { league_id: league.id, name: "Spring 2027" });
       const venue2 = await post("/api/setup/venue", { name: "Annex", league_id: league.id });
+      await post(`/api/v2/setup/seasons/${otherSeason.id}/venue-access`, { venue_id: venue2.id });
       const rink2 = await post("/api/setup/rink", { venue_id: venue2.id, name: "Annex Ice" });
       // The legacy v1 "league" IS a v2 Program under the shim (server.py's
       // POST /api/setup/league routes straight to api.create_program(), and
@@ -567,11 +577,31 @@ async function checkViewport(browser, viewport) {
       const venue = await post("/api/setup/venue", { name: "DST Arena", league_id: league.id });
       await post(`/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
       const rink = await post("/api/setup/rink", { venue_id: venue.id, name: "DST Sheet" });
+      // #367: get_demo_overview's `seasons` (what #ib-season's <option>s
+      // render from) now scopes to the ACTIVE Program only, unlike before
+      // #367 where it was globally unfiltered and a brand-new, never-
+      // activated Program's own Season still showed up regardless of the
+      // active context. Actively switch to this fresh DST League/Season so
+      // it resolves in the builder below, mirroring the identical
+      // requirement the fixture setup above already documents.
+      await post("/api/context", { program_id: league.id, season_id: season.id });
+      // Clear the #ctx= deep-link hash the earlier AHL switch's reload/render
+      // synced into the URL: restoreContextDeepLink() on the NEXT boot below
+      // treats a hash that disagrees with the just-persisted server selection
+      // as an intentional deep link and silently POSTS it right back,
+      // reverting this switch to AHL before the builder ever sees it.
+      history.replaceState(null, "", location.pathname + location.search);
       return { season: season.id, rink: rink.id };
     });
-    // The previous step's commit already closed the builder back to the
-    // calendar (no cancel needed) — mirrors step (D) reopening after (C)'s
-    // successful commit.
+    // The bare /api/context fetch above moves the SERVER's active context but
+    // leaves the already-loaded page's own client-side contextOptions (and
+    // ov.rinks/ov.seasons) stale -- reload to re-run the boot sequence's own
+    // loadContextOptions(), then re-navigate back to the calendar tab (mirrors
+    // the identical reload the fixture setup above already performs).
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForSelector("#content > *", { timeout: 10000 });
+    await page.click('.tab[data-tab="calendar"]');
+    await page.waitForSelector('[data-mode="month"]', { state: "visible", timeout: 10000 });
     await page.click("[data-ice-builder-open]");
     await page.waitForSelector(".ib-form", { timeout: 10000 });
     await page.selectOption("#ib-season", dstIds.season);

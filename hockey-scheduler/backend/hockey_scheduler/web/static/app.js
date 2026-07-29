@@ -6410,6 +6410,22 @@ async function render() {
   updateToast();
   const c = document.getElementById("content");
   document.body.dataset.view = view;
+  // #367 review: a completed factory reset (#256) already cleared this
+  // browser's session cookie server-side (the execute response signs every
+  // session out) BEFORE this render() is called to show the success modal --
+  // so /api/demo/overview's now-session-required read would always 401 here,
+  // throwing and replacing the success confirmation with an error banner the
+  // operator never asked for, even though the reset itself genuinely
+  // succeeded. The success modal needs no overview data at all (it's a
+  // static "you're signed out" confirmation), so it paints on its own,
+  // skipping the normal ov-dependent pipeline entirely rather than reworking
+  // that pipeline to tolerate a caller it already knows is signed out.
+  if (modal && modal.type === "factory-reset" && modal.step === "success") {
+    setPageTitle(view);
+    c.innerHTML = renderModal();
+    wireModal(c);  // same generic modal wiring every other modal gets
+    return;
+  }
   // #345 review: set BEFORE the awaited overview load and before either
   // early return below (backend-error banner, restricted roster/sheet), so an
   // error or restricted state still announces the destination the user chose

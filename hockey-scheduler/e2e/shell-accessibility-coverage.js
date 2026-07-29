@@ -19,7 +19,8 @@
 //   4. A forced loading, then forced error, surface: the public schedule's
 //      own fetch held open and then made to 502, both via real clicks that
 //      re-trigger the same request (switching tabs), not a synthetic replay.
-//   5. The Restricted early-return: an Official account with NO assignment
+//   5. The Restricted early-return: an Official account assigned to ONE
+//      demo game but not the one app.js's own default-game-selection picks
 //      lands there from one real click on the "Roster" nav tab (the backend
 //      scope gate mirrors this at the API level -- see app.js's
 //      accessibleGames()/canReadAnyPrivateGame() comments), landing exactly
@@ -305,16 +306,47 @@ async function checkViewport(browser, viewport) {
 
     // Seed real demo data (schedule + fixtures) so the public schedule has
     // actual content to check accessible names/keyboard order over, and so
-    // surface 5 has a real, unassigned game to be "restricted" from.
+    // surface 5 has a real game outside this Official's scope to be
+    // "restricted" from.
+    //
+    // #367: get_demo_overview now scopes ov.schedule to the caller's
+    // authorized Program(s) (services/context_scope.py's
+    // authorized_program_ids), and for an Official that authorization is
+    // derived ENTIRELY from their own assignments. An official with
+    // literally ZERO assignments is therefore authorized for ZERO Programs,
+    // which makes ov.schedule itself come back EMPTY for them -- app.js's
+    // render() never sets currentGame off an empty schedule, so the
+    // Roster/Sheet lineups fetch that drives the "Restricted" banner never
+    // even fires (pre-#367, ov.schedule was globally unscoped, so this same
+    // "zero assignments" official still saw every demo game and always
+    // landed on one it could not open). To reach "Restricted" now, the
+    // Official needs an assignment to SOME game (so it is authorized for
+    // the Program and its schedule is non-empty) that is NOT the game
+    // app.js's own default-game-selection picks -- accessibleGames() gives
+    // an official the unfiltered list, so app.js defaults to schedule[0];
+    // assigning to any OTHER game keeps that default pick out of scope.
     await apiPost(page, "/api/demo/load", {});
-    const official = await apiPost(page, "/api/v2/setup/official", { name: "Ozzy No-Assignment" });
+    const overviewForAssignment = await apiGet(page, "/api/demo/overview");
+    const defaultPickedGame = (overviewForAssignment.schedule || [])[0];
+    const outOfScopeGame = (overviewForAssignment.schedule || [])
+      .find((g) => g.game_id !== defaultPickedGame.game_id);
+    if (!defaultPickedGame || !outOfScopeGame) {
+      fail(`setup: expected at least two demo games to set up the Restricted `
+        + `surface, got ${JSON.stringify(overviewForAssignment.schedule)}`);
+    }
+    const official = await apiPost(page, "/api/v2/setup/official", { name: "Ozzy Wrong-Game" });
+    const assignment = await apiPost(page, `/api/games/${outOfScopeGame.game_id}/officials/assign`,
+      { official_id: official.id, role: "referee" });
+    if (assignment.status && assignment.error) {
+      fail(`could not assign the Official to their own in-scope game: ${JSON.stringify(assignment)}`);
+    }
     const officialUsername = `shellcov_official_${viewport.port}`;
     const officialAcct = await apiPost(page, "/api/accounts", {
       username: officialUsername, password: "scoped-account-pw",
       role: "official", scope: { official_id: official.id },
     });
     if (officialAcct.status && officialAcct.error) {
-      fail(`could not create the unassigned Official account: ${JSON.stringify(officialAcct)}`);
+      fail(`could not create the scoped Official account: ${JSON.stringify(officialAcct)}`);
     }
     const publicSchedule = await apiGet(page, "/api/public/schedule");
     const expectedPublicHeading = publicSchedule.league_name || "Program";
@@ -710,10 +742,11 @@ async function checkViewport(browser, viewport) {
     checkpointErrors("forced error retry recovery");
 
     // ---- (5) Restricted early return, via a real "Roster" nav click -------
-    // The Official account created above has zero assignments, so
-    // accessibleGames()/the backend scope gate put them on a game outside
-    // their scope the instant they land on Roster -- no synthetic game
-    // selection needed. Retry recovery above left the public schedule
+    // The Official account created above is assigned to outOfScopeGame only,
+    // so accessibleGames() (unfiltered for an official)/app.js's own default
+    // game selection lands them on defaultPickedGame instead -- a game
+    // outside their scope -- the instant they land on Roster, no synthetic
+    // game selection needed. Retry recovery above left the public schedule
     // showing real content again, so a real click back to Staff sign-in
     // is needed before the official can sign in.
     await page.click("#public-signin-link");
@@ -826,7 +859,8 @@ async function checkViewport(browser, viewport) {
       + `newer render was started via two real clicks on the persistent `
       + `Staff-sign-in/guest-link controls -- proven unable to clobber that `
       + `newer render's content, title, or focus), and the Restricted early `
-      + `return for an unassigned Official reached by one real Roster-tab `
+      + `return for an Official assigned to a different game reached by one `
+      + `real Roster-tab `
       + `click (title, role="alert", focus landing on the heading, no `
       + `keyboard trap) — each with a zero-serious/critical axe scan. A `
       + `precise HTTP-response ledger (not a text-pattern filter) allowed `

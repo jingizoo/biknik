@@ -4087,41 +4087,66 @@ class ApiService:
 
         #367: when a real user context is supplied (``role`` is not
         ``None`` — the HTTP route at ``/api/demo/overview`` always supplies
-        one now), every collection with a real Program/Season/League join is
-        scoped to the resolved active context: mandatory Program, further
-        narrowed to the selected Season (else the union of every Season the
-        Program has — the broader "no Season chosen" view) and to the
+        one now), every collection with a real Program/League join is scoped
+        to the resolved active context: mandatory Program, and to the
         selected League (else every League's data — the "No League" broader
-        view, matching the #364 ruling's own semantics). Venues/Rinks/Ice
-        slots have no competition-League axis at all (physical facility
-        resources are deliberately independent of competition structure —
-        see ``SeasonVenueAccess``) and are scoped by Program+Season only,
-        mirroring ``get_setup_progress``'s own "facilities" workflow.
-        Clubs/Organizations/Officials have no Program linkage in the domain
-        model at all and stay unfiltered regardless. Called with no
+        view, matching the #364 ruling's own semantics). Deliberately NOT
+        narrowed by the resolved Season, unlike a first version of this
+        change: two independent, real CI regressions (an existing cross-
+        Season scheduling-wizard journey, and a Program's ice inventory
+        split across Seasons with only one holding venue access) proved that
+        Season is not a hard filter boundary for this Dashboard-wide read —
+        an operator's Program-wide operational picture (schedule, ice,
+        registrations across every Season, not just whichever one happens
+        to be "active" for other purposes) must stay visible, exactly as it
+        always was pre-#367. The League axis is the actual, intentional new
+        narrowing #367 asks for; Season only ever helped resolve which
+        LeagueSeason bindings exist, never a visibility boundary of its own,
+        here. Clubs/Organizations/Officials have no Program linkage in the
+        domain model at all and stay unfiltered regardless. Called with no
         arguments (``role`` left ``None``, the default), returns the full,
         unfiltered installation view exactly as before #367 — this is what
         every existing internal caller that inspects whole-store state
         (tests exercising other subsystems) keeps using unchanged; only the
         HTTP route's own per-user Dashboard read opts into scoping.
         """
-        program = season = league = None
+        program = league = None
         in_scope_season_ids = None  # None == no Program scoping active (legacy)
         if role is not None:
-            program, season, league = self.context.resolve_with_league(
+            program, _season, league = self.context.resolve_with_league(
                 user_id, role, scope)
             if program is None:
+                # #367 review correction: Clubs/Organizations/Officials have
+                # no Program dependency in the domain model at all (same
+                # lesson as get_setup_overview_v2's identical fix) -- a
+                # brand-new install with zero Programs yet (or a role
+                # authorized for none) must still let an operator see/create
+                # these Program-independent reference records, not zero them
+                # out alongside the genuinely Program-dependent collections.
+                empty_clubs = {c.id: c for c in self.store.all_clubs()}
                 return {
                     "league": None, "leagues": [], "seasons": [], "levels": [],
-                    "divisions": [], "clubs": [], "teams": [],
-                    "organizations": [], "venues": [], "rinks": [],
-                    "ice_slots": [], "officials": [], "schedule": [],
+                    "divisions": [],
+                    "clubs": [_serialize(c) for c in empty_clubs.values()],
+                    "teams": [],
+                    "organizations": [
+                        _serialize(o) for o in self.store.all_organizations()],
+                    "venues": [], "rinks": [], "ice_slots": [],
+                    "officials": [
+                        {"id": o.id, "name": o.name,
+                         "home_club_name": (empty_clubs[o.home_club_id].name
+                                            if o.home_club_id in empty_clubs
+                                            else None)}
+                        for o in self.store.all_officials()
+                    ],
+                    "schedule": [],
                     "public_fixtures": [], "registrations": [],
                     "setup_audit": [], "setup_audit_count": 0,
                 }
-            in_scope_season_ids = (
-                {season.id} if season else
-                {s.id for s in self.store.seasons_for_program(program.id)})
+            # Every Season the Program has -- never narrowed to just the one
+            # currently resolved (see docstring above).
+            in_scope_season_ids = {
+                s.id for s in self.store.seasons_for_program(program.id)}
 
         all_ls = self.store.all_league_seasons()
         # #367: the League(+Season)-scoped LeagueSeason ids, when Program
@@ -4156,8 +4181,9 @@ class ApiService:
         orgs = {o.id: o for o in self.store.all_organizations()}
         leagues_by_id = {lg.id: lg for lg in self.store.all_programs()}
         # #367: Venues/Rinks/Ice slots have no competition-League axis at all
-        # — scoped by Program+Season only, via active SeasonVenueAccess to
-        # an in-scope Season, never by League (no such join exists).
+        # — scoped by Program only (via active SeasonVenueAccess to any of
+        # the Program's Seasons, per `in_scope_season_ids` above), never by
+        # League (no such join exists).
         in_scope_venue_ids = None
         if in_scope_season_ids is not None:
             in_scope_venue_ids = {
@@ -4463,15 +4489,17 @@ class ApiService:
         """
         program_ids = None
         if role is not None:
+            # #367 review correction: NOT an early-return shortcut when this
+            # is empty (e.g. a brand-new install with zero Programs yet, or
+            # a role authorized for none) -- that previously zeroed out
+            # Clubs/Organizations/Officials/Venues/Rinks/Ice slots too, which
+            # have no Program dependency at all and must stay visible so an
+            # operator can still create the very first Program's supporting
+            # records. Each Program-linked collection below narrows to an
+            # empty list naturally via its own filter; the Program-
+            # independent ones are simply never filtered by `program_ids`.
             program_ids = set(
                 authorized_program_ids(self.store, role, scope, user_id))
-            if not program_ids:
-                return {
-                    "programs": [], "seasons": [], "leagues": [],
-                    "divisions": [], "teams": [], "clubs": [],
-                    "organizations": [], "officials": [], "venues": [],
-                    "rinks": [], "ice_slots": [],
-                }
 
         programs = self.store.all_programs()
         if program_ids is not None:

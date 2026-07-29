@@ -1953,7 +1953,7 @@ async function checkRoleScenarios(browser, viewport) {
         + `ACTIVE Season G1 (${g.seasonG1}), got ${ibSeasonSelected}`);
     }
     // -- Select G1's own rink and preview under A.
-    await page.click(`.ib-rink[value="${g.rinkG1}"]`);
+    await page.check(`.ib-rink[value="${g.rinkG1}"]`);
     const previewResp = page.waitForResponse((r) =>
       r.url() === `${base}/api/setup/ice-availability/preview` && r.request().method() === "POST");
     await page.click("[data-ib-preview]");
@@ -1984,7 +1984,7 @@ async function checkRoleScenarios(browser, viewport) {
         + "carried over, after switching to Program G2");
     }
     // -- A fresh preview+create now targets G2 only, all the way through.
-    await page.click(`.ib-rink[value="${g.rinkG2}"]`);
+    await page.check(`.ib-rink[value="${g.rinkG2}"]`);
     const previewResp2 = page.waitForResponse((r) =>
       r.url() === `${base}/api/setup/ice-availability/preview` && r.request().method() === "POST");
     await page.click("[data-ib-preview]");
@@ -2730,7 +2730,7 @@ async function checkRoleScenarios(browser, viewport) {
     await page.waitForFunction(
       (v) => (document.getElementById("ib-season") || {}).value === v,
       k.seasonK1, { timeout: 10000 });
-    await page.click(`.ib-rink[value="${k.rinkK1}"]`);
+    await page.check(`.ib-rink[value="${k.rinkK1}"]`);
     const kPreviewResp = page.waitForResponse((r) =>
       r.url() === `${base}/api/setup/ice-availability/preview` && r.request().method() === "POST");
     await page.click("[data-ib-preview]");
@@ -2802,7 +2802,7 @@ async function checkRoleScenarios(browser, viewport) {
     await page.waitForFunction(
       (v) => (document.getElementById("ib-season") || {}).value === v,
       k.seasonK3, { timeout: 10000 });
-    await page.click(`.ib-rink[value="${k.rinkK3}"]`);
+    await page.check(`.ib-rink[value="${k.rinkK3}"]`);
     let releasePreviewK3;
     const previewHoldK3 = new Promise((resolve) => { releasePreviewK3 = resolve; });
     await page.route("**/api/setup/ice-availability/preview", async (route) => {
@@ -2848,7 +2848,7 @@ async function checkRoleScenarios(browser, viewport) {
     await page.waitForFunction(
       (v) => (document.getElementById("ib-season") || {}).value === v,
       k.seasonK4, { timeout: 10000 });
-    await page.click(`.ib-rink[value="${k.rinkK4}"]`);
+    await page.check(`.ib-rink[value="${k.rinkK4}"]`);
     const k4PreviewResp = page.waitForResponse((r) =>
       r.url() === `${base}/api/setup/ice-availability/preview` && r.request().method() === "POST");
     await page.click("[data-ib-preview]");
@@ -2907,7 +2907,7 @@ async function checkRoleScenarios(browser, viewport) {
     await page.waitForFunction(
       (v) => (document.getElementById("ib-season") || {}).value === v,
       k.seasonK5, { timeout: 10000 });
-    await page.click(`.ib-rink[value="${k.rinkK5}"]`);
+    await page.check(`.ib-rink[value="${k.rinkK5}"]`);
     let releasePreviewA;
     const previewHoldA = new Promise((resolve) => { releasePreviewA = resolve; });
     await page.route("**/api/setup/ice-availability/preview", async (route) => {
@@ -2943,7 +2943,7 @@ async function checkRoleScenarios(browser, viewport) {
     await page.waitForFunction(
       (v) => (document.getElementById("ib-season") || {}).value === v,
       k.seasonK5, { timeout: 10000 });
-    await page.click(`.ib-rink[value="${k.rinkK5}"]`);
+    await page.check(`.ib-rink[value="${k.rinkK5}"]`);
     const kCrPreviewResp = page.waitForResponse((r) =>
       r.url() === `${base}/api/setup/ice-availability/preview` && r.request().method() === "POST");
     await page.click("[data-ib-preview]");
@@ -2993,7 +2993,7 @@ async function checkRoleScenarios(browser, viewport) {
     await page.waitForFunction(
       (v) => (document.getElementById("ib-season") || {}).value === v,
       k.seasonK5, { timeout: 10000 });
-    await page.click(`.ib-rink[value="${k.rinkK5}"]`);
+    await page.check(`.ib-rink[value="${k.rinkK5}"]`);
     const kReorderBaselineResp = page.waitForResponse((r) =>
       r.url() === `${base}/api/setup/ice-availability/preview` && r.request().method() === "POST");
     await page.click("[data-ib-preview]");
@@ -3078,7 +3078,7 @@ async function checkRoleScenarios(browser, viewport) {
     await page.waitForFunction(
       (v) => (document.getElementById("ib-season") || {}).value === v,
       k.seasonK5, { timeout: 10000 });
-    await page.click(`.ib-rink[value="${kRp.rinkKRp}"]`);
+    await page.check(`.ib-rink[value="${kRp.rinkKRp}"]`);
     const kRpPreviewResp = page.waitForResponse((r) =>
       r.url() === `${base}/api/setup/ice-availability/preview` && r.request().method() === "POST");
     await page.click("[data-ib-preview]");
@@ -3140,7 +3140,7 @@ async function checkRoleScenarios(browser, viewport) {
     await page.waitForFunction(
       (v) => (document.getElementById("ib-season") || {}).value === v,
       k.seasonK5, { timeout: 10000 });
-    await page.click(`.ib-rink[value="${k.rinkK5}"]`);
+    await page.check(`.ib-rink[value="${k.rinkK5}"]`);
     let releaseEditPreview;
     const holdEditPreview = new Promise((resolve) => { releaseEditPreview = resolve; });
     await page.route("**/api/setup/ice-availability/preview", async (route) => {
@@ -3181,7 +3181,7 @@ async function checkRoleScenarios(browser, viewport) {
     await page.waitForFunction(
       (v) => (document.getElementById("ib-season") || {}).value === v,
       k.seasonK5, { timeout: 10000 });
-    await page.click(`.ib-rink[value="${k.rinkK5}"]`);
+    await page.check(`.ib-rink[value="${k.rinkK5}"]`);
     let releaseExclPreview;
     const holdExclPreview = new Promise((resolve) => { releaseExclPreview = resolve; });
     await page.route("**/api/setup/ice-availability/preview", async (route) => {
@@ -3221,7 +3221,7 @@ async function checkRoleScenarios(browser, viewport) {
     await page.waitForFunction(
       (v) => (document.getElementById("ib-season") || {}).value === v,
       k.seasonK5, { timeout: 10000 });
-    await page.click(`.ib-rink[value="${k.rinkK5}"]`);
+    await page.check(`.ib-rink[value="${k.rinkK5}"]`);
     let releaseInputPreview;
     const holdInputPreview = new Promise((resolve) => { releaseInputPreview = resolve; });
     await page.route("**/api/setup/ice-availability/preview", async (route) => {
@@ -3738,7 +3738,7 @@ async function checkRoleScenarios(browser, viewport) {
       await page.waitForFunction(
         (v) => (document.getElementById("ib-season") || {}).value === v,
         m.seasonM1, { timeout: 10000 });
-      await page.click(`.ib-rink[value="${m.rinkM1}"]`);
+      await page.check(`.ib-rink[value="${m.rinkM1}"]`);
       const previewResp = page.waitForResponse((r) =>
         r.url() === `${base}/api/setup/ice-availability/preview` && r.request().method() === "POST");
       await page.click("[data-ib-preview]");

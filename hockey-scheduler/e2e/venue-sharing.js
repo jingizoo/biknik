@@ -38,6 +38,21 @@
 //      Calendar wizard — proving eligibility and isolation both hold for the
 //      allowed combinations while the ungranted one stays blocked.
 //
+// #367 review: the Calendar/wizard read (get_demo_overview) now scopes ice
+// slots/venues/leagues to whichever Program is the caller's ACTIVE context,
+// not to every Program the League Admin administers (that broader list is
+// Setup > Records' own get_setup_overview_v2 read, a different surface) — so
+// steps 5-6 above each explicitly switch the active Program (through the
+// real header context switcher, `#ctx-select`) to whichever Program the step
+// is acting for before touching the wizard. Program B is also given a SECOND
+// Season (never bound to League B or any Team) with its own grant to the
+// second Venue: #367 scopes Calendar visibility to "any of the active
+// Program's Seasons has an active grant", so without it the second Venue
+// would never appear in Program B's own Calendar at all, making step 5's
+// negative case unreachable through real UI navigation — Season B itself
+// (the one League B's teams actually play under) still has no access,
+// exactly as the original acceptance criteria require.
+//
 // Fails on any browser console/page error.
 const { chromium } = require("playwright");
 const { spawn } = require("child_process");
@@ -137,6 +152,24 @@ async function checkViewport(browser, viewport) {
     }
     await page.waitForSelector(`[data-va-revoke="${body.id}"]`, { timeout: 10000 });
     return body;
+  };
+
+  // Switches the signed-in operator's active Program/Season through the real
+  // header context switcher (#159/#345) — required post-#367, since the
+  // Calendar/wizard read (get_demo_overview) scopes ice slots/venues/leagues
+  // to whichever Program is currently ACTIVE, not every Program the caller
+  // administers (that broader, unscoped list is Setup > Records' own
+  // get_setup_overview_v2 read, a different surface). `#ctx-select`'s option
+  // list is seeded once at page load/reload (loadContextOptions(), never
+  // re-polled on every render) so a Program created after that point is
+  // simply absent from it until the caller reloads.
+  const switchContext = async (programId, seasonId) => {
+    const value = `${programId}|${seasonId}`;
+    await page.waitForSelector("#ctx-select", { timeout: 10000 });
+    await page.selectOption("#ctx-select", value);
+    await page.waitForFunction(
+      (v) => document.getElementById("ctx-select").value === v,
+      value, { timeout: 10000 });
   };
 
   // Creates a Game via the Calendar wizard on the given ice slot, for the
@@ -300,6 +333,21 @@ async function checkViewport(browser, viewport) {
     const teamB2 = await createViaDrawer("team",
       { "f-team-club": "", "f-team-perm-league": leagueB.id, "f-team": "Varsity Away" },
       "/api/v2/setup/team");
+    // A SECOND Season under Program B, deliberately unrelated to League B —
+    // #367 scoped the Calendar's ice-slot/venue view to "any of the active
+    // Program's Seasons has an active grant" (Program-level visibility), not
+    // to whichever Season is currently selected. Without SOME Season under
+    // Program B holding access to the second Venue, that Venue (and its ice
+    // slots) would never appear in Program B's own Calendar at all, making
+    // the ungranted-Venue negative case below unreachable through real UI
+    // navigation. Granting THIS season (never bound to League B or used by
+    // any Team) keeps the Venue discoverable while Season B itself — the one
+    // League B's teams actually play under — still has no access, so the
+    // negative case's exact original assumption ("Season B was never
+    // granted") stays true to the letter.
+    const seasonBAlt = await createViaDrawer("season",
+      { "f-season-league": programB.id, "f-season": "2026-27 JV (unused)" },
+      "/api/v2/setup/season");
     // A THIRD ice slot on the second Venue, deliberately never granted to
     // Season B — the ungranted-Venue negative case below (#258 review).
     const slotSecondDenied = await createViaDrawer("ice-slot", {
@@ -357,6 +405,10 @@ async function checkViewport(browser, viewport) {
     // one Venue, multiple independent Programs/Seasons — and the picker
     // still offers it despite Program A's grant.
     await grantViaUi(seasonB.id, venueShared.id);
+    // Program-level-only visibility grant (see seasonBAlt's own comment
+    // above) — keeps the second Venue in Program B's Calendar scope without
+    // giving Season B (or League B) itself any access to it.
+    await grantViaUi(seasonBAlt.id, venueSecond.id);
 
     // Neither Season's Allowed-venues list leaks the other's rows: read each
     // Season's OWN "Allowed venues" subsection (scoped from its delete button
@@ -395,19 +447,42 @@ async function checkViewport(browser, viewport) {
         `{${venueShared.name}}, found ${JSON.stringify(namesB)}`);
     }
 
+    // The header context switcher's option list is only seeded at page
+    // load/reload (#367) — Program B (and its Seasons) were created well
+    // after this page loaded, so a reload is required before `#ctx-select`
+    // can offer them at all.
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForSelector("#content > *", { timeout: 10000 });
+    // A reload can land on the onboarding shell (progress < all stages) rather
+    // than the normal tabbed interface -- that shell doesn't run the ordinary
+    // render()/renderContextSwitcher() pipeline. Navigate to a real tab to
+    // reach it, exactly as an operator would.
+    await page.click('.tab[data-tab="calendar"]');
+    await page.waitForFunction(() => {
+      const wrap = document.getElementById("context-switcher");
+      return wrap && !wrap.hidden;
+    }, null, { timeout: 15000 });
+
     // (5) Program B's Season was never granted the second Venue — attempting
     // a Game there through the real Calendar UI must be rejected, with zero
     // mutation (no Game created, slot stays available), not merely "some
-    // positive path happens to succeed elsewhere" (#258 review).
+    // positive path happens to succeed elsewhere" (#258 review). Program B
+    // must be the ACTIVE context (#367) for its own League to be selectable
+    // in the wizard at all.
+    await switchContext(programB.id, seasonB.id);
     await assertGameDenied(slotSecondDenied.id, leagueB.id, teamB1.id, teamB2.id);
 
     // (6) Program A schedules a Game on the shared venue AND on its second
     // venue; Program B independently schedules a Game on the same shared
-    // venue — proving eligibility and isolation both hold end to end.
+    // venue — proving eligibility and isolation both hold end to end. Each
+    // creation needs ITS OWN Program active (#367 scopes the wizard's League
+    // choices to the active Program only).
+    await switchContext(programA.id, seasonA.id);
     const gameA1 = await createGameViaWizard(
       slotSharedA.id, leagueA.id, divisionA.id, teamA1.id, teamA2.id);
     const gameA2 = await createGameViaWizard(
       slotSecond.id, leagueA.id, divisionA.id, teamA1.id, teamA2.id);
+    await switchContext(programB.id, seasonB.id);
     const gameB1 = await createGameViaWizard(
       slotSharedB.id, leagueB.id, null, teamB1.id, teamB2.id);
     if (!gameA1.id || !gameA2.id || !gameB1.id) {
