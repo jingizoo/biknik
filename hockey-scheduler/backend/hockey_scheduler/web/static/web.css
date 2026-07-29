@@ -105,6 +105,14 @@
   display: flex; justify-content: space-between; align-items: flex-start; gap: 16px;
   padding: 20px 30px 14px; background: var(--content-bg);
   position: sticky; top: 0; z-index: 10;
+  /* #364 review: unconditional wrap (not gated behind the 880px breakpoint
+     web.css otherwise reserves for shell reflow) -- the context bar's own
+     two selects + role action buttons can outgrow 1440px for a
+     max-permission role (e.g. Arena Manager) well above that breakpoint.
+     Letting the row wrap here, rather than adding a new breakpoint token,
+     keeps every control on screen and reachable at any width instead of
+     overflowing the viewport horizontally. */
+  flex-wrap: wrap;
 }
 .topbar-heading { display: flex; align-items: center; gap: 9px; }
 .topbar h1 { margin: 0; font-size: 21px; font-weight: 700; letter-spacing: -.02em; }
@@ -115,7 +123,15 @@
 .env-chip.subtle { background: #eef0f4; color: #6b7280; font-family: var(--mono); font-weight: 500; }
 .env-chip.prod { background: #e7f7ec; color: #1a8a44; }
 .env-chip.live { background: #fdf0dd; color: #b4690e; }
-.topbar-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+/* #364 review: was `flex: 0 0 auto` (never shrinks, never wraps outside the
+   880px breakpoint) -- with two context selects now living inside it, that
+   pinned the whole group's natural width, forcing .topbar to overflow the
+   viewport at desktop widths a max-permission role's action set can exceed.
+   Wrapping onto a second line keeps every control visible and reachable
+   rather than clipped or scrolled off; `flex: 1 1 auto` + `min-width: 0`
+   let the group shrink to share the row with .topbar-title instead of
+   forcing it to overflow first. */
+.topbar-actions { display: flex; align-items: center; gap: 8px; flex: 1 1 auto; min-width: 0; flex-wrap: wrap; justify-content: flex-end; }
 .topbar-actions .act { padding: 8px 14px; font-size: 13px; border-radius: 9px; }
 .topbar-actions .act.icon-only { padding: 8px 10px; }
 

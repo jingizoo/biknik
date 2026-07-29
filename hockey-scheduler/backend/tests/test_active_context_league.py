@@ -31,6 +31,7 @@ import os
 import tempfile
 import threading
 import unittest
+from dataclasses import asdict
 from datetime import datetime, timezone
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
@@ -169,18 +170,152 @@ class LeagueContextSelectionTest(unittest.TestCase):
                     svc.resolve_with_league("u1", *ADMIN)[2], None, label)
                 _close(store)
 
-    def test_league_without_season_is_allowed_when_it_matches_the_program(self):
-        """A Program+League selection needs no binding — the binding rule only
-        applies once a Season is also selected."""
+    def test_program_only_plus_league_canonicalizes_to_the_unique_binding(self):
+        """Selecting a League from a Program-only context resolves through the
+        SAME canonical rules (#364 re-review) — it is not a binding-free path.
+
+        **This reverses an earlier revision of this test**, which asserted that
+        (Program, None, League) was committed as-is. That codified a real
+        defect: it let the context persist and render an ACTIVE LEAGUE WITH NO
+        `LeagueSeason` behind it, breaking the canonical-tuple invariant #367
+        and #365 build on. With no current Season rule 1 cannot match, so rule 2
+        takes the League's unique valid binding — a unique binding is not a
+        guess. Program-only stays first-class only when no League is chosen,
+        which is asserted separately."""
         for label, store in _backends():
             with self.subTest(backend=label):
                 api = ApiService(store)
                 pid, sid, lid = _program_season_league(api)
                 svc = ContextService(store)
                 p, s, lg = svc.set_with_league("u1", *ADMIN, pid, None, lid)
-                self.assertEqual((p.id, s, lg.id), (pid, None, lid), label)
+                self.assertEqual((p.id, s.id, lg.id), (pid, sid, lid), label)
+                saved = store.get_active_context("u1")
+                self.assertEqual((saved.season_id, saved.league_id), (sid, lid),
+                                 label)
                 self.assertEqual(
                     svc.resolve_with_league("u1", *ADMIN)[2].id, lid, label)
+                _close(store)
+
+    def test_program_only_without_a_league_stays_program_only(self):
+        """The genuinely Program-only case -- no League -- is untouched by the
+        canonicalization above and still commits a null Season."""
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                pid, sid, lid = _program_season_league(api)
+                svc = ContextService(store)
+                p, s, lg = svc.set_with_league("u1", *ADMIN, pid, None, None)
+                self.assertEqual((p.id, s, lg), (pid, None, None), label)
+                self.assertIsNone(store.get_active_context("u1").season_id, label)
+                _close(store)
+
+    def test_program_only_plus_league_refuses_when_not_unique(self):
+        """Rule 3 from a Program-only context (`season_id=None`) across ALL
+        THREE candidate shapes, each one actually CONSTRUCTED and asserted to
+        be that shape before it is exercised:
+
+        * **zero** — a permanent League left with no ``LeagueSeason`` at all;
+        * **ambiguous** — a League with TWO valid authorized ACTIVE bindings;
+        * **archived-only** — a League whose single binding is an ARCHIVED
+          Season, which rule 2 must never auto-enter.
+
+        The null-Season path is the one the resolution defect lived on, so each
+        refusal is checked three ways rather than by reason alone:
+
+        1. all three reasons collapse to ONE generic value — asserted as a
+           one-element SET of everything observed, so a shape-specific reason
+           (an existence/state oracle) fails even though each is individually
+           a refusal;
+        2. the COMPLETE prior active-context row is byte-identical afterwards,
+           ``updated_at`` INCLUDED — comparing only program/season/league ids
+           cannot catch a refusal that rewrites the same values with a fresh
+           clock;
+        3. the refused League's ``LeagueSeason`` set is identical before and
+           after — a refusal must never create or "repair" the binding that
+           would have made the selection legal.
+
+        A positive control closes the loop last: the SAME Program-only shape
+        still commits for a League with exactly one valid active binding
+        (rule 2 moves atomically to it), so these assertions cannot be
+        satisfied by a server that simply refuses everything."""
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                pid, s1, gold = _program_season_league(api, "P", "S1", "Gold")
+                s2 = api.create_season(pid, "S2")["id"]
+                # ambiguous: Gold binds BOTH active S1 and S2.
+                api.setup.create_league_season(gold, s2)
+                # zero: a permanent League whose only binding is removed again.
+                unbound = api.create_league(s2, "Unbound")["id"]
+                _unbind(store, unbound, s2)
+                # archived-only: History's ONE binding is to an archived Season
+                # (created while S3 was still active, then archived).
+                s3 = api.create_season(pid, "S3")["id"]
+                history = api.create_league(s3, "History")["id"]
+                retired = store.get_season(s3)
+                retired.status = SeasonStatus.ARCHIVED
+                store.save_season(retired)
+                # the positive control's League: exactly one active binding.
+                solo = api.create_league(s2, "Solo")["id"]
+
+                svc = ContextService(store)
+                # A known-good prior context, so "zero mutation" is provable
+                # against a real saved row rather than against absence.
+                svc.set_with_league("u1", *ADMIN, pid, s1, gold)
+                # asdict() so the snapshot is VALUES, not a live store object a
+                # mutation could edit underneath the comparison.
+                before = asdict(store.get_active_context("u1"))
+
+                def bindings(league_id):
+                    return sorted(
+                        (ls.id, ls.league_id, ls.season_id)
+                        for ls in store.league_seasons_for_league(league_id))
+
+                # The three candidates really are zero / two / archived-only.
+                self.assertEqual(bindings(unbound), [], label)
+                self.assertEqual(len(bindings(gold)), 2, label)
+                self.assertEqual(len(bindings(history)), 1, label)
+                self.assertEqual(
+                    store.get_season(bindings(history)[0][2]).status,
+                    SeasonStatus.ARCHIVED, label)
+
+                reasons = set()
+
+                def refused(league_id, why):
+                    bound_before = bindings(league_id)
+                    try:
+                        svc.set_with_league("u1", *ADMIN, pid, None, league_id)
+                    except Exception as exc:   # NotFoundError carries .details
+                        reasons.add(getattr(exc, "details", {}).get("reason"))
+                    else:
+                        self.fail(f"{label}: {why} was not refused")
+                    self.assertEqual(
+                        asdict(store.get_active_context("u1")), before,
+                        f"{label}: {why} rewrote the saved context row "
+                        f"(full row incl. updated_at)")
+                    self.assertEqual(
+                        bindings(league_id), bound_before,
+                        f"{label}: {why} created or repaired a LeagueSeason")
+
+                refused(unbound, "zero-binding League from Program-only")
+                refused(gold, "ambiguous multi-binding League from Program-only")
+                refused(history, "archived-only League from Program-only")
+
+                # One indistinguishable reason for all three shapes.
+                self.assertEqual(len(reasons), 1,
+                                 f"{label}: refusal reason varied by shape: "
+                                 f"{sorted(map(str, reasons))}")
+                self.assertEqual(reasons, {"league_not_accessible"}, label)
+
+                # Positive control: the same Program-only shape COMMITS when the
+                # League has exactly one valid active binding -- so the refusal
+                # assertions above cannot pass by refusing unconditionally.
+                p, s, lg = svc.set_with_league("u1", *ADMIN, pid, None, solo)
+                self.assertEqual((p.id, s.id, lg.id), (pid, s2, solo), label)
+                saved = store.get_active_context("u1")
+                self.assertEqual(
+                    (saved.program_id, saved.season_id, saved.league_id),
+                    (pid, s2, solo), label)
                 _close(store)
 
     def test_archived_season_keeps_its_league_as_read_only_history(self):
@@ -226,9 +361,17 @@ class LeagueContextRejectionTest(unittest.TestCase):
                 self.assertIsNone(store.get_active_context("u1"), label)
                 _close(store)
 
-    def test_wrong_season_binding_is_rejected_and_creates_nothing(self):
-        """A League bound to S1 but NOT to S2 cannot be selected with S2 — and
-        the refusal must not implicitly create the missing binding."""
+    def test_single_other_season_binding_moves_atomically_and_creates_nothing(self):
+        """A League bound only to S1, selected from active S2, MOVES the context
+        atomically to (Program, S1, League) — it is not refused.
+
+        **This reverses the pre-#364 behavior deliberately.** Refusing here was
+        the reported release blocker: the context bar offered an authorized
+        League that could never be committed. The #364 owner ruling makes the
+        SERVER own resolution — keep the current Season when it binds, else move
+        to the League's single valid authorized active binding. What must NOT
+        change is that resolution never CREATES a binding, which is still
+        asserted below."""
         for label, store in _backends():
             with self.subTest(backend=label):
                 api = ApiService(store)
@@ -237,12 +380,94 @@ class LeagueContextRejectionTest(unittest.TestCase):
                 svc = ContextService(store)
 
                 before = len(store.league_seasons_for_league(lid))
-                reason, msg = self._reason(
+                program, season, league = svc.set_with_league(
+                    "u1", *ADMIN, pid, s2, lid)
+                # The canonical tuple names S1 -- NOT the requested S2.
+                self.assertEqual((program.id, season.id, league.id),
+                                 (pid, s1, lid), label)
+                # ...and it is what was PERSISTED, so a reload agrees.
+                saved = store.get_active_context("u1")
+                self.assertEqual((saved.program_id, saved.season_id,
+                                  saved.league_id), (pid, s1, lid), label)
+                self.assertEqual(
+                    svc.resolve_with_league("u1", *ADMIN)[1].id, s1, label)
+                # The move resolved an EXISTING binding and invented none.
+                self.assertEqual(len(store.league_seasons_for_league(lid)),
+                                 before, label)
+                self.assertIsNone(store.league_season_for(lid, s2), label)
+                _close(store)
+
+    def test_current_season_binding_is_kept_not_moved(self):
+        """Rule 1: when the current Season is itself a valid binding it is kept,
+        even though other bindings exist — the server must not "helpfully" move
+        a context that was already canonical."""
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                pid, s1, lid = _program_season_league(api, "P", "S1", "Gold")
+                s2 = api.create_season(pid, "S2")["id"]
+                api.setup.create_league_season(lid, s2)   # now bound to BOTH
+                svc = ContextService(store)
+
+                _p, season, _lg = svc.set_with_league("u1", *ADMIN, pid, s2, lid)
+                self.assertEqual(season.id, s2, f"{label}: S2 bound, must stay")
+                self.assertEqual(
+                    store.get_active_context("u1").season_id, s2, label)
+                _close(store)
+
+    def test_ambiguous_multi_binding_refuses_without_mutation(self):
+        """Rule 3: several valid bindings and the current Season not among them
+        must refuse — never tie-break. A deterministic pick would silently move
+        the operator into a Season they never chose and never saw."""
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                pid, s1, lid = _program_season_league(api, "P", "S1", "Gold")
+                s2 = api.create_season(pid, "S2")["id"]
+                s3 = api.create_season(pid, "S3")["id"]
+                api.setup.create_league_season(lid, s2)   # bound to S1 and S2
+                svc = ContextService(store)
+                # Establish a known-good prior context so "zero mutation" is
+                # provable against a real saved row rather than against absence.
+                svc.set_with_league("u1", *ADMIN, pid, s1, lid)
+                before = store.get_active_context("u1")
+
+                reason, msg = self._reason(   # acting from S3, bound to neither
+                    lambda: svc.set_with_league("u1", *ADMIN, pid, s3, lid))
+                self.assertEqual(reason, "league_not_accessible", (label, msg))
+                after = store.get_active_context("u1")
+                self.assertEqual(
+                    (after.program_id, after.season_id, after.league_id),
+                    (before.program_id, before.season_id, before.league_id),
+                    f"{label}: a refused selection mutated the saved context")
+                _close(store)
+
+    def test_archived_only_binding_refuses_and_is_never_auto_entered(self):
+        """Rule 2 resolves only ACTIVE bindings. An archived Season is honored
+        when EXPLICITLY chosen (read-only history) but must never be somewhere
+        the system moves an operator on their behalf — the same rule
+        `_fallback` already applies when auto-selecting."""
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                pid, s1, lid = _program_season_league(api, "P", "S1", "Gold")
+                s2 = api.create_season(pid, "S2")["id"]
+                archived = store.get_season(s1)
+                archived.status = SeasonStatus.ARCHIVED
+                store.save_season(archived)
+                svc = ContextService(store)
+
+                reason, msg = self._reason(   # only binding is archived S1
                     lambda: svc.set_with_league("u1", *ADMIN, pid, s2, lid))
                 self.assertEqual(reason, "league_not_accessible", (label, msg))
-                self.assertEqual(len(store.league_seasons_for_league(lid)),
-                                 before, label)   # no implicit binding created
-                self.assertIsNone(store.league_season_for(lid, s2), label)
+                self.assertIsNone(store.get_active_context("u1"), label)
+
+                # But explicitly selecting the archived Season+League still
+                # works -- honored history, not an auto-entered destination.
+                _p, season, league = svc.set_with_league(
+                    "u1", *ADMIN, pid, s1, lid)
+                self.assertEqual((season.id, season.status, league.id),
+                                 (s1, SeasonStatus.ARCHIVED, lid), label)
                 _close(store)
 
     def test_nonexistent_and_unauthorized_are_indistinguishable(self):
