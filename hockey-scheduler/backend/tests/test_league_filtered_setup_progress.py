@@ -927,6 +927,217 @@ class LeagueFilteredSetupProgressInvalidLeagueTest(unittest.TestCase):
                 _close(store)
 
 
+class LeagueFilteredSetupProgressSeasonCeilingTest(unittest.TestCase):
+    """The #367 owner ruling: the active-Season ceiling from #330 review
+    round 1 finding 2 is not merely a narrowing convenience — it is a hard,
+    non-optional ceiling for every Season-BOUND workflow here, exactly as
+    ``get_demo_overview``'s own
+    ``in_scope_season_ids = {season.id} if season is not None else set()``
+    idiom already is for its own Season-scoped collections
+    (``docs/architecture/active-context-scoping.md``). "Season participation
+    and divisions" and "Venues, rinks and ice" are the two Season-bound
+    workflows (each counts rows that reach a Season only through a
+    LeagueSeason or a SeasonVenueAccess grant): both must narrow to the
+    ACTIVE Season alone, flip when the active Season switches, and go EMPTY
+    under a Program-only context — never fall back to the union of every
+    Season the Program has. "League profile and seasons" (Program-wide over
+    every Season collectively) and "Permanent teams"/"Clubs, players and
+    staff" (Team/Player carry no Season field at all) are the deliberate
+    contrast: their counts must NOT move with the Season selection at all —
+    included here so a future change that accidentally narrows them by
+    Season, or accidentally widens the two Season-bound workflows back to
+    every Season, is caught either way."""
+
+    def test_two_seasons_ceiling_flips_on_switch_and_empties_program_only(self):
+        """Two Seasons in one Program, each with two Leagues, each League
+        carrying its own registered Team and its own granted ice, sized so
+        every count is distinguishable (1 vs 2 registrations/slots per
+        Season, per League — and 4 Teams total across both Seasons). With
+        Season 1 active, every Season-bound count reflects Season 1 ONLY;
+        switching the active context to Season 2 flips both to Season 2's
+        own counts; and resolving to Program-only (no Season selected)
+        empties both regardless of which Season has real data — covering
+        both the League-selected and the No-League ("union within the
+        active Season") case at each step."""
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                api.create_user_account("admin", "pw", "league_admin")
+                program = api.create_program("Prog", actor_id="admin")
+                club = api.create_club("C", actor_id="admin")
+
+                # -- Season 1: two Leagues, one registered Team each, one
+                # granted Venue/Rink/available game slot.
+                season1 = api.create_season(program["id"], "S1", actor_id="admin")
+                league_1a = api.create_league(season1["id"], "1A", actor_id="admin")
+                league_1b = api.create_league(season1["id"], "1B", actor_id="admin")
+                team_1a = api.create_team(club["id"], None, "T1A", actor_id="admin",
+                                          program_id=program["id"],
+                                          league_id=league_1a["id"])
+                team_1b = api.create_team(club["id"], None, "T1B", actor_id="admin",
+                                          program_id=program["id"],
+                                          league_id=league_1b["id"])
+                reg_1a = api.register_team_for_season(
+                    season1["id"], team_1a["id"], actor_id="admin",
+                    league_id=league_1a["id"])
+                reg_1b = api.register_team_for_season(
+                    season1["id"], team_1b["id"], actor_id="admin",
+                    league_id=league_1b["id"])
+                self.assertNotIn("error", reg_1a, reg_1a)
+                self.assertNotIn("error", reg_1b, reg_1b)
+                venue1 = api.create_venue("V1", league_id=program["id"],
+                                          actor_id="admin")
+                rink1 = api.create_rink(venue1["id"], "R1", actor_id="admin")
+                api.create_ice_slot(rink1["id"], "2026-09-01T18:00:00+00:00",
+                                    "2026-09-01T19:30:00+00:00", actor_id="admin")
+                api.grant_season_venue_access(season1["id"], venue1["id"],
+                                              actor_id="admin")
+
+                # -- Season 2: same shape but with 2 available slots (instead
+                # of 1) so a leaked Season 1 count is caught either way.
+                season2 = api.create_season(program["id"], "S2", actor_id="admin")
+                league_2a = api.create_league(season2["id"], "2A", actor_id="admin")
+                league_2b = api.create_league(season2["id"], "2B", actor_id="admin")
+                team_2a = api.create_team(club["id"], None, "T2A", actor_id="admin",
+                                          program_id=program["id"],
+                                          league_id=league_2a["id"])
+                team_2b = api.create_team(club["id"], None, "T2B", actor_id="admin",
+                                          program_id=program["id"],
+                                          league_id=league_2b["id"])
+                reg_2a = api.register_team_for_season(
+                    season2["id"], team_2a["id"], actor_id="admin",
+                    league_id=league_2a["id"])
+                reg_2b = api.register_team_for_season(
+                    season2["id"], team_2b["id"], actor_id="admin",
+                    league_id=league_2b["id"])
+                self.assertNotIn("error", reg_2a, reg_2a)
+                self.assertNotIn("error", reg_2b, reg_2b)
+                venue2 = api.create_venue("V2", league_id=program["id"],
+                                          actor_id="admin")
+                rink2 = api.create_rink(venue2["id"], "R2", actor_id="admin")
+                api.create_ice_slot(rink2["id"], "2026-09-02T18:00:00+00:00",
+                                    "2026-09-02T19:30:00+00:00", actor_id="admin")
+                api.create_ice_slot(rink2["id"], "2026-09-02T20:00:00+00:00",
+                                    "2026-09-02T21:30:00+00:00", actor_id="admin")
+                api.grant_season_venue_access(season2["id"], venue2["id"],
+                                              actor_id="admin")
+
+                def _read(season, league_id):
+                    api.set_active_context(
+                        "admin", Role.LEAGUE_ADMIN, {}, program["id"],
+                        season["id"] if season else None, league_id)
+                    return api.get_setup_progress("admin", *ADMIN)
+
+                # --- Season 1 active, No League: union of 1A+1B. ---
+                p = _read(season1, None)
+                self.assertEqual(
+                    _workflow(p, "participation")["detail"],
+                    "2 schedulable registration(s)",
+                    f"{label}: S1/No-League must show BOTH of S1's own "
+                    "registrations, never S2's")
+                self.assertEqual(
+                    _workflow(p, "facilities")["detail"],
+                    "1 available game slot(s)",
+                    f"{label}: S1/No-League must show S1's own slot count, "
+                    "never S2's 2")
+                # "teams" is NOT Season-bound: the full Program+League-union
+                # set includes every Season's Teams (4), proving Season
+                # selection alone never narrows it.
+                self.assertEqual(
+                    _workflow(p, "teams")["detail"], "4 team(s)",
+                    f"{label}: teams must stay Program-wide across every "
+                    "Season, S1 active or not")
+
+                # --- Season 1 active, League 1A selected: narrows further,
+                # WITHIN Season 1, to 1A's own registration only. ---
+                p = _read(season1, league_1a["id"])
+                self.assertEqual(
+                    _workflow(p, "participation")["detail"],
+                    "1 schedulable registration(s)",
+                    f"{label}: S1/League 1A must show ONLY 1A's own "
+                    "registration")
+                self.assertEqual(
+                    _workflow(p, "facilities")["detail"],
+                    "1 available game slot(s)",
+                    f"{label}: facilities has no League axis -- selecting "
+                    "1A must not change S1's count")
+
+                # --- Season 2 active, No League: union of 2A+2B -- proves
+                # switching the active Season flips BOTH counts to Season
+                # 2's OWN data, not stuck on Season 1's. ---
+                p = _read(season2, None)
+                self.assertEqual(
+                    _workflow(p, "participation")["detail"],
+                    "2 schedulable registration(s)",
+                    f"{label}: S2/No-League must show BOTH of S2's own "
+                    "registrations, never S1's")
+                self.assertEqual(
+                    _workflow(p, "facilities")["detail"],
+                    "2 available game slot(s)",
+                    f"{label}: switching to S2 must flip facilities to S2's "
+                    "OWN 2 slots, not stay on S1's 1")
+
+                # --- Season 2 active, League 2B selected. ---
+                p = _read(season2, league_2b["id"])
+                self.assertEqual(
+                    _workflow(p, "participation")["detail"],
+                    "1 schedulable registration(s)",
+                    f"{label}: S2/League 2B must show ONLY 2B's own "
+                    "registration")
+                self.assertEqual(
+                    _workflow(p, "facilities")["detail"],
+                    "2 available game slot(s)", label)
+
+                # --- Program-only (no Season resolved): BOTH Season-bound
+                # workflows must go EMPTY -- neither Season's real,
+                # non-empty data may leak through. ---
+                p = _read(None, None)
+                participation_none = _workflow(p, "participation")
+                self.assertEqual(
+                    participation_none["status"], "todo",
+                    f"{label}: Program-only must not read participation as "
+                    "done from EITHER season")
+                self.assertEqual(
+                    participation_none["detail"],
+                    "No team registered to play yet.",
+                    f"{label}: Program-only participation must be empty, "
+                    "not fall back to every Season's registrations")
+                facilities_none = _workflow(p, "facilities")
+                self.assertEqual(
+                    facilities_none["status"], "todo",
+                    f"{label}: Program-only must not read facilities as "
+                    "done from EITHER season")
+                self.assertEqual(
+                    facilities_none["detail"],
+                    "No available game ice slot yet.",
+                    f"{label}: Program-only facilities must be empty, not "
+                    "fall back to every Season's ice")
+                # "league_season" (Program-wide over every Season
+                # collectively) and "teams" (no Season field at all) must
+                # both stay fully populated and "done" even Program-only --
+                # a contrast proof that the ceiling above is Season-
+                # SPECIFIC, not an accidental blanket empty-out of the whole
+                # response.
+                self.assertEqual(
+                    _workflow(p, "league_season")["status"], "done",
+                    f"{label}: league_season is Program-wide and must stay "
+                    "done Program-only")
+                self.assertEqual(
+                    _workflow(p, "teams")["detail"], "4 team(s)",
+                    f"{label}: teams must stay Program-wide and fully "
+                    "populated Program-only too")
+
+                # --- Switching back to Season 1/No League reproduces the
+                # ORIGINAL counts -- proves no residual state (from Season
+                # 2, League selections, or the Program-only read) survived.
+                p = _read(season1, None)
+                self.assertEqual(_workflow(p, "participation")["detail"],
+                                 "2 schedulable registration(s)", label)
+                self.assertEqual(_workflow(p, "facilities")["detail"],
+                                 "1 available game slot(s)", label)
+                _close(store)
+
+
 class LeagueFilteredSetupProgressStatelessReadTest(unittest.TestCase):
     """A facade-level approximation of the client-side delayed/stale-response
     race guard (properly proven end-to-end at the Playwright/e2e layer):

@@ -437,6 +437,26 @@ class ApiService:
         either would not correspond to anything real in the domain model.
         Explicit "No League" keeps the full Program/Season-wide view,
         byte-identical to pre-#367 behavior.
+
+        The #367 owner ruling also makes the active-Season ceiling explicit
+        and non-optional here, exactly as it already is for
+        ``get_demo_overview``: a workflow is **Season-bound** when it counts
+        or gates on rows that reach a Season only through a
+        SeasonTeamRegistration/Division's LeagueSeason, or a
+        SeasonVenueAccess grant -- "Season participation and divisions" and
+        "Venues, rinks and ice" are the two here, and BOTH must go EMPTY
+        under a Program-only context (no Season resolved), never fall back
+        to the union of every Season the Program has. See
+        ``in_scope_season_ids`` at their shared computation below, which
+        mirrors ``get_demo_overview``'s own
+        ``in_scope_season_ids = {season.id} if season is not None else set()``
+        idiom byte-for-byte (docs/architecture/active-context-scoping.md).
+        "League profile and seasons" (a Program-WIDE integrity check ABOUT
+        every Season collectively, not a per-Season fact) and "Permanent
+        teams"/"Clubs, players and staff" (Team/Player carry no Season field
+        at all -- see ``domain.models.Team``/``Player``) are NOT Season-bound
+        by this test, and correctly stay invariant to the active Season,
+        Program-only included.
         """
         program, season, league = self.context.resolve_with_league(
             user_id, role, scope)
@@ -466,13 +486,30 @@ class ApiService:
         # Season's registrations or granted ice can't mask required work in
         # a newly-selected Season (#330 review round 1 finding 2). No Season
         # resolved (a Program-only context) means neither can be done yet.
+        # #367 owner ruling: this is the active-Season CEILING, not merely a
+        # convenience narrowing -- a Program-only context MUST make both
+        # workflows empty, never silently widen back to "every Season the
+        # Program has". `in_scope_season_ids` names the ceiling as its own
+        # value (instead of two independent `if season else ...` ternaries)
+        # so it matches, textually, the identical
+        # `in_scope_season_ids = {season.id} if season is not None else set()`
+        # idiom `get_demo_overview` uses for its own Season-scoped
+        # collections (docs/architecture/active-context-scoping.md) -- the
+        # cross-check the #367 review round used to confirm this ceiling is
+        # real and not merely coincidentally empty. "League profile and
+        # seasons" (Program-wide over every Season COLLECTIVELY, computed
+        # above from `seasons`/`program_league_seasons`) and "Permanent
+        # teams"/"Clubs, players and staff" (`league_teams`/
+        # `program_players` -- Team/Player have no Season field at all) are
+        # NOT Season-bound and deliberately never read `in_scope_season_ids`.
+        in_scope_season_ids = {season.id} if season is not None else set()
         # #367: a selected League further narrows the candidate LeagueSeason
         # set to that League's own binding for the resolved Season -- "No
         # League" considers every League's binding, identical to pre-#367
         # behavior.
-        season_league_seasons = (
-            [ls for ls in program_league_seasons if ls.season_id == season.id]
-            if season else [])
+        season_league_seasons = [
+            ls for ls in program_league_seasons
+            if ls.season_id in in_scope_season_ids]
         if league:
             season_league_seasons = [
                 ls for ls in season_league_seasons
@@ -513,7 +550,11 @@ class ApiService:
         # scoped to the selected Season like participation/facilities below:
         # this is an integrity check ("does EVERY Season have a League"),
         # mirroring get_onboarding_status_v2's own "league" step exactly, not
-        # a per-selected-Season fact.
+        # a per-selected-Season fact. NOT Season-bound under the #367 owner
+        # ruling (it is precisely the "Program-wide structural check ABOUT
+        # Seasons collectively" that ruling names as the non-Season-bound
+        # case) -- stays identical across every Season selection and
+        # Program-only alike.
         seasons_without_league = [
             s for s in seasons
             if s.id not in {ls.season_id for ls in program_league_seasons}]
@@ -524,8 +565,11 @@ class ApiService:
             "Add Season")
 
         # 2. Permanent teams — Program-level, no Season dimension at all.
-        # #367: narrowed to the selected League's own Teams when one is
-        # active (league_teams); "No League" keeps the full Program set.
+        # NOT Season-bound (``domain.models.Team`` has no season_id field to
+        # gate on) -- identical across every Season selection, Program-only
+        # included. #367: narrowed to the selected League's own Teams when
+        # one is active (league_teams); "No League" keeps the full Program
+        # set.
         add("teams", "Permanent teams", bool(league_teams),
             f"{len(league_teams)} team(s)" if league_teams
             else "No team added yet.",
@@ -608,7 +652,10 @@ class ApiService:
 
         # 4. Clubs, players and staff: at least one player on one of this
         # Program's teams. Program-level like Teams — a Player belongs to a
-        # Team, never a Season directly.
+        # Team, never a Season directly. NOT Season-bound for the same
+        # reason as "Permanent teams" above (``domain.models.Player`` has no
+        # season_id field either, only ``team_id``) -- identical across
+        # every Season selection, Program-only included.
         # #367: narrowed to the selected League's own Teams (league_team_ids)
         # when one is active, matching "Permanent teams" above; "No League"
         # keeps the full Program set.
@@ -621,10 +668,17 @@ class ApiService:
 
         # 5. Venues, rinks and ice: at least one available GAME slot at a
         # rink whose Venue holds active SeasonVenueAccess to the SELECTED
-        # Season specifically (not any of the Program's Seasons).
-        venue_access_venue_ids = ({
+        # Season specifically (not any of the Program's Seasons). Season-
+        # bound under the #367 owner ruling (same `in_scope_season_ids`
+        # ceiling computed above for participation) -- empty under a
+        # Program-only context, never any OTHER Season's grant. Deliberately
+        # has NO League axis anywhere in this computation: Venue/Rink/IceSlot
+        # reach a Season only through SeasonVenueAccess and carry no
+        # competition-League field at all (see "Venues have no League axis",
+        # docs/architecture/active-context-scoping.md).
+        venue_access_venue_ids = {
             a.venue_id for a in self.store.all_season_venue_access()
-            if a.active and a.season_id == season.id} if season else set())
+            if a.active and a.season_id in in_scope_season_ids}
         schedulable_rink_ids = {
             r.id for r in self.store.all_rinks()
             if r.venue_id in venue_access_venue_ids}
@@ -5128,38 +5182,77 @@ class ApiService:
         # Row-shape builders, applied identically to a main (scoped/
         # unfiltered) list and its `pending_link_*` counterpart, so both read
         # as the exact same DTO shape client-side.
+        #
+        # `visible` is the ownership contract's second half (#367 owner
+        # ruling: visibility "cannot be gained by probing/replaying an id").
+        # A pending-link row is offered because the caller CREATED it — and
+        # that authorizes THE ROW, never the foreign records it happens to
+        # point at. Every create route takes its parent id verbatim from the
+        # request body and does not check that the caller may see that
+        # parent, so resolving a parent's NAME from the full store turned the
+        # create routes into a name oracle for exactly the identity the
+        # ruling names: an Arena Manager (MANAGE_ARENA covers venue/rink/
+        # ice-slot/organization creates AND this read, at zero authorized
+        # Programs) POSTs a Rink at `venue_N`, an IceSlot at `rink_N`, a
+        # Venue at `org_N` or an Official homed at `club_N` — ids are
+        # sequential — and reads another operator's never-linked
+        # `venue_name` / `rink_name` / `organization_name` / `home_club_name`
+        # straight back out of its own pending row. Verified by probe before
+        # this guard existed. So on a pending row every parent LABEL resolves
+        # only against what this caller can already see (its scoped list plus
+        # its own pending list) and is None otherwise; the parent id the
+        # caller itself supplied stays, since it is not new information.
+        # `visible=None` (every main list, and the whole unfiltered shape)
+        # keeps the previous full resolution.
+        def _resolved_name(by_id, parent_id, visible):
+            if visible is not None and parent_id not in visible:
+                return None
+            parent = by_id.get(parent_id)
+            return parent.name if parent is not None else None
+
         def _club_row(c):
             return {"id": c.id, "name": c.name}
 
         def _org_row(o):
             return {"id": o.id, "name": o.name, "short_name": o.short_name}
 
-        def _official_row(o):
+        def _official_row(o, visible=None):
             return {"id": o.id, "name": o.name,
-                    "home_club_name": (clubs_by_id[o.home_club_id].name
-                                       if o.home_club_id in clubs_by_id
-                                       else None)}
+                    "home_club_name": _resolved_name(
+                        clubs_by_id, o.home_club_id, visible)}
 
-        def _venue_row(v):
+        def _venue_row(v, visible=None):
             return {"id": v.id, "name": v.name, "address": v.address,
                     "timezone": v.timezone,
                     "organization_id": v.organization_id,
-                    "organization_name": (orgs_by_id[v.organization_id].name
-                                          if v.organization_id in orgs_by_id
-                                          else None)}
+                    "organization_name": _resolved_name(
+                        orgs_by_id, v.organization_id, visible)}
 
-        def _rink_row(r):
+        def _rink_row(r, visible=None):
             return {"id": r.id, "venue_id": r.venue_id, "name": r.name,
-                    "venue_name": (venues_by_id[r.venue_id].name
-                                   if r.venue_id in venues_by_id else None)}
+                    "venue_name": _resolved_name(
+                        venues_by_id, r.venue_id, visible)}
 
-        def _slot_row(ic):
+        def _slot_row(ic, visible=None):
             return {"id": ic.id, "rink_id": ic.rink_id,
                     "start_time": ic.start_time.isoformat(),
                     "end_time": ic.end_time.isoformat(),
                     "slot_type": ic.slot_type.value, "status": ic.status.value,
-                    "rink_name": (rinks_by_id[ic.rink_id].name
-                                  if ic.rink_id in rinks_by_id else None)}
+                    "rink_name": _resolved_name(
+                        rinks_by_id, ic.rink_id, visible)}
+
+        # What a PENDING row may resolve a parent name against: this caller's
+        # scoped list for that kind, plus its own pending list for that kind
+        # (a Rink the caller created under a Venue it also created must still
+        # render the Venue's name — that is the create-then-link flow itself).
+        # Anything else is a record this caller was never shown, so its name
+        # is withheld. Built unconditionally: in the unfiltered shape every
+        # pending list is empty, so these sets are never consulted there.
+        visible_club_ids = {c.id for c in clubs} | {c.id for c in pending_clubs}
+        visible_org_ids = {o.id for o in orgs} | {o.id for o in pending_orgs}
+        visible_venue_ids = ({v.id for v in venues}
+                             | {v.id for v in pending_venues})
+        visible_rink_ids = {r.id for r in rinks} | {r.id for r in pending_rinks}
 
         return {
             "programs": [
@@ -5212,14 +5305,23 @@ class ApiService:
             # flow, and by nobody else. Always empty for the unfiltered
             # (`role=None` / zero-Program bootstrap) case, where the main
             # lists above are already unfiltered.
+            # Parent LABELS on these rows resolve only against what this
+            # caller can already see -- its own scoped list plus its own
+            # pending list -- so creating a child under a guessed parent id
+            # cannot read that parent's name back out (see `_resolved_name`).
             "pending_link_clubs": [_club_row(c) for c in pending_clubs],
             "pending_link_organizations": [_org_row(o) for o in pending_orgs],
-            "pending_link_officials": [_official_row(o) for o in pending_officials],
-            "pending_link_venues": [_venue_row(v) for v in pending_venues],
-            "pending_link_rinks": [_rink_row(r) for r in pending_rinks],
-            "pending_link_ice_slots": [_slot_row(ic) for ic in
-                                       sorted(pending_slots,
-                                              key=lambda x: (x.rink_id, x.start_time))],
+            "pending_link_officials": [
+                _official_row(o, visible_club_ids)
+                for o in pending_officials],
+            "pending_link_venues": [
+                _venue_row(v, visible_org_ids) for v in pending_venues],
+            "pending_link_rinks": [
+                _rink_row(r, visible_venue_ids) for r in pending_rinks],
+            "pending_link_ice_slots": [
+                _slot_row(ic, visible_rink_ids) for ic in
+                sorted(pending_slots,
+                       key=lambda x: (x.rink_id, x.start_time))],
         }
 
     @catch

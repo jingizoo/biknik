@@ -38,7 +38,7 @@ the contract — not drift.
 
 | Read | Program | Season | League |
 |------|---------|--------|--------|
-| `get_setup_progress` (Home / Tasks) | mandatory | resolved | narrows teams, roster, participation only |
+| `get_setup_progress` (Home / Tasks) | mandatory | **hard ceiling** for participation/facilities (Program-only is empty); league_season/teams/roster unaffected | narrows teams, roster, participation only |
 | `get_demo_overview` (Dashboard) | mandatory | **hard ceiling** | narrows within the Season |
 | `get_standings` | must match active | **required, must match exactly** | must match when one is selected |
 | `get_setup_overview_v2` (Setup) | **the ceiling** | **hard ceiling** | narrows divisions, teams, clubs, officials |
@@ -100,6 +100,25 @@ Two workflows are deliberately **invariant** to League selection:
 `league_season` ("League profile and seasons") is a Program-wide structural
 integrity check, and `facilities` has no competition-League axis at all (see
 [Venues have no League axis](#venues-have-no-league-axis)).
+
+**The active Season is a hard ceiling for the two Season-BOUND workflows** —
+"Season participation and divisions" (a SeasonTeamRegistration/Division
+reaches its Season only through a `LeagueSeason`) and "Venues, rinks and ice"
+(reaches its Season only through a `SeasonVenueAccess` grant) — per the #367
+owner ruling: **Program-only must be empty for those workflows**, never the
+union of every Season the Program has. `in_scope_season_ids = {season.id} if
+season is not None else set()` is the exact idiom `get_demo_overview` already
+uses for its own Season-scoped collections (see below); this read names the
+same set for the same reason, so both contracts stay auditable against one
+pattern instead of two independently-invented ones.
+
+The other three workflows are deliberately **not** Season-bound, and stay
+identical across every Season selection, Program-only included:
+`league_season` is a Program-wide integrity check *about* every Season
+collectively (not a per-Season fact — "does EVERY Season have a League"),
+and `teams`/`roster` ("Permanent teams" / "Clubs, players and staff") key off
+`Team`/`Player`, neither of which carries a Season field at all — a selected
+League can narrow them (see above), but no Season selection ever does.
 
 ### `get_demo_overview` — Dashboard
 
@@ -301,21 +320,76 @@ through one helper (`withPendingLink(sv, key)` in `web/static/app.js`), so the
 operator performing a create-then-link keeps seeing their fresh record right up
 until its first real link narrows it — and nobody else ever sees it.
 
-Two restrictions make that an ownership signal rather than a second disclosure
-path, and both are asserted:
+Four restrictions make that an ownership signal rather than a second disclosure
+path. Each is asserted in `tests/test_pending_link_ownership.py` across
+Memory/SQLite/PostgreSQL **and** authenticated HTTP, and each was
+mutation-proven — reverting the guard makes the matching assertion fail:
 
+- **Ownership is the authenticated account id, never a caller-supplied value.**
+  `actor_id` on the create audit row is always the server-resolved session
+  `user_id` (`_resolve_role` reads it from the server-side session record), and
+  `user_id` on the read is the same value. No write path lets a request body
+  influence it: `_handle_setup` / `_handle_setup_v2` take `actor_id` as a
+  parameter the router supplies, and `test_actor_attribution.py` rejects a
+  forged body `actor_id` outright.
 - **Only the CREATE entry counts.** Any later write (rename, reassign, delete)
-  is ignored, so poking an id you were never shown can never become permission
-  to enumerate it afterwards.
+  is ignored, and `action` must equal `f"{entity_type}_created"` — both halves,
+  so a `club_created` row filed under `entity_type="venue"` matches nothing.
+  Poking an id you were never shown can never become permission to enumerate
+  it afterwards.
 - **`user_id=None` owns nothing.** An identity-less caller gets empty lists
   rather than matching every `actor_id=None` row an internal or seed call path
   ever wrote.
+- **A pending row's parent LABELS resolve only against what the caller can
+  already see** — its own scoped list plus its own pending list. Ownership
+  authorizes *the row*, never the foreign records it points at. Without this,
+  the create routes were a name oracle: they take a parent id verbatim from the
+  request body and never check the caller may see that parent, and ids are
+  sequential, so an Arena Manager (MANAGE_ARENA covers the venue/rink/ice-slot/
+  organization creates *and* this read, at zero authorized Programs) could POST
+  a Rink at `venue_N`, an IceSlot at `rink_N`, a Venue at `org_N` or an Official
+  homed at `club_N` and read another operator's never-linked `venue_name` /
+  `rink_name` / `organization_name` / `home_club_name` straight back out of its
+  own pending row. The parent *id* the caller itself supplied stays; the name
+  goes `null`. The caller's own create-then-link chain is unaffected — a Rink
+  under a Venue it created still renders that Venue's name.
 
-One consequence to keep in mind when reading demo data: records created by the
-seed (`actor_id="league_admin"`, not an account id) and never linked to
-anything — the seeded club with no teams — are owned by nobody and therefore
-show for nobody. That is the contract working, not a bug; linking such a record
-(or recreating it through the UI) brings it back.
+**Lifecycle.** A row leaves `pending_link_*` the instant any validated Program
+link exists, and reappears in the normal scoped list for the Program it is now
+linked to (a Club once a Team is in it; a Venue once a `SeasonVenueAccess`
+grant exists, with its Rinks/IceSlots cascading and its owning Organization
+following through the Venue). It is then that Program's data, governed by the
+active-tuple ceiling like everything else — so a second operator authorized for
+that same Program *does* get it, through the scoped list, and never through
+anyone's pending list.
+
+**A deactivated (or departed) creator's rows go to nobody.** They stay keyed to
+that account's id, which no other session can present — deactivation revokes
+the account's sessions *and* `SessionManager.resolve` independently rejects a
+session whose account is inactive, and login refuses it. So the rows fail
+closed: not inherited by the admin who deactivated the account, not released
+into any installation-wide pool, and not picked up by a later account (ids come
+from a monotonic per-prefix counter and are never recycled, so even reusing the
+freed username yields a different id). Reactivation restores exactly the
+creator's own view. There is deliberately **no** "creator account must still
+exist" check inside the read: `user_id` *is* the caller's proven identity,
+established at the HTTP boundary, and re-deriving authorization from account
+state would add a second, weaker signal that an attacker able to present the
+id has already bypassed anyway.
+
+**Demo seed.** Seeded records are attributed to `full_demo.DEMO_ADMIN_ACCOUNT_ID`
+(`"user_admin"`) — the account id `_seed_demo_accounts` / `_seed_admin_account`
+actually mint for the "admin" persona. This used to be the string
+`"league_admin"`, which is a *role name*, not an account id: no session's
+`user_id` could ever equal it, so every seeded record with no Program link was
+owned by nobody and visible to nobody — concretely the 17 seeded Officials with
+neither a home Club that has a Team nor a game assignment, present in the store
+and unreachable in the UI. The ruling's remedy is to link such data or attribute
+it to a real account; a read-side bypass for synthetic actor labels is **not**
+an option, since it would hand rows to callers who authenticated as nobody and
+reopen the disclosure the ruling reversed. The test resolves the seed's actor
+against the seeded accounts, so a rename on either side fails there rather than
+silently orphaning the demo data again.
 
 ### Bootstrap vs. denial
 
