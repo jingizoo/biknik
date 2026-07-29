@@ -487,14 +487,39 @@ class StandingsActiveContextMatrixTest(unittest.TestCase):
                     "unbound": fixture["unbound"]["division"]["id"],
                     "archived_non_active": fixture["archived"]["division"]["id"],
                 }
+                # #369 self-audit: the response-shape check alone is VACUOUS
+                # for `deleted` and `unbound`. Deleting a Division (or its
+                # LeagueSeason binding) leaves the registration lookup
+                # resolving to nothing, so those two ids return the empty
+                # shape even with the gate removed entirely -- mutation
+                # confirmed dropping the chain-missing clause left this file
+                # green. So assert the GATE ITSELF rejects each id, which is
+                # the actual claim ("the requested division's validated
+                # LeagueSeason -> Season -> Program chain must match"), and
+                # keep the shape check as the non-disclosure half.
+                program, season, league = api.context.resolve_with_league(*admin)
                 for case, div_id in negative_cases.items():
                     with self.subTest(backend=label, case=case):
+                        self.assertFalse(
+                            api._division_matches_active_context(
+                                div_id, program, season, league),
+                            f"{label}/{case}: the active-context gate ACCEPTED "
+                            f"this division -- any empty result is then "
+                            f"incidental, not enforced")
                         result = api.get_standings(div_id, *admin)
                         self.assertEqual(
                             result, {"division_id": div_id, "standings": []},
                             f"{label}/{case}: must return the identical "
                             f"generic empty shape, never a distinguishable "
                             f"error or partial disclosure")
+                # Control: the gate ACCEPTS the active Division, so the
+                # assertions above cannot pass by rejecting everything.
+                self.assertTrue(
+                    api._division_matches_active_context(
+                        fixture["active"]["division"]["id"], program, season,
+                        league),
+                    f"{label}: the gate rejected the admin's OWN active "
+                    f"Division -- the negative assertions are meaningless")
 
                 # Positive: an ARCHIVED Season explicitly SELECTED as the
                 # active tuple is honored as read-only history -- it is not
