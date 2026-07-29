@@ -357,6 +357,15 @@ class CalendarHttpTest(unittest.TestCase):
         admin = self._client()
         self._req(admin, "POST", "/api/auth/login",
                   {"username": "admin", "password": "demo"})
+        # #369 review: /api/demo/overview's setup_audit now scopes to the
+        # caller's ACTIVE Program -- this class shares one server/store
+        # across every test method (setUpClass runs once), and the admin
+        # account's active-context fallback is not guaranteed to keep
+        # landing on the Alpine Program `self.home` belongs to as other
+        # tests run. Pin it explicitly rather than relying on the
+        # auto-fallback, so this audit-visibility assertion is deterministic.
+        self._req(admin, "POST", "/api/context",
+                  {"program_id": self.srv.STATE.ids["league_id"]})
         _, _, created = self._req(
             admin, "POST", "/api/calendar-feeds",
             {"actor_type": "team", "actor_ref": self.home,

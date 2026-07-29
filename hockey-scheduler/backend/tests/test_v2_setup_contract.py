@@ -324,6 +324,17 @@ class V2SetupContractTest(unittest.TestCase):
         venue = self._v2(c, "venue",
                         {"name": "OvV", "organization_id": org["id"]})
 
+        # #369 review: /api/v2/setup/overview now ceilings its `programs`
+        # (and everything under it) to the caller's ACTIVE Program rather
+        # than every authorized Program -- this shared-store test class
+        # (setUpClass runs once) may have created other Programs in earlier
+        # test methods, so pin the context to THIS test's own Program
+        # explicitly rather than relying on whichever one the auto-fallback
+        # happens to pick.
+        status, _ = self._req(c, "POST", "/api/context",
+                              {"program_id": program["id"]})
+        self.assertEqual(status, 200)
+
         status, ov = self._req(c, "GET", "/api/v2/setup/overview")
         self.assertEqual(status, 200, ov)
         # Flat canonical lists exist for every setup entity.
@@ -350,7 +361,13 @@ class V2SetupContractTest(unittest.TestCase):
         # League-aware consumer needs to filter client-side.
         self.assertEqual(t["league_id"], league["id"])
 
-        v = next(x for x in ov["venues"] if x["id"] == venue["id"])
+        # #369 review: a Venue is only in the strictly-scoped `venues` list
+        # once it has a SeasonVenueAccess grant into the active Program's
+        # seasons -- a just-created, not-yet-granted Venue like this one
+        # lives in the additive `unassigned_venues` bootstrap bucket instead
+        # (still safe to disclose: it is linked to no Program at all).
+        v = next(x for x in ov["venues"] + ov["unassigned_venues"]
+                if x["id"] == venue["id"])
         self.assertEqual(v["organization_id"], org["id"])
         # Canonical Venue is org-owned only — the temporary program link is NOT
         # exposed here (managed via the v1 assign-league bridge until Slice E).

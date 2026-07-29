@@ -1,243 +1,563 @@
-"""get_setup_overview_v2's authorized-Program-set scoping axis (#367).
+"""``get_setup_overview_v2``'s active-Program scoping axis (#369 rearchitecture).
 
-``test_v2_setup_contract.py`` already covers this endpoint's canonical field
-shapes over real HTTP (including the additive ``teams[].league_id`` DTO field
-itself, in ``test_v2_overview_canonical_flat_lists``) — this file does not
-repeat that. It covers only what #367 actually changed: the endpoint used to
-be fully global/unfiltered (every Program in the installation, regardless of
-caller); it now scopes Programs/Seasons/Leagues/Divisions/Teams to the
-caller's full ``context_scope.authorized_program_ids`` set when a real
-``role`` is supplied, while leaving the no-role default (still used by a
-couple of pre-#367 direct call sites, e.g. ``test_season_lifecycle.py``) and
-the Venue/Rink/IceSlot/Club/Organization/Official reference data fully
-unfiltered either way.
+This file replaces the pre-review version of itself, which encoded the OLD
+(#367-era) contract: a scoped role saw its FULL authorized Program set, and
+Club/Organization/Official/Venue/Rink/IceSlot reference data stayed globally
+unfiltered no matter what. #369 review corrected both of those:
 
-Facade-level only (``ApiService(InMemoryStore())`` directly): the HTTP route's
-auth gate and canonical shape are already exercised end to end in
-``test_v2_setup_contract.py``; the scoping logic itself has no HTTP-specific
-angle, so one facade-level pass is sufficient here, mirroring
-``test_setup_progress.py``'s own facade-vs-HTTP split.
+* ``programs`` (and everything derived from it) now collapses to the single
+  persisted ACTIVE Program (``ContextService.resolve_with_league`` — the same
+  ceiling the Dashboard and Setup Progress reads already use), never the
+  caller's whole authorized set. The context BAR is the cross-Program picker;
+  this structural surface only ever operates within whichever one Program is
+  currently active. A selected League further narrows Teams/Divisions only —
+  Season is NOT a further filter here (unlike the Dashboard): every Season of
+  the active Program is always offered.
+* Club/Organization/Official/Venue/Rink/IceSlot are no longer disclosed
+  globally: each is included only via a real, validatable chain into the
+  active Program (a Club with >=1 Team there, an Organization owning an
+  in-scope Venue, a Venue with an active ``SeasonVenueAccess`` grant to one of
+  the Program's Seasons, an Official whose home Club is in-scope or who has an
+  assignment there). The additive ``unassigned_*`` lists carry records with NO
+  chain to ANY Program at all, so create-then-link UI flows (assign a fresh
+  Club to a Team, grant a fresh Venue to a Season, ...) keep working without
+  reintroducing cross-Program leakage.
+* A brand-new install with ZERO Programs anywhere still gets the full
+  unfiltered legacy shape (nothing exists yet to leak); a role authorized for
+  ZERO Programs while OTHER Programs already exist instead gets the fully
+  scoped-empty shape (every derived-join set is naturally empty too, since
+  nothing can validate against a Program that never resolved) except for the
+  ``unassigned_*`` lists, which stay populated — they disclose nothing
+  Program-specific by construction.
 
-Today only League Admin and Arena Manager reach this endpoint via HTTP, and
-both are "global" roles (``context_scope._GLOBAL_ROLES``) — so scoping is a
-real no-op for them. To actually exercise the narrowing, some tests below
-call the facade directly with a Coach role/scope (whose ``authorized_
-program_ids`` narrows to a single Team's Program, per ``context_scope.py``)
-even though no HTTP route currently lets a Coach reach this endpoint — the
-facade-level authorization logic must still narrow correctly for ANY
-role/scope it is given, independent of which roles the route permits today.
+Facade-level only (``ApiService`` directly over each supported store): the
+HTTP route's auth gate and canonical DTO shape are already exercised end to
+end in ``test_v2_setup_contract.py``; this file is the scoping logic itself,
+across the full Memory/SQLite/(optional)PostgreSQL backend matrix per the
+review's explicit "parametrize the store" requirement (mirroring
+``test_active_context_league.py``), and across the full role matrix (League
+Admin, Coach, Player, Guardian, Official, Arena Manager, Viewer) per the
+review's explicit "exercise every role, not just Coach/League Admin"
+requirement.
 """
 
+import os
 import unittest
+from datetime import datetime, timezone
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import Role
-from hockey_scheduler.store import InMemoryStore
+from hockey_scheduler.domain import GuardianLink, OfficialRole, Role
+from hockey_scheduler.domain.models import Game
+from hockey_scheduler.domain.setup_models import OfficialAssignment
+from hockey_scheduler.store import InMemoryStore, SqlStore
 
 _ALL_OVERVIEW_KEYS = (
     "programs", "seasons", "leagues", "divisions", "teams", "clubs",
     "organizations", "officials", "venues", "rinks", "ice_slots",
 )
+_ALL_UNASSIGNED_KEYS = (
+    "unassigned_clubs", "unassigned_organizations", "unassigned_officials",
+    "unassigned_venues", "unassigned_rinks", "unassigned_ice_slots",
+)
+
+_TS = datetime(2027, 1, 1, tzinfo=timezone.utc)
+
+# Every role the endpoint must scope correctly, independent of which roles the
+# HTTP route permits today (#369 review: the facade's own authorization logic
+# must narrow correctly for ANY role/scope it is given).
+_ROLE_MATRIX = (Role.LEAGUE_ADMIN, Role.ARENA_MANAGER, Role.VIEWER,
+               Role.COACH, Role.PLAYER, Role.GUARDIAN, Role.OFFICIAL)
+
+
+def _backends():
+    yield "memory", InMemoryStore()
+    yield "sqlite", SqlStore(":memory:")
+    url = os.environ.get("TEST_DATABASE_URL")
+    if url:
+        SqlStore(url).clear_all_data()
+        yield "postgres", SqlStore(url)
+
+
+def _close(store):
+    if isinstance(store, SqlStore):
+        store.close()
+
+
+def _assign_game(api, official_id, *, season_id, team_id):
+    """Assign ``official_id`` to a minimal REGULAR Game under ``season_id`` —
+    enough for ``context_scope``'s Official-authorization branch (which reads
+    only the Game's ``season_id``) and for the endpoint's own
+    assignment-based Official-inclusion branch (same field)."""
+    store = api.store
+    with store.transaction():
+        gid = store.next_id("game")
+        store.add_game(Game(id=gid, home_team_id=team_id, away_team_id=team_id,
+                            start_time=None, season_id=season_id))
+        store.add_official_assignment(OfficialAssignment(
+            id=store.next_id("assign"), game_id=gid, official_id=official_id,
+            role=OfficialRole.REFEREE))
+    return gid
 
 
 class LeagueFilteredOverviewV2Test(unittest.TestCase):
-    """Facade-level, Memory-backed: mirrors ``SetupProgressComputationTest``'s
-    own reasoning (a pure read composed from store methods that already carry
-    their own Memory/SQLite/PostgreSQL parity coverage elsewhere)."""
-
-    def _api(self):
-        return ApiService(InMemoryStore())
-
-    def _build_stack(self, api, label):
-        """One full Program → Season → League → Division → Club → Team stack
-        labeled ``label``, with the Team's PERMANENT competition League
-        (``Team.league_id``, #283) set explicitly."""
-        program = api.create_program(f"Program {label}")
-        self.assertNotIn("error", program, program)
-        season = api.create_season(program["id"], f"Season {label}")
-        self.assertNotIn("error", season, season)
-        league = api.create_league(season["id"], f"League {label}")
-        self.assertNotIn("error", league, league)
-        division = api.create_division(season["id"], f"Division {label}",
-                                       league_id=league["id"])
-        self.assertNotIn("error", division, division)
-        club = api.create_club(f"Club {label}")
-        self.assertNotIn("error", club, club)
-        team = api.create_team(club_id=club["id"], division_id=division["id"],
-                               name=f"Team {label}", program_id=program["id"],
-                               league_id=league["id"])
-        self.assertNotIn("error", team, team)
-        return {"program": program, "season": season, "league": league,
-                "division": division, "club": club, "team": team}
+    """Facade-level, Memory/SQLite/(optional)PostgreSQL-parametrized: mirrors
+    ``test_active_context_league.py``'s own backend-matrix discipline for a
+    pure read composed from store methods."""
 
     def _ids(self, ov, key):
         return {row["id"] for row in ov[key]}
 
+    def _build_program_env(self, api, label):
+        """One two-League Program environment labeled ``label``: 2 Seasons,
+        2 sibling Leagues (each bound to its own Season), 2 Divisions, 2
+        Clubs, 2 Teams (one permanently in each League, registered into its
+        League's Season), 1 Organization owning 1 Venue (granted active
+        ``SeasonVenueAccess`` to Season 1), 1 Rink, 1 IceSlot, and 1 Official
+        (home club = Club 1) — rich enough to prove both the Program axis
+        (vs. a sibling Program) and the League axis (vs. a sibling League
+        within the SAME Program)."""
+        program = api.create_program(f"Program {label}", "US", "UTC")
+        self.assertNotIn("error", program, program)
+        season1 = api.create_season(program["id"], f"Season {label}1")
+        self.assertNotIn("error", season1, season1)
+        season2 = api.create_season(program["id"], f"Season {label}2")
+        self.assertNotIn("error", season2, season2)
+        league1 = api.create_league(season1["id"], f"League {label}1")
+        self.assertNotIn("error", league1, league1)
+        league2 = api.create_league(season2["id"], f"League {label}2")
+        self.assertNotIn("error", league2, league2)
+        division1 = api.create_division(season1["id"], f"Division {label}1",
+                                        league_id=league1["id"])
+        self.assertNotIn("error", division1, division1)
+        division2 = api.create_division(season2["id"], f"Division {label}2",
+                                        league_id=league2["id"])
+        self.assertNotIn("error", division2, division2)
+        club1 = api.create_club(f"Club {label}1")
+        self.assertNotIn("error", club1, club1)
+        club2 = api.create_club(f"Club {label}2")
+        self.assertNotIn("error", club2, club2)
+        team1 = api.create_team(club_id=club1["id"], division_id=division1["id"],
+                                name=f"Team {label}1", program_id=program["id"],
+                                league_id=league1["id"])
+        self.assertNotIn("error", team1, team1)
+        team2 = api.create_team(club_id=club2["id"], division_id=division2["id"],
+                                name=f"Team {label}2", program_id=program["id"],
+                                league_id=league2["id"])
+        self.assertNotIn("error", team2, team2)
+        reg1 = api.register_team_for_season(season1["id"], team1["id"],
+                                            division1["id"],
+                                            league_id=league1["id"])
+        self.assertNotIn("error", reg1, reg1)
+        reg2 = api.register_team_for_season(season2["id"], team2["id"],
+                                            division2["id"],
+                                            league_id=league2["id"])
+        self.assertNotIn("error", reg2, reg2)
+        org = api.create_organization(f"Org {label}")
+        self.assertNotIn("error", org, org)
+        venue = api.create_venue(f"Venue {label}", organization_id=org["id"])
+        self.assertNotIn("error", venue, venue)
+        sva = api.grant_season_venue_access(season1["id"], venue["id"])
+        self.assertNotIn("error", sva, sva)
+        rink = api.create_rink(venue["id"], f"Rink {label}")
+        self.assertNotIn("error", rink, rink)
+        slot = api.create_ice_slot(
+            rink["id"], "2026-09-01T18:30:00+00:00", "2026-09-01T20:00:00+00:00")
+        self.assertNotIn("error", slot, slot)
+        official = api.create_official(f"Official {label}",
+                                       home_club_id=club1["id"])
+        self.assertNotIn("error", official, official)
+        return {"program": program, "season1": season1, "season2": season2,
+                "league1": league1, "league2": league2,
+                "division1": division1, "division2": division2,
+                "club1": club1, "club2": club2, "team1": team1, "team2": team2,
+                "org": org, "venue": venue, "rink": rink, "slot": slot,
+                "official": official}
+
+    def _role_scope_for(self, api, role, env, label):
+        """``(user_id, scope, extra_official_id)`` for ``role``, authorized
+        for ONLY ``env``'s Program — constructing whatever real subject row
+        (Player / assigned Official / verified GuardianLink) that role's own
+        ``context_scope`` resolution requires. ``extra_official_id`` is the id
+        of a side-effect Official row (Official role only); callers must
+        account for its presence in ``officials``."""
+        team1 = env["team1"]
+        if role in (Role.LEAGUE_ADMIN, Role.ARENA_MANAGER, Role.VIEWER):
+            return f"user_{role.value}_{label}", {}, None
+        if role == Role.COACH:
+            return f"coach_{label}", {"team_id": team1["id"]}, None
+        if role == Role.PLAYER:
+            player = api.create_player(team1["id"], f"Player {label}", "forward")
+            self.assertNotIn("error", player, player)
+            return f"player_{label}", {"player_id": player["id"]}, None
+        if role == Role.OFFICIAL:
+            official = api.create_official(f"Caller Official {label}")
+            self.assertNotIn("error", official, official)
+            _assign_game(api, official["id"], season_id=env["season1"]["id"],
+                        team_id=team1["id"])
+            return (f"official_{label}", {"official_id": official["id"]},
+                    official["id"])
+        if role == Role.GUARDIAN:
+            player = api.create_player(team1["id"], f"Junior {label}", "forward")
+            self.assertNotIn("error", player, player)
+            uid = f"guardian_{label}"
+            with api.store.transaction():
+                api.store.add_guardian_link(GuardianLink(
+                    id=api.store.next_id("glink"), guardian_user_id=uid,
+                    player_id=player["id"], created_at=_TS, verified=True))
+            return uid, {}, None
+        raise AssertionError(f"unhandled role {role}")
+
     # -- 1. no-role default stays the full, unfiltered installation view -----
     def test_no_role_returns_full_unfiltered_installation_view(self):
-        """Unchanged pre-#367 behavior when ``role`` is left ``None`` (the
-        default) — confirming the exact default a couple of pre-#367 direct
-        call sites (``test_season_lifecycle.py``) rely on, unmodified."""
-        api = self._api()
-        a = self._build_stack(api, "A")
-        b = self._build_stack(api, "B")
+        """Unchanged legacy behavior when ``role`` is left ``None`` (the
+        default) — a couple of pre-#367 direct call sites
+        (``test_season_lifecycle.py``) rely on this exact shape."""
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                a = self._build_program_env(api, "A")
+                b = self._build_program_env(api, "B")
 
-        ov = api.get_setup_overview_v2()
-        self.assertNotIn("error", ov, ov)
+                ov = api.get_setup_overview_v2()
+                self.assertNotIn("error", ov, ov)
 
-        self.assertEqual(
-            {a["program"]["id"], b["program"]["id"]} - self._ids(ov, "programs"),
-            set())
-        self.assertEqual(
-            {a["season"]["id"], b["season"]["id"]} - self._ids(ov, "seasons"),
-            set())
-        self.assertEqual(
-            {a["league"]["id"], b["league"]["id"]} - self._ids(ov, "leagues"),
-            set())
-        self.assertEqual(
-            {a["division"]["id"], b["division"]["id"]}
-            - self._ids(ov, "divisions"), set())
-        self.assertEqual(
-            {a["team"]["id"], b["team"]["id"]} - self._ids(ov, "teams"), set())
+                expected = (
+                    ("programs", {a["program"]["id"], b["program"]["id"]}),
+                    ("seasons", {a["season1"]["id"], a["season2"]["id"],
+                                b["season1"]["id"], b["season2"]["id"]}),
+                    ("leagues", {a["league1"]["id"], a["league2"]["id"],
+                                b["league1"]["id"], b["league2"]["id"]}),
+                    ("divisions", {a["division1"]["id"], a["division2"]["id"],
+                                  b["division1"]["id"], b["division2"]["id"]}),
+                    ("teams", {a["team1"]["id"], a["team2"]["id"],
+                              b["team1"]["id"], b["team2"]["id"]}),
+                    ("clubs", {a["club1"]["id"], a["club2"]["id"],
+                              b["club1"]["id"], b["club2"]["id"]}),
+                    ("organizations", {a["org"]["id"], b["org"]["id"]}),
+                    ("venues", {a["venue"]["id"], b["venue"]["id"]}),
+                    ("rinks", {a["rink"]["id"], b["rink"]["id"]}),
+                    ("ice_slots", {a["slot"]["id"], b["slot"]["id"]}),
+                    ("officials", {a["official"]["id"], b["official"]["id"]}),
+                )
+                for key, ids in expected:
+                    self.assertEqual(self._ids(ov, key), ids, (label, key))
 
-    # -- 2. global role (today's actual callers) sees EVERY Program ----------
-    def test_global_role_sees_both_programs_full_structure(self):
-        """League Admin (a ``_GLOBAL_ROLES`` member) supplies a real role/scope
-        but must see NO behavior change from point 1 — the "no visible
-        behavior change for today's actual roles" half of the #367 design."""
-        api = self._api()
-        a = self._build_stack(api, "A")
-        b = self._build_stack(api, "B")
+                # unassigned_* are always empty in the unfiltered shape — the
+                # main lists above are already unfiltered, so there is nothing
+                # additive left to offer.
+                for key in _ALL_UNASSIGNED_KEYS:
+                    self.assertEqual(ov[key], [], (label, key))
+                _close(store)
 
-        ov = api.get_setup_overview_v2("admin1", Role.LEAGUE_ADMIN, {})
-        self.assertNotIn("error", ov, ov)
+    # -- 2. zero Programs anywhere: bootstrap matches the no-role shape ------
+    def test_bootstrap_with_zero_programs_matches_the_unfiltered_norole_shape(self):
+        """A brand-new install with LITERALLY no Program yet: even a real
+        role/scope must fall through to the exact same unfiltered shape as
+        ``role=None`` — there is no "other Program" for such an install to
+        leak, so this is a bootstrap read, not a denial."""
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                no_role = api.get_setup_overview_v2()
+                self.assertNotIn("error", no_role, no_role)
+                with_role = api.get_setup_overview_v2(
+                    "someone", Role.COACH, {"team_id": "team_does_not_exist"})
+                self.assertNotIn("error", with_role, with_role)
 
-        for key, stack_key in (("programs", "program"), ("seasons", "season"),
-                               ("leagues", "league"),
-                               ("divisions", "division"),
-                               ("teams", "team")):
-            ids = self._ids(ov, key)
-            self.assertIn(a[stack_key]["id"], ids, (key, "A missing"))
-            self.assertIn(b[stack_key]["id"], ids, (key, "B missing"))
+                self.assertEqual(with_role, no_role, label)
+                for key in _ALL_OVERVIEW_KEYS + _ALL_UNASSIGNED_KEYS:
+                    self.assertEqual(no_role[key], [], (label, key))
+                _close(store)
 
-    # -- 3. a scoped role/scope actually narrows ------------------------------
-    def test_scoped_role_narrows_to_single_authorized_program(self):
-        """A Coach scoped to a Team in Program A (``context_scope.
-        authorized_program_ids`` resolves a Coach to exactly its own Team's
-        Program) sees ONLY Program A's structure — Program B's
-        programs/seasons/leagues/divisions/teams are entirely absent. No HTTP
-        route lets a Coach reach this endpoint today; the facade's own
-        authorization logic is what's under test here."""
-        api = self._api()
-        a = self._build_stack(api, "A")
-        b = self._build_stack(api, "B")
+    # -- 3. every role in the matrix narrows to its OWN active Program -------
+    def test_role_matrix_each_role_narrows_to_its_active_program(self):
+        """League Admin, Arena Manager, Viewer, Coach, Player, Guardian, and
+        Official each independently resolve to Program A (never Program B,
+        which also exists in the same installation) once Program A is set as
+        the active context — proving both the full role matrix (#369 review)
+        and that EVERY collection (Programs/Seasons/Leagues/Divisions/Teams/
+        Clubs/Organizations/Officials/Venues/Rinks/IceSlots) excludes a
+        sibling Program's rows, for every role, not just Coach/League Admin."""
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                a = self._build_program_env(api, "A")
+                self._build_program_env(api, "B")  # never expected to appear
 
-        scope = {"team_id": a["team"]["id"]}
-        ov = api.get_setup_overview_v2("coach1", Role.COACH, scope)
-        self.assertNotIn("error", ov, ov)
+                for role in _ROLE_MATRIX:
+                    with self.subTest(backend=label, role=role.value):
+                        user_id, scope, extra_official_id = (
+                            self._role_scope_for(api, role, a, "A"))
+                        ctx = api.set_active_context(
+                            user_id, role, scope, a["program"]["id"], None, None)
+                        self.assertNotIn("error", ctx, (label, role, ctx))
+                        self.assertEqual(ctx["program_id"], a["program"]["id"])
 
-        for key, stack_key in (("programs", "program"), ("seasons", "season"),
-                               ("leagues", "league"),
-                               ("divisions", "division"),
-                               ("teams", "team")):
-            ids = self._ids(ov, key)
-            self.assertIn(a[stack_key]["id"], ids, (key, "A should be visible"))
-            self.assertNotIn(b[stack_key]["id"], ids,
-                             (key, "B should be narrowed out"))
+                        ov = api.get_setup_overview_v2(user_id, role, scope)
+                        self.assertNotIn("error", ov, (label, role, ov))
 
-    # -- 4. an empty authorized set is a fully-empty shape, not an error -----
-    def test_empty_authorized_program_set_returns_fully_empty_shape(self):
+                        expected = (
+                            ("programs", {a["program"]["id"]}),
+                            ("seasons", {a["season1"]["id"],
+                                        a["season2"]["id"]}),
+                            ("leagues", {a["league1"]["id"],
+                                        a["league2"]["id"]}),
+                            ("divisions", {a["division1"]["id"],
+                                          a["division2"]["id"]}),
+                            ("teams", {a["team1"]["id"], a["team2"]["id"]}),
+                            ("clubs", {a["club1"]["id"], a["club2"]["id"]}),
+                            ("organizations", {a["org"]["id"]}),
+                            ("venues", {a["venue"]["id"]}),
+                            ("rinks", {a["rink"]["id"]}),
+                            ("ice_slots", {a["slot"]["id"]}),
+                        )
+                        for key, ids in expected:
+                            # Exact equality: since it never includes any of
+                            # Program B's (differently-id'd) rows, this proves
+                            # exclusion, not merely presence of Program A's.
+                            self.assertEqual(
+                                self._ids(ov, key), ids, (label, role, key))
+
+                        expected_officials = {a["official"]["id"]}
+                        if extra_official_id:
+                            expected_officials.add(extra_official_id)
+                        self.assertEqual(
+                            self._ids(ov, "officials"), expected_officials,
+                            (label, role))
+                _close(store)
+
+    # -- 4. a selected League narrows Teams/Divisions only -------------------
+    def test_selected_league_narrows_teams_and_divisions_but_not_program_level_data(self):
+        """Within Program A (which has two sibling Leagues, A1 and A2),
+        selecting League A1 narrows Teams/Divisions down to League A1's own —
+        but Clubs/Organizations/Venues/Rinks/IceSlots/Officials are Program-
+        level, not League-level, and stay at their full Program-A scope
+        (both Leagues' Clubs still show). Seasons/Leagues themselves are
+        never narrowed by the selection either — every one of the Program's
+        is still offered so the operator can pick a different one."""
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                a = self._build_program_env(api, "A")
+
+                scope = {"team_id": a["team1"]["id"]}
+                ctx = api.set_active_context(
+                    "coach_a", Role.COACH, scope, a["program"]["id"], None,
+                    a["league1"]["id"])
+                self.assertNotIn("error", ctx, ctx)
+                self.assertEqual(ctx["league_id"], a["league1"]["id"], ctx)
+
+                ov = api.get_setup_overview_v2("coach_a", Role.COACH, scope)
+                self.assertNotIn("error", ov, ov)
+
+                # League-narrowed axis: only League A1's own Team/Division.
+                self.assertEqual(self._ids(ov, "teams"), {a["team1"]["id"]},
+                                 label)
+                self.assertEqual(self._ids(ov, "divisions"),
+                                 {a["division1"]["id"]}, label)
+
+                # Program-level axis: untouched by the League selection.
+                self.assertEqual(
+                    self._ids(ov, "clubs"),
+                    {a["club1"]["id"], a["club2"]["id"]}, label)
+                self.assertEqual(self._ids(ov, "organizations"),
+                                 {a["org"]["id"]}, label)
+                self.assertEqual(self._ids(ov, "venues"), {a["venue"]["id"]},
+                                 label)
+                self.assertEqual(self._ids(ov, "rinks"), {a["rink"]["id"]},
+                                 label)
+                self.assertEqual(self._ids(ov, "ice_slots"), {a["slot"]["id"]},
+                                 label)
+                self.assertEqual(self._ids(ov, "officials"),
+                                 {a["official"]["id"]}, label)
+
+                # Never narrowed by League OR Season: every one of the
+                # Program's Seasons/Leagues stays offered.
+                self.assertEqual(
+                    self._ids(ov, "seasons"),
+                    {a["season1"]["id"], a["season2"]["id"]}, label)
+                self.assertEqual(
+                    self._ids(ov, "leagues"),
+                    {a["league1"]["id"], a["league2"]["id"]}, label)
+
+                # The additive Team.league_id DTO field (#283) survives.
+                row = next(t for t in ov["teams"] if t["id"] == a["team1"]["id"])
+                self.assertEqual(row["league_id"], a["league1"]["id"], label)
+                self.assertEqual(row["program_id"], a["program"]["id"], label)
+                _close(store)
+
+    # -- 5. unassigned_* buckets: genuinely-unlinked records, from EITHER side
+    def test_unassigned_buckets_show_genuinely_unlinked_records_from_either_program(self):
+        """A Club/Organization/Venue/Rink/IceSlot/Official linked to NO
+        Program at all shows up in the RIGHT ``unassigned_*`` bucket
+        regardless of which Program is currently active — Program A and
+        Program B each see the exact same never-linked record in their own
+        ``unassigned_*`` list, since it discloses nothing Program-specific.
+        A record linked to ONE specific Program, by contrast, never appears in
+        ``unassigned_*`` from either Program's perspective — it belongs to
+        someone else, not to nobody."""
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                a = self._build_program_env(api, "A")
+                b = self._build_program_env(api, "B")
+
+                free_club = api.create_club("Free Club")
+                self.assertNotIn("error", free_club, free_club)
+                free_org = api.create_organization("Free Org")
+                self.assertNotIn("error", free_org, free_org)
+                # Deliberately no organization_id: an Organization is only
+                # "unassigned" when it owns ZERO Venues anywhere (see
+                # get_setup_overview_v2's org_ids_any) -- owning even a
+                # grant-less Venue would disqualify it. A Venue owned by NO
+                # Organization at all keeps the two unassigned checks
+                # (Organization / Venue) fully independent of each other.
+                free_venue = api.create_venue("Free Venue")
+                self.assertNotIn("error", free_venue, free_venue)
+                free_rink = api.create_rink(free_venue["id"], "Free Rink")
+                self.assertNotIn("error", free_rink, free_rink)
+                free_slot = api.create_ice_slot(
+                    free_rink["id"], "2026-10-01T10:00:00+00:00",
+                    "2026-10-01T11:00:00+00:00")
+                self.assertNotIn("error", free_slot, free_slot)
+                free_official = api.create_official("Free Official")
+                self.assertNotIn("error", free_official, free_official)
+
+                for chosen_label, env, other in (("A", a, b), ("B", b, a)):
+                    admin_id = f"admin_{chosen_label}"
+                    ctx = api.set_active_context(
+                        admin_id, Role.LEAGUE_ADMIN, {}, env["program"]["id"],
+                        None, None)
+                    self.assertNotIn("error", ctx, ctx)
+                    ov = api.get_setup_overview_v2(admin_id, Role.LEAGUE_ADMIN,
+                                                   {})
+                    self.assertNotIn("error", ov, ov)
+
+                    # The genuinely-free records show up as unassigned no
+                    # matter which Program is active.
+                    self.assertIn(free_club["id"],
+                                 self._ids(ov, "unassigned_clubs"),
+                                 (label, chosen_label))
+                    self.assertIn(free_org["id"],
+                                 self._ids(ov, "unassigned_organizations"),
+                                 (label, chosen_label))
+                    self.assertIn(free_venue["id"],
+                                 self._ids(ov, "unassigned_venues"),
+                                 (label, chosen_label))
+                    self.assertIn(free_rink["id"],
+                                 self._ids(ov, "unassigned_rinks"),
+                                 (label, chosen_label))
+                    self.assertIn(free_slot["id"],
+                                 self._ids(ov, "unassigned_ice_slots"),
+                                 (label, chosen_label))
+                    self.assertIn(free_official["id"],
+                                 self._ids(ov, "unassigned_officials"),
+                                 (label, chosen_label))
+
+                    # A record already linked to ONE specific Program (own OR
+                    # the other) never leaks into unassigned_* either way.
+                    for owner in (env, other):
+                        self.assertNotIn(
+                            owner["club1"]["id"],
+                            self._ids(ov, "unassigned_clubs"),
+                            (label, chosen_label))
+                        self.assertNotIn(
+                            owner["org"]["id"],
+                            self._ids(ov, "unassigned_organizations"),
+                            (label, chosen_label))
+                        self.assertNotIn(
+                            owner["venue"]["id"],
+                            self._ids(ov, "unassigned_venues"),
+                            (label, chosen_label))
+                        self.assertNotIn(
+                            owner["rink"]["id"],
+                            self._ids(ov, "unassigned_rinks"),
+                            (label, chosen_label))
+                        self.assertNotIn(
+                            owner["slot"]["id"],
+                            self._ids(ov, "unassigned_ice_slots"),
+                            (label, chosen_label))
+                        self.assertNotIn(
+                            owner["official"]["id"],
+                            self._ids(ov, "unassigned_officials"),
+                            (label, chosen_label))
+                _close(store)
+
+    # -- 6. zero-authorized-program: fully empty, except unassigned_* --------
+    def test_scoped_role_with_no_resolved_program_is_fully_empty_but_unassigned_still_shows(self):
         """A Coach whose ``team_id`` resolves to no Team at all (context_scope
-        fails CLOSED — see ``authorized_program_ids``: ``own_team_id`` returns
-        the dangling id, ``store.get_team`` returns ``None``, so the pid is
-        ``None`` and the authorized set is empty) gets every PROGRAM-
-        DEPENDENT key back as an empty list — never an error — even though
-        real data exists in the installation. #367 review correction:
-        Clubs/Organizations/Officials/Venues/Rinks/IceSlots have no Program
-        dependency in the domain model at all (see point 5 below) and must
-        stay visible regardless — a role authorized for zero Programs still
-        needs to see/create this Program-independent reference data. Only
-        Clubs has real data from ``_build_stack`` here; the rest are empty
-        because none was created, not because they were filtered out."""
-        api = self._api()
-        self._build_stack(api, "A")  # real data exists; must still be hidden
+        fails CLOSED: ``own_team_id`` returns the dangling id, ``get_team``
+        returns ``None``, so the authorized-program set is empty) in a store
+        that DOES have other real Programs: every key that depends on a
+        resolved Program comes back empty — never an error — including
+        Clubs/Organizations/Officials/Venues/Rinks/IceSlots (#369 review
+        correction: these are no longer globally unfiltered, so an
+        unauthorized-for-every-Program caller gets none of them either). The
+        additive ``unassigned_*`` buckets are unaffected by the failed
+        resolution — they hold records linked to NO Program at all, which
+        disclose nothing Program-specific regardless of who is asking."""
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                self._build_program_env(api, "A")  # real data exists elsewhere
 
-        scope = {"team_id": "team_does_not_exist"}
-        ov = api.get_setup_overview_v2("coach2", Role.COACH, scope)
-        self.assertNotIn("error", ov, ov)
+                free_club = api.create_club("Free Club")
+                self.assertNotIn("error", free_club, free_club)
+                free_official = api.create_official("Free Official")
+                self.assertNotIn("error", free_official, free_official)
 
-        program_dependent = set(_ALL_OVERVIEW_KEYS) - {
-            "clubs", "organizations", "officials", "venues", "rinks",
-            "ice_slots"}
-        for key in program_dependent:
-            self.assertEqual(ov[key], [], key)
-        self.assertEqual([c["name"] for c in ov["clubs"]], ["Club A"])
+                scope = {"team_id": "team_does_not_exist"}
+                ov = api.get_setup_overview_v2("coach_dangling", Role.COACH,
+                                               scope)
+                self.assertNotIn("error", ov, ov)
 
-    # -- 5. Venues/Rinks/IceSlots/Clubs/Organizations/Officials stay global --
-    def test_reference_data_stays_unfiltered_despite_program_narrowing(self):
-        """Even while Programs/Seasons/Leagues/Divisions/Teams are narrowed to
-        one authorized Program (per point 3), Venue/Rink/IceSlot/Club/
-        Organization/Official data belonging to (or associated with) a
-        DIFFERENT, unauthorized Program still appears in full — a deliberate,
-        disclosed design choice (Venues are Organization-owned, not
-        Program-owned; Clubs/Organizations/Officials have no Program link in
-        the domain model at all), not a scoping gap. This must never get
-        "fixed" by a future refactor: the Setup Records creation workflow
-        needs to see all reference data when creating new structure."""
-        api = self._api()
-        a = self._build_stack(api, "A")
-        b = self._build_stack(api, "B")
+                for key in _ALL_OVERVIEW_KEYS:
+                    self.assertEqual(ov[key], [], (label, key))
 
-        org_b = api.create_organization("Org B")
-        self.assertNotIn("error", org_b, org_b)
-        venue_b = api.create_venue("Venue B", organization_id=org_b["id"])
-        self.assertNotIn("error", venue_b, venue_b)
-        rink_b = api.create_rink(venue_b["id"], "Rink B")
-        self.assertNotIn("error", rink_b, rink_b)
-        slot_b = api.create_ice_slot(rink_b["id"], "2026-09-01T18:30:00+00:00",
-                                     "2026-09-01T20:00:00+00:00")
-        self.assertNotIn("error", slot_b, slot_b)
-        official_b = api.create_official("Ref B", home_club_id=b["club"]["id"])
-        self.assertNotIn("error", official_b, official_b)
+                self.assertIn(free_club["id"],
+                             self._ids(ov, "unassigned_clubs"), label)
+                self.assertIn(free_official["id"],
+                             self._ids(ov, "unassigned_officials"), label)
+                _close(store)
 
-        scope = {"team_id": a["team"]["id"]}
-        ov = api.get_setup_overview_v2("coach3", Role.COACH, scope)
-        self.assertNotIn("error", ov, ov)
+    # -- 7. Viewer: a pure read, no mutation ---------------------------------
+    def test_viewer_role_is_a_pure_read(self):
+        """A sanity check that calling this facade method with ``Role.VIEWER``
+        never itself mutates store state — it is a pure read composed from
+        store query methods. (Viewer's actual permission gate — rejecting
+        mutation ENDPOINTS — is enforced at the HTTP/web authorization layer,
+        not this Python facade; a facade-level test has no HTTP request to
+        fabricate, so that half of the Viewer contract is out of scope here by
+        design.)"""
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                self._build_program_env(api, "A")
 
-        # Narrowed axis: Program B's own competition structure is absent.
-        self.assertNotIn(b["program"]["id"], self._ids(ov, "programs"))
-        self.assertNotIn(b["team"]["id"], self._ids(ov, "teams"))
+                def _snapshot():
+                    return {
+                        "programs": {p.id for p in api.store.all_programs()},
+                        "seasons": {s.id for s in api.store.all_seasons()},
+                        "leagues": {lg.id for lg in api.store.all_leagues()},
+                        "divisions": {d.id for d in api.store.all_divisions()},
+                        "teams": {t.id for t in api.store.all_teams()},
+                        "clubs": {c.id for c in api.store.all_clubs()},
+                        "organizations":
+                            {o.id for o in api.store.all_organizations()},
+                        "officials": {o.id for o in api.store.all_officials()},
+                        "venues": {v.id for v in api.store.all_venues()},
+                        "rinks": {r.id for r in api.store.all_rinks()},
+                        "ice_slots": {s.id for s in api.store.all_ice_slots()},
+                    }
 
-        # Unfiltered axis: every piece of Program-B-associated reference data
-        # still shows up whole.
-        self.assertIn(b["club"]["id"], self._ids(ov, "clubs"))
-        self.assertIn(org_b["id"], self._ids(ov, "organizations"))
-        self.assertIn(venue_b["id"], self._ids(ov, "venues"))
-        self.assertIn(rink_b["id"], self._ids(ov, "rinks"))
-        self.assertIn(slot_b["id"], self._ids(ov, "ice_slots"))
-        self.assertIn(official_b["id"], self._ids(ov, "officials"))
-
-    # -- 6. teams[].league_id (real competition League) survives narrowing --
-    def test_team_league_id_field_correct_after_program_narrowing(self):
-        """Within a narrowed (single-authorized-Program) view, a Team's
-        ``league_id`` is still the correct real competition-League id
-        (``Team.league_id``, #283) — not dropped or nulled by the Program-
-        scoping logic. (The DTO shape itself, including this field's
-        presence, is already covered by
-        ``test_v2_overview_canonical_flat_lists`` in
-        test_v2_setup_contract.py; this is only the scoping interaction.)"""
-        api = self._api()
-        a = self._build_stack(api, "A")
-
-        scope = {"team_id": a["team"]["id"]}
-        ov = api.get_setup_overview_v2("coach4", Role.COACH, scope)
-        self.assertNotIn("error", ov, ov)
-
-        row = next(t for t in ov["teams"] if t["id"] == a["team"]["id"])
-        self.assertEqual(row["league_id"], a["league"]["id"])
-        self.assertEqual(row["program_id"], a["program"]["id"])
+                before = _snapshot()
+                ov = api.get_setup_overview_v2("viewer_1", Role.VIEWER, {})
+                self.assertNotIn("error", ov, ov)
+                after = _snapshot()
+                self.assertEqual(before, after, label)
+                _close(store)
 
 
 if __name__ == "__main__":

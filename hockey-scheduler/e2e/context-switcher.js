@@ -107,7 +107,21 @@ async function newPage(browser, viewport) {
       errors.push(`[console] ${m.text()}`);
     }
   });
-  return { context, page, errors };
+  // #369 review: a rolling log of the three reads render()/renderContextSwitcher()
+  // depend on (GET /api/context, GET /api/context/options, GET /api/demo/overview)
+  // so a failure here shows what the server actually returned -- and how long it
+  // took -- rather than leaving a bare waitForFunction timeout to guess whether a
+  // slow or erroring fetch is why the switcher's DOM never reached the expected
+  // state. Capped so a long run doesn't grow this without bound.
+  const responses = [];
+  page.on("response", (res) => {
+    const u = res.url();
+    if (!/\/api\/(context(\/options)?|demo\/overview)(\?|$)/.test(u)) return;
+    const rel = u.replace(/^https?:\/\/[^/]+/, "");
+    responses.push(`${new Date().toISOString().slice(11, 23)} ${res.request().method()} ${rel} -> ${res.status()}`);
+    if (responses.length > 12) responses.shift();
+  });
+  return { context, page, errors, responses };
 }
 
 async function reloadShell(page) {
@@ -116,6 +130,24 @@ async function reloadShell(page) {
 }
 const selectValue = (page) => page.evaluate(() => document.getElementById("ctx-select").value);
 const ctxSeason = async (page) => (await apiGet(page, "/api/context")).json.season_id;
+const recentResponses = (responses) => responses.length
+  ? `recent /api/context* + /api/demo/overview responses:\n${responses.join("\n")}`
+  : "no /api/context* or /api/demo/overview responses observed";
+
+// Labeled, diagnosable wrapper around page.waitForFunction (#369 review): a bare
+// page.waitForFunction timeout says only "Timeout 10000ms exceeded", with no
+// indication of WHICH of this file's ~15 waits it was -- exactly what made the CI
+// shard-3 phone failure (a waitForFunction timeout alongside a concurrent server
+// exception on /api/demo/overview) hard to attribute to a specific assertion.
+// Every call site below names the state it is polling for, so a future timeout
+// is self-describing instead of anonymous.
+async function waitFor(page, label, fn, arg, timeoutMs) {
+  try {
+    await page.waitForFunction(fn, arg, { timeout: timeoutMs });
+  } catch (error) {
+    throw new Error(`timed out waiting for: ${label}\n${error.message}`);
+  }
+}
 
 // --- the interactive switcher (Program-only, keyboard, deep-link, archived) ---
 async function checkSwitcher(browser, viewport) {
@@ -124,7 +156,7 @@ async function checkSwitcher(browser, viewport) {
   let out = "";
   server.stdout.on("data", (d) => { out += d.toString(); });
   server.stderr.on("data", (d) => { out += d.toString(); });
-  const { context, page, errors } = await newPage(browser, viewport);
+  const { context, page, errors, responses } = await newPage(browser, viewport);
   const L = viewport.label;
   try {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
@@ -142,11 +174,11 @@ async function checkSwitcher(browser, viewport) {
 
     // (A) One Program + one Season exposes BOTH choices in a real <select>, and
     //     the persistent "display only" notice is visible in the closed state.
-    await page.waitForFunction(() => {
+    await waitFor(page, "(A) switcher + select visible with >= 2 options", () => {
       const w = document.getElementById("context-switcher");
       const s = document.getElementById("ctx-select");
       return w && !w.hidden && s && !s.hidden && s.options.length >= 2;
-    }, null, { timeout: 10000 });
+    }, null, 10000);
     const optionValues = await page.locator("#ctx-select option").evaluateAll((os) => os.map((o) => o.value));
     if (!optionValues.includes(progOnly)) throw new Error(`[${L}] Program-only option missing: ${optionValues}`);
     if (!optionValues.includes(winter)) throw new Error(`[${L}] Season option missing: ${optionValues}`);
@@ -158,10 +190,11 @@ async function checkSwitcher(browser, viewport) {
     // (B) Select Program-only ⇒ persisted season_id:null + #ctx= hash + reload
     //     restore; then switch back to the Season.
     await page.selectOption("#ctx-select", progOnly);
-    await page.waitForFunction(() => location.hash.indexOf("#ctx=") === 0, null, { timeout: 10000 });
+    await waitFor(page, "(B) #ctx= hash written after selecting Program-only", () => location.hash.indexOf("#ctx=") === 0, null, 10000);
     if ((await ctxSeason(page)) !== null) throw new Error(`[${L}] Program-only did not persist season_id:null`);
     await reloadShell(page);
-    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v, progOnly, { timeout: 10000 });
+    await waitFor(page, "(B) select value restored to Program-only after reload",
+      (v) => document.getElementById("ctx-select").value === v, progOnly, 10000);
     await page.selectOption("#ctx-select", winter);
     await page.waitForFunction(() => true);
     if ((await ctxSeason(page)) !== winterId) throw new Error(`[${L}] switch back to Season did not persist`);
@@ -173,7 +206,8 @@ async function checkSwitcher(browser, viewport) {
     if (focused !== "ctx-select") throw new Error(`[${L}] select not keyboard-focusable (active=${focused})`);
     const before = await selectValue(page);
     await page.keyboard.press("ArrowUp");
-    await page.waitForFunction((b) => document.getElementById("ctx-select").value !== b, before, { timeout: 10000 });
+    await waitFor(page, "(C) select value changed after keyboard ArrowUp",
+      (b) => document.getElementById("ctx-select").value !== b, before, 10000);
     const afterKb = await selectValue(page);
     const kbSeason = afterKb.slice(afterKb.indexOf("|") + 1) || null;
     // The change handler persists through an async POST /api/context; the
@@ -196,7 +230,8 @@ async function checkSwitcher(browser, viewport) {
     await apiPost(page, "/api/context", { program_id: programId, season_id: winterId });
     await page.evaluate((h) => { location.hash = h; }, encodeCtx(programId, null));
     await reloadShell(page);
-    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v, progOnly, { timeout: 10000 });
+    await waitFor(page, "(D) select value adopts the Program-only deep link over the persisted Season",
+      (v) => document.getElementById("ctx-select").value === v, progOnly, 10000);
     if ((await ctxSeason(page)) !== null) throw new Error(`[${L}] deep link was not adopted over the persisted row`);
 
     // (E) Invalid/stale link ⇒ normalized to the saved context with a GENERIC
@@ -206,7 +241,8 @@ async function checkSwitcher(browser, viewport) {
     //     goto that only changes the fragment does NOT re-run bootstrap).
     await page.evaluate((h) => { location.hash = h; }, encodeCtx("ghost_program", "ghost_season"));
     await reloadShell(page);
-    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v, progOnly, { timeout: 10000 });
+    await waitFor(page, "(E) select value normalized to the saved context after an invalid deep link",
+      (v) => document.getElementById("ctx-select").value === v, progOnly, 10000);
     const toast = (await page.locator("#toast-root").textContent()) || "";
     if (!/saved context|isn't available/i.test(toast)) throw new Error(`[${L}] no generic normalize message: "${toast}"`);
     if (/ghost/i.test(toast)) throw new Error(`[${L}] normalize message leaked the bogus id`);
@@ -223,15 +259,15 @@ async function checkSwitcher(browser, viewport) {
     const winterLabel = await page.locator(`#ctx-select option[value="${winter}"]`).textContent();
     if (!/archived|read-only/i.test(winterLabel)) throw new Error(`[${L}] archived Season not flagged: "${winterLabel}"`);
     await page.selectOption("#ctx-select", winter);
-    await page.waitForFunction(() => {
+    await waitFor(page, "(F) read-only badge shown after selecting the archived Season", () => {
       const ro = document.getElementById("ctx-ro");
       return ro && !ro.hidden;
-    }, null, { timeout: 10000 });
+    }, null, 10000);
 
     if (errors.length) throw new Error(`[${L}] console/page errors:\n${errors.join("\n")}`);
     console.log(`[${L}] OK — Program-only + Season, keyboard, deep-link adopt/normalize, #ctx=, archived read-only.`);
   } catch (error) {
-    throw new Error(`${error.message}\n--- server output ---\n${out}`);
+    throw new Error(`${error.message}\n${recentResponses(responses)}\n--- server output ---\n${out}`);
   } finally {
     await context.close();
     await stopServer(server);
@@ -245,7 +281,7 @@ async function checkChip(browser, viewport) {
   let out = "";
   server.stdout.on("data", (d) => { out += d.toString(); });
   server.stderr.on("data", (d) => { out += d.toString(); });
-  const { context, page, errors } = await newPage(browser, viewport);
+  const { context, page, errors, responses } = await newPage(browser, viewport);
   const L = viewport.label;
   try {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
@@ -263,11 +299,11 @@ async function checkChip(browser, viewport) {
     await reloadShell(page);
     // A single selectable context (Program-only) ⇒ a static CHIP, not a select,
     // and the persistent "display only" notice is still shown.
-    await page.waitForFunction(() => {
+    await waitFor(page, "chip visible / select hidden for a single selectable context", () => {
       const chip = document.getElementById("ctx-static");
       const sel = document.getElementById("ctx-select");
       return chip && !chip.hidden && sel && sel.hidden;
-    }, null, { timeout: 10000 });
+    }, null, 10000);
     const expectedChip = "Solo Program · Program overview (no season)";
     let chipText = (await page.locator("#ctx-static").textContent()).trim();
     if (chipText !== expectedChip) {
@@ -283,12 +319,12 @@ async function checkChip(browser, viewport) {
     // visible context on both desktop and 390px, not fall back to the generic
     // no-season wording.
     await reloadShell(page);
-    await page.waitForFunction((expected) => {
+    await waitFor(page, "chip identity + select hidden restored after reload", (expected) => {
       const chip = document.getElementById("ctx-static");
       const sel = document.getElementById("ctx-select");
       return chip && !chip.hidden && chip.textContent.trim() === expected
         && sel && sel.hidden;
-    }, expectedChip, { timeout: 10000 });
+    }, expectedChip, 10000);
     chipText = (await page.locator("#ctx-static").textContent()).trim();
     if (chipText !== expectedChip || !(await page.locator(".ctx-unfiltered").isVisible())) {
       throw new Error(`[${L}] chip/deep-link restoration lost the Program identity`);
@@ -296,7 +332,7 @@ async function checkChip(browser, viewport) {
     if (errors.length) throw new Error(`[${L}] console/page errors:\n${errors.join("\n")}`);
     console.log(`[${L}] OK — seasonless Program chip names the Program and survives deep-link reload.`);
   } catch (error) {
-    throw new Error(`${error.message}\n--- server output ---\n${out}`);
+    throw new Error(`${error.message}\n${recentResponses(responses)}\n--- server output ---\n${out}`);
   } finally {
     await context.close();
     await stopServer(server);
@@ -313,7 +349,7 @@ async function checkReconcile(browser, viewport) {
   let out = "";
   server.stdout.on("data", (d) => { out += d.toString(); });
   server.stderr.on("data", (d) => { out += d.toString(); });
-  const { context, page, errors } = await newPage(browser, viewport);   // the subject (viewer)
+  const { context, page, errors, responses } = await newPage(browser, viewport);   // the subject (viewer)
   const admin = await newPage(browser, viewport);                       // a concurrent actor
   const L = viewport.label;
   try {
@@ -339,10 +375,10 @@ async function checkReconcile(browser, viewport) {
     if ((await loginAs(page, "viewer")).status !== 200) throw new Error(`[${L}] viewer login failed`);
     await apiPost(page, "/api/context", { program_id: programId, season_id: null });
     await reloadShell(page);
-    await page.waitForFunction((v) => {
+    await waitFor(page, "viewer deterministic starting point: Program-only selected, options loaded", (v) => {
       const s = document.getElementById("ctx-select");
       return s && !s.hidden && s.value === v && s.options.length >= 2;
-    }, progOnly, { timeout: 10000 });
+    }, progOnly, 10000);
 
     // (1) Archive BETWEEN options-load and POST: the viewer's row still says
     //     Winter is writable; a concurrent archive + the viewer selecting Winter
@@ -351,10 +387,10 @@ async function checkReconcile(browser, viewport) {
       throw new Error(`[${L}] concurrent archive failed`);
     }
     await page.selectOption("#ctx-select", winter);
-    await page.waitForFunction(() => {
+    await waitFor(page, "(1) read-only badge reconciled after a concurrent archive", () => {
       const ro = document.getElementById("ctx-ro");
       return ro && !ro.hidden;
-    }, null, { timeout: 10000 });
+    }, null, 10000);
     const archivedLabel = await page.locator(`#ctx-select option[value="${winter}"]`).textContent();
     if (!/archived|read-only/i.test(archivedLabel)) {
       throw new Error(`[${L}] archived Season not reconciled without reload: "${archivedLabel}"`);
@@ -367,12 +403,13 @@ async function checkReconcile(browser, viewport) {
       throw new Error(`[${L}] concurrent reopen failed`);
     }
     await page.selectOption("#ctx-select", progOnly);
-    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v, progOnly, { timeout: 10000 });
+    await waitFor(page, "(2) select value toggled to Program-only before re-selecting the reopened Season",
+      (v) => document.getElementById("ctx-select").value === v, progOnly, 10000);
     await page.selectOption("#ctx-select", winter);
-    await page.waitForFunction(() => {
+    await waitFor(page, "(2) read-only badge cleared after a concurrent reopen", () => {
       const ro = document.getElementById("ctx-ro");
       return ro && ro.hidden;
-    }, null, { timeout: 10000 });
+    }, null, 10000);
     const reopenedLabel = await page.locator(`#ctx-select option[value="${winter}"]`).textContent();
     if (/archived|read-only/i.test(reopenedLabel)) {
       throw new Error(`[${L}] reopened Season still flagged read-only: "${reopenedLabel}"`);
@@ -387,17 +424,17 @@ async function checkReconcile(browser, viewport) {
     }
     const spring = programId + "|" + created.json.id;
     await page.selectOption("#ctx-select", progOnly);
-    await page.waitForFunction((v) => {
+    await waitFor(page, "(3) newly created Season surfaced in the options after a concurrent create", (v) => {
       const s = document.getElementById("ctx-select");
       return Array.from(s.options).some((o) => o.value === v);
-    }, spring, { timeout: 10000 });
+    }, spring, 10000);
     const springLabel = await page.locator(`#ctx-select option[value="${spring}"]`).textContent();
     if (!/Spring Cup/.test(springLabel)) throw new Error(`[${L}] newly available Season not surfaced: "${springLabel}"`);
 
     if (errors.length) throw new Error(`[${L}] console/page errors:\n${errors.join("\n")}`);
     console.log(`[${L}] OK — no-reload reconciliation: archive→read-only, reopen→writable, newly-available Season surfaced.`);
   } catch (error) {
-    throw new Error(`${error.message}\n--- server output ---\n${out}`);
+    throw new Error(`${error.message}\n${recentResponses(responses)}\n--- server output ---\n${out}`);
   } finally {
     await admin.context.close();
     await context.close();
@@ -418,7 +455,7 @@ async function main() {
     console.log("Context-switcher browser journey passed.");
   } catch (error) {
     console.error("Context-switcher browser journey FAILED.");
-    console.error(error && error.message ? error.message : error);
+    console.error(error && error.stack ? error.stack : error);
     process.exitCode = 1;
   } finally {
     if (browser) await browser.close();

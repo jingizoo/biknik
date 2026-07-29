@@ -315,10 +315,16 @@ async function checkCore(browser, viewport) {
         + `${JSON.stringify(rosterCard)}`);
     }
 
-    // Setup Records is a structural/management surface -- deliberately
-    // Program-wide, NEVER narrowed by League (see get_setup_overview_v2's own
-    // docstring). All 3 teams must be listed regardless of which League (or
-    // none) is currently active.
+    // #369 review correction -- this block previously asserted the OPPOSITE:
+    // that Setup Records was deliberately Program-wide and its Teams count
+    // stayed IDENTICAL across League selections. Review rejected that as a
+    // real scoping gap ("selected League narrows that result, while 'No
+    // League' means the selected Program/Season"), so the contract now is:
+    // a selected League NARROWS Setup Records' Teams to that League, and
+    // "No League" broadens to every Team in the ACTIVE PROGRAM (never
+    // across Programs). The assertion is inverted accordingly, and kept
+    // strict in BOTH directions so a future regression in either direction
+    // -- over-narrowing, or reverting to unfiltered -- fails here.
     await page.click('[data-setup-view="records"]');
     await page.waitForSelector(".setup-grid", { timeout: 10000 }).catch(() => fail(
       `[${L}] Records view never rendered`));
@@ -339,14 +345,20 @@ async function checkCore(browser, viewport) {
       fail(`[${L}] could not find a Teams record card to read a count from -- `
         + "selector/markup assumption is stale, update this check");
     }
-    if (recordsX !== recordsY || recordsX !== recordsNone) {
-      fail(`[${L}] Setup Records' Teams count must be IDENTICAL regardless of `
-        + `League selection (Program-wide by design): X=${recordsX} `
-        + `Y=${recordsY} none=${recordsNone}`);
+    // The fixture puts TWO Teams (X1, X2) in League X and ONE (Y1) in
+    // League Y, all three in the same Program -- so the three counts are
+    // mutually distinguishable and no pair of them can coincide by luck.
+    if (recordsX !== 2) {
+      fail(`[${L}] Setup Records' Teams count with League X active expected 2 `
+        + `(League X's own Teams only), got ${recordsX}`);
     }
-    if (recordsX !== 3) {
-      fail(`[${L}] Setup Records' Teams count expected 3 (all Teams in the `
-        + `Program), got ${recordsX}`);
+    if (recordsY !== 1) {
+      fail(`[${L}] Setup Records' Teams count with League Y active expected 1 `
+        + `(League Y's own Team only), got ${recordsY}`);
+    }
+    if (recordsNone !== 3) {
+      fail(`[${L}] Setup Records' Teams count with NO League selected expected `
+        + `3 (every Team in the ACTIVE Program), got ${recordsNone}`);
     }
 
     if (errors.length) {

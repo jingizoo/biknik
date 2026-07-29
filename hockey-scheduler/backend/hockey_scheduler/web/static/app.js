@@ -1230,6 +1230,25 @@ function renderCoachQuickLinks() {
 }
 
 /* ---------- Setup ---------- */
+// #369 review: get_setup_overview_v2's Club/Organization/Official/Venue/
+// Rink/IceSlot lists are now STRICTLY scoped to the active Program (a
+// record with no validated chain into it is omitted, never shown
+// globally) -- but a freshly-created record of one of these kinds has NO
+// chain to ANY Program yet (a just-created Club has no Team; a
+// just-created Venue has no SeasonVenueAccess grant), so it would
+// otherwise vanish from its own "just created this" card and from every
+// picker that exists to link it to something. The backend additively
+// returns each kind's `unassigned_<key>` bucket -- records linked to NO
+// Program at all, safe to offer alongside the active Program's own
+// records without disclosing any OTHER Program's data (an unassigned row
+// belongs to nobody yet). Every list/options function below that reads
+// one of these six kinds unions the scoped list with its unassigned
+// counterpart through this one helper, so a fresh record stays
+// pickable/manageable right up until its first real link narrows it.
+function withUnassigned(sv, key) {
+  return (sv[key] || []).concat((sv["unassigned_" + key]) || []);
+}
+
 // Data-driven Setup (#44): each entity declares its card list projection and
 // its create-form fields once, so the record cards and the create drawer stay
 // in sync. The API endpoints are unchanged — the drawer just POSTs to them.
@@ -1249,7 +1268,7 @@ const SETUP_ENTITIES = [
       // forcing an organization to exist before a Program can be created.
       { id: "f-league-org", label: "Operating organization (optional)", type: "select",
         ofNoun: "organization", ofNounDisplay: "operating organization",
-        options: (ov) => [["", "— none —"]].concat((ov.organizations || []).map((o) => [o.id, o.name])) },
+        options: (ov) => [["", "— none —"]].concat(withUnassigned(ov, "organizations").map((o) => [o.id, o.name])) },
       // The Program timezone anchors date-only Season boundaries (#272): an
       // IANA name, defaulting to UTC. A bad name is rejected server-side with
       // invalid_timezone and surfaced in the drawer.
@@ -1307,7 +1326,7 @@ const SETUP_ENTITIES = [
       { id: "f-div-season", type: "hidden" }] },
   { key: "club", title: "Clubs", icon: "🏒", noun: "club", perm: "manage_setup",
     delKind: "club",  // a club with no team can be deleted from here (#215)
-    list: (ov) => (ov.clubs || []).map((c) => ({ id: c.id, title: c.name })),
+    list: (ov) => withUnassigned(ov, "clubs").map((c) => ({ id: c.id, title: c.name })),
     fields: [{ id: "f-club", label: "Club name", required: true, placeholder: "e.g. Eagles HC" }] },
   { key: "team", title: "Teams", icon: "👥", noun: "team", perm: "manage_setup",
     delKind: "team",
@@ -1328,7 +1347,7 @@ const SETUP_ENTITIES = [
     }),
     fields: [
       { id: "f-team-club", label: "Club (optional)", type: "select", ofNoun: "club",
-        options: (ov) => [["", "— none —"]].concat((ov.clubs || []).map((c) => [c.id, c.name])) },
+        options: (ov) => [["", "— none —"]].concat(withUnassigned(ov, "clubs").map((c) => [c.id, c.name])) },
       // #283 Slice E: a Team is created under its PERMANENT League (required);
       // the backend derives its Program from that League, so no Program field is
       // needed. A league-less Team is only a legacy/migration remediation state,
@@ -1341,7 +1360,7 @@ const SETUP_ENTITIES = [
   // company, distinct from a hockey Club. Arena-side, like venue/rink.
   { key: "organization", title: "Facility owners", icon: "🏢", noun: "facility owner", perm: "manage_arena",
     delKind: "organization",
-    list: (ov) => (ov.organizations || []).map((o) => ({
+    list: (ov) => withUnassigned(ov, "organizations").map((o) => ({
       id: o.id, title: o.name, sub: o.short_name || "" })),
     fields: [
       { id: "f-org", label: "Facility owner name", required: true, placeholder: "e.g. Summit Ice Facilities" },
@@ -1351,7 +1370,7 @@ const SETUP_ENTITIES = [
     // A venue is owned by an organization (#233 canonical) — show its facility
     // owner. Which Seasons may use a venue's ice is a separate, independent
     // grant (SeasonVenueAccess, #233 Slice E) managed under each Season.
-    list: (ov) => (ov.venues || []).map((v) => ({
+    list: (ov) => withUnassigned(ov, "venues").map((v) => ({
       id: v.id, title: v.name,
       sub: [v.organization_name].filter(Boolean).join(" · ") || "Unassigned" })),
     // No Program field on this form (#233 B2a review r1): canonical Venue
@@ -1359,20 +1378,20 @@ const SETUP_ENTITIES = [
     fields: [
       { id: "f-venue", label: "Venue name", required: true, placeholder: "e.g. South Arena" },
       { id: "f-venue-org", label: "Facility owner (organization)", type: "select", ofNoun: "organization", ofNounDisplay: "facility owner",
-        options: (ov) => [["", "— none —"]].concat((ov.organizations || []).map((o) => [o.id, o.name])) }] },
+        options: (ov) => [["", "— none —"]].concat(withUnassigned(ov, "organizations").map((o) => [o.id, o.name])) }] },
   { key: "rink", title: "Rinks", icon: "⛸️", noun: "rink", perm: "manage_arena",
     delKind: "rink",
-    list: (ov) => (ov.rinks || []).map((r) => ({
+    list: (ov) => withUnassigned(ov, "rinks").map((r) => ({
       id: r.id, title: r.name, sub: r.venue_name || "" })),
     fields: [
       { id: "f-rink-venue", label: "Venue", type: "select", required: true, ofNoun: "venue",
-        options: (ov) => (ov.venues || []).map((v) => [v.id, v.name]) },
+        options: (ov) => withUnassigned(ov, "venues").map((v) => [v.id, v.name]) },
       { id: "f-rink", label: "Rink name", required: true, placeholder: "e.g. Rink 3" }] },
   { key: "ice-slot", title: "Ice slots", icon: "🧊", noun: "ice slot", perm: "manage_arena",
     list: null,  // ice inventory is managed visually on the Arena Calendar
     fields: [
       { id: "f-slot-rink", label: "Rink", type: "select", required: true, ofNoun: "rink",
-        options: (ov) => (ov.rinks || []).map((r) => [r.id, `${r.venue_name ? r.venue_name + " · " : ""}${r.name}`]) },
+        options: (ov) => withUnassigned(ov, "rinks").map((r) => [r.id, `${r.venue_name ? r.venue_name + " · " : ""}${r.name}`]) },
       { id: "f-slot-date", label: "Date", type: "date", required: true, value: "2026-09-05" },
       { id: "f-slot-start", label: "Start", type: "time", required: true, value: "21:00" },
       { id: "f-slot-end", label: "End", type: "time", required: true, value: "22:30" },
@@ -2204,7 +2223,8 @@ function renderSetupHierarchy(sv, hv, ov) {
   // A brand-new demo (or any empty setup) opens on the "Start your league"
   // card rather than empty trees (#215).
   if (hasPerm("manage_setup") && !(sv.programs || []).length
-      && !(sv.teams || []).length && !(sv.organizations || []).length) {
+      && !(sv.teams || []).length
+      && !withUnassigned(sv, "organizations").length) {
     return startYourLeagueCard();
   }
   const canSeePlayers = hasPerm("manage_setup");
@@ -2219,7 +2239,7 @@ function renderSetupHierarchy(sv, hv, ov) {
   //    org-owned, independent of any competition Program). Which Seasons may
   //    use a Venue's ice is managed under each Season (SeasonVenueAccess,
   //    #233 Slice E), not here on the facility tree. --
-  const rinksByVenue = groupBy(sv.rinks, "venue_id");
+  const rinksByVenue = groupBy(withUnassigned(sv, "rinks"), "venue_id");
   const venueNode = (v) => {
     const rinks = rinksByVenue[v.id] || [];
     const badge = rinks.length
@@ -2234,8 +2254,8 @@ function renderSetupHierarchy(sv, hv, ov) {
     </details>`;
   };
   // A facility owner (organization) groups the venues it owns.
-  const venuesByOrg = groupBy(sv.venues, "organization_id");
-  const orgSections = (sv.organizations || []).map((o) => {
+  const venuesByOrg = groupBy(withUnassigned(sv, "venues"), "organization_id");
+  const orgSections = withUnassigned(sv, "organizations").map((o) => {
     const vs = venuesByOrg[o.id] || [];
     const venueRows = vs.map(venueNode).join("")
       || `<div class="tn-empty">No venues yet. Add a venue owned by ${esc(o.name)}.</div>`;
@@ -2529,7 +2549,13 @@ function renderSeasonParticipation(hv, ov, sv) {
   if (!hasPerm("manage_setup")) return "";
   const programs = (hv.programs || []).filter((p) => (p.seasons || []).length);
   if (!programs.length) return "";
-  const allVenues = (sv && sv.venues) || [];
+  // #369: unions the additive `unassigned_venues` bucket -- this is the
+  // "Allow a venue" picker, i.e. the very control that CREATES a Venue's
+  // first link to a Season. A just-created Venue has no SeasonVenueAccess
+  // grant yet, so under the strict active-Program scoping it is by
+  // definition not in `sv.venues`; without the union it could never be
+  // granted to anything and the Setup flow would deadlock.
+  const allVenues = sv ? withUnassigned(sv, "venues") : [];
 
   const programBlocks = programs.map((program) => {
     const permanentTeams = leagueTeams[program.id] || [];
@@ -2980,7 +3006,7 @@ const SETUP_WORKFLOWS = [
     secondary: [{ label: "Clubs", act: "club" }],
     summary: (sv) => [
       { label: "Teams", n: leagueScopedTeams(sv).length },
-      { label: "Clubs", n: (sv.clubs || []).length }] },
+      { label: "Clubs", n: withUnassigned(sv, "clubs").length }] },
   { key: "participation", title: "Season participation and divisions", icon: "🏅",
     purpose: "Which teams play in which league-season, and the divisions that split them.",
     perm: "manage_setup",
@@ -3003,7 +3029,7 @@ const SETUP_WORKFLOWS = [
       }
       return [
         { label: "Players", n: players.length },
-        { label: "Officials", n: (sv.officials || []).length }];
+        { label: "Officials", n: withUnassigned(sv, "officials").length }];
     } },
   { key: "facilities", title: "Venues, rinks and ice", icon: "🏟️",
     purpose: "Where games can be played, and the recurring ice that makes them schedulable.",
@@ -3015,8 +3041,8 @@ const SETUP_WORKFLOWS = [
     secondary: [{ label: "Venues", act: "venue" }, { label: "Rinks", act: "rink" }],
     tertiary: [{ label: "Add one ice slot", act: "ice-slot" }],
     summary: (sv) => [
-      { label: "Venues", n: (sv.venues || []).length },
-      { label: "Rinks", n: (sv.rinks || []).length }] },
+      { label: "Venues", n: withUnassigned(sv, "venues").length },
+      { label: "Rinks", n: withUnassigned(sv, "rinks").length }] },
   // Workflow 6 is OPTIONAL (Decision 9): always visible and always reachable,
   // never the hub's `next` recommendation, and never blocking the complete
   // state. It carries its own status wording rather than done/todo.
@@ -6424,6 +6450,12 @@ async function render() {
     setPageTitle(view);
     c.innerHTML = renderModal();
     wireModal(c);  // same generic modal wiring every other modal gets
+    // #369 review: this early return must still run the SAME shared
+    // dialog focus lifecycle every other render() path gets (line ~8332) --
+    // skipping it left focus on the removed "Resetting…" control (or on
+    // <body>), so keyboard/screen-reader users lost the dialog/focus-trap
+    // contract even though the success modal was visibly on-screen.
+    syncOverlayFocus();
     return;
   }
   // #345 review: set BEFORE the awaited overview load and before either

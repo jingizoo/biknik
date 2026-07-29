@@ -11,6 +11,7 @@ import json
 import os
 import re
 import ssl
+import sys
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -3164,6 +3165,28 @@ class Handler(BaseHTTPRequestHandler):
                                           "message": "Unknown setup entity."}}, 404)
 
 
+class Server(ThreadingHTTPServer):
+    """``ThreadingHTTPServer`` that quietly drops an ordinary client
+    disconnect mid-response instead of dumping a full traceback to stderr.
+
+    A page navigating away (a reload, or this app's own render() firing a
+    fresh /api/demo/overview fetch that a subsequent action makes moot) closes
+    the connection while a handler may still be mid-``wfile.write`` -- entirely
+    normal, not a bug, but the default socketserver.BaseServer.handle_error
+    prints the full traceback for every one of these (#369 review: exactly the
+    "concurrent BrokenPipeError while /api/demo/overview was writing the
+    abandoned response" the browser-smoke CI log showed). The socket is
+    already gone; there is nothing left to send. Anything else still gets the
+    default traceback so a genuine bug is never silently swallowed.
+    """
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+            return
+        super().handle_error(request, client_address)
+
+
 def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
     # Configure the delivery worker loop from env and start it if enabled (#79).
     # ApiService keeps a disabled loop by default (safe for tests); only the
@@ -3174,7 +3197,7 @@ def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
         print(f"Delivery worker loop started "
               f"(every {STATE.api.delivery_loop.interval_seconds}s, "
               f"batch {STATE.api.delivery_loop.batch_size}).")
-    httpd = ThreadingHTTPServer((host, port), Handler)
+    httpd = Server((host, port), Handler)
     print(f"Hockey Scheduler demo running at http://{host}:{port}")
     print("Open that URL in your browser. Press Ctrl+C to stop.")
     try:
