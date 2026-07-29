@@ -170,6 +170,10 @@ _SETUP_PARENT_LISTS = {
     "rink": "Rink",
     "organization": "Organization",
     "club": "Club",
+    # The legacy v1-only `Venue.league_id` names a PROGRAM. The facade already
+    # says "Program <id> not found." for a missing one, so a refused
+    # inaccessible Program is byte-identical to a nonexistent one here too.
+    "program": "Program",
 }
 
 # The same four relations reached by the OTHER verb (#369 review). A create is
@@ -2879,6 +2883,19 @@ class Handler(BaseHTTPRequestHandler):
             if self._reject_parent_outside_scope(
                     "organization", b.get("organization_id"),
                     role, scope, actor_id):
+                return
+            # ...and `league_id` is a SECOND parent on this same route (the
+            # legacy v1-only Venue→Program link; that field stores a PROGRAM
+            # id despite its name). Gating only organization_id left the
+            # identical attachment reachable one field over: create_venue
+            # resolves the Program's operator and OVERWRITES organization_id
+            # with it (setup_service.create_venue), so a caller refused at
+            # `organization_id: org_N` one line above could pass
+            # `league_id: <the Program org_N operates>` and land a Venue
+            # carrying org_N anyway — with 200-vs-404 as an existence oracle
+            # over Program ids on top. Same gate, same generic refusal.
+            if self._reject_parent_outside_scope(
+                    "program", b.get("league_id"), role, scope, actor_id):
                 return
             return self._send_api(api.create_venue(
                 b.get("name"), b.get("address", ""), b.get("timezone", "UTC"),

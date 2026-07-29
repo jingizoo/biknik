@@ -4789,7 +4789,20 @@ class ApiService:
         "rink": ("rinks", "pending_link_rinks"),
         "organization": ("organizations", "pending_link_organizations"),
         "club": ("clubs", "pending_link_clubs"),
+        # A Program has no pending-link list: it IS the thing everything else
+        # links TO, so it is never "linked to no Program". The legacy v1-only
+        # `Venue.league_id` names one (that field stores a PROGRAM id despite
+        # its name -- see the vocabulary note in the module docstring).
+        "program": ("programs", None),
     }
+
+    # Setup-audit entity types differ from the parent-kind names above where
+    # the LEGACY vocabulary survives in the audit trail: `create_program`
+    # writes action "league_created" / entity_type "league", because pre-#233
+    # "League" meant what is now a Program. Looking up "program" finds nothing
+    # and would silently deny a creator its own Program. Only kinds that
+    # actually differ appear here.
+    _SETUP_PARENT_AUDIT_TYPE = {"program": "league"}
 
     def writable_setup_parent_ids(self, kind, user_id, role, scope):
         """Ids of `kind` this caller may attach a NEW child to, or ``None``
@@ -4833,9 +4846,27 @@ class ApiService:
             return None
         scoped_key, pending_key = self._SETUP_PARENT_KEYS[kind]
         ids = {row["id"] for row in overview.get(scoped_key) or []}
-        ids |= {row["id"] for row in overview.get(pending_key) or []}
-        ids |= self._creator_created_ids(user_id).get(kind, set())
+        if pending_key:
+            ids |= {row["id"] for row in overview.get(pending_key) or []}
+        ids |= self._created_ids_of_type(
+            self._SETUP_PARENT_AUDIT_TYPE.get(kind, kind), user_id)
         return ids
+
+    def _created_ids_of_type(self, entity_type, user_id):
+        """``{entity_id, ...}`` of `entity_type` rows ``user_id`` CREATED.
+
+        The same ownership signal as ``_creator_created_ids`` and with the
+        same two restrictions (CREATE actions only, so probing an id can
+        never become permission to use it; a real account id only, so an
+        identity-less caller owns nothing) -- but not restricted to the
+        pending-link entity types, because a Program is a valid write parent
+        and is never a pending-link row.
+        """
+        if not user_id:
+            return set()
+        return {a.entity_id for a in self.store.all_setup_audit()
+                if a.actor_id == user_id and a.entity_type == entity_type
+                and a.action == f"{entity_type}_created"}
 
     def _creator_created_ids(self, user_id):
         """``{entity_type: {entity_id, ...}}`` for the rows ``user_id``

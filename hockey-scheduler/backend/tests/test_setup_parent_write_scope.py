@@ -296,6 +296,79 @@ class SetupParentWriteScopeHttpTest(unittest.TestCase):
                 f"refused -- the gate is not a scope decision but a blanket "
                 f"block")
 
+    def test_the_v1_venue_league_id_is_a_second_parent_and_is_gated_too(self):
+        """`/api/setup/venue` carries TWO parent ids, and gating one of them
+        left the identical attachment reachable one field over.
+
+        `league_id` is the legacy v1-only Venue->Program link (that field
+        stores a PROGRAM id despite its name). `create_venue` resolves the
+        Program's operator Organization and OVERWRITES `organization_id` with
+        it -- so a caller refused at `organization_id: org_N` could pass
+        `league_id: <the Program org_N operates>` and land a Venue carrying
+        org_N anyway, then keep building on it (the poached Venue is now
+        creator-owned, so the gate itself admits the follow-on Rink). The
+        200-vs-404 split was an existence oracle over Program ids on top.
+
+        Found by adversarial audit AFTER the create gate shipped and passed
+        CI, which is why the negative below asserts the two refusals are
+        identical rather than merely both non-200.
+        """
+        admin = self._login("admin")
+        org = self._post(admin, "organization", {"name": "LEAGUEID-ORG"})
+        program = self._post(admin, "program", {"name": "LEAGUEID-PROGRAM"})
+        status, _ = self._req(
+            admin, "POST",
+            f"/api/v2/setup/program/{program['id']}/assign-organization",
+            {"operator_organization_id": org["id"]})
+        self.assertEqual(status, 200)
+
+        arena = self._login("arena")
+        ov = self._req(arena, "GET", "/api/v2/setup/overview")[1]
+        readable = ({r["id"] for r in ov["organizations"]}
+                    | {r["id"] for r in ov["pending_link_organizations"]})
+        self.assertNotIn(org["id"], readable,
+                         "fixture drifted: the victim org is readable, so "
+                         "this proves nothing")
+
+        # The gated field refuses...
+        gated_status, gated = self._req(
+            arena, "POST", "/api/setup/venue",
+            {"name": "control", "organization_id": org["id"]})
+        self.assertEqual(gated_status, 404, gated)
+
+        # ...and so must the second parent on the very same route.
+        status, resp = self._req(arena, "POST", "/api/setup/venue",
+                                 {"name": "poached",
+                                  "league_id": program["id"]})
+        self.assertEqual(
+            status, 404,
+            f"an Arena Manager created a Venue inside a Program it cannot "
+            f"read, via league_id: {resp}")
+        self.assertEqual(resp["error"]["message"],
+                         f"Program {program['id']} not found.", resp)
+        self.assertNotIn(
+            "poached", json.dumps([v.__dict__ for v in
+                                   self.srv.STATE.api.store.all_venues()]),
+            "the refused Venue was written anyway")
+
+        # No existence oracle: an inaccessible Program and a nonexistent one
+        # are indistinguishable.
+        ghost_status, ghost = self._req(
+            arena, "POST", "/api/setup/venue",
+            {"name": "poached", "league_id": "league_never_existed"})
+        self.assertEqual(
+            (ghost_status, ghost),
+            (status, {"error": {
+                "code": resp["error"]["code"],
+                "message": "Program league_never_existed not found."}}),
+            f"200/404 on league_id discloses which Programs exist: {resp} vs "
+            f"{ghost}")
+
+        # Positive control: the creator's OWN Program still accepts it, so
+        # the legacy v1 link is gated rather than disabled.
+        self._post(admin, "venue", {"name": "own-legacy-link",
+                                    "league_id": program["id"]}, api="v1")
+
     def test_every_gated_reassign_relation_is_actually_in_the_table(self):
         """The gate is table-driven, so the table IS the coverage.
 
