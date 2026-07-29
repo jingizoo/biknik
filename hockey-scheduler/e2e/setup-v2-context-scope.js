@@ -252,7 +252,17 @@ async function buildFixture(page) {
     // season registration and one Player). The Player DOES carry the Program
     // tag, so the grid-wide foreign-token net below covers the Players card
     // too -- see the header comment for why that changed.
+    // The v2 Team create binds `league_id` to the ACTIVE Program (#367
+    // prerequisite, PR #371), so building structure in a Program means
+    // working IN it. The journey switches context per Program rather than
+    // being exempted from the guard it is partly here to exercise.
+    const useProgram = async (base) => {
+      await post("/api/context",
+        { program_id: base.program.id, season_id: base.season.id });
+    };
+
     const buildLeague = async (base, tag, suffix) => {
+      await useProgram(base);
       const league = await post("/api/v2/setup/league",
         { season_id: base.season.id, name: `${tag}-League-${suffix}` });
       const division = await post("/api/v2/setup/division",
@@ -279,6 +289,7 @@ async function buildFixture(page) {
     // Every Season needs a League of its own or get_onboarding_status_v2's
     // INSTALLATION-WIDE readiness check redirects the session into the
     // Initial Setup wizard.
+    await useProgram(a);
     const seasonA2 = await post("/api/v2/setup/season",
       { program_id: a.program.id, name: "PROGA-Autumn" });
     const leagueA3 = await post("/api/v2/setup/league",
