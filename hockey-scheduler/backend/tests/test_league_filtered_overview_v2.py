@@ -639,6 +639,76 @@ class LeagueFilteredOverviewV2Test(unittest.TestCase):
                 self.assertEqual(row["program_id"], a["program"]["id"], label)
                 _close(store)
 
+    def test_official_reached_only_through_a_sibling_leagues_game_is_out_of_scope(self):
+        """The assignment edge is evaluated against the COMPLETE active
+        tuple, not the Season alone.
+
+        An Official with no home Club reaches the active context only through
+        an assignment, and the ruling makes that edge League-bound: "Officials
+        through an in-scope home Club or assignment". Checking only the Season
+        left a sibling League's referee in scope — the same rule the Dashboard
+        applies, so both surfaces now run the ONE shared
+        ``_game_matches_active`` predicate rather than two copies that can
+        drift (they already did, inside a single method).
+        """
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                api = ApiService(store)
+                a = self._build_program_env(api, "A")
+                # A second League inside Season A1, so League is the only axis
+                # that differs between the two games below.
+                league3 = api.create_league(a["season1"]["id"], "League A3")
+                self.assertNotIn("error", league3, league3)
+                team3 = api.create_team(club_id=a["club1"]["id"],
+                                        name="Team A3",
+                                        program_id=a["program"]["id"],
+                                        league_id=league3["id"])
+                self.assertNotIn("error", team3, team3)
+
+                ref1 = api.create_official("Ref League A1")   # no home club
+                ref3 = api.create_official("Ref League A3")
+                for r in (ref1, ref3):
+                    self.assertNotIn("error", r, r)
+                with store.transaction():
+                    for ref, team, lg in ((ref1, a["team1"], a["league1"]),
+                                          (ref3, team3, league3)):
+                        gid = store.next_id("game")
+                        store.add_game(Game(
+                            id=gid, home_team_id=team["id"],
+                            away_team_id=team["id"], start_time=None,
+                            season_id=a["season1"]["id"],
+                            league_id=lg["id"]))
+                        store.add_official_assignment(OfficialAssignment(
+                            id=store.next_id("assign"), game_id=gid,
+                            official_id=ref["id"], role=OfficialRole.REFEREE))
+
+                ctx = api.set_active_context(
+                    "admin_a", Role.LEAGUE_ADMIN, {}, a["program"]["id"],
+                    a["season1"]["id"], a["league1"]["id"])
+                self.assertNotIn("error", ctx, ctx)
+                ov = api.get_setup_overview_v2("admin_a", Role.LEAGUE_ADMIN, {})
+                ids = self._ids(ov, "officials")
+                self.assertIn(ref1["id"], ids,
+                              f"[{label}] the League A1 referee reaches the "
+                              "active tuple through its own assignment")
+                self.assertNotIn(
+                    ref3["id"], ids,
+                    f"[{label}] an Official reachable only through a SIBLING "
+                    "League's game stayed in scope -- the assignment edge is "
+                    "League-bound, not Season-only")
+
+                # "No League" is the union: both referees' games are in the
+                # active Season, so both belong.
+                ctx = api.set_active_context(
+                    "admin_a", Role.LEAGUE_ADMIN, {}, a["program"]["id"],
+                    a["season1"]["id"], None)
+                self.assertNotIn("error", ctx, ctx)
+                ov_none = api.get_setup_overview_v2("admin_a",
+                                                    Role.LEAGUE_ADMIN, {})
+                self.assertLessEqual({ref1["id"], ref3["id"]},
+                                     self._ids(ov_none, "officials"), label)
+                _close(store)
+
     def test_player_list_never_spans_programs(self):
         """#369 self-audit: ``list_players`` was the last Setup collection
         still answering installation-wide.

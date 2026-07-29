@@ -2928,6 +2928,40 @@ class ApiService:
         r = self.store.result_for_game(game_id)
         return _serialize(r) if r is not None else {"game_id": game_id, "status": None}
 
+    def _game_matches_active(self, game, season_ids, league_id, team_ids):
+        """Whether ``game`` belongs to the active ``(Season, League)`` — the
+        ONE Game-scoping predicate, shared by every scoped read that has to
+        answer it (the Dashboard's schedule/ice/audit, and the Setup
+        surface's Official-by-assignment edge). Two copies of this rule drifted
+        apart once already inside a single method, so it lives here.
+
+        A Game's own ``season_id``/``league_id`` (real, permanent fields —
+        #233 Slice C1b, unrelated to any legacy naming elsewhere) are the
+        direct join.
+
+        #367 owner ruling on the league-less EXHIBITION: it "may appear under
+        a selected League only when at least one participating Team validates
+        into that League; otherwise omit it". An earlier revision treated
+        every ``league_id is None`` game as universally eligible — "a
+        league-less Team is universally eligible, so a league-less Game must
+        be too". That analogy does not hold: a league-less Team has no League
+        to disagree with, while an exhibition between two League B teams is
+        concretely League B's fixture. It surfaced League B-vs-C exhibitions
+        (with both teams' NAMES, venue and time) on League A's Dashboard.
+
+        ``team_ids`` is the caller's ALREADY Program+League-narrowed Team
+        collection (any container supporting ``in``), so membership in it IS
+        the validation — the caller never has to re-derive it.
+        """
+        if game.season_id not in season_ids:
+            return False
+        if league_id is None:
+            return True                          # "No League": the union
+        if game.league_id is not None:
+            return game.league_id == league_id
+        return any(tid in team_ids
+                   for tid in (game.home_team_id, game.away_team_id) if tid)
+
     def _division_league_season_chain(self, division_id):
         """The Division's own ``(league_season, season)`` — ``(None, None)``
         if the Division, its LeagueSeason, or Season is missing/dangling
@@ -4335,32 +4369,13 @@ class ApiService:
             for v in venues.values()
         ]
 
-        # #367: a Game's own `season_id`/`league_id` (real, permanent fields
-        # — #233 Slice C1b, unrelated to any legacy naming elsewhere) are the
-        # direct scoping join.
-        #
-        # #367 owner ruling on the league-less EXHIBITION: it "may appear
-        # under a selected League only when at least one participating Team
-        # validates into that League; otherwise omit it". An earlier revision
-        # treated every `league_id is None` game as universally eligible —
-        # "a league-less Team is universally eligible, so a league-less Game
-        # must be too". That analogy does not hold: a league-less Team has no
-        # League to disagree with, while an exhibition between two League B
-        # teams is concretely League B's fixture. It surfaced League B-vs-C
-        # exhibitions (with both teams' NAMES, venue and time) on League A's
-        # Dashboard. `teams` is already narrowed to the active
-        # Program + selected League, so membership in it IS the validation.
+        # `None` season ids == no scoping active (the legacy no-role call).
         def _in_scope_game(g):
             if in_scope_season_ids is None:
                 return True
-            if g.season_id not in in_scope_season_ids:
-                return False
-            if league is None:
-                return True                       # "No League": the union
-            if g.league_id is not None:
-                return g.league_id == league.id
-            return any(tid in teams
-                       for tid in (g.home_team_id, g.away_team_id) if tid)
+            return self._game_matches_active(
+                g, in_scope_season_ids,
+                league.id if league is not None else None, teams)
 
         # Draft games (#86) are proposals under review — they must never surface
         # in the operator slot grid / schedule / calendar until published, so
@@ -5039,21 +5054,33 @@ class ApiService:
                             if o.id not in org_ids_any
                             and o.id in created["organization"]]
 
-            def _official_season_ids(official_id):
-                out = set()
+            # The Official edges, in the two forms this method needs them:
+            # "assigned to a Game in the ACTIVE tuple" (in scope) and
+            # "assigned to any resolvable Game at all" (linked to SOME
+            # Program, and therefore never a pending-link row). The first
+            # runs through the SHARED `_game_matches_active` -- the same
+            # predicate the Dashboard applies, exhibition rule included --
+            # because the ruling makes Officials League-bound "through an
+            # in-scope home Club or assignment", so an assignment in a
+            # sibling League's game is no more this League's data than that
+            # game is.
+            team_ids_active = {t.id for t in teams}
+
+            def _official_games(official_id):
                 for a in self.store.assignments_for_official(official_id):
                     g = self.store.get_game(a.game_id)
                     if g is not None and g.season_id:
-                        out.add(g.season_id)
-                return out
+                        yield g
 
             officials, pending_officials = [], []
             for o in all_officials:
-                o_seasons = _official_season_ids(o.id)
+                o_games = list(_official_games(o.id))
                 in_active = ((o.home_club_id in club_ids_active)
-                            or bool(o_seasons & in_scope_season_ids))
+                            or any(self._game_matches_active(
+                                g, in_scope_season_ids, active_league_id,
+                                team_ids_active) for g in o_games))
                 has_any_link = ((o.home_club_id in club_ids_any)
-                                or bool(o_seasons))
+                                or bool(o_games))
                 if in_active:
                     officials.append(o)
                 elif not has_any_link and o.id in created["official"]:
