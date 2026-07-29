@@ -843,7 +843,19 @@ class DemoOverviewRoleMatrixTest(unittest.TestCase):
         raise AssertionError(f"unhandled role {role}")
 
     def test_every_role_sees_only_its_own_program(self):
-        api = ApiService(InMemoryStore())
+        # #369 self-audit: this ran Memory-only, so on SQLite/PostgreSQL the
+        # Dashboard contract effectively exercised League Admin alone -- the
+        # other roles appeared there only as deliberately UNRESOLVABLE
+        # identities, which proves the empty case is empty, not that the role
+        # scopes correctly. The review asks for the seven roles across all
+        # three stores in as many words, and every identity built here
+        # genuinely resolves.
+        for backend, store in _backends():
+            with self.subTest(backend=backend):
+                self._every_role_sees_only_its_own_program(ApiService(store))
+                _close(store)
+
+    def _every_role_sees_only_its_own_program(self, api):
         a = _build_scheduled_program(api, "Prog A")
         b = _build_scheduled_program(api, "Prog B")
         for role in (Role.LEAGUE_ADMIN, Role.ARENA_MANAGER, Role.VIEWER,
