@@ -188,6 +188,12 @@ async function checkViewport(browser, viewport) {
       const season = await post("/api/v2/setup/season", { program_id: program.id, name: "2026-27" });
       const lg = await post("/api/v2/setup/league", { season_id: season.id, name: `Twin League ${i.label}` });
       const club = await post("/api/v2/setup/club", { name: `Twin Club ${i.label}` });
+      // #367 prerequisite: a Team's League must belong to the ACTIVE Program.
+      // This journey builds several Programs in one session, so the context
+      // can still point at an earlier fixture's Program -- move to the one
+      // being populated before creating into it.
+      await post("/api/context",
+        { program_id: program.id, season_id: season.id });
       const team = await post("/api/v2/setup/team",
         { league_id: lg.id, club_id: club.id, name: `Twin Team ${i.label}` });
       const reg1 = await post(`/api/v2/setup/seasons/${season.id}/team-registrations`,

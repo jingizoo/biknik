@@ -4529,8 +4529,26 @@ class ApiService:
         }
 
     @catch
-    def get_setup_hierarchy_v2(self) -> dict:
+    def get_setup_hierarchy_v2(self, user_id=None, role=None, scope=None) -> dict:
         """Canonical Program→Season→League→Division setup tree (#233 Slice C2).
+
+        #367 prerequisite: when a real user context is supplied (``role`` is
+        not ``None`` — the HTTP route always supplies one now), the tree is
+        ceilinged to the caller's ACTIVE Program, the same ceiling every other
+        scoped Setup read uses. It was previously installation-wide, and that
+        was not merely a display inconsistency with the now-scoped Setup
+        Records: ``app.js`` builds ``allPermLeagues`` from THIS payload, and
+        that array is the option list for the Team drawer's "Permanent league"
+        select — its options are labelled "<program> · <league>" precisely
+        because they spanned Programs. An operator working in Program B could
+        therefore pick Program A's League and create a Team under it. Scoping
+        the read narrows what the picker can offer; the write is refused
+        independently at the route, because a picker is a convenience and
+        never the authorization boundary.
+
+        Called with no arguments (``role`` left ``None``, the default) the full
+        unfiltered tree is returned exactly as before — several internal
+        callers and the hierarchy tests inspect whole-store state that way.
 
         The v2 counterpart of ``get_setup_hierarchy``: canonical keys throughout
         (``program_id`` / ``operator_organization_id`` / competition
@@ -4553,6 +4571,25 @@ class ApiService:
         leagues = self.store.all_leagues()  # the grouping League (was Level)
         divisions = self.store.all_divisions()
         teams = self.store.all_teams()
+        if role is not None:
+            active, _season, _league = self.context.resolve_with_league(
+                user_id, role, scope)
+            # Season/League are NOT further ceilings here: this is the
+            # structural management tree, so every Season and League of the
+            # active Program stays visible (same rule get_setup_overview_v2
+            # applies). Only the Program axis narrows.
+            pid = active.id if active is not None else None
+            programs = [p for p in programs if p.id == pid]
+            season_ids = {s.id for s in seasons if s.program_id == pid}
+            seasons = [s for s in seasons if s.id in season_ids]
+            leagues = [lg for lg in leagues if lg.program_id == pid]
+            league_ids = {lg.id for lg in leagues}
+            ls_by_id = {ls.id: ls for ls in self.store.all_league_seasons()}
+            divisions = [
+                d for d in divisions
+                if (ls := ls_by_id.get(d.league_season_id)) is not None
+                and ls.season_id in season_ids and ls.league_id in league_ids]
+            teams = [t for t in teams if t.program_id == pid]
 
         player_count = {}
         for p in self.store.all_players():

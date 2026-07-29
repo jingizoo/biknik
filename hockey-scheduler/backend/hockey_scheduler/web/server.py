@@ -1037,7 +1037,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/v2/setup/hierarchy":
             if self._operator_only("/api/v2/setup/player"):
                 return
-            return self._send_api(api.get_setup_hierarchy_v2())
+            role, scope, user_id, _err = self._resolve_role()
+            return self._send_api(api.get_setup_hierarchy_v2(
+                user_id, role, scope))
         if path == "/api/v2/setup/progress":
             # Home/Tasks hub setup-progress (#330): the six Setup workflows'
             # completion state for the operator's ACTIVE Program (#159
@@ -2820,6 +2822,47 @@ class Handler(BaseHTTPRequestHandler):
             "code": "not_found",
             "message": f"Unknown reassignment {entity}/assign-{target}."}}, 404)
 
+    def _reject_league_outside_active_program(self, league_id) -> bool:
+        """True (and a response already sent) when ``league_id`` does not
+        belong to the caller's ACTIVE Program (#367 prerequisite).
+
+        The write-side half of scoping the setup hierarchy. The read fix stops
+        another Program's Leagues being OFFERED; this stops them being
+        ACCEPTED, which is the part that actually matters — the id arrives in
+        a request body and a client can send any value it likes.
+
+        Deliberately binds to the ACTIVE Program rather than the caller's
+        whole authorized set: a global League Admin is authorized for every
+        Program, so an authorization-only check would not stop the reported
+        case (an operator working in Program B creating into Program A). You
+        create where you are working; switching Program is the context bar's
+        job.
+
+        The refusal reuses ``ContextService``'s existing generic League
+        message, so an inaccessible League is indistinguishable from a
+        nonexistent one and this never becomes an existence oracle.
+        """
+        api = STATE.api
+        role, scope, user_id, err = self._resolve_role()
+        if err is not None:
+            code, payload = err
+            self._send_json(payload, code)
+            return True
+        if role is None:
+            return False          # unscoped/demo caller: unchanged behavior
+        program, _season, _league = api.context.resolve_with_league(
+            user_id, role, scope)
+        league = api.store.get_league(league_id) if league_id else None
+        if (program is None or league is None
+                or league.program_id != program.id):
+            self._send_json({"error": {
+                "code": "not_found",
+                "message": "League not found or not accessible for this "
+                           "context.",
+                "details": {"reason": "league_not_accessible"}}}, 404)
+            return True
+        return False
+
     def _handle_setup_v2(self, entity: str, body: dict, actor_id: str):
         """Dispatch /api/v2/setup/<entity> to the canonical facade (#233 Slice C2).
 
@@ -3059,6 +3102,18 @@ class Handler(BaseHTTPRequestHandler):
             # the canonical create path never mints a new league-less Team.
             if not (b.get("league_id") or None):
                 return _required_error("A league_id is required.")
+            # #367 prerequisite: the supplied League must belong to the
+            # caller's ACTIVE Program. `league_id` arrives in the request
+            # body, so it is a caller-supplied identifier -- the fact that a
+            # picker offered it is not evidence of entitlement to it, and the
+            # picker used to span every Program in the installation. Without
+            # this an operator working in Program B could create a Team under
+            # Program A's League, which is a cross-Program WRITE, not just a
+            # read leak. The refusal is the same generic not-found the context
+            # layer already uses for an inaccessible League, so this never
+            # becomes an existence oracle for another Program's Leagues.
+            if self._reject_league_outside_active_program(b.get("league_id")):
+                return
             return self._send_api(api.create_team(
                 b.get("club_id") or None, None, b.get("name"),
                 actor_id, program_id=b.get("program_id") or None,
