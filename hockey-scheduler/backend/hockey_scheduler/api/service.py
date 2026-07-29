@@ -5911,7 +5911,14 @@ class ApiService:
         """
         players = (self.store.players_for_team(team_id) if team_id
                   else self.store.all_players())
-        if team_id is None and role is not None:
+        # The Program ceiling applies to BOTH forms. An earlier revision
+        # scoped only the unfiltered form (`team_id is None and role is not
+        # None`), which left an IDOR: `?team_id=<another Program's team>`
+        # skipped the gate entirely and returned that Team's players -- and,
+        # on this MANAGE_SETUP route, their emails. `team_id` is a caller-
+        # supplied identifier, so it selects WHICH rows to consider; it can
+        # never be evidence of authorization for them.
+        if role is not None:
             program, _season, _league = self.context.resolve_with_league(
                 user_id, role, scope)
             if program is None:

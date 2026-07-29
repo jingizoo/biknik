@@ -432,6 +432,33 @@ class LeagueFilteredOverviewV2Test(unittest.TestCase):
                     f"[{label}] another Program's player NAME leaked into the "
                     "active Program's player list")
 
+                # IDOR: an EXPLICIT team_id must not bypass the ceiling.
+                # The first version of this fix scoped only the unfiltered
+                # form, so `?team_id=<another Program's team>` skipped the
+                # gate entirely -- and the first version of THIS test only
+                # ever passed the active Program's own team_id, so it agreed.
+                # team_id selects WHICH rows to consider; it is never evidence
+                # of authorization for them.
+                own_team = [p["name"] for p in api.list_players(
+                    a["team1"]["id"], user_id="admin_a",
+                    role=Role.LEAGUE_ADMIN, scope={})]
+                self.assertIn("A-PLAYER", own_team, (label, "own team"))
+                foreign_team = [p["name"] for p in api.list_players(
+                    b["team1"]["id"], user_id="admin_a",
+                    role=Role.LEAGUE_ADMIN, scope={})]
+                self.assertEqual(
+                    foreign_team, [],
+                    f"[{label}] IDOR: an explicit team_id for a Team in "
+                    "ANOTHER Program returned that Team's players")
+                # Same via the email-bearing form the operator route uses.
+                foreign_email = api.list_players(
+                    b["team1"]["id"], include_email=True, user_id="admin_a",
+                    role=Role.LEAGUE_ADMIN, scope={})
+                self.assertEqual(
+                    foreign_email, [],
+                    f"[{label}] IDOR: the include_email form disclosed "
+                    "another Program's players")
+
                 # Legacy no-context form is deliberately unchanged.
                 legacy = [p["name"] for p in api.list_players()]
                 self.assertIn("A-PLAYER", legacy, label)
