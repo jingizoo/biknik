@@ -42,7 +42,7 @@ the contract — not drift.
 | `get_demo_overview` (Dashboard) | mandatory | **hard ceiling** | narrows within the Season |
 | `get_standings` | must match active | must match when one is active | must match when one is selected |
 | `get_setup_overview_v2` (Setup) | **the ceiling** | not a further filter | narrows divisions + teams |
-| `list_players` (`/api/players`) | mandatory | — | — |
+| `list_players` (`/api/players`) | mandatory | — | narrows via `Team.league_id` |
 
 `list_players` is the one to remember when adding a Setup collection, because it
 is easy to miss: it is not part of any overview DTO, it predates this work, and
@@ -51,8 +51,22 @@ ceilinged. It returns player **names**, and on its MANAGE_SETUP route their
 **emails** — which is exactly why the route already refuses to be folded into an
 unauthenticated payload. A cross-Program answer there is the same disclosure by
 another door. It narrows to Teams in the active Program whenever a role is
-supplied; passing an explicit `team_id` still scopes to that Team, and the
-no-context form stays unfiltered for internal callers.
+supplied, and further to the selected League; the no-context form stays
+unfiltered for internal callers.
+
+Two traps here, both of which shipped before being caught:
+
+- **`team_id` is not authorization.** An early revision scoped only the
+  *unfiltered* form (`if team_id is None and role is not None`), so
+  `?team_id=<another Program's team>` skipped the ceiling entirely and returned
+  that Team's players and emails. A caller-supplied id selects *which rows to
+  consider*; it can never be evidence of entitlement to them. The ceiling
+  applies to both forms.
+- **Players DO have a League axis**, unlike Clubs/Organizations/Officials/
+  Venues. They reach a League through their Team's real permanent
+  `Team.league_id` (#283), so a selected League narrows them — and must, since
+  `get_setup_progress`'s roster workflow and the Setup roster summary already
+  do. Leaving only the Players card Program-wide contradicted its own screen.
 
 ### `get_setup_progress` — Home / Tasks hub
 

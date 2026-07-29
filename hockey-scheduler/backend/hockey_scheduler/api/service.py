@@ -5919,14 +5919,24 @@ class ApiService:
         # supplied identifier, so it selects WHICH rows to consider; it can
         # never be evidence of authorization for them.
         if role is not None:
-            program, _season, _league = self.context.resolve_with_league(
+            program, _season, league = self.context.resolve_with_league(
                 user_id, role, scope)
             if program is None:
                 players = []
             else:
-                in_program = {t.id for t in self.store.all_teams()
-                              if t.program_id == program.id}
-                players = [p for p in players if p.team_id in in_program]
+                # A selected League narrows here too, via the Team's REAL
+                # permanent competition League (`Team.league_id`, #283 -- not
+                # any of the legacy `league_id` fields that store a Program).
+                # Players are League-narrowable in a way Clubs/Organizations/
+                # Venues are not, and the rest of the surface already treats
+                # them that way: get_setup_progress's "roster" workflow and
+                # the Setup roster summary both League-filter players, and
+                # get_setup_overview_v2 League-narrows teams. Leaving the
+                # Players card Program-wide contradicted its own screen.
+                in_scope = {t.id for t in self.store.all_teams()
+                            if t.program_id == program.id
+                            and (league is None or t.league_id == league.id)}
+                players = [p for p in players if p.team_id in in_scope]
         rows = [_serialize(p) for p in players]
         # The Player DTO deliberately carries no email (it reaches coach/roster
         # views). Only the MANAGE_SETUP-gated operator list opts in, so the edit

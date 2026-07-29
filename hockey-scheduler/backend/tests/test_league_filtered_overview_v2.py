@@ -459,6 +459,33 @@ class LeagueFilteredOverviewV2Test(unittest.TestCase):
                     f"[{label}] IDOR: the include_email form disclosed "
                     "another Program's players")
 
+                # A selected League narrows within the Program. Players are
+                # League-narrowable through their Team's real permanent
+                # Team.league_id (#283), unlike Clubs/Officials/Venues, which
+                # have no League axis at all -- so the same-Program
+                # cross-League case is a real requirement here.
+                pa2 = api.create_player(team_id=a["team2"]["id"],
+                                        name="A2-PLAYER", position="forward")
+                self.assertNotIn("error", pa2, pa2)
+                ctx_l1 = api.set_active_context(
+                    "admin_a", Role.LEAGUE_ADMIN, {}, a["program"]["id"],
+                    a["season1"]["id"], a["league1"]["id"])
+                self.assertNotIn("error", ctx_l1, ctx_l1)
+                in_l1 = [p["name"] for p in api.list_players(
+                    user_id="admin_a", role=Role.LEAGUE_ADMIN, scope={})]
+                self.assertIn("A-PLAYER", in_l1, (label, "League 1's own"))
+                self.assertNotIn(
+                    "A2-PLAYER", in_l1,
+                    f"[{label}] a SAME-Program player from another League "
+                    "leaked while League 1 was active")
+                # ...and an explicit team_id for the sibling League's Team is
+                # refused too, not just filtered out of the unscoped list.
+                self.assertEqual(
+                    api.list_players(a["team2"]["id"], user_id="admin_a",
+                                     role=Role.LEAGUE_ADMIN, scope={}), [],
+                    f"[{label}] explicit team_id reached a sibling League's "
+                    "Team while another League was active")
+
                 # Legacy no-context form is deliberately unchanged.
                 legacy = [p["name"] for p in api.list_players()]
                 self.assertIn("A-PLAYER", legacy, label)

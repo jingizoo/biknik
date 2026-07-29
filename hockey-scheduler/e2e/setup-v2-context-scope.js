@@ -148,6 +148,7 @@ const PROGRAM_A = {
   leagues: ["PROGA-League-A1", "PROGA-League-A2"],
   divisions: ["PROGA-Division-A1", "PROGA-Division-A2"],
   teams: ["PROGA-Team-A1", "PROGA-Team-A2"],
+  players: ["PROGA-Player-A1", "PROGA-Player-A2"],
   club: "PROGA-Club", org: "PROGA-Org", official: "PROGA-Official",
   venue: "PROGA-Venue", rink: "PROGA-Rink",
 };
@@ -156,6 +157,7 @@ const PROGRAM_B = {
   leagues: ["PROGB-League-B1"],
   divisions: ["PROGB-Division-B1"],
   teams: ["PROGB-Team-B1"],
+  players: ["PROGB-Player-B1"],
   club: "PROGB-Club", org: "PROGB-Org", official: "PROGB-Official",
   venue: "PROGB-Venue", rink: "PROGB-Rink",
 };
@@ -379,6 +381,14 @@ async function assertRecordsScope(page, self, other, expected, step) {
   self.teams.forEach((name) => (expected.teams.includes(name)
     ? present("Teams", name) : absent("Teams", name)));
   other.teams.forEach((name) => absent("Teams", name));
+  // Players narrow on BOTH axes. Unlike Clubs/Officials/Venues/Organizations
+  // -- which have no League axis in the domain model and so stay Program-wide
+  // -- a Player reaches a League through its Team's real permanent
+  // `Team.league_id` (#283), so the same-Program cross-League case is a
+  // genuine requirement here, not an invented one.
+  self.players.forEach((name) => (expected.players.includes(name)
+    ? present("Players", name) : absent("Players", name)));
+  other.players.forEach((name) => absent("Players", name));
 
   // 4. The derived-join entities -- no direct Program FK, scoped by a real
   //    validated chain into the active Program. These are Program-level and
@@ -442,10 +452,14 @@ async function checkViewport(browser, viewport) {
     await page.waitForSelector(".setup-grid", { timeout: 10000 }).catch(() => fail(
       `[${L}] the Setup Records grid never rendered`));
 
-    const bothA = { divisions: PROGRAM_A.divisions, teams: PROGRAM_A.teams };
-    const onlyA1 = { divisions: ["PROGA-Division-A1"], teams: ["PROGA-Team-A1"] };
-    const onlyA2 = { divisions: ["PROGA-Division-A2"], teams: ["PROGA-Team-A2"] };
-    const allB = { divisions: PROGRAM_B.divisions, teams: PROGRAM_B.teams };
+    const bothA = { divisions: PROGRAM_A.divisions, teams: PROGRAM_A.teams,
+                    players: PROGRAM_A.players };
+    const onlyA1 = { divisions: ["PROGA-Division-A1"], teams: ["PROGA-Team-A1"],
+                     players: ["PROGA-Player-A1"] };
+    const onlyA2 = { divisions: ["PROGA-Division-A2"], teams: ["PROGA-Team-A2"],
+                     players: ["PROGA-Player-A2"] };
+    const allB = { divisions: PROGRAM_B.divisions, teams: PROGRAM_B.teams,
+                   players: PROGRAM_B.players };
 
     // (1) Program A + No League: every one of Program B's records is absent
     //     from every card, and A's own equivalents are present.
