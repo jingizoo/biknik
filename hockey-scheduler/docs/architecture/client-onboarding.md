@@ -1284,8 +1284,9 @@ round 16 section above already describes) — preserving the round 16
 `registration_league_change_strands_games` repair behavior for the common
 single-stray-row case byte-for-byte, including its game-free-repair,
 stranded-rejection, and already-correct-no-op triple (now additionally
-proven safe against a planted, non-cancelled but CANCELLED game in the
-stale League, closing a gap the round 16 matrix itself didn't cover). Any
+proven safe against a planted CANCELLED game in the stale League that does
+not block the repair, closing a gap the round 16 matrix itself didn't
+cover). Any
 other shape — the target row already exists AND a separate active row
 also exists elsewhere, or more than one other active row exists with none
 at the target — is a genuine, no-safe-default conflict: rejected before
@@ -1303,9 +1304,11 @@ exactly as `transfer_team_to_league` itself unconditionally clears the
 Division on a cross-League move rather than treating it as a change to
 strand-check.
 
-Regression coverage adds nine scenarios to the same `ImportCommitServiceContract`
-mix-in (Memory/SQLite/PostgreSQL, per round 16's own established pattern
-above) plus one driven through the real HTTP commit route: the canonical
+Regression coverage adds six new test methods to the same
+`ImportCommitServiceContract` mix-in — each inherited by Memory, SQLite, and
+PostgreSQL (18 executions), per round 16's own established pattern above —
+plus one separate test driven through the real HTTP commit route (19
+executions total): the canonical
 transfer-from-inactive-only reproduction (a distinct new active row is
 created, the inactive row is byte-for-byte untouched); the same
 end-state as a true no-op in both physical insertion orders (the
@@ -1378,8 +1381,9 @@ The six sites and their fixes:
    target_league_id)`, with the identical exact-identity/conflict contract;
    `SetupService._resolve_import_row_registration` is now a one-line
    delegate to it, so `commit_teams_players_import`, `upsert_imported_
-   registration`, both rollover entry points, and the hierarchy preflight
-   gate all resolve a row through the exact same callable — never two
+   registration`, Season rollover v1 (`roll_forward_registrations`), and
+   the hierarchy preflight gate all resolve a row through the exact same
+   callable — never two
    independently-written lookups that could quietly diverge on the identical
    input, the same discipline round 16 established for Division/League
    resolution and round 17 extended to row selection. The preflight's
@@ -1500,11 +1504,12 @@ eight in a new `RolloverExactIdentityTest` in `test_season_rollover.py` (v1 —
 inactive-sibling, true no-op in both physical insertion orders, the stale-
 active-row move succeeding game-free and with only a cancelled Game present,
 rejecting with zero mutation when a non-cancelled Game is present, and the
-two-active-row conflict in both insertion orders); four new tests extending
-`RollForwardConflictSqlTest` in `test_v2_reassignment_integrity_sql.py` (v2 —
-inactive-sibling, and the active-elsewhere conflict proven identical whether
-or not a committed Game is present, on both SQLite and PostgreSQL); four new
-tests in two new SQL-integrity classes in the same file,
+two-active-row conflict in both insertion orders); three new test methods
+extending `RollForwardConflictSqlTest` in `test_v2_reassignment_integrity_
+sql.py`, each run against both SQLite and PostgreSQL (v2 — inactive-sibling,
+and the active-elsewhere conflict proven identical whether or not a
+committed Game is present); four new tests in two new SQL-integrity classes
+in the same file,
 `TransferRetainedTargetSqlTest` and `AssignLeagueRetainedTargetSqlTest`
 (retained-inactive-row reactivation and independently-active-row conflict,
 zero mutation on rejection, for both `_transfer_team_to_league_inner` and
