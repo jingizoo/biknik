@@ -4571,6 +4571,9 @@ class ApiService:
         leagues = self.store.all_leagues()  # the grouping League (was Level)
         divisions = self.store.all_divisions()
         teams = self.store.all_teams()
+        # #371 review: whether this payload is Program-ceilinged at all. The
+        # legacy identity-less internal form (role is None) stays unfiltered.
+        scoped_hierarchy = role is not None
         if role is not None:
             active, _season, _league = self.context.resolve_with_league(
                 user_id, role, scope)
@@ -4617,6 +4620,37 @@ class ApiService:
                 divs_by_season.setdefault(sid, []).append(d)
         divisions_by_id = {d.id: d for d in divisions}
         teams_by_id = {t.id: t for t in teams}
+
+        def _needs_assignment_row(reg, reason, reg_league_id):
+            """One ``needs_assignment.registrations`` row, with the foreign
+            Team id withheld on a scoped read (#371 review).
+
+            ``teams_by_id`` is already narrowed to the active Program above, so
+            a registration whose team is missing from it names either a Team
+            that does not exist or one belonging to ANOTHER Program. Emitting
+            that id handed the caller a probeable identifier for a Program it
+            cannot read -- the same disclosure the name filtering exists to
+            prevent, and worse, because an id is exactly what a later write
+            needs. Filtering names while returning the identifier is not a
+            ceiling.
+
+            The row is KEPT rather than dropped: the operator still has to see
+            that this Season holds a registration needing repair. Only the id
+            is replaced, by ``None`` -- a repair signal that cannot be joined
+            back to the foreign Team. Both cases collapse to the same
+            ``team_missing`` reason here, so the response also cannot
+            distinguish "belongs to another Program" from "does not exist".
+
+            The legacy unscoped internal form is untouched: several call sites
+            read the whole installation through it.
+            """
+            team_id = reg.team_id
+            if scoped_hierarchy and team_id not in teams_by_id:
+                team_id = None
+            return {"registration_id": reg.id, "team_id": team_id,
+                    "league_id": reg_league_id,
+                    "division_id": reg.division_id, "reason": reason}
+
         # Active registrations grouped by their Season, so each Season resolves
         # participation from its own rows.
         regs_by_season = {}
@@ -4693,10 +4727,8 @@ class ApiService:
                     tm = teams_by_id.get(reg.team_id)
                     if tm is None:
                         needs_assignment_regs.append(
-                            {"registration_id": reg.id, "team_id": reg.team_id,
-                             "league_id": reg_league_id,
-                             "division_id": reg.division_id,
-                             "reason": "team_missing"})
+                            _needs_assignment_row(
+                                reg, "team_missing", reg_league_id))
                         continue
                     # A registration's Team must belong to THIS Program — a
                     # cross-Program (or program-less legacy) Team is invalid
@@ -4704,10 +4736,8 @@ class ApiService:
                     # valid branch under this Program's tree (#233 Slice C2 review).
                     if tm.program_id != prog.id:
                         needs_assignment_regs.append(
-                            {"registration_id": reg.id, "team_id": reg.team_id,
-                             "league_id": reg_league_id,
-                             "division_id": reg.division_id,
-                             "reason": "team_program_mismatch"})
+                            _needs_assignment_row(
+                                reg, "team_program_mismatch", reg_league_id))
                         continue
                     if reg.division_id:
                         div = divisions_by_id.get(reg.division_id)
@@ -4720,10 +4750,8 @@ class ApiService:
                             teams_by_div.setdefault(div.id, []).append((tm, reg))
                         else:
                             needs_assignment_regs.append(
-                                {"registration_id": reg.id, "team_id": reg.team_id,
-                                 "league_id": reg_league_id,
-                                 "division_id": reg.division_id,
-                                 "reason": "registration_league_division_mismatch"})
+                                _needs_assignment_row(
+                                reg, "registration_league_division_mismatch", reg_league_id))
                     else:
                         # Division-less: hangs directly off its registration
                         # League when that League is a real League in this Season.
@@ -4732,10 +4760,8 @@ class ApiService:
                                 reg_league_id, []).append((tm, reg))
                         else:
                             needs_assignment_regs.append(
-                                {"registration_id": reg.id, "team_id": reg.team_id,
-                                 "league_id": reg_league_id,
-                                 "division_id": reg.division_id,
-                                 "reason": "registration_league_not_in_season"})
+                                _needs_assignment_row(
+                                reg, "registration_league_not_in_season", reg_league_id))
 
                 def division_node(d):
                     return {"id": d.id, "name": d.name, "age_group": d.age_group,

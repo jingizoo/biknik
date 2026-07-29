@@ -104,6 +104,97 @@ class HierarchyReadScopeTest(unittest.TestCase):
                 _close(store)
 
 
+def _cross_program_registration(api, store, fx):
+    """Register Program B's Team into Program A's Season directly.
+
+    The already-supported legacy/corrupt shape: an ACTIVE LeagueSeason
+    registration in Program A whose ``team_id`` points at a Program-B Team.
+    The repo treats this as a real remediation state (see
+    ``HierarchyV2ProgramMismatchTest``), which is why it must be REPAIRABLE
+    from A's tree without A's tree disclosing the foreign Team.
+    """
+    from hockey_scheduler.domain.models import Team
+    from hockey_scheduler.domain.setup_models import SeasonTeamRegistration
+    # Injected directly, exactly as HierarchyV2ProgramMismatchTest does it:
+    # the facade now REFUSES to create this shape, which is correct -- the
+    # point is that a row already in the store (legacy data, a migration, a
+    # direct load) must still be repairable from A's tree without A's tree
+    # disclosing B's Team.
+    team_b = Team(id=store.next_id("team"), name="LEAK-CANARY-TEAM",
+                  club_id=fx["club"]["id"],
+                  program_id=fx["B"]["program"]["id"])
+    store.add_team(team_b)
+    ls_a = next(ls for ls in store.all_league_seasons()
+                if ls.season_id == fx["A"]["season"]["id"]
+                and ls.league_id == fx["A"]["league"]["id"])
+    store.add_season_team_registration(SeasonTeamRegistration(
+        id=store.next_id("streg"), league_season_id=ls_a.id,
+        team_id=team_b.id, division_id=None, active=True))
+    return {"id": team_b.id, "name": team_b.name}
+
+
+class HierarchyRegistrationLeakTest(unittest.TestCase):
+    """A scoped hierarchy must not hand back a FOREIGN Team id (#371 review).
+
+    ``teams`` is narrowed to the active Program, so a registration naming a
+    Program-B Team misses ``teams_by_id`` and was emitted into
+    ``needs_assignment.registrations`` as
+    ``{"team_id": "<Program-B team id>", "reason": "team_missing"}``.
+    Filtering NAMES while returning the IDENTIFIER is not a ceiling: an id is
+    precisely what a later write needs, and it is joinable back to the foreign
+    Program's graph.
+    """
+
+    def test_a_foreign_registration_leaks_no_team_id(self):
+        for backend, store in _backends():
+            with self.subTest(backend=backend):
+                api = ApiService(store)
+                fx = _two_programs(api)
+                admin = ("admin", Role.LEAGUE_ADMIN, {})
+                team_b = _cross_program_registration(api, store, fx)
+
+                api.set_active_context(*admin, fx["A"]["program"]["id"],
+                                       fx["A"]["season"]["id"])
+                tree = api.get_setup_hierarchy_v2(*admin)
+                self.assertNotIn("error", tree, tree)
+
+                blob = json.dumps(tree)
+                self.assertNotIn(
+                    team_b["id"], blob,
+                    f"[{backend}] Program A's scoped hierarchy returned "
+                    f"Program B's Team id {team_b['id']!r} -- a probeable "
+                    f"identifier for a Program this caller cannot read")
+                self.assertNotIn(
+                    "LEAK-CANARY-TEAM", blob,
+                    f"[{backend}] the foreign Team's NAME leaked too")
+
+                # The repair signal itself survives -- the row is withheld of
+                # its id, not dropped, so the operator can still see there is
+                # something in this Season to fix.
+                rows = [r for s in tree["programs"][0]["seasons"]
+                        for r in s["needs_assignment"]["registrations"]]
+                self.assertTrue(
+                    rows, f"[{backend}] the needs-assignment repair signal "
+                    f"disappeared along with the id")
+                self.assertTrue(
+                    all(r["team_id"] is None for r in rows),
+                    f"[{backend}] a needs-assignment row still carries a "
+                    f"team_id: {rows}")
+
+                # Legitimate Program-A structure still renders.
+                self.assertEqual(
+                    [p["name"] for p in tree["programs"]], ["Prog A"], backend)
+
+                # The legacy unscoped internal form is UNCHANGED -- it still
+                # names the foreign Team, which several callers rely on.
+                legacy = json.dumps(api.get_setup_hierarchy_v2())
+                self.assertIn(
+                    team_b["id"], legacy,
+                    f"[{backend}] the unscoped internal form was changed too; "
+                    f"only the user-scoped read was in scope here")
+                _close(store)
+
+
 class HierarchyWriteScopeHttpTest(unittest.TestCase):
     """The write path over real authenticated HTTP -- the part that matters,
     since a picker can be bypassed but the route cannot.
@@ -235,6 +326,52 @@ class HierarchyWriteScopeHttpTest(unittest.TestCase):
         league = self._v2(c, "league",
                           {"season_id": season["id"], "name": f"WS {tag} L"})
         return {"program": program, "season": season, "league": league}
+
+    def test_http_scoped_hierarchy_leaks_no_foreign_registration_team_id(self):
+        """The #371 read leak across the route boundary.
+
+        A facade test supplies ``user_id``/``role`` by hand; only here is the
+        scoping driven by a real session, which is what production does.
+        """
+        from hockey_scheduler.domain.models import Team
+        from hockey_scheduler.domain.setup_models import SeasonTeamRegistration
+
+        c = self._admin()
+        a = self._fixture(c, "LEAK-A")
+        b = self._fixture(c, "LEAK-B")
+        club = self._v2(c, "club", {"name": "Leak Club"})
+        store = self.srv.STATE.api.store
+
+        # Program B's Team, registered into Program A's Season -- injected,
+        # because the facade correctly refuses to create this shape now.
+        team_b = Team(id=store.next_id("team"), name="HTTP-LEAK-CANARY",
+                      club_id=club["id"], program_id=b["program"]["id"])
+        store.add_team(team_b)
+        ls_a = next(ls for ls in store.all_league_seasons()
+                    if ls.season_id == a["season"]["id"]
+                    and ls.league_id == a["league"]["id"])
+        store.add_season_team_registration(SeasonTeamRegistration(
+            id=store.next_id("streg"), league_season_id=ls_a.id,
+            team_id=team_b.id, division_id=None, active=True))
+
+        status, _ = self._req(c, "POST", "/api/context",
+                              {"program_id": a["program"]["id"],
+                               "season_id": a["season"]["id"]})
+        self.assertEqual(status, 200)
+
+        status, tree = self._req(c, "GET", "/api/v2/setup/hierarchy")
+        self.assertEqual(status, 200, tree)
+        blob = json.dumps(tree)
+        self.assertNotIn(
+            team_b.id, blob,
+            f"the scoped hierarchy route returned Program B's Team id "
+            f"{team_b.id!r} while Program A was active")
+        self.assertNotIn("HTTP-LEAK-CANARY", blob,
+                         "the foreign Team's name leaked over HTTP")
+        rows = [r for p in tree["programs"] for s in p["seasons"]
+                for r in s["needs_assignment"]["registrations"]]
+        self.assertTrue(rows, "the repair signal disappeared over HTTP")
+        self.assertTrue(all(r["team_id"] is None for r in rows), rows)
 
     def _assert_cross_program_team_create_refused(self, backend):
         """The route-level cross-Program-write proof, parametrized by the
