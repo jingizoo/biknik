@@ -376,18 +376,53 @@ async function checkViewport(browser, viewport) {
     //     must run against the Program that owns the Division.
     const primaryContext = await currentContext();
     await switchContext(`${orglessId}|`);
-    await page.waitForSelector(".setup-card", { timeout: 10000 });
+    // Wait for the REPAINTED Programs card, not merely for ".setup-card" to
+    // exist: the previous context's cards are still in the DOM the moment the
+    // switch resolves, so a bare waitForSelector(".setup-card") returns
+    // immediately and the read below can run against the OLD paint -- where
+    // the Programs card has no "Orgless Program" row, `.find()` yields
+    // undefined, and `card.querySelectorAll` throws
+    // "Cannot read properties of undefined". That is a pure race: it never
+    // reproduced locally (the repaint beats the next statement every time)
+    // and failed on the slower CI runner.
+    await page.waitForFunction(() => {
+      const card = [...document.querySelectorAll(".setup-card")]
+        .find((c) => (c.querySelector(".sc-title") || {}).textContent
+          && c.querySelector(".sc-title").textContent.includes("Programs"));
+      return !!card && [...card.querySelectorAll(".li-title")]
+        .some((t) => t.textContent.trim() === "Orgless Program");
+    }, null, { timeout: 15000 }).catch(() => {
+      fail("the Programs card never repainted with the Orgless Program row "
+        + "after switching to its context");
+    });
     const orglessRow = await page.evaluate(() => {
       const card = [...document.querySelectorAll(".setup-card")]
-        .find((c) => c.querySelector(".sc-title").textContent.includes("Programs"));
+        .find((c) => (c.querySelector(".sc-title") || {}).textContent
+          && c.querySelector(".sc-title").textContent.includes("Programs"));
+      if (!card) return null;
       const row = [...card.querySelectorAll(".li-title")]
         .find((t) => t.textContent.trim() === "Orgless Program");
-      return row ? row.closest(".li").querySelector(".li-sub").textContent.trim() : null;
+      const sub = row && row.closest(".li")
+        && row.closest(".li").querySelector(".li-sub");
+      return sub ? sub.textContent.trim() : null;
     });
     if (orglessRow !== "No operating org")
       fail(`Orgless program not shown as "No operating org" after reload (got ${JSON.stringify(orglessRow)})`);
     await switchContext(primaryContext);
-    await page.waitForSelector(".setup-card", { timeout: 10000 });
+    // Same race in reverse, and this one matters more than a display check:
+    // step 11's reassign panel builds its options from `ov.levels`, which is
+    // the primary Program's read, so acting before the repaint would offer the
+    // orgless Program's (empty) Leagues. Wait for the Programs card to stop
+    // showing the orgless Program rather than for any card to exist.
+    await page.waitForFunction(() => {
+      const card = [...document.querySelectorAll(".setup-card")]
+        .find((c) => (c.querySelector(".sc-title") || {}).textContent
+          && c.querySelector(".sc-title").textContent.includes("Programs"));
+      return !!card && ![...card.querySelectorAll(".li-title")]
+        .some((t) => t.textContent.trim() === "Orgless Program");
+    }, null, { timeout: 15000 }).catch(() => {
+      fail("the Programs card never repainted back to the primary context");
+    });
 
     // 11) #233 B2a review r1: structural Setup writes go to v2 — a Division
     //     move (division:level) and a Division delete both POST to
