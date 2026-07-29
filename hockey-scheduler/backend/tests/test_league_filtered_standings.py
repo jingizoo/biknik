@@ -597,14 +597,25 @@ class StandingsActiveContextMatrixTest(unittest.TestCase):
 
 
 class StandingsRoleMatrixTest(unittest.TestCase):
-    """Every supported role, Memory-backed (the role-scope computation
-    itself already carries its own Memory/SQLite/PostgreSQL parity coverage
-    in test_active_context_league.py's LeagueScopeMatrixTest; this proves
-    #369's active-tuple gate composes correctly with EVERY role's scope
-    construction, not just League Admin/Coach)."""
+    """Every supported role, on every backend.
+
+    #369 self-audit: this was Memory-only, justified by pointing at
+    test_active_context_league.py's LeagueScopeMatrixTest for store parity of
+    the role-scope computation. That covers how a role RESOLVES, not how
+    #369's active-tuple gate composes with it, which is what this file exists
+    to prove -- and the review asks for the seven roles across Memory, SQLite
+    and PostgreSQL in as many words. Note the roles here all use scopes that
+    genuinely RESOLVE: a role "covered" by an identity that silently resolves
+    to nothing proves only that the empty case is empty.
+    """
 
     def test_every_role_is_bound_to_its_active_tuple_and_rejects_a_foreign_program(self):
-        api = ApiService(InMemoryStore())
+        for backend, store in _backends():
+            with self.subTest(backend=backend):
+                self._role_matrix(ApiService(store))
+                _close(store)
+
+    def _role_matrix(self, api):
         fixture = _build_matrix_fixture(api)
         pid = fixture["program_a"]["id"]
         sid = fixture["season_a1"]["id"]
