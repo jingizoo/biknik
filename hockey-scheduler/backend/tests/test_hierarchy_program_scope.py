@@ -106,12 +106,29 @@ class HierarchyReadScopeTest(unittest.TestCase):
 
 class HierarchyWriteScopeHttpTest(unittest.TestCase):
     """The write path over real authenticated HTTP -- the part that matters,
-    since a picker can be bypassed but the route cannot."""
+    since a picker can be bypassed but the route cannot.
+
+    ``test_cross_program_team_create_is_refused_generically_*`` runs this
+    proof -- route dispatch, the guard, the real ``create_team``, and the
+    audit write -- against Memory, SQLite, and (when configured) PostgreSQL.
+    ``STATE.reset()`` (web/server.py) rebuilds its store from ``create_store()``
+    (store/__init__.py), which resolves the backend from the ``DATABASE_URL``
+    env var; ``_reset_backend`` below sets that var only for the duration of
+    the ``reset()`` call so each backend's HTTP class gets a store actually
+    built from it, instead of always landing on the InMemoryStore default (the
+    prior state on PostgreSQL CI, which sets ``TEST_DATABASE_URL`` but never
+    ``DATABASE_URL``). The other two test methods in this class are
+    deliberately left single-backend (Memory, from ``setUpClass`` below) --
+    they exercise session-resolution/authorization plumbing that doesn't vary
+    by store, and ``HierarchyWriteScopeStoreParityTest`` below already proves
+    the guard's predicate itself on every store.
+    """
 
     @classmethod
     def setUpClass(cls):
         srv = __import__("hockey_scheduler.web.server", fromlist=["x"])
         cls.srv = srv
+        os.environ.pop("DATABASE_URL", None)  # class baseline is Memory
         srv.STATE.reset(seed=False)
         cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.Handler)
         cls.port = cls.httpd.server_address[1]
@@ -122,6 +139,48 @@ class HierarchyWriteScopeHttpTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+
+    def _reset_backend(self, database_url):
+        """Rebuild the live ``STATE`` on the given backend for this one test.
+
+        ``create_store()`` resolves the backend purely from ``DATABASE_URL``
+        at call time and ``DemoState.reset()`` calls it with no override, so
+        setting the env var only around this one ``reset()`` call is enough
+        to steer it -- the value is restored immediately after, so no other
+        test (running before or after, in this class or another) ever
+        observes the mutation. ``APP_MODE`` is deliberately left untouched
+        (defaults to "demo"): reset()'s production branch never seeds the
+        admin/demo account this class logs in with, and preserves rather
+        than rebuilds a clean slate, so it would silently break every
+        backend here -- not just the ones this test targets.
+
+        A cleanup is registered that flips ``STATE`` back to a fresh Memory
+        store the moment THIS test ends (pass, fail, or error), so a test
+        that runs after it -- which may assume the class's Memory baseline
+        from ``setUpClass`` -- never inherits a SQLite/Postgres-backed STATE.
+        """
+        prev = os.environ.get("DATABASE_URL")
+
+        def _set(url):
+            if url is None:
+                os.environ.pop("DATABASE_URL", None)
+            else:
+                os.environ["DATABASE_URL"] = url
+
+        _set(database_url)
+        try:
+            self.srv.STATE.reset(seed=False)
+        finally:
+            _set(prev)
+
+        def _restore_memory():
+            _set(None)
+            try:
+                self.srv.STATE.reset(seed=False)
+            finally:
+                _set(prev)
+
+        self.addCleanup(_restore_memory)
 
     def _client(self):
         return urllib.request.build_opener(
@@ -177,7 +236,34 @@ class HierarchyWriteScopeHttpTest(unittest.TestCase):
                           {"season_id": season["id"], "name": f"WS {tag} L"})
         return {"program": program, "season": season, "league": league}
 
-    def test_cross_program_team_create_is_refused_generically(self):
+    def _assert_cross_program_team_create_refused(self, backend):
+        """The route-level cross-Program-write proof, parametrized by the
+        label of whatever backend the caller already pointed ``STATE`` at."""
+        # Prove the store REALLY is the one this variant claims, before
+        # asserting anything about the guard. Without this the whole matrix is
+        # theatre: the original defect here was precisely a write test that
+        # believed it covered PostgreSQL while silently running on
+        # InMemoryStore, and it looked green the entire time. If
+        # ``_reset_backend`` ever stops steering ``create_store()`` -- a
+        # renamed env var, a changed resolution order, a caching ``reset()``
+        # -- this fails loudly instead of quietly re-testing Memory three
+        # times under three different names.
+        live = self.srv.STATE.api.store
+        if backend == "memory":
+            self.assertIsInstance(
+                live, InMemoryStore,
+                f"expected the in-memory store, got {type(live).__name__}")
+        else:
+            self.assertIsInstance(
+                live, SqlStore,
+                f"the {backend} variant is not running on a SQL store at all "
+                f"-- got {type(live).__name__}; it would silently re-prove "
+                f"the Memory case")
+            self.assertEqual(
+                live.backend, backend,
+                f"the {backend} variant is running on a "
+                f"{live.backend!r}-backed SqlStore")
+
         c = self._admin()
         a = self._fixture(c, "A")
         b = self._fixture(c, "B")
@@ -206,21 +292,23 @@ class HierarchyWriteScopeHttpTest(unittest.TestCase):
                                   "name": "Cross-Program Team"})
         self.assertEqual(
             status, 404,
-            f"a Team was created under another Program's League: {resp}")
+            f"[{backend}] a Team was created under another Program's "
+            f"League: {resp}")
         self.assertEqual(resp["error"]["details"]["reason"],
-                         "league_not_accessible", resp)
+                         "league_not_accessible", (backend, resp))
 
         self.assertEqual(
             {t.id for t in store.all_teams()}, teams_before,
-            "the refused create still wrote a Team row")
+            f"[{backend}] the refused create still wrote a Team row")
         self.assertEqual(
             len(store.all_setup_audit()), audit_before,
-            "the refused create still appended a setup-audit row -- a refusal "
-            "must not record the attempt, or the audit feed becomes its own "
-            "disclosure of what was tried and against which League")
+            f"[{backend}] the refused create still appended a setup-audit "
+            "row -- a refusal must not record the attempt, or the audit feed "
+            "becomes its own disclosure of what was tried and against which "
+            "League")
         self.assertFalse(
             any(t.name == "Cross-Program Team" for t in store.all_teams()),
-            "the refused Team name is present in the store")
+            f"[{backend}] the refused Team name is present in the store")
 
         # A NONEXISTENT League id is refused identically -- so the response
         # cannot be used to probe whether another Program's League exists.
@@ -229,8 +317,8 @@ class HierarchyWriteScopeHttpTest(unittest.TestCase):
             {"club_id": club["id"], "league_id": "league_does_not_exist",
              "name": "Ghost"})
         self.assertEqual((status_missing, resp_missing), (status, resp),
-                         "an inaccessible League must be indistinguishable "
-                         "from a nonexistent one")
+                         f"[{backend}] an inaccessible League must be "
+                         "indistinguishable from a nonexistent one")
 
         # ...and identical ON THE WIRE, not merely as decoded dicts. Compared
         # as raw bytes because that is what an attacker actually observes;
@@ -244,11 +332,12 @@ class HierarchyWriteScopeHttpTest(unittest.TestCase):
             c, "POST", "/api/v2/setup/team",
             {"club_id": club["id"], "league_id": "league_also_missing",
              "name": "Ghost 2"})
-        self.assertEqual(cross_status, ghost_status)
+        self.assertEqual(cross_status, ghost_status, backend)
         self.assertEqual(
             cross_bytes, ghost_bytes,
-            "the cross-Program refusal differs from the nonexistent-League "
-            f"refusal on the wire: {cross_bytes!r} vs {ghost_bytes!r}")
+            f"[{backend}] the cross-Program refusal differs from the "
+            f"nonexistent-League refusal on the wire: {cross_bytes!r} vs "
+            f"{ghost_bytes!r}")
 
         # Positive control: the SAME request against the active Program's own
         # League succeeds, so the refusals above are not a blanket failure.
@@ -258,7 +347,7 @@ class HierarchyWriteScopeHttpTest(unittest.TestCase):
         # Assert on program_id, not league_id: the v2 Team DTO carries the
         # Program (the service derives it from the League), and where the Team
         # actually LANDED is the stronger claim anyway.
-        self.assertEqual(ok["program_id"], b["program"]["id"], ok)
+        self.assertEqual(ok["program_id"], b["program"]["id"], (backend, ok))
 
         # Switching to Program A makes ITS League writable and B's refused --
         # the gate follows the context rather than being a fixed allow-list.
@@ -268,12 +357,29 @@ class HierarchyWriteScopeHttpTest(unittest.TestCase):
         ok_a = self._v2(c, "team", {"club_id": club["id"],
                                     "league_id": a["league"]["id"],
                                     "name": "Now Allowed"})
-        self.assertEqual(ok_a["program_id"], a["program"]["id"], ok_a)
+        self.assertEqual(ok_a["program_id"], a["program"]["id"],
+                         (backend, ok_a))
         status_b, _ = self._req(c, "POST", "/api/v2/setup/team",
                                 {"club_id": club["id"],
                                  "league_id": b["league"]["id"],
                                  "name": "Now Refused"})
-        self.assertEqual(status_b, 404)
+        self.assertEqual(status_b, 404, backend)
+
+    def test_cross_program_team_create_is_refused_generically_memory(self):
+        self._reset_backend(None)
+        self._assert_cross_program_team_create_refused("memory")
+
+    def test_cross_program_team_create_is_refused_generically_sqlite(self):
+        self._reset_backend(":memory:")
+        self._assert_cross_program_team_create_refused("sqlite")
+
+    @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                         "PostgreSQL required (set TEST_DATABASE_URL) -- "
+                         "skipped VISIBLY rather than silently falling back "
+                         "to another store")
+    def test_cross_program_team_create_is_refused_generically_postgres(self):
+        self._reset_backend(os.environ["TEST_DATABASE_URL"])
+        self._assert_cross_program_team_create_refused("postgres")
 
     def test_hierarchy_route_refuses_a_session_that_dies_mid_request(self):
         """A session that resolves for the authorization read but NOT for the
@@ -351,16 +457,21 @@ class HierarchyWriteScopeHttpTest(unittest.TestCase):
 
 
 class HierarchyWriteScopeStoreParityTest(unittest.TestCase):
-    """The same refusal/no-residue/own-League-success proof on EVERY store.
+    """The same refusal/no-residue/own-League-success proof on EVERY store,
+    one layer BELOW the route.
 
-    The HTTP class above proves the ROUTE (session resolution, the guard, the
-    wire format), but it can only ever run on one store: ``STATE.reset()``
-    builds its store from ``create_store()``, which reads ``DATABASE_URL`` --
-    and the PostgreSQL CI job sets only ``TEST_DATABASE_URL``, so that class
-    silently stays on ``InMemoryStore`` even there, and never sees SQLite at
-    all. A SQL-specific transaction or audit-write regression would pass it
-    unnoticed. This class closes that by driving the same predicate one layer
-    down, across Memory / SQLite / PostgreSQL-when-configured.
+    ``HierarchyWriteScopeHttpTest`` above now also runs its real-route proof
+    (session resolution, the guard, dispatch, the actual ``create_team``, the
+    wire format) against Memory, SQLite, and PostgreSQL-when-configured -- it
+    points ``STATE`` at each backend in turn via ``DATABASE_URL`` (see
+    ``_reset_backend`` there) rather than always landing on the
+    ``InMemoryStore`` default, which is what ``STATE.reset()`` used to do
+    unconditionally (``create_store()`` reads ``DATABASE_URL``, and the
+    PostgreSQL CI job sets only ``TEST_DATABASE_URL``). This class remains as
+    a belt-and-suspenders check: it drives the guard's PREDICATE directly, in
+    isolation from route/session/wire-format concerns, so a change to the
+    predicate itself is caught here even if something about the HTTP
+    plumbing above changes independently.
     """
 
     def _guard(self, api, user_id, role, scope, league_id):
