@@ -172,6 +172,30 @@ _SETUP_PARENT_LISTS = {
     "club": "Club",
 }
 
+# The same four relations reached by the OTHER verb (#369 review). A create is
+# not the only way to attach a record to a parent: ``assign-<target>`` moves an
+# existing one, and a gate on creates alone leaves the identical cross-owner
+# write open behind a different URL — proven, before this was added, by an
+# Arena Manager moving its own Rink under another creator's Venue and getting a
+# 200 on BOTH API versions.
+#
+# ``(entity, target)`` -> ``(parent kind, body key naming the new parent)``.
+# Only relations whose parent is one of the four kinds above appear here;
+# division→league / team→league / player→team have different parent kinds and
+# are governed elsewhere. A null id (the explicit unassign on the nullable
+# relations) is not gated — there is no parent to leak and nothing to probe.
+#
+# ``("league", "organization")`` is v1-only and ``("program", "organization")``
+# v2-only (legacy vocabulary: v1 "league" IS today's Program), so one table
+# serves both handlers without collision.
+_REASSIGN_PARENTS = {
+    ("league", "organization"): ("organization", "organization_id"),
+    ("program", "organization"): ("organization", "operator_organization_id"),
+    ("venue", "organization"): ("organization", "organization_id"),
+    ("rink", "venue"): ("venue", "venue_id"),
+    ("team", "club"): ("club", "club_id"),
+}
+
 
 # Method-405 routing table (#271). Two ordered lists of compiled path patterns
 # transcribed from the ``do_GET``/``do_POST`` dispatch below (an explicitly
@@ -2535,7 +2559,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._unmatched_route("POST")
 
     def _handle_reassign(self, entity: str, record_id: str, target: str,
-                         body: dict, actor_id: str):
+                         body: dict, actor_id: str, role=None, scope=None):
         """Dispatch /api/setup/<entity>/<id>/assign-<target> (#166 PR D).
 
         Each moves ``record_id`` under a new parent id read from the body; the
@@ -2578,6 +2602,13 @@ class Handler(BaseHTTPRequestHandler):
                 check_body(b, **_V1_REASSIGN_SCHEMA[combo])
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
+        # #369 review: the new parent must be one this caller may already
+        # reach -- the same gate, and the same refusal, as the creates.
+        if combo in _REASSIGN_PARENTS:
+            _kind, _key = _REASSIGN_PARENTS[combo]
+            if self._reject_parent_outside_scope(
+                    _kind, b.get(_key), role, scope, actor_id):
+                return
         # v1 boundary (#233 C1b): legacy request keys map straight onto the
         # canonical facade args (same id values), and canonical result dicts are
         # mapped back to the exact legacy v1 response keys via _v1.
@@ -2692,7 +2723,8 @@ class Handler(BaseHTTPRequestHandler):
         # Move a record under a new parent, recording the old→new ids in audit.
         m = re.match(r"^(league|venue|rink|division|team|player)/([^/]+)/assign-(\w+)$", entity)
         if m:
-            return self._handle_reassign(m.group(1), m.group(2), m.group(3), b, actor_id)
+            return self._handle_reassign(m.group(1), m.group(2), m.group(3),
+                                         b, actor_id, role, scope)
         # Season team registrations (#180): register a permanent league team for
         # a season, reassign its division for that season, or remove it from the
         # season. All League-Admin (MANAGE_SETUP) via the /api/setup/ authz
@@ -2902,7 +2934,7 @@ class Handler(BaseHTTPRequestHandler):
                                           "message": "Unknown setup entity."}}, 404)
 
     def _handle_reassign_v2(self, entity: str, record_id: str, target: str,
-                            body: dict, actor_id: str):
+                            body: dict, actor_id: str, role=None, scope=None):
         """Dispatch /api/v2/setup/<entity>/<id>/assign-<target> (#233 Slice C2).
 
         Canonical reassign per the ADR 0001 new tree: division→league (the
@@ -2952,6 +2984,13 @@ class Handler(BaseHTTPRequestHandler):
                 check_body(b, **_V2_REASSIGN_SCHEMA[combo])
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
+        # #369 review: the new parent must be one this caller may already
+        # reach -- the same gate, and the same refusal, as the creates.
+        if combo in _REASSIGN_PARENTS:
+            _kind, _key = _REASSIGN_PARENTS[combo]
+            if self._reject_parent_outside_scope(
+                    _kind, b.get(_key), role, scope, actor_id):
+                return
         if combo == ("program", "organization"):
             # v2 Program operator reassignment (#233 Slice C2 review): the
             # canonical umbrella owner move, using ``operator_organization_id``.
@@ -3021,7 +3060,7 @@ class Handler(BaseHTTPRequestHandler):
             entity)
         if m:
             return self._handle_reassign_v2(
-                m.group(1), m.group(2), m.group(3), b, actor_id)
+                m.group(1), m.group(2), m.group(3), b, actor_id, role, scope)
         # Audited in-place Player profile edit (#268): correct name / position /
         # jersey_number / shoots / email without touching the id, Team, active
         # state, or any history. Every field is OPTIONAL (a partial edit) but an

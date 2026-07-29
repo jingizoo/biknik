@@ -220,6 +220,105 @@ class SetupParentWriteScopeHttpTest(unittest.TestCase):
                                           "name": "OPERATOR-RINK"})
         self._post(admin, "ice-slot", dict(rink_id=rink["id"], **_SLOT_TIMES))
 
+    def test_reassign_is_gated_like_create_on_both_api_versions(self):
+        """A create is not the only way to attach a record to a parent.
+
+        ``assign-<target>`` MOVES an existing record under a new parent, and a
+        gate on creates alone leaves the identical cross-owner write open
+        behind a different URL. Before this was closed, an Arena Manager could
+        move its own Rink under another creator's Venue and get a 200 on both
+        API versions -- the owner's Venue silently acquiring a Rink it never
+        agreed to, which is the same mutation the create gate exists to stop.
+        """
+        _admin, parents = self._owner_parents("REASSIGN")
+        arena = self._login("arena")
+        for api in ("v1", "v2"):
+            prefix = "/api/v2/setup" if api == "v2" else "/api/setup"
+            own_venue = self._post(arena, "venue",
+                                   {"name": f"ARENA-{api}-VENUE"})
+            own_rink = self._post(arena, "rink",
+                                  {"venue_id": own_venue["id"],
+                                   "name": f"ARENA-{api}-RINK"})
+            moves = [
+                (f"rink/{own_rink['id']}/assign-venue", "venue_id",
+                 parents["venue_id"], "Venue"),
+                (f"venue/{own_venue['id']}/assign-organization",
+                 "organization_id", parents["organization_id"],
+                 "Organization"),
+            ]
+            for path, key, foreign_id, label in moves:
+                status, resp = self._req(arena, "POST", f"{prefix}/{path}",
+                                         {key: foreign_id})
+                self.assertEqual(
+                    status, 404,
+                    f"[{api}] an Arena Manager moved a record under another "
+                    f"creator's {key}={foreign_id}: {resp}")
+                self.assertEqual(resp["error"]["message"],
+                                 f"{label} {foreign_id} not found.",
+                                 (api, resp))
+                ghost = f"{key[:-3]}_never_existed"
+                g_status, g_resp = self._req(arena, "POST",
+                                             f"{prefix}/{path}", {key: ghost})
+                self.assertEqual(
+                    (g_status, g_resp),
+                    (status, {"error": {
+                        "code": resp["error"]["code"],
+                        "message": f"{label} {ghost} not found."}}),
+                    f"[{api}] the inaccessible-{key} reassign refusal is "
+                    f"distinguishable from the nonexistent one")
+
+            # The record did not move.
+            ov = self._req(arena, "GET", "/api/v2/setup/overview")[1]
+            rink = next(r for r in ov["pending_link_rinks"]
+                        if r["id"] == own_rink["id"])
+            self.assertEqual(rink["venue_id"], own_venue["id"],
+                             f"[{api}] a refused reassign still moved the "
+                             f"Rink: {rink}")
+
+            # Positive controls: the explicit null unassign is NOT gated
+            # (there is no parent to leak), and a move under a parent this
+            # caller owns still works.
+            status, _ = self._req(
+                arena, "POST",
+                f"{prefix}/venue/{own_venue['id']}/assign-organization",
+                {"organization_id": None})
+            self.assertEqual(status, 200,
+                             f"[{api}] the explicit unassign was refused")
+            own_org = self._post(arena, "organization",
+                                 {"name": f"ARENA-{api}-ORG"})
+            status, _ = self._req(
+                arena, "POST",
+                f"{prefix}/venue/{own_venue['id']}/assign-organization",
+                {"organization_id": own_org["id"]})
+            self.assertEqual(
+                status, 200,
+                f"[{api}] a move under the caller's OWN Organization was "
+                f"refused -- the gate is not a scope decision but a blanket "
+                f"block")
+
+    def test_every_gated_reassign_relation_is_actually_in_the_table(self):
+        """The gate is table-driven, so the table IS the coverage.
+
+        A relation silently dropped from it would reopen that one write with
+        no test failing anywhere -- the loop above exercises the mechanism on
+        two relations, and this pins the remaining three so adding a create
+        gate without its reassign twin cannot pass unnoticed.
+        """
+        from hockey_scheduler.web.server import (_REASSIGN_PARENTS,
+                                                 _SETUP_PARENT_LISTS)
+        self.assertEqual(
+            _REASSIGN_PARENTS,
+            {("league", "organization"): ("organization", "organization_id"),
+             ("program", "organization"): ("organization",
+                                           "operator_organization_id"),
+             ("venue", "organization"): ("organization", "organization_id"),
+             ("rink", "venue"): ("venue", "venue_id"),
+             ("team", "club"): ("club", "club_id")})
+        # Every kind the reassign table names must be one the gate can
+        # actually resolve a list for, or the lookup raises at request time.
+        for kind, _key in _REASSIGN_PARENTS.values():
+            self.assertIn(kind, _SETUP_PARENT_LISTS)
+
     def test_a_second_account_cannot_reach_that_same_operator_org(self):
         """The other half of the case above: creator-ownership admits the
         creator and nobody else. Without this, "allow rows you created" could

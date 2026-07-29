@@ -458,7 +458,8 @@ name redaction:
   grows an Official carrying a person's name.
 
 So the parent id is validated before the facade call, on **both** API versions
-(`/api/setup/` is not a bypass), by `Handler._reject_parent_outside_scope` →
+(`/api/setup/` is not a bypass) and on **both verbs** (create and reassign — see
+below), by `Handler._reject_parent_outside_scope` →
 `ApiService.writable_setup_parent_ids`. The accepted set is computed from the
 read itself, so the write gate cannot drift into a weaker policy, and has
 **three** sources:
@@ -491,8 +492,30 @@ identity or an errored overview refuses rather than falling through to the
 write. A falsy parent id is not this gate's business — that stays the facade's
 own validation error.
 
+**Creates are not the only verb.** `assign-<target>` *moves* an existing record
+under a new parent, and a gate on creates alone leaves the identical write open
+behind a different URL — proven, before it was closed, by an Arena Manager
+moving its own Rink under another creator's Venue and getting a **200 on both
+API versions**. The same gate therefore runs on both reassign handlers, driven
+by `_REASSIGN_PARENTS`:
+
+| relation | body key | API |
+| --- | --- | --- |
+| `rink` → `venue` | `venue_id` | v1 + v2 |
+| `venue` → `organization` | `organization_id` | v1 + v2 |
+| `team` → `club` | `club_id` | v1 + v2 |
+| `league` → `organization` | `organization_id` | v1 (legacy: v1 “league” **is** today’s Program) |
+| `program` → `organization` | `operator_organization_id` | v2 |
+
+An explicit **null** id — the unassign on the nullable relations — is deliberately
+not gated: there is no parent to leak and nothing to probe.
+`division`→`league`, `team`→`league` and `player`→`team` have different parent
+kinds and are governed elsewhere.
+
 Regression: `backend/tests/test_setup_parent_write_scope.py` (v1 parity, the
-global-role case, and the operator-org flow from both sides) plus
+global-role case, the operator-org flow from both sides, the reassign verb on
+both APIs, and a table-completeness check so a relation dropped from
+`_REASSIGN_PARENTS` cannot reopen a write silently) plus
 `test_http_writing_under_a_guessed_parent_id_is_refused_outright` in
 `backend/tests/test_pending_link_ownership.py` — which is the **reversal** of an
 assertion that previously required only that the probe creates come back with
