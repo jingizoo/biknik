@@ -4209,10 +4209,15 @@ class ApiService:
         teams = {t.id: t for t in all_teams}
         orgs = {o.id: o for o in self.store.all_organizations()}
         leagues_by_id = {lg.id: lg for lg in self.store.all_programs()}
-        # #367: Venues/Rinks/Ice slots have no competition-League axis at all
-        # — scoped by Program only (via active SeasonVenueAccess to any of
-        # the Program's Seasons, per `in_scope_season_ids` above), never by
-        # League (no such join exists).
+        # #369: Venues/Rinks/Ice slots have no competition-League axis at all
+        # (SeasonVenueAccess is the ONLY join between the physical and
+        # competition trees), so they are never narrowed by League. They ARE
+        # narrowed by Season: `in_scope_season_ids` is the single ACTIVE
+        # Season (empty for a Program-only context), so only a Venue granted
+        # to THAT Season is in scope. An earlier revision scoped these to any
+        # of the Program's Seasons; #369 review rejected that as silently
+        # widening the released contract, and this comment described it for
+        # one commit after the code had already stopped doing it.
         in_scope_venue_ids = None
         if in_scope_season_ids is not None:
             in_scope_venue_ids = {

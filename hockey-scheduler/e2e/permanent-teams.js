@@ -102,6 +102,33 @@ async function checkViewport(browser, viewport) {
     await page.waitForFunction(() => !document.querySelector(".modal[role=dialog]"), null, { timeout: 5000 });
     return title;
   };
+  // Switch the PERSISTED active context through the real header switcher — the
+  // same control an operator uses — so the scoped Setup reads actually see the
+  // new selection. #ctx-select option values are "<programId>|<seasonId>", with
+  // an EMPTY season part for a Program-only selection (e.g. "program_2|"). The
+  // option list is seeded once per page load by loadContextOptions() and is not
+  // re-polled per render, so a Program created after that point is only offered
+  // once the page has been reloaded.
+  const switchContext = async (value) => {
+    await page.waitForSelector("#ctx-select:not([hidden])", { timeout: 10000 });
+    await page.waitForFunction(
+      (v) => [...document.querySelectorAll("#ctx-select option")].some((o) => o.value === v),
+      value, { timeout: 10000 });
+    const ctxPost = page.waitForResponse(
+      (r) => r.url().endsWith("/api/context") && r.request().method() === "POST",
+      { timeout: 10000 });
+    await page.selectOption("#ctx-select", value);
+    await ctxPost;
+    // The switcher repaints from the CANONICAL post-switch options, so the
+    // select settling on the requested value is proof the backend persisted it
+    // — a rejected switch snaps back to the previously persisted selection.
+    await page.waitForFunction(
+      (v) => { const s = document.getElementById("ctx-select"); return s && s.value === v; },
+      value, { timeout: 10000 });
+  };
+  // The switcher's current selection, so a step that borrows another Program's
+  // context can hand the original back.
+  const currentContext = () => page.$eval("#ctx-select", (s) => s.value);
   // Open a reassignment panel by "kind:parent" from the Setup trees, read its
   // title + any warning, then cancel out.
   const reassignPanel = async (key) => {
@@ -322,14 +349,33 @@ async function checkViewport(browser, viewport) {
     await page.waitForSelector("#f-league", { timeout: 5000 });
     await page.fill("#f-league", "Orgless Program");
     await page.click('[data-drawer-submit="league"]');
-    const noOrgBody = (await noOrgReq).postDataJSON();
+    const noOrgRequest = await noOrgReq;
+    const noOrgBody = noOrgRequest.postDataJSON();
     if (noOrgBody.operator_organization_id !== null)
       fail(`Program-create body did not carry a null operator_organization_id (got ${JSON.stringify(noOrgBody)})`);
+    const orglessId = await noOrgRequest.response()
+      .then((res) => (res ? res.json() : {}))
+      .then((body) => body && body.id);
+    if (!orglessId) fail(`Program create returned no id to switch context to`);
     await page.waitForFunction(() => !document.querySelector(".drawer[role=dialog]"), null, { timeout: 5000 });
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.click('.tab[data-tab="setup"]');
     await page.click('[data-setup-view="hierarchy"]');
     await page.click('[data-setup-view="records"]');
+    await page.waitForSelector(".setup-card", { timeout: 10000 });
+    //     #369 review: Setup Records now ceilings on the ACTIVE Program and its
+    //     `programs` list collapses to exactly that one Program, so this second
+    //     Program is only readable from its OWN context — the active context is
+    //     still "Permanent League" (the deterministic fallback picks the Program
+    //     that has an active Season). Switch to the new Program through the real
+    //     header switcher before asserting on its card; the reload above is what
+    //     makes the switcher offer it at all. The selection is Program-only
+    //     ("<id>|") because an orgless, season-less Program has no Season to
+    //     select. Afterwards hand the original context back: step 11's
+    //     reassign-target options come from this same Program-scoped read, so it
+    //     must run against the Program that owns the Division.
+    const primaryContext = await currentContext();
+    await switchContext(`${orglessId}|`);
     await page.waitForSelector(".setup-card", { timeout: 10000 });
     const orglessRow = await page.evaluate(() => {
       const card = [...document.querySelectorAll(".setup-card")]
@@ -340,6 +386,8 @@ async function checkViewport(browser, viewport) {
     });
     if (orglessRow !== "No operating org")
       fail(`Orgless program not shown as "No operating org" after reload (got ${JSON.stringify(orglessRow)})`);
+    await switchContext(primaryContext);
+    await page.waitForSelector(".setup-card", { timeout: 10000 });
 
     // 11) #233 B2a review r1: structural Setup writes go to v2 — a Division
     //     move (division:level) and a Division delete both POST to

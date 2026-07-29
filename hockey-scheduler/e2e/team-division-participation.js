@@ -5,7 +5,19 @@
 //   * Season participation shows the single Team in each Season's own Division;
 //   * the Arena Calendar scheduling wizard offers that Team only in a Division it
 //     is REGISTERED in (via SeasonTeamRegistration), never via the legacy
-//     Team.division_id — a division it isn't registered in doesn't list it.
+//     Team.division_id — a division it isn't registered in doesn't list it;
+//   * the SAME permanent Team is reachable in its OTHER Season's Division after
+//     an explicit context switch — one Team, two Seasons, two Divisions, proven
+//     through the real UI rather than through one read that spans both.
+//
+// #369: the Calendar/wizard read (`get_demo_overview`) ceilings HARD on the
+// active Season — divisions, registrations, games and (via SeasonVenueAccess)
+// venues/rinks/ice slots are the active Season's only. So this journey never
+// leans on one context showing every Season's data: it drives the REAL header
+// context switcher (`#ctx-select`, values "<programId>|<seasonId>") to the
+// Season each step operates in, exactly as an operator must. The switcher's
+// option list is seeded once per page load, so the fixture build is followed by
+// a reload before the first switch.
 // Fails on any browser console/page error.
 const { chromium } = require("playwright");
 const { spawn } = require("child_process");
@@ -46,6 +58,44 @@ function stopServer(server) {
   });
 }
 
+// Move the REAL header context switcher to a (Program, Season) pair and wait
+// until the app has actually repainted from it. `#ctx-select` option values are
+// "<programId>|<seasonId>"; the list is seeded once per page load, so a Season
+// created after that point is only selectable after a reload. The context is
+// never poked into localStorage or set through a direct API call — the point of
+// every assertion downstream is that the PERSISTED context drives the read.
+async function switchSeason(page, label, programId, seasonId) {
+  // render() rewrites #content wholesale, so a stamp on the painted view cannot
+  // survive a repaint — a real happened-after signal, not a guessed sleep.
+  await page.evaluate(() => {
+    const el = document.querySelector("#content > *");
+    if (el) el.dataset.tdpStamp = "1";
+  });
+  const value = `${programId}|${seasonId}`;
+  await page.selectOption("#ctx-select", value);
+  await page.waitForFunction((v) => {
+    const el = document.getElementById("ctx-select");
+    return el && el.value === v;
+  }, value, { timeout: 10000 }).catch(() => {
+    throw new Error(`[${label}] the context select never settled on "${value}"`);
+  });
+  // The switch is fire-and-forget from the <select>'s own onchange, so wait for
+  // the PERSISTED context — what every scoped read resolves through — and then
+  // for the repaint it triggers.
+  await page.waitForFunction(async (s) => {
+    const r = await (await fetch("/api/context", { credentials: "same-origin" })).json();
+    return !!r && r.season_id === s;
+  }, seasonId, { timeout: 10000, polling: 250 }).catch(() => {
+    throw new Error(`[${label}] the active context never persisted Season ${seasonId}`);
+  });
+  await page.waitForFunction(() => {
+    const el = document.querySelector("#content > *");
+    return !!el && el.dataset.tdpStamp !== "1";
+  }, null, { timeout: 15000 }).catch(() => {
+    throw new Error(`[${label}] the view never repainted after the context switch`);
+  });
+}
+
 async function checkViewport(browser, viewport) {
   const base = `http://${HOST}:${viewport.port}`;
   const server = spawn(
@@ -74,7 +124,13 @@ async function checkViewport(browser, viewport) {
         method: "POST", credentials: "same-origin",
         headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
       })).json();
-      const league = await post("/api/setup/league", { name: "Perm League" });
+      // An operator Organization is linked at Program creation so that the
+      // reload below lands a League Admin on the normal shell (with the header
+      // context switcher) instead of the blocking Initial Setup wizard — the
+      // established fixture convention, see league-filtered-data.js.
+      const org = await post("/api/v2/setup/organization", { name: "Perm Org" });
+      const league = await post("/api/setup/league",
+        { name: "Perm League", operator_organization_id: org.id });
       const s1 = await post("/api/setup/season", { league_id: league.id, name: "2026" });
       const s2 = await post("/api/setup/season", { league_id: league.id, name: "2027" });
       // #283 Slice E / rule 7: Perma's two registrations (d1 in s1, d2 in s2)
@@ -97,8 +153,14 @@ async function checkViewport(browser, viewport) {
       const dOther = await post("/api/setup/division", { season_id: s1.id, level_id: lv2.id, name: "S1 L2 Div" });
       const venue = await post("/api/setup/venue", { name: "V", league_id: league.id });
       // Game ice eligibility (#233 Slice E) requires the venue to hold active
-      // SeasonVenueAccess for the season the game is scheduled in.
+      // SeasonVenueAccess for the season the game is scheduled in. Since #369
+      // that grant is also what makes the venue — and its rinks and ice slots —
+      // VISIBLE at all: the Calendar read is ceilinged on the active Season, so
+      // ice granted only to s1 simply does not exist while s2 is active. This
+      // journey works the wizard in BOTH Seasons, so the one arena is granted to
+      // both (the same physical rink used across two seasons).
       await post(`/api/v2/setup/seasons/${s1.id}/venue-access`, { venue_id: venue.id });
+      await post(`/api/v2/setup/seasons/${s2.id}/venue-access`, { venue_id: venue.id });
       const rink = await post("/api/setup/rink", { venue_id: venue.id, name: "R" });
       const club = await post("/api/setup/club", { name: "Club" });
       // #180/#283 Slice E: create every permanent Team under its permanent
@@ -129,13 +191,18 @@ async function checkViewport(browser, viewport) {
       const slot = await post("/api/setup/ice-slot", {
         rink_id: rink.id, start_time: `${day}T18:00:00+00:00`,
         end_time: `${day}T19:00:00+00:00`, slot_type: "game" });
-      // A second game slot for the #283 Slice D Exhibition step below.
+      // A second game slot for the #283 Slice D Exhibition step below, and a
+      // third for the season-2 wizard step (E) — the ice is physical and shared,
+      // but slots 1 and 2 are consumed by the games created in season 1.
       const slot2 = await post("/api/setup/ice-slot", {
         rink_id: rink.id, start_time: `${day}T20:00:00+00:00`,
         end_time: `${day}T21:00:00+00:00`, slot_type: "game" });
+      const slot3 = await post("/api/setup/ice-slot", {
+        rink_id: rink.id, start_time: `${day}T22:00:00+00:00`,
+        end_time: `${day}T23:00:00+00:00`, slot_type: "game" });
       return { league: league.id, s1: s1.id, s2: s2.id, lv1: lv1.id,
-        d1: d1.id, d1b: d1b.id, d2: d2.id, dOther: dOther.id, perma, leagueOnly,
-        slot: slot.id, slot2: slot2.id };
+        d1: d1.id, d1b: d1b.id, d2: d2.id, dOther: dOther.id, perma, mateA,
+        leagueOnly, slot: slot.id, slot2: slot2.id, slot3: slot3.id };
     }, CAL_DAY);
 
     // (A) Season participation: one permanent Team, two seasons, two divisions.
@@ -155,6 +222,14 @@ async function checkViewport(browser, viewport) {
     if (part.div1 !== ids.d1 || part.div2 !== ids.d2) {
       throw new Error(`[${viewport.label}] Perma resolved wrong per-season divisions: ${JSON.stringify(part)}`);
     }
+
+    // Both Seasons were created after this page loaded, so the context
+    // switcher — seeded once by loadContextOptions() — does not know about
+    // them yet. Reload, then switch to the Season steps (B)–(D) operate in.
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForSelector("#content > *", { timeout: 10000 });
+    await page.waitForSelector("#ctx-select:not([hidden])", { timeout: 10000 });
+    await switchSeason(page, viewport.label, ids.league, ids.s1);
 
     // (B) Scheduling wizard filters by registration, not legacy division.
     await page.click('.tab[data-tab="calendar"]');
@@ -198,10 +273,12 @@ async function checkViewport(browser, viewport) {
       ids.d1, { timeout: 10000 });
 
     // (B1) Choosing a League enables the downstream controls, and scopes the
-    // Division picker to it — dOther (L_B's own division) must never leak
-    // into L_A's picker. (d2 is L_A's own division in the OTHER season, so it
-    // legitimately belongs to L_A here — the picker is league-scoped, not
-    // season-scoped.)
+    // Division picker to it — dOther (L_B's own division, in this same season)
+    // must never leak into L_A's picker. d2 is L_A's own division in the OTHER
+    // season and is absent too: since #369 the read is ceilinged on the active
+    // Season, so the picker is League-scoped AND Season-scoped, and scheduling
+    // into another Season's division is not offered from here at all. (Step (E)
+    // below reaches d2 the supported way — by switching Season.)
     const postSelect = await page.evaluate(() => ({
       divDisabled: document.querySelector("#w-div").disabled,
       homeDisabled: document.querySelector("#w-home").disabled,
@@ -213,6 +290,9 @@ async function checkViewport(browser, viewport) {
     }
     if (postSelect.divOptions.includes(ids.dOther)) {
       throw new Error(`[${viewport.label}] L_A's Division picker leaked L_B's own division: ${JSON.stringify(postSelect.divOptions)}`);
+    }
+    if (postSelect.divOptions.includes(ids.d2)) {
+      throw new Error(`[${viewport.label}] Division picker leaked the OTHER season's division while season 1 was active: ${JSON.stringify(postSelect.divOptions)}`);
     }
 
     const homeOptions = async () => page.$$eval(
@@ -271,10 +351,21 @@ async function checkViewport(browser, viewport) {
     await page.waitForSelector("#w-exhibition", { timeout: 10000 });
     await page.check("#w-exhibition");
     await page.waitForSelector("#w-season", { timeout: 10000 });
-    // No implicit Season pick with more than one Season present.
-    const exSeason = await page.$eval("#w-season", (s) => s.value);
-    if (exSeason !== "") {
-      throw new Error(`[${viewport.label}] Exhibition Season was implicitly pre-selected: ${exSeason}`);
+    // The Season picker offers exactly the ACTIVE Season and nothing else:
+    // since #369 the wizard's read is ceilinged on it, so the "exactly one
+    // unambiguous choice" auto-select always fires here. What must hold is that
+    // the friendly can only ever be created in the Season the operator actually
+    // switched to — never blank, and never the other Season, whose teams are
+    // out of scope entirely. (The "never implicitly pick one of several" rule
+    // still has real force on the League axis, asserted in B0 above: `ov.levels`
+    // is Program-wide, so both Leagues are offered there.)
+    const exSeason = await page.$eval("#w-season", (s) => ({
+      value: s.value,
+      options: Array.from(s.options).map((o) => o.value),
+    }));
+    if (exSeason.value !== ids.s1 || exSeason.options.length !== 1
+        || exSeason.options[0] !== ids.s1) {
+      throw new Error(`[${viewport.label}] Exhibition Season picker was not scoped to the active Season: ${JSON.stringify(exSeason)}`);
     }
     await page.selectOption("#w-season", ids.s1);
     await page.waitForFunction(
@@ -292,10 +383,48 @@ async function checkViewport(browser, viewport) {
     }
     await page.waitForFunction(() => !document.querySelector(".wizard"), null, { timeout: 10000 });
 
+    // (E) The cross-season half, reached the supported way (#369): switch the
+    // REAL context bar to season 2 and work the SAME permanent Team there. Its
+    // s2 registration puts it in d2 — a different Division than in s1 — so the
+    // wizard must now offer d2 (and only L_A's s2 divisions), offer Perma in it,
+    // and no longer offer mateA, whose registration is s1's. That is the same
+    // one-Team/two-Seasons/two-Divisions fact assertion (A) reads from the
+    // registration API, proven here through the operational UI.
+    // No game is created in this step: `ov.levels` serializes ONE season_id per
+    // League, so the wizard's regular-game payload derives its Season from the
+    // League's first-bound Season — an s2 create through the wizard is a
+    // separate concern this journey does not assert.
+    await switchSeason(page, viewport.label, ids.league, ids.s2);
+    await page.click('.tab[data-tab="calendar"]');
+    await page.waitForSelector(`[data-slot="${ids.slot3}"]`, { timeout: 15000 });
+    await page.click(`[data-slot="${ids.slot3}"]`);
+    await page.waitForSelector("#w-league", { timeout: 10000 });
+    await page.selectOption("#w-league", ids.lv1);
+    await page.waitForFunction(
+      (d) => !!Array.from(document.querySelectorAll("#w-div option")).find((o) => o.value === d),
+      ids.d2, { timeout: 10000 });
+    const s2Divs = await page.$$eval("#w-div option", (opts) => opts.map((o) => o.value));
+    if (s2Divs.includes(ids.d1) || s2Divs.includes(ids.d1b)) {
+      throw new Error(`[${viewport.label}] season 1's divisions were still offered after switching to season 2: ${JSON.stringify(s2Divs)}`);
+    }
+    await page.selectOption("#w-div", ids.d2);
+    await page.waitForFunction(
+      (p) => Array.from(document.querySelectorAll("#w-home option"))
+        .some((o) => o.value === p), ids.perma, { timeout: 10000 });
+    const inD2 = await homeOptions();
+    if (!inD2.includes(ids.perma)) {
+      throw new Error(`[${viewport.label}] the permanent Team was not offered in its season-2 division`);
+    }
+    if (inD2.includes(ids.mateA)) {
+      throw new Error(`[${viewport.label}] a season-1-only team was offered in a season-2 division: ${JSON.stringify(inD2)}`);
+    }
+    await page.click("[data-wizcancel]");
+    await page.waitForFunction(() => !document.querySelector(".wizard"), null, { timeout: 10000 });
+
     if (errors.length) {
       throw new Error(`[${viewport.label}] console/page errors:\n${errors.join("\n")}`);
     }
-    console.log(`[${viewport.label}] OK — one team across two seasons; wizard filters by registration; no implicit League selection; Exhibition friendly is season-scoped.`);
+    console.log(`[${viewport.label}] OK — one team across two seasons (each reached by switching the real context bar); wizard filters by registration; no implicit League selection; Exhibition friendly is season-scoped.`);
   } catch (error) {
     throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {

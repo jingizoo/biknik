@@ -6711,12 +6711,16 @@ async function render() {
     }
     // Import wizard (#96): bind the season picker to the ACTIVE #159
     // Season, not "the first Season that happens to exist" (#331 review
-    // round 7) — `ov.seasons` is unfiltered (every Program), and
-    // goToSetupWorkflow("import") does no seeding of its own (it only
-    // switches tabs), so the old fallback was a silent, COMMITTABLE
+    // round 7). When that rule was written `ov.seasons` was unfiltered
+    // (every Program), so the old fallback was a silent, COMMITTABLE
     // cross-Program default: needsSeason import types send seasonId
-    // verbatim to commit_import, and #159's context is display-only, not
-    // a backend filter, so nothing else would have caught it. Re-binds on
+    // verbatim to commit_import, and #159's context was display-only, not
+    // a backend filter, so nothing else would have caught it. #369 has
+    // since made `ov.seasons` the ACTIVE Season only, which independently
+    // closes the cross-Program half — but this binding stays load-bearing:
+    // goToSetupWorkflow("import") still does no seeding of its own (it
+    // only switches tabs), so without it the picker is simply unseeded.
+    // Re-binds on
     // ANY context revision, not just the first visit, since the operator
     // can reach Import once and then switch Program via the switcher
     // while still on this view. Fails CLOSED, not to a fresh global

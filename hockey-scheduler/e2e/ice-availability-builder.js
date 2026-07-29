@@ -6,7 +6,8 @@
 //   * the Arena Calendar has a Month view that renders a day grid;
 //   * the builder previews the correct slot count for a Tue/Thu block in the
 //     selected date range, and reports rinks whose Venue lacks SeasonVenueAccess
-//     (never generating ice for them);
+//     for the previewed Season (never generating ice for them) — re-checking
+//     access at preview time rather than trusting the rink list it offered;
 //   * committing creates exactly the previewed AVAILABLE Game ice;
 //   * re-running the same template is idempotent — zero new, all duplicates,
 //     and the create button is disabled;
@@ -153,8 +154,8 @@ async function checkViewport(browser, viewport) {
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
 
-    // One accessible rink (venue granted to the Season) and one whose Venue is
-    // NOT granted, to exercise the venue-access report.
+    // Two rinks, both offered by the builder; step (B) revokes the second one's
+    // venue access before previewing, to exercise the venue-access report.
     const ids = await page.evaluate(async () => {
       const post = async (p, b) => (await fetch(p, {
         method: "POST", credentials: "same-origin",
@@ -165,18 +166,20 @@ async function checkViewport(browser, viewport) {
       const venue = await post("/api/setup/venue", { name: "Main Arena", league_id: league.id });
       await post(`/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
       const rink = await post("/api/setup/rink", { venue_id: venue.id, name: "Rink A" });
-      // A second venue with access granted to a DIFFERENT Season of the SAME
-      // Program, never to the ACTIVE `season` above, so it is still reported
-      // as access-missing for it below (#367: get_demo_overview's ov.rinks —
-      // what the builder's checkboxes render from — now scopes a Venue into
-      // the active Program's view via SeasonVenueAccess to ANY of the
-      // Program's Seasons, not just the active one; a venue with literally
-      // ZERO access anywhere in the Program is entirely out of scope and its
-      // rink's checkbox would never render at all, so a plain "no access"
-      // venue can no longer exercise this report through the real UI).
-      const otherSeason = await post("/api/setup/season", { league_id: league.id, name: "Spring 2027" });
+      // A second venue, granted to the ACTIVE `season` so the builder actually
+      // OFFERS its rink (#369: get_demo_overview's ov.rinks — what the
+      // builder's checkboxes render from — treats the resolved Season as a
+      // hard ceiling, admitting only Venues with an active SeasonVenueAccess
+      // grant to THAT Season; a venue granted to some other Season, or to
+      // none at all, simply has no checkbox to tick). Step (B) then REVOKES
+      // this grant out from under the already-rendered form — a League Admin
+      // pulling access while the arena operator has the builder open. That is
+      // the one way an operator can still submit an un-granted rink now, and
+      // it is precisely why the preview re-checks venue access server-side
+      // instead of trusting the rink list the UI offered: this fixture proves
+      // that check, not the (no longer reachable) "never granted" shape.
       const venue2 = await post("/api/setup/venue", { name: "Annex", league_id: league.id });
-      await post(`/api/v2/setup/seasons/${otherSeason.id}/venue-access`, { venue_id: venue2.id });
+      const access2 = await post(`/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue2.id });
       const rink2 = await post("/api/setup/rink", { venue_id: venue2.id, name: "Annex Ice" });
       // The legacy v1 "league" IS a v2 Program under the shim (server.py's
       // POST /api/setup/league routes straight to api.create_program(), and
@@ -188,7 +191,8 @@ async function checkViewport(browser, viewport) {
       // actively selected -- this fixture must actively select one, not rely
       // on a silent global default that no longer exists).
       await post("/api/context", { program_id: league.id, season_id: season.id });
-      return { league: league.id, season: season.id, rink: rink.id, rink2: rink2.id };
+      return { league: league.id, season: season.id, rink: rink.id,
+               rink2: rink2.id, access2: access2.id };
     });
     // The /api/context call above is a bare fetch, bypassing setActiveContext()
     // (the real switcher's own handler) entirely -- it moves the SERVER's
@@ -210,11 +214,20 @@ async function checkViewport(browser, viewport) {
     const cellCount = await page.$$eval(".mo-grid .mo-cell", (els) => els.length);
     if (cellCount !== 42) fail(`month grid should have 42 day cells, got ${cellCount}`);
 
-    // (B) Open the builder and select BOTH rinks (one lacks venue access).
+    // (B) Open the builder and select BOTH rinks, then revoke the second
+    // venue's Season access BEFORE previewing (see the fixture comment): the
+    // preview re-checks access server-side, reports that rink as skipped and
+    // generates no ice for it, while the still-granted rink yields its full
+    // block and Create stays enabled.
     await page.click("[data-ice-builder-open]");
     await page.waitForSelector(".ib-form", { timeout: 10000 });
     await page.check(`.ib-rink[value="${ids.rink}"]`);
     await page.check(`.ib-rink[value="${ids.rink2}"]`);
+    await page.evaluate(async (accessId) => {
+      await fetch(`/api/v2/setup/season-venue-access/${accessId}/remove`, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: "{}" });
+    }, ids.access2);
     await preview(page);
     let s = await previewState(page);
     if (s.new !== EXPECTED_NEW) fail(`expected ${EXPECTED_NEW} new slots, got ${JSON.stringify(s)}`);
@@ -222,6 +235,19 @@ async function checkViewport(browser, viewport) {
     if (s.commitDisabled !== false) fail(`commit should be enabled with new slots: ${JSON.stringify(s)}`);
     const warn = await page.$(".ib-warn");
     if (!warn) fail("venue-access warning should be shown for the un-granted rink");
+
+    // That same revocation also dropped the un-granted rink from ov.rinks, so
+    // the post-preview re-render removed its checkbox — the form Create would
+    // now read no longer matches the fingerprint-bound template that was
+    // reviewed above (the server would refuse it as a stale preview, exactly
+    // as step H asserts). Re-preview the CURRENT, granted-rink-only proposal:
+    // same slot count, nothing left to report as access-missing, and that is
+    // the preview (C) commits.
+    await preview(page);
+    s = await previewState(page);
+    if (s.new !== EXPECTED_NEW || s.accessMissing !== 0) {
+      fail(`the re-preview should drop the revoked rink and keep ${EXPECTED_NEW} new slots, got ${JSON.stringify(s)}`);
+    }
 
     // (C) Commit creates exactly the accessible rink's slots.
     await page.click("[data-ib-commit]");
@@ -577,13 +603,14 @@ async function checkViewport(browser, viewport) {
       const venue = await post("/api/setup/venue", { name: "DST Arena", league_id: league.id });
       await post(`/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
       const rink = await post("/api/setup/rink", { venue_id: venue.id, name: "DST Sheet" });
-      // #367: get_demo_overview's `seasons` (what #ib-season's <option>s
-      // render from) now scopes to the ACTIVE Program only, unlike before
-      // #367 where it was globally unfiltered and a brand-new, never-
-      // activated Program's own Season still showed up regardless of the
-      // active context. Actively switch to this fresh DST League/Season so
-      // it resolves in the builder below, mirroring the identical
-      // requirement the fixture setup above already documents.
+      // #369: get_demo_overview's `seasons` (what #ib-season's <option>s
+      // render from) is ceilinged on the resolved ACTIVE Season — it lists
+      // exactly that one Season — unlike before #367, where it was globally
+      // unfiltered and a brand-new, never-activated Program's own Season
+      // still showed up regardless of the active context. Actively switch to
+      // this fresh DST League/Season so it (and its venue-access grants)
+      // resolve in the builder below, mirroring the identical requirement the
+      // fixture setup above already documents.
       await post("/api/context", { program_id: league.id, season_id: season.id });
       // Clear the #ctx= deep-link hash the earlier AHL switch's reload/render
       // synced into the URL: restoreContextDeepLink() on the NEXT boot below
@@ -666,8 +693,9 @@ async function checkViewport(browser, viewport) {
     await page.click("[data-ice-builder-open]");
     await page.waitForSelector(".ib-form", { timeout: 10000 });
     // A fresh open resets the form to its defaults (Tue/Thu, 15-min turnover,
-    // the first ACTIVE season overall) — reselect the DST season explicitly, or
-    // this rink's venue-access grant (scoped to dstIds.season) won't resolve.
+    // and the ACTIVE Season — the only option #ib-season now offers under the
+    // #369 Season ceiling) — reselect it explicitly anyway, so this step still
+    // states which Season it operates in rather than inheriting it silently.
     await page.selectOption("#ib-season", dstIds.season);
     await page.waitForSelector(`.ib-rink[value="${dstRink2}"]`, { timeout: 10000 });
     await page.check(`.ib-rink[value="${dstRink2}"]`);

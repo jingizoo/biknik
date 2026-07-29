@@ -1279,12 +1279,29 @@ async function checkRoleScenarios(browser, viewport) {
 
     // ---- (D) Two Programs, A created first / B active (#331 review round
     // 5 finding 4): every hub-driven create-drawer/Ice-Builder destination
-    // must seed its parent field from the ACTIVE Program/Season -- these
-    // fields' own option lists span every Program, unfiltered, so left
-    // unseeded they fall back to whichever entity happens to sort first
-    // GLOBALLY, which is Program A's here by construction (created, hence
-    // id-ordered, first). A silent wrong default would let a real submit
-    // create data under A while the operator is acting from B.
+    // must seed its parent field from the ACTIVE Program/Season.
+    //
+    // The failure guarded here is a cross-PROGRAM one: an unseeded field
+    // falls back to whichever entity sorts first GLOBALLY -- Program A's
+    // here by construction (created, hence id-ordered, first) -- letting a
+    // real submit create data under A while the operator acts from B.
+    //
+    // #369 changed how much of that is still reachable, and the two halves
+    // are worth keeping straight:
+    //   * Fields fed by get_setup_overview_v2 (the Program select, and the
+    //     Season/League selects derived from it) can no longer offer
+    //     another Program at all -- `programs` is now the ACTIVE Program
+    //     alone. Those assertions are consequently upheld by the ceiling
+    //     rather than by the seeding, and would survive the seeding being
+    //     removed. They are kept as ceiling regression cover.
+    //   * `#f-team-perm-league` is NOT one of those. It renders from
+    //     `allPermLeagues`, built in render() from `hv`
+    //     (/api/v2/setup/hierarchy -> get_setup_hierarchy_v2), which takes
+    //     no user/role/scope and is still installation-wide -- its options
+    //     are deliberately labelled "&lt;programName&gt; · &lt;leagueName&gt;" because
+    //     they span Programs. So the League-B-not-League-A assertion below
+    //     remains a REAL cross-Program seeding guard with genuine force,
+    //     and is the load-bearing assertion of this case.
     await logout(page);
     await loginAs(page, "admin", "demo");
     const d = await page.evaluate(async () => {
@@ -1876,16 +1893,37 @@ async function checkRoleScenarios(browser, viewport) {
     // -- Switch to a Program-ONLY context (no Season selected at all) --
     // the explicit "fail closed when no valid in-context Season resolves"
     // requirement, distinct from rebinding Season-to-Season above: the
-    // field must show no real selection (never a silent global-first
-    // fallback disguised as one), and Commit must stay disabled.
+    // operator must be offered no real Season selection (never a silent
+    // global-first fallback disguised as one), and Commit must stay
+    // disabled.
+    //
+    // #345/#369: the REQUIREMENT is unchanged, but what "fails closed"
+    // looks like on screen is now stronger. renderImport() builds its
+    // Season field from `ov.seasons`, i.e. get_demo_overview, whose
+    // resolved Season is a HARD ceiling as of #369 -- and a Program-only
+    // active context resolves NO Season, so `in_scope_season_ids` is empty
+    // and `ov.seasons` comes back empty rather than "every Season in the
+    // Program". renderImport() therefore drops the <select
+    // id="import-season"> entirely in favour of its "Create a season
+    // first." note. This supersedes the older expectation asserted here (a
+    // select still present, its value "" because no <option> carried
+    // `selected`): a global-first Season is no longer merely left
+    // unselected, it is not offerable at all. Assert the field genuinely
+    // rebound to that state -- rather than just waiting on #ctx-select's
+    // value, which settles earlier in the same render() cycle than
+    // renderImport()'s own repaint (the same gap the F1->F2 switch above
+    // documents).
     const switchToF2ProgramOnly = `${f.progF2}|`;
     await page.selectOption("#ctx-select", switchToF2ProgramOnly);
     await page.waitForFunction(
       (v) => document.getElementById("ctx-select").value === v,
       switchToF2ProgramOnly, { timeout: 10000 });
     await page.waitForFunction(
-      () => (document.getElementById("import-season") || {}).value === "",
-      null, { timeout: 10000 });
+      () => {
+        const form = document.querySelector(".import-form");
+        return !!form && !document.getElementById("import-season")
+          && /Create a season first/.test(form.textContent);
+      }, null, { timeout: 10000 });
     const noSeasonCommitEnabled = await page.evaluate(() => {
       const btn = document.querySelector("[data-import-commit]");
       return btn ? !btn.disabled : null;
@@ -2557,17 +2595,50 @@ async function checkRoleScenarios(browser, viewport) {
         + "content trivially matches the first load");
     }
 
-    // ---- (J, season-switch reorder) #import-season's own onchange only
-    // ever assigned importState.seasonId -- it never bumped
-    // importOperationSeq or otherwise participated in Commit's response
-    // ownership check (#331 review round 11 finding 1b). Switching to a
-    // DIFFERENT Season in the SAME context doesn't touch contextRevision (no
-    // context change) and, by design, must NOT touch report/validatedKey
-    // either (Validate's own dry-run is deliberately season-agnostic -- its
-    // result stays valid regardless of which Season is selected). Without
-    // its own operation bump, a Commit response captured for the
-    // PREVIOUSLY selected Season would still pass every remaining check and
-    // land as if it were the NEWLY selected Season's own result.
+    // ---- (J, season-switch reorder) A Commit response captured for the
+    // PREVIOUSLY targeted Season must never land as if it were the NEWLY
+    // targeted Season's own result -- and, more seriously, must never null
+    // out a genuinely fresh validation the operator has ALREADY completed
+    // against that new Season by the time the stale response arrives
+    // (#331 review round 11 finding 1b).
+    //
+    // #345/#369: the REQUIREMENT is unchanged; the way an operator
+    // RETARGETS Import's Season is what changed, so this case now drives it
+    // the only way that remains real. renderImport() builds #import-season
+    // from `ov.seasons`, i.e. get_demo_overview, whose resolved Season is
+    // now a HARD ceiling -- so that <select> offers exactly the ONE active
+    // Season (or none at all, in a Program-only context; see step F above).
+    // Picking "a different Season without changing the context" is
+    // therefore no longer an action the UI can express: retargeting Import
+    // means moving the active Season, which is the header context
+    // switcher's job. This case accordingly switches Season JSS-A ->
+    // JSS-B through #ctx-select, within the SAME Program, rather than
+    // through the now-single-option #import-season -- a Season-only move,
+    // distinct from (J2)/(J3)'s own Program+Season switches.
+    //
+    // The switch does bump contextRevision, which by design clears
+    // report/validatedKey, so this case re-validates under Season B before
+    // releasing A's held response. That keeps the ASSERTION honest --
+    // "Season B's own Commit availability must remain exactly as it was
+    // before A's response landed" is a real check here, not the weaker
+    // "Commit happens to be disabled anyway" the context switch alone would
+    // make trivially true.
+    //
+    // Be precise about what this case no longer proves, though. Commit
+    // ownership is `... || contextRevision !== requestRevision ||
+    // requestOp !== importOperationSeq`. Retargeting via #import-season
+    // bumped ONLY importOperationSeq, which made the seq leg the SOLE
+    // discriminator -- precisely the isolation #331 review round 11 finding
+    // 1b added this case for. Routing the retarget through #ctx-select
+    // bumps contextRevision too, so that leg alone now discards the stale
+    // response and this case would still pass with the seq leg deleted.
+    // The seq leg's isolated coverage is NOT lost -- it lives in the
+    // same-context reorder cases below, untouched: (J, commit reorder),
+    // (J, type-switch reorder) and (J, sample-reload reorder) all hold
+    // context constant so only the seq can discriminate. What IS gone is
+    // this case's uniqueness, and with it the last live exercise of
+    // importSeason.onchange's own importOperationSeq bump, which the
+    // single-option ceiling now makes unreachable from the UI.
     const jSeasonSwitch = await page.evaluate(async () => {
       const post = async (p, b) => (await fetch(p, {
         method: "POST", credentials: "same-origin",
@@ -2617,8 +2688,29 @@ async function checkRoleScenarios(browser, viewport) {
     });
     await page.click("[data-import-commit]");  // captures & sends season_id = JSS-A
     await new Promise((r) => setTimeout(r, 200));  // let the request actually leave
-    await page.selectOption("#import-season", jSeasonSwitch.seasonJSSB);
-    await new Promise((r) => setTimeout(r, 100));
+    // Retarget Import onto Season B via the REAL header switcher (see this
+    // step's own comment above) -- a Season-only move inside the same
+    // Program. Wait for the Import view's OWN re-render to rebind the
+    // season field, not just #ctx-select's value (the same gap steps
+    // F/G/K's own comments document elsewhere in this file).
+    await page.selectOption("#ctx-select",
+      `${jSeasonSwitch.progJSS}|${jSeasonSwitch.seasonJSSB}`);
+    await page.waitForFunction(
+      (v) => (document.getElementById("import-season") || {}).value === v,
+      jSeasonSwitch.seasonJSSB, { timeout: 10000 });
+    // Season B's OWN fresh validation, completed by the operator before A's
+    // straggler lands -- this is the state A's stale "Committed" response
+    // must leave untouched (it would otherwise null out report/validatedKey
+    // and silently un-commit work the operator had already reviewed here).
+    await page.click("[data-import-sample]");
+    const jSeasonSwitchRevalidateResp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/import/dry-run` && r.request().method() === "POST");
+    await page.click("[data-import-validate]");
+    await jSeasonSwitchRevalidateResp;
+    await page.waitForFunction(() => {
+      const btn = document.querySelector("[data-import-commit]");
+      return !!(btn && !btn.disabled);
+    }, null, { timeout: 10000 });
     releaseSeasonSwitchCommit();
     await page.unroute("**/api/import/commit/**");
     await new Promise((r) => setTimeout(r, 300));  // let the stale A response's own (discarded) handler run
@@ -2644,10 +2736,10 @@ async function checkRoleScenarios(browser, viewport) {
       return btn ? !btn.disabled : null;
     });
     if (!jSeasonSwitchCommitStillEnabled) {
-      fail("(J, season-switch reorder) expected Season B's own Commit "
-        + "availability -- never legitimately touched by A's stale response, "
-        + "since Validate's dry-run is deliberately season-agnostic -- to "
-        + "remain exactly as it was before A's response landed");
+      fail("(J, season-switch reorder) expected Season B's OWN freshly "
+        + "validated report -- reviewed under B, never legitimately touched "
+        + "by A's stale response -- to still leave Commit enabled exactly "
+        + "as it was before A's response landed");
     }
 
     // ---- (K) Ice Builder Create must be uncommittable the INSTANT a
