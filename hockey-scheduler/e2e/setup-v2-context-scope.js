@@ -3,28 +3,39 @@
 //
 // #369's review correction rearchitected get_setup_overview_v2
 // (backend/hockey_scheduler/api/service.py) so that EVERY collection it
-// returns ceilings on the persisted ACTIVE Program (ContextService.
-// resolve_with_league), not on the caller's full authorized Program set:
+// returns ceilings on the persisted ACTIVE tuple (ContextService.
+// resolve_with_league), not on the caller's full authorized Program set.
+// The #367 owner ruling then corrected two of those rules again, and this
+// file carries both reversals:
 //   * `programs` collapses to just `[active_program]`;
-//   * `seasons`/`leagues` are all of the active Program's (Season is NOT a
-//     further ceiling on this structural surface, unlike the Dashboard);
-//   * `divisions`/`teams` narrow further when a League is selected;
-//   * clubs / organizations / officials / venues / rinks / ice_slots have no
-//     direct Program FK and are scoped by DERIVED JOINS into the active
-//     Program (Club: >=1 Team there; Venue: an active SeasonVenueAccess grant
-//     to one of the Program's Seasons; Rink/IceSlot: cascade from Venue;
-//     Organization: owns >=1 in-scope Venue; Official: home_club in-scope OR
-//     an assignment whose Game's Season is in-scope);
-//   * the additive `unassigned_*` lists carry records linked to NO Program at
-//     all, which app.js's `withUnassigned(sv, key)` unions back into the
-//     Setup Records cards and create-drawer pickers so create-then-link flows
-//     still work.
+//   * `seasons` is the ACTIVE Season alone -- REVERSED from #369's "all of
+//     the active Program's Seasons, Season is not a further ceiling here".
+//     A sibling Season of the same Program is now as absent as another
+//     Program's, on the hub, the six workflow landings and Records alike;
+//   * `leagues` stays all of the active Program's: a League is PERMANENT
+//     Program structure, narrowed by neither the Season nor the League
+//     selection;
+//   * `divisions`/`teams` narrow further when a League is selected, and so
+//     do Clubs (through their Teams) and Officials (through an in-scope home
+//     Club or assignment);
+//   * venues / rinks / ice slots and their owning facility organization
+//     follow the SEASON axis (SeasonVenueAccess) and have NO
+//     competition-League axis at all, so they stay active-Season-wide under
+//     ANY League selection -- deliberately, and asserted as such below;
+//   * `pending_link_*` carries the unlinked records the CALLING account
+//     created, which app.js's `withPendingLink(sv, key)` unions back into
+//     the Setup Records cards and create-drawer pickers so create-then-link
+//     flows still work -- REVERSING #369's `unassigned_*` lists, which
+//     published every never-linked record in the installation to every
+//     scoped operator.
 //
 // This file is the reviewer's verbatim Required Regression: "seed two
 // authorized Programs and two Leagues with distinguishable teams, players,
 // venues/rinks/slots, clubs/orgs, and officials; prove Program A + No League
 // excludes Program B everywhere, and Program A + League A excludes League B,
-// at desktop and 390px." Every record carries an unmistakable PROGA-/PROGB-
+// at desktop and 390px" -- plus #367 B1's "prove Setup hub, six landings and
+// Records show only S1 under League and No League, then flip exactly when S2
+// is selected". Every record carries an unmistakable PROGA-/PROGB-
 // name, so a leak shows up as a SUBSTRING of the rendered card rather than
 // only as an id mismatch, and every check runs through the REAL Setup Records
 // UI (the SETUP_ENTITIES cards) with the context driven by the REAL context
@@ -42,9 +53,12 @@
 //     generation guard -- league-filtered-data.js's own scope.
 //   * The `Ice slots` card, which deliberately renders no list at all (ice
 //     inventory is managed on the Arena Calendar), so `ice_slots` /
-//     `unassigned_ice_slots` have no Records surface to assert against here;
-//     slots are still seeded per Program so the fixture matches the
+//     `pending_link_ice_slots` have no Records surface to assert against
+//     here; slots are still seeded per Program so the fixture matches the
 //     reviewer's wording, and their scoping is asserted at the facade level.
+//   * "and to nobody else" for the pending-link records -- a per-identity
+//     claim needing two real sessions, proven over authenticated HTTP in
+//     test_league_filtered_overview_v2.py.
 // The `Players` card USED to be excluded here, on the reasoning that it is
 // sourced from its own /api/players call rather than this endpoint's payload
 // and so sat outside get_setup_overview_v2's contract. That reasoning was the
@@ -72,11 +86,19 @@ const VIEWPORTS = [
   { label: "phone", width: 390, height: 844, port: 8382 },
 ];
 
-// The two never-linked bootstrap records (#369's `unassigned_*` contract):
-// a Club with no Team anywhere and a Venue with no SeasonVenueAccess grant
-// and no owning Organization. Neither is any Program's data, so BOTH
-// Programs' Setup Records must keep showing them -- the create-then-link
-// flows depend on it.
+// The two never-linked create-then-link records: a Club with no Team
+// anywhere and a Venue with no SeasonVenueAccess grant and no owning
+// Organization.
+//
+// #367 owner ruling: these are NOT "nobody's data" to be published to every
+// scoped operator (the reversed `unassigned_*` mechanism). They reach the
+// payload through `pending_link_*`, which carries only the unlinked records
+// the CALLING account created -- and this journey's single admin session is
+// exactly that account, which is why they must still be visible here, from
+// either Program, right up until their first real link. The
+// "and to nobody else" half is a per-identity claim with no pixel to check,
+// so it lives in test_league_filtered_overview_v2.py (facade + authenticated
+// HTTP, two different real sessions).
 const FREE_CLUB = "FREE-Club";
 const FREE_VENUE = "FREE-Venue";
 
@@ -143,23 +165,35 @@ function fail(msg) { throw new Error(msg); }
 // builder, so "Program B excludes A" is exactly as strong a check as
 // "Program A excludes B" -- neither direction can pass by accident because
 // one side happens to have less data.
+// Program A carries a SECOND Season (`season2`) with its own League,
+// Division, Venue and Rink, so the #367 owner ruling's Season ceiling has
+// something distinguishable to hide and to reveal on this surface. Every
+// Season-bound name is listed here; which of them are EXPECTED at any moment
+// is the `expected` argument, so anything not expected is asserted absent.
 const PROGRAM_A = {
   tag: "PROGA", program: "PROGA-Program", season: "PROGA-Season",
-  leagues: ["PROGA-League-A1", "PROGA-League-A2"],
-  divisions: ["PROGA-Division-A1", "PROGA-Division-A2"],
+  season2: "PROGA-Autumn",
+  seasons: ["PROGA-Season", "PROGA-Autumn"],
+  leagues: ["PROGA-League-A1", "PROGA-League-A2", "PROGA-League-A3"],
+  divisions: ["PROGA-Division-A1", "PROGA-Division-A2", "PROGA-Division-A3"],
   teams: ["PROGA-Team-A1", "PROGA-Team-A2"],
   players: ["PROGA-Player-A1", "PROGA-Player-A2"],
   club: "PROGA-Club", org: "PROGA-Org", official: "PROGA-Official",
   venue: "PROGA-Venue", rink: "PROGA-Rink",
+  venues: ["PROGA-Venue", "PROGA-Icehouse"],
+  rinks: ["PROGA-Rink", "PROGA-Padtwo"],
 };
 const PROGRAM_B = {
   tag: "PROGB", program: "PROGB-Program", season: "PROGB-Season",
+  seasons: ["PROGB-Season"],
   leagues: ["PROGB-League-B1"],
   divisions: ["PROGB-Division-B1"],
   teams: ["PROGB-Team-B1"],
   players: ["PROGB-Player-B1"],
   club: "PROGB-Club", org: "PROGB-Org", official: "PROGB-Official",
   venue: "PROGB-Venue", rink: "PROGB-Rink",
+  venues: ["PROGB-Venue"],
+  rinks: ["PROGB-Rink"],
 };
 
 // Two fully-populated, independently authorized Programs -- each with its own
@@ -238,6 +272,26 @@ async function buildFixture(page) {
     const leagueA2 = await buildLeague(a, "PROGA", "A2");
     await buildLeague(b, "PROGB", "B1");
 
+    // Program A's SECOND Season, with its own League, Division and its own
+    // granted Venue -> Rink (#367 owner ruling: the active Season is a hard
+    // ceiling on this surface too, and the facility tree follows the SEASON
+    // axis -- SeasonVenueAccess -- while ignoring the League axis entirely).
+    // Every Season needs a League of its own or get_onboarding_status_v2's
+    // INSTALLATION-WIDE readiness check redirects the session into the
+    // Initial Setup wizard.
+    const seasonA2 = await post("/api/v2/setup/season",
+      { program_id: a.program.id, name: "PROGA-Autumn" });
+    const leagueA3 = await post("/api/v2/setup/league",
+      { season_id: seasonA2.id, name: "PROGA-League-A3" });
+    await post("/api/v2/setup/division",
+      { league_id: leagueA3.id, name: "PROGA-Division-A3" });
+    const venueA2 = await post("/api/v2/setup/venue",
+      { name: "PROGA-Icehouse", organization_id: a.org.id });
+    await post(`/api/v2/setup/seasons/${seasonA2.id}/venue-access`,
+      { venue_id: venueA2.id });
+    await post("/api/v2/setup/rink",
+      { venue_id: venueA2.id, name: "PROGA-Padtwo" });
+
     // The never-linked bootstrap pair (#369's `unassigned_*` contract): a
     // Club with no Team and an owner-less Venue with no Season grant. Neither
     // has a chain into ANY Program, so both must stay visible from BOTH.
@@ -246,6 +300,7 @@ async function buildFixture(page) {
 
     return {
       programA: a.program.id, seasonA: a.season.id,
+      seasonA2: seasonA2.id,
       programB: b.program.id, seasonB: b.season.id,
       leagueA1, leagueA2,
     };
@@ -276,34 +331,46 @@ async function readRecords(page) {
   });
 }
 
-// Wait for the Records grid to reflect a context switch. The Teams card is
-// the settle signal because it is the ONE card that changes on BOTH axes
-// (Program and League), so every switch this journey makes has a genuinely
-// new expected value here -- there is no state where waiting on it could
-// return immediately against the pre-switch paint. On timeout it reports what
-// actually rendered, so a real narrowing regression reads as a precise diff
-// rather than an opaque hang; the same expectation is then re-asserted
-// explicitly below, so a late paint landing wrong content still fails.
-async function settleRecords(page, expectedTeams, step) {
+// Wait for the Records grid to settle on an expected card content. The
+// SIGNAL CARD matters: it has to be one whose expected value genuinely
+// CHANGES across the switch being made, or the wait returns immediately
+// against the pre-switch paint and proves nothing.
+//   * League switches use "Teams" (League-bound, and it changes on the
+//     Program axis too).
+//   * Program AND Season switches use "Seasons": under the #367 owner
+//     ruling that card holds exactly the active Season, so it is the one
+//     card guaranteed to differ across both of those switches -- Teams is
+//     PERMANENT Program+League structure and does NOT change when only the
+//     Season changes.
+// On timeout it reports what actually rendered, so a real narrowing
+// regression reads as a precise diff rather than an opaque hang; the same
+// expectation is then re-asserted explicitly below, so a late paint landing
+// wrong content still fails.
+async function settleCard(page, cardTitle, expectedTitles, step) {
   await page.waitForSelector(".setup-grid", { timeout: 10000 }).catch(() => fail(
     `[${step}] the Setup Records grid never rendered`));
-  const want = [...expectedTeams].sort();
-  await page.waitForFunction((expected) => {
+  const want = [...expectedTitles].sort();
+  await page.waitForFunction(([title, expected]) => {
     const card = Array.from(document.querySelectorAll(".setup-grid .setup-card"))
-      .find((c) => (c.querySelector(".sc-title")?.textContent || "").trim() === "Teams");
+      .find((c) => (c.querySelector(".sc-title")?.textContent || "").trim() === title);
     if (!card) return false;
     const got = Array.from(card.querySelectorAll(".setup-card-body .li-title"))
       .map((el) => el.textContent.trim()).sort();
     return got.length === expected.length && got.every((v, i) => v === expected[i]);
-  }, want, { timeout: 10000 }).catch(async () => {
+  }, [cardTitle, want], { timeout: 10000 }).catch(async () => {
     const { cards } = await readRecords(page);
-    fail(`[${step}] the Records "Teams" card never settled on ${JSON.stringify(want)} `
-      + `-- rendered ${JSON.stringify((cards["Teams"] || {}).titles)}`);
+    fail(`[${step}] the Records "${cardTitle}" card never settled on `
+      + `${JSON.stringify(want)} -- rendered `
+      + `${JSON.stringify((cards[cardTitle] || {}).titles)}`);
   });
 }
 
-async function selectProgram(page, programId, seasonId, expected, step) {
+const settleRecords = (page, expectedTeams, step) =>
+  settleCard(page, "Teams", expectedTeams, step);
+
+async function selectProgram(page, programId, seasonId, seasonName, expected, step) {
   await page.selectOption("#ctx-select", `${programId}|${seasonId}`);
+  await settleCard(page, "Seasons", [seasonName], step);
   await settleRecords(page, expected.teams, step);
 }
 
@@ -365,11 +432,16 @@ async function assertRecordsScope(page, self, other, expected, step) {
   present("Programs", self.program);
   absent("Programs", other.program);
 
-  // 2. Seasons and Leagues: ALL of the active Program's, never narrowed by
-  //    the selected Season or League (the deliberate structural-surface
-  //    contract), and never another Program's.
-  present("Seasons", self.season);
-  absent("Seasons", other.season);
+  // 2. Seasons: exactly the ACTIVE one (#367 owner ruling -- REVERSED from
+  //    "all of the active Program's Seasons"), so a sibling Season of the
+  //    SAME Program is absent here just like another Program's is.
+  //    Leagues: ALL of the active Program's, never narrowed by the Season or
+  //    the League selection -- a League is permanent Program structure, and
+  //    asserting that explicitly is what makes a future over-narrowing
+  //    regression fail here.
+  self.seasons.forEach((name) => (expected.seasons.includes(name)
+    ? present("Seasons", name) : absent("Seasons", name)));
+  other.seasons.forEach((name) => absent("Seasons", name));
   self.leagues.forEach((name) => present("Leagues", name));
   other.leagues.forEach((name) => absent("Leagues", name));
 
@@ -391,20 +463,29 @@ async function assertRecordsScope(page, self, other, expected, step) {
   other.players.forEach((name) => absent("Players", name));
 
   // 4. The derived-join entities -- no direct Program FK, scoped by a real
-  //    validated chain into the active Program. These are Program-level and
-  //    are NOT League-narrowed: every caller of this helper passes through
-  //    here under "No League", League A1 and League A2 alike, so an
-  //    over-narrowing regression on any of them fails.
+  //    validated chain into the active tuple.
+  //    Clubs and Officials ARE League-bound (a Club through its Teams, an
+  //    Official through its home Club); this fixture gives each Program ONE
+  //    Club shared by both of its Leagues' Teams, so both stay in scope
+  //    under either League -- the same-Program cross-LEAGUE case for those
+  //    two is proven at the facade level, where a per-League Club fixture
+  //    can be built without duplicating this whole journey.
+  //    Venues/Rinks/Facility owners follow the SEASON axis and have no
+  //    competition-League axis at all: every caller of this helper passes
+  //    through here under "No League", League A1 and League A2 alike, so an
+  //    over-narrowing regression on them fails here.
   present("Clubs", self.club);
   absent("Clubs", other.club);
   present("Facility owners", self.org);
   absent("Facility owners", other.org);
   present("Officials", self.official);
   absent("Officials", other.official);
-  present("Venues", self.venue);
-  absent("Venues", other.venue);
-  present("Rinks", self.rink);
-  absent("Rinks", other.rink);
+  self.venues.forEach((name) => (expected.venues.includes(name)
+    ? present("Venues", name) : absent("Venues", name)));
+  other.venues.forEach((name) => absent("Venues", name));
+  self.rinks.forEach((name) => (expected.rinks.includes(name)
+    ? present("Rinks", name) : absent("Rinks", name)));
+  other.rinks.forEach((name) => absent("Rinks", name));
 
   // 5. The `unassigned_*` bootstrap contract: a record linked to NO Program
   //    at all is nobody's data yet, so it stays visible from EVERY Program's
@@ -423,6 +504,68 @@ async function assertRecordsScope(page, self, other, expected, step) {
       + `grid while the OTHER Program is active -- leaking card(s): `
       + `${JSON.stringify(offenders)}`);
   }
+}
+
+// The Setup HUB and the workflow LANDINGS read the same payload as Records,
+// so the #367 owner ruling's Season ceiling has to be visible there too --
+// B1 names "the hub, all six landings, and Records" explicitly. The
+// "participation" workflow's Divisions summary is the value that flips with
+// the Season here (2 Divisions in Season A1, 1 in Season A2), and hub cards
+// and landings share ONE renderer (setupSummaryHtml), so checking the hub
+// card and then the landing covers both surfaces of the same number.
+// Returns to the Records view afterwards, which is what the rest of this
+// journey asserts against.
+async function assertSetupSummaries(page, expectedDivisions, step) {
+  const readDivisions = async (selector) => page.evaluate((sel) => {
+    const root = document.querySelector(sel);
+    if (!root) return null;
+    const stat = Array.from(root.querySelectorAll(".swf-stat"))
+      .find((el) => /Divisions/.test(el.textContent || ""));
+    const strong = stat && stat.querySelector("strong");
+    return strong ? parseInt(strong.textContent.trim(), 10) : null;
+  }, selector);
+
+  await page.click('[data-setup-view="hub"]');
+  await page.waitForSelector(".swf-grid", { timeout: 10000 }).catch(() => fail(
+    `[${step}] the Setup hub never rendered`));
+  await page.waitForFunction((want) => {
+    const root = document.querySelector(
+      '[data-setup-workflow-card="participation"] .swf-stats');
+    if (!root) return false;
+    const stat = Array.from(root.querySelectorAll(".swf-stat"))
+      .find((el) => /Divisions/.test(el.textContent || ""));
+    const strong = stat && stat.querySelector("strong");
+    return !!strong && parseInt(strong.textContent.trim(), 10) === want;
+  }, expectedDivisions, { timeout: 10000 }).catch(async () => fail(
+    `[${step}] the Setup HUB's "Season participation" card never settled on `
+    + `${expectedDivisions} Divisions -- got `
+    + `${await readDivisions('[data-setup-workflow-card="participation"] .swf-stats')}`));
+
+  await page.click('[data-setup-workflow="participation"]');
+  await page.waitForSelector(".swf-landing", { timeout: 10000 }).catch(() => fail(
+    `[${step}] the Season participation LANDING never rendered`));
+  const landing = await readDivisions(".swf-landing .swf-stats");
+  if (landing !== expectedDivisions) {
+    fail(`[${step}] the Season participation LANDING shows ${landing} Divisions, `
+      + `expected ${expectedDivisions} -- the landings share the Records `
+      + `surface's Season ceiling`);
+  }
+  // The scope note is the UI copy the ruling requires: it has to name the
+  // active Season and state the deliberately Season-wide, League-blind
+  // facility behavior, or an operator reads an empty card as data loss.
+  const note = await page.evaluate(() => {
+    const el = document.querySelector(".swf-landing [data-setup-scope-note]");
+    return el ? el.textContent.replace(/\s+/g, " ").trim() : null;
+  });
+  if (!note || !/season/i.test(note) || !/Venues, rinks and ice/i.test(note)) {
+    fail(`[${step}] the Setup scope note is missing or no longer explains the `
+      + `Season ceiling and the season-wide facility rule -- got `
+      + `${JSON.stringify(note)}`);
+  }
+
+  await page.click('[data-setup-view="records"]');
+  await page.waitForSelector(".setup-grid", { timeout: 10000 }).catch(() => fail(
+    `[${step}] the Records grid never came back`));
 }
 
 async function checkViewport(browser, viewport) {
@@ -452,18 +595,36 @@ async function checkViewport(browser, viewport) {
     await page.waitForSelector(".setup-grid", { timeout: 10000 }).catch(() => fail(
       `[${L}] the Setup Records grid never rendered`));
 
-    const bothA = { divisions: PROGRAM_A.divisions, teams: PROGRAM_A.teams,
-                    players: PROGRAM_A.players };
-    const onlyA1 = { divisions: ["PROGA-Division-A1"], teams: ["PROGA-Team-A1"],
+    // Season A1 is active in every `A*` expectation below: its two Divisions
+    // are visible, Season A2's third one is not, and the facility tree shows
+    // Season A1's granted Venue/Rink only.
+    const A1_SEASON = { seasons: [PROGRAM_A.season],
+                        venues: ["PROGA-Venue"], rinks: ["PROGA-Rink"] };
+    const bothA = { ...A1_SEASON, teams: PROGRAM_A.teams,
+                    players: PROGRAM_A.players,
+                    divisions: ["PROGA-Division-A1", "PROGA-Division-A2"] };
+    const onlyA1 = { ...A1_SEASON, divisions: ["PROGA-Division-A1"],
+                     teams: ["PROGA-Team-A1"],
                      players: ["PROGA-Player-A1"] };
-    const onlyA2 = { divisions: ["PROGA-Division-A2"], teams: ["PROGA-Team-A2"],
+    const onlyA2 = { ...A1_SEASON, divisions: ["PROGA-Division-A2"],
+                     teams: ["PROGA-Team-A2"],
                      players: ["PROGA-Player-A2"] };
+    // Season A2 active: the Season-BOUND records flip wholesale, while the
+    // permanent Program structure (Leagues) and the permanent Teams/Players
+    // stay exactly as they were -- that contrast is what makes this a Season
+    // ceiling rather than a blanket narrowing.
+    const seasonTwoA = { seasons: [PROGRAM_A.season2],
+                         venues: ["PROGA-Icehouse"], rinks: ["PROGA-Padtwo"],
+                         divisions: ["PROGA-Division-A3"],
+                         teams: PROGRAM_A.teams, players: PROGRAM_A.players };
     const allB = { divisions: PROGRAM_B.divisions, teams: PROGRAM_B.teams,
-                   players: PROGRAM_B.players };
+                   players: PROGRAM_B.players, seasons: PROGRAM_B.seasons,
+                   venues: PROGRAM_B.venues, rinks: PROGRAM_B.rinks };
 
     // (1) Program A + No League: every one of Program B's records is absent
     //     from every card, and A's own equivalents are present.
-    await selectProgram(page, f.programA, f.seasonA, bothA, `${L}/A-select`);
+    await selectProgram(page, f.programA, f.seasonA, PROGRAM_A.season, bothA,
+                        `${L}/A-select`);
     await page.waitForFunction(() => {
       const s = document.getElementById("ctx-league-select");
       return s && !s.hidden;
@@ -488,15 +649,43 @@ async function checkViewport(browser, viewport) {
     await selectLeague(page, "", bothA, `${L}/A-none-again`);
     await assertRecordsScope(page, PROGRAM_A, PROGRAM_B, bothA, `${L}/A+none-again`);
 
+    // (4) The SEASON ceiling (#367 owner ruling), the reversal of this
+    //     surface's previous "every Season of the active Program" contract.
+    //     Switching Program A to its SECOND Season flips every Season-bound
+    //     card -- Seasons, Divisions, Venues, Rinks -- while the permanent
+    //     Program structure (Leagues, Teams, Clubs, Players) stays put.
+    await selectProgram(page, f.programA, f.seasonA2, PROGRAM_A.season2,
+                        seasonTwoA, `${L}/A-season2`);
+    await assertRecordsScope(page, PROGRAM_A, PROGRAM_B, seasonTwoA,
+                             `${L}/A+season2`);
+    //     ...and the hub + workflow landings share the same ceiling, so the
+    //     Divisions summary flips with it (2 in Season A1, 1 in Season A2).
+    await assertSetupSummaries(page, 1, `${L}/season2`);
+
+    //     Back to Season A1: it flips back, rather than accumulating.
+    await selectProgram(page, f.programA, f.seasonA, PROGRAM_A.season, bothA,
+                        `${L}/A-season1-again`);
+    await assertRecordsScope(page, PROGRAM_A, PROGRAM_B, bothA,
+                             `${L}/A+season1-again`);
+    await assertSetupSummaries(page, 2, `${L}/season1`);
+    //     ...and the Season ceiling holds under a selected League too, not
+    //     only under "No League".
+    await selectLeague(page, f.leagueA1, onlyA1, `${L}/A-season1-league-A1`);
+    await assertRecordsScope(page, PROGRAM_A, PROGRAM_B, onlyA1,
+                             `${L}/A+season1+A1`);
+    await selectLeague(page, "", bothA, `${L}/A-season1-none`);
+
     // (2) Switching the context bar to Program B flips it ENTIRELY: B's
     //     records present, A's absent -- the mirror image, asserted with the
     //     exact same helper so neither direction can pass by asymmetry.
-    await selectProgram(page, f.programB, f.seasonB, allB, `${L}/B-select`);
+    await selectProgram(page, f.programB, f.seasonB, PROGRAM_B.season, allB,
+                        `${L}/B-select`);
     await assertRecordsScope(page, PROGRAM_B, PROGRAM_A, allB, `${L}/B+none`);
 
     //     And back to A, so the switch is proven reversible rather than a
     //     one-way narrowing that happens to look right once.
-    await selectProgram(page, f.programA, f.seasonA, bothA, `${L}/A-return`);
+    await selectProgram(page, f.programA, f.seasonA, PROGRAM_A.season, bothA,
+                        `${L}/A-return`);
     await assertRecordsScope(page, PROGRAM_A, PROGRAM_B, bothA, `${L}/A+none-return`);
 
     if (errors.length) {
@@ -507,11 +696,13 @@ async function checkViewport(browser, viewport) {
     if (overflow > 1) {
       fail(`[${L}] horizontal overflow: scrollWidth exceeds clientWidth by ${overflow}px`);
     }
-    console.log(`[${L}] OK — Setup Records scopes to the persisted active Program `
+    console.log(`[${L}] OK — Setup Records scopes to the persisted active tuple `
       + `(A excludes B and B excludes A across Programs/Seasons/Leagues/Divisions/`
-      + `Teams/Clubs/Facility owners/Officials/Venues/Rinks), League A1/A2 narrow `
-      + `Divisions+Teams only, and the never-linked FREE-Club/FREE-Venue stay `
-      + `visible from both.`);
+      + `Teams/Clubs/Facility owners/Officials/Venues/Rinks), the active SEASON `
+      + `ceilings Seasons/Divisions/Venues/Rinks on Records AND on the hub + `
+      + `landings (flipping both ways, under a League and under No League), `
+      + `League A1/A2 narrow Divisions+Teams, and this session's own `
+      + `never-linked FREE-Club/FREE-Venue stay visible from both Programs.`);
   } finally {
     await context.close();
     await stopServer(server);

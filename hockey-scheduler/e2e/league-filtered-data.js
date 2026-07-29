@@ -484,6 +484,111 @@ async function checkRaceGuard(browser) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Race guard, second shape: MODULE-LEVEL state written after an awaited
+// context-scoped fetch.
+//
+// The check above covers `ov`, a LOCAL of render(). `playersList` is
+// different in kind: render() assigns it to a module-level variable that
+// every later paint reads. So a superseded render() still awaiting
+// /api/players could write ANOTHER context's player list, and the newest
+// render() would then paint its own correctly-scoped Programs/Seasons/
+// Leagues/Divisions/Teams/Clubs cards right beside those foreign player
+// NAMES. There was no generation check between that fetch and its
+// assignment; this reproduced as exactly that mixed Setup Records grid, and
+// player names are the most sensitive thing on the screen (juniors, and on
+// this MANAGE_SETUP route the payload carries emails too).
+//
+// Built on the Setup RECORDS view, because that is where the Players card
+// renders one row per name -- the hub's Players stat is a count filtered
+// client-side against always-current state, which cannot show the defect.
+// Desktop only (timing/JS logic, not layout).
+// ---------------------------------------------------------------------------
+async function checkPlayerListRaceGuard(browser) {
+  const viewport = { label: "desktop", width: 1440, height: 900, port: 8373 };
+  const base = `http://${HOST}:${viewport.port}`;
+  const server = startServer(viewport.port, {});
+  let out = "";
+  server.stdout.on("data", (d) => { out += d.toString(); });
+  server.stderr.on("data", (d) => { out += d.toString(); });
+  const { context, page, errors } = await newPage(browser, viewport);
+  try {
+    await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
+    await page.goto(base, { waitUntil: "domcontentloaded" });
+    if ((await loginAs(page, "admin")).status !== 200) throw new Error("admin login failed");
+    const f = await buildFixture(page);
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForSelector("#content > *", { timeout: 10000 });
+    await page.selectOption("#ctx-select", `${f.program}|${f.season}`);
+    await page.waitForFunction(() => {
+      const s = document.getElementById("ctx-league-select");
+      return s && !s.hidden;
+    }, null, { timeout: 10000 });
+    await page.click('.tab[data-tab="setup"]:not([data-setup-workflow-nav])');
+    await page.waitForFunction(() => document.body.dataset.view === "setup",
+      null, { timeout: 10000 });
+    await page.click('[data-setup-view="records"]');
+    await page.waitForSelector(".setup-grid", { timeout: 10000 });
+    // Let the Records view's own settled render finish before intercepting,
+    // so the delayed response below is League X's and not this one's.
+    await page.waitForTimeout(500);
+
+    // Fetch the REAL response first, then delay only its DELIVERY -- delaying
+    // the outgoing request instead would let it reach the server after the
+    // League Y switch committed and come back with Y's data, which proves
+    // nothing about stale-response handling.
+    let delayedOnce = false;
+    await page.route("**/api/players*", async (route) => {
+      if (!delayedOnce) {
+        delayedOnce = true;
+        const response = await route.fetch();
+        await new Promise((r) => setTimeout(r, 1500));
+        await route.fulfill({ response });
+        return;
+      }
+      await route.continue();
+    });
+
+    await selectLeague(page, f.leagueX, "players-race/select-X-delayed");
+    await selectLeague(page, f.leagueY, "players-race/select-Y-while-X-in-flight");
+    await page.waitForTimeout(2000);   // past the delayed response's arrival
+
+    const names = await page.evaluate(() => {
+      const card = Array.from(document.querySelectorAll(".setup-card"))
+        .find((c) => (c.querySelector(".sc-title")?.textContent || "").trim() === "Players");
+      if (!card) return null;
+      return Array.from(card.querySelectorAll(".setup-card-body .li-title"))
+        .map((el) => el.textContent.trim());
+    });
+    if (names === null) {
+      fail("players race guard: no Players card rendered -- the selector "
+        + "assumption is stale, update this check");
+    }
+    const leaked = names.filter((n) => /^X\d/.test(n));
+    if (leaked.length) {
+      fail("players race guard: the DELAYED League X player list overwrote the "
+        + `newer League Y render() -- Players card shows ${JSON.stringify(names)}`);
+    }
+    if (!names.includes("Y1 Player A")) {
+      fail("players race guard: League Y's own player is missing -- expected "
+        + `"Y1 Player A", got ${JSON.stringify(names)}`);
+    }
+    const finalLeagueSelect = await page.evaluate(
+      () => document.getElementById("ctx-league-select").value);
+    if (finalLeagueSelect !== f.leagueY) {
+      fail(`players race guard: League select itself drifted -- expected `
+        + `"${f.leagueY}", got "${finalLeagueSelect}"`);
+    }
+    if (errors.length) {
+      fail(`players race guard: unexpected console/page errors: ${JSON.stringify(errors)}`);
+    }
+  } finally {
+    await context.close();
+    await stopServer(server);
+    if (process.env.SMOKE_DEBUG) console.error(out);
+  }
+}
+
 async function main() {
   let browser;
   try {
@@ -491,6 +596,7 @@ async function main() {
       process.env.SMOKE_CHROMIUM_PATH ? { executablePath: process.env.SMOKE_CHROMIUM_PATH } : {});
     for (const viewport of VIEWPORTS) await checkCore(browser, viewport);
     await checkRaceGuard(browser);
+    await checkPlayerListRaceGuard(browser);
     console.log("League-filtered data browser journey passed.");
   } catch (error) {
     console.error("League-filtered data browser journey FAILED.");
