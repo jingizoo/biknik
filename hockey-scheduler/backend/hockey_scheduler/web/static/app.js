@@ -9006,15 +9006,72 @@ function syncContextHash() {
   const sel = contextOptions && contextOptions.selected;
   const want = (sel && sel.program_id)
     ? encodeContextHash(sel.program_id, sel.season_id, sel.league_id) : "";
+  writeContextHash(want);
+}
+// #369 root cause (reproduced deterministically by holding POST /api/context's
+// RESPONSE while letting the request itself reach the server, at desktop AND
+// 390px). syncContextHash() above can only ever run AFTER a switch's POST
+// response is delivered, because it reads the POST echo out of
+// contextOptions.selected. That leaves a window in which the SERVER has
+// already accepted the new context while location.hash still encodes the OLD
+// one -- and the whole window is exactly as long as that response takes to
+// arrive (unbounded on a slow/mobile connection; this is why CI's phone leg
+// was where it bit). A reload landing inside that window boots into
+// restoreContextDeepLink(), which sees hash != persisted selection, cannot
+// tell "my own hash has not caught up yet" from "someone handed me a deep
+// link", and so applies the documented deep-link-wins rule to a STALE hash --
+// POSTing the old context back and silently reverting a switch the user made
+// and the server already took. Observed reverting request is
+// restoreContextDeepLink()'s own three-key body {program_id, season_id,
+// league_id}, the same fingerprint this bug left in venue-sharing.js.
+//
+// Fix: mirror the INTENDED selection into the hash immediately BEFORE the POST
+// goes out (below, in sendContextSwitch), so the hash always leads or equals
+// the server and can never lag it. A reload anywhere in the window then finds
+// a hash describing what the user actually chose: if the POST already landed,
+// hash == persisted and boot does nothing; if it did not, deep-link-wins
+// re-applies the user's own intent instead of undoing it. Either way the
+// switch converges on what was asked for. Deliberately NOT done in
+// setActiveContext(): a switch that is merely QUEUED there may still be
+// discarded by resetTransientUiState() on an identity change, and must not
+// leave a phantom hash behind for the next identity's boot to adopt.
+function writeContextHash(want) {
+  if (!currentUser || location.hash === "#public") return;
   if (location.hash !== want) {
     history.replaceState(null, "", location.pathname + location.search + want);
   }
 }
 // Load the caller's AUTHORIZED options + current selection. Session-only; a
 // signed-out user has no context.
+//
+// #369 review (root cause, reproduced via delayed /api/context/options
+// responses, not just delayed requests): this is called from several
+// independent places -- bootstrap()/signIn(), restoreContextDeepLink(), and
+// BOTH branches of sendContextSwitch() -- and two of its GETs can genuinely
+// be in flight at once (sendContextSwitch() only serializes the /api/context
+// POSTs themselves via contextSwitchInFlight/contextSwitchQueued; that flag
+// is already reset to false, and the NEXT switch's own POST+load already
+// under way, well before THIS call's trailing GET here resolves). Without a
+// sequence guard, whichever response happens to be DELIVERED last wins the
+// unconditional assignment below, regardless of which call was issued last
+// -- a slow, already-superseded load can clobber `contextOptions` with a
+// stale selection AFTER a newer switch's load already set the correct one.
+// sendContextSwitch()'s own `mySeq !== contextSwitchSeq` check catches this
+// far too late: it only skips the stale call's OWN render()/hash-sync, not
+// the assignment here, so the corruption sits silently in `contextOptions`
+// until the next unrelated render() (a toast, a poll, any of this file's
+// many other render() call sites) reads it and visibly reverts the switcher
+// to the stale choice with no user action. Fixed with the same
+// "only the latest-issued call may write" idiom already used for
+// contextSwitchSeq/iceOperationSeq/importOperationSeq elsewhere in this
+// file: bump a dedicated sequence BEFORE the await, and refuse to write
+// `contextOptions` if a newer load has started since.
+let contextOptionsLoadSeq = 0;
 async function loadContextOptions() {
   if (!currentUser) { contextOptions = null; return; }
+  const mySeq = ++contextOptionsLoadSeq;
   const o = await getJSON("/api/context/options");
+  if (mySeq !== contextOptionsLoadSeq) return;  // superseded by a newer load
   contextOptions = (o && !o.error) ? o : null;
 }
 // Restore on load: the persisted context is already loaded above; if the URL
@@ -9151,6 +9208,9 @@ async function setActiveContext(programId, seasonId, leagueId) {
 }
 async function sendContextSwitch(mySeq, programId, seasonId, leagueId) {
   contextSwitchInFlight = true;
+  // #369: publish the intent to the hash BEFORE the server can act on it, so
+  // the hash never lags an already-mutated server. See writeContextHash().
+  writeContextHash(encodeContextHash(programId, seasonId || null, leagueId || null));
   const r = await post("/api/context",
     { program_id: programId, season_id: seasonId || null, league_id: leagueId || null });
   contextSwitchInFlight = false;
