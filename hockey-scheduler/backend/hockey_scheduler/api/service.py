@@ -4920,30 +4920,49 @@ class ApiService:
         1. **Its own route**, gated MANAGE_SETUP -- the same permission as the
            grant it feeds, so no role learns anything it could not already act
            on. The overview stays Program/active-Season scoped.
-        2. **A valid destination Season**, which must resolve INTO the caller's
-           active Program. A foreign or nonexistent ``season_id`` is refused
-           identically, so this never becomes a Season oracle either.
+        2. **The SELECTED destination Season** -- ``season_id`` must BE the
+           caller's persisted active Season, not merely some Season of the
+           active Program (#369 owner ruling). A foreign or nonexistent
+           ``season_id`` is refused identically, so this never becomes a
+           Season oracle either.
         3. **Candidates only**: id and name, for Venues that are either linked
            to some Program (an established shared facility) or unlinked and
            created by THIS caller (its own create-then-grant draft). Another
            operator's unlinked draft is never a candidate -- that case leaked
            in an earlier round of this work.
 
-        Deliberately NOT filtered to the active Program: a Venue already
-        linked to another Program is exactly what sharing means, and filtering
-        it out is what deadlocked the capability (once one Program holds the
-        grant, no other could obtain it). Rinks, IceSlots and every
-        competition record keep the ordinary ceiling.
+        On (2) the ceiling was first written as a Program comparison
+        (``season.program_id == program.id``), which answered 200 for any
+        SIBLING Season of the active Program. The owner ruled that incorrect:
+        the active tuple is what the operator actually selected, and a
+        same-Program/other-Season 200 hands out a grant surface for a Season
+        the caller is not working in. So the check is now identity against the
+        resolved active Season, which also makes a Program-only context (no
+        Season selected) fail closed -- there is no selected Season for the
+        request to equal, and inventing one would be exactly the widening the
+        ruling forbids.
+
+        The ceiling being tightened is the DESTINATION Season, never WHICH
+        Venues may be offered: the candidate set is still deliberately NOT
+        filtered to the active Program, because a Venue already linked to
+        another Program is exactly what sharing means, and filtering it out is
+        what deadlocked the capability (once one Program holds the grant, no
+        other could obtain it). Rinks, IceSlots and every competition record
+        keep the ordinary ceiling.
         """
         if role is None:
             return {"error": {"code": "forbidden",
                               "message": "An identity is required."}}
-        program, _season, _league = self.context.resolve_with_league(
+        program, active_season, _league = self.context.resolve_with_league(
             user_id, role, scope)
-        season = self.store.get_season(season_id) if season_id else None
-        if (program is None or season is None
-                or season.program_id != program.id):
+        # The EXACT selected-Season ceiling (#369 owner ruling). One generic
+        # refusal for every miss -- foreign Program, sibling Season of the
+        # active Program, nonexistent id, and Program-only context alike -- so
+        # none of them is distinguishable from the others.
+        if (program is None or active_season is None
+                or not season_id or season_id != active_season.id):
             raise NotFoundError(f"Season {season_id} not found.")
+        season = active_season
         granted = {a.venue_id for a in
                    self.store.season_venue_access_for_season(season.id)
                    if a.active}
@@ -6190,21 +6209,65 @@ class ApiService:
             access_id, actor_id))
 
     @catch
-    def list_season_venue_access(self, season_id: str) -> dict:
+    def list_season_venue_access(self, season_id: str, user_id=None, role=None,
+                                 scope=None) -> dict:
         """This Season's venue grants, each naming its own Venue.
 
-        ``venue_name`` is additive (#369 review). A Season may hold a grant to a
-        Venue belonging to ANOTHER Program -- that is what shared arenas are --
-        and once cross-Program Venues stopped appearing in the ordinary scoped
-        overview, there was nowhere left for the client to resolve that name
-        from, so the Allowed-venues row rendered a bare id. Naming the Venue on
-        the grant that already exists is not a cross-Program directory: it
-        discloses only a facility this Season demonstrably already uses, to a
-        caller already reading that Season's grants.
+        SCOPED exactly like :meth:`get_venue_grant_candidates` (#369 review):
+        ``season_id`` must BE the caller's persisted active Season, and a
+        foreign, sibling or nonexistent ``season_id`` takes the same generic
+        not-found path -- so this is neither a Season oracle nor a way to name
+        another Program's facilities.
+
+        That check is the whole point of the identity parameters. This read had
+        only a role-level MANAGE_SETUP gate on its route and took the requested
+        id on trust, which was survivable while it echoed opaque grant rows but
+        stopped being so the moment ``venue_name`` was added below: with
+        Program A active, asking for Program B's Season answered 200 with B's
+        Venue id AND its name, while a guessed id answered 200 with an empty
+        list -- a cross-Program facility disclosure and an existence oracle in
+        one route. Role-level permission says the caller may manage SOME
+        Season's grants; it never says which Season, and only the persisted
+        active tuple can say that.
+
+        ``venue_name`` itself is additive and stays, but only past that check. A
+        Season may hold a grant to a Venue belonging to ANOTHER Program -- that
+        is what shared arenas are -- and once cross-Program Venues stopped
+        appearing in the ordinary scoped overview, there was nowhere left for
+        the client to resolve that name from, so the Allowed-venues row
+        rendered a bare id. Naming the Venue on a grant the caller's OWN active
+        Program already holds is not a cross-Program directory: it discloses
+        only a facility that Season demonstrably already uses, to a caller who
+        has been proven entitled to that Season's grants.
+
+        Ceilinged to the EXACT selected Season, deliberately and identically to
+        the candidate route (#369 owner ruling). The first version of this
+        check compared Programs, so any SIBLING Season of the active Program
+        answered 200 with its grants and its Venue names; the owner ruled that
+        same-Program/other-Season 200 incorrect. It was written that way to
+        serve the client, which walked every Season of the active Program in
+        ``get_setup_hierarchy_v2`` and read allowed venues for each -- i.e.
+        used this route as an all-Seasons inventory. That use has stopped:
+        ``app.js`` now reads this route for the selected Season only, and
+        renders a non-identifying placeholder for the rest. A Program-only
+        context (no Season selected) fails closed for the same reason -- there
+        is no selected Season for the request to equal.
         """
+        if role is None:
+            return {"error": {"code": "forbidden",
+                              "message": "An identity is required."}}
+        program, active_season, _league = self.context.resolve_with_league(
+            user_id, role, scope)
+        # One generic refusal for every miss -- foreign Program, sibling Season
+        # of the active Program, nonexistent id, Program-only context -- so no
+        # one of them is distinguishable from the others.
+        if (program is None or active_season is None
+                or not season_id or season_id != active_season.id):
+            raise NotFoundError(f"Season {season_id} not found.")
+        season = active_season
         names = {v.id: v.name for v in self.store.all_venues()}
         rows = []
-        for a in self.store.season_venue_access_for_season(season_id):
+        for a in self.store.season_venue_access_for_season(season.id):
             row = _serialize(a)
             row["venue_name"] = names.get(a.venue_id)
             rows.append(row)

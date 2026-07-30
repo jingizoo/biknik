@@ -1092,6 +1092,9 @@ class Handler(BaseHTTPRequestHandler):
         # #369 review: grant CANDIDATES for one destination Season -- the only
         # facility contract that reaches across the Program ceiling, and the
         # reason it is its own route rather than a field on the overview below.
+        # The destination Season must be the caller's persisted ACTIVE Season
+        # (#369 owner ruling); a sibling Season of the active Program is
+        # refused exactly like a foreign or nonexistent one.
         # The overview is MANAGE_ARENA; this is MANAGE_SETUP, the same
         # permission as the grant it feeds, so no role learns a Venue it could
         # not already act on. Emitting these on the overview meant an Arena
@@ -1199,9 +1202,22 @@ class Handler(BaseHTTPRequestHandler):
                 api.list_season_team_registrations(mv2tr.group(1)))
         mv2va = re.match(r"^/api/v2/setup/seasons/([^/]+)/venue-access$", path)
         if mv2va:
+            # #369 review: MANAGE_SETUP below is a ROLE gate — it says the
+            # caller may manage grants somewhere, never that THIS Season is
+            # theirs. The identity goes through to the service so the requested
+            # Season is checked against the persisted active SEASON (#369 owner
+            # ruling — the exact selected tuple, not merely its Program), the
+            # same ceiling the venue-candidates route above applies; without
+            # it, adding venue_name turned this read into a cross-Program
+            # facility disclosure and a Season-existence oracle.
             if self._operator_only("/api/v2/setup/player"):
                 return
-            return self._send_api(api.list_season_venue_access(mv2va.group(1)))
+            role, scope, user_id, err = self._resolve_role()
+            if err is not None:
+                code, payload = err
+                return self._send_json(payload, code)
+            return self._send_api(api.list_season_venue_access(
+                mv2va.group(1), user_id, role, scope))
         if path == "/api/v2/onboarding/status":
             if self._operator_only("/api/v2/onboarding/status"):
                 return

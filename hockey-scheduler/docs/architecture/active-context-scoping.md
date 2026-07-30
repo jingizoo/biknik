@@ -551,16 +551,68 @@ bounded four ways:
 | bound | why |
 | --- | --- |
 | its own `MANAGE_SETUP` route | the same permission as the grant it feeds, so no role learns a Venue it could not already act on |
-| a valid destination Season, inside the active Program | a foreign or nonexistent `season_id` is refused identically, so this is not a Season oracle either |
+| the destination Season must **be** the persisted **selected** Season | a sibling Season of the active Program, a foreign one and a nonexistent one are all refused identically, so this is neither a widened grant surface nor a Season oracle |
 | id + name only | a physical building's existence, not anybody's data |
 | **linked** venues, or the caller's **own** unlinked draft | another operator's never-linked Venue is a private draft governed by the creator-only `pending_link_venues` contract. An earlier revision returned every Venue and leaked one operator's arena to another on a Program-less install. |
 
 Already-granted Venues are deliberately **not** candidates, so
 `list_season_venue_access` names its own Venue (`venue_name`, additive): a
 cross-Program Venue this Season already uses has nowhere else to resolve its
-name from, and the Allowed-venues row would otherwise render a bare id. Naming
-a facility a Season demonstrably already uses, to a caller already reading that
-Season's grants, is not a directory.
+name from, and the Allowed-venues row would otherwise render a bare id.
+
+**That addition needed the same ceiling, and at first did not have it.** The
+justification above ends "…to a caller already reading that Season's grants" —
+but `GET /api/v2/setup/seasons/<id>/venue-access` had only a role-level
+`MANAGE_SETUP` gate and took the requested Season id on trust, so *which*
+Season's grants a caller was reading had never been established. With Program A
+active, asking for Program B's Season answered `200` with B's Venue id **and**
+its name, while a guessed Season id answered `200 {"venue_access": []}` — one
+route, a cross-Program facility disclosure and a Season-existence oracle.
+Role-level permission says the caller may manage *some* Season's grants; only
+the persisted active tuple says *which*.
+
+So the read is bound exactly like the candidate route beside it: identity goes
+through to the service, the requested Season is checked against the persisted
+active tuple, and every miss takes one generic `not_found` path. `venue_name` is
+serialized only past that check.
+
+### The exact selected-Season ceiling (owner ruling)
+
+That check was first written as a **Program** comparison
+(`season.program_id == active_program.id`), for a client reason: the Setup tree
+shows every Season of the active Program, and `app.js` read allowed venues for
+each one. The repository owner ruled that insufficient —
+
+> Use the exact selected-Season ceiling. The same-Program/other-Season 200
+> remains incorrect. Both the venue-access list and candidate route must require
+> the requested Season to equal the persisted selected Season; Records must stop
+> using the endpoint as an all-Seasons inventory.
+
+So **both** routes now require `season_id == resolved_active_season.id`:
+
+| requested Season | answer |
+| --- | --- |
+| the persisted **selected** Season | `200`, unchanged in every respect |
+| a **sibling** Season of the active Program | `404`, generic |
+| a Season of another Program | `404`, generic |
+| a Season that does not exist | `404`, generic |
+| any Season, with a **Program-only** context | `404`, generic — there is no selected Season for the request to equal, so it fails closed |
+
+All four refusals are byte-identical once the echoed id is masked.
+
+The ceiling is the **destination Season**, never the candidate *set*: a Venue
+linked only to another Program is still a candidate (that exception is the whole
+reason this contract exists — without it arena sharing deadlocks on its own
+first use), and a shared cross-Program arena the selected Season already holds is
+still named by `venue_name`.
+
+The all-Seasons client walk that motivated the Program ceiling is gone.
+`app.js`'s Setup render loop fetches both routes **only** for the selected
+Season; every other Season in the hierarchy renders "Select this season to
+manage its venues" in place of its allowed-venues list and its Allow picker —
+no venue ids, no venue names, no count, and no request issued. Deliberately no
+new batch endpoint: that would re-create the inventory the ruling removed, one
+HTTP hop further down.
 
 `get_setup_overview_v2` is unchanged and fully ceilinged — it carries no
 candidate list at all.
@@ -570,9 +622,33 @@ overview enumerating no foreign Venue for League Admin, Arena Manager and a
 zero-scope identity with Program B active; the candidate set across active,
 revoked-only and legacy links plus another creator's draft; identical refusal
 for foreign and nonexistent Seasons; the `MANAGE_SETUP` boundary at the route;
-and zero grant/audit mutation on a refused read. Mutation-proven: gating the
-route `MANAGE_ARENA` fails with *"an Arena Manager reached the grant-candidate
-contract"*, and dropping the Season ceiling fails the oracle assertions.
+and zero grant/audit mutation on a refused read. For the grant READ the same
+file pins, on Memory/SQLite/PostgreSQL **and** authenticated HTTP, that a
+foreign and a nonexistent Season produce byte-identical bodies once the echoed
+id is masked, naming nothing of the other Program's, while the active Program's
+own Season still returns its active *and* revoked rows with `venue_name` —
+including a legitimately shared cross-Program arena.
+
+`SelectedSeasonCeilingTest` / `SelectedSeasonCeilingHttpTest` in the same file
+pin the owner ruling for **both** routes on Memory/SQLite/PostgreSQL and over
+authenticated HTTP: the selected Season still returns its rows and its
+candidates (including the cross-Program shared arena and a cross-Program
+candidate); a **sibling** Season of the active Program, a foreign one and a
+nonexistent one all refuse with identical raw bytes once the echoed id is
+masked; a Program-only context fails closed; and grants plus setup-audit are
+unchanged after every refusal. Each fixture asserts its own preconditions first
+(the sibling Season really shares the selected Season's Program, the shared
+arena really is held by both, the Venue names really are distinct), or the
+refusal assertions would pass with the fix reverted.
+
+Mutation-proven: gating the candidate route `MANAGE_ARENA` fails with *"an
+Arena Manager reached the grant-candidate contract"*; dropping either route's
+target-Season check fails the oracle assertions on every backend (*"Program B's
+Season was readable while Program A was active"*); and relaxing either route
+back to the Program comparison fails on Memory, SQLite, PostgreSQL and HTTP
+with *"the sibling Season was readable while another Season was selected"* and
+*"a Season of the active Program was readable with NO Season selected — there
+is no selected Season for the request to equal"*.
 
 ## Venues have no League axis
 

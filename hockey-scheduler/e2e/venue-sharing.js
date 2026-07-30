@@ -511,6 +511,14 @@ async function checkViewport(browser, viewport) {
     const seasonBAlt = await createViaDrawer("season",
       { "f-season-league": programB.id, "f-season": "2027 Varsity Spring" },
       "/api/v2/setup/season");
+    // #369 OWNER RULING: register this Season's Program too. `activateForSeason`
+    // is a no-op for a Season missing from this map, and the spring half-season
+    // was missing -- which used to be survivable only because BOTH venue reads
+    // ceilinged on the PROGRAM, so leaving Season B selected still served Season
+    // BAlt's grants and picker. The ruling made the SELECTED Season the exact
+    // ceiling, so the grant and the Allowed-venues read below must genuinely
+    // switch to this Season, not merely to its Program.
+    seasonProgram[seasonBAlt.id] = programB.id;
     // A THIRD ice slot on the second Venue, deliberately never granted to
     // Season B — the ungranted-Venue negative case below (#258 review).
     const slotSecondDenied = await createViaDrawer("ice-slot", {

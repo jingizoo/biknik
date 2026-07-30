@@ -100,9 +100,26 @@ async function checkViewport(browser, viewport) {
         { name: "VA Cleanup Program", operator_organization_id: org.id });
       const season = await post("/api/v2/setup/season", { program_id: program.id, name: "2028-29" });
       const venue = await post("/api/v2/setup/venue", { name: "VA Cleanup Venue", organization_id: org.id });
+      // #369 OWNER RULING: the Allowed-venues list and its Allow picker are
+      // served only for the EXACT persisted selected Season, and the client
+      // decides which Season that is from the context options it loaded at
+      // page load -- i.e. before this raw-fetch fixture existed. Select this
+      // Season explicitly here (and reload below), rather than relying on the
+      // server's fallback resolution happening to land on it.
+      await post("/api/context", { program_id: program.id, season_id: season.id });
       return { program: program.id, season: season.id, venue: venue.id };
     });
 
+    // Re-enter with the context this journey operates in: `contextOptions` is
+    // seeded once per page load and never re-polled by render(). Drop the
+    // URL's "#ctx=" deep link first — app.js keeps it in sync only through the
+    // real switcher, so after a raw POST it still encodes the PREVIOUS
+    // selection and bootstrap() would faithfully POST that back (the same
+    // guard venue-sharing.js's activate() carries, for the same reason).
+    await page.evaluate(() => history.replaceState(
+      null, "", location.pathname + location.search));
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForSelector("#content > *", { timeout: 10000 });
     await page.click('.tab[data-tab="setup"]');
     await page.click('[data-setup-view="hierarchy"]');
     await page.waitForFunction(
@@ -269,9 +286,17 @@ async function checkViewport(browser, viewport) {
         home_team_id: home.id, away_team_id: away.id, ice_slot_id: slot.id,
       });
       await post(`/api/v2/setup/season-venue-access/${access.id}/remove`, {});
+      // Same reason as the first fixture (#369 owner ruling): this scenario's
+      // Revoked-venue-access row is rendered only for the SELECTED Season, so
+      // move to it explicitly instead of depending on the server's fallback.
+      await post("/api/context", { program_id: program.id, season_id: season.id });
       return { season: season.id, venue: venue.id, access: access.id, game: game.id };
     });
 
+    // Same deep-link drop as the first fixture: the hash still names the
+    // Season deleted in step (6), which bootstrap() would try to re-adopt.
+    await page.evaluate(() => history.replaceState(
+      null, "", location.pathname + location.search));
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.click('.tab[data-tab="setup"]');
     await page.click('[data-setup-view="hierarchy"]');

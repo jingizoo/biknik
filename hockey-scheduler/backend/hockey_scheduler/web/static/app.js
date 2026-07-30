@@ -2648,6 +2648,19 @@ function renderSeasonParticipation(hv, ov, sv) {
     }
     return out;
   };
+  // #369 owner ruling: the venue-access list and the candidate route both
+  // require the requested Season to BE the persisted selected Season, so this
+  // tree is no longer an all-Seasons venue inventory. Only the selected Season
+  // renders its allowed venues, its Revoke controls, its revoked-access
+  // cleanup rows and its Allow picker; every other Season of the Program gets
+  // a placeholder that names nothing (no venue id, no venue name, no count)
+  // and for which render() issued no request at all. `allVenues` is the reason
+  // this gate has to exist on the render side too and not only in the fetch
+  // loop: `grantableFor` unions the scoped overview venues, so an ungated
+  // Allow picker would still list real facilities under a Season the operator
+  // has not selected.
+  const selectedSeasonId = (contextOptions && contextOptions.selected
+    && contextOptions.selected.season_id) || null;
 
   const programBlocks = programs.map((program) => {
     const permanentTeams = leagueTeams[program.id] || [];
@@ -2735,26 +2748,28 @@ function renderSeasonParticipation(hv, ov, sv) {
       // grant to may belong to another Program, so its name is not in the
       // Season-ceilinged `venues` -- and the "Allowed venues" row must still
       // name it rather than showing a bare id.
+      // ...but only for the SELECTED Season (#369 owner ruling). Every other
+      // Season here has no grant rows and no candidates because render()
+      // deliberately asked for neither, so it renders a placeholder rather
+      // than an empty-looking list that would read as "this season has no
+      // venues" — a claim this surface is no longer entitled to make.
+      const isSelectedSeason = s.id === selectedSeasonId;
+      const seasonAccessRows = isSelectedSeason
+        ? (seasonVenueAccess[s.id] || []) : [];
       const venueNameById = {};
-      const grantable = grantableFor(s.id);
+      const grantable = isSelectedSeason ? grantableFor(s.id) : [];
       grantable.forEach((v) => { venueNameById[v.id] = v.name; });
       allVenues.forEach((v) => { venueNameById[v.id] = v.name; });
       // A Venue this Season ALREADY holds a grant to is deliberately not a
       // candidate, and a cross-Program one is not in the scoped `venues`
       // either -- so the grant row itself is the only place its name survives.
-      (seasonVenueAccess[s.id] || []).forEach((a) => {
-        if (a.venue_name && !venueNameById[a.venue_id]) {
-          venueNameById[a.venue_id] = a.venue_name;
-        }
-      });
-      // A Venue this Season ALREADY holds a grant to is deliberately not a
-      // candidate, so its name comes from the grant row itself -- which
-      // matters for a shared arena owned by another Program, whose name is in
-      // neither the scoped venue list nor the candidate list.
-      (seasonVenueAccess[s.id] || []).forEach((a) => {
+      // That is the `venue_name` resolution the selected Season still needs
+      // for a shared arena owned by another Program, whose name is in neither
+      // the scoped venue list nor the candidate list.
+      seasonAccessRows.forEach((a) => {
         if (a.venue_name) venueNameById[a.venue_id] = a.venue_name;
       });
-      const grantedAccess = (seasonVenueAccess[s.id] || []).filter((a) => a.active);
+      const grantedAccess = seasonAccessRows.filter((a) => a.active);
       const grantedVenueIds = new Set(grantedAccess.map((a) => a.venue_id));
       const venueAccessRows = grantedAccess.map((a) => `<div class="tn-leaf reg-row">
           <span class="tn-label">🏟️ ${esc(venueNameById[a.venue_id] || a.venue_id)}</span>
@@ -2771,10 +2786,19 @@ function renderSeasonParticipation(hv, ov, sv) {
         : (grantable.length
             ? `<div class="tn-empty">Every venue is already allowed for this season.</div>`
             : `<div class="tn-empty">Create a venue on the Facility tree first, then allow it here.</div>`);
-      const venueAccessSection = `<details class="tn" open><summary class="tn-sum">
+      // The placeholder for a non-selected Season carries NO venue id, NO
+      // venue name and NO count — a count would still be an inventory, just a
+      // coarser one — and offers no Allow picker, because granting is a write
+      // against a Season this operator has not selected.
+      const venueAccessSection = isSelectedSeason
+        ? `<details class="tn" open><summary class="tn-sum">
           <span class="tn-label">🏟️ Allowed venues</span>
           <span class="tn-meta">${grantedAccess.length} venue${grantedAccess.length === 1 ? "" : "s"}</span></summary>
-        <div class="tn-children">${venueAccessRows}${venueAddCtl}</div></details>`;
+        <div class="tn-children">${venueAccessRows}${venueAddCtl}</div></details>`
+        : `<details class="tn"><summary class="tn-sum">
+          <span class="tn-label">🏟️ Allowed venues</span>
+          <span class="tn-meta">not loaded</span></summary>
+        <div class="tn-children"><div class="tn-empty">Select this season to manage its venues.</div></div></details>`;
 
       // Revoked venue access (#233 Slice E, mirrors #251's inactive
       // registrations exactly): revoke only deactivates a row, preserving
@@ -2782,7 +2806,10 @@ function renderSeasonParticipation(hv, ov, sv) {
       // access row REGARDLESS of active status, so a revoked row still needs
       // this explicit, audited permanent-cleanup path before the Season or
       // Venue it references can ever be deleted.
-      const revokedAccess = (seasonVenueAccess[s.id] || []).filter((a) => !a.active);
+      // Selected-Season-only for the same reason: a revoked row names its
+      // Venue and carries a permanent-delete control, so it is exactly the
+      // kind of row a non-selected Season must not put on screen.
+      const revokedAccess = seasonAccessRows.filter((a) => !a.active);
       const revokedAccessRows = revokedAccess.map((a) => {
         const venueName = venueNameById[a.venue_id] || a.venue_id;
         return `<div class="tn-leaf reg-row inactive-reg">
@@ -6770,7 +6797,25 @@ async function render() {
       // requested ids are consistently canonical; hv is only populated under
       // manage_setup, which already gates this whole block.
       leagueTeams = {}; seasonRegs = {}; leagueDivisions = {}; seasonVenueAccess = {};
+      // Reset alongside seasonVenueAccess (#369 owner ruling): both maps are
+      // keyed by Season id and both are now filled for the SELECTED Season
+      // only, so a stale entry left over from a previous context is the one
+      // way a Season could still paint venue data it no longer fetched.
+      seasonVenueCandidates = {};
       permLeaguesByProgram = {}; allPermLeagues = []; teamPermLeague = {};
+      // #369 owner ruling: `/venue-access` and `/venue-candidates` are
+      // ceilinged to the EXACT persisted selected Season -- a sibling Season of
+      // the active Program is refused just like a foreign one. This loop used
+      // to fetch BOTH for every Season in the tree, which is precisely the
+      // "Records using the endpoint as an all-Seasons inventory" the ruling
+      // ends: it would now 404 once per non-selected Season. So they are
+      // fetched for the selected Season alone, and every other Season renders a
+      // non-identifying placeholder instead (see renderSeasonParticipation) --
+      // no venue ids, no venue names, and no request issued. Deliberately NOT
+      // replaced by a new batch endpoint: that would re-create the inventory
+      // the ruling removed, one HTTP hop further down.
+      const selectedSeasonId = (contextOptions && contextOptions.selected
+        && contextOptions.selected.season_id) || null;
       for (const program of (hv.programs || [])) {
         const r = await getJSON(`/api/v2/setup/programs/${program.id}/teams`);
         // Same reason as the player list above, and more acute: this loop
@@ -6797,22 +6842,28 @@ async function render() {
           const rr = await getJSON(`/api/v2/setup/seasons/${s.id}/team-registrations`);
           if (contextRevision !== myRenderContext) return;  // superseded
           seasonRegs[s.id] = (rr && rr.registrations) || [];
-          // Allowed venues (#233 Slice E): which Venues this Season may use
-          // for game ice, independent of any Venue-Program ownership.
-          const va = await getJSON(`/api/v2/setup/seasons/${s.id}/venue-access`);
-          if (contextRevision !== myRenderContext) return;  // superseded
-          seasonVenueAccess[s.id] = (va && va.venue_access) || [];
-          // Grant CANDIDATES for this Season (#369 review): its own
-          // MANAGE_SETUP-gated route, not a field on the overview. The
-          // candidate list is the one facility contract that reaches across the
-          // Program ceiling, so it is fetched only where it is used and only by
-          // a caller that could actually perform the grant -- an Arena Manager
-          // gets a 403 here and simply has no picker, rather than being handed
-          // every linked Venue in the installation by the overview.
-          const vc = await getJSON(
-            `/api/v2/setup/seasons/${s.id}/venue-candidates`);
-          if (contextRevision !== myRenderContext) return;  // superseded
-          seasonVenueCandidates[s.id] = (vc && vc.candidates) || [];
+          // The SELECTED Season only -- see the ruling note above. Every other
+          // Season of this Program is skipped outright, so nothing about its
+          // venues is requested, held or painted.
+          if (s.id === selectedSeasonId) {
+            // Allowed venues (#233 Slice E): which Venues this Season may use
+            // for game ice, independent of any Venue-Program ownership.
+            const va = await getJSON(`/api/v2/setup/seasons/${s.id}/venue-access`);
+            if (contextRevision !== myRenderContext) return;  // superseded
+            seasonVenueAccess[s.id] = (va && va.venue_access) || [];
+            // Grant CANDIDATES for this Season (#369 review): its own
+            // MANAGE_SETUP-gated route, not a field on the overview. The
+            // candidate list is the one facility contract that reaches across
+            // the Program ceiling, so it is fetched only where it is used and
+            // only by a caller that could actually perform the grant -- an
+            // Arena Manager gets a 403 here and simply has no picker, rather
+            // than being handed every linked Venue in the installation by the
+            // overview.
+            const vc = await getJSON(
+              `/api/v2/setup/seasons/${s.id}/venue-candidates`);
+            if (contextRevision !== myRenderContext) return;  // superseded
+            seasonVenueCandidates[s.id] = (vc && vc.candidates) || [];
+          }
         }
       }
     }
