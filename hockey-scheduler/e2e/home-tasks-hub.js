@@ -2754,6 +2754,9 @@ async function checkRoleScenarios(browser, viewport) {
         { name: "VK3", organization_id: null });
       const rinkK3 = await post("/api/v2/setup/rink",
         { venue_id: venueK3.id, name: "RK3" });
+      // Grant from inside the Program/Season being built -- a venue-access
+      // grant binds to the ACTIVE Program AND Season (#369 prereq).
+      await post("/api/context", { program_id: progK3.id, season_id: seasonK3.id });
       await post(`/api/v2/setup/seasons/${seasonK3.id}/venue-access`,
         { venue_id: venueK3.id });
       // K4/K5 are for (K3)'s own straggling-COMMIT-response coverage
@@ -2766,6 +2769,9 @@ async function checkRoleScenarios(browser, viewport) {
         { name: "VK4", organization_id: null });
       const rinkK4 = await post("/api/v2/setup/rink",
         { venue_id: venueK4.id, name: "RK4" });
+      // Grant from inside the Program/Season being built -- a venue-access
+      // grant binds to the ACTIVE Program AND Season (#369 prereq).
+      await post("/api/context", { program_id: progK4.id, season_id: seasonK4.id });
       await post(`/api/v2/setup/seasons/${seasonK4.id}/venue-access`,
         { venue_id: venueK4.id });
       const progK5 = await post("/api/v2/setup/program",
@@ -2776,6 +2782,9 @@ async function checkRoleScenarios(browser, viewport) {
         { name: "VK5", organization_id: null });
       const rinkK5 = await post("/api/v2/setup/rink",
         { venue_id: venueK5.id, name: "RK5" });
+      // Grant from inside the Program/Season being built -- a venue-access
+      // grant binds to the ACTIVE Program AND Season (#369 prereq).
+      await post("/api/context", { program_id: progK5.id, season_id: seasonK5.id });
       await post(`/api/v2/setup/seasons/${seasonK5.id}/venue-access`,
         { venue_id: venueK5.id });
       return { progK1: progK1.id, seasonK1: seasonK1.id, rinkK1: rinkK1.id,
@@ -3748,6 +3757,9 @@ async function checkRoleScenarios(browser, viewport) {
         { name: "VM1", organization_id: null });
       const rinkM1 = await post("/api/v2/setup/rink",
         { venue_id: venueM1.id, name: "RM1" });
+      // Grant from inside the Program/Season being built -- a venue-access
+      // grant binds to the ACTIVE Program AND Season (#369 prereq).
+      await post("/api/context", { program_id: progM1.id, season_id: seasonM1.id });
       await post(`/api/v2/setup/seasons/${seasonM1.id}/venue-access`,
         { venue_id: venueM1.id });
       return { progM1: progM1.id, seasonM1: seasonM1.id, rinkM1: rinkM1.id };
