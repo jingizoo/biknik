@@ -521,6 +521,45 @@ both APIs, and a table-completeness check so a relation dropped from
 assertion that previously required only that the probe creates come back with
 the name withheld.
 
+## The facility-tree exception (venue sharing)
+
+The ceiling governs the **competition** tree — Seasons, Leagues, Divisions,
+Teams, and the personal names on Players and Officials. The facility tree
+(Organization → Venue → Rink → IceSlot) is joined to it only by
+`SeasonVenueAccess`, and there the ceiling alone produced a **deadlock**, not
+just a restriction:
+
+> An arena serves several leagues. Once Program A grants itself access to one,
+> that Venue is linked to A and therefore leaves Program B's scoped `venues` —
+> and it is not `pending_link_venues` either, because it *is* linked. So B can
+> never grant itself the access that would have made it visible. The capability
+> fails on its own first use.
+
+`venue-sharing.js` step 4 requires that grant explicitly. So
+`get_setup_overview_v2` emits one additional list, `grantable_venues`, for the
+single purpose of offering a Venue to a Season.
+
+Its **width is the whole risk**, and is bounded on three sides:
+
+| bound | why |
+| --- | --- |
+| id + name only | a physical building's existence, not anybody's data. No address, timezone, owner, or legacy Program link. |
+| **linked** venues only | a Venue linked to no Program is some operator's private draft, governed by the creator-only `pending_link_venues` contract. The first version of this list returned *every* Venue and leaked one operator's never-linked arena to another on a Program-less install — caught by `test_zero_program_bootstrap_scoping`. |
+| stops at the Venue | Rinks, IceSlots and every competition-tree list stay ceilinged. |
+
+`venues` itself is unchanged and still Season-ceilinged: what a Season **uses**
+is not widened, only what it may be **offered**. The client unions
+`grantable_venues` with its own scoped and pending lists, so a Venue the
+operator just created — linked to nothing yet, and deliberately absent from
+`grantable_venues` — still reaches its own picker.
+
+Empty for the identity-less legacy form, where `venues` is already everything.
+
+Regression: `backend/tests/test_facility_tree_exception.py` — pins the feature,
+each of the three bounds, the context flip, and the unlinked-draft case, all
+mutation-proven in both directions (exception absent → sharing deadlocks;
+exception widened → the width assertions fail).
+
 ## Venues have no League axis
 
 `Venue.league_id` is **legacy vocabulary** and stores a *Program* id, not a

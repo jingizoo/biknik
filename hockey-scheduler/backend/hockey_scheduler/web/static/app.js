@@ -2627,6 +2627,23 @@ function renderSeasonParticipation(hv, ov, sv) {
   // definition not in `sv.venues`; without the union it could never be
   // granted to anything and the Setup flow would deadlock.
   const allVenues = sv ? withPendingLink(sv, "venues") : [];
+  // The facility-tree exception (#369 owner ruling): a Season may be granted
+  // access to ANY Venue, including one another Program already uses -- an
+  // arena serves several leagues. `grantable_venues` carries id+name only, and
+  // deliberately nothing about Rinks, IceSlots or the competition tree.
+  // Falls back to the scoped union so an older payload still renders.
+  // Established shared facilities, UNIONED with this caller's own scoped and
+  // pending-link venues -- a Venue it just created is linked to nothing yet, so
+  // it is deliberately absent from `grantable_venues` (that list must not carry
+  // other operators' unlinked drafts) and comes in through the union instead.
+  const grantableVenues = (() => {
+    const seen = new Set();
+    const out = [];
+    for (const v of ((sv && sv.grantable_venues) || []).concat(allVenues)) {
+      if (v && v.id && !seen.has(v.id)) { seen.add(v.id); out.push(v); }
+    }
+    return out;
+  })();
 
   const programBlocks = programs.map((program) => {
     const permanentTeams = leagueTeams[program.id] || [];
@@ -2710,7 +2727,12 @@ function renderSeasonParticipation(hv, ov, sv) {
       // game ice on, via SeasonVenueAccess — independent of any Venue-Program
       // ownership. A Venue may be granted to several Seasons/Programs at
       // once, and a Season may use several Venues.
+      // Resolve names from the grantable set too: a Venue this Season holds a
+      // grant to may belong to another Program, so its name is not in the
+      // Season-ceilinged `venues` -- and the "Allowed venues" row must still
+      // name it rather than showing a bare id.
       const venueNameById = {};
+      grantableVenues.forEach((v) => { venueNameById[v.id] = v.name; });
       allVenues.forEach((v) => { venueNameById[v.id] = v.name; });
       const grantedAccess = (seasonVenueAccess[s.id] || []).filter((a) => a.active);
       const grantedVenueIds = new Set(grantedAccess.map((a) => a.venue_id));
@@ -2719,13 +2741,14 @@ function renderSeasonParticipation(hv, ov, sv) {
           <button class="icon-btn danger" data-va-revoke="${esc(a.id)}"
             title="Revoke venue access" aria-label="Revoke ${esc(venueNameById[a.venue_id] || a.venue_id)} from ${esc(s.name)}">${ICONS.circleMinus}</button></div>`).join("")
         || `<div class="tn-empty">No venues allowed for this season yet — games can't be scheduled until one is added.</div>`;
-      const availableVenues = allVenues.filter((v) => !grantedVenueIds.has(v.id));
+      const availableVenues = grantableVenues.filter(
+        (v) => !grantedVenueIds.has(v.id));
       const venueAddCtl = availableVenues.length
         ? `<div class="tn-leaf reg-add">
             <select id="va-add-${esc(s.id)}"><option value="">Add a venue…</option>${
               availableVenues.map((v) => opt(v.id, v.name)).join("")}</select>
             <button class="act primary" data-va-add="${esc(s.id)}">Allow</button></div>`
-        : (allVenues.length
+        : (grantableVenues.length
             ? `<div class="tn-empty">Every venue is already allowed for this season.</div>`
             : `<div class="tn-empty">Create a venue on the Facility tree first, then allow it here.</div>`);
       const venueAccessSection = `<details class="tn" open><summary class="tn-sum">
