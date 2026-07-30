@@ -1110,6 +1110,9 @@ async function checkRoleScenarios(browser, viewport) {
       { name: "A2 Arena", organization_id: null });
     await apiPost(page, "/api/v2/setup/rink",
       { venue_id: a2Venue.id, name: "A2 Rink" });
+    // Same rule: grant from inside the Program that owns s2. The switch that
+    // already exists below this block happens after the grant.
+    await apiPost(page, "/api/context", { program_id: a.program, season_id: a.s2 });
     await apiPost(page, `/api/v2/setup/seasons/${a.s2}/venue-access`,
       { venue_id: a2Venue.id });
 
@@ -1932,6 +1935,13 @@ async function checkRoleScenarios(browser, viewport) {
       // dates of its own has none to fall back to, and the real preview
       // endpoint correctly REJECTS that (missing_start_date), which would
       // read here as "no [data-ib-commit]" for an unrelated reason.
+      // The stale-state scenario below depends on the context this fixture
+      // STARTED in (F2's Program-only selection), so capture it and put it
+      // back once both worlds are built. Each world is selected and granted
+      // independently, because a venue-access grant binds to the ACTIVE
+      // Program (#369 prerequisite).
+      const priorCtx = await (await fetch("/api/context",
+        { credentials: "same-origin" })).json();
       const progG1 = await post("/api/v2/setup/program",
         { name: "Round7G1 Program", country: "US" });
       const seasonG1 = await post("/api/v2/setup/season", { program_id: progG1.id,
@@ -1940,8 +1950,17 @@ async function checkRoleScenarios(browser, viewport) {
         { name: "VG1", organization_id: null });
       const rinkG1 = await post("/api/v2/setup/rink",
         { venue_id: venueG1.id, name: "RG1" });
-      await post(`/api/v2/setup/seasons/${seasonG1.id}/venue-access`,
+      // Grant from inside the Program being built: setup mutations bind to
+      // the ACTIVE Program (#369 prerequisite), and this fixture creates its
+      // own Program. Matches the explicit switch other fixtures in this file
+      // already do; the guard is not weakened for a fixture's convenience.
+      await post("/api/context", { program_id: progG1.id, season_id: seasonG1.id });
+      const grantG1 = await post(`/api/v2/setup/seasons/${seasonG1.id}/venue-access`,
         { venue_id: venueG1.id });
+      if (!grantG1 || !grantG1.id || grantG1.error) {
+        throw new Error("G1 venue-access grant did not succeed: "
+          + JSON.stringify(grantG1));
+      }
       const progG2 = await post("/api/v2/setup/program",
         { name: "Round7G2 Program", country: "US" });
       const seasonG2 = await post("/api/v2/setup/season", { program_id: progG2.id,
@@ -1950,8 +1969,15 @@ async function checkRoleScenarios(browser, viewport) {
         { name: "VG2", organization_id: null });
       const rinkG2 = await post("/api/v2/setup/rink",
         { venue_id: venueG2.id, name: "RG2" });
-      await post(`/api/v2/setup/seasons/${seasonG2.id}/venue-access`,
+      await post("/api/context", { program_id: progG2.id, season_id: seasonG2.id });
+      const grantG2 = await post(`/api/v2/setup/seasons/${seasonG2.id}/venue-access`,
         { venue_id: venueG2.id });
+      if (!grantG2 || !grantG2.id || grantG2.error) {
+        throw new Error("G2 venue-access grant did not succeed: "
+          + JSON.stringify(grantG2));
+      }
+      await post("/api/context", { program_id: priorCtx.program_id || null,
+        season_id: priorCtx.season_id || null });
       return { progG1: progG1.id, seasonG1: seasonG1.id, rinkG1: rinkG1.id,
         progG2: progG2.id, seasonG2: seasonG2.id, rinkG2: rinkG2.id };
     });
@@ -2693,6 +2719,11 @@ async function checkRoleScenarios(browser, viewport) {
         { name: "VK1", organization_id: null });
       const rinkK1 = await post("/api/v2/setup/rink",
         { venue_id: venueK1.id, name: "RK1" });
+      // Grant from inside the Program being built: setup mutations bind to
+      // the ACTIVE Program (#369 prerequisite), and this fixture creates its
+      // own Program. Matches the explicit switch other fixtures in this file
+      // already do; the guard is not weakened for a fixture's convenience.
+      await post("/api/context", { program_id: progK1.id, season_id: seasonK1.id });
       await post(`/api/v2/setup/seasons/${seasonK1.id}/venue-access`,
         { venue_id: venueK1.id });
       const progK2 = await post("/api/v2/setup/program",
