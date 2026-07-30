@@ -336,6 +336,15 @@ class ApiService:
     #     `upsert_imported_league` writes ("league_created", "league") against
     #     that same kind of id. So ("league_created", "league") is ambiguous
     #     BETWEEN Program and League on its face.
+    #   * `add_player` — the INTERACTIVE Player create, i.e. every Player not
+    #     imported — writes ("player_added", "player"); only the CSV import's
+    #     `upsert_imported_player` writes ("player_created", "player"). Both
+    #     spellings are live, exactly like the Program pair above, so both are
+    #     listed. Omitting "player_added" made `_setup_target_created_by`
+    #     answer False for every hand-entered Player, which fails CLOSED today
+    #     (a Player is always bound to a Team, so its chain never empties and
+    #     rule 6 is unreachable) but would deny an operator their own record
+    #     the moment an unbound Player became representable.
     #
     # The ambiguity is resolved by `entity_id`, which is always matched too:
     # `next_id` hands out one monotonic sequence per prefix, and both
@@ -350,7 +359,7 @@ class ApiService:
         "league_season": {("league_season_created", "league_season")},
         "division": {("division_created", "division")},
         "team": {("team_created", "team")},
-        "player": {("player_created", "player")},
+        "player": {("player_added", "player"), ("player_created", "player")},
         "game": {("game_created", "game")},
         "club": {("club_created", "club")},
         "official": {("official_created", "official")},

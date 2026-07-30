@@ -228,7 +228,13 @@ def created_by(store, kind, record_id):
         "league_season": {("league_season_created", "league_season")},
         "division": {("division_created", "division")},
         "team": {("team_created", "team")},
-        "player": {("player_created", "player")},
+        # Both spellings are live: `add_player` (the interactive create) writes
+        # "player_added", the CSV import's `upsert_imported_player` writes
+        # "player_created". Derived from what the audit calls actually write,
+        # NOT copied from `_SETUP_CREATION_AUDIT_KEYS` -- listing only
+        # "player_created" here (as the product's map did) makes every
+        # creator-ownership assertion about a hand-entered Player vacuous.
+        "player": {("player_added", "player"), ("player_created", "player")},
         "game": {("game_created", "game")},
         "club": {("club_created", "club")},
         "official": {("official_created", "official")},
@@ -1198,3 +1204,650 @@ class SetupTargetRouteMatrixTest(unittest.TestCase):
         """A target that the route under test does not consume, so the standing
         world record can be reused."""
         return lambda tag: self.worlds[tag][key]
+
+    # -- the three identities, and the two worlds ---------------------------
+    OWNER_A = "ta_owner_a"
+    OWNER_B = "ta_owner_b"
+    ATTACKER = "ta_attacker"
+    ARENA = "ta_arena_manager"
+
+    #: The victim's world, and the attacker's own. Named rather than inlined
+    #: because every case below reads as "world A's record, world B's context".
+    VICTIM = "A"
+    OWN = "B"
+
+    def _build(self, backend, database_url):
+        """Point ``STATE`` at ``backend``, then build both worlds over HTTP.
+
+        ``owner_a``/``owner_b`` each create their own Program tree and then
+        never act again. ``attacker`` creates nothing that appears in either
+        world and drives every call in the matrix, changing only which Program
+        it has selected -- so a positive can never be creator ownership and a
+        refusal can never be a missing role (it is a League Admin, holding both
+        MANAGE_SETUP and MANAGE_ARENA).
+        """
+        self._reset_backend(database_url, backend)
+        self.openers, self.uids, self.worlds = {}, {}, {}
+        for tag, username in (("A", self.OWNER_A), ("B", self.OWNER_B)):
+            self.openers[tag], self.uids[tag] = self._account(
+                username, Role.LEAGUE_ADMIN)
+        self.openers["attacker"], self.uids["attacker"] = self._account(
+            self.ATTACKER, Role.LEAGUE_ADMIN)
+        for tag in ("A", "B"):
+            self.worlds[tag] = self._setup_world(
+                tag, self.openers[tag], self.uids[tag])
+        self._select(self.openers["attacker"], self.worlds[self.OWN]["program"])
+        # The two worlds must really be two: a single shared Program would make
+        # every "foreign" case below a same-Program case, and the whole matrix
+        # would stay green with the guard deleted.
+        self.assertNotEqual(self.worlds["A"]["program"],
+                            self.worlds["B"]["program"],
+                            "fixture: the two worlds share a Program")
+
+    # -- assertions ---------------------------------------------------------
+    def _rows_of(self, witnesses):
+        """Field-level snapshots of the records a single call could touch."""
+        return {(kind, rid): self._row(kind, rid) for kind, rid in witnesses}
+
+    def _assert_allowed(self, status, resp, codes, where):
+        """The gate let this call through to the facade.
+
+        Not "returned 200": a route whose facade then refuses for a
+        NON-authorization reason (a Club that still owns Teams) has still
+        proved the gate allowed it, which is the only thing under test here.
+        ``not_found`` is never such a reason -- that IS the refusal.
+        """
+        code = (resp.get("error") or {}).get("code")
+        self.assertNotEqual(
+            code, "not_found",
+            f"{where} was REFUSED by the target gate ({resp}). A gate that "
+            f"turns away the caller's own Program is a blanket block, not a "
+            f"scope decision -- and would pass the refusal cases for free.")
+        if code is None:
+            self.assertEqual(status, 200, f"{where}: {resp}")
+            return
+        self.assertIn(
+            code, _NON_AUTH_CODES,
+            f"{where} failed with {code!r}, which is not a recognised "
+            f"non-authorization outcome: {resp}")
+        self.assertIn(
+            code, codes,
+            f"{where} failed with {code!r}, which this route's row does not "
+            f"declare as an expected non-authorization outcome: {resp}")
+
+    @staticmethod
+    def _blind(raw, record_id):
+        """The refusal bytes with the echoed id masked out.
+
+        The ONLY difference the contract permits between a foreign target and a
+        nonexistent one is the id the caller itself supplied, so that is the one
+        thing normalised away. Everything else -- key order, spacing, a stray
+        field, the status line -- must match byte for byte, because anything
+        that differs is an existence oracle for another Program's records.
+        """
+        return raw.replace(record_id.encode(), b"<the id the caller sent>")
+
+    # -- the five-case matrix, driven once per table row --------------------
+    def _five_cases(self, backend, row):
+        att = self.openers["attacker"]
+        store = self.srv.STATE.api.store
+        kind, own, victim_tag = row["kind"], self.OWN, self.VICTIM
+        where = f"[{backend}] {row['name']}"
+
+        # ---- positive: a target inside the caller's ACTIVE Program --------
+        mine = row["pmint"](own)
+        self._select(att, row["ctx"](own, mine))
+        path, body, _w = row["call"](own, mine)
+        status, resp, _raw = self._post(att, path, body)
+        self._assert_allowed(status, resp, row["codes"],
+                             f"{where} POSITIVE ({path})")
+
+        # ---- the victim, and the precondition that makes a refusal mean
+        #      anything at all ---------------------------------------------
+        victim = row["mint"](victim_tag)
+        active = self.worlds[own]["program"]
+        self._select(att, active)
+        # #369 note: the owner's repro words this precondition as "the record is
+        # absent from the attacker's reads". ``get_setup_overview_v2`` is not
+        # Program-scoped until #369 proper (which rebases on top of this
+        # branch), so read-absence is not assertable here yet and asserting it
+        # would fail. The Program-chain fact below is what the guard actually
+        # decides on, recomputed from the stored rows rather than read back out
+        # of the code under test, and stands in its place.
+        chain = chain_programs(store, kind, victim)
+        self.assertTrue(
+            chain,
+            f"{where}: fixture is not distinguishable -- the victim record has "
+            f"NO Program chain, so refusing it would prove nothing about scope")
+        self.assertNotIn(
+            active, chain,
+            f"{where}: fixture is not distinguishable -- the victim resolves "
+            f"to the attacker's OWN active Program {active}")
+        if kind in _CREATABLE:
+            creators = created_by(store, kind, victim)
+            # Assert who DID create it before asserting who did not: an
+            # `assertNotIn` against an empty set (a mint whose audit actor never
+            # reached the store, an actor-id format that stopped matching the
+            # session's) passes while proving nothing at all.
+            if creators:
+                self.assertEqual(
+                    creators, {self.uids[victim_tag]},
+                    f"{where}: fixture is not distinguishable -- the victim's "
+                    f"recorded creator is {creators}, not the other world's "
+                    f"owner, so the creator-ownership check below would be "
+                    f"comparing against the wrong account")
+            else:
+                # Exactly ONE kind carries no creation attribution at all, and
+                # it is a product fact rather than a fixture gap: a
+                # LeagueSeason binding minted as a side effect of create_league
+                # gets no row of its own (create_league audits
+                # ("level_created", "level") against the LEAGUE's id). It is
+                # harmless here for a specific reason -- the chain assertion
+                # above already proved this record is LINKED, so rule 6
+                # ("unlinked -> creator only") is unreachable for it and
+                # creator ownership cannot explain any outcome. Pinned to that
+                # one kind so any OTHER record losing its attribution fails
+                # here instead of quietly going vacuous.
+                self.assertEqual(
+                    kind, "league_season",
+                    f"{where}: fixture is not distinguishable -- NOTHING is "
+                    f"recorded as having created the victim, so the "
+                    f"creator-ownership check below proves nothing")
+            self.assertNotIn(
+                self.uids["attacker"], creators,
+                f"{where}: fixture is not distinguishable -- the attacker "
+                f"CREATED the record it is attacking, so a refusal would be "
+                f"about something other than Program scope")
+
+        # ---- foreign + no-mutation ---------------------------------------
+        path, body, witnesses = row["call"](own, victim)
+        before, rows_before = self._snapshot(), self._rows_of(witnesses)
+        status, resp, raw_foreign = self._post(att, path, body)
+        self.assertEqual(
+            status, 404,
+            f"{where} FOREIGN: another Program's record answered {status} "
+            f"({resp}) -- this is the reported blocker")
+        self.assertEqual(
+            resp, {"error": {"code": "not_found",
+                             "message": f"{_WORD[kind]} {victim} not found."}},
+            f"{where} FOREIGN: the refusal is not the facade's own generic "
+            f"not-found, so it is distinguishable from a nonexistent id")
+        self.assertEqual(
+            self._snapshot(), before,
+            f"{where} NO-MUTATION: a REFUSED call changed the store's row-id "
+            f"sets or wrote a setup-audit row")
+        self.assertEqual(
+            self._rows_of(witnesses), rows_before,
+            f"{where} NO-MUTATION: a REFUSED call edited a record in place")
+
+        # ---- nonexistent: the same bytes, never an oracle -----------------
+        absent = f"{kind}_ta_absent_{self._seq()}"
+        path, body, _w = row["call"](own, absent)
+        status_absent, _resp, raw_absent = self._post(att, path, body)
+        self.assertEqual(status_absent, 404, f"{where} NONEXISTENT: {_resp}")
+        self.assertEqual(
+            (status, self._blind(raw_foreign, victim)),
+            (status_absent, self._blind(raw_absent, absent)),
+            f"{where} NONEXISTENT: a reader of the socket can tell a record "
+            f"that EXISTS in another Program from one that does not exist at "
+            f"all -- the refusal is an existence oracle")
+
+        # ---- context switch: the SAME call, the target's own Program -------
+        self._select(att, row["ctx"](victim_tag, victim))
+        path, body, _w = row["call"](victim_tag, victim)
+        status, resp, _raw = self._post(att, path, body)
+        self._assert_allowed(
+            status, resp, row["codes"],
+            f"{where} CONTEXT SWITCH ({path}): selecting the target's OWN "
+            f"Program did not make the same call on the same target succeed, "
+            f"so the refusal above was a blanket block rather than a scope "
+            f"decision")
+        self._select(att, self.worlds[own]["program"])
+
+    # ----------------------------------------------------------------------
+    # THE ROUTE TABLE
+    #
+    # One row per (route, GATED ARGUMENT). A reassign contributes TWO rows --
+    # one for the SOURCE record named in the path and one for the DESTINATION
+    # id carried in the body -- because those are two separate calls into the
+    # shared gate, and a route that gated only the source would otherwise sail
+    # through a source-only matrix while still moving a foreign record.
+    #
+    #   kind   the CANONICAL kind of the gated argument. Picks the label the
+    #          refusal must carry (``_WORD``) and the store getter the
+    #          no-mutation case field-snapshots.
+    #   mint   (tag) -> a fresh target linked to THAT world's Program. Used by
+    #          the foreign / nonexistent / context-switch cases.
+    #   pmint  optional override for the POSITIVE case only, for the two kinds
+    #          (Club, Organization) whose LINKED form can never be deleted.
+    #   ctx    (tag, target) -> the Program the attacker selects for the
+    #          positive and context-switch cases. The world's Program by
+    #          default; the TARGET ITSELF when the target is a Program, since a
+    #          Program is its own scope and "switch to the target's Program"
+    #          means exactly that.
+    #   call   (active tag, target id) -> (path, body, witnesses). Witnesses are
+    #          every record this one call could have written, so the no-mutation
+    #          case covers an in-place edit that changes no row-id set. A
+    #          DESTINATION row mints its own source inside ``call``, in whatever
+    #          Program is active, so the only thing its refusal can be about is
+    #          the destination id.
+    #   codes  non-authorization error codes the positive / context-switch case
+    #          may legitimately carry (see ``_NON_AUTH_CODES``).
+    # ----------------------------------------------------------------------
+    def _route_rows(self):
+        rows = []
+
+        def add(name, kind, mint, call, pmint=None, ctx=None,
+                codes=frozenset()):
+            rows.append({"name": name, "kind": kind, "mint": mint,
+                         "pmint": pmint or mint, "call": call,
+                         "codes": codes,
+                         "ctx": ctx or (lambda tag, _tid:
+                                        self.worlds[tag]["program"])})
+
+        # -- the generic deletes, on BOTH versions -------------------------
+        # (canonical kind, v1 wire word or None, v2 wire word or None, mint,
+        #  positive-case mint, ctx, tolerated non-auth codes). v1's vocabulary
+        # differs: its "league" is today's PROGRAM and its "level" is today's
+        # competition LEAGUE. Player/Official delete is v2-only (#232/#271) and
+        # league-season delete is a v2 addition (#159), hence the Nones.
+        _target_is_its_own_scope = (lambda _tag, tid: tid)
+        deletes = [
+            ("organization", "organization", "organization",
+             self._mint_organization, self._mint_unlinked_org_as_attacker,
+             None, frozenset({"has_dependencies"})),
+            ("program", "league", "program", self._mint_program, None,
+             _target_is_its_own_scope, frozenset()),
+            ("season", "season", "season", self._mint_season, None, None,
+             frozenset()),
+            ("league", "level", "league", self._mint_league, None, None,
+             frozenset()),
+            ("league_season", None, "league-season", self._mint_league_season,
+             None, None, frozenset()),
+            ("division", "division", "division", self._mint_division, None,
+             None, frozenset()),
+            ("club", "club", "club", self._mint_club,
+             self._mint_unlinked_club_as_attacker, None,
+             frozenset({"has_dependencies"})),
+            ("team", "team", "team", self._mint_team, None, None, frozenset()),
+            ("player", None, "player", self._mint_player, None, None,
+             frozenset()),
+            ("official", None, "official", self._mint_official, None, None,
+             frozenset()),
+            ("venue", "venue", "venue", self._mint_venue, None, None,
+             frozenset()),
+            ("rink", "rink", "rink", self._mint_rink, None, None, frozenset()),
+            ("ice_slot", "ice-slot", "ice-slot", self._mint_ice_slot, None,
+             None, frozenset()),
+            ("game", "game", "game", self._mint_game, None, None, frozenset()),
+        ]
+        for kind, v1w, v2w, mint, pmint, ctx, codes in deletes:
+            for base, word in (("/api/setup", v1w), ("/api/v2/setup", v2w)):
+                if word is None:
+                    continue
+
+                def call(_active, tid, _b=base, _w=word, _k=kind):
+                    return f"{_b}/{_w}/{tid}/delete", {}, [(_k, tid)]
+
+                add(f"POST {base}/{word}/<id>/delete", kind, mint, call,
+                    pmint=pmint, ctx=ctx, codes=codes)
+
+        # -- every assign-<target> reassign, BOTH ENDS ---------------------
+        # (base, path entity word, assign-<word>, body key, SOURCE kind,
+        #  source mint, DESTINATION kind, the world key naming a valid
+        #  destination inside whichever Program is active).
+        # The destination for a SOURCE row is always taken from the ACTIVE
+        # world, so the only thing the source row can fail on is its source.
+        reassigns = [
+            ("/api/setup", "league", "organization", "organization_id",
+             "program", self._standing("program"), "organization",
+             "organization"),
+            ("/api/setup", "venue", "organization", "organization_id",
+             "venue", self._mint_venue, "organization", "organization"),
+            ("/api/setup", "rink", "venue", "venue_id",
+             "rink", self._mint_rink, "venue", "venue"),
+            ("/api/setup", "division", "level", "level_id",
+             "division", self._mint_division, "league", "league"),
+            ("/api/setup", "team", "club", "club_id",
+             "team", self._mint_team, "club", "club"),
+            ("/api/setup", "player", "team", "team_id",
+             "player", self._mint_player, "team", "team"),
+            ("/api/v2/setup", "program", "organization",
+             "operator_organization_id", "program", self._standing("program"),
+             "organization", "organization"),
+            ("/api/v2/setup", "division", "league", "league_id",
+             "division", self._mint_division, "league", "league"),
+            ("/api/v2/setup", "team", "club", "club_id",
+             "team", self._mint_team, "club", "club"),
+            ("/api/v2/setup", "team", "league", "league_id",
+             "team", self._mint_team, "league", "league"),
+            ("/api/v2/setup", "player", "team", "team_id",
+             "player", self._mint_player, "team", "team"),
+            ("/api/v2/setup", "rink", "venue", "venue_id",
+             "rink", self._mint_rink, "venue", "venue"),
+            ("/api/v2/setup", "venue", "organization", "organization_id",
+             "venue", self._mint_venue, "organization", "organization"),
+        ]
+        for (base, ent, word, key, src_kind, src_mint, dest_kind,
+             dest_key) in reassigns:
+
+            def source_call(active, tid, _b=base, _e=ent, _w=word, _k=key,
+                            _sk=src_kind, _dk=dest_key):
+                return (f"{_b}/{_e}/{tid}/assign-{_w}",
+                        {_k: self.worlds[active][_dk]}, [(_sk, tid)])
+
+            def dest_call(active, tid, _b=base, _e=ent, _w=word, _k=key,
+                          _sm=src_mint, _sk=src_kind, _dk=dest_kind):
+                source = _sm(active)
+                return (f"{_b}/{_e}/{source}/assign-{_w}", {_k: tid},
+                        [(_dk, tid), (_sk, source)])
+
+            add(f"POST {base}/{ent}/<id>/assign-{word} [SOURCE]",
+                src_kind, src_mint, source_call,
+                ctx=(_target_is_its_own_scope if src_kind == "program"
+                     else None))
+            add(f"POST {base}/{ent}/<id>/assign-{word} [DESTINATION]",
+                dest_kind, self._standing(dest_key), dest_call)
+
+        # -- the two in-place Player edits (v2 only) -----------------------
+        def player_update_call(_active, tid):
+            return (f"/api/v2/setup/player/{tid}/update",
+                    {"name": f"TA Renamed {self._seq()}"}, [("player", tid)])
+
+        def player_active_call(_active, tid):
+            return (f"/api/v2/setup/player/{tid}/active",
+                    {"active": False, "reason": "matrix"}, [("player", tid)])
+
+        add("POST /api/v2/setup/player/<id>/update", "player",
+            self._mint_player, player_update_call)
+        add("POST /api/v2/setup/player/<id>/active", "player",
+            self._mint_player, player_active_call)
+
+        # -- Season lifecycle: an in-place status flip on an existing row ---
+        def archive_call(_active, tid):
+            return (f"/api/v2/setup/seasons/{tid}/archive",
+                    {"reason": "matrix"}, [("season", tid)])
+
+        def reopen_call(_active, tid):
+            return (f"/api/v2/setup/seasons/{tid}/reopen",
+                    {"reason": "matrix"}, [("season", tid)])
+
+        add("POST /api/v2/setup/seasons/<id>/archive", "season",
+            self._mint_season, archive_call)
+        add("POST /api/v2/setup/seasons/<id>/reopen", "season",
+            self._mint_archived_season, reopen_call)
+
+        # -- the venue-access grant's SEASON argument, which is generic ------
+        # (its VENUE argument is the facility-tree exception and has its own
+        # test below -- the whole point being that the two arguments of this
+        # one route are judged by DIFFERENT rules).
+        def grant_season_call(active, tid):
+            return (f"/api/v2/setup/seasons/{tid}/venue-access",
+                    {"venue_id": self._mint_venue(active)}, [("season", tid)])
+
+        add("POST /api/v2/setup/seasons/<id>/venue-access [SEASON]", "season",
+            self._mint_season, grant_season_call)
+
+        # -- bridge row: SeasonTeamRegistration -----------------------------
+        # It carries no Program of its own -- it IS the (Team, LeagueSeason)
+        # join -- so it is judged by its LeagueSeason while still being
+        # REPORTED under its own id and label.
+        registration_routes = [
+            ("/api/setup", "assign-division", "division_id", "division",
+             "division", self._mint_registration),
+            ("/api/v2/setup", "assign-league", "league_id", "league", "league",
+             self._mint_registration),
+            ("/api/v2/setup", "assign-division", "division_id", "division",
+             "division", self._mint_registration),
+        ]
+        for base, verb, key, dest_kind, dest_key, reg_mint in \
+                registration_routes:
+
+            def reg_source_call(active, tid, _b=base, _v=verb, _k=key,
+                                _dk=dest_key):
+                return (f"{_b}/season-team-registration/{tid}/{_v}",
+                        {_k: self.worlds[active][_dk]}, [("registration", tid)])
+
+            def reg_dest_call(active, tid, _b=base, _v=verb, _k=key,
+                              _dk=dest_kind):
+                source = self._mint_registration(active)
+                return (f"{_b}/season-team-registration/{source}/{_v}",
+                        {_k: tid}, [(_dk, tid), ("registration", source)])
+
+            add(f"POST {base}/season-team-registration/<id>/{verb} [SOURCE]",
+                "registration", reg_mint, reg_source_call)
+            add(f"POST {base}/season-team-registration/<id>/{verb} "
+                f"[DESTINATION]", dest_kind, self._standing(dest_key),
+                reg_dest_call)
+
+        for base in ("/api/setup", "/api/v2/setup"):
+            def remove_call(_active, tid, _b=base):
+                return (f"{_b}/season-team-registration/{tid}/remove", {},
+                        [("registration", tid)])
+
+            add(f"POST {base}/season-team-registration/<id>/remove",
+                "registration", self._mint_registration, remove_call)
+
+        def registration_delete_call(_active, tid):
+            return (f"/api/v2/setup/season-team-registration/{tid}/delete", {},
+                    [("registration", tid)])
+
+        add("POST /api/v2/setup/season-team-registration/<id>/delete",
+            "registration", self._mint_inactive_registration,
+            registration_delete_call)
+
+        # -- bridge row: SeasonVenueAccess, judged by its Season ------------
+        def access_remove_call(_active, tid):
+            return (f"/api/v2/setup/season-venue-access/{tid}/remove", {},
+                    [("season_venue_access", tid)])
+
+        def access_delete_call(_active, tid):
+            return (f"/api/v2/setup/season-venue-access/{tid}/delete", {},
+                    [("season_venue_access", tid)])
+
+        add("POST /api/v2/setup/season-venue-access/<id>/remove",
+            "season_venue_access", self._mint_grant, access_remove_call)
+        add("POST /api/v2/setup/season-venue-access/<id>/delete",
+            "season_venue_access", self._mint_revoked_grant,
+            access_delete_call)
+
+        return rows
+
+    def _run_route_matrix(self, database_url, backend):
+        self._build(backend, database_url)
+        rows = self._route_rows()
+        # A table that silently shrank (a lambda that stopped being appended, a
+        # loop that stopped looping) would still report OK, having proved
+        # nothing about the routes it dropped.
+        self.assertGreaterEqual(
+            len(rows), 60,
+            "the route table has shrunk; every gated argument on every gated "
+            "route needs its own row")
+        for row in rows:
+            with self.subTest(route=row["name"]):
+                self._five_cases(backend, row)
+
+    def test_every_gated_route_five_case_matrix_memory(self):
+        self._run_route_matrix(None, "memory")
+
+    def test_every_gated_route_five_case_matrix_sqlite(self):
+        self._run_route_matrix(":memory:", "sqlite")
+
+    @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                         "PostgreSQL required (set TEST_DATABASE_URL) -- "
+                         "the SQL leg is covered by the SQLite variant")
+    def test_every_gated_route_five_case_matrix_postgres(self):
+        self._run_route_matrix(os.environ["TEST_DATABASE_URL"], "postgres")
+
+    # ----------------------------------------------------------------------
+    # The ONE deliberate exception, over HTTP.
+    # ----------------------------------------------------------------------
+    def _run_venue_access_exception(self, database_url, backend):
+        """``POST /api/v2/setup/seasons/<id>/venue-access`` judges its two
+        arguments by two DIFFERENT rules, on purpose.
+
+        The SEASON end is generic and is covered by its own row in the table
+        above. The VENUE end is the facility-tree exception: an arena serves
+        several leagues, so a Venue linked to ANOTHER Program stays grantable
+        (the generic rule deadlocked sharing on its very first use -- once one
+        Program held the grant no other Program could ever obtain it). What is
+        NOT grantable is a Venue linked to NOTHING and created by a DIFFERENT
+        account: somebody's private draft, which leaked by name in an earlier
+        round of this work.
+        """
+        self._build(backend, database_url)
+        att, api = self.openers["attacker"], self.srv.STATE.api
+        store = api.store
+        attacker = (self.uids["attacker"], Role.LEAGUE_ADMIN, {})
+        season = self.worlds[self.OWN]["season"]
+        path = f"/api/v2/setup/seasons/{season}/venue-access"
+
+        # -- positive: an arena inside the caller's own Program -------------
+        self._select(att, self.worlds[self.OWN]["program"])
+        mine = self._mint_venue(self.OWN)
+        self._ok(att, path, {"venue_id": mine}, "own-Program arena")
+
+        # -- THE EXCEPTION: an established arena in ANOTHER Program ---------
+        arena = self._mint_venue(self.VICTIM)
+        self.assertEqual(
+            chain_programs(store, "venue", arena),
+            {self.worlds[self.VICTIM]["program"]},
+            "fixture: the shared arena must be linked to the OTHER Program")
+        # ...and the GENERIC rule refuses that very record. Asserted here so
+        # that if the exception ever quietly becomes the rule everywhere, this
+        # test says so instead of passing for the wrong reason.
+        self.assertIs(
+            api.setup_target_accessible("venue", arena, *attacker), False,
+            f"[{backend}] the generic rule no longer refuses a foreign Venue, "
+            f"so this route's exception is indistinguishable from it")
+        granted = self._ok(att, path, {"venue_id": arena}, "shared arena")
+        self.assertEqual(granted.get("venue_id"), arena)
+
+        # -- and the half that must NOT pass: another account's unlinked
+        #    private draft ------------------------------------------------
+        private = self._ok(self.openers[self.VICTIM], "/api/setup/venue",
+                           {"name": f"TA Private Draft {self._seq()}"})["id"]
+        self.assertEqual(
+            chain_programs(store, "venue", private), set(),
+            "fixture: the private draft must be linked to nothing, or the "
+            "established-arena clause would carry it")
+        self.assertNotIn(
+            self.uids["attacker"], created_by(store, "venue", private),
+            "fixture: a DIFFERENT account must have created the draft")
+        before = self._snapshot()
+        status, resp, raw_private = self._post(att, path,
+                                               {"venue_id": private})
+        self.assertEqual(
+            status, 404,
+            f"[{backend}] another operator's never-linked private arena was "
+            f"accepted into this Season by name ({resp})")
+        self.assertEqual(
+            resp, {"error": {"code": "not_found",
+                             "message": f"Venue {private} not found."}}, resp)
+        self.assertEqual(
+            self._snapshot(), before,
+            f"[{backend}] the refused grant still mutated the store")
+
+        # -- nonexistent: byte-identical to the refusal above ---------------
+        absent = f"venue_ta_absent_{self._seq()}"
+        status_absent, _r, raw_absent = self._post(att, path,
+                                                   {"venue_id": absent})
+        self.assertEqual(
+            (status, self._blind(raw_private, private)),
+            (status_absent, self._blind(raw_absent, absent)),
+            f"[{backend}] the venue-access refusal is an existence oracle for "
+            f"another account's private drafts")
+
+        # -- the "scope decision, not a blanket block" half. A draft is
+        #    creator-gated rather than Program-gated, so the proof is that its
+        #    OWN author can finish the two-step flow -- switching Programs
+        #    would (correctly) change nothing here.
+        self._ok(self.openers[self.VICTIM],
+                 f"/api/v2/setup/seasons/{self.worlds[self.VICTIM]['season']}"
+                 f"/venue-access", {"venue_id": private},
+                 "the creator finishing its own pending grant")
+
+    def test_venue_access_exception_memory(self):
+        self._run_venue_access_exception(None, "memory")
+
+    def test_venue_access_exception_sqlite(self):
+        self._run_venue_access_exception(":memory:", "sqlite")
+
+    @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                         "PostgreSQL required (set TEST_DATABASE_URL)")
+    def test_venue_access_exception_postgres(self):
+        self._run_venue_access_exception(os.environ["TEST_DATABASE_URL"],
+                                         "postgres")
+
+    # ----------------------------------------------------------------------
+    # The owner's verbatim repro.
+    # ----------------------------------------------------------------------
+    def _run_owner_repro(self, database_url, backend):
+        """An ARENA MANAGER POSTs ``/api/v2/setup/venue/<foreign-id>/delete``.
+
+        Word for word the reported blocker, including the part that is easy to
+        forget once the write is stopped: the 200 response ECHOED the foreign
+        Venue's own fields back, so the caller learned its NAME even before the
+        row disappeared. The role gate was never the problem -- an Arena Manager
+        genuinely may delete Venues -- so this identity holds exactly the
+        permission the route requires and differs from the owner in one respect
+        only: which Program it has selected.
+        """
+        self._build(backend, database_url)
+        store = self.srv.STATE.api.store
+        arena, arena_uid = self._account(self.ARENA, Role.ARENA_MANAGER)
+        self._select(arena, self.worlds[self.OWN]["program"])
+
+        # A Venue linked to the other Program through the LEGACY
+        # ``Venue.league_id`` bridge and carrying no Rink -- the blocker's own
+        # shape, and the only Venue shape a dependency gate can actually delete
+        # (a granted Venue's grant is itself a delete blocker).
+        victim = self._mint_venue(self.VICTIM)
+        row = store.get_venue(victim)
+        self.assertIsNotNone(row, "fixture: the victim Venue must exist")
+        self.assertEqual(
+            chain_programs(store, "venue", victim),
+            {self.worlds[self.VICTIM]["program"]},
+            "fixture: the victim must belong to the OTHER Program")
+        self.assertNotIn(
+            arena_uid, created_by(store, "venue", victim),
+            "fixture: a different account must have created the victim")
+
+        before = self._snapshot()
+        status, resp, raw = self._post(
+            arena, f"/api/v2/setup/venue/{victim}/delete", {})
+        self.assertEqual(
+            status, 404,
+            f"[{backend}] THE BLOCKER: an Arena Manager deleted a Venue in "
+            f"another Program ({resp})")
+        self.assertEqual(
+            resp, {"error": {"code": "not_found",
+                             "message": f"Venue {victim} not found."}}, resp)
+        self.assertNotIn(
+            row.name.encode(), raw,
+            f"[{backend}] the refusal LEAKED the foreign Venue's name back to "
+            f"the caller -- the information leak half of the blocker")
+        self.assertIsNotNone(
+            store.get_venue(victim),
+            f"[{backend}] the foreign Venue was deleted anyway")
+        self.assertEqual(
+            self._snapshot(), before,
+            f"[{backend}] the refused delete still wrote to the store or the "
+            f"setup audit trail")
+
+        # A scope decision, not a blanket block: the same Arena Manager, the
+        # same call, after selecting the Venue's own Program.
+        self._select(arena, self.worlds[self.VICTIM]["program"])
+        self._ok(arena, f"/api/v2/setup/venue/{victim}/delete", {},
+                 "the same call inside the Venue's own Program")
+
+    def test_owner_repro_arena_manager_memory(self):
+        self._run_owner_repro(None, "memory")
+
+    def test_owner_repro_arena_manager_sqlite(self):
+        self._run_owner_repro(":memory:", "sqlite")
+
+    @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                         "PostgreSQL required (set TEST_DATABASE_URL)")
+    def test_owner_repro_arena_manager_postgres(self):
+        self._run_owner_repro(os.environ["TEST_DATABASE_URL"], "postgres")
