@@ -586,6 +586,59 @@ class ApiService:
 
         return ids, saw_link
 
+    def setup_venue_grantable(self, venue_id, user_id, role, scope):
+        """The FACILITY-TREE EXCEPTION for the venue-access write (#369 ruling).
+
+        ``setup_target_accessible`` is the right rule for every other target,
+        but applying it to the Venue end of a venue-access grant DEADLOCKS the
+        shared-arena capability: an arena serves several leagues, and the moment
+        Program A grants itself access the Venue is linked to A, so it fails the
+        active-context check for every other Program -- which can then never
+        obtain the grant that would have made it accessible. The capability
+        fails on its own first use.
+
+        The owner's ruling: the ceiling governs the COMPETITION tree, while a
+        Venue stays grantable across Programs. So this predicate replaces the
+        generic one for that ONE argument, and nothing else -- the Season end of
+        the same grant stays strictly ceilinged, and Rinks, IceSlots and every
+        competition record keep the generic rule.
+
+        Grantable means:
+
+        * the Venue is linked to SOME Program (any grant, active or revoked, or
+          the legacy Program link) -- an established facility; or
+        * it is linked to nothing AND this caller created it -- its own
+          create-then-grant draft.
+
+        The second clause is the load-bearing one. "Any Venue at all" was the
+        first attempt and leaked: on an installation with no Programs yet it
+        offered one operator the other's never-linked arena by name. An unlinked
+        Venue is somebody's private draft and stays creator-only.
+        """
+        if role is None:
+            return None
+        program, _season, _league = self.context.resolve_with_league(
+            user_id, role, scope)
+        if program is None:
+            return False
+        venue = self.store.get_venue(venue_id) if venue_id else None
+        if venue is None:
+            return False
+        # `_venue_program_ids` returns (ids, saw_link) -- unpack it. Testing
+        # the 2-tuple directly is ALWAYS truthy, which made this "any Venue at
+        # all" and silently reinstated the exact leak the docstring above
+        # records: on a Program-less install one operator was offered the
+        # other's never-linked arena by name.
+        program_ids, saw_link = self._venue_program_ids(venue)
+        if program_ids:
+            return True                      # an established shared facility
+        if saw_link:
+            # A link that exists but does not resolve (a dangling season or
+            # Program reference) is NOT "unlinked" -- treating it as such would
+            # hand a corrupt row to the creator clause below. Fail closed.
+            return False
+        return self._setup_target_created_by("venue", venue.id, user_id)
+
     def _setup_target_created_by(self, kind, record_id, user_id) -> bool:
         """True when ``user_id`` is the recorded CREATOR of this record.
 

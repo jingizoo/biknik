@@ -618,6 +618,10 @@ class V2SetupContractTest(unittest.TestCase):
         status, dprog = self._req(
             c, "POST", f"/api/v2/setup/season/{season['id']}/delete", {})
         self.assertEqual(status, 200, dprog)
+        # Deleting the Season above left the persisted context resolving to
+        # some OTHER Program, so re-select this one: you delete where you are
+        # working, and the target guard binds to the ACTIVE Program.
+        self._select(c, program["id"])
         status, dprogram = self._req(
             c, "POST", f"/api/v2/setup/program/{program['id']}/delete", {})
         self.assertEqual(status, 200, dprogram)
@@ -861,29 +865,27 @@ class V2SetupContractTest(unittest.TestCase):
                          {venue["id"], venue2["id"]})
 
         # -- one Venue can host multiple Programs/Seasons ---------------------
-        # The MODEL still allows it (distinct rows, no uniqueness across
-        # Programs). The HTTP GRANT route no longer does: #369 gates BOTH ends
-        # of this create, and a Venue already linked to SVA Prog's Season is
-        # outside SVA Prog 2's active context — precisely the "refused when
-        # REASSIGNING into that Venue" the blocker calls correct. So the
-        # cross-Program grant is asserted as REFUSED, with the same generic
-        # not-found a nonexistent Venue gets, and the sharing itself is seeded
-        # through the identity-less facade (this file's established precedent
-        # for states no HTTP route mints).
+        # Cross-Program venue sharing over the REAL route. #369 gates both
+        # ends of this create, but the Venue end uses the facility-tree
+        # exception (an arena serves several leagues), so a Venue already
+        # linked to SVA Prog's Season is still grantable to SVA Prog 2 --
+        # otherwise the capability would deadlock the moment the first Program
+        # took the grant. The SEASON end remains strictly ceilinged, which is
+        # why the context is switched to SVA Prog 2 first.
         program2 = self._program(c,
                            {"name": "SVA Prog 2",
                             "operator_organization_id": org["id"]})
         season2 = self._v2(c, "season",
                           {"program_id": program2["id"], "name": "SVA Season 2"})
-        status, refused = self._req(
+        self._select(c, program2["id"])
+        status, granted3 = self._req(
             c, "POST", f"/api/v2/setup/seasons/{season2['id']}/venue-access",
             {"venue_id": venue["id"]})
-        self.assertEqual(status, 404, refused)
-        self.assertEqual(refused["error"]["message"],
-                         f"Venue {venue['id']} not found.", refused)
-        granted3 = self.srv.STATE.api.setup.grant_season_venue_access(
-            season2["id"], venue["id"], actor_id="fixture")
-        self.assertNotEqual(granted3.id, granted["id"])
+        self.assertEqual(
+            status, 200,
+            f"the shared arena was refused to a second Program, which "
+            f"deadlocks venue sharing: {granted3}")
+        self.assertNotEqual(granted3["id"], granted["id"])
         self.assertEqual(
             {a.season_id for a in self.srv.STATE.api.store
              .season_venue_access_for_venue(venue["id"])},

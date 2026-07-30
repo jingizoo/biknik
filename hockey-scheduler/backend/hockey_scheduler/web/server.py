@@ -3248,8 +3248,19 @@ class Handler(BaseHTTPRequestHandler):
             if self._reject_target_outside_scope(
                     "season", mva.group(1), actor_id, role, scope):
                 return
-            if self._reject_target_outside_scope(
-                    "venue", b.get("venue_id") or None, actor_id, role, scope):
+            # The Venue end uses the FACILITY-TREE EXCEPTION, not the generic
+            # rule (#369 owner ruling). Applying the ceiling here deadlocked
+            # shared arenas: once one Program holds the grant, no other Program
+            # can ever obtain it. The Season end above stays strictly
+            # ceilinged, and every other target on every other route keeps the
+            # generic rule -- the exception is this one argument.
+            venue_id = b.get("venue_id") or None
+            grantable = api.setup_venue_grantable(
+                venue_id, actor_id, role, scope)
+            if grantable is False:
+                self._send_json({"error": {
+                    "code": "not_found",
+                    "message": f"Venue {venue_id} not found."}}, 404)
                 return
             return self._send_api(api.grant_season_venue_access(
                 mva.group(1), b.get("venue_id"), actor_id))
