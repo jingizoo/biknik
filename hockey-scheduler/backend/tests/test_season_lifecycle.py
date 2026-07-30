@@ -833,8 +833,19 @@ class SeasonLifecycleHttpTest(unittest.TestCase):
 
     def _seed_season(self, name="S1"):
         """Seed a Program + Season straight into the live server store and
-        return the season id, avoiding a long HTTP build for lifecycle tests."""
-        STATE.reset()
+        return the season id, avoiding a long HTTP build for lifecycle tests.
+
+        ``seed=False`` (clean slate) rather than the full Alpine dataset, so
+        Program "p" is the ONLY Program in the store (#369). Every request in
+        this class is an identity-less ``X-Demo-Role`` call with no session and
+        therefore no persisted active context, so the context resolver falls
+        back to the first authorized Program by id — with the demo dataset
+        loaded that is one of its ``league_*`` Programs, and every archive /
+        reopen / league-delete below then correctly refuses "p"'s records as
+        outside the active context. Making "p" the only Program is how a
+        context-less caller states which Program it is working in; the guard
+        itself is untouched."""
+        STATE.reset(seed=False)
         store = STATE.api.store
         store.add_program(Program(id="p", name="P"))
         store.add_season(Season(id="s", program_id="p", name=name))

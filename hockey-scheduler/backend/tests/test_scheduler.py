@@ -2249,6 +2249,13 @@ class SchedulerHttpTest(unittest.TestCase):
             self.assertEqual(status, 200, repr(resp))
             return resp
         league = post("/api/setup/league", {"name": "HTTP Commit Contract"})
+        # #369: a setup mutation that names an EXISTING record (here the
+        # venue-access grant below, whose Season AND Venue are both existing
+        # records) is authorized against the caller's PERSISTED active Program,
+        # not merely against its role — so select the Program this fixture just
+        # created. v1 calls a Program a "league"; /api/context is canonical, so
+        # the same id goes in as program_id.
+        post("/api/context", {"program_id": league["id"]})
         season = post("/api/setup/season",
                       {"league_id": league["id"], "name": "HCC Season"})
         level = post("/api/setup/level",

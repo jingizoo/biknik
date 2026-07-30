@@ -747,6 +747,110 @@ class Handler(BaseHTTPRequestHandler):
             return True
         return False
 
+    # -- setup TARGET-RECORD authorization (#369) --------------------------
+    #
+    # ``authorize()`` gates the ROLE: may this caller use a setup verb at all.
+    # It says nothing about WHICH records that verb may touch — which is exactly
+    # the blocker. An Arena Manager POSTed
+    # ``/api/v2/setup/venue/<foreign-id>/delete`` for a Venue created by another
+    # account in another Program; the route returned 200, ECHOED the foreign
+    # record's own fields back (its name included — an information leak on top
+    # of the write), deleted it, and wrote a ``venue_deleted`` audit row.
+    # Permission to use a setup capability is not authorization over every
+    # record in the installation.
+    #
+    # ``_reject_target_outside_scope`` below is THE one gate every setup
+    # mutation that accepts an EXISTING entity id routes through, so the rule
+    # cannot drift between v1 and v2, or between delete / reassign / in-place
+    # edit. The decision itself lives in ONE predicate —
+    # ``ApiService.setup_target_accessible`` — and nothing here re-derives it.
+
+    # Canonical setup kind → the label the FACADE's own NotFoundError uses.
+    # Reused verbatim so a refusal is byte-identical to a genuinely nonexistent
+    # id and can never be turned into an existence oracle for another Program's
+    # records.
+    _SETUP_TARGET_LABELS = {
+        "program": "Program", "season": "Season", "league": "League",
+        "league_season": "LeagueSeason", "division": "Division",
+        "team": "Team", "player": "Player", "game": "Game", "club": "Club",
+        "official": "Official", "venue": "Venue", "rink": "Rink",
+        "ice_slot": "Ice slot", "organization": "Organization",
+        # Bridge rows (below) — the facade's wording for those two ids.
+        "registration": "Registration",
+        "season_venue_access": "Season-venue access",
+    }
+
+    # Join rows that carry no Program of their own: a SeasonTeamRegistration IS
+    # the (Team, LeagueSeason) join and a SeasonVenueAccess IS the (Season,
+    # Venue) join, so neither is a ``setup_target_accessible`` kind. Each is
+    # judged by the parent that names its Program while still being REPORTED
+    # under its own id and label. Maps pseudo-kind → (store getter, the
+    # attribute holding the parent id, the canonical kind of that parent).
+    _SETUP_BRIDGE_TARGETS = {
+        "registration": ("get_season_team_registration", "league_season_id",
+                         "league_season"),
+        "season_venue_access": ("get_season_venue_access", "season_id",
+                                "season"),
+    }
+
+    # Transport alias → canonical kind, for the v1 (/api/setup/) surface ONLY.
+    # v1 "league" is TODAY'S PROGRAM and v1 "level" is today's competition
+    # LEAGUE — the pre-#233 vocabulary, still the v1 wire contract (v1 dispatches
+    # league→delete_program and level→delete_league). Passing the raw v1 word
+    # through would gate every v1 Program delete as a competition League; because
+    # Program and League ids are drawn from the SAME "league_" id sequence they
+    # never collide, so the lookup would simply miss and refuse EVERY v1 program
+    # delete with a not-found. v2 already speaks canonical names and needs no
+    # translation.
+    _V1_SETUP_KIND = {"league": "program", "level": "league"}
+
+    def _reject_target_outside_scope(self, kind, record_id, user_id, role,
+                                     scope) -> bool:
+        """Send the generic not-found and return True when this caller may not
+        act on THIS setup record; return False to proceed (#369).
+
+        Call it BEFORE the facade — before any lookup-derived field is
+        serialized into a response and before any save or audit row — so a
+        refused mutation leaves no trace and leaks nothing about the target.
+
+        Three cases deliberately pass through untouched:
+
+        * ``record_id`` falsy or not a string. Not this gate's business: the
+          route's own ``check_body`` and the facade already own that error, and
+          turning a precise ``validation_error`` into a generic not-found would
+          be a regression.
+        * ``setup_target_accessible`` returns **None** — no user context was
+          supplied at all (``role is None``). Legacy identity-less internal
+          callers, the demo/full seeds and the acceptance harnesses drive the
+          facade with no identity and must be completely unaffected. This is NOT
+          a bypass for synthetic actor labels: an identified caller with a real
+          role is gated no matter what its actor string looks like.
+        * A bridge row (registration / season-venue-access) that does not
+          resolve. There is nothing to judge, and the facade emits the
+          byte-identical wording a step later.
+        """
+        if not isinstance(record_id, str) or not record_id:
+            return False
+        kind = kind.replace("-", "_")
+        # What the caller ASKED about is always what gets reported back — a
+        # bridge row is judged by its parent but never named as one.
+        label = self._SETUP_TARGET_LABELS.get(kind, kind)
+        check_kind, check_id = kind, record_id
+        bridge = self._SETUP_BRIDGE_TARGETS.get(kind)
+        if bridge is not None:
+            getter, attr, check_kind = bridge
+            row = getattr(STATE.api.store, getter)(record_id)
+            check_id = getattr(row, attr, None) if row is not None else None
+            if not check_id:
+                return False
+        if STATE.api.setup_target_accessible(
+                check_kind, check_id, user_id, role, scope) is not False:
+            return False
+        self._send_api({"error": {
+            "code": "not_found",
+            "message": f"{label} {record_id} not found."}})
+        return True
+
     def _require_player_scope(self):
         """Resolve the signed-in player's id + user id from the session for a
         player-scoped route (#110), so the browser never passes a player_id.
@@ -2098,8 +2202,12 @@ class Handler(BaseHTTPRequestHandler):
         # (enforced above), but canonical request bodies and canonical
         # (_serialize) responses — NO v1 adapter mapping. Checked before the v1
         # prefix so /api/v2/setup/ never falls through to /api/setup/.
+        # ``role``/``scope`` come from the SAME _resolve_role() call that
+        # produced ``user_id`` above (#369), so the identity the target-record
+        # gate checks is exactly the identity the audit trail records.
         if path.startswith("/api/v2/setup/"):
-            return self._handle_setup_v2(path[len("/api/v2/setup/"):], body, user_id)
+            return self._handle_setup_v2(path[len("/api/v2/setup/"):], body,
+                                         user_id, role, scope)
 
         # Ice Availability Builder (#158): preview then idempotently commit a
         # recurring block of AVAILABLE Game ice for a Season. Checked BEFORE the
@@ -2151,7 +2259,8 @@ class Handler(BaseHTTPRequestHandler):
 
         # Setup create endpoints — operator creates real records via the API.
         if path.startswith("/api/setup/"):
-            return self._handle_setup(path[len("/api/setup/"):], body, user_id)
+            return self._handle_setup(path[len("/api/setup/"):], body, user_id,
+                                      role, scope)
 
         # Pilot onboarding import dry-run (#92): validates CSV-shaped rows and
         # always returns 200 with the report itself (ok true/false) — nothing
@@ -2472,13 +2581,14 @@ class Handler(BaseHTTPRequestHandler):
         return self._unmatched_route("POST")
 
     def _handle_reassign(self, entity: str, record_id: str, target: str,
-                         body: dict, actor_id: str):
+                         body: dict, actor_id: str, role, scope):
         """Dispatch /api/setup/<entity>/<id>/assign-<target> (#166 PR D).
 
         Each moves ``record_id`` under a new parent id read from the body; the
         facade validates the target exists (or accepts null to unassign the
         nullable links) and audits the old→new ids. ``actor_id`` is the
-        server-resolved session user (#136), never client-supplied.
+        server-resolved session user (#136), never client-supplied, and
+        ``role``/``scope`` come from that same resolution (#369).
         """
         api = STATE.api
         b = body
@@ -2515,6 +2625,31 @@ class Handler(BaseHTTPRequestHandler):
                 check_body(b, **_V1_REASSIGN_SCHEMA[combo])
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
+        # #369 — target-record authorization, BOTH ENDS. A reassign moves a
+        # record out of one parent and into another, so the caller must be
+        # entitled to the SOURCE record it is moving AND to any non-null
+        # DESTINATION it is moving into; an explicit null (unassign) has no
+        # destination to check. Runs before the facade, so a refused reassign
+        # serializes nothing, saves nothing and audits nothing. The v1 wire word
+        # is translated first: "league" here is a PROGRAM.
+        if self._reject_target_outside_scope(
+                self._V1_SETUP_KIND.get(entity, entity), record_id, actor_id,
+                role, scope):
+            return
+        # combo → (canonical kind of the destination, its v1 body key). "level"
+        # is v1 for the competition LEAGUE, so the destination kind is "league".
+        _V1_REASSIGN_DEST = {
+            ("league", "organization"): ("organization", "organization_id"),
+            ("venue", "organization"): ("organization", "organization_id"),
+            ("rink", "venue"): ("venue", "venue_id"),
+            ("division", "level"): ("league", "level_id"),
+            ("team", "club"): ("club", "club_id"),
+            ("player", "team"): ("team", "team_id"),
+        }
+        dest = _V1_REASSIGN_DEST.get(combo)
+        if dest is not None and self._reject_target_outside_scope(
+                dest[0], b.get(dest[1]) or None, actor_id, role, scope):
+            return
         # v1 boundary (#233 C1b): legacy request keys map straight onto the
         # canonical facade args (same id values), and canonical result dicts are
         # mapped back to the exact legacy v1 response keys via _v1.
@@ -2543,12 +2678,16 @@ class Handler(BaseHTTPRequestHandler):
             "code": "not_found",
             "message": f"Unknown reassignment {entity}/assign-{target}."}}, 404)
 
-    def _handle_setup(self, entity: str, body: dict, actor_id: str):
+    def _handle_setup(self, entity: str, body: dict, actor_id: str,
+                      role, scope):
         """Dispatch /api/setup/<entity> to the matching facade create method.
 
         ``actor_id`` is always the caller's server-resolved session user id
         (#136) — never a client-supplied body field, so the setup audit
-        trail can't be forged.
+        trail can't be forged. ``role``/``scope`` come from that SAME
+        ``_resolve_role()`` call and feed ``_reject_target_outside_scope``
+        (#369), so the identity the target gate checks is exactly the identity
+        the audit records.
         """
         api = STATE.api
         b = body
@@ -2556,7 +2695,8 @@ class Handler(BaseHTTPRequestHandler):
         # Move a record under a new parent, recording the old→new ids in audit.
         m = re.match(r"^(league|venue|rink|division|team|player)/([^/]+)/assign-(\w+)$", entity)
         if m:
-            return self._handle_reassign(m.group(1), m.group(2), m.group(3), b, actor_id)
+            return self._handle_reassign(m.group(1), m.group(2), m.group(3), b,
+                                         actor_id, role, scope)
         # Season team registrations (#180): register a permanent league team for
         # a season, reassign its division for that season, or remove it from the
         # season. All League-Admin (MANAGE_SETUP) via the /api/setup/ authz
@@ -2589,6 +2729,15 @@ class Handler(BaseHTTPRequestHandler):
                            types={"division_id": (str, type(None))})
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
+            # #369 — both ends: the registration being edited (judged by its
+            # LeagueSeason) and the destination Division when one is given.
+            if self._reject_target_outside_scope(
+                    "registration", ma.group(1), actor_id, role, scope):
+                return
+            if self._reject_target_outside_scope(
+                    "division", b.get("division_id") or None, actor_id,
+                    role, scope):
+                return
             return self._send_api(_v1.registration_to_v1(
                 api.assign_season_team_division(
                     ma.group(1), b.get("division_id") or None, actor_id)))
@@ -2598,6 +2747,10 @@ class Handler(BaseHTTPRequestHandler):
                 check_body(b, allowed=set())  # no body
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
+            # #369 — an unassign still mutates an existing record: gate it.
+            if self._reject_target_outside_scope(
+                    "registration", mx.group(1), actor_id, role, scope):
+                return
             return self._send_api(_v1.registration_to_v1(
                 api.unregister_team_from_season(mx.group(1), actor_id)))
         # Safe destructive deletion (#215): /api/setup/<entity>/<id>/delete.
@@ -2624,6 +2777,15 @@ class Handler(BaseHTTPRequestHandler):
                 "venue": api.delete_venue, "rink": api.delete_rink,
                 "ice-slot": api.delete_ice_slot, "game": api.delete_game,
             }[kind]
+            # #369 — THE blocker's dispatch point on v1. Refuse a target outside
+            # the caller's validated context BEFORE the facade runs, so the
+            # foreign record is never serialized into the response, never
+            # deleted, and never audited. "league" here is a PROGRAM and "level"
+            # is a competition League — translate before gating.
+            if self._reject_target_outside_scope(
+                    self._V1_SETUP_KIND.get(kind, kind), md.group(2), actor_id,
+                    role, scope):
+                return
             # v1 boundary (#233 C1b): the deleted record is returned serialized,
             # so canonical entities are mapped back to their legacy v1 shape.
             _to_v1 = {"league": _v1.program_to_v1, "season": _v1.season_to_v1,
@@ -2749,7 +2911,7 @@ class Handler(BaseHTTPRequestHandler):
                                           "message": "Unknown setup entity."}}, 404)
 
     def _handle_reassign_v2(self, entity: str, record_id: str, target: str,
-                            body: dict, actor_id: str):
+                            body: dict, actor_id: str, role, scope):
         """Dispatch /api/v2/setup/<entity>/<id>/assign-<target> (#233 Slice C2).
 
         Canonical reassign per the ADR 0001 new tree: division→league (the
@@ -2758,7 +2920,8 @@ class Handler(BaseHTTPRequestHandler):
         There is NO team→program (a Team is program-permanent) and NO
         division→level (division's parent is now a League). Canonical request
         keys and canonical (_serialize) responses — no v1 mapping. ``actor_id``
-        is the server-resolved session user (#136), never client-supplied.
+        is the server-resolved session user (#136), never client-supplied, and
+        ``role``/``scope`` come from that same resolution (#369).
         """
         api = STATE.api
         b = body
@@ -2799,6 +2962,28 @@ class Handler(BaseHTTPRequestHandler):
                 check_body(b, **_V2_REASSIGN_SCHEMA[combo])
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
+        # #369 — target-record authorization, BOTH ENDS: the SOURCE record being
+        # moved and any non-null DESTINATION it is moving into (an explicit null
+        # unassign has no destination to check). Before the facade, so a refused
+        # reassign serializes nothing, saves nothing and audits nothing. v2
+        # already speaks canonical kind names, so no alias translation here.
+        if self._reject_target_outside_scope(
+                entity, record_id, actor_id, role, scope):
+            return
+        _V2_REASSIGN_DEST = {
+            ("program", "organization"): ("organization",
+                                          "operator_organization_id"),
+            ("division", "league"): ("league", "league_id"),
+            ("team", "club"): ("club", "club_id"),
+            ("team", "league"): ("league", "league_id"),
+            ("player", "team"): ("team", "team_id"),
+            ("rink", "venue"): ("venue", "venue_id"),
+            ("venue", "organization"): ("organization", "organization_id"),
+        }
+        dest = _V2_REASSIGN_DEST.get(combo)
+        if dest is not None and self._reject_target_outside_scope(
+                dest[0], b.get(dest[1]) or None, actor_id, role, scope):
+            return
         if combo == ("program", "organization"):
             # v2 Program operator reassignment (#233 Slice C2 review): the
             # canonical umbrella owner move, using ``operator_organization_id``.
@@ -2879,7 +3064,8 @@ class Handler(BaseHTTPRequestHandler):
             return True
         return False
 
-    def _handle_setup_v2(self, entity: str, body: dict, actor_id: str):
+    def _handle_setup_v2(self, entity: str, body: dict, actor_id: str,
+                         role, scope):
         """Dispatch /api/v2/setup/<entity> to the canonical facade (#233 Slice C2).
 
         The canonical write surface: canonical body keys (program_id /
@@ -2888,7 +3074,9 @@ class Handler(BaseHTTPRequestHandler):
         validation is REQUIRED on the v2 routes where the target model demands it
         (League on division / registration / game); a missing one is a
         validation_error rather than a silent v1-style derivation. ``actor_id`` is
-        always the server-resolved session user (#136).
+        always the server-resolved session user (#136); ``role``/``scope`` come
+        from that same ``_resolve_role()`` call and feed the #369 target gate,
+        so the identity checked is the identity audited.
         """
         api = STATE.api
         b = body
@@ -2906,7 +3094,7 @@ class Handler(BaseHTTPRequestHandler):
             entity)
         if m:
             return self._handle_reassign_v2(
-                m.group(1), m.group(2), m.group(3), b, actor_id)
+                m.group(1), m.group(2), m.group(3), b, actor_id, role, scope)
         # Audited in-place Player profile edit (#268): correct name / position /
         # jersey_number / shoots / email without touching the id, Team, active
         # state, or any history. Every field is OPTIONAL (a partial edit) but an
@@ -2926,6 +3114,11 @@ class Handler(BaseHTTPRequestHandler):
                            "email": (str, type(None))})
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
+            # #369 — an in-place edit is a mutation of an EXISTING record and
+            # echoes that record back; gate it exactly like a delete.
+            if self._reject_target_outside_scope(
+                    "player", mpu.group(1), actor_id, role, scope):
+                return
             return self._send_api(api.update_player(
                 mpu.group(1), actor_id=actor_id, **b))
         # Deactivate/reactivate a Player without deleting history (#270): the
@@ -2942,6 +3135,10 @@ class Handler(BaseHTTPRequestHandler):
                                   "reason": (str, type(None))})
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
+            # #369 — same as /update: an existing-record lifecycle edit.
+            if self._reject_target_outside_scope(
+                    "player", mpa.group(1), actor_id, role, scope):
+                return
             return self._send_api(api.set_player_active(
                 mpa.group(1), b["active"], actor_id=actor_id,
                 reason=b.get("reason")))
@@ -2970,6 +3167,15 @@ class Handler(BaseHTTPRequestHandler):
                            types={"league_id": str})
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
+            # #369 — both ends: the registration (judged by its LeagueSeason)
+            # and the destination League.
+            if self._reject_target_outside_scope(
+                    "registration", ml.group(1), actor_id, role, scope):
+                return
+            if self._reject_target_outside_scope(
+                    "league", b.get("league_id") or None, actor_id, role,
+                    scope):
+                return
             return self._send_api(api.assign_season_team_league(
                 ml.group(1), b.get("league_id") or None, actor_id))
         ma = re.match(r"^season-team-registration/([^/]+)/assign-division$", entity)
@@ -2983,6 +3189,15 @@ class Handler(BaseHTTPRequestHandler):
                            types={"division_id": (str, type(None))})
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
+            # #369 — both ends: the registration and the destination Division
+            # (an explicit null clears it and has no destination to check).
+            if self._reject_target_outside_scope(
+                    "registration", ma.group(1), actor_id, role, scope):
+                return
+            if self._reject_target_outside_scope(
+                    "division", b.get("division_id") or None, actor_id, role,
+                    scope):
+                return
             return self._send_api(api.assign_season_team_division(
                 ma.group(1), b.get("division_id") or None, actor_id, v2=True))
         mx = re.match(r"^season-team-registration/([^/]+)/remove$", entity)
@@ -2991,6 +3206,10 @@ class Handler(BaseHTTPRequestHandler):
                 check_body(b, allowed=set())  # no body
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
+            # #369 — an unassign still mutates an existing record: gate it.
+            if self._reject_target_outside_scope(
+                    "registration", mx.group(1), actor_id, role, scope):
+                return
             return self._send_api(api.unregister_team_from_season(
                 mx.group(1), actor_id))
         # Explicit permanent cleanup of an already-inactive, game-free
@@ -3003,6 +3222,10 @@ class Handler(BaseHTTPRequestHandler):
                 check_body(b, allowed=set())  # no body
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
+            # #369 — permanent cleanup of an existing record: gate it.
+            if self._reject_target_outside_scope(
+                    "registration", mdr.group(1), actor_id, role, scope):
+                return
             return self._send_api(api.delete_season_team_registration(
                 mdr.group(1), actor_id))
         # Season-venue access (#233 Slice E, E1): grant/revoke which Venues a
@@ -3016,6 +3239,18 @@ class Handler(BaseHTTPRequestHandler):
                            types={"venue_id": str})
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
+            # #369 — the ONE create the owner named explicitly, because both of
+            # its arguments are EXISTING records: the Season being granted
+            # access and the Venue it is being granted into. This is also the
+            # legitimate pending-link flow — a just-created, still-unlinked
+            # Venue is claimable only by the account that created it, which the
+            # predicate's rule 6 handles.
+            if self._reject_target_outside_scope(
+                    "season", mva.group(1), actor_id, role, scope):
+                return
+            if self._reject_target_outside_scope(
+                    "venue", b.get("venue_id") or None, actor_id, role, scope):
+                return
             return self._send_api(api.grant_season_venue_access(
                 mva.group(1), b.get("venue_id"), actor_id))
         mvr = re.match(r"^season-venue-access/([^/]+)/remove$", entity)
@@ -3024,6 +3259,11 @@ class Handler(BaseHTTPRequestHandler):
                 check_body(b, allowed=set())  # no body
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
+            # #369 — revoke deactivates an existing grant: gate it. The grant is
+            # judged by its Season (the competition side names the Program).
+            if self._reject_target_outside_scope(
+                    "season_venue_access", mvr.group(1), actor_id, role, scope):
+                return
             return self._send_api(api.revoke_season_venue_access(
                 mvr.group(1), actor_id))
         # Explicit permanent cleanup of an already-revoked access row (#255
@@ -3034,6 +3274,10 @@ class Handler(BaseHTTPRequestHandler):
                 check_body(b, allowed=set())  # no body
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
+            # #369 — permanent cleanup of an existing grant: gate it.
+            if self._reject_target_outside_scope(
+                    "season_venue_access", mvd.group(1), actor_id, role, scope):
+                return
             return self._send_api(api.delete_season_venue_access(
                 mvd.group(1), actor_id))
         # Season rollover (canonical v2): each selection REQUIRES a target
@@ -3051,6 +3295,14 @@ class Handler(BaseHTTPRequestHandler):
                 check_body(b, allowed={"reason"})
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
+            # #369 — archive/reopen are in-place edits of an EXISTING Season:
+            # they flip its status, echo the Season back and write an audit row,
+            # so they belong to the same class as player/update and are gated
+            # identically. Freezing or reopening another Program's Season is the
+            # blocker in a different costume.
+            if self._reject_target_outside_scope(
+                    "season", mar.group(1), actor_id, role, scope):
+                return
             call = (api.archive_season if mar.group(2) == "archive"
                     else api.reopen_season)
             return self._send_api(call(
@@ -3079,6 +3331,15 @@ class Handler(BaseHTTPRequestHandler):
                 "ice-slot": api.delete_ice_slot, "game": api.delete_game,
                 "official": api.delete_official, "player": api.delete_player,
             }[kind]
+            # #369 — THE blocker's own dispatch point. Refuse a target outside
+            # the caller's validated context BEFORE the facade runs: before the
+            # foreign record's fields are serialized into the response, before
+            # the delete, and before the *_deleted audit row. v2 kind names are
+            # already canonical; the helper folds the hyphen in "ice-slot" /
+            # "league-season".
+            if self._reject_target_outside_scope(
+                    kind, md.group(2), actor_id, role, scope):
+                return
             # Canonical Venue responses drop the legacy league_id (org-owned only).
             mapper = _v2p.venue_to_v2 if kind == "venue" else (lambda r: r)
             return self._send_api(mapper(deleter(md.group(2), actor_id)))

@@ -95,6 +95,32 @@ class V1SetupContractTest(unittest.TestCase):
         self.assertNotIn("error", resp, (entity, resp))
         return resp
 
+    def _select(self, c, program_id):
+        """Make ``program_id`` this caller's PERSISTED active context (#369).
+
+        A setup mutation that names an EXISTING record is authorized against the
+        active Program, not merely against the caller's role. A test that builds
+        a fresh Program and then reassigns, edits or deletes records under it
+        has to say which Program it is working in; otherwise the admin is still
+        sitting in whichever Program resolved first and every one of those
+        mutations is correctly refused as not-found.
+        """
+        status, ctx = self._req(c, "POST", "/api/context",
+                                {"program_id": program_id})
+        self.assertEqual(status, 200, ctx)
+        return ctx
+
+    def _program(self, c, body):
+        """Create a Program via the v1 "league" route and select it (#369).
+
+        v1 spells today's Program "league" — the pre-#233 vocabulary this whole
+        file exists to pin — but ``/api/context`` is canonical, so the same id
+        goes in as ``program_id``.
+        """
+        program = self._create(c, "league", body)
+        self._select(c, program["id"])
+        return program
+
     # -- exact legacy key sets on every create response ---------------------
     def test_v1_create_responses_have_exact_legacy_key_sets(self):
         c = self._admin()
@@ -159,8 +185,8 @@ class V1SetupContractTest(unittest.TestCase):
     def test_v1_reassign_responses_have_exact_legacy_key_sets(self):
         c = self._admin()
         org = self._create(c, "organization", {"name": "Reorg", "short_name": "REO"})
-        league = self._create(c, "league",
-                              {"name": "Reassign", "organization_id": org["id"]})
+        league = self._program(c,
+                               {"name": "Reassign", "organization_id": org["id"]})
         season = self._create(c, "season",
                               {"league_id": league["id"], "name": "S"})
         level = self._create(c, "level", {"season_id": season["id"], "name": "L"})
@@ -192,8 +218,8 @@ class V1SetupContractTest(unittest.TestCase):
     def _build_playable(self, c):
         """Full hierarchy with two registered teams + a valid game ice slot."""
         org = self._create(c, "organization", {"name": "Game Org", "short_name": "GMO"})
-        league = self._create(c, "league",
-                              {"name": "Game Prog", "organization_id": org["id"]})
+        league = self._program(c,
+                               {"name": "Game Prog", "organization_id": org["id"]})
         season = self._create(c, "season",
                               {"league_id": league["id"], "name": "Fall"})
         division = self._create(c, "division",

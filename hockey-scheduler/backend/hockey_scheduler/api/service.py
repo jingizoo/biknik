@@ -298,6 +298,439 @@ class ApiService:
             },
         }
 
+    # -- setup TARGET-RECORD authorization (#369) --------------------------
+    #
+    # Holding a setup CAPABILITY (MANAGE_SETUP / MANAGE_ARENA) says the caller
+    # may use a setup verb. It says nothing about WHICH records that verb may
+    # touch. The two are checked in different places and must both pass:
+    # `web/authz.py` gates the role, and this predicate gates the target record.
+    #
+    # `entity_type` names in the SETUP AUDIT TRAIL are historical, not canonical
+    # (see `_SETUP_CREATION_AUDIT_KEYS`). Only these CANONICAL kind strings are
+    # accepted here; a transport-layer alias ("league" meaning a Program on the
+    # v1 route, "level" meaning a League, the hyphenated v2 "ice-slot" /
+    # "league-season") MUST be translated by its caller. Hyphens are folded to
+    # underscores as a convenience; nothing else is guessed, because guessing
+    # between the two meanings of "league" is exactly how #369's sibling defects
+    # were introduced.
+    _SETUP_TARGET_KINDS = frozenset({
+        "program", "season", "league", "league_season", "division", "team",
+        "player", "game", "club", "official", "venue", "rink", "ice_slot",
+        "organization",
+    })
+
+    # (action, entity_type) pairs a "this user created this record" audit row
+    # can legitimately carry, per canonical kind. NOT simply
+    # f"{kind}_created" — the trail predates #233's vocabulary and was never
+    # rewritten:
+    #
+    #   * `create_program` writes ("league_created", "league") against the
+    #     PROGRAM's id, because pre-#233 "League" meant today's Program. A
+    #     lookup for ("program_created", "program") finds NOTHING for every
+    #     interactively-created Program.
+    #   * `upsert_imported_program` (the hierarchy import) DOES write
+    #     ("program_created", "program"), so both spellings are live and a
+    #     Program may legitimately carry either.
+    #   * `create_league` writes ("level_created", "level") against the
+    #     competition LEAGUE's id — "level" was the pre-#283 name — while
+    #     `upsert_imported_league` writes ("league_created", "league") against
+    #     that same kind of id. So ("league_created", "league") is ambiguous
+    #     BETWEEN Program and League on its face.
+    #
+    # The ambiguity is resolved by `entity_id`, which is always matched too:
+    # `next_id` hands out one monotonic sequence per prefix, and both
+    # `create_program` and `create_league` draw from the SAME "league" prefix,
+    # so a Program id and a League id can never be equal. Matching the id (not
+    # just the action) is therefore what makes the overlapping row safe.
+    _SETUP_CREATION_AUDIT_KEYS = {
+        "program": {("league_created", "league"),
+                    ("program_created", "program")},
+        "league": {("level_created", "level"), ("league_created", "league")},
+        "season": {("season_created", "season")},
+        "league_season": {("league_season_created", "league_season")},
+        "division": {("division_created", "division")},
+        "team": {("team_created", "team")},
+        "player": {("player_created", "player")},
+        "game": {("game_created", "game")},
+        "club": {("club_created", "club")},
+        "official": {("official_created", "official")},
+        "venue": {("venue_created", "venue")},
+        "rink": {("rink_created", "rink")},
+        "ice_slot": {("ice_slot_created", "ice_slot")},
+        "organization": {("organization_created", "organization")},
+    }
+
+    def _setup_target_record(self, kind, record_id):
+        """The stored record for a canonical setup ``kind``, or None.
+
+        None means "no such record" for EVERY reason — unknown kind, falsy id,
+        or a genuinely absent row — because the caller renders one generic
+        not-found for all of them. An unrecognized kind failing closed here is
+        deliberate: a mis-spelled or untranslated kind must refuse, never
+        silently skip the gate."""
+        if not record_id or not isinstance(record_id, str):
+            return None
+        getter = {
+            "program": self.store.get_program,
+            "season": self.store.get_season,
+            "league": self.store.get_league,
+            "league_season": self.store.get_league_season,
+            "division": self.store.get_division,
+            "team": self.store.get_team,
+            "player": self.store.get_player,
+            "game": self.store.get_game,
+            "club": self.store.get_club,
+            "official": self.store.get_official,
+            "venue": self.store.get_venue,
+            "rink": self.store.get_rink,
+            "ice_slot": self.store.get_ice_slot,
+            "organization": self.store.get_organization,
+        }.get(kind)
+        return getter(record_id) if getter else None
+
+    def _team_program_ids(self, team):
+        """Program ids a Team is linked to.
+
+        ``Team.program_id`` is the permanent owner and is authoritative whenever
+        it is set. It is NULLABLE, though, and a Team also belongs permanently to
+        exactly one competition ``League`` whose ``program_id`` names the same
+        Program (the service layer enforces the invariant). So when — and ONLY
+        when — ``program_id`` is null, the League edge is walked instead: that
+        Team is still part of a Program's competition chain, and the owner's
+        rule is that a LINKED record is judged by its chain, not by who typed it
+        in. The League is never consulted while ``program_id`` is set, so a
+        (corrupt) disagreement between the two can never widen access."""
+        if team is None:
+            return set(), False
+        if team.program_id:
+            return {team.program_id}, True
+        if team.league_id:
+            league = self.store.get_league(team.league_id)
+            if league is None:
+                return set(), True          # dangling edge → linked, unresolvable
+            if league.program_id:
+                return {league.program_id}, True
+        return set(), False
+
+    def _venue_program_ids(self, venue):
+        """Program ids a Venue is linked to — the union of BOTH bridges.
+
+        1. ``SeasonVenueAccess`` is the only real join between the facility tree
+           (Organization → Venue → Rink → IceSlot) and the competition tree
+           (Program → Season → League → Division). EVERY grant counts, ACTIVE OR
+           REVOKED: revoking deactivates the row rather than deleting it, so a
+           revoked grant is durable evidence that this Venue was used by that
+           Program's Season. Treating a revoked grant as "no link" would let a
+           Program revoke its own access and thereby turn a shared Venue into an
+           unlinked record that some unrelated account could claim by creator
+           ownership — a privilege *gain* produced by giving something up.
+        2. ``Venue.league_id`` is the LEGACY pre-#233 bridge and, despite the
+           name, holds a PROGRAM id — `store/integrity_checks.py` joins it to
+           ``seasons.program_id``. It is NEVER a competition League id. It is
+           taken verbatim and is deliberately NOT filtered against existing
+           Programs: a dangling legacy value must keep the Venue LINKED (and so
+           refuse everyone) rather than decay into "unlinked" and become
+           claimable.
+
+        Returns ``(program_ids, saw_link)``; ``saw_link`` is True when a linking
+        row existed even if its Program could not be resolved, so corrupt data
+        can never demote a linked record into the permissive creator branch."""
+        if venue is None:
+            return set(), False
+        ids, saw_link = set(), False
+        for grant in self.store.season_venue_access_for_venue(venue.id):
+            saw_link = True                 # active or revoked — both are links
+            season = self.store.get_season(grant.season_id)
+            if season is not None and season.program_id:
+                ids.add(season.program_id)
+        if venue.league_id:
+            saw_link = True
+            ids.add(venue.league_id)        # LEGACY: this IS a Program id
+        return ids, saw_link
+
+    def _setup_target_program_ids(self, kind, record):
+        """``(program_ids, saw_link)`` — the Programs ``record`` is linked to.
+
+        ``saw_link`` distinguishes "this record has no Program chain at all"
+        (empty set, False → the pending-link/creator contract applies) from
+        "this record HAS a chain but a row in it is missing" (empty set, True →
+        refuse). Without that distinction a dangling FK would silently promote a
+        linked record into the permissive branch, which is a privilege
+        escalation reachable by breaking data rather than by holding rights."""
+        ids, saw_link = set(), False
+
+        if kind == "program":
+            return {record.id}, True
+
+        if kind == "season":
+            if record.program_id:
+                return {record.program_id}, True
+            return ids, saw_link
+
+        if kind == "league":
+            # The REAL competition League — its parent is a Program directly.
+            if record.program_id:
+                return {record.program_id}, True
+            return ids, saw_link
+
+        if kind == "league_season":
+            season = self.store.get_season(record.season_id)
+            if season is None:
+                return ids, True
+            if season.program_id:
+                return {season.program_id}, True
+            return ids, True
+
+        if kind == "division":
+            ls = self.store.get_league_season(record.league_season_id)
+            if ls is None:
+                return ids, True
+            return self._setup_target_program_ids("league_season", ls)
+
+        if kind == "team":
+            return self._team_program_ids(record)
+
+        if kind == "player":
+            team = self.store.get_team(record.team_id) if record.team_id else None
+            if record.team_id and team is None:
+                return ids, True
+            return self._team_program_ids(team)
+
+        if kind == "game":
+            # A REGULAR game's Season is its Program chain. An exhibition may
+            # carry no Season (#283 Slice D); only then are its League and
+            # Division consulted, so a set season_id is never second-guessed.
+            if record.season_id:
+                season = self.store.get_season(record.season_id)
+                if season is None:
+                    return ids, True
+                if season.program_id:
+                    return {season.program_id}, True
+                return ids, True
+            if record.league_id:
+                league = self.store.get_league(record.league_id)
+                if league is None:
+                    return ids, True
+                if league.program_id:
+                    return {league.program_id}, True
+                return ids, True
+            if record.division_id:
+                division = self.store.get_division(record.division_id)
+                if division is None:
+                    return ids, True
+                return self._setup_target_program_ids("division", division)
+            return ids, saw_link
+
+        if kind == "club":
+            # A Club owns Teams across Programs; its link set is the union of
+            # its Teams' Programs. A Club with no Team is genuinely unlinked.
+            for team in self.store.all_teams():
+                if team.club_id == record.id:
+                    team_ids, team_link = self._team_program_ids(team)
+                    ids |= team_ids
+                    saw_link = saw_link or team_link
+            return ids, saw_link
+
+        if kind == "official":
+            # Two independent links: the home Club used for conflict-of-interest
+            # checks, and the Games actually officiated.
+            if record.home_club_id:
+                club = self.store.get_club(record.home_club_id)
+                if club is None:
+                    saw_link = True
+                else:
+                    club_ids, club_link = self._setup_target_program_ids(
+                        "club", club)
+                    ids |= club_ids
+                    saw_link = saw_link or club_link
+            for assignment in self.store.assignments_for_official(record.id):
+                game = self.store.get_game(assignment.game_id)
+                if game is None:
+                    saw_link = True
+                    continue
+                game_ids, game_link = self._setup_target_program_ids("game", game)
+                ids |= game_ids
+                saw_link = saw_link or game_link
+            return ids, saw_link
+
+        if kind == "venue":
+            return self._venue_program_ids(record)
+
+        if kind == "rink":
+            venue = self.store.get_venue(record.venue_id) if record.venue_id else None
+            if record.venue_id and venue is None:
+                return ids, True
+            return self._venue_program_ids(venue)
+
+        if kind == "ice_slot":
+            rink = self.store.get_rink(record.rink_id) if record.rink_id else None
+            if record.rink_id and rink is None:
+                return ids, True
+            if rink is None:
+                return ids, saw_link
+            return self._setup_target_program_ids("rink", rink)
+
+        if kind == "organization":
+            # A facility Organization reaches the competition tree two ways: the
+            # Programs it OPERATES, and the Programs its Venues serve.
+            for program in self.store.all_programs():
+                if program.operator_organization_id == record.id:
+                    ids.add(program.id)
+                    saw_link = True
+            for venue in self.store.all_venues():
+                if venue.organization_id == record.id:
+                    venue_ids, venue_link = self._venue_program_ids(venue)
+                    ids |= venue_ids
+                    saw_link = saw_link or venue_link
+            return ids, saw_link
+
+        return ids, saw_link
+
+    def _setup_target_created_by(self, kind, record_id, user_id) -> bool:
+        """True when ``user_id`` is the recorded CREATOR of this record.
+
+        Reads the setup audit trail through ``_SETUP_CREATION_AUDIT_KEYS``,
+        matching the (action, entity_type) pair AND the entity id AND the actor
+        — see that map for why f"{kind}_created" alone is wrong and why the id
+        is what disambiguates the one overlapping pair. A falsy ``user_id``
+        (an unauthenticated or identity-less caller) owns nothing, ever."""
+        if not user_id:
+            return False
+        keys = self._SETUP_CREATION_AUDIT_KEYS.get(kind)
+        if not keys:
+            return False
+        for row in self.store.all_setup_audit():
+            if (row.entity_id == record_id
+                    and row.actor_id == user_id
+                    and (row.action, row.entity_type) in keys):
+                return True
+        return False
+
+    def setup_target_accessible(self, kind, record_id, user_id, role, scope):
+        """May this caller act on THIS setup record? True / False / None.
+
+        #369. The blocker this closes: an Arena Manager POSTed
+        ``/api/v2/setup/venue/<foreign-id>/delete`` for a Venue created by a
+        different account in a different Program. The route returned 200, echoed
+        the foreign record's own fields back (including its name — an
+        information leak on top of the write), deleted it, and wrote a
+        ``venue_deleted`` audit row. Nothing was wrong with the role gate: an
+        Arena Manager genuinely may delete Venues. What was missing is any check
+        of the TARGET. *Permission to use a setup capability is not authority
+        over every record in the installation.*
+
+        This is the ONE predicate every setup mutation that accepts an EXISTING
+        entity id routes through, so the rule cannot drift between v1 and v2, or
+        between delete / reassign / in-place edit. Callers must apply it BEFORE
+        calling the facade — i.e. before any lookup-derived field is serialized
+        into a response and before any save or audit row — and must refuse with
+        the facade's own byte-identical ``"<Label> <id> not found."`` wording, so
+        an inaccessible record is indistinguishable from a nonexistent one and
+        this never becomes an existence oracle. A falsy id is not this gate's
+        business; leave the facade's own validation error alone.
+
+        Rules, applied in order:
+
+        1. ``role is None`` → **None**, meaning "no user context was supplied,
+           do not gate". Returned rather than True so the caller can tell
+           "legacy identity-less call" from "authorized", and so no call site
+           can accidentally read a skipped gate as an approval. Very many
+           internal call sites, the demo/full seeds, and the acceptance
+           harnesses drive this facade with no identity at all; they must be
+           completely unaffected. This is NOT a bypass for synthetic actor
+           labels or for the seed — an identified caller with a real role is
+           gated no matter what its actor string looks like.
+
+        2. Resolve the caller's persisted active context via
+           ``resolve_with_league``. **A null Program fails CLOSED (False).**
+           No active Program means nothing has been validated to compare
+           against, so there is no record this caller may mutate. Failing open
+           here would reinstate the exact blocker for any account that has not
+           selected a context.
+
+        3. Look the record up. Missing → False, the same value an inaccessible
+           record gets, because the caller emits one generic not-found for both.
+
+        4. Compute the set of Program ids the record is LINKED to by walking its
+           chain (see ``_setup_target_program_ids``).
+
+        5. **Non-empty set → the record is LINKED: return whether the active
+           Program is in it.** Creator ownership deliberately does NOT apply
+           here. Permanent creator authority surviving Program linking was ruled
+           a blocker in its own right: whoever first typed a record in would keep
+           delete rights over it forever, across every Program it was later
+           bound into and every operator handover — an unrevokable, invisible
+           back door that no Program admin could see or remove. Once a record
+           joins a Program's chain, the chain is the sole authority.
+
+        6. **Empty set → the record is genuinely UNLINKED**, the pending-link
+           state a two-step setup flow legitimately passes through (create a
+           Venue, then grant a Season access to it). Only its authenticated
+           CREATOR may act on it, read from the setup audit trail. This is the
+           narrowest rule that keeps that flow working: without it the operator
+           could not finish, or even delete, the record they just made.
+
+        A record whose chain EXISTS but cannot be resolved (a dangling FK) is
+        treated as linked-and-unmatched → False, never as unlinked. Corrupting
+        data must not be a way into the permissive branch.
+
+        ``kind`` must be one of ``_SETUP_TARGET_KINDS`` (hyphens are folded to
+        underscores). Transport aliases — v1's "league" for a Program and
+        "level" for a League — MUST be translated by the caller; they are
+        rejected here rather than guessed, because guessing between the two
+        meanings of "league" is precisely the vocabulary trap that produced
+        this class of defect.
+        """
+        # -- rule 1: no identity → no gate ---------------------------------
+        if role is None:
+            return None
+
+        normalized = (kind or "").replace("-", "_")
+        if normalized not in self._SETUP_TARGET_KINDS:
+            return False                     # untranslated/unknown → fail closed
+
+        # -- rule 2: the persisted active context, failing closed ----------
+        program, _season, _league = self.context.resolve_with_league(
+            user_id, role, scope)
+        if program is None:
+            return False
+
+        # ONE read snapshot for the whole chain walk. Rules 5 and 6 branch on
+        # whether a set assembled from MANY separate reads is empty (an
+        # Organization alone walks all_programs + all_venues + one grant query
+        # per venue), so a torn read is a correctness question, not a cosmetic
+        # one. Plain `transaction()` would be READ COMMITTED on PostgreSQL —
+        # every statement re-snapshots — so the isolation is requested
+        # explicitly; on memory/SQLite it is a documented no-op because the
+        # process-wide lock already serializes the block.
+        #
+        # Requesting isolation is only legal on the OUTERMOST transaction, and
+        # reaching this line PROVES we are outermost: `resolve_with_league`
+        # above opens its own SERIALIZABLE transaction, which would already have
+        # raised had this call been nested inside one. So this can never add a
+        # failure mode the resolve did not hit first. READ-ONLY at REPEATABLE
+        # READ also cannot raise a serialization conflict, so no retry loop is
+        # needed here (unlike the context service's `_snapshot`).
+        with self.store.transaction(isolation="REPEATABLE READ"):
+            # -- rule 3: existence (indistinguishable from inaccessible) ---
+            record = self._setup_target_record(normalized, record_id)
+            if record is None:
+                return False
+
+            # -- rule 4: the record's Program chain ------------------------
+            program_ids, saw_link = self._setup_target_program_ids(
+                normalized, record)
+
+            # -- rule 5: LINKED → the chain decides, creator is irrelevant --
+            if program_ids:
+                return program.id in program_ids
+            if saw_link:
+                return False                 # linked but unresolvable → closed
+
+            # -- rule 6: genuinely UNLINKED → creator only -----------------
+            return self._setup_target_created_by(
+                normalized, record_id, user_id)
+
     # The permission each Setup workflow's own primary action needs (#330
     # review round 1 finding 1). Facilities is MANAGE_ARENA — the one
     # permission both League Admin and Arena Manager hold — like its own
