@@ -1028,9 +1028,21 @@ async function checkRoleScenarios(browser, viewport) {
       const regA = await post(`/api/v2/setup/seasons/${s1.id}/team-registrations`,
         { team_id: teamA.id, league_id: league.id, division_id: null });
       const s2 = await post("/api/v2/setup/season", { program_id: program.id, name: "S2" });
+      // The bootstrap registration lives in S2, and removing it targets a row
+      // whose Season is S2 -- Season is a real authorization axis now (#369
+      // prereq), so this must be done from inside S2 rather than from S1.
+      // Restored to S1 afterwards, which is the context the rest of this
+      // fixture and its caller expect.
+      await post("/api/context", { program_id: program.id, season_id: s2.id });
       const boot = await post(`/api/v2/setup/seasons/${s2.id}/team-registrations`,
         { team_id: teamA.id, league_id: league.id, division_id: null });
-      await post(`/api/v2/setup/season-team-registration/${boot.id}/remove`, {});
+      const removed = await post(
+        `/api/v2/setup/season-team-registration/${boot.id}/remove`, {});
+      if (!removed || removed.error) {
+        throw new Error("bootstrap registration remove did not succeed: "
+          + JSON.stringify(removed));
+      }
+      await post("/api/context", { program_id: program.id, season_id: s1.id });
       return { program: program.id, s1: s1.id, s2: s2.id, league: league.id,
         teamA: teamA.id, teamB: teamB.id, regA: regA.id };
     });

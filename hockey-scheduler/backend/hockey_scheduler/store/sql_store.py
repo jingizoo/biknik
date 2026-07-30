@@ -299,6 +299,15 @@ _DIALECT_PAIR = {"sqlite", "postgres"}
 # this whitelist is the injection guard — never format an arbitrary string in).
 _ISOLATION_LEVELS = frozenset({"SERIALIZABLE", "REPEATABLE READ"})
 
+# Strength order, so a NESTED transaction() can tell "I need at least X" from "I
+# need exactly X" (#369). A join cannot RAISE the isolation of an already-open
+# transaction — that is still a programming error — but joining one that is
+# already at least as strong SATISFIES the request, which is what lets an
+# outer guard adopt the strongest level any participant needs and then call the
+# inner services that each ask for their own. ``None`` is the driver default
+# (READ COMMITTED on PostgreSQL), the weakest rung.
+_ISOLATION_RANK = {None: 0, "REPEATABLE READ": 1, "SERIALIZABLE": 2}
+
 
 def _split_statements(raw):
     # Drop whole-line comments first (a comment may itself contain a ';', so it
@@ -504,6 +513,11 @@ class SqlStore:
         # atomic — e.g. the demo reset's reset_schema + full reseed — wrap many
         # @_transactional service calls in a single commit/rollback.
         self._txn_depth = 0
+        # Isolation the OPEN outermost transaction actually holds (#369), so a
+        # nested join can be admitted when what it asks for is already
+        # guaranteed and refused when it would need more. None outside a
+        # transaction, and outside one it is meaningless.
+        self._txn_isolation = None
         # Re-resolver for the no-row-lock parent-delete FK race (#201 Slice 3),
         # set by the service via set_dependent_conflict_resolver. Invoked by the
         # OUTERMOST transaction() only after rollback, so the itemised
@@ -540,18 +554,27 @@ class SqlStore:
         snapshot, never a global connection change — so all its reads observe a
         single consistent snapshot (used by the context selector so an
         authorization computation can't straddle a concurrent scope revocation,
-        #159). It must be requested on the OUTERMOST transaction (a nested join
-        cannot retro-raise the isolation of the already-open transaction). On
-        SQLite it is a no-op: the process-wide lock already serializes writers.
+        #159). A nested join can never RAISE the isolation of the already-open
+        transaction, so asking for MORE than is currently held is a programming
+        error and raises. Asking for the same level or LESS is satisfied by the
+        open transaction and simply joins it (#369): the atomic setup guard opens
+        one SERIALIZABLE transaction around an authorization computation that
+        itself asks for SERIALIZABLE (the context selector) and REPEATABLE READ
+        (the target chain walk), and both are already guaranteed by the outer
+        one. On SQLite it is a no-op: the process-wide lock already serializes
+        writers.
         """
         if isolation is not None and isolation not in _ISOLATION_LEVELS:
             raise ValueError(f"unsupported isolation level: {isolation!r}")
         with self._lock:
             if self._txn_depth > 0:  # already inside a transaction — just join it
-                if isolation is not None:
+                if (_ISOLATION_RANK[isolation]
+                        > _ISOLATION_RANK[self._txn_isolation]):
                     raise RuntimeError(
                         "transaction(isolation=...) must be the outermost "
-                        "transaction; a nested join cannot change isolation")
+                        "transaction; a nested join cannot raise the isolation "
+                        f"of the open one ({self._txn_isolation!r} < "
+                        f"{isolation!r})")
                 self._txn_depth += 1
                 try:
                     yield
@@ -559,6 +582,7 @@ class SqlStore:
                     self._txn_depth -= 1
                 return
             self._txn_depth = 1
+            self._txn_isolation = isolation
             try:
                 try:
                     if self.dialect.paramstyle == "pyformat":  # psycopg manages it
@@ -611,6 +635,7 @@ class SqlStore:
                     raise
             finally:
                 self._txn_depth = 0
+                self._txn_isolation = None
 
     def _enrich_jersey_conflict(self, exc) -> None:
         """Add the conflicting player to a rolled-back jersey conflict (#292).
@@ -967,6 +992,8 @@ class SqlStore:
 
     def add_game(self, game): return self._write_game(self._insert, game)
     def get_game(self, game_id): return self._get(Game, game_id)
+    def get_game_for_update(self, game_id):
+        return self._get_for_update(Game, game_id)
     def all_games(self): return self._query(Game, order="id")
     def save_game(self, game): return self._write_game(self._update, game)
     def delete_game(self, game_id):
@@ -1116,6 +1143,8 @@ class SqlStore:
     # LeagueSeason (#283): a permanent League's participation in one Season.
     def add_league_season(self, ls): return self._insert(ls)
     def get_league_season(self, ls_id): return self._get(LeagueSeason, ls_id)
+    def get_league_season_for_update(self, ls_id):
+        return self._get_for_update(LeagueSeason, ls_id)
     def all_league_seasons(self): return self._query(LeagueSeason, order="id")
     def save_league_season(self, ls): return self._update(ls)
     def delete_league_season(self, ls_id): self._delete(LeagueSeason, ls_id)
@@ -1130,6 +1159,8 @@ class SqlStore:
 
     def add_division(self, division): return self._insert(division)
     def get_division(self, division_id): return self._get(Division, division_id)
+    def get_division_for_update(self, division_id):
+        return self._get_for_update(Division, division_id)
     def all_divisions(self): return self._query(Division, order="id")
     def save_division(self, division): return self._update(division)
     def divisions_for_league_season(self, league_season_id):
@@ -1147,6 +1178,8 @@ class SqlStore:
     def add_season_team_registration(self, reg): return self._insert(reg)
     def get_season_team_registration(self, reg_id):
         return self._get(SeasonTeamRegistration, reg_id)
+    def get_season_team_registration_for_update(self, reg_id):
+        return self._get_for_update(SeasonTeamRegistration, reg_id)
     def save_season_team_registration(self, reg): return self._update(reg)
     def all_season_team_registrations(self):
         return self._query(SeasonTeamRegistration, order="id")
@@ -1219,6 +1252,8 @@ class SqlStore:
         return self._write_season_venue_access(self._insert, sva)
     def get_season_venue_access(self, sva_id):
         return self._get(SeasonVenueAccess, sva_id)
+    def get_season_venue_access_for_update(self, sva_id):
+        return self._get_for_update(SeasonVenueAccess, sva_id)
     def save_season_venue_access(self, sva):
         return self._write_season_venue_access(self._update, sva)
     def all_season_venue_access(self):
@@ -1243,6 +1278,8 @@ class SqlStore:
 
     def add_organization(self, org): return self._insert(org)
     def get_organization(self, org_id): return self._get(Organization, org_id)
+    def get_organization_for_update(self, org_id):
+        return self._get_for_update(Organization, org_id)
     def all_organizations(self): return self._query(Organization, order="id")
     def save_organization(self, org): return self._update(org)
 
@@ -1286,6 +1323,8 @@ class SqlStore:
 
     def add_venue(self, venue): return self._write_venue(self._insert, venue)
     def get_venue(self, venue_id): return self._get(Venue, venue_id)
+    def get_venue_for_update(self, venue_id):
+        return self._get_for_update(Venue, venue_id)
     def all_venues(self): return self._query(Venue, order="id")
     def save_venue(self, venue): return self._write_venue(self._update, venue)
 
@@ -1339,6 +1378,8 @@ class SqlStore:
 
     def add_ice_slot(self, slot): return self._write_ice_slot(self._insert, slot)
     def get_ice_slot(self, slot_id): return self._get(IceSlot, slot_id)
+    def get_ice_slot_for_update(self, slot_id):
+        return self._get_for_update(IceSlot, slot_id)
     def all_ice_slots(self): return self._query(IceSlot, order="id")
     def save_ice_slot(self, slot): return self._write_ice_slot(self._update, slot)
 

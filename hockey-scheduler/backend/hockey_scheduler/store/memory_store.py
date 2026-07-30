@@ -301,6 +301,12 @@ class InMemoryStore:
         self.games[game.id] = game
         return game
 
+    def get_game_for_update(self, game_id: str) -> Optional[Game]:
+        # #369 row-lock parity with SqlStore's SELECT ... FOR UPDATE:
+        # transaction() holds self._lock for its whole body here, so a
+        # plain read already serializes against every concurrent writer.
+        return self.games.get(game_id)
+
     def get_game(self, game_id: str) -> Optional[Game]:
         return self.games.get(game_id)
 
@@ -432,6 +438,13 @@ class InMemoryStore:
         self.league_seasons[ls.id] = ls
         return ls
 
+    def get_league_season_for_update(
+            self, ls_id: str) -> Optional[LeagueSeason]:
+        # #369 row-lock parity with SqlStore's SELECT ... FOR UPDATE:
+        # transaction() holds self._lock for its whole body here, so a
+        # plain read already serializes against every concurrent writer.
+        return self.league_seasons.get(ls_id)
+
     def get_league_season(self, ls_id: str) -> Optional[LeagueSeason]:
         return self.league_seasons.get(ls_id)
 
@@ -462,6 +475,13 @@ class InMemoryStore:
     def add_division(self, division: Division) -> Division:
         self.divisions[division.id] = division
         return division
+
+    def get_division_for_update(
+            self, division_id: str) -> Optional[Division]:
+        # #369 row-lock parity with SqlStore's SELECT ... FOR UPDATE:
+        # transaction() holds self._lock for its whole body here, so a
+        # plain read already serializes against every concurrent writer.
+        return self.divisions.get(division_id)
 
     def get_division(self, division_id: str) -> Optional[Division]:
         return self.divisions.get(division_id)
@@ -512,6 +532,13 @@ class InMemoryStore:
             self, reg: SeasonTeamRegistration) -> SeasonTeamRegistration:
         self.season_team_registrations[reg.id] = reg
         return reg
+
+    def get_season_team_registration_for_update(
+            self, reg_id: str) -> Optional[SeasonTeamRegistration]:
+        # #369 row-lock parity with SqlStore's SELECT ... FOR UPDATE:
+        # transaction() holds self._lock for its whole body here, so a
+        # plain read already serializes against every concurrent writer.
+        return self.season_team_registrations.get(reg_id)
 
     def get_season_team_registration(
             self, reg_id: str) -> Optional[SeasonTeamRegistration]:
@@ -592,6 +619,13 @@ class InMemoryStore:
         self.season_venue_access[sva.id] = sva
         return sva
 
+    def get_season_venue_access_for_update(
+            self, sva_id: str) -> Optional[SeasonVenueAccess]:
+        # #369 row-lock parity with SqlStore's SELECT ... FOR UPDATE:
+        # transaction() holds self._lock for its whole body here, so a
+        # plain read already serializes against every concurrent writer.
+        return self.season_venue_access.get(sva_id)
+
     def get_season_venue_access(
             self, sva_id: str) -> Optional[SeasonVenueAccess]:
         return self.season_venue_access.get(sva_id)
@@ -623,12 +657,25 @@ class InMemoryStore:
         self.organizations[org.id] = org
         return org
 
+    def get_organization_for_update(
+            self, org_id: str) -> Optional[Organization]:
+        # #369 row-lock parity with SqlStore's SELECT ... FOR UPDATE:
+        # transaction() holds self._lock for its whole body here, so a
+        # plain read already serializes against every concurrent writer.
+        return self.organizations.get(org_id)
+
     def get_organization(self, org_id: str) -> Optional[Organization]:
         return self.organizations.get(org_id)
 
     def add_venue(self, venue: Venue) -> Venue:
         self.venues[venue.id] = venue
         return venue
+
+    def get_venue_for_update(self, venue_id: str) -> Optional[Venue]:
+        # #369 row-lock parity with SqlStore's SELECT ... FOR UPDATE:
+        # transaction() holds self._lock for its whole body here, so a
+        # plain read already serializes against every concurrent writer.
+        return self.venues.get(venue_id)
 
     def get_venue(self, venue_id: str) -> Optional[Venue]:
         return self.venues.get(venue_id)
@@ -673,6 +720,12 @@ class InMemoryStore:
             (p for p in self.scheduling_policies.values()
              if getattr(p.scope_type, "value", p.scope_type) == scope_type
              and p.scope_id == scope_id), None)
+
+    def get_ice_slot_for_update(self, slot_id: str) -> Optional[IceSlot]:
+        # #369 row-lock parity with SqlStore's SELECT ... FOR UPDATE:
+        # transaction() holds self._lock for its whole body here, so a
+        # plain read already serializes against every concurrent writer.
+        return self.ice_slots.get(slot_id)
 
     def get_ice_slot(self, slot_id: str) -> Optional[IceSlot]:
         return self.ice_slots.get(slot_id)

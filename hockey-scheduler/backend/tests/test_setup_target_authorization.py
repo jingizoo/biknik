@@ -43,6 +43,17 @@ record resolves to a Program that is not the active one) and says so at the
 call site. The write behaviour is asserted in full; nothing else is weakened to
 compensate, and no read scoping is added on this branch.
 
+PART 1b and PART 2b cover the OTHER TWO AXES (#369 re-review). The first cut
+of this gate resolved all three and then discarded Season and League, judging
+every record by its Program alone: with Program P / Season S / League A
+persisted, ``POST /api/v2/setup/player/<League-B-player>/update`` returned 200
+and renamed a Player in a League the caller had not selected, and the identical
+construction let a Season-A caller mutate Season-B rows. Those parts hold the
+Program CONSTANT and vary exactly one of the other two axes, so no assertion in
+them can be satisfied by the Program ceiling, and each asserts -- from the
+stored rows, through ``chain_axes`` -- that its victim differs from the
+selection in that one axis and nothing else.
+
 The facility-tree EXCEPTION is covered explicitly, because it is the one
 deviation from the rule above: ``setup_venue_grantable`` governs ONLY the Venue
 argument of ``POST /api/v2/setup/seasons/<id>/venue-access``, since an arena
@@ -98,7 +109,7 @@ def _slot_times(offset_hours=0):
 # The Program chain, recomputed INDEPENDENTLY of the code under test.
 #
 # Every refusal in this file asserts its precondition through this function
-# rather than through ``ApiService._setup_target_program_ids``. If the
+# rather than through ``ApiService._setup_target_edges``. If the
 # precondition were read out of the same helper the guard uses, a bug that
 # collapsed the chain to the empty set would make both the guard and its own
 # precondition agree, and the test would pass while the product leaked.
@@ -214,6 +225,164 @@ def chain_programs(store, kind, record_id):
             return set()
         return chain_programs(store, "season", row.season_id)
     raise AssertionError(f"chain_programs has no rule for kind {kind!r}")
+
+
+# --------------------------------------------------------------------------
+# The full LINK TRIPLE, recomputed INDEPENDENTLY of the code under test.
+#
+# ``chain_programs`` above answers only the Program axis, which is exactly the
+# question the first cut of #369 mistook for the whole one: it resolved all
+# three axes and then discarded Season and League, so a League-B Player in the
+# caller's OWN Program answered 200 to an update. This function returns every
+# ``(program, season, league)`` link the STORED ROWS say a record carries, so
+# each axis negative below can assert its own precondition -- "the same
+# Program, the same Season, a different League" -- rather than trusting the
+# predicate it is about to measure.
+# --------------------------------------------------------------------------
+def chain_axes(store, kind, record_id):
+    """Every ``(program_id, season_id | None, league_id | None)`` link this
+    record carries, derived from the stored rows only.
+
+    A ``None`` component means the link genuinely names no such axis -- a
+    permanent League has no Season, the facility tree has no League -- never
+    "unknown" and never "any". The Program component of every triple agrees
+    with ``chain_programs`` by construction; the other two are what this file's
+    axis negatives are about."""
+    kind = kind.replace("-", "_")
+
+    if kind == "program":
+        return {(record_id, None, None)} if store.get_program(record_id) else set()
+    if kind == "season":
+        season = store.get_season(record_id)
+        if season is None or not season.program_id:
+            return set()
+        return {(season.program_id, season.id, None)}
+    if kind == "league":
+        # PERMANENT: a League outlives the Seasons it plays in, so it names no
+        # Season of its own -- its per-Season participation is a LeagueSeason.
+        league = store.get_league(record_id)
+        if league is None or not league.program_id:
+            return set()
+        return {(league.program_id, None, league.id)}
+    if kind == "league_season":
+        ls = store.get_league_season(record_id)
+        if ls is None:
+            return set()
+        season = store.get_season(ls.season_id)
+        if season is None or not season.program_id:
+            return set()
+        return {(season.program_id, season.id, ls.league_id or None)}
+    if kind == "division":
+        division = store.get_division(record_id)
+        if division is None:
+            return set()
+        return chain_axes(store, "league_season", division.league_season_id)
+    if kind == "team":
+        # PERMANENT too: a Team's Season participation is its registration, not
+        # the Team row, so a Team carries a League and no Season.
+        team = store.get_team(record_id)
+        if team is None:
+            return set()
+        if team.program_id:
+            return {(team.program_id, None, team.league_id or None)}
+        if team.league_id:
+            league = store.get_league(team.league_id)
+            if league is not None and league.program_id:
+                return {(league.program_id, None, team.league_id)}
+        return set()
+    if kind == "player":
+        player = store.get_player(record_id)
+        if player is None or not player.team_id:
+            return set()
+        return chain_axes(store, "team", player.team_id)
+    if kind == "game":
+        game = store.get_game(record_id)
+        if game is None:
+            return set()
+        league_id = game.league_id or None
+        if league_id is None and getattr(game, "league_season_id", None):
+            ls = store.get_league_season(game.league_season_id)
+            league_id = ls.league_id if ls is not None else None
+        if league_id is None and game.division_id:
+            division = store.get_division(game.division_id)
+            ls = (store.get_league_season(division.league_season_id)
+                  if division is not None else None)
+            league_id = ls.league_id if ls is not None else None
+        if game.season_id:
+            season = store.get_season(game.season_id)
+            if season is None or not season.program_id:
+                return set()
+            return {(season.program_id, season.id, league_id)}
+        if game.league_id:
+            league = store.get_league(game.league_id)
+            if league is None or not league.program_id:
+                return set()
+            return {(league.program_id, None, game.league_id)}
+        if game.division_id:
+            return chain_axes(store, "division", game.division_id)
+        return set()
+    if kind == "club":
+        axes = set()
+        for team in store.all_teams():
+            if team.club_id == record_id:
+                axes |= chain_axes(store, "team", team.id)
+        return axes
+    if kind == "official":
+        official = store.get_official(record_id)
+        if official is None:
+            return set()
+        axes = set()
+        if official.home_club_id:
+            axes |= chain_axes(store, "club", official.home_club_id)
+        for assignment in store.assignments_for_official(record_id):
+            axes |= chain_axes(store, "game", assignment.game_id)
+        return axes
+    if kind == "venue":
+        # The facility tree reaches the competition tree ONLY through
+        # SeasonVenueAccess, which names a Season and never a League. The legacy
+        # ``Venue.league_id`` holds a PROGRAM id and names no Season.
+        venue = store.get_venue(record_id)
+        if venue is None:
+            return set()
+        axes = set()
+        for grant in store.season_venue_access_for_venue(record_id):
+            season = store.get_season(grant.season_id)
+            if season is not None and season.program_id:
+                axes.add((season.program_id, season.id, None))
+        if venue.league_id:
+            axes.add((venue.league_id, None, None))
+        return axes
+    if kind == "rink":
+        rink = store.get_rink(record_id)
+        if rink is None or not rink.venue_id:
+            return set()
+        return chain_axes(store, "venue", rink.venue_id)
+    if kind == "ice_slot":
+        slot = store.get_ice_slot(record_id)
+        if slot is None or not slot.rink_id:
+            return set()
+        return chain_axes(store, "rink", slot.rink_id)
+    if kind == "organization":
+        axes = set()
+        for program in store.all_programs():
+            if program.operator_organization_id == record_id:
+                axes.add((program.id, None, None))
+        for venue in store.all_venues():
+            if venue.organization_id == record_id:
+                axes |= chain_axes(store, "venue", venue.id)
+        return axes
+    # The two bridge rows are judged by the parent that names their axes.
+    if kind == "registration":
+        row = store.get_season_team_registration(record_id)
+        if row is None:
+            return set()
+        return chain_axes(store, "league_season", row.league_season_id)
+    if kind == "season_venue_access":
+        row = store.get_season_venue_access(record_id)
+        if row is None:
+            return set()
+        return chain_axes(store, "season", row.season_id)
+    raise AssertionError(f"chain_axes has no rule for kind {kind!r}")
 
 
 def created_by(store, kind, record_id):
@@ -351,12 +520,24 @@ class SetupTargetPredicateParityTest(unittest.TestCase):
 
                 for kind in _KINDS:
                     target_a, target_b = world_a[kind], world_b[kind]
-                    # The active Program for a record is its own world's
-                    # Program -- except for a Program, which IS its own scope.
-                    scope_a = (target_a if kind == "program"
-                               else world_a["program"])
-                    scope_b = (target_b if kind == "program"
-                               else world_b["program"])
+                    # The active context for a record is its own world's
+                    # Program AND Season (#369 re-review). Program-only is no
+                    # longer sufficient: a Season-bound row -- the Season
+                    # itself, its LeagueSeason, Division, Game, registration or
+                    # venue grant -- fails CLOSED when nothing has been
+                    # validated to compare its Season against. Each world has
+                    # exactly one Season, so this is the world's own context and
+                    # nothing is widened; the kinds that are not Season-bound
+                    # (Program, League, Team, Player, Club, Official and the
+                    # whole facility tree) are unaffected by it.
+                    #
+                    # No League is selected here on purpose: the two-League
+                    # negatives live in their own test below, and "No League"
+                    # is the approved Program + active-Season union, so it
+                    # leaves this matrix measuring exactly the Program axis it
+                    # was written to measure.
+                    scope_a = (world_a["program"], world_a["season"])
+                    scope_b = (world_b["program"], world_b["season"])
 
                     # -- PRECONDITION, recomputed from the store --------------
                     # #369 note: the owner's repro states this precondition as
@@ -382,7 +563,7 @@ class SetupTargetPredicateParityTest(unittest.TestCase):
                         f"the attacker CREATED the record it is attacking, so "
                         f"a positive could come from creator ownership")
 
-                    api.set_active_context(*attacker, scope_b, None)
+                    api.set_active_context(*attacker, *scope_b)
 
                     # -- positive: the target inside the ACTIVE Program -------
                     self.assertIs(
@@ -403,14 +584,14 @@ class SetupTargetPredicateParityTest(unittest.TestCase):
                         f"[{backend}/{kind}] a nonexistent id did not fail "
                         f"closed")
                     # -- context switch: the same record, the other Program ---
-                    api.set_active_context(*attacker, scope_a, None)
+                    api.set_active_context(*attacker, *scope_a)
                     self.assertIs(
                         api.setup_target_accessible(kind, target_a, *attacker),
                         True,
                         f"[{backend}/{kind}] switching to the record's OWN "
                         f"Program did not make it accessible -- the refusal "
                         f"was a blanket block, not a scope decision")
-                    api.set_active_context(*attacker, scope_b, None)
+                    api.set_active_context(*attacker, *scope_b)
 
                 # The owner's world is unaffected by any of the above: a
                 # refusal is a read-only decision.
@@ -472,7 +653,8 @@ class SetupTargetPredicateParityTest(unittest.TestCase):
                 api = ApiService(store)
                 _owner, attacker = self._identities(api)
                 world_a = _facade_world(api, store, "A", self.OWNER)
-                api.set_active_context(*attacker, world_a["program"], None)
+                api.set_active_context(*attacker, world_a["program"],
+                                       world_a["season"])
                 # "level" is v1 for the competition League; the League record
                 # here IS accessible under its canonical kind, so a False for
                 # "level" is the untranslated-kind refusal and nothing else.
@@ -500,8 +682,10 @@ class SetupTargetPredicateParityTest(unittest.TestCase):
                 owner, attacker = self._identities(api)
                 world_a = _facade_world(api, store, "A", self.OWNER)
                 world_b = _facade_world(api, store, "B", self.ATTACKER)
-                api.set_active_context(*owner, world_a["program"], None)
-                api.set_active_context(*attacker, world_b["program"], None)
+                api.set_active_context(*owner, world_a["program"],
+                                       world_a["season"])
+                api.set_active_context(*attacker, world_b["program"],
+                                       world_b["season"])
 
                 draft = api.create_venue("TA Pending Venue", "", "UTC", None,
                                          None, self.OWNER)
@@ -551,7 +735,8 @@ class SetupTargetPredicateParityTest(unittest.TestCase):
                 owner, attacker = self._identities(api)
                 world_a = _facade_world(api, store, "A", self.OWNER)
                 world_b = _facade_world(api, store, "B", self.ATTACKER)
-                api.set_active_context(*attacker, world_b["program"], None)
+                api.set_active_context(*attacker, world_b["program"],
+                                       world_b["season"])
 
                 shared = api.create_venue("TA Revoked Venue", "", "UTC", None,
                                           None, self.ATTACKER)
@@ -578,7 +763,8 @@ class SetupTargetPredicateParityTest(unittest.TestCase):
                 api = ApiService(store)
                 _owner, attacker = self._identities(api)
                 world_b = _facade_world(api, store, "B", self.ATTACKER)
-                api.set_active_context(*attacker, world_b["program"], None)
+                api.set_active_context(*attacker, world_b["program"],
+                                       world_b["season"])
 
                 orphan = api.create_team(None, None, "TA Orphan Team",
                                          self.ATTACKER,
@@ -620,8 +806,10 @@ class VenueGrantablePredicateTest(unittest.TestCase):
         attacker = (self.ATTACKER, Role.LEAGUE_ADMIN, {})
         world_a = _facade_world(api, store, "A", self.OWNER)
         world_b = _facade_world(api, store, "B", self.ATTACKER)
-        api.set_active_context(*owner, world_a["program"], None)
-        api.set_active_context(*attacker, world_b["program"], None)
+        api.set_active_context(*owner, world_a["program"],
+                               world_a["season"])
+        api.set_active_context(*attacker, world_b["program"],
+                               world_b["season"])
         return api, owner, attacker, world_a, world_b
 
     def test_an_established_arena_is_shared_across_programs(self):
@@ -717,6 +905,431 @@ class VenueGrantablePredicateTest(unittest.TestCase):
                     api.setup_venue_grantable(world_a["venue"], None, None,
                                               None),
                     f"[{backend}] an identity-less caller must not be gated")
+                _close(store)
+
+
+# ==========================================================================
+# PART 1b — the SEASON and LEAGUE axes at the predicate, on every store.
+#
+# Part 1 varies the PROGRAM and holds everything else fixed, which is exactly
+# the blind spot the re-review found: the gate resolved all three axes and then
+# authorized on the Program alone, so a same-Program record in another League
+# or another Season sailed through. Everything below therefore holds the
+# Program CONSTANT and varies exactly one of the other two axes, so a refusal
+# can only be about the axis under test -- the Program ceiling provably cannot
+# explain any of it.
+# ==========================================================================
+
+#: The two Seasons and the two Leagues every fixture in this part is built
+#: from. Both Leagues are bound to BOTH Seasons, so "switch the League" and
+#: "switch the Season" are each a single, legal context move -- a fixture where
+#: League B existed only in Season B would make every negative ambiguous
+#: between the two axes.
+_AXIS_KEYS = ("A", "B")
+
+
+def _axis_world(api, store, actor):
+    """ONE Program, TWO Seasons, TWO Leagues, all four bindings, and one record
+    of every applicable kind at each corner.
+
+    Returns a dict whose League-keyed entries are ``{league_key: id}``,
+    Season-keyed entries ``{season_key: id}`` and corner-keyed entries
+    ``{(league_key, season_key): id}``.
+
+    The Venues here are deliberately built the OPPOSITE way round from Part 1's:
+    no legacy ``Venue.league_id`` at all, only a SeasonVenueAccess grant. The
+    legacy bridge holds a PROGRAM id and names no Season, so a Venue carrying
+    one is not Season-bound and could never demonstrate the facility tree's
+    Season axis -- it would pass these tests with the Season comparison
+    deleted."""
+    program = api.create_program("AX Program", "US", "UTC", None, actor)
+    world = {"program": program["id"], "season": {}, "league": {},
+             "league_season": {}, "division": {}, "team": {}, "player": {},
+             "club": {}, "official": {}, "game": {}, "registration": {},
+             "venue": {}, "rink": {}, "ice_slot": {},
+             "season_venue_access": {}}
+    for key in _AXIS_KEYS:
+        world["season"][key] = api.create_season(
+            program["id"], f"AX Season {key}", actor_id=actor)["id"]
+    for key in _AXIS_KEYS:
+        league = api.create_league(world["season"]["A"], f"AX League {key}",
+                                   0, actor)
+        world["league"][key] = league["id"]
+        # Bind the same PERMANENT League to Season B as well. There is no HTTP
+        # route for binding an existing League to a further Season (only
+        # `create_league`, which mints a new one), so the setup service is
+        # called directly -- a fixture step, exactly like the injected draft
+        # Game below.
+        api.setup.create_league_season(league["id"], world["season"]["B"],
+                                       actor)
+    for lk in _AXIS_KEYS:
+        world["club"][lk] = api.create_club(f"AX Club {lk}", "", actor)["id"]
+        world["team"][lk] = api.create_team(
+            world["club"][lk], None, f"AX Team {lk}", actor,
+            league_id=world["league"][lk])["id"]
+        world["player"][lk] = api.create_player(
+            world["team"][lk], f"AX Player {lk}", "forward", None, None, None,
+            True, actor)["id"]
+        world["official"][lk] = api.create_official(
+            f"AX Official {lk}", world["club"][lk], actor)["id"]
+    for sk in _AXIS_KEYS:
+        # A Venue linked ONLY by a grant: its whole chain is (Program, Season).
+        venue = api.create_venue(f"AX Venue {sk}", "", "UTC", None, None,
+                                 actor)
+        grant = api.grant_season_venue_access(world["season"][sk],
+                                              venue["id"], actor)
+        rink = api.create_rink(venue["id"], f"AX Rink {sk}", actor)
+        start, end = _slot_times(30 if sk == "A" else 40)
+        slot = api.create_ice_slot(rink["id"], start, end, "game", actor)
+        world["venue"][sk] = venue["id"]
+        world["season_venue_access"][sk] = grant["id"]
+        world["rink"][sk] = rink["id"]
+        world["ice_slot"][sk] = slot["id"]
+    from hockey_scheduler.domain.models import Game
+    for lk in _AXIS_KEYS:
+        for sk in _AXIS_KEYS:
+            binding = store.league_season_for(world["league"][lk],
+                                              world["season"][sk])
+            assert binding is not None, ("fixture: both Leagues must be bound "
+                                         "to both Seasons", lk, sk)
+            world["league_season"][(lk, sk)] = binding.id
+            world["division"][(lk, sk)] = api.create_division_v2(
+                world["league"][lk], f"AX Div {lk}{sk}", "", actor,
+                season_id=world["season"][sk])["id"]
+            world["registration"][(lk, sk)] = api.register_team_for_season(
+                world["season"][sk], world["team"][lk], None, actor,
+                league_id=world["league"][lk])["id"]
+            game = Game(id=store.next_id("game"),
+                        home_team_id=world["team"][lk],
+                        start_time=_FUTURE, season_id=world["season"][sk],
+                        league_id=world["league"][lk], is_draft=True,
+                        game_type="exhibition")
+            store.add_game(game)
+            api.setup._audit("game_created", "game", game.id, actor, None)
+            world["game"][(lk, sk)] = game.id
+    for name, value in world.items():
+        if isinstance(value, dict):
+            for key, rid in value.items():
+                assert isinstance(rid, str) and rid, (name, key, rid)
+    return world
+
+
+#: (kind, corner-picker) for every kind whose chain really names a LEAGUE.
+#: The picker takes ``(world, league_key)`` and returns the record for that
+#: League in Season A, so the two records differ in the League and NOTHING
+#: else.
+_LEAGUE_BOUND = (
+    ("league", lambda w, lk: w["league"][lk]),
+    ("league_season", lambda w, lk: w["league_season"][(lk, "A")]),
+    ("division", lambda w, lk: w["division"][(lk, "A")]),
+    ("team", lambda w, lk: w["team"][lk]),
+    ("player", lambda w, lk: w["player"][lk]),
+    ("club", lambda w, lk: w["club"][lk]),
+    ("official", lambda w, lk: w["official"][lk]),
+    ("game", lambda w, lk: w["game"][(lk, "A")]),
+)
+
+#: (kind, corner-picker) for every kind whose chain really names a SEASON.
+#: The picker takes ``(world, season_key)``; where the kind also carries a
+#: League it is always League A, so the two records differ in the Season and
+#: NOTHING else. The facility tree is here because SeasonVenueAccess is a real
+#: Season link -- and it is NOT in the League table above, because the facility
+#: tree has no League axis and none is invented for it.
+_SEASON_BOUND = (
+    ("season", lambda w, sk: w["season"][sk]),
+    ("league_season", lambda w, sk: w["league_season"][("A", sk)]),
+    ("division", lambda w, sk: w["division"][("A", sk)]),
+    ("game", lambda w, sk: w["game"][("A", sk)]),
+    ("venue", lambda w, sk: w["venue"][sk]),
+    ("rink", lambda w, sk: w["rink"][sk]),
+    ("ice_slot", lambda w, sk: w["ice_slot"][sk]),
+)
+
+#: Kinds that carry NO Season axis at all, used by the Program-only test: they
+#: must stay reachable from a Program-only context, or a brand-new Program with
+#: no Season selected becomes unmanageable.
+_SEASON_FREE = ("program", "league", "team", "player", "club", "official")
+
+
+class SetupTargetAxisParityTest(unittest.TestCase):
+    """The persisted tuple is Program AND Season AND League (#369 re-review).
+
+    The reported blocker, verbatim: "``setup_target_accessible()`` resolves all
+    three axes, discards ``_season`` and ``_league``, reduces every record to
+    Program ids, then authorizes on ``program.id in program_ids``. With Program
+    P / Season S / League A persisted, ``POST
+    /api/v2/setup/player/<League-B-player>/update`` returned 200, renamed the
+    League-B Player, and persisted the change; a nonexistent Player returned
+    404. Both Players were in the same Program."
+
+    Every fixture below is inside ONE Program, so no assertion here can be
+    satisfied by the Program ceiling. The caller created nothing, so no
+    positive can be creator ownership."""
+
+    OWNER = "user_axis_owner"
+    CALLER = "user_axis_caller"
+
+    def _fixture(self, store):
+        api = ApiService(store)
+        caller = (self.CALLER, Role.LEAGUE_ADMIN, {})
+        world = _axis_world(api, store, self.OWNER)
+        return api, caller, world
+
+    def _assert_only_the_league_differs(self, store, kind, victim, world,
+                                        backend):
+        """Precondition: this record is in the caller's OWN Program and OWN
+        Season, and differs from the selection in the LEAGUE alone."""
+        axes = chain_axes(store, kind, victim)
+        self.assertTrue(
+            axes,
+            f"[{backend}/{kind}] fixture is not distinguishable: the victim "
+            f"has no chain at all, so refusing it would prove nothing")
+        self.assertEqual(
+            {t[0] for t in axes}, {world["program"]},
+            f"[{backend}/{kind}] fixture is not distinguishable: the victim is "
+            f"not in the caller's own Program, so the PROGRAM ceiling alone "
+            f"could explain the refusal")
+        self.assertEqual(
+            {t[2] for t in axes}, {world["league"]["B"]},
+            f"[{backend}/{kind}] fixture is not distinguishable: the victim's "
+            f"League is not exactly the unselected League B")
+        self.assertLessEqual(
+            {t[1] for t in axes} - {None}, {world["season"]["A"]},
+            f"[{backend}/{kind}] fixture is not distinguishable: the victim "
+            f"names a Season other than the selected one, so the SEASON axis "
+            f"could explain the refusal instead of the League")
+
+    def _assert_only_the_season_differs(self, store, kind, victim, world,
+                                        backend):
+        axes = chain_axes(store, kind, victim)
+        self.assertTrue(
+            axes,
+            f"[{backend}/{kind}] fixture is not distinguishable: the victim "
+            f"has no chain at all")
+        self.assertEqual(
+            {t[0] for t in axes}, {world["program"]},
+            f"[{backend}/{kind}] fixture is not distinguishable: the victim is "
+            f"not in the caller's own Program")
+        self.assertEqual(
+            {t[1] for t in axes}, {world["season"]["B"]},
+            f"[{backend}/{kind}] fixture is not distinguishable: the victim's "
+            f"Season is not exactly the unselected Season B")
+        # The League axis provably cannot explain these refusals: they are all
+        # driven with NO League selected, which is the approved Program +
+        # active-Season union and compares no League at all.
+
+    def test_league_axis_negative_for_every_league_bound_kind(self):
+        """At League A, a League-B record in the SAME Program and the SAME
+        Season is refused -- and selecting League B makes the very same call on
+        the very same record succeed."""
+        for backend, store in _backends():
+            with self.subTest(backend=backend):
+                api, caller, w = self._fixture(store)
+                program, season_a = w["program"], w["season"]["A"]
+                for kind, pick in _LEAGUE_BOUND:
+                    mine, victim = pick(w, "A"), pick(w, "B")
+                    self._assert_only_the_league_differs(
+                        store, kind, victim, w, backend)
+                    self.assertNotIn(
+                        self.CALLER, created_by(store, kind, victim),
+                        f"[{backend}/{kind}] fixture: the caller created the "
+                        f"record it is attacking")
+
+                    api.set_active_context(*caller, program, season_a,
+                                           w["league"]["A"])
+                    self.assertIs(
+                        api.setup_target_accessible(kind, mine, *caller), True,
+                        f"[{backend}/{kind}] the caller's OWN League's record "
+                        f"was refused -- a blanket block, not a scope decision")
+                    self.assertIs(
+                        api.setup_target_accessible(kind, victim, *caller),
+                        False,
+                        f"[{backend}/{kind}] THE BLOCKER: a League-B record "
+                        f"was authorized while League A was persisted. Same "
+                        f"Program, same Season -- only the League differs, and "
+                        f"the League was discarded")
+                    self.assertIs(
+                        api.setup_target_accessible(
+                            kind, f"{kind}_ax_absent", *caller), False,
+                        f"[{backend}/{kind}] a nonexistent id did not fail "
+                        f"closed")
+
+                    # Switching the EXACT missing axis, and nothing else.
+                    api.set_active_context(*caller, program, season_a,
+                                           w["league"]["B"])
+                    self.assertIs(
+                        api.setup_target_accessible(kind, victim, *caller),
+                        True,
+                        f"[{backend}/{kind}] selecting the record's own League "
+                        f"did not make it accessible -- the refusal was a "
+                        f"blanket block rather than a League decision")
+                _close(store)
+
+    def test_season_axis_negative_for_every_season_bound_kind(self):
+        """At Season A (and NO League, so the League axis provably plays no
+        part), a Season-B record in the SAME Program is refused -- and
+        selecting Season B makes the same call succeed."""
+        for backend, store in _backends():
+            with self.subTest(backend=backend):
+                api, caller, w = self._fixture(store)
+                program = w["program"]
+                for kind, pick in _SEASON_BOUND:
+                    mine, victim = pick(w, "A"), pick(w, "B")
+                    self._assert_only_the_season_differs(
+                        store, kind, victim, w, backend)
+
+                    api.set_active_context(*caller, program, w["season"]["A"],
+                                           None)
+                    self.assertIs(
+                        api.setup_target_accessible(kind, mine, *caller), True,
+                        f"[{backend}/{kind}] the caller's OWN Season's record "
+                        f"was refused")
+                    self.assertIs(
+                        api.setup_target_accessible(kind, victim, *caller),
+                        False,
+                        f"[{backend}/{kind}] a Season-B record was authorized "
+                        f"while Season A was persisted. Same Program -- only "
+                        f"the Season differs, and the Season was discarded")
+
+                    api.set_active_context(*caller, program, w["season"]["B"],
+                                           None)
+                    self.assertIs(
+                        api.setup_target_accessible(kind, victim, *caller),
+                        True,
+                        f"[{backend}/{kind}] selecting the record's own Season "
+                        f"did not make it accessible")
+                _close(store)
+
+    def test_no_league_is_the_program_plus_active_season_union(self):
+        """Explicit "No League" is a first-class selection meaning the approved
+        Program + ACTIVE-SEASON union: every League inside that already
+        validated Program/Season, and nothing outside it.
+
+        Both halves matter. Permitting nothing would make No League a dead
+        context (it is the state every operator starts in). Permitting
+        everything would make it a way to opt out of the Season ceiling."""
+        for backend, store in _backends():
+            with self.subTest(backend=backend):
+                api, caller, w = self._fixture(store)
+                api.set_active_context(*caller, w["program"],
+                                       w["season"]["A"], None)
+                self.assertIsNone(
+                    api.context.resolve_with_league(*caller)[2],
+                    f"[{backend}] fixture: no League may be resolved, or this "
+                    f"is not the No-League state at all")
+
+                # -- the UNION half: every League inside the active Season ---
+                for kind, pick in _LEAGUE_BOUND:
+                    for lk in _AXIS_KEYS:
+                        self.assertIs(
+                            api.setup_target_accessible(kind, pick(w, lk),
+                                                        *caller), True,
+                            f"[{backend}/{kind}] No League refused League {lk} "
+                            f"inside the active Season -- No League is not the "
+                            f"union it is defined to be")
+
+                # -- the ONLY half: nothing outside the active Season --------
+                for kind, pick in _SEASON_BOUND:
+                    self.assertIs(
+                        api.setup_target_accessible(kind, pick(w, "B"),
+                                                    *caller), False,
+                        f"[{backend}/{kind}] No League reached OUTSIDE the "
+                        f"active Season -- selecting no League became a way "
+                        f"to opt out of the Season ceiling")
+                # ...including a League-bound row that lives in Season B, which
+                # is the exact combination "any League" would wave through.
+                for kind, corner in (("league_season", "league_season"),
+                                     ("division", "division"),
+                                     ("game", "game")):
+                    for lk in _AXIS_KEYS:
+                        self.assertIs(
+                            api.setup_target_accessible(
+                                kind, w[corner][(lk, "B")], *caller), False,
+                            f"[{backend}/{kind}] a League-{lk} row in Season B "
+                            f"was authorized from a Season-A No-League context")
+                _close(store)
+
+    def test_program_only_fails_closed_for_every_season_bound_kind(self):
+        """A Program-only context has validated no Season, so there is nothing
+        to compare a Season-bound row against: it fails CLOSED.
+
+        The complement is asserted in the same breath, because failing closed
+        for EVERYTHING would pass this test while making a brand-new Program
+        (which has no Season yet) unmanageable: the permanent, Season-free
+        kinds stay reachable."""
+        for backend, store in _backends():
+            with self.subTest(backend=backend):
+                api, caller, w = self._fixture(store)
+                api.set_active_context(*caller, w["program"], None, None)
+                program, season = api.context.resolve_with_league(*caller)[:2]
+                self.assertIsNotNone(program, f"[{backend}] fixture: the "
+                                              f"Program must resolve")
+                self.assertIsNone(
+                    season,
+                    f"[{backend}] fixture: a Season resolved anyway, so this "
+                    f"is not the Program-only state under test")
+
+                for kind, pick in _SEASON_BOUND:
+                    for sk in _AXIS_KEYS:
+                        self.assertIs(
+                            api.setup_target_accessible(kind, pick(w, sk),
+                                                        *caller), False,
+                            f"[{backend}/{kind}] a Program-only caller was "
+                            f"granted authority over a Season-bound row in "
+                            f"Season {sk} -- nothing was validated to compare "
+                            f"its Season against")
+
+                free = {"program": w["program"], "league": w["league"]["A"],
+                        "team": w["team"]["A"], "player": w["player"]["A"],
+                        "club": w["club"]["A"], "official": w["official"]["A"]}
+                for kind in _SEASON_FREE:
+                    self.assertIs(
+                        api.setup_target_accessible(kind, free[kind], *caller),
+                        True,
+                        f"[{backend}/{kind}] a PERMANENT, Season-free record "
+                        f"was refused to a Program-only caller -- a Program "
+                        f"with no Season yet would be unmanageable")
+                _close(store)
+
+    def test_the_facility_tree_has_a_season_axis_and_no_league_axis(self):
+        """Both halves of the owner's facility ruling, in one place.
+
+        The Season axis is REAL: it arrives through SeasonVenueAccess, the only
+        join between the facility tree and the competition tree. The League axis
+        does NOT exist and must not be invented: with League A selected, a Venue
+        (and its Rink and IceSlot) inside the active Season stays reachable,
+        because no link it carries names a League to compare."""
+        for backend, store in _backends():
+            with self.subTest(backend=backend):
+                api, caller, w = self._fixture(store)
+                for kind in ("venue", "rink", "ice_slot"):
+                    axes = chain_axes(store, kind, w[kind]["A"])
+                    self.assertEqual(
+                        {t[2] for t in axes}, {None},
+                        f"[{backend}/{kind}] fixture: the facility record has "
+                        f"acquired a League, so this proves nothing")
+                    self.assertEqual(
+                        {t[1] for t in axes}, {w["season"]["A"]},
+                        f"[{backend}/{kind}] fixture: the facility record is "
+                        f"not bound to exactly Season A")
+
+                for league_key in _AXIS_KEYS:
+                    api.set_active_context(*caller, w["program"],
+                                           w["season"]["A"],
+                                           w["league"][league_key])
+                    for kind in ("venue", "rink", "ice_slot"):
+                        self.assertIs(
+                            api.setup_target_accessible(kind, w[kind]["A"],
+                                                        *caller), True,
+                            f"[{backend}/{kind}] a League was INVENTED for the "
+                            f"facility tree: selecting League {league_key} "
+                            f"changed whether an arena in the active Season is "
+                            f"reachable")
+                        self.assertIs(
+                            api.setup_target_accessible(kind, w[kind]["B"],
+                                                        *caller), False,
+                            f"[{backend}/{kind}] a facility record granted "
+                            f"only to Season B was reachable from Season A")
                 _close(store)
 
 
@@ -902,11 +1515,31 @@ class SetupTargetRouteMatrixTest(unittest.TestCase):
         self.assertEqual(status, 200, (username, resp))
         return opener, account.id
 
-    def _select(self, opener, program_id):
-        status, resp = self._req(opener, "POST", "/api/context",
-                                 {"program_id": program_id})
-        self.assertEqual(status, 200, (program_id, resp))
+    def _select(self, opener, program_id, season_id=None, league_id=None):
+        """Persist all three context axes and PROVE what actually landed.
+
+        The three axes are asserted back out of the response rather than
+        assumed: ``set_with_league`` is allowed to move the Season when a
+        League is selected (#364's canonical resolution), and a matrix that
+        believed it had selected (S, A) while the server had persisted (S', A)
+        would be measuring a context nobody holds."""
+        body = {"program_id": program_id}
+        if season_id is not None:
+            body["season_id"] = season_id
+        if league_id is not None:
+            body["league_id"] = league_id
+        status, resp = self._req(opener, "POST", "/api/context", body)
+        self.assertEqual(status, 200, (body, resp))
         self.assertEqual(resp.get("program", {}).get("id"), program_id, resp)
+        if season_id is not None:
+            self.assertEqual((resp.get("season") or {}).get("id"), season_id,
+                             ("the persisted Season is not the one selected",
+                              body, resp))
+        if league_id is not None:
+            self.assertEqual((resp.get("league") or {}).get("id"), league_id,
+                             ("the persisted League is not the one selected",
+                              body, resp))
+        return resp
 
     def _ok(self, opener, path, body, why=""):
         """A fixture call that must succeed. A fixture that half-built itself
@@ -965,6 +1598,10 @@ class SetupTargetRouteMatrixTest(unittest.TestCase):
         season = self._ok(opener, "/api/v2/setup/season",
                           {"program_id": program["id"],
                            "name": f"TA-{tag} Season"})
+        # The Season axis is a real ceiling (#369 re-review), so the owner
+        # selects its own Season before touching anything Season-bound -- the
+        # standing venue-access grant below is exactly such a write.
+        self._select(opener, program["id"], season["id"])
         league = self._ok(opener, "/api/v2/setup/league",
                           {"season_id": season["id"],
                            "name": f"TA-{tag} League"})
@@ -1058,9 +1695,20 @@ class SetupTargetRouteMatrixTest(unittest.TestCase):
                          "name": f"TA-{tag} Spare Season {self._seq()}"})["id"]
 
     def _mint_archived_season(self, tag):
+        """A spare, archived Season.
+
+        The archive route is itself gated on the Season axis (#369
+        re-review), so the world's owner selects the spare Season before
+        archiving it and restores its standing context afterwards -- the
+        other mints run as the same identity and expect the world's Season.
+        A fixture is fixed by switching context explicitly, never by
+        weakening the guard it is about to be measured against."""
         season = self._mint_season(tag)
+        self._select(self._o(tag), self.worlds[tag]["program"], season)
         self._ok(self._o(tag), f"/api/v2/setup/seasons/{season}/archive",
                  {"reason": "fixture"})
+        self._select(self._o(tag), self.worlds[tag]["program"],
+                     self.worlds[tag]["season"])
         return season
 
     def _mint_league(self, tag):
@@ -1296,7 +1944,7 @@ class SetupTargetRouteMatrixTest(unittest.TestCase):
 
         # ---- positive: a target inside the caller's ACTIVE Program --------
         mine = row["pmint"](own)
-        self._select(att, row["ctx"](own, mine))
+        self._select(att, *row["ctx"](own, mine))
         path, body, _w = row["call"](own, mine)
         status, resp, _raw = self._post(att, path, body)
         self._assert_allowed(status, resp, row["codes"],
@@ -1306,7 +1954,10 @@ class SetupTargetRouteMatrixTest(unittest.TestCase):
         #      anything at all ---------------------------------------------
         victim = row["mint"](victim_tag)
         active = self.worlds[own]["program"]
-        self._select(att, active)
+        # The attacker's own Program AND Season (#369 re-review): a
+        # Program-only context now fails closed against every Season-bound
+        # row, which would make half this table refuse for the wrong reason.
+        self._select(att, active, self.worlds[own]["season"])
         # #369 note: the owner's repro words this precondition as "the record is
         # absent from the attacker's reads". ``get_setup_overview_v2`` is not
         # Program-scoped until #369 proper (which rebases on top of this
@@ -1393,7 +2044,7 @@ class SetupTargetRouteMatrixTest(unittest.TestCase):
             f"all -- the refusal is an existence oracle")
 
         # ---- context switch: the SAME call, the target's own Program -------
-        self._select(att, row["ctx"](victim_tag, victim))
+        self._select(att, *row["ctx"](victim_tag, victim))
         path, body, _w = row["call"](victim_tag, victim)
         status, resp, _raw = self._post(att, path, body)
         self._assert_allowed(
@@ -1402,7 +2053,8 @@ class SetupTargetRouteMatrixTest(unittest.TestCase):
             f"Program did not make the same call on the same target succeed, "
             f"so the refusal above was a blanket block rather than a scope "
             f"decision")
-        self._select(att, self.worlds[own]["program"])
+        self._select(att, self.worlds[own]["program"],
+                     self.worlds[own]["season"])
 
     # ----------------------------------------------------------------------
     # THE ROUTE TABLE
@@ -1420,11 +2072,17 @@ class SetupTargetRouteMatrixTest(unittest.TestCase):
     #          the foreign / nonexistent / context-switch cases.
     #   pmint  optional override for the POSITIVE case only, for the two kinds
     #          (Club, Organization) whose LINKED form can never be deleted.
-    #   ctx    (tag, target) -> the Program the attacker selects for the
-    #          positive and context-switch cases. The world's Program by
-    #          default; the TARGET ITSELF when the target is a Program, since a
-    #          Program is its own scope and "switch to the target's Program"
-    #          means exactly that.
+    #   ctx    (tag, target) -> the (program_id, season_id, league_id) the
+    #          attacker selects for the positive and context-switch cases. The
+    #          world's Program AND Season by default, because a Program-only
+    #          context now fails closed against every Season-bound row (#369
+    #          re-review). Two overrides: the TARGET ITSELF when the target is
+    #          a Program (a Program is its own scope, and it carries no Season
+    #          axis to select), and the TARGET SEASON when the target IS a
+    #          Season that is not the world's standing one. League is left
+    #          unselected ("No League" = the approved Program + active-Season
+    #          union), so this table keeps measuring the PROGRAM axis it was
+    #          written for; the League axis has its own negatives below.
     #   call   (active tag, target id) -> (path, body, witnesses). Witnesses are
     #          every record this one call could have written, so the no-mutation
     #          case covers an in-place edit that changes no row-id set. A
@@ -1443,7 +2101,8 @@ class SetupTargetRouteMatrixTest(unittest.TestCase):
                          "pmint": pmint or mint, "call": call,
                          "codes": codes,
                          "ctx": ctx or (lambda tag, _tid:
-                                        self.worlds[tag]["program"])})
+                                        (self.worlds[tag]["program"],
+                                         self.worlds[tag]["season"], None))})
 
         # -- the generic deletes, on BOTH versions -------------------------
         # (canonical kind, v1 wire word or None, v2 wire word or None, mint,
@@ -1451,15 +2110,20 @@ class SetupTargetRouteMatrixTest(unittest.TestCase):
         # differs: its "league" is today's PROGRAM and its "level" is today's
         # competition LEAGUE. Player/Official delete is v2-only (#232/#271) and
         # league-season delete is a v2 addition (#159), hence the Nones.
-        _target_is_its_own_scope = (lambda _tag, tid: tid)
+        # A Program IS its own scope, and it carries no Season axis to select.
+        _target_is_its_own_scope = (lambda _tag, tid: (tid, None, None))
+        # A Season IS the Season axis: "switch to the target's own context"
+        # means selecting that very Season, not the world's standing one.
+        _target_season_is_the_scope = (
+            lambda tag, tid: (self.worlds[tag]["program"], tid, None))
         deletes = [
             ("organization", "organization", "organization",
              self._mint_organization, self._mint_unlinked_org_as_attacker,
              None, frozenset({"has_dependencies"})),
             ("program", "league", "program", self._mint_program, None,
              _target_is_its_own_scope, frozenset()),
-            ("season", "season", "season", self._mint_season, None, None,
-             frozenset()),
+            ("season", "season", "season", self._mint_season, None,
+             _target_season_is_the_scope, frozenset()),
             ("league", "level", "league", self._mint_league, None, None,
              frozenset()),
             ("league_season", None, "league-season", self._mint_league_season,
@@ -1573,9 +2237,11 @@ class SetupTargetRouteMatrixTest(unittest.TestCase):
                     {"reason": "matrix"}, [("season", tid)])
 
         add("POST /api/v2/setup/seasons/<id>/archive", "season",
-            self._mint_season, archive_call)
+            self._mint_season, archive_call,
+            ctx=_target_season_is_the_scope)
         add("POST /api/v2/setup/seasons/<id>/reopen", "season",
-            self._mint_archived_season, reopen_call)
+            self._mint_archived_season, reopen_call,
+            ctx=_target_season_is_the_scope)
 
         # -- the venue-access grant's SEASON argument, which is generic ------
         # (its VENUE argument is the facility-tree exception and has its own
@@ -1586,7 +2252,8 @@ class SetupTargetRouteMatrixTest(unittest.TestCase):
                     {"venue_id": self._mint_venue(active)}, [("season", tid)])
 
         add("POST /api/v2/setup/seasons/<id>/venue-access [SEASON]", "season",
-            self._mint_season, grant_season_call)
+            self._mint_season, grant_season_call,
+            ctx=_target_season_is_the_scope)
 
         # -- bridge row: SeasonTeamRegistration -----------------------------
         # It carries no Program of its own -- it IS the (Team, LeagueSeason)
@@ -1680,6 +2347,692 @@ class SetupTargetRouteMatrixTest(unittest.TestCase):
         self._run_route_matrix(os.environ["TEST_DATABASE_URL"], "postgres")
 
     # ----------------------------------------------------------------------
+    # PART 2b — the SEASON and LEAGUE axes over authenticated v1/v2 HTTP.
+    #
+    # Part 2 varies the PROGRAM. These legs hold the Program CONSTANT and vary
+    # exactly ONE of the other two axes, which is the blind spot the re-review
+    # found: the shared gate resolved all three and authorized on the Program
+    # alone, so `POST /api/v2/setup/player/<League-B-player>/update` answered
+    # 200 and renamed a Player in a League the caller had not selected. The
+    # decision is proved in Part 1b; this proves the WIRING, on both API
+    # versions, for the same 23 call sites.
+    # ----------------------------------------------------------------------
+    AXIS_OWNER = "ta_axis_owner"
+    AXIS_CALLER = "ta_axis_caller"
+
+    def _build_axis_world(self, backend, database_url):
+        """ONE Program, TWO Seasons, TWO Leagues, all four bindings — built
+        over real HTTP by an owner who then never acts again.
+
+        ``axis_caller`` (League Admin, holding both MANAGE_SETUP and
+        MANAGE_ARENA) creates nothing that appears in the world and drives
+        every call below, changing only its SEASON or its LEAGUE. So no
+        positive can be creator ownership, no refusal can be a missing role,
+        and — because there is only ONE Program — no refusal can be the Program
+        ceiling either."""
+        self._reset_backend(database_url, backend)
+        self.ax_owner, self.ax_owner_uid = self._account(
+            self.AXIS_OWNER, Role.LEAGUE_ADMIN)
+        self.ax_caller, self.ax_caller_uid = self._account(
+            self.AXIS_CALLER, Role.LEAGUE_ADMIN)
+        o = self.ax_owner
+        program = self._ok(o, "/api/v2/setup/program", {"name": "AX Program"})
+        w = {"program": program["id"], "season": {}, "league": {},
+             "league_season": {}, "club": {}, "team": {}}
+        self._select(o, program["id"])
+        for key in ("A", "B"):
+            w["season"][key] = self._ok(
+                o, "/api/v2/setup/season",
+                {"program_id": program["id"],
+                 "name": f"AX Season {key}"})["id"]
+        for key in ("A", "B"):
+            league = self._ok(o, "/api/v2/setup/league",
+                              {"season_id": w["season"]["A"],
+                               "name": f"AX League {key}"})
+            w["league"][key] = league["id"]
+            # No HTTP route binds an EXISTING League to a further Season
+            # (`create_league` only ever mints a new one), so the setup service
+            # is called directly — a fixture step, like the injected draft Game.
+            # Both Leagues bound to both Seasons is what makes "switch the
+            # League" and "switch the Season" each a single legal context move;
+            # a League that existed only in Season B would leave every negative
+            # ambiguous between the two axes.
+            self.srv.STATE.api.setup.create_league_season(
+                league["id"], w["season"]["B"], self.ax_owner_uid)
+        for lk in ("A", "B"):
+            w["club"][lk] = self._ok(o, "/api/v2/setup/club",
+                                     {"name": f"AX Club {lk}"})["id"]
+            w["team"][lk] = self._ok(
+                o, "/api/v2/setup/team",
+                {"club_id": w["club"][lk], "league_id": w["league"][lk],
+                 "name": f"AX Team {lk}"})["id"]
+        store = self.srv.STATE.api.store
+        for lk in ("A", "B"):
+            for sk in ("A", "B"):
+                binding = store.league_season_for(w["league"][lk],
+                                                  w["season"][sk])
+                self.assertIsNotNone(
+                    binding,
+                    f"fixture: League {lk} must be bound to Season {sk}")
+                w["league_season"][(lk, sk)] = binding.id
+        self.assertNotEqual(w["season"]["A"], w["season"]["B"])
+        self.assertNotEqual(w["league"]["A"], w["league"]["B"])
+        self.ax = w
+        #: binding id -> the League it binds, for the LeagueSeason rows' ctx.
+        self._ax_ls_league = {}
+        self._ax_owner_at(w["season"]["A"])
+
+    # -- fixture context ----------------------------------------------------
+    def _ax_owner_at(self, season_id):
+        """Put the WORLD OWNER in a given Season. Several fixture steps below
+        (a venue-access grant, a revoke, a registration remove, an archive) are
+        themselves Season-bound writes and go through the very gate under test;
+        the fixture switches context explicitly rather than the guard being
+        relaxed for it."""
+        self._select(self.ax_owner, self.ax["program"], season_id)
+
+    # -- axis mints: one FRESH record at the (League, Season) corner asked for
+    def _ax_team(self, lk, _sk):
+        return self._ok(self.ax_owner, "/api/v2/setup/team",
+                        {"club_id": self.ax["club"][lk],
+                         "league_id": self.ax["league"][lk],
+                         "name": f"AX Spare Team {self._seq()}"})["id"]
+
+    def _ax_player(self, lk, _sk):
+        return self._ok(self.ax_owner, "/api/v2/setup/player",
+                        {"team_id": self.ax["team"][lk],
+                         "name": f"AX Spare Player {self._seq()}",
+                         "position": "forward"})["id"]
+
+    def _ax_club(self, lk, _sk):
+        """A Club whose only Team is in League ``lk`` — so its whole chain
+        names that League and nothing else. A linked Club can never be deleted
+        (its Team blocks it), which is why the club rows tolerate
+        ``has_dependencies`` on the cases the gate ALLOWS."""
+        club = self._ok(self.ax_owner, "/api/v2/setup/club",
+                        {"name": f"AX Spare Club {self._seq()}"})["id"]
+        self._ok(self.ax_owner, "/api/v2/setup/team",
+                 {"club_id": club, "league_id": self.ax["league"][lk],
+                  "name": f"AX Club Team {self._seq()}"})
+        return club
+
+    def _ax_official(self, lk, _sk):
+        return self._ok(self.ax_owner, "/api/v2/setup/official",
+                        {"name": f"AX Spare Official {self._seq()}",
+                         "home_club_id": self.ax["club"][lk]})["id"]
+
+    def _ax_division(self, lk, sk):
+        return self._ok(self.ax_owner, "/api/v2/setup/division",
+                        {"league_id": self.ax["league"][lk],
+                         "season_id": self.ax["season"][sk],
+                         "name": f"AX Spare Div {self._seq()}"})["id"]
+
+    def _ax_league_season(self, _lk, sk):
+        """A FRESH permanent League bound to Season ``sk``, returned as its
+        BINDING id — never one of the world's standing bindings, which the
+        route under test would delete out from under every later row.
+
+        Its League is recorded so the League-axis rows can select it: a
+        LeagueSeason's League axis is the League it binds, so "switch to the
+        record's own League" means that one. Childless, so the dependency gate
+        never masks the target gate's answer."""
+        league = self._ok(self.ax_owner, "/api/v2/setup/league",
+                          {"season_id": self.ax["season"][sk],
+                           "name": f"AX Bound League {self._seq()}"})["id"]
+        binding = self.srv.STATE.api.store.league_season_for(
+            league, self.ax["season"][sk])
+        self.assertIsNotNone(binding, "fixture: the League/Season binding")
+        self._ax_ls_league[binding.id] = league
+        return binding.id
+
+    def _ax_game(self, lk, sk):
+        from hockey_scheduler.domain.models import Game
+        store = self.srv.STATE.api.store
+        game = Game(id=store.next_id("game"), home_team_id=self.ax["team"][lk],
+                    start_time=_FUTURE, season_id=self.ax["season"][sk],
+                    league_id=self.ax["league"][lk], is_draft=True,
+                    game_type="exhibition")
+        store.add_game(game)
+        self.srv.STATE.api.setup._audit("game_created", "game", game.id,
+                                        self.ax_owner_uid, None)
+        return game.id
+
+    def _ax_registration(self, lk, sk):
+        self._ax_owner_at(self.ax["season"][sk])
+        return self._ok(
+            self.ax_owner,
+            f"/api/v2/setup/seasons/{self.ax['season'][sk]}/team-registrations",
+            {"team_id": self._ax_team(lk, sk),
+             "league_id": self.ax["league"][lk]})["id"]
+
+    def _ax_inactive_registration(self, lk, sk):
+        reg = self._ax_registration(lk, sk)
+        self._ax_owner_at(self.ax["season"][sk])
+        self._ok(self.ax_owner,
+                 f"/api/v2/setup/season-team-registration/{reg}/remove", {})
+        return reg
+
+    def _ax_season(self, _lk, _sk):
+        """A spare, childless Season — the only Season shape a dependency-gated
+        delete can remove, and its own Season axis."""
+        return self._ok(self.ax_owner, "/api/v2/setup/season",
+                        {"program_id": self.ax["program"],
+                         "name": f"AX Spare Season {self._seq()}"})["id"]
+
+    def _ax_archived_season(self, lk, sk):
+        season = self._ax_season(lk, sk)
+        self._ax_owner_at(season)
+        self._ok(self.ax_owner, f"/api/v2/setup/seasons/{season}/archive",
+                 {"reason": "fixture"})
+        self._ax_owner_at(self.ax["season"]["A"])
+        return season
+
+    def _ax_grantable_venue(self):
+        """A Venue the facility-tree EXCEPTION will accept as an established
+        arena: linked through the LEGACY ``Venue.league_id`` bridge (a PROGRAM
+        id). Used only as the BODY of a venue-access grant whose SEASON is the
+        gated argument."""
+        return self._ok(self.ax_owner, "/api/setup/venue",
+                        {"name": f"AX Grantable Venue {self._seq()}",
+                         "league_id": self.ax["program"]})["id"]
+
+    def _ax_venue(self, _lk, sk):
+        """A Venue whose ONLY link is a grant to Season ``sk``.
+
+        Deliberately NOT the legacy ``Venue.league_id`` shape Part 2 uses: that
+        bridge holds a Program id and names no Season, so a Venue carrying one
+        is not Season-bound at all and would pass every assertion below with
+        the Season comparison deleted."""
+        venue = self._ok(self.ax_owner, "/api/v2/setup/venue",
+                         {"name": f"AX Venue {self._seq()}"})["id"]
+        self._ax_owner_at(self.ax["season"][sk])
+        self._ok(self.ax_owner,
+                 f"/api/v2/setup/seasons/{self.ax['season'][sk]}/venue-access",
+                 {"venue_id": venue})
+        return venue
+
+    def _ax_rink(self, lk, sk):
+        return self._ok(self.ax_owner, "/api/v2/setup/rink",
+                        {"venue_id": self._ax_venue(lk, sk),
+                         "name": f"AX Rink {self._seq()}"})["id"]
+
+    def _ax_ice_slot(self, lk, sk):
+        start, end = self._next_slot_times()
+        return self._ok(self.ax_owner, "/api/v2/setup/ice-slot",
+                        {"rink_id": self._ax_rink(lk, sk),
+                         "start_time": start, "end_time": end,
+                         "slot_type": "game"})["id"]
+
+    def _ax_grant(self, _lk, sk):
+        venue = self._ok(self.ax_owner, "/api/v2/setup/venue",
+                         {"name": f"AX Grant Venue {self._seq()}"})["id"]
+        self._ax_owner_at(self.ax["season"][sk])
+        return self._ok(
+            self.ax_owner,
+            f"/api/v2/setup/seasons/{self.ax['season'][sk]}/venue-access",
+            {"venue_id": venue})["id"]
+
+    def _ax_revoked_grant(self, lk, sk):
+        grant = self._ax_grant(lk, sk)
+        self._ax_owner_at(self.ax["season"][sk])
+        self._ok(self.ax_owner,
+                 f"/api/v2/setup/season-venue-access/{grant}/remove", {})
+        return grant
+
+    def _ax_standing(self, key):
+        return lambda lk, sk: self.ax[key][lk]
+
+    # -- the runner ---------------------------------------------------------
+    def _axis_cases(self, backend, row):
+        """The five cases of Part 2, with the PROGRAM held constant and one of
+        the other two axes varied."""
+        caller = self.ax_caller
+        store = self.srv.STATE.api.store
+        kind, axis, where = row["kind"], row["axis"], f"[{backend}] {row['name']}"
+        # ("A", "A") is always the SELECTED corner; the victim sits one axis
+        # away from it and nowhere else.
+        same = ("A", "A")
+        other = ("B", "A") if axis == "league" else ("A", "B")
+
+        # Every record is minted BEFORE anything is called, and the REFUSAL is
+        # measured first. A destructive route consumes its target, and for the
+        # two kinds that NAME their own axis (a Season, a LeagueSeason) the
+        # context is that very record -- so running the positive first would
+        # delete the context the refusal is supposed to be judged in, and the
+        # refusal would then be about a context that no longer exists rather
+        # than about the axis under test.
+        victim = row["mint"](*other)
+        ctx_other = row["ctx"](victim, *other)
+        mine = row["mint"](*same)
+        ctx_same = row["ctx"](mine, *same)
+
+        # ---- the precondition that makes the refusal mean exactly ONE axis -
+        self._select(caller, *ctx_same)
+        active_program, active_season, active_league = ctx_same
+        axes = chain_axes(store, kind, victim)
+        self.assertTrue(
+            axes,
+            f"{where}: fixture is not distinguishable — the victim has no "
+            f"chain at all, so refusing it would prove nothing")
+        self.assertEqual(
+            {t[0] for t in axes}, {active_program},
+            f"{where}: fixture is not distinguishable — the victim is not in "
+            f"the caller's OWN Program, so the Program ceiling alone could "
+            f"explain the refusal and nothing about {axis} would be proved")
+        if axis == "league":
+            self.assertTrue(
+                all(t[2] is not None and t[2] != active_league for t in axes),
+                f"{where}: fixture is not distinguishable — the victim does "
+                f"not name a League other than the selected one: {axes}")
+            self.assertLessEqual(
+                {t[1] for t in axes} - {None}, {active_season},
+                f"{where}: fixture is not distinguishable — the victim names "
+                f"a Season other than the selected one, so the SEASON axis "
+                f"could explain the refusal instead of the League: {axes}")
+        else:
+            self.assertIsNone(
+                active_league,
+                f"{where}: the Season negatives run with NO League selected, "
+                f"so the League comparison provably plays no part; a League "
+                f"is selected here, which makes the refusal ambiguous")
+            self.assertTrue(
+                all(t[1] is not None and t[1] != active_season for t in axes),
+                f"{where}: fixture is not distinguishable — the victim does "
+                f"not name a Season other than the selected one: {axes}")
+        if kind in _CREATABLE:
+            self.assertNotIn(
+                self.ax_caller_uid, created_by(store, kind, victim),
+                f"{where}: fixture is not distinguishable — the caller CREATED "
+                f"the record it is attacking")
+
+        # ---- the refusal + no mutation ------------------------------------
+        path, body, witnesses = row["call"](victim, *same)
+        before, rows_before = self._snapshot(), self._rows_of(witnesses)
+        status, resp, raw_victim = self._post(caller, path, body)
+        self.assertEqual(
+            status, 404,
+            f"{where} CROSS-{axis.upper()}: a same-Program record in another "
+            f"{axis} answered {status} ({resp}) — this is the reported blocker")
+        self.assertEqual(
+            resp, {"error": {"code": "not_found",
+                             "message": f"{_WORD[kind]} {victim} not found."}},
+            f"{where} CROSS-{axis.upper()}: the refusal is not the facade's "
+            f"own generic not-found")
+        self.assertEqual(
+            self._snapshot(), before,
+            f"{where} NO-MUTATION: a REFUSED call changed the store's row-id "
+            f"sets or wrote a setup-audit row")
+        self.assertEqual(
+            self._rows_of(witnesses), rows_before,
+            f"{where} NO-MUTATION: a REFUSED call edited a record in place")
+
+        # ---- nonexistent: the same bytes, never an oracle -----------------
+        absent = f"{kind}_ax_absent_{self._seq()}"
+        path, body, _w = row["call"](absent, *same)
+        status_absent, _resp, raw_absent = self._post(caller, path, body)
+        self.assertEqual(status_absent, 404, f"{where} NONEXISTENT: {_resp}")
+        self.assertEqual(
+            (status, self._blind(raw_victim, victim)),
+            (status_absent, self._blind(raw_absent, absent)),
+            f"{where} NONEXISTENT: a reader of the socket can tell a record "
+            f"that EXISTS in another {axis} from one that does not exist at "
+            f"all — the refusal is an existence oracle")
+
+        # ---- positive: the same call inside the caller's own context ------
+        self._select(caller, *ctx_same)
+        path, body, _w = row["call"](mine, *same)
+        status, resp, _raw = self._post(caller, path, body)
+        self._assert_allowed(status, resp, row["codes"],
+                             f"{where} POSITIVE ({path})")
+
+        # ---- switch the EXACT missing axis --------------------------------
+        self.assertEqual(
+            ctx_other[0], active_program,
+            f"{where}: the switch must change ONLY the {axis}, never the "
+            f"Program")
+        if axis == "league":
+            self.assertEqual(ctx_other[1], active_season,
+                             f"{where}: the League switch changed the Season "
+                             f"too, so it proves nothing about the League")
+        else:
+            self.assertEqual(ctx_other[2], active_league,
+                             f"{where}: the Season switch changed the League "
+                             f"too")
+        self._select(caller, *ctx_other)
+        path, body, _w = row["call"](victim, *other)
+        status, resp, _raw = self._post(caller, path, body)
+        self._assert_allowed(
+            status, resp, row["codes"],
+            f"{where} AXIS SWITCH ({path}): selecting the target's own {axis} "
+            f"did not make the same call on the same record succeed, so the "
+            f"refusal above was a blanket block rather than an {axis} decision")
+
+    # -- the axis route table -----------------------------------------------
+    def _axis_route_rows(self):
+        """One row per (route, gated argument, axis under test).
+
+        Same contract as the Part 2 table, plus ``axis`` ("league" | "season")
+        and a ``mint``/``call``/``ctx`` that take the (League key, Season key)
+        CORNER rather than a world tag. ``ctx`` returns the whole triple, so a
+        row whose target IS an axis value (a Season) can name itself."""
+        rows = []
+        ax = lambda: self.ax                                   # noqa: E731
+
+        def add(name, kind, axis, mint, call, ctx=None, codes=frozenset()):
+            default = (
+                (lambda _tid, lk, sk: (self.ax["program"],
+                                       self.ax["season"][sk],
+                                       self.ax["league"][lk]))
+                if axis == "league" else
+                (lambda _tid, _lk, sk: (self.ax["program"],
+                                        self.ax["season"][sk], None)))
+            rows.append({"name": f"{name} [{axis}]", "kind": kind,
+                         "axis": axis, "mint": mint, "call": call,
+                         "codes": codes, "ctx": ctx or default})
+
+        # -- deletes, both versions, per axis ------------------------------
+        # (kind, v1 wire word or None, v2 wire word or None, mint, axes, codes)
+        deletes = [
+            ("team", "team", "team", self._ax_team, ("league",), frozenset()),
+            ("player", None, "player", self._ax_player, ("league",),
+             frozenset()),
+            ("official", None, "official", self._ax_official, ("league",),
+             frozenset()),
+            ("club", "club", "club", self._ax_club, ("league",),
+             frozenset({"has_dependencies"})),
+            ("division", "division", "division", self._ax_division,
+             ("league", "season"), frozenset()),
+            ("game", "game", "game", self._ax_game, ("league", "season"),
+             frozenset()),
+            ("league_season", None, "league-season", self._ax_league_season,
+             ("league", "season"), frozenset()),
+            ("season", "season", "season", self._ax_season, ("season",),
+             frozenset()),
+            # THE FACILITY TREE — a Season axis through SeasonVenueAccess and
+            # no League axis whatever, so it appears under "season" only.
+            ("venue", "venue", "venue", self._ax_venue, ("season",),
+             frozenset({"has_dependencies"})),
+            ("rink", "rink", "rink", self._ax_rink, ("season",),
+             frozenset({"has_dependencies"})),
+            ("ice_slot", "ice-slot", "ice-slot", self._ax_ice_slot,
+             ("season",), frozenset()),
+        ]
+        # A Season IS the Season axis and a LeagueSeason names its own League:
+        # for those two kinds "switch to the record's own axis" means the
+        # record itself, not the world's standing value.
+        _season_names_itself = (
+            lambda tid, _lk, _sk: (self.ax["program"], tid, None))
+        _binding_names_its_league = (
+            lambda tid, _lk, sk: (self.ax["program"], self.ax["season"][sk],
+                                  self._ax_ls_league[tid]))
+        _own_axis = {("season", "season"): _season_names_itself,
+                     ("league_season", "league"): _binding_names_its_league}
+        for kind, v1w, v2w, mint, axes, codes in deletes:
+            for base, word in (("/api/setup", v1w), ("/api/v2/setup", v2w)):
+                if word is None:
+                    continue
+
+                def call(tid, _lk, _sk, _b=base, _w=word, _k=kind):
+                    return f"{_b}/{_w}/{tid}/delete", {}, [(_k, tid)]
+
+                for axis in axes:
+                    add(f"POST {base}/{word}/<id>/delete", kind, axis, mint,
+                        call, ctx=_own_axis.get((kind, axis)), codes=codes)
+
+        # -- the two in-place Player edits: the owner's VERBATIM repro ------
+        def player_update_call(tid, _lk, _sk):
+            return (f"/api/v2/setup/player/{tid}/update",
+                    {"name": f"AX Renamed {self._seq()}"}, [("player", tid)])
+
+        def player_active_call(tid, _lk, _sk):
+            return (f"/api/v2/setup/player/{tid}/active",
+                    {"active": False, "reason": "axis"}, [("player", tid)])
+
+        add("POST /api/v2/setup/player/<id>/update", "player", "league",
+            self._ax_player, player_update_call)
+        add("POST /api/v2/setup/player/<id>/active", "player", "league",
+            self._ax_player, player_active_call)
+
+        # -- Season lifecycle: in-place status flips on an existing Season --
+        def archive_call(tid, _lk, _sk):
+            return (f"/api/v2/setup/seasons/{tid}/archive", {"reason": "axis"},
+                    [("season", tid)])
+
+        def reopen_call(tid, _lk, _sk):
+            return (f"/api/v2/setup/seasons/{tid}/reopen", {"reason": "axis"},
+                    [("season", tid)])
+
+        add("POST /api/v2/setup/seasons/<id>/archive", "season", "season",
+            self._ax_season, archive_call, ctx=_season_names_itself)
+        add("POST /api/v2/setup/seasons/<id>/reopen", "season", "season",
+            self._ax_archived_season, reopen_call, ctx=_season_names_itself)
+
+        # -- the venue-access grant's SEASON argument (generic, Season-bound)
+        def grant_season_call(tid, _lk, _sk):
+            return (f"/api/v2/setup/seasons/{tid}/venue-access",
+                    {"venue_id": self._ax_grantable_venue()},
+                    [("season", tid)])
+
+        add("POST /api/v2/setup/seasons/<id>/venue-access [SEASON]", "season",
+            "season", self._ax_season, grant_season_call,
+            ctx=_season_names_itself)
+
+        # -- bridge row: SeasonVenueAccess, judged by its Season ------------
+        def access_remove_call(tid, _lk, _sk):
+            return (f"/api/v2/setup/season-venue-access/{tid}/remove", {},
+                    [("season_venue_access", tid)])
+
+        def access_delete_call(tid, _lk, _sk):
+            return (f"/api/v2/setup/season-venue-access/{tid}/delete", {},
+                    [("season_venue_access", tid)])
+
+        add("POST /api/v2/setup/season-venue-access/<id>/remove",
+            "season_venue_access", "season", self._ax_grant,
+            access_remove_call)
+        add("POST /api/v2/setup/season-venue-access/<id>/delete",
+            "season_venue_access", "season", self._ax_revoked_grant,
+            access_delete_call)
+
+        # -- every assign-<target> reassign, BOTH ENDS, per axis ------------
+        # (base, path word, assign-<word>, body key, SOURCE kind, source mint,
+        #  SOURCE axes, DESTINATION kind, destination mint, DESTINATION axes).
+        # The two ends carry DIFFERENT axes and are declared separately: a
+        # Division source is Program+Season+League, but a League destination is
+        # PERMANENT and names no Season at all, so generating a Season-axis row
+        # for it would assert a Season that record provably does not have.
+        _L, _LS = ("league",), ("league", "season")
+        _S = ("season",)
+        reassigns = [
+            ("/api/setup", "player", "team", "team_id", "player",
+             self._ax_player, _L, "team", self._ax_standing("team"), _L),
+            ("/api/v2/setup", "player", "team", "team_id", "player",
+             self._ax_player, _L, "team", self._ax_standing("team"), _L),
+            ("/api/setup", "team", "club", "club_id", "team", self._ax_team,
+             _L, "club", self._ax_standing("club"), _L),
+            ("/api/v2/setup", "team", "club", "club_id", "team", self._ax_team,
+             _L, "club", self._ax_standing("club"), _L),
+            ("/api/v2/setup", "team", "league", "league_id", "team",
+             self._ax_team, _L, "league", self._ax_standing("league"), _L),
+            ("/api/setup", "division", "level", "level_id", "division",
+             self._ax_division, _LS, "league", self._ax_standing("league"),
+             _L),
+            ("/api/v2/setup", "division", "league", "league_id", "division",
+             self._ax_division, _LS, "league", self._ax_standing("league"),
+             _L),
+            ("/api/setup", "rink", "venue", "venue_id", "rink", self._ax_rink,
+             _S, "venue", self._ax_venue, _S),
+            ("/api/v2/setup", "rink", "venue", "venue_id", "rink",
+             self._ax_rink, _S, "venue", self._ax_venue, _S),
+        ]
+        for (base, ent, word, key, src_kind, src_mint, src_axes, dest_kind,
+             dest_mint, dest_axes) in reassigns:
+
+            def source_call(tid, lk, sk, _b=base, _e=ent, _w=word, _k=key,
+                            _sk2=src_kind, _dm=dest_mint):
+                # The DESTINATION always comes from the ACTIVE corner, so the
+                # only thing a SOURCE row can fail on is its source.
+                return (f"{_b}/{_e}/{tid}/assign-{_w}", {_k: _dm(lk, sk)},
+                        [(_sk2, tid)])
+
+            def dest_call(tid, lk, sk, _b=base, _e=ent, _w=word, _k=key,
+                          _sm=src_mint, _sk2=src_kind, _dk=dest_kind):
+                source = _sm(lk, sk)
+                return (f"{_b}/{_e}/{source}/assign-{_w}", {_k: tid},
+                        [(_dk, tid), (_sk2, source)])
+
+            for axis in src_axes:
+                add(f"POST {base}/{ent}/<id>/assign-{word} [SOURCE]", src_kind,
+                    axis, src_mint, source_call)
+            for axis in dest_axes:
+                add(f"POST {base}/{ent}/<id>/assign-{word} [DESTINATION]",
+                    dest_kind, axis, dest_mint, dest_call)
+
+        # -- bridge row: SeasonTeamRegistration, judged by its LeagueSeason --
+        registration_routes = [
+            ("/api/setup", "assign-division", "division_id", "division",
+             self._ax_division, _LS),
+            ("/api/v2/setup", "assign-division", "division_id", "division",
+             self._ax_division, _LS),
+            # A League destination is permanent: League axis only.
+            ("/api/v2/setup", "assign-league", "league_id", "league",
+             self._ax_standing("league"), _L),
+        ]
+        for base, verb, key, dest_kind, dest_mint, dest_axes in \
+                registration_routes:
+
+            def reg_source_call(tid, lk, sk, _b=base, _v=verb, _k=key,
+                                _dm=dest_mint):
+                return (f"{_b}/season-team-registration/{tid}/{_v}",
+                        {_k: _dm(lk, sk)}, [("registration", tid)])
+
+            def reg_dest_call(tid, lk, sk, _b=base, _v=verb, _k=key,
+                              _dk=dest_kind):
+                source = self._ax_registration(lk, sk)
+                return (f"{_b}/season-team-registration/{source}/{_v}",
+                        {_k: tid}, [(_dk, tid), ("registration", source)])
+
+            for axis in ("league", "season"):
+                add(f"POST {base}/season-team-registration/<id>/{verb} "
+                    f"[SOURCE]", "registration", axis, self._ax_registration,
+                    reg_source_call)
+            for axis in dest_axes:
+                add(f"POST {base}/season-team-registration/<id>/{verb} "
+                    f"[DESTINATION]", dest_kind, axis, dest_mint,
+                    reg_dest_call)
+
+        for base in ("/api/setup", "/api/v2/setup"):
+            def remove_call(tid, _lk, _sk, _b=base):
+                return (f"{_b}/season-team-registration/{tid}/remove", {},
+                        [("registration", tid)])
+
+            for axis in ("league", "season"):
+                add(f"POST {base}/season-team-registration/<id>/remove",
+                    "registration", axis, self._ax_registration, remove_call)
+
+        def registration_delete_call(tid, _lk, _sk):
+            return (f"/api/v2/setup/season-team-registration/{tid}/delete", {},
+                    [("registration", tid)])
+
+        for axis in ("league", "season"):
+            add("POST /api/v2/setup/season-team-registration/<id>/delete",
+                "registration", axis, self._ax_inactive_registration,
+                registration_delete_call)
+        return rows
+
+    def _run_axis_matrix(self, database_url, backend):
+        self._build_axis_world(backend, database_url)
+        rows = self._axis_route_rows()
+        league_rows = [r for r in rows if r["axis"] == "league"]
+        season_rows = [r for r in rows if r["axis"] == "season"]
+        # A table that silently shrank would still report OK, having proved
+        # nothing about the rows it dropped.
+        self.assertGreaterEqual(len(league_rows), 36, "the LEAGUE-axis table "
+                                                      "has shrunk")
+        self.assertGreaterEqual(len(season_rows), 32, "the SEASON-axis table "
+                                                      "has shrunk")
+        for row in rows:
+            with self.subTest(route=row["name"]):
+                self._axis_cases(backend, row)
+
+    def test_axis_route_matrix_memory(self):
+        self._run_axis_matrix(None, "memory")
+
+    def test_axis_route_matrix_sqlite(self):
+        self._run_axis_matrix(":memory:", "sqlite")
+
+    @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                         "PostgreSQL required (set TEST_DATABASE_URL)")
+    def test_axis_route_matrix_postgres(self):
+        self._run_axis_matrix(os.environ["TEST_DATABASE_URL"], "postgres")
+
+    # ----------------------------------------------------------------------
+    # "No League" over HTTP: the approved Program + active-Season union.
+    # ----------------------------------------------------------------------
+    def _run_no_league_union(self, database_url, backend):
+        """With NO League selected, a League-B Player update SUCCEEDS (that is
+        the union) while a Season-B registration mutation is still refused
+        (that is the "only").
+
+        The first half is what stops "No League" from being a dead context —
+        it is the state every operator starts in. The second is what stops it
+        from becoming an opt-out of the Season ceiling."""
+        self._build_axis_world(backend, database_url)
+        caller, store = self.ax_caller, self.srv.STATE.api.store
+        self._select(caller, self.ax["program"], self.ax["season"]["A"])
+        self.assertIsNone(
+            (self._req(caller, "GET", "/api/context")[1].get("league")),
+            f"[{backend}] fixture: a League is selected, so this is not the "
+            f"No-League state under test")
+
+        for lk in ("A", "B"):
+            player = self._ax_player(lk, "A")
+            self.assertEqual(
+                {t[2] for t in chain_axes(store, "player", player)},
+                {self.ax["league"][lk]},
+                f"[{backend}] fixture: the Player is not in League {lk}")
+            status, resp, _raw = self._post(
+                caller, f"/api/v2/setup/player/{player}/update",
+                {"name": f"AX Union {lk} {self._seq()}"})
+            self.assertEqual(
+                status, 200,
+                f"[{backend}] No League refused a League-{lk} Player inside "
+                f"the active Season — No League is not the approved Program + "
+                f"active-Season UNION it is defined to be: {resp}")
+
+        victim = self._ax_registration("A", "B")
+        self._select(caller, self.ax["program"], self.ax["season"]["A"])
+        self.assertEqual(
+            {t[1] for t in chain_axes(store, "registration", victim)},
+            {self.ax["season"]["B"]},
+            f"[{backend}] fixture: the registration is not in Season B")
+        before = self._snapshot()
+        status, resp, _raw = self._post(
+            caller,
+            f"/api/v2/setup/season-team-registration/{victim}/remove", {})
+        self.assertEqual(
+            status, 404,
+            f"[{backend}] selecting NO League became a way OUT of the Season "
+            f"ceiling: a Season-B registration was mutated from a Season-A "
+            f"context ({resp})")
+        self.assertEqual(
+            resp, {"error": {"code": "not_found",
+                             "message": f"Registration {victim} not found."}},
+            resp)
+        self.assertEqual(self._snapshot(), before,
+                         f"[{backend}] the refused call still mutated the store")
+
+    def test_no_league_union_memory(self):
+        self._run_no_league_union(None, "memory")
+
+    def test_no_league_union_sqlite(self):
+        self._run_no_league_union(":memory:", "sqlite")
+
+    @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                         "PostgreSQL required (set TEST_DATABASE_URL)")
+    def test_no_league_union_postgres(self):
+        self._run_no_league_union(os.environ["TEST_DATABASE_URL"], "postgres")
+
+    # ----------------------------------------------------------------------
     # The ONE deliberate exception, over HTTP.
     # ----------------------------------------------------------------------
     def _run_venue_access_exception(self, database_url, backend):
@@ -1703,7 +3056,12 @@ class SetupTargetRouteMatrixTest(unittest.TestCase):
         path = f"/api/v2/setup/seasons/{season}/venue-access"
 
         # -- positive: an arena inside the caller's own Program -------------
-        self._select(att, self.worlds[self.OWN]["program"])
+        # Program AND Season: the SEASON argument of this route is generic and
+        # Season-bound (#369 re-review), so a Program-only context would refuse
+        # every case below on the Season end and prove nothing about the Venue
+        # end this test exists to pin down.
+        self._select(att, self.worlds[self.OWN]["program"],
+                     self.worlds[self.OWN]["season"])
         mine = self._mint_venue(self.OWN)
         self._ok(att, path, {"venue_id": mine}, "own-Program arena")
 
@@ -1851,3 +3209,535 @@ class SetupTargetRouteMatrixTest(unittest.TestCase):
                          "PostgreSQL required (set TEST_DATABASE_URL)")
     def test_owner_repro_arena_manager_postgres(self):
         self._run_owner_repro(os.environ["TEST_DATABASE_URL"], "postgres")
+
+
+# ==========================================================================
+# PART 3 — the CHECK/USE gap: authorization and mutation must be ONE unit.
+#
+# The blocker this part closes is not "the gate is wrong" but "the gate is not
+# atomic with the write". `setup_target_accessible` is a PREDICATE: it opens a
+# snapshot, decides, and CLOSES its transaction. The transport layer then called
+# the facade in a SECOND transaction. Between them the target's chain could
+# move, and it did: an authorized Program-A delete of Venue V raced a commit
+# that moved V into Program B, and the Program-A request answered 200 and
+# deleted B's row, having authorized against a world that no longer existed.
+# Source/destination reassigns had the identical gap, and the bridge-row parent
+# lookup ran outside even the predicate's transaction.
+#
+# Snapshot isolation is NOT the fix and never was: it makes the chain WALK
+# coherent, then ends before the write. The fix is `_guarded_mutation` —
+# target lookup, bridge-parent resolution, active-tuple authorization,
+# source/destination validation, the mutation and its audit inside ONE
+# `store.transaction(isolation="SERIALIZABLE")`, with every named row locked
+# (`SELECT ... FOR UPDATE`) as that transaction's FIRST statements, so the
+# authorization snapshot is established no earlier than the lock and nothing
+# touching a named row can commit between the decision and the write.
+#
+# How each test below forces the exact interleaving, deterministically and with
+# no sleeps: the request is paused with an Event at
+# `ApiService.setup_guarded_mutation`'s entry — i.e. AFTER the handler's
+# preflight has authorized the target and BEFORE the atomic section opens, the
+# precise window the blocker describes. No store lock is held there, so the
+# concurrent writer really does commit inside the window on every backend
+# (on PostgreSQL from a SECOND, REAL connection; Memory and SQLite are
+# single-connection stores by construction, and their process-wide lock is what
+# they offer instead).
+#
+# Each test asserts all four things the owner named: the original request
+# refuses GENERICALLY, Program B's row survives untouched, the setup audit
+# trail is unchanged, and the moved record's own fields are never serialized
+# into the response — compared as BYTES, because a decoded body says nothing
+# about what a reader of the socket can see.
+#
+# The load-bearing element is the IN-TRANSACTION re-authorization: neutralise
+# `ApiService._authorize_setup_targets` and every test here fails with the
+# request answering 200 and mutating Program B's record.
+# ==========================================================================
+class SetupTargetAtomicityTest(unittest.TestCase):
+    """Authorization and mutation are one transaction (#369 re-review)."""
+
+    OWNER_A = "ta_race_owner_a"
+    OWNER_B = "ta_race_owner_b"
+
+    @classmethod
+    def setUpClass(cls):
+        srv = __import__("hockey_scheduler.web.server", fromlist=["x"])
+        cls.srv = srv
+        os.environ.pop("DATABASE_URL", None)   # class baseline is Memory
+        srv.STATE.reset(seed=False)
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.Handler)
+        cls.port = cls.httpd.server_address[1]
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
+                                      daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.thread.join(timeout=5)
+
+    # -- plumbing (same shape as the route matrix above) --------------------
+    def _reset_backend(self, database_url, backend):
+        prev = os.environ.get("DATABASE_URL")
+
+        def _set(url):
+            if url is None:
+                os.environ.pop("DATABASE_URL", None)
+            else:
+                os.environ["DATABASE_URL"] = url
+
+        _set(database_url)
+        try:
+            self.srv.STATE.reset(seed=False)
+        finally:
+            _set(prev)
+
+        def _restore_memory():
+            _set(None)
+            try:
+                self.srv.STATE.reset(seed=False)
+            finally:
+                _set(prev)
+
+        self.addCleanup(_restore_memory)
+        # Prove the store REALLY is the one this variant claims, before
+        # asserting anything: a race test that silently ran on InMemoryStore
+        # while believing it covered PostgreSQL would look green throughout.
+        live = self.srv.STATE.api.store
+        if backend == "memory":
+            self.assertIsInstance(live, InMemoryStore, type(live).__name__)
+        else:
+            self.assertIsInstance(live, SqlStore, type(live).__name__)
+            self.assertEqual(live.backend, backend,
+                             f"the {backend} variant is running on "
+                             f"{live.backend!r}")
+
+    def _client(self):
+        return urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(CookieJar()))
+
+    def _raw(self, opener, method, path, body=None):
+        url = f"http://127.0.0.1:{self.port}{path}"
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method)
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        try:
+            with opener.open(req) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+
+    def _post(self, opener, path, body):
+        status, raw = self._raw(opener, "POST", path, body)
+        return status, json.loads(raw or b"{}"), raw
+
+    def _account(self, username, role):
+        account = self.srv.STATE.api.accounts.create_account(
+            username, "targetauth-pw", role, scope={}, actor_id="test_seed")
+        opener = self._client()
+        status, resp, _ = self._post(opener, "/api/auth/login",
+                                     {"username": username,
+                                      "password": "targetauth-pw"})
+        self.assertEqual(status, 200, (username, resp))
+        return opener, account.id
+
+    def _select(self, opener, program_id, season_id=None):
+        body = {"program_id": program_id}
+        if season_id is not None:
+            body["season_id"] = season_id
+        status, resp, _ = self._post(opener, "/api/context", body)
+        self.assertEqual(status, 200, (body, resp))
+        self.assertEqual(resp.get("program", {}).get("id"), program_id, resp)
+        if season_id is not None:
+            self.assertEqual((resp.get("season") or {}).get("id"), season_id,
+                             resp)
+        return resp
+
+    def _ok(self, opener, path, body, why=""):
+        status, resp, _ = self._post(opener, path, body)
+        self.assertEqual(status, 200, (why or path, body, resp))
+        self.assertNotIn("error", resp, (why or path, resp))
+        return resp
+
+    def _audit_rows(self):
+        return len(self.srv.STATE.api.store.all_setup_audit())
+
+    # -- the two Programs ---------------------------------------------------
+    def _build(self, backend, database_url):
+        """Program A (the caller's) and Program B (the concurrent winner's),
+        each with a Season, a League and their LeagueSeason binding."""
+        self._reset_backend(database_url, backend)
+        self.backend = backend
+        self.database_url = database_url
+        self.openers, self.uids, self.worlds = {}, {}, {}
+        for tag, name in ((self.OWNER_A, "A"), (self.OWNER_B, "B")):
+            opener, uid = self._account(f"{tag}_{backend}", Role.LEAGUE_ADMIN)
+            self.openers[tag], self.uids[tag] = opener, uid
+            program = self._ok(opener, "/api/v2/setup/program",
+                               {"name": f"TA-race {name} Program"})
+            self._select(opener, program["id"])
+            season = self._ok(opener, "/api/v2/setup/season",
+                              {"program_id": program["id"],
+                               "name": f"TA-race {name} Season"})
+            self._select(opener, program["id"], season["id"])
+            league = self._ok(opener, "/api/v2/setup/league",
+                              {"season_id": season["id"],
+                               "name": f"TA-race {name} League"})
+            binding = self.srv.STATE.api.store.league_season_for(
+                league["id"], season["id"])
+            self.assertIsNotNone(binding, "fixture: the League/Season binding")
+            self.worlds[tag] = {"program": program["id"],
+                                "season": season["id"],
+                                "league": league["id"],
+                                "league_season": binding.id}
+
+    # -- the deterministic barrier -----------------------------------------
+    def _writer_store(self):
+        """The connection the CONCURRENT writer commits on.
+
+        PostgreSQL gets a SECOND, REAL ``SqlStore`` — a genuinely independent
+        connection and transaction, which is the only way to prove the guard
+        rather than the process lock. Memory and SQLite are single-connection
+        stores by construction (a second ``SqlStore(":memory:")`` would be a
+        different, empty database), so the writer commits on the live store;
+        the request is paused OUTSIDE the guard's transaction, so nothing is
+        held and the write really does land inside the window."""
+        if self.backend == "postgres":
+            store = SqlStore(self.database_url)
+            self.addCleanup(store.close)
+            return store
+        return self.srv.STATE.api.store
+
+    def _race(self, opener, path, body, concurrent_write):
+        """POST ``path``, pause between the preflight and the atomic section,
+        run ``concurrent_write(writer_store)`` to completion, release.
+
+        Returns ``(status, decoded, raw)``. Deterministic: two Events, no
+        sleeps and no polling — the request cannot proceed until the writer has
+        committed, and the writer cannot start until the request has been
+        authorized against the pre-move world."""
+        api = self.srv.STATE.api
+        authorized = threading.Event()
+        released = threading.Event()
+        orig = api.setup_guarded_mutation
+        entered = []
+
+        def paused(*a, **k):
+            # Entry = the handler's preflight has ALREADY authorized every
+            # target and no transaction is open yet. This is the exact window
+            # the blocker describes.
+            entered.append(True)
+            authorized.set()
+            self.assertTrue(released.wait(20), "the writer never released")
+            return orig(*a, **k)
+
+        api.setup_guarded_mutation = paused
+        self.addCleanup(lambda: setattr(api, "setup_guarded_mutation", orig)
+                        if api.setup_guarded_mutation is paused else None)
+        out = {}
+
+        def run():
+            out["r"] = self._post(opener, path, body)
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        self.assertTrue(
+            authorized.wait(20),
+            "the request never reached the guard -- it was refused by the "
+            "preflight, so this test proved nothing about the race")
+        concurrent_write(self._writer_store())      # committed in the window
+        released.set()
+        thread.join(30)
+        self.assertFalse(thread.is_alive(), "the guarded request never returned")
+        api.setup_guarded_mutation = orig
+        self.assertTrue(entered, "the barrier never fired")
+        return out["r"]
+
+    def _assert_refused(self, result, label, record_id, leaked, why):
+        """The refusal contract: generic not-found, byte-identical to a
+        nonexistent id, and not one field of the moved record echoed back."""
+        status, resp, raw = result
+        self.assertEqual(status, 404, (why, resp))
+        self.assertEqual(
+            resp, {"error": {"code": "not_found",
+                             "message": f"{label} {record_id} not found."}},
+            (why, resp))
+        for secret in leaked:
+            self.assertNotIn(
+                secret.encode(), raw,
+                f"{why}: the response SERIALIZED a field of the record that "
+                f"had already moved into Program B ({secret!r})")
+
+    # ----------------------------------------------------------------------
+    # Race 1 — the owner's verbatim repro: a delete authorized while the Venue
+    # belonged to Program A, with the move to Program B committing in between.
+    # ----------------------------------------------------------------------
+    def _run_venue_delete_race(self, database_url, backend):
+        self._build(backend, database_url)
+        owner = self.openers[self.OWNER_A]
+        a, b = self.worlds[self.OWNER_A], self.worlds[self.OWNER_B]
+        # The LEGACY Venue.league_id bridge holds a PROGRAM id: the one Venue
+        # shape that is both LINKED to a Program and still deletable (a
+        # SeasonVenueAccess grant is itself a delete blocker).
+        venue = self._ok(owner, "/api/setup/venue",
+                         {"name": "TA-race Arena", "league_id": a["program"]})
+        store = self.srv.STATE.api.store
+        self.assertEqual(store.get_venue(venue["id"]).league_id, a["program"],
+                         "fixture: the Venue starts in Program A")
+
+        def move_to_b(writer):
+            row = writer.get_venue(venue["id"])
+            row.league_id = b["program"]
+            writer.save_venue(row)              # committed: autocommit store
+
+        before_audit = self._audit_rows()
+        result = self._race(owner, f"/api/v2/setup/venue/{venue['id']}/delete",
+                            {}, move_to_b)
+        self._assert_refused(
+            result, "Venue", venue["id"], ("TA-race Arena", b["program"]),
+            f"[{backend}] a Program-A delete authorized BEFORE the move still "
+            f"deleted the Venue out of Program B")
+        row = store.get_venue(venue["id"])
+        self.assertIsNotNone(
+            row, f"[{backend}] Program B's Venue row was deleted by a request "
+                 f"that was only ever authorized against Program A")
+        self.assertEqual(row.league_id, b["program"],
+                         f"[{backend}] Program B's row was modified")
+        self.assertEqual(self._audit_rows(), before_audit,
+                         f"[{backend}] the refused delete wrote an audit row")
+
+    def test_venue_delete_race_memory(self):
+        self._run_venue_delete_race(None, "memory")
+
+    def test_venue_delete_race_sqlite(self):
+        self._run_venue_delete_race(":memory:", "sqlite")
+
+    @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                         "PostgreSQL required (set TEST_DATABASE_URL)")
+    def test_venue_delete_race_postgres(self):
+        self._run_venue_delete_race(os.environ["TEST_DATABASE_URL"],
+                                    "postgres")
+
+    # ----------------------------------------------------------------------
+    # Race 2 — a BRIDGE row. A SeasonTeamRegistration carries no Program of its
+    # own and is judged by its LeagueSeason. That parent lookup used to run
+    # outside even the authorization transaction, so re-pointing it was the
+    # cheapest way through the gate.
+    # ----------------------------------------------------------------------
+    def _run_bridge_parent_race(self, database_url, backend):
+        self._build(backend, database_url)
+        owner = self.openers[self.OWNER_A]
+        a, b = self.worlds[self.OWNER_A], self.worlds[self.OWNER_B]
+        club = self._ok(owner, "/api/v2/setup/club", {"name": "TA-race Club"})
+        team = self._ok(owner, "/api/v2/setup/team",
+                        {"club_id": club["id"], "league_id": a["league"],
+                         "name": "TA-race Team"})
+        registration = self._ok(
+            owner, f"/api/v2/setup/seasons/{a['season']}/team-registrations",
+            {"team_id": team["id"], "league_id": a["league"]})
+        store = self.srv.STATE.api.store
+        self.assertEqual(
+            store.get_season_team_registration(
+                registration["id"]).league_season_id,
+            a["league_season"], "fixture: the registration starts under A")
+
+        def repoint_to_b(writer):
+            row = writer.get_season_team_registration(registration["id"])
+            row.league_season_id = b["league_season"]
+            row.league_id = b["league"]
+            writer.save_season_team_registration(row)
+
+        before_audit = self._audit_rows()
+        result = self._race(
+            owner,
+            f"/api/v2/setup/season-team-registration/{registration['id']}"
+            f"/remove", {}, repoint_to_b)
+        self._assert_refused(
+            result, "Registration", registration["id"],
+            (b["league_season"], b["league"]),
+            f"[{backend}] a registration re-pointed at Program B's "
+            f"LeagueSeason was still mutated by the Program-A request")
+        row = store.get_season_team_registration(registration["id"])
+        self.assertEqual(row.league_season_id, b["league_season"],
+                         f"[{backend}] Program B's bridge parent was changed")
+        self.assertTrue(row.active,
+                        f"[{backend}] the registration was deactivated anyway "
+                        f"-- the mutation ran against Program B's row")
+        self.assertEqual(self._audit_rows(), before_audit,
+                         f"[{backend}] the refused remove wrote an audit row")
+
+    def test_bridge_parent_race_memory(self):
+        self._run_bridge_parent_race(None, "memory")
+
+    def test_bridge_parent_race_sqlite(self):
+        self._run_bridge_parent_race(":memory:", "sqlite")
+
+    @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                         "PostgreSQL required (set TEST_DATABASE_URL)")
+    def test_bridge_parent_race_postgres(self):
+        self._run_bridge_parent_race(os.environ["TEST_DATABASE_URL"],
+                                     "postgres")
+
+    # ----------------------------------------------------------------------
+    # Race 3 — a reassign's DESTINATION end. Both ends of a move are gated, so
+    # both must be locked and re-judged: a destination that leaves the caller's
+    # Program mid-request would otherwise receive the moved record.
+    # ----------------------------------------------------------------------
+    def _run_reassign_destination_race(self, database_url, backend):
+        self._build(backend, database_url)
+        owner = self.openers[self.OWNER_A]
+        a, b = self.worlds[self.OWNER_A], self.worlds[self.OWNER_B]
+        source_venue = self._ok(owner, "/api/setup/venue",
+                                {"name": "TA-race Source Venue",
+                                 "league_id": a["program"]})
+        rink = self._ok(owner, "/api/v2/setup/rink",
+                        {"venue_id": source_venue["id"],
+                         "name": "TA-race Rink"})
+        destination = self._ok(owner, "/api/setup/venue",
+                               {"name": "TA-race Destination Venue",
+                                "league_id": a["program"]})
+
+        def move_destination_to_b(writer):
+            row = writer.get_venue(destination["id"])
+            row.league_id = b["program"]
+            writer.save_venue(row)
+
+        store = self.srv.STATE.api.store
+        before_audit = self._audit_rows()
+        result = self._race(
+            owner, f"/api/v2/setup/rink/{rink['id']}/assign-venue",
+            {"venue_id": destination["id"]}, move_destination_to_b)
+        self._assert_refused(
+            result, "Venue", destination["id"],
+            ("TA-race Destination Venue", b["program"]),
+            f"[{backend}] a Rink was reassigned INTO a Venue that had already "
+            f"moved to Program B")
+        self.assertEqual(
+            store.get_rink(rink["id"]).venue_id, source_venue["id"],
+            f"[{backend}] the Rink was moved even though the refusal was sent")
+        self.assertEqual(self._audit_rows(), before_audit,
+                         f"[{backend}] the refused reassign wrote an audit row")
+
+    def test_reassign_destination_race_memory(self):
+        self._run_reassign_destination_race(None, "memory")
+
+    def test_reassign_destination_race_sqlite(self):
+        self._run_reassign_destination_race(":memory:", "sqlite")
+
+    @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                         "PostgreSQL required (set TEST_DATABASE_URL)")
+    def test_reassign_destination_race_postgres(self):
+        self._run_reassign_destination_race(os.environ["TEST_DATABASE_URL"],
+                                            "postgres")
+
+
+class SetupGuardedMutationContractTest(unittest.TestCase):
+    """The three contracts ``setup_guarded_mutation`` rests on, on every store.
+
+    They are asserted directly because each is invisible in a passing route
+    test but fatal if it regresses:
+
+    1. **Reentrant isolation.** The guard opens ONE transaction at the
+       strongest level any participant needs (SERIALIZABLE, for the context
+       selector's #159 linearizability) and the participants then ask for their
+       own — SERIALIZABLE again, and REPEATABLE READ for the chain walk. A join
+       asking for the SAME or a WEAKER level is already satisfied and must
+       join; one asking for MORE cannot retro-raise an open transaction and
+       must still raise, or an inner guarantee would be silently downgraded.
+    2. **Identity-less callers stay untouched.** ``role is None`` (the legacy
+       internal callers, the demo/full seeds, the acceptance harnesses) must
+       run completely ungated, open no transaction and take no lock, so they
+       can never be made to wait on — or deadlock with — anybody.
+    3. **An error response rolls back.** The facade's ``@catch`` turns a domain
+       error into a dict INSIDE the guard's transaction, and a nested
+       ``transaction()`` only joins rather than rolling back, so without an
+       explicit rollback a half-applied mutation would commit under an error
+       body. Before the guard the facade owned the outermost transaction and
+       got that rollback from the store; it must still get it.
+    """
+
+    ACTOR = "user_guard_contract"
+
+    def test_a_nested_join_may_not_raise_the_isolation(self):
+        for backend, store in _backends():
+            with self.subTest(backend=backend):
+                if isinstance(store, SqlStore):
+                    with store.transaction(isolation="SERIALIZABLE"):
+                        with store.transaction(isolation="SERIALIZABLE"):
+                            with store.transaction(isolation="REPEATABLE READ"):
+                                with store.transaction():
+                                    pass
+                    with self.assertRaises(RuntimeError):
+                        with store.transaction(isolation="REPEATABLE READ"):
+                            with store.transaction(isolation="SERIALIZABLE"):
+                                pass
+                    with self.assertRaises(RuntimeError):
+                        with store.transaction():
+                            with store.transaction(isolation="REPEATABLE READ"):
+                                pass
+                    self.assertEqual(store._txn_depth, 0)
+                    self.assertIsNone(store._txn_isolation)
+                else:
+                    # The in-memory store documents isolation as a no-op: its
+                    # process-wide lock already gives the strongest level.
+                    with store.transaction(isolation="SERIALIZABLE"):
+                        with store.transaction(isolation="REPEATABLE READ"):
+                            pass
+                _close(store)
+
+    def test_an_identityless_caller_opens_no_transaction_and_takes_no_lock(self):
+        for backend, store in _backends():
+            with self.subTest(backend=backend):
+                api = ApiService(store)
+                world = _facade_world(api, store, "A", self.ACTOR)
+                seen = {}
+
+                def mutation():
+                    seen["depth"] = store._txn_depth
+                    return {"ran": True}
+
+                payload, refused = api.setup_guarded_mutation(
+                    [("venue", world["venue"], "scope")], mutation,
+                    None, None, {})
+                self.assertEqual(payload, {"ran": True},
+                                 f"[{backend}] the ungated mutation did not run")
+                self.assertIsNone(refused, backend)
+                self.assertEqual(
+                    seen["depth"], 0,
+                    f"[{backend}] an identity-less caller was wrapped in a "
+                    f"transaction it never asked for -- the path that must "
+                    f"stay lock-free and deadlock-free")
+                _close(store)
+
+    def test_an_error_payload_rolls_the_whole_unit_back(self):
+        for backend, store in _backends():
+            with self.subTest(backend=backend):
+                api = ApiService(store)
+                world = _facade_world(api, store, "A", self.ACTOR)
+                api.set_active_context(self.ACTOR, Role.LEAGUE_ADMIN, {},
+                                       world["program"], world["season"])
+                planted = f"club_planted_{backend}"
+
+                def mutation():
+                    # A write the facade would have rolled back when IT owned
+                    # the outermost transaction, followed by the error dict its
+                    # own @catch produces.
+                    api.setup._audit("club_created", "club", planted,
+                                     self.ACTOR, None)
+                    return {"error": {"code": "validation_error",
+                                      "message": "nope"}}
+
+                before = len(store.all_setup_audit())
+                payload, refused = api.setup_guarded_mutation(
+                    [("venue", world["venue"], "scope")], mutation,
+                    self.ACTOR, Role.LEAGUE_ADMIN, {})
+                self.assertIsNone(refused, backend)
+                self.assertEqual(payload["error"]["code"], "validation_error",
+                                 (backend, payload))
+                self.assertEqual(
+                    len(store.all_setup_audit()), before,
+                    f"[{backend}] the mutation's write COMMITTED under an "
+                    f"error response -- the nested transaction only joined, so "
+                    f"nothing rolled it back")
+                _close(store)

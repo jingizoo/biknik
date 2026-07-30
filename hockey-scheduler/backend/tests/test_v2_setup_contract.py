@@ -110,20 +110,33 @@ class V2SetupContractTest(unittest.TestCase):
                        "season_id": resp["id"]})
         return resp
 
-    def _select(self, c, program_id):
-        """Make ``program_id`` this caller's PERSISTED active context (#369).
+    def _select(self, c, program_id, season_id=None):
+        """Make ``program_id`` (and optionally ``season_id``) this caller's
+        PERSISTED active context (#369).
 
         A setup mutation that names an EXISTING record is authorized against the
-        active Program, not merely against the caller's role — holding
+        active context, not merely against the caller's role — holding
         MANAGE_SETUP does not confer authority over every record in the
         installation. So a test that builds a fresh Program and then deletes,
         reassigns or edits records under it has to SAY so; otherwise the admin
         is still sitting in whichever Program resolved first and every one of
         those mutations is correctly refused as not-found.
+
+        ``season_id`` matters for the same reason one axis down (#369
+        re-review): a SEASON-BOUND target — a venue-access grant, a
+        registration, a Division, a LeagueSeason — is judged against the ACTIVE
+        SEASON too, and a Program-only context fails closed against it. Passing
+        the Season is how a test says which Season it is working in; the guard
+        is never relaxed to accommodate a test that did not say.
         """
-        status, ctx = self._req(c, "POST", "/api/context",
-                                {"program_id": program_id})
+        body = {"program_id": program_id}
+        if season_id is not None:
+            body["season_id"] = season_id
+        status, ctx = self._req(c, "POST", "/api/context", body)
         self.assertEqual(status, 200, ctx)
+        if season_id is not None:
+            self.assertEqual((ctx.get("season") or {}).get("id"), season_id,
+                             ctx)
         return ctx
 
     def _program(self, c, body):
@@ -877,7 +890,7 @@ class V2SetupContractTest(unittest.TestCase):
                             "operator_organization_id": org["id"]})
         season2 = self._v2(c, "season",
                           {"program_id": program2["id"], "name": "SVA Season 2"})
-        self._select(c, program2["id"])
+        self._select(c, program2["id"], season2["id"])
         status, granted3 = self._req(
             c, "POST", f"/api/v2/setup/seasons/{season2['id']}/venue-access",
             {"venue_id": venue["id"]})
@@ -894,7 +907,7 @@ class V2SetupContractTest(unittest.TestCase):
         # -- remove deactivates; not-found and missing-venue_id are reported --
         # Back to the Program that owns `granted` — the remove below targets
         # SVA Prog's grant, and SVA Prog 2 is (correctly) not authorized over it.
-        self._select(c, program["id"])
+        self._select(c, program["id"], season["id"])
         status, removed = self._req(
             c, "POST",
             f"/api/v2/setup/season-venue-access/{granted['id']}/remove", {})

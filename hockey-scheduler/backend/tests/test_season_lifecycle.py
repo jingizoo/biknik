@@ -14,11 +14,13 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from http.cookiejar import CookieJar
 from http.server import ThreadingHTTPServer
 
 from helpers import BACKEND, commit_fresh_draft  # noqa: F401  (BACKEND: sys.path)
 
 from hockey_scheduler.api import ApiService
+from hockey_scheduler.domain import Role
 from hockey_scheduler.domain.enums import SeasonStatus
 from hockey_scheduler.domain.errors import (
     HasDependenciesError,
@@ -818,18 +820,49 @@ class SeasonLifecycleHttpTest(unittest.TestCase):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
 
-    def _req(self, method, path, body=None, role="league_admin"):
+    def _req(self, method, path, body=None, role="league_admin", opener=None):
         url = f"http://127.0.0.1:{self.port}{path}"
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(url, data=data, method=method,
                                      headers={"Content-Type": "application/json"})
         if role is not None:
             req.add_header("X-Demo-Role", role)
+        open_it = opener.open if opener is not None else urllib.request.urlopen
         try:
-            with urllib.request.urlopen(req) as r:
+            with open_it(req) as r:
                 return r.status, json.loads(r.read() or b"{}")
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read() or b"{}")
+
+    def _admin_holding(self, sid):
+        """A signed-in League Admin whose PERSISTED context is Season ``sid``.
+
+        REOPEN is a Season-bound mutation, so #369's target gate judges it
+        against the ACTIVE SEASON and a Program-only context fails closed. The
+        identity-less ``X-Demo-Role`` requests the rest of this class uses can
+        persist no context at all, and the deterministic fallback deliberately
+        never enters an ARCHIVED Season on its own (``ContextService._fallback``
+        — an archived Season is honored when EXPLICITLY chosen, never something
+        the system moves you into). So the reopen legs sign in and select the
+        Season while it is still active; the saved selection survives archiving,
+        which is exactly the operator flow. The guard is untouched.
+        """
+        STATE.api.accounts.create_account(
+            "lifecycle_admin", "lifecycle-pw", Role.LEAGUE_ADMIN, scope={},
+            actor_id="test_seed")
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(CookieJar()))
+        st, resp = self._req("POST", "/api/auth/login",
+                             {"username": "lifecycle_admin",
+                              "password": "lifecycle-pw"},
+                             role=None, opener=opener)
+        self.assertEqual(st, 200, resp)
+        st, ctx = self._req("POST", "/api/context",
+                            {"program_id": "p", "season_id": sid},
+                            role=None, opener=opener)
+        self.assertEqual(st, 200, ctx)
+        self.assertEqual((ctx.get("season") or {}).get("id"), sid, ctx)
+        return opener
 
     def _seed_season(self, name="S1"):
         """Seed a Program + Season straight into the live server store and
@@ -853,18 +886,21 @@ class SeasonLifecycleHttpTest(unittest.TestCase):
 
     def test_archive_reopen_contract(self):
         sid = self._seed_season()
+        admin = self._admin_holding(sid)
         # Archive (League Admin) → 200 + archived status.
         st, body = self._req("POST", f"/api/v2/setup/seasons/{sid}/archive",
-                             {"reason": "season over"})
+                             {"reason": "season over"}, role=None,
+                             opener=admin)
         self.assertEqual(st, 200, body)
         self.assertEqual(body["status"], "archived")
         # Reopen without a reason → 400 reason_required.
-        st, body = self._req("POST", f"/api/v2/setup/seasons/{sid}/reopen", {})
+        st, body = self._req("POST", f"/api/v2/setup/seasons/{sid}/reopen", {},
+                             role=None, opener=admin)
         self.assertEqual(st, 400, body)
         self.assertEqual(body["error"]["details"]["reason"], "reason_required")
         # Reopen with a reason → 200 active.
         st, body = self._req("POST", f"/api/v2/setup/seasons/{sid}/reopen",
-                             {"reason": "fix"})
+                             {"reason": "fix"}, role=None, opener=admin)
         self.assertEqual(st, 200, body)
         self.assertEqual(body["status"], "active")
 
@@ -918,9 +954,10 @@ class SeasonLifecycleHttpTest(unittest.TestCase):
     def test_reopen_rejects_nonstring_reason_over_http(self):
         for bad in (True, 5, ["x"], {"k": "v"}):
             sid = self._seed_season()
+            admin = self._admin_holding(sid)
             STATE.api.setup.archive_season(sid, actor_id="admin", reason="c")
             st, body = self._req("POST", f"/api/v2/setup/seasons/{sid}/reopen",
-                                 {"reason": bad})
+                                 {"reason": bad}, role=None, opener=admin)
             self.assertEqual(st, 400, (bad, body))
             self.assertEqual(body["error"]["details"]["reason"],
                              "invalid_reason", (bad, body))
@@ -931,9 +968,10 @@ class SeasonLifecycleHttpTest(unittest.TestCase):
 
     def test_reopen_trims_reason_over_http(self):
         sid = self._seed_season()
+        admin = self._admin_holding(sid)
         STATE.api.setup.archive_season(sid, actor_id="admin", reason="c")
         st, body = self._req("POST", f"/api/v2/setup/seasons/{sid}/reopen",
-                             {"reason": "  fixed  "})
+                             {"reason": "  fixed  "}, role=None, opener=admin)
         self.assertEqual(st, 200, body)
         self.assertEqual(body["status"], "active")
         aud = [a for a in STATE.api.store.all_setup_audit()
