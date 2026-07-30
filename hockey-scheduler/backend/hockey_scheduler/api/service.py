@@ -4900,6 +4900,80 @@ class ApiService:
         return out
 
     @catch
+    def get_venue_grant_candidates(self, season_id, user_id=None, role=None,
+                                   scope=None) -> dict:
+        """Venues that MAY be granted to ``season_id`` -- the grant-only
+        facility contract (#369 review).
+
+        This exists because the alternative failed review. The candidate list
+        was first emitted as ``grantable_venues`` on ``get_setup_overview_v2``,
+        and that turned the ordinary scoped overview into an
+        installation-wide Venue directory: ``/api/v2/setup/overview`` is gated
+        MANAGE_ARENA, the grant POST needs MANAGE_SETUP, so an Arena Manager --
+        a role that cannot perform the sharing action at all -- received every
+        linked Venue's id and name, independent of its active Program. Ordinary
+        read visibility is not write authorization, and the ceiling cannot be
+        widened for every reader to serve one capability.
+
+        So the disclosure is bound to the feature that needs it, three ways:
+
+        1. **Its own route**, gated MANAGE_SETUP -- the same permission as the
+           grant it feeds, so no role learns anything it could not already act
+           on. The overview stays Program/active-Season scoped.
+        2. **A valid destination Season**, which must resolve INTO the caller's
+           active Program. A foreign or nonexistent ``season_id`` is refused
+           identically, so this never becomes a Season oracle either.
+        3. **Candidates only**: id and name, for Venues that are either linked
+           to some Program (an established shared facility) or unlinked and
+           created by THIS caller (its own create-then-grant draft). Another
+           operator's unlinked draft is never a candidate -- that case leaked
+           in an earlier round of this work.
+
+        Deliberately NOT filtered to the active Program: a Venue already
+        linked to another Program is exactly what sharing means, and filtering
+        it out is what deadlocked the capability (once one Program holds the
+        grant, no other could obtain it). Rinks, IceSlots and every
+        competition record keep the ordinary ceiling.
+        """
+        if role is None:
+            return {"error": {"code": "forbidden",
+                              "message": "An identity is required."}}
+        program, _season, _league = self.context.resolve_with_league(
+            user_id, role, scope)
+        season = self.store.get_season(season_id) if season_id else None
+        if (program is None or season is None
+                or season.program_id != program.id):
+            raise NotFoundError(f"Season {season_id} not found.")
+        granted = {a.venue_id for a in
+                   self.store.season_venue_access_for_season(season.id)
+                   if a.active}
+        own = self._created_ids_of_type("venue", user_id)
+        out = [{"id": v.id, "name": v.name}
+               for v in self.store.all_venues()
+               if v.id not in granted            # already allowed here
+               and (self._venue_program_ids_for_grant(v) or v.id in own)]
+        return {"season_id": season.id, "candidates": out}
+
+    def _venue_program_ids_for_grant(self, venue):
+        """Program ids this Venue is linked to, for candidacy purposes.
+
+        Every ``SeasonVenueAccess`` grant counts, ACTIVE OR REVOKED -- revoking
+        deactivates the row rather than deleting it, so history still makes the
+        Venue an established facility rather than a private draft -- plus the
+        legacy ``Venue.league_id``, which despite its name stores a PROGRAM id.
+        """
+        ids = {a.season_id for a in
+               self.store.season_venue_access_for_venue(venue.id)}
+        out = set()
+        for sid in ids:
+            s = self.store.get_season(sid)
+            if s is not None:
+                out.add(s.program_id)
+        if venue.league_id:
+            out.add(venue.league_id)
+        return out
+
+    @catch
     def get_setup_overview_v2(self, user_id=None, role=None, scope=None) -> dict:
         """Canonical flat setup-entity lists for the Setup/Records UI (#233 B2a).
 
@@ -5409,43 +5483,6 @@ class ApiService:
             # endpoint rather than the v1 demo overview.
             "officials": [_official_row(o) for o in officials],
             "venues": [_venue_row(v) for v in venues],
-            # The FACILITY-TREE EXCEPTION to the Program ceiling (#369 owner
-            # ruling). Every Venue in the installation, for the single purpose
-            # of granting a Season access to one.
-            #
-            # Why an exception is needed at all: an arena serves several
-            # leagues, and `venue-sharing.js` step 4 requires the shared Venue
-            # to still be offered in Program B's Allow picker after Program A
-            # has granted itself access. Under the ceiling alone that is
-            # impossible -- once the Venue is linked to A it leaves B's scoped
-            # `venues`, and it is not `pending_link_*` either (it IS linked),
-            # so B can never grant itself the access that would make it
-            # visible. The capability deadlocks on its own first use.
-            #
-            # Why it is safe: the ceiling exists to stop one Program reading
-            # another's COMPETITION tree (Seasons/Leagues/Divisions/Teams and
-            # the personal names on Players and Officials). This list carries
-            # only a Venue id and its name -- a physical building, not
-            # anybody's data -- and deliberately does NOT extend to Rinks,
-            # IceSlots or anything in the competition tree. `venues` above
-            # stays Season-ceilinged, so what a Season USES is unchanged; this
-            # is only what it may be OFFERED.
-            #
-            # The exception covers only venues LINKED to some Program -- an
-            # established facility. A venue linked to NOTHING is some
-            # operator's private draft, and handing those across accounts is
-            # exactly the zero-Program bootstrap leak: on a Program-less
-            # install this list initially returned every pre-Program venue, so
-            # one operator received the other's arena by name. Unlinked venues
-            # stay governed by the creator-only `pending_link_venues` contract,
-            # which the client unions in for its own create-then-grant flow.
-            #
-            # Empty for the unfiltered legacy form, where `venues` is already
-            # everything.
-            "grantable_venues": ([] if not scoped else
-                                 [{"id": v.id, "name": v.name}
-                                  for v in all_venues
-                                  if v.id in linked_venue_ids]),
             "rinks": [_rink_row(r) for r in rinks],
             "ice_slots": [_slot_row(ic) for ic in
                          sorted(ice_slots, key=lambda x: (x.rink_id, x.start_time))],
@@ -6154,8 +6191,23 @@ class ApiService:
 
     @catch
     def list_season_venue_access(self, season_id: str) -> dict:
-        rows = [_serialize(a)
-                for a in self.store.season_venue_access_for_season(season_id)]
+        """This Season's venue grants, each naming its own Venue.
+
+        ``venue_name`` is additive (#369 review). A Season may hold a grant to a
+        Venue belonging to ANOTHER Program -- that is what shared arenas are --
+        and once cross-Program Venues stopped appearing in the ordinary scoped
+        overview, there was nowhere left for the client to resolve that name
+        from, so the Allowed-venues row rendered a bare id. Naming the Venue on
+        the grant that already exists is not a cross-Program directory: it
+        discloses only a facility this Season demonstrably already uses, to a
+        caller already reading that Season's grants.
+        """
+        names = {v.id: v.name for v in self.store.all_venues()}
+        rows = []
+        for a in self.store.season_venue_access_for_season(season_id):
+            row = _serialize(a)
+            row["venue_name"] = names.get(a.venue_id)
+            rows.append(row)
         return {"venue_access": rows}
 
     @catch

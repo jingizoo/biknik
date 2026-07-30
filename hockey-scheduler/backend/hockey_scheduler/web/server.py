@@ -217,6 +217,7 @@ _GET_ROUTES = [re.compile(p) for p in (
     r"^/api/setup/seasons/[^/]+/team-registrations$",
     r"^/api/onboarding/status$",
     r"^/api/v2/setup/overview$",
+    r"^/api/v2/setup/seasons/[^/]+/venue-candidates$",  # #369 grant candidates
     r"^/api/v2/setup/hierarchy$",
     r"^/api/v2/setup/progress$",
     r"^/api/v2/setup/programs/[^/]+/teams$",
@@ -1087,6 +1088,26 @@ class Handler(BaseHTTPRequestHandler):
                 scope_type=(qs.get("scope_type") or [None])[0],
                 scope_id=(qs.get("scope_id") or [None])[0],
                 season_id=(qs.get("season_id") or [None])[0]))
+
+        # #369 review: grant CANDIDATES for one destination Season -- the only
+        # facility contract that reaches across the Program ceiling, and the
+        # reason it is its own route rather than a field on the overview below.
+        # The overview is MANAGE_ARENA; this is MANAGE_SETUP, the same
+        # permission as the grant it feeds, so no role learns a Venue it could
+        # not already act on. Emitting these on the overview meant an Arena
+        # Manager received every linked Venue's id and name while being unable
+        # to grant anything.
+        mvc = re.match(r"^/api/v2/setup/seasons/([^/]+)/venue-candidates$", path)
+        if mvc:
+            guard = f"/api/v2/setup/seasons/{mvc.group(1)}/venue-candidates"
+            if self._operator_only(guard):
+                return
+            role, scope, user_id, err = self._resolve_role()
+            if err is not None:
+                code, payload = err
+                return self._send_json(payload, code)
+            return self._send_api(api.get_venue_grant_candidates(
+                mvc.group(1), user_id, role, scope))
 
         if path == "/api/v2/setup/overview":
             # Canonical flat setup-entity lists for the Setup/Records UI (#233

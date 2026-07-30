@@ -521,13 +521,12 @@ both APIs, and a table-completeness check so a relation dropped from
 assertion that previously required only that the probe creates come back with
 the name withheld.
 
-## The facility-tree exception (venue sharing)
+## The grant-only facility contract (venue sharing)
 
 The ceiling governs the **competition** tree — Seasons, Leagues, Divisions,
 Teams, and the personal names on Players and Officials. The facility tree
 (Organization → Venue → Rink → IceSlot) is joined to it only by
-`SeasonVenueAccess`, and there the ceiling alone produced a **deadlock**, not
-just a restriction:
+`SeasonVenueAccess`, and there the ceiling alone produced a **deadlock**:
 
 > An arena serves several leagues. Once Program A grants itself access to one,
 > that Venue is linked to A and therefore leaves Program B's scoped `venues` —
@@ -535,30 +534,45 @@ just a restriction:
 > never grant itself the access that would have made it visible. The capability
 > fails on its own first use.
 
-`venue-sharing.js` step 4 requires that grant explicitly. So
-`get_setup_overview_v2` emits one additional list, `grantable_venues`, for the
-single purpose of offering a Venue to a Season.
+**The first fix for this was wrong, and the reason is the point of this
+section.** It added a `grantable_venues` field to `get_setup_overview_v2`.
+But `/api/v2/setup/overview` is gated `MANAGE_ARENA` while the grant POST needs
+`MANAGE_SETUP` — so an Arena Manager, a role that *cannot perform the sharing
+action at all*, received every linked Venue's id and name regardless of its
+active Program. The disclosure was not bounded to the feature that needed it,
+and ordinary read visibility had quietly become write authorization.
 
-Its **width is the whole risk**, and is bounded on three sides:
+So the candidate list lives on its own route:
+
+`GET /api/v2/setup/seasons/<season_id>/venue-candidates` → `MANAGE_SETUP`
+
+bounded four ways:
 
 | bound | why |
 | --- | --- |
-| id + name only | a physical building's existence, not anybody's data. No address, timezone, owner, or legacy Program link. |
-| **linked** venues only | a Venue linked to no Program is some operator's private draft, governed by the creator-only `pending_link_venues` contract. The first version of this list returned *every* Venue and leaked one operator's never-linked arena to another on a Program-less install — caught by `test_zero_program_bootstrap_scoping`. |
-| stops at the Venue | Rinks, IceSlots and every competition-tree list stay ceilinged. |
+| its own `MANAGE_SETUP` route | the same permission as the grant it feeds, so no role learns a Venue it could not already act on |
+| a valid destination Season, inside the active Program | a foreign or nonexistent `season_id` is refused identically, so this is not a Season oracle either |
+| id + name only | a physical building's existence, not anybody's data |
+| **linked** venues, or the caller's **own** unlinked draft | another operator's never-linked Venue is a private draft governed by the creator-only `pending_link_venues` contract. An earlier revision returned every Venue and leaked one operator's arena to another on a Program-less install. |
 
-`venues` itself is unchanged and still Season-ceilinged: what a Season **uses**
-is not widened, only what it may be **offered**. The client unions
-`grantable_venues` with its own scoped and pending lists, so a Venue the
-operator just created — linked to nothing yet, and deliberately absent from
-`grantable_venues` — still reaches its own picker.
+Already-granted Venues are deliberately **not** candidates, so
+`list_season_venue_access` names its own Venue (`venue_name`, additive): a
+cross-Program Venue this Season already uses has nowhere else to resolve its
+name from, and the Allowed-venues row would otherwise render a bare id. Naming
+a facility a Season demonstrably already uses, to a caller already reading that
+Season's grants, is not a directory.
 
-Empty for the identity-less legacy form, where `venues` is already everything.
+`get_setup_overview_v2` is unchanged and fully ceilinged — it carries no
+candidate list at all.
 
-Regression: `backend/tests/test_facility_tree_exception.py` — pins the feature,
-each of the three bounds, the context flip, and the unlinked-draft case, all
-mutation-proven in both directions (exception absent → sharing deadlocks;
-exception widened → the width assertions fail).
+Regression: `backend/tests/test_facility_tree_exception.py` — the ordinary
+overview enumerating no foreign Venue for League Admin, Arena Manager and a
+zero-scope identity with Program B active; the candidate set across active,
+revoked-only and legacy links plus another creator's draft; identical refusal
+for foreign and nonexistent Seasons; the `MANAGE_SETUP` boundary at the route;
+and zero grant/audit mutation on a refused read. Mutation-proven: gating the
+route `MANAGE_ARENA` fails with *"an Arena Manager reached the grant-candidate
+contract"*, and dropping the Season ceiling fails the oracle assertions.
 
 ## Venues have no League axis
 

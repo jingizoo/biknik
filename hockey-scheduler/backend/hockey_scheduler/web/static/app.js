@@ -117,6 +117,7 @@ let allPermLeagues = [];            // [{id,name,programName}] across all progra
 let teamPermLeague = {};            // team_id -> {id,name} permanent League (#283 Slice E)
 let seasonRegs = {};                // season_id -> [{id,team_id,league_id,division_id,active}] registrations (#180/#233 v2)
 let seasonVenueAccess = {};         // season_id -> [{id,season_id,venue_id,active}] (#233 Slice E)
+let seasonVenueCandidates = {};     // season_id -> [{id,name}] grantable Venues (#369; MANAGE_SETUP-gated route)
 let leagueDivisions = {};           // league_id -> [{id,name,...}] — cascade data for the League→Division
                                      // selects in Season participation / Rollover (#233 Slice B2b), populated
                                      // each render from hv and read by the onchange handlers that rescope a
@@ -2636,14 +2637,17 @@ function renderSeasonParticipation(hv, ov, sv) {
   // pending-link venues -- a Venue it just created is linked to nothing yet, so
   // it is deliberately absent from `grantable_venues` (that list must not carry
   // other operators' unlinked drafts) and comes in through the union instead.
-  const grantableVenues = (() => {
+  // Per-Season grant candidates, unioned with this caller's own scoped and
+  // pending-link venues. Keyed by Season because the contract is per
+  // destination Season -- see get_venue_grant_candidates.
+  const grantableFor = (seasonId) => {
     const seen = new Set();
     const out = [];
-    for (const v of ((sv && sv.grantable_venues) || []).concat(allVenues)) {
+    for (const v of (seasonVenueCandidates[seasonId] || []).concat(allVenues)) {
       if (v && v.id && !seen.has(v.id)) { seen.add(v.id); out.push(v); }
     }
     return out;
-  })();
+  };
 
   const programBlocks = programs.map((program) => {
     const permanentTeams = leagueTeams[program.id] || [];
@@ -2732,8 +2736,24 @@ function renderSeasonParticipation(hv, ov, sv) {
       // Season-ceilinged `venues` -- and the "Allowed venues" row must still
       // name it rather than showing a bare id.
       const venueNameById = {};
-      grantableVenues.forEach((v) => { venueNameById[v.id] = v.name; });
+      const grantable = grantableFor(s.id);
+      grantable.forEach((v) => { venueNameById[v.id] = v.name; });
       allVenues.forEach((v) => { venueNameById[v.id] = v.name; });
+      // A Venue this Season ALREADY holds a grant to is deliberately not a
+      // candidate, and a cross-Program one is not in the scoped `venues`
+      // either -- so the grant row itself is the only place its name survives.
+      (seasonVenueAccess[s.id] || []).forEach((a) => {
+        if (a.venue_name && !venueNameById[a.venue_id]) {
+          venueNameById[a.venue_id] = a.venue_name;
+        }
+      });
+      // A Venue this Season ALREADY holds a grant to is deliberately not a
+      // candidate, so its name comes from the grant row itself -- which
+      // matters for a shared arena owned by another Program, whose name is in
+      // neither the scoped venue list nor the candidate list.
+      (seasonVenueAccess[s.id] || []).forEach((a) => {
+        if (a.venue_name) venueNameById[a.venue_id] = a.venue_name;
+      });
       const grantedAccess = (seasonVenueAccess[s.id] || []).filter((a) => a.active);
       const grantedVenueIds = new Set(grantedAccess.map((a) => a.venue_id));
       const venueAccessRows = grantedAccess.map((a) => `<div class="tn-leaf reg-row">
@@ -2741,14 +2761,14 @@ function renderSeasonParticipation(hv, ov, sv) {
           <button class="icon-btn danger" data-va-revoke="${esc(a.id)}"
             title="Revoke venue access" aria-label="Revoke ${esc(venueNameById[a.venue_id] || a.venue_id)} from ${esc(s.name)}">${ICONS.circleMinus}</button></div>`).join("")
         || `<div class="tn-empty">No venues allowed for this season yet — games can't be scheduled until one is added.</div>`;
-      const availableVenues = grantableVenues.filter(
+      const availableVenues = grantable.filter(
         (v) => !grantedVenueIds.has(v.id));
       const venueAddCtl = availableVenues.length
         ? `<div class="tn-leaf reg-add">
             <select id="va-add-${esc(s.id)}"><option value="">Add a venue…</option>${
               availableVenues.map((v) => opt(v.id, v.name)).join("")}</select>
             <button class="act primary" data-va-add="${esc(s.id)}">Allow</button></div>`
-        : (grantableVenues.length
+        : (grantable.length
             ? `<div class="tn-empty">Every venue is already allowed for this season.</div>`
             : `<div class="tn-empty">Create a venue on the Facility tree first, then allow it here.</div>`);
       const venueAccessSection = `<details class="tn" open><summary class="tn-sum">
@@ -6782,6 +6802,17 @@ async function render() {
           const va = await getJSON(`/api/v2/setup/seasons/${s.id}/venue-access`);
           if (contextRevision !== myRenderContext) return;  // superseded
           seasonVenueAccess[s.id] = (va && va.venue_access) || [];
+          // Grant CANDIDATES for this Season (#369 review): its own
+          // MANAGE_SETUP-gated route, not a field on the overview. The
+          // candidate list is the one facility contract that reaches across the
+          // Program ceiling, so it is fetched only where it is used and only by
+          // a caller that could actually perform the grant -- an Arena Manager
+          // gets a 403 here and simply has no picker, rather than being handed
+          // every linked Venue in the installation by the overview.
+          const vc = await getJSON(
+            `/api/v2/setup/seasons/${s.id}/venue-candidates`);
+          if (contextRevision !== myRenderContext) return;  // superseded
+          seasonVenueCandidates[s.id] = (vc && vc.candidates) || [];
         }
       }
     }
