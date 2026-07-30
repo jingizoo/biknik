@@ -65,7 +65,9 @@ earlier round), and the SEASON argument of the same route stays generic.
 
 import json
 import os
+import tempfile
 import threading
+import time as _time
 import unittest
 import urllib.error
 import urllib.request
@@ -3741,3 +3743,897 @@ class SetupGuardedMutationContractTest(unittest.TestCase):
                     f"error response -- the nested transaction only joined, so "
                     f"nothing rolled it back")
                 _close(store)
+
+
+# ==========================================================================
+# Parent-axis CONSISTENCY (#369 re-review 2, blocking fail-open).
+#
+# The edge resolver trusted each record's independently persisted parent
+# references without checking that they AGREE. The columns involved are
+# separate FKs with no database constraint tying them together — nothing stops
+# a persisted Team from carrying ``program_id = A`` while its ``league_id``
+# names a League in Program B, or an A-Season LeagueSeason from naming the B
+# League. Legacy data, imports, migrations or a prior partial write can all
+# produce these shapes. Under Program A / Season A / **No League** the League
+# comparison is legitimately skipped (No League = the approved Program +
+# active-Season union), so the disagreeing edge authorized and every guarded
+# mutation that trusted it could act on a row whose persisted parent graph
+# crosses the Program ceiling.
+#
+# The rule now: while resolving an edge, every named parent is independently
+# resolved and the axes must be MUTUALLY CONSISTENT before the edge is
+# emitted. A found-but-inconsistent (or dangling) chain is LINKED BUT
+# UNAUTHORIZED — ``(set(), True)`` — so it can neither authorize nor fall
+# through to creator ownership / No-League union semantics.
+#
+# Every case below runs under Program A / Season A / No League — the exact
+# reproduced conditions — over authenticated HTTP, on Memory, FILE-BACKED
+# SQLite and PostgreSQL. Each corrupt shape is materialized directly in the
+# store (FK-valid: every referenced row exists), then:
+#   * the mutation must be RAW-BODY-EQUIVALENT to a nonexistent id (the
+#     ``_blind`` masking used by the route matrix),
+#   * the row and the setup audit trail must be unchanged,
+#   * a clean in-scope sibling must still succeed (so a blanket refusal
+#     cannot pass these for free).
+#
+# Mutation-proof (run manually, documented in the PR discussion): disabling
+# any one of the three consistency checks in ``_team_edges`` /
+# ``_setup_target_edges`` ("league_season", "game") makes its shape's cases
+# fail on every backend.
+# ==========================================================================
+class SetupTargetAxisConsistencyTest(unittest.TestCase):
+    """Inconsistent cross-Program parent references must fail closed."""
+
+    OWNER_A = "ax_owner_a"
+    OWNER_B = "ax_owner_b"
+
+    @classmethod
+    def setUpClass(cls):
+        srv = __import__("hockey_scheduler.web.server", fromlist=["x"])
+        cls.srv = srv
+        os.environ.pop("DATABASE_URL", None)
+        srv.STATE.reset(seed=False)
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.Handler)
+        cls.port = cls.httpd.server_address[1]
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
+                                      daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.thread.join(timeout=5)
+
+    # -- plumbing (same shape as the atomicity class above) -----------------
+    def _reset_backend(self, database_url, backend):
+        prev = os.environ.get("DATABASE_URL")
+
+        def _set(url):
+            if url is None:
+                os.environ.pop("DATABASE_URL", None)
+            else:
+                os.environ["DATABASE_URL"] = url
+
+        _set(database_url)
+        try:
+            self.srv.STATE.reset(seed=False)
+        finally:
+            _set(prev)
+
+        def _restore_memory():
+            _set(None)
+            try:
+                self.srv.STATE.reset(seed=False)
+            finally:
+                _set(prev)
+
+        self.addCleanup(_restore_memory)
+        live = self.srv.STATE.api.store
+        if backend == "memory":
+            self.assertIsInstance(live, InMemoryStore, type(live).__name__)
+        else:
+            self.assertIsInstance(live, SqlStore, type(live).__name__)
+            self.assertEqual(live.backend, backend,
+                             f"the {backend} variant is running on "
+                             f"{live.backend!r}")
+
+    def _client(self):
+        return urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(CookieJar()))
+
+    def _raw(self, opener, method, path, body=None):
+        url = f"http://127.0.0.1:{self.port}{path}"
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method)
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        try:
+            with opener.open(req) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+
+    def _post(self, opener, path, body):
+        status, raw = self._raw(opener, "POST", path, body)
+        return status, json.loads(raw or b"{}"), raw
+
+    def _account(self, username, role):
+        account = self.srv.STATE.api.accounts.create_account(
+            username, "axisconsist-pw", role, scope={}, actor_id="test_seed")
+        opener = self._client()
+        status, resp, _ = self._post(opener, "/api/auth/login",
+                                     {"username": username,
+                                      "password": "axisconsist-pw"})
+        self.assertEqual(status, 200, (username, resp))
+        return opener, account.id
+
+    def _select(self, opener, program_id, season_id=None):
+        body = {"program_id": program_id}
+        if season_id is not None:
+            body["season_id"] = season_id
+        status, resp, _ = self._post(opener, "/api/context", body)
+        self.assertEqual(status, 200, (body, resp))
+        self.assertEqual(resp.get("program", {}).get("id"), program_id, resp)
+        return resp
+
+    def _ok(self, opener, path, body, why=""):
+        status, resp, _ = self._post(opener, path, body)
+        self.assertEqual(status, 200, (why or path, body, resp))
+        self.assertNotIn("error", resp, (why or path, resp))
+        return resp
+
+    def _audit_rows(self):
+        return len(self.srv.STATE.api.store.all_setup_audit())
+
+    @staticmethod
+    def _blind(raw, record_id):
+        """The refusal bytes with the echoed id masked out — see the route
+        matrix's ``_blind``: byte-for-byte equality is the contract, because
+        any other difference is an existence oracle."""
+        return raw.replace(record_id.encode(), b"<the id the caller sent>")
+
+    def _build(self, backend, database_url):
+        """Program A (the caller's) and Program B (the foreign graph's),
+        each with a Season, a League and their LeagueSeason binding."""
+        self._reset_backend(database_url, backend)
+        self.backend = backend
+        self.openers, self.worlds = {}, {}
+        for tag, name in ((self.OWNER_A, "A"), (self.OWNER_B, "B")):
+            opener, _uid = self._account(f"{tag}_{backend}", Role.LEAGUE_ADMIN)
+            self.openers[tag] = opener
+            program = self._ok(opener, "/api/v2/setup/program",
+                               {"name": f"AX {name} Program"})
+            self._select(opener, program["id"])
+            season = self._ok(opener, "/api/v2/setup/season",
+                              {"program_id": program["id"],
+                               "name": f"AX {name} Season"})
+            self._select(opener, program["id"], season["id"])
+            league = self._ok(opener, "/api/v2/setup/league",
+                              {"season_id": season["id"],
+                               "name": f"AX {name} League"})
+            binding = self.srv.STATE.api.store.league_season_for(
+                league["id"], season["id"])
+            self.assertIsNotNone(binding, "fixture: the League/Season binding")
+            self.worlds[tag] = {"program": program["id"],
+                                "season": season["id"],
+                                "league": league["id"],
+                                "league_season": binding.id}
+
+    def _assert_foreign_equivalent(self, opener, path_for, body, label,
+                                   record_id, why):
+        """POST the mutation at the corrupt record AND at a nonexistent id;
+        the two answers must be 404 and byte-identical after masking only the
+        id the caller sent."""
+        ghost = f"{label}_does_not_exist"
+        g_status, _g_resp, g_raw = self._post(opener, path_for(ghost), body)
+        status, resp, raw = self._post(opener, path_for(record_id), body)
+        self.assertEqual(status, 404, (why, resp))
+        self.assertEqual(g_status, 404, (why, "nonexistent probe", g_raw))
+        self.assertEqual(
+            self._blind(raw, record_id), self._blind(g_raw, ghost),
+            f"{why}: the corrupt-graph refusal is distinguishable from a "
+            f"nonexistent id — an existence oracle for the foreign graph")
+
+    # -- the driver ---------------------------------------------------------
+    def _run_axis_consistency(self, database_url, backend):
+        self._build(backend, database_url)
+        owner = self.openers[self.OWNER_A]
+        a, b = self.worlds[self.OWNER_A], self.worlds[self.OWNER_B]
+        store = self.srv.STATE.api.store
+        # The exact reproduced conditions: Program A / Season A / NO League —
+        # the union context whose League comparison is legitimately skipped.
+        self._select(owner, a["program"], a["season"])
+
+        # ================= SHAPE 1: Team (+ Player propagation) ============
+        # team.program_id stays A; team.league_id is re-pointed at B's League.
+        # FK-valid: both rows exist. The axes disagree.
+        control_team = self._ok(owner, "/api/v2/setup/team",
+                                {"league_id": a["league"],
+                                 "name": "AX Control Team"})
+        corrupt_team = self._ok(owner, "/api/v2/setup/team",
+                                {"league_id": a["league"],
+                                 "name": "AX Corrupt Team"})
+        passenger = self._ok(owner, "/api/v2/setup/player",
+                             {"team_id": corrupt_team["id"],
+                              "name": "AX Passenger Player",
+                              "position": "forward"})
+        row = store.get_team(corrupt_team["id"])
+        self.assertEqual(row.program_id, a["program"],
+                         "fixture: the Team's own Program stays A")
+        row.league_id = b["league"]
+        store.save_team(row)
+
+        self._ok(owner, f"/api/v2/setup/team/{control_team['id']}/assign-club",
+                 {"club_id": None},
+                 why=f"[{backend}] clean in-scope Team control")
+
+        before = self._audit_rows()
+        self._assert_foreign_equivalent(
+            owner, lambda i: f"/api/v2/setup/team/{i}/assign-club",
+            {"club_id": None}, "team", corrupt_team["id"],
+            f"[{backend}] a Team whose league_id crosses into Program B was "
+            f"still mutable under No League")
+        after_row = store.get_team(corrupt_team["id"])
+        self.assertEqual(after_row.league_id, b["league"],
+                         f"[{backend}] the corrupt Team row was changed")
+        self.assertEqual(self._audit_rows(), before,
+                         f"[{backend}] the refused Team mutation wrote audit")
+
+        # Player propagation: the Player inherits its Team's (inconsistent)
+        # chain verbatim, so the same mutation class must refuse identically.
+        self._assert_foreign_equivalent(
+            owner, lambda i: f"/api/v2/setup/player/{i}/update",
+            {"name": "AX Renamed"}, "player", passenger["id"],
+            f"[{backend}] a Player on the inconsistent Team was still "
+            f"editable under No League")
+        self.assertEqual(store.get_player(passenger["id"]).name,
+                         "AX Passenger Player",
+                         f"[{backend}] the passenger Player was renamed")
+
+        # ================= SHAPE 2: LeagueSeason (+ Division, Registration) =
+        # A's LeagueSeason keeps season_id = A-Season but names B's League.
+        division = self._ok(owner, "/api/v2/setup/division",
+                            {"league_id": a["league"], "name": "AX Division",
+                             "season_id": a["season"]})
+        control_div = self._ok(owner, "/api/v2/setup/division",
+                               {"league_id": a["league"],
+                                "name": "AX Control Division",
+                                "season_id": a["season"]})
+        registration = self._ok(
+            owner, f"/api/v2/setup/seasons/{a['season']}/team-registrations",
+            {"team_id": control_team["id"], "league_id": a["league"]})
+        ls = store.get_league_season(a["league_season"])
+        self.assertEqual(ls.season_id, a["season"],
+                         "fixture: the LeagueSeason's Season stays A")
+        ls.league_id = b["league"]
+        store.save_league_season(ls)
+
+        before = self._audit_rows()
+        self._assert_foreign_equivalent(
+            owner, lambda i: f"/api/v2/setup/league-season/{i}/delete",
+            {}, "league_season", a["league_season"],
+            f"[{backend}] an A-Season LeagueSeason naming B's League was "
+            f"still deletable under No League")
+        self.assertIsNotNone(store.get_league_season(a["league_season"]),
+                             f"[{backend}] the corrupt LeagueSeason was "
+                             f"deleted")
+
+        self._assert_foreign_equivalent(
+            owner, lambda i: f"/api/v2/setup/division/{i}/delete",
+            {}, "division", division["id"],
+            f"[{backend}] a Division under the inconsistent LeagueSeason was "
+            f"still deletable under No League")
+        self.assertIsNotNone(store.get_division(division["id"]),
+                             f"[{backend}] the Division was deleted")
+
+        self._assert_foreign_equivalent(
+            owner,
+            lambda i: f"/api/v2/setup/season-team-registration/{i}/remove",
+            {}, "registration", registration["id"],
+            f"[{backend}] a registration judged by the inconsistent "
+            f"LeagueSeason was still removable under No League")
+        reg_row = store.get_season_team_registration(registration["id"])
+        self.assertTrue(reg_row.active,
+                        f"[{backend}] the registration was deactivated")
+        self.assertEqual(self._audit_rows(), before,
+                         f"[{backend}] a refused LeagueSeason-shape mutation "
+                         f"wrote audit")
+
+        # Repair the binding so the clean control still proves the refusals
+        # above were the CONSISTENCY check, not a blanket block.
+        ls = store.get_league_season(a["league_season"])
+        ls.league_id = a["league"]
+        store.save_league_season(ls)
+        self._ok(owner, f"/api/v2/setup/division/{control_div['id']}/delete",
+                 {}, why=f"[{backend}] clean in-scope Division control")
+
+        # ================= SHAPE 3: Game ===================================
+        # game.season_id = A-Season while game.league_id names B's League.
+        from hockey_scheduler.domain.models import Game
+        start = datetime(2027, 1, 9, 18, 0, tzinfo=timezone.utc)
+        # Draft games, so the CONTROL delete is reachable (only a draft may be
+        # deleted); the corrupt twin must be refused by the GATE, upstream of
+        # that rule.
+        control_game = Game(id=store.next_id("game"),
+                            home_team_id=control_team["id"],
+                            start_time=start,
+                            away_team_id=corrupt_team["id"],
+                            season_id=a["season"], league_id=a["league"],
+                            is_draft=True)
+        store.add_game(control_game)
+        corrupt_game = Game(id=store.next_id("game"),
+                            home_team_id=control_team["id"],
+                            start_time=start + timedelta(days=1),
+                            away_team_id=corrupt_team["id"],
+                            season_id=a["season"], league_id=b["league"],
+                            is_draft=True)
+        store.add_game(corrupt_game)
+
+        self._ok(owner, f"/api/v2/setup/game/{control_game.id}/delete", {},
+                 why=f"[{backend}] clean in-scope Game control")
+
+        before = self._audit_rows()
+        self._assert_foreign_equivalent(
+            owner, lambda i: f"/api/v2/setup/game/{i}/delete",
+            {}, "game", corrupt_game.id,
+            f"[{backend}] an A-Season Game naming B's League was still "
+            f"deletable under No League")
+        self.assertIsNotNone(store.get_game(corrupt_game.id),
+                             f"[{backend}] the corrupt Game was deleted")
+        self.assertEqual(self._audit_rows(), before,
+                         f"[{backend}] the refused Game delete wrote audit")
+
+    def test_axis_consistency_memory(self):
+        self._run_axis_consistency(None, "memory")
+
+    def test_axis_consistency_sqlite_file(self):
+        # FILE-BACKED on purpose (#369 re-review): a second connection must be
+        # able to open the same database, and ":memory:" cannot express the
+        # real cross-connection semantics this suite exists to prove.
+        tmp = tempfile.mkdtemp(prefix="hs-axis-")
+        path = os.path.join(tmp, "axis.db")
+        self._run_axis_consistency(f"sqlite:///{path}", "sqlite")
+
+    @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                         "PostgreSQL required (set TEST_DATABASE_URL)")
+    def test_axis_consistency_postgres(self):
+        self._run_axis_consistency(os.environ["TEST_DATABASE_URL"],
+                                   "postgres")
+
+
+# ==========================================================================
+# IN-TRANSACTION interleaving and the row locks (#369 re-review, blocking
+# test gap).
+#
+# `SetupTargetAtomicityTest` above pauses at `setup_guarded_mutation`'s ENTRY
+# — before the transaction opens — so it proves the second, in-transaction
+# authorization catches a move that committed BEFORE the atomic section. It
+# never puts a writer between the in-transaction decision and `mutation()`,
+# and its Memory/SQLite variants share the live store/connection, so the row
+# locks themselves were unfalsified: neutralising `_lock_setup_row()` left
+# all of its runnable cases green.
+#
+# This class closes that gap. The barrier here fires INSIDE the outer
+# SERIALIZABLE transaction — in `_authorize_setup_targets`, AFTER every named
+# row has been locked and every target authorized, and BEFORE `mutation()`
+# runs. While the request is paused there, a concurrent writer attempts to
+# move/relink a named row:
+#
+#   * PostgreSQL — a SECOND, REAL `SqlStore` connection. Its single-column
+#     UPDATE must BLOCK on the `SELECT ... FOR UPDATE` row lock and commit
+#     only after the guarded transaction does. Removing the relevant FOR
+#     UPDATE (`_lock_setup_row` → no-op) makes these cases FAIL: the writer
+#     commits mid-window, the guarded write then raises a serialization
+#     conflict, the bounded retry re-authorizes against the moved row and
+#     refuses — observed as a 404 where this test demands the linearized 200.
+#   * SQLite — a FILE-BACKED database and a second `SqlStore` connection
+#     (":memory:" cannot express cross-connection semantics at all). The
+#     writer's autocommit UPDATE needs the file's write lock; the guarded
+#     transaction's snapshot holds SHARED, so every mid-window attempt fails
+#     with the database-locked error, which the writer treats as "locked out,
+#     retry" — never surfaced raw, never a 500 — and first succeeds only
+#     after the guarded commit.
+#   * Memory — a second THREAD against the live store. Every store call takes
+#     the process-wide lock the outermost transaction holds, so the thread
+#     provably cannot interleave until the guarded unit exits.
+#
+# Each case asserts, in order: the writer did NOT commit inside the window;
+# the guarded request answered 200 (it was authorized against the world it
+# locked, and nothing moved under it); and the FINAL store state is the one
+# valid linearization — guarded mutation first, writer second. Shapes: a
+# direct target (player in-place update), a bridge row + its parent (a
+# registration remove), and a reassign DESTINATION (rink → venue).
+#
+# `_authorize_setup_targets` neutralisation is deliberately NOT this suite's
+# lock proof — that proves the in-transaction recheck is load-bearing (the
+# class above), not that the check stays atomic with the write.
+# ==========================================================================
+class SetupTargetLockAtomicityTest(unittest.TestCase):
+    """The check→mutate window is closed BY THE LOCKS, per backend."""
+
+    OWNER_A = "lk_owner_a"
+    OWNER_B = "lk_owner_b"
+    # How long a writer may keep retrying before the harness calls it hung.
+    WRITER_DEADLINE = 20.0
+    # The mid-window grace: how long the writer gets to (wrongly) commit
+    # while the guarded transaction is paused on the barrier.
+    WINDOW_GRACE = 0.4
+
+    @classmethod
+    def setUpClass(cls):
+        srv = __import__("hockey_scheduler.web.server", fromlist=["x"])
+        cls.srv = srv
+        os.environ.pop("DATABASE_URL", None)
+        srv.STATE.reset(seed=False)
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.Handler)
+        cls.port = cls.httpd.server_address[1]
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
+                                      daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.thread.join(timeout=5)
+
+    # -- plumbing (same shape as the classes above) -------------------------
+    def _reset_backend(self, database_url, backend):
+        prev = os.environ.get("DATABASE_URL")
+
+        def _set(url):
+            if url is None:
+                os.environ.pop("DATABASE_URL", None)
+            else:
+                os.environ["DATABASE_URL"] = url
+
+        _set(database_url)
+        try:
+            self.srv.STATE.reset(seed=False)
+        finally:
+            _set(prev)
+
+        def _restore_memory():
+            _set(None)
+            try:
+                self.srv.STATE.reset(seed=False)
+            finally:
+                _set(prev)
+
+        self.addCleanup(_restore_memory)
+        live = self.srv.STATE.api.store
+        if backend == "memory":
+            self.assertIsInstance(live, InMemoryStore, type(live).__name__)
+        else:
+            self.assertIsInstance(live, SqlStore, type(live).__name__)
+            self.assertEqual(live.backend, backend,
+                             f"the {backend} variant is running on "
+                             f"{live.backend!r}")
+
+    def _client(self):
+        return urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(CookieJar()))
+
+    def _raw(self, opener, method, path, body=None):
+        url = f"http://127.0.0.1:{self.port}{path}"
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method)
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        try:
+            with opener.open(req) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+
+    def _post(self, opener, path, body):
+        status, raw = self._raw(opener, "POST", path, body)
+        return status, json.loads(raw or b"{}"), raw
+
+    def _account(self, username, role):
+        account = self.srv.STATE.api.accounts.create_account(
+            username, "lockatomic-pw", role, scope={}, actor_id="test_seed")
+        opener = self._client()
+        status, resp, _ = self._post(opener, "/api/auth/login",
+                                     {"username": username,
+                                      "password": "lockatomic-pw"})
+        self.assertEqual(status, 200, (username, resp))
+        return opener, account.id
+
+    def _select(self, opener, program_id, season_id=None):
+        body = {"program_id": program_id}
+        if season_id is not None:
+            body["season_id"] = season_id
+        status, resp, _ = self._post(opener, "/api/context", body)
+        self.assertEqual(status, 200, (body, resp))
+        return resp
+
+    def _ok(self, opener, path, body, why=""):
+        status, resp, _ = self._post(opener, path, body)
+        self.assertEqual(status, 200, (why or path, body, resp))
+        self.assertNotIn("error", resp, (why or path, resp))
+        return resp
+
+    def _build(self, backend, database_url):
+        """Program A (the caller's) and Program B (the writer's target),
+        each with a Season, a League, its LeagueSeason binding and one Team."""
+        self._reset_backend(database_url, backend)
+        self.backend = backend
+        self.database_url = database_url
+        self.openers, self.worlds = {}, {}
+        for tag, name in ((self.OWNER_A, "A"), (self.OWNER_B, "B")):
+            opener, _uid = self._account(f"{tag}_{backend}", Role.LEAGUE_ADMIN)
+            self.openers[tag] = opener
+            program = self._ok(opener, "/api/v2/setup/program",
+                               {"name": f"LK {name} Program"})
+            self._select(opener, program["id"])
+            season = self._ok(opener, "/api/v2/setup/season",
+                              {"program_id": program["id"],
+                               "name": f"LK {name} Season"})
+            self._select(opener, program["id"], season["id"])
+            league = self._ok(opener, "/api/v2/setup/league",
+                              {"season_id": season["id"],
+                               "name": f"LK {name} League"})
+            team = self._ok(opener, "/api/v2/setup/team",
+                            {"league_id": league["id"],
+                             "name": f"LK {name} Team"})
+            binding = self.srv.STATE.api.store.league_season_for(
+                league["id"], season["id"])
+            self.assertIsNotNone(binding, "fixture: the League/Season binding")
+            self.worlds[tag] = {"program": program["id"],
+                                "season": season["id"],
+                                "league": league["id"],
+                                "league_season": binding.id,
+                                "team": team["id"]}
+
+    # -- the second connection / second thread ------------------------------
+    def _writer_store(self):
+        """A genuinely independent way to write, per backend.
+
+        PostgreSQL and file-backed SQLite get a SECOND, REAL ``SqlStore`` — a
+        separate connection, so the contention observed is the database's, not
+        the process lock's. Memory returns the live store: the writer runs on
+        a second THREAD inside a REAL ``store.transaction()`` (the way every
+        actual mutation writes), and the process-wide lock the outermost
+        transaction holds is exactly the mechanism under test there — a raw
+        un-transactional poke would bypass the lock and prove nothing."""
+        if self.backend in ("postgres", "sqlite"):
+            store = SqlStore(self.database_url)
+            if store.backend == "sqlite":
+                # The sqlite3 driver's default 5s busy-wait would swallow the
+                # contention this suite exists to OBSERVE: the mover would sit
+                # inside execute() until the guarded commit and the locked-out
+                # signal would never fire. Zero it on the WRITER's connection
+                # only — the collision then surfaces as the database-locked
+                # error the harness records and retries, which is the
+                # lock-or-retry contract under test.
+                store.conn.execute("PRAGMA busy_timeout = 0")
+            self.addCleanup(store.close)
+            return store
+        return self.srv.STATE.api.store
+
+    def _column_update(self, store, table, assignments, row_id):
+        """One targeted UPDATE on the writer's own connection.
+
+        Deliberately NOT read-modify-write through the store's save_* helpers:
+        those write every column, so a writer that read before the guarded
+        commit would clobber the guarded mutation on release and no
+        linearization could be asserted at all."""
+        cols = ", ".join(f"{c} = ?" for c in assignments)
+        query = f"UPDATE {table} SET {cols} WHERE id = ?"
+        params = tuple(assignments.values()) + (row_id,)
+        if store.backend == "postgres":
+            query = query.replace("?", "%s")
+        store.conn.execute(query, params)
+
+    # -- the in-transaction barrier -----------------------------------------
+    def _race_inside_txn(self, opener, path, body, move):
+        """POST ``path``; pause INSIDE the guarded transaction — after every
+        named row is locked and every target authorized, before
+        ``mutation()`` — run the concurrent mover, prove it cannot commit
+        inside the window, release, and return ``(status, decoded, raw)``.
+
+        ``move`` is ``{"table":…, "assignments":…, "row_id":…, "mem_apply":…}``
+        — the SQL single-column move and its Memory read-modify-write twin.
+
+        The barrier lives in ``_authorize_setup_targets``: its return is the
+        exact point the re-review names — the decision is taken, the locks
+        are held, the write has not happened. Per backend the mover behaves
+        as that backend's real contention demands:
+
+        * **PostgreSQL** — one UPDATE on the second connection. It BLOCKS on
+          the ``FOR UPDATE`` row lock and, being autocommit, has committed
+          the moment it returns. With `_lock_setup_row` neutralised it
+          commits inside the window instead, and the mid-window assertion
+          fails — the locks are what this suite falsifies.
+        * **SQLite** — repeated UPDATE attempts on the second connection for
+          the whole window. Each one needs the database file's write lock,
+          collides with the guarded transaction's snapshot, and raises the
+          database-locked error, which is recorded as the LOCKED-OUT signal
+          and retried — never surfaced raw, never a 500. Only after the
+          request completes does the mover apply cleanly, so the asserted
+          final state is the one valid linearization.
+        * **Memory** — a second thread entering a REAL ``transaction()``,
+          which blocks on the process-wide lock the guarded unit holds until
+          that unit exits.
+        """
+        api = self.srv.STATE.api
+        backend = self.backend
+        in_txn = threading.Event()
+        released = threading.Event()
+        request_done = threading.Event()
+        committed = threading.Event()
+        locked_out = threading.Event()
+        writer_store = self._writer_store()
+        writer_errors = []
+        orig = api._authorize_setup_targets
+        fired = []
+
+        def paused(*a, **k):
+            refused = orig(*a, **k)
+            # Pause only the first AUTHORIZED pass: a retry (or a refusal)
+            # must run straight through, or a legitimate second attempt would
+            # deadlock the harness.
+            if refused is None and not fired:
+                fired.append(True)
+                in_txn.set()
+                if not released.wait(20):
+                    raise AssertionError("the harness never released the "
+                                         "guarded transaction")
+            return refused
+
+        def writer_body():
+            try:
+                if backend == "memory":
+                    with writer_store.transaction():   # blocks on the lock
+                        move["mem_apply"](writer_store)
+                    committed.set()
+                    return
+                if backend == "postgres":
+                    self._column_update(writer_store, move["table"],
+                                        move["assignments"], move["row_id"])
+                    committed.set()
+                    return
+                import sqlite3
+                while not released.is_set():
+                    try:
+                        self._column_update(writer_store, move["table"],
+                                            move["assignments"],
+                                            move["row_id"])
+                        committed.set()      # window breach — the outer
+                        return               # assertion reports it
+                    except sqlite3.OperationalError as exc:
+                        if "locked" not in str(exc).lower():
+                            raise
+                        locked_out.set()
+                        _time.sleep(0.02)
+                # Window over: let the guarded request finish COMMITTING
+                # before the clean final apply, so the linearization is
+                # deterministic rather than a busy-loop coin toss.
+                if not request_done.wait(self.WRITER_DEADLINE):
+                    raise AssertionError("the guarded request never "
+                                         "completed")
+                deadline = _time.monotonic() + self.WRITER_DEADLINE
+                while True:
+                    try:
+                        self._column_update(writer_store, move["table"],
+                                            move["assignments"],
+                                            move["row_id"])
+                        committed.set()
+                        return
+                    except sqlite3.OperationalError as exc:
+                        if ("locked" not in str(exc).lower()
+                                or _time.monotonic() > deadline):
+                            raise
+                        _time.sleep(0.02)
+            except BaseException as exc:      # surfaced by the main thread
+                writer_errors.append(exc)
+
+        api._authorize_setup_targets = paused
+        self.addCleanup(lambda: setattr(api, "_authorize_setup_targets", orig)
+                        if api._authorize_setup_targets is paused else None)
+        out = {}
+
+        def run():
+            out["r"] = self._post(opener, path, body)
+
+        request = threading.Thread(target=run, daemon=True)
+        request.start()
+        self.assertTrue(
+            in_txn.wait(20),
+            "the request never reached the in-transaction barrier — it was "
+            "refused upstream, so this test proved nothing about the locks")
+
+        writer_thread = threading.Thread(target=writer_body, daemon=True)
+        writer_thread.start()
+        # THE CLAIM UNDER TEST: with the guarded transaction holding the row
+        # locks (PostgreSQL), the file's write lock (SQLite) or the process
+        # lock (Memory), the mover cannot commit inside the window.
+        self.assertFalse(
+            committed.wait(self.WINDOW_GRACE),
+            f"[{backend}] the concurrent writer COMMITTED between the "
+            f"in-transaction authorization and the mutation — the "
+            f"check→mutate window is open")
+        released.set()
+        request.join(30)
+        self.assertFalse(request.is_alive(),
+                         "the guarded request never returned")
+        request_done.set()
+        api._authorize_setup_targets = orig
+        writer_thread.join(self.WRITER_DEADLINE + 10)
+        self.assertFalse(writer_thread.is_alive(),
+                         f"[{backend}] the writer never completed after the "
+                         f"guarded commit released the locks")
+        self.assertEqual(
+            writer_errors, [],
+            f"[{backend}] the writer leaked a raw error instead of the "
+            f"lock-or-retry contract: {writer_errors!r}")
+        self.assertTrue(committed.is_set(),
+                        f"[{backend}] the writer finished without "
+                        f"committing its move")
+        if backend == "sqlite":
+            self.assertTrue(
+                locked_out.is_set(),
+                "[sqlite] the mover was never locked out during the window — "
+                "no real cross-connection contention was observed")
+        self.assertTrue(fired, "the in-transaction barrier never fired")
+        return out["r"]
+
+    # ----------------------------------------------------------------------
+    # Shape 1 — a DIRECT target: an in-place player update, with the writer
+    # relinking the same Player into Program B's Team.
+    # ----------------------------------------------------------------------
+    def _run_player_update_lock(self, database_url, backend):
+        self._build(backend, database_url)
+        owner = self.openers[self.OWNER_A]
+        a, b = self.worlds[self.OWNER_A], self.worlds[self.OWNER_B]
+        self._select(owner, a["program"], a["season"])
+        player = self._ok(owner, "/api/v2/setup/player",
+                          {"team_id": a["team"], "name": "LK Locked Player",
+                           "position": "forward"})
+        store = self.srv.STATE.api.store
+
+        def mem_apply(ws):
+            row = ws.get_player(player["id"])
+            row.team_id = b["team"]
+            ws.save_player(row)
+
+        status, resp, _raw = self._race_inside_txn(
+            owner, f"/api/v2/setup/player/{player['id']}/update",
+            {"name": "LK Renamed Under Lock"},
+            {"table": "players", "assignments": {"team_id": b["team"]},
+             "row_id": player["id"], "mem_apply": mem_apply})
+        self.assertEqual(status, 200,
+                         (f"[{backend}] the guarded update was authorized "
+                          f"under the locks and nothing moved under it — it "
+                          f"must succeed", resp))
+        self.assertEqual(resp.get("name"), "LK Renamed Under Lock", resp)
+        self.assertEqual(
+            resp.get("team_id"), a["team"],
+            f"[{backend}] the response must echo the PRE-MOVE row the "
+            f"mutation actually ran against")
+        # The one valid linearization: guarded write first, mover second.
+        final = store.get_player(player["id"])
+        self.assertEqual(final.name, "LK Renamed Under Lock",
+                         f"[{backend}] the writer's move CLOBBERED the "
+                         f"guarded mutation — not a linearization")
+        self.assertEqual(final.team_id, b["team"],
+                         f"[{backend}] the writer's move never applied")
+
+    def test_player_update_lock_memory(self):
+        self._run_player_update_lock(None, "memory")
+
+    def test_player_update_lock_sqlite_file(self):
+        tmp = tempfile.mkdtemp(prefix="hs-lock-")
+        self._run_player_update_lock(
+            f"sqlite:///{os.path.join(tmp, 'lock.db')}", "sqlite")
+
+    @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                         "PostgreSQL required (set TEST_DATABASE_URL)")
+    def test_player_update_lock_postgres(self):
+        self._run_player_update_lock(os.environ["TEST_DATABASE_URL"],
+                                     "postgres")
+
+    # ----------------------------------------------------------------------
+    # Shape 2 — a BRIDGE row and its locked parent: a registration remove,
+    # with the writer re-pointing the registration at Program B's
+    # LeagueSeason.
+    # ----------------------------------------------------------------------
+    def _run_bridge_parent_lock(self, database_url, backend):
+        self._build(backend, database_url)
+        owner = self.openers[self.OWNER_A]
+        a, b = self.worlds[self.OWNER_A], self.worlds[self.OWNER_B]
+        self._select(owner, a["program"], a["season"])
+        registration = self._ok(
+            owner, f"/api/v2/setup/seasons/{a['season']}/team-registrations",
+            {"team_id": a["team"], "league_id": a["league"]})
+        store = self.srv.STATE.api.store
+
+        def mem_apply(ws):
+            row = ws.get_season_team_registration(registration["id"])
+            row.league_season_id = b["league_season"]
+            ws.save_season_team_registration(row)
+
+        # ``league_season_id`` alone: migration 035 dropped the redundant
+        # ``league_id`` column — the LeagueSeason IS the competition edge.
+        status, resp, _raw = self._race_inside_txn(
+            owner,
+            f"/api/v2/setup/season-team-registration/{registration['id']}"
+            f"/remove", {},
+            {"table": "season_team_registrations",
+             "assignments": {"league_season_id": b["league_season"]},
+             "row_id": registration["id"], "mem_apply": mem_apply})
+        self.assertEqual(status, 200,
+                         (f"[{backend}] the guarded remove was authorized "
+                          f"under the locks — it must succeed", resp))
+        final = store.get_season_team_registration(registration["id"])
+        self.assertFalse(final.active,
+                         f"[{backend}] the guarded remove never applied")
+        self.assertEqual(final.league_season_id, b["league_season"],
+                         f"[{backend}] the writer's re-point never applied")
+
+    def test_bridge_parent_lock_memory(self):
+        self._run_bridge_parent_lock(None, "memory")
+
+    def test_bridge_parent_lock_sqlite_file(self):
+        tmp = tempfile.mkdtemp(prefix="hs-lock-")
+        self._run_bridge_parent_lock(
+            f"sqlite:///{os.path.join(tmp, 'lock.db')}", "sqlite")
+
+    @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                         "PostgreSQL required (set TEST_DATABASE_URL)")
+    def test_bridge_parent_lock_postgres(self):
+        self._run_bridge_parent_lock(os.environ["TEST_DATABASE_URL"],
+                                     "postgres")
+
+    # ----------------------------------------------------------------------
+    # Shape 3 — a reassign DESTINATION: rink → venue, with the writer moving
+    # the destination Venue into Program B.
+    # ----------------------------------------------------------------------
+    def _run_reassign_destination_lock(self, database_url, backend):
+        self._build(backend, database_url)
+        owner = self.openers[self.OWNER_A]
+        a, b = self.worlds[self.OWNER_A], self.worlds[self.OWNER_B]
+        self._select(owner, a["program"], a["season"])
+        source = self._ok(owner, "/api/setup/venue",
+                          {"name": "LK Source Venue",
+                           "league_id": a["program"]})
+        rink = self._ok(owner, "/api/v2/setup/rink",
+                        {"venue_id": source["id"], "name": "LK Rink"})
+        destination = self._ok(owner, "/api/setup/venue",
+                               {"name": "LK Destination Venue",
+                                "league_id": a["program"]})
+        store = self.srv.STATE.api.store
+
+        def mem_apply(ws):
+            row = ws.get_venue(destination["id"])
+            row.league_id = b["program"]
+            ws.save_venue(row)
+
+        status, resp, _raw = self._race_inside_txn(
+            owner, f"/api/v2/setup/rink/{rink['id']}/assign-venue",
+            {"venue_id": destination["id"]},
+            {"table": "venues", "assignments": {"league_id": b["program"]},
+             "row_id": destination["id"], "mem_apply": mem_apply})
+        self.assertEqual(status, 200,
+                         (f"[{backend}] the guarded reassign was authorized "
+                          f"under the locks — it must succeed", resp))
+        self.assertEqual(store.get_rink(rink["id"]).venue_id,
+                         destination["id"],
+                         f"[{backend}] the guarded reassign never applied")
+        self.assertEqual(store.get_venue(destination["id"]).league_id,
+                         b["program"],
+                         f"[{backend}] the writer's move never applied")
+
+    def test_reassign_destination_lock_memory(self):
+        self._run_reassign_destination_lock(None, "memory")
+
+    def test_reassign_destination_lock_sqlite_file(self):
+        tmp = tempfile.mkdtemp(prefix="hs-lock-")
+        self._run_reassign_destination_lock(
+            f"sqlite:///{os.path.join(tmp, 'lock.db')}", "sqlite")
+
+    @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                         "PostgreSQL required (set TEST_DATABASE_URL)")
+    def test_reassign_destination_lock_postgres(self):
+        self._run_reassign_destination_lock(os.environ["TEST_DATABASE_URL"],
+                                            "postgres")

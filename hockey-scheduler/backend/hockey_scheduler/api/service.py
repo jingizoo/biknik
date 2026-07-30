@@ -514,19 +514,37 @@ class ApiService:
         when — ``program_id`` is null, the League edge is walked instead for the
         PROGRAM component: that Team is still part of a Program's competition
         chain, and the owner's rule is that a LINKED record is judged by its
-        chain, not by who typed it in. The League is never consulted for the
-        Program while ``program_id`` is set, so a (corrupt) disagreement between
-        the two can never widen access.
+        chain, not by who typed it in. The League is never consulted FOR THE
+        PROGRAM COMPONENT while ``program_id`` is set — but it IS resolved and
+        checked for AGREEMENT (#369 re-review 2): the two columns are
+        independent FKs with no database constraint tying the League's Program
+        to ``Team.program_id``, so legacy data, imports or a prior partial
+        write can persist a Team whose ``league_id`` names a League in ANOTHER
+        Program. Emitting that pair as one edge lets an explicit-No-League
+        caller (whose League comparison is legitimately skipped) mutate a
+        record whose persisted graph crosses the Program ceiling. A found-but-
+        disagreeing pair is therefore LINKED BUT UNAUTHORIZED — ``(set(),
+        True)`` — never an edge and never creator-claimable.
 
-        The LEAGUE component is always ``Team.league_id`` verbatim — the REAL
+        The LEAGUE component is ``Team.league_id`` verbatim — the REAL
         competition League (never ``Venue.league_id``, which is a Program id
-        under a legacy name). It is taken unresolved on purpose: a dangling
-        League id can then never equal the caller's selected League, so it fails
-        closed instead of decaying into "no League axis". A Team with no League
-        at all is a real, supported state (#345: "Teams with a Program but no
-        League yet"), and it carries no League axis to check — refusing it
-        whenever any League is selected would make a league-less Team
+        under a legacy name). It is taken UNRESOLVED into the edge on purpose:
+        a dangling League id can then never equal the caller's selected League,
+        so it fails closed under a specific League instead of decaying into "no
+        League axis", while under No League (the League comparison skipped) the
+        Team stays manageable by its authoritative Program. A Team with no
+        League at all is a real, supported state (#345: "Teams with a Program
+        but no League yet"), and it carries no League axis to check — refusing
+        it whenever any League is selected would make a league-less Team
         permanently unmanageable.
+
+        The disagreement check is therefore SURGICAL: it fires ONLY when the
+        League RESOLVES to a real League in ANOTHER Program (the owner's exact
+        repro: ``program_id`` = A, ``league_id`` → a valid League in B). A
+        merely dangling id is not a cross-Program handle — it points at nothing
+        — so it is left to the verbatim-edge behavior above rather than
+        rejected outright, which keeps a program-owned Team with broken League
+        data repairable instead of permanently frozen.
 
         The Season axis is deliberately ABSENT: a Team is PERMANENT. Its
         participation in a Season is a separate SeasonTeamRegistration record,
@@ -538,6 +556,14 @@ class ApiService:
             return set(), False
         league_id = team.league_id or None
         if team.program_id:
+            if league_id is not None:
+                league = self.store.get_league(league_id)
+                if (league is not None and league.program_id
+                        and league.program_id != team.program_id):
+                    # #369 re-review 2: independently persisted axes DISAGREE —
+                    # the named League resolves into another Program. Linked but
+                    # unauthorized, so No-League union semantics can't reach it.
+                    return set(), True
             return {(team.program_id, None, league_id)}, True
         if team.league_id:
             league = self.store.get_league(team.league_id)
@@ -689,10 +715,29 @@ class ApiService:
             season = self.store.get_season(record.season_id)
             if season is None:
                 return edges, True
-            if season.program_id:
-                return ({(season.program_id, season.id,
-                          record.league_id or None)}, True)
-            return edges, True
+            if not season.program_id:
+                return edges, True
+            # #369 re-review 2: ``season_id`` and ``league_id`` are independent
+            # FKs — nothing in the schema forces the named League to belong to
+            # the same Program as the named Season. When the League RESOLVES
+            # into a DIFFERENT Program (the owner's repro: an A-Season
+            # LeagueSeason whose league_id names a valid B League), the No-League
+            # union — which rightly skips the League comparison — would otherwise
+            # authorize a graph that crosses the Program ceiling; reject it as
+            # linked-but-unauthorized. A DANGLING league_id is left in the edge
+            # verbatim (as the Team edge does): it is not a cross-Program handle,
+            # it fails closed under a selected League, and leaving it judged by
+            # its Season keeps a corrupt-but-own-Program registration
+            # REPAIRABLE (the ``registration_league_not_in_season`` fix flow
+            # relies on exactly this). A Division inherits this verdict through
+            # its delegation below.
+            if record.league_id:
+                league = self.store.get_league(record.league_id)
+                if (league is not None and league.program_id
+                        and league.program_id != season.program_id):
+                    return edges, True      # real cross-Program disagreement
+            return ({(season.program_id, season.id,
+                      record.league_id or None)}, True)
 
         if kind == "division":
             ls = self.store.get_league_season(record.league_season_id)
@@ -712,15 +757,31 @@ class ApiService:
         if kind == "game":
             # A REGULAR game's Season is its Program chain. An exhibition may
             # carry no Season (#283 Slice D); only then are its League and
-            # Division consulted, so a set season_id is never second-guessed.
+            # Division consulted, so a set season_id is never second-guessed
+            # FOR THE PROGRAM/SEASON components. The League axis, when one
+            # resolves, must still AGREE with that Season's Program (#369
+            # re-review 2): ``Game.season_id`` and ``Game.league_id`` /
+            # ``league_season_id`` are independent FKs, so a game whose named
+            # League lives in another Program is a persisted disagreement and
+            # is linked-but-unauthorized, never an edge the No-League union
+            # could authorize.
             league_id = self._game_league_id(record)
             if record.season_id:
                 season = self.store.get_season(record.season_id)
                 if season is None:
                     return edges, True
-                if season.program_id:
-                    return ({(season.program_id, season.id, league_id)}, True)
-                return edges, True
+                if not season.program_id:
+                    return edges, True
+                # Reject only a REAL cross-Program disagreement (the resolved
+                # League lives in another Program than the Game's Season); a
+                # dangling/absent League leaves ``league_id`` None and is judged
+                # by the Season, consistent with the Team and LeagueSeason edges.
+                if league_id is not None:
+                    league = self.store.get_league(league_id)
+                    if (league is not None and league.program_id
+                            and league.program_id != season.program_id):
+                        return edges, True  # real cross-Program disagreement
+                return ({(season.program_id, season.id, league_id)}, True)
             if record.league_id:
                 league = self.store.get_league(record.league_id)
                 if league is None:
