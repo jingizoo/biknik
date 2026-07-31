@@ -4580,6 +4580,597 @@ class SetupTargetGameParentConsistencyHttpTest(unittest.TestCase):
 
 
 # ==========================================================================
+# #372, the BINDING-END leg: each END of `league_season_id` on its own.
+#
+# `_game_parent_constraints` resolves a `league_season_id` into TWO separate
+# constraints -- its SEASON end (`ls.season_id` -> that Season's Program and
+# Season) and its LEAGUE end (`ls.league_id` -> that League's Program and
+# League) -- and a `division_id` contributes exactly the same pair through its
+# own binding. The classes above vary WHICH PARENT COLUMN is foreign; every
+# foreign binding they use is itself CONSISTENT (it lives wholly in Program B,
+# or wholly in the Program's other Season), so BOTH of its ends disagree with
+# the caller's context at once. Deleting either end alone therefore leaves the
+# other one still catching the case and the suite still green: neither end is
+# falsified by those shapes, and the two-constraint rule is unproven.
+#
+# This class isolates the ends. Every shape here hangs the Game off an
+# INTERNALLY INCONSISTENT LeagueSeason -- a row whose own two columns point
+# into different worlds -- arranged so that exactly ONE of its ends disagrees
+# and the Game's every other parent, INCLUDING THE BINDING'S OTHER END, agrees:
+#
+#   * season_id = the caller's own Season 1, league_id = a Program-B League
+#     -> only the LEAGUE end disagrees (Program + League)
+#   * season_id = the caller's own Season 1, league_id = the Program's OTHER
+#     League -> only the LEAGUE end disagrees, on the LEAGUE AXIS ALONE, so
+#     the Program ceiling cannot explain the refusal either
+#   * league_id = the Game's own League, season_id = the Program's OTHER
+#     Season -> only the SEASON end disagrees (the mirror, season axis alone)
+#   * league_id = the Game's own League, season_id = a Program-B Season
+#     -> only the SEASON end disagrees (Program + Season)
+#
+# and each of the four is driven BOTH ways a binding reaches a Game: directly
+# as `game.league_season_id`, and indirectly as the `league_season_id` of the
+# Division named by `game.division_id`.
+#
+# Such a row cannot be created through the facade -- `create_league_season`
+# enforces `league.program_id == season.program_id`, and no route re-points an
+# existing binding -- so it is INJECTED, exactly as the dangling shapes above
+# are. That is the point: this is legacy/corrupt data, and an authorization
+# gate is precisely the code that has to survive it.
+#
+# The precondition each shape asserts, entirely from the STORED ROWS: the
+# binding really carries the stated `season_id` and `league_id`, both of those
+# rows really exist and really resolve to a Program, every one of the Game's
+# parent ends resolves (so no refusal is the dangling rule), EXACTLY ONE end
+# disagrees, it disagrees on exactly the axes claimed, and with that one end
+# removed the remaining ends are fully self-consistent on all three axes --
+# i.e. that end is the ONLY thing standing between this Game and a 200.
+# ==========================================================================
+
+def _inject_league_season(store, league_id, season_id):
+    """A LeagueSeason row written STRAIGHT INTO THE STORE.
+
+    `SetupService.create_league_season` refuses a binding whose League and
+    Season belong to different Programs, and nothing re-points an existing
+    binding, so the facade cannot express an internally inconsistent one at
+    all. Injecting is the only way to stage the legacy/corrupt row this class
+    is about -- the same reason the dangling ids above are staged by hand."""
+    from hockey_scheduler.domain.setup_models import LeagueSeason
+    ls = LeagueSeason(id=store.next_id("league_season"), league_id=league_id,
+                      season_id=season_id)
+    store.add_league_season(ls)
+    return ls.id
+
+
+def _inject_division(store, league_season_id, name):
+    """A Division hung off ``league_season_id``, injected for the same reason:
+    `create_division_under_league` derives the binding from a League the
+    caller may use, so it can never point a Division at a corrupt one."""
+    from hockey_scheduler.domain.setup_models import Division
+    division = Division(id=store.next_id("division"),
+                        league_season_id=league_season_id, name=name)
+    store.add_division(division)
+    return division.id
+
+
+def game_parent_ends(store, game):
+    """Every parent END of ``game``, resolved from the STORED ROWS and kept
+    APART -- ``None`` where an end does not resolve.
+
+    Deliberately finer-grained than ``game_parent_axes`` above, which collapses
+    a binding's two columns into ONE triple and so cannot express "the Season
+    end agrees and the League end does not". A LeagueSeason contributes two
+    entries, ``<column>.season`` and ``<column>.league``; a ``division_id``
+    contributes its own binding's two, under its own name. Computed here rather
+    than read out of ``_game_parent_constraints`` for this file's standing
+    reason: a precondition taken from the code under test would agree with that
+    code no matter how wrong both were."""
+    def _binding_ends(prefix, league_season_id, out):
+        ls = (store.get_league_season(league_season_id)
+              if league_season_id else None)
+        if ls is None:
+            out[f"{prefix}.season"] = None
+            out[f"{prefix}.league"] = None
+            return
+        season = store.get_season(ls.season_id) if ls.season_id else None
+        out[f"{prefix}.season"] = (
+            None if season is None or not season.program_id
+            else (season.program_id, season.id, None))
+        league = store.get_league(ls.league_id) if ls.league_id else None
+        out[f"{prefix}.league"] = (
+            None if league is None or not league.program_id
+            else (league.program_id, None, league.id))
+
+    ends = {}
+    if game.season_id:
+        season = store.get_season(game.season_id)
+        ends["season_id"] = (None if season is None or not season.program_id
+                             else (season.program_id, season.id, None))
+    if game.league_id:
+        league = store.get_league(game.league_id)
+        ends["league_id"] = (None if league is None or not league.program_id
+                             else (league.program_id, None, league.id))
+    if getattr(game, "league_season_id", None):
+        _binding_ends("league_season_id", game.league_season_id, ends)
+    if game.division_id:
+        division = store.get_division(game.division_id)
+        if division is None or not division.league_season_id:
+            ends["division_id.season"] = None
+            ends["division_id.league"] = None
+        else:
+            _binding_ends("division_id", division.league_season_id, ends)
+    return ends
+
+
+def end_disagreements(resolved, reference):
+    """The axes on which one resolved end differs from ``reference``.
+
+    An end names only the axes it really carries: a Season end names a Program
+    and a Season and NO League, a League end names a Program and a League and
+    NO Season. A ``None`` component is "this end says nothing about that axis"
+    -- never "any" -- so it can never disagree, which is the same "no invented
+    axis" rule the product folds these constraints under."""
+    axes = set()
+    if resolved[0] != reference[0]:
+        axes.add("program")
+    if resolved[1] is not None and resolved[1] != reference[1]:
+        axes.add("season")
+    if resolved[2] is not None and resolved[2] != reference[2]:
+        axes.add("league")
+    return axes
+
+
+def _binding_end_world(api, store, tag, actor):
+    """One Program with TWO Seasons and TWO Leagues, crossed so that the pairs
+    this class needs are all FREE.
+
+    ``league`` is created in Season 1 (so the product's own binding is
+    ``(league, Season 1)``) and ``sibling_league`` in Season 2. That leaves
+    ``(league, Season 2)`` and ``(sibling_league, Season 1)`` unbound, so the
+    corrupt rows below can be injected without colliding with the
+    ``(league_id, season_id)`` uniqueness the schema enforces -- and it means
+    every corrupt row really is a binding the product never made."""
+    program = api.create_program(f"BE-{tag} Program", "US", "UTC", None, actor)
+    assert "error" not in program, program
+    seasons = []
+    for n in (1, 2):
+        season = api.create_season(program["id"], f"BE-{tag} Season {n}",
+                                   actor_id=actor)
+        assert "error" not in season, season
+        seasons.append(season["id"])
+    league = api.create_league(seasons[0], f"BE-{tag} League", 0, actor)
+    assert "error" not in league, league
+    sibling = api.create_league(seasons[1], f"BE-{tag} Sibling League", 0,
+                               actor)
+    assert "error" not in sibling, sibling
+    binding = store.league_season_for(league["id"], seasons[0])
+    assert binding is not None, (tag, "the product's own Season-1 binding")
+    division = api.create_division_v2(league["id"], f"BE-{tag} Division", "",
+                                      actor, season_id=seasons[0])
+    assert "error" not in division, division
+    club = api.create_club(f"BE-{tag} Club", "", actor)
+    team = api.create_team(club["id"], None, f"BE-{tag} Team", actor,
+                           league_id=league["id"])
+    assert "error" not in team, team
+    return {"program": program["id"], "seasons": seasons,
+            "league": league["id"], "sibling_league": sibling["id"],
+            "binding": binding.id, "division": division["id"],
+            "team": team["id"]}
+
+
+# (key, league_id source, season_id source, which END disagrees, on which axes)
+_CORRUPT_BINDINGS = (
+    ("league_foreign", ("b", "league"), ("a", "seasons0"), "league",
+     {"program", "league"}),
+    ("league_sibling", ("a", "sibling_league"), ("a", "seasons0"), "league",
+     {"league"}),
+    ("season_sibling", ("a", "league"), ("a", "seasons1"), "season",
+     {"season"}),
+    ("season_foreign", ("a", "league"), ("b", "seasons0"), "season",
+     {"program", "season"}),
+)
+
+
+def _inject_corrupt_bindings(store, a, b):
+    """The four internally inconsistent LeagueSeason rows, each with a Division
+    hung off it so the same binding can be reached BOTH ways."""
+    def _pick(world_tag, key):
+        world = a if world_tag == "a" else b
+        if key == "seasons0":
+            return world["seasons"][0]
+        if key == "seasons1":
+            return world["seasons"][1]
+        return world[key]
+
+    corrupt = {}
+    for key, league_src, season_src, end, axes in _CORRUPT_BINDINGS:
+        league_id = _pick(*league_src)
+        season_id = _pick(*season_src)
+        binding = _inject_league_season(store, league_id, season_id)
+        corrupt[key] = {
+            "binding": binding, "league_id": league_id,
+            "season_id": season_id, "end": end, "axes": axes,
+            "division": _inject_division(store, binding,
+                                         f"BE Corrupt Division {key}")}
+    return corrupt
+
+
+# (corrupt binding, how the Game reaches it) -> the shape's name in every
+# assertion message below.
+_BINDING_END_LABELS = {
+    ("league_foreign", "direct"):
+        "an internally inconsistent league_season_id: the caller's own "
+        "Season 1 bound to a Program-B League",
+    ("league_foreign", "division"):
+        "a division_id whose binding is Season 1 bound to a Program-B "
+        "League",
+    ("league_sibling", "direct"):
+        "an internally inconsistent league_season_id: the caller's own "
+        "Season 1 bound to the Program's OTHER League",
+    ("league_sibling", "division"):
+        "a division_id whose binding is Season 1 bound to the Program's "
+        "OTHER League",
+    ("season_sibling", "direct"):
+        "the MIRROR: the Game's own League bound to the Program's OTHER "
+        "Season, as league_season_id",
+    ("season_sibling", "division"):
+        "the MIRROR through a division_id: the Game's own League bound to "
+        "the Program's OTHER Season",
+    ("season_foreign", "direct"):
+        "the MIRROR: the Game's own League bound to a Program-B Season, "
+        "as league_season_id",
+    ("season_foreign", "division"):
+        "the MIRROR through a division_id: the Game's own League bound to "
+        "a Program-B Season",
+}
+
+
+class SetupTargetBindingEndConsistencyTest(unittest.TestCase):
+    """#372, the BINDING-END predicate leg: on every backend."""
+
+    OWNER_A = "be_owner_a"
+    OWNER_B = "be_owner_b"
+    CALLER = "be_caller"
+
+    def _shapes(self, a, corrupt):
+        """The consistent base row, then every corrupt binding reached both
+        ways. Each shape moves exactly ONE parent column off the base."""
+        base = {"season_id": a["seasons"][0], "league_id": a["league"],
+                "league_season_id": a["binding"],
+                "division_id": a["division"]}
+        reference = (a["program"], a["seasons"][0], a["league"])
+        shapes = [{"label": "the fully consistent Game",
+                   "parents": dict(base), "allowed": True,
+                   "reference": reference, "end": None, "axes": set(),
+                   "binding": None, "division": None}]
+        for key, _lsrc, _ssrc, end, axes in _CORRUPT_BINDINGS:
+            row = corrupt[key]
+            for via, column, prefix in (("direct", "league_season_id",
+                                         "league_season_id"),
+                                        ("division", "division_id",
+                                         "division_id")):
+                shapes.append({
+                    "label": _BINDING_END_LABELS[(key, via)],
+                    "parents": {**base,
+                                column: (row["binding"] if via == "direct"
+                                         else row["division"])},
+                    "allowed": False, "reference": reference,
+                    "end": f"{prefix}.{end}", "axes": axes,
+                    "binding": row["binding"],
+                    "binding_league": row["league_id"],
+                    "binding_season": row["season_id"],
+                    "division": (row["division"] if via == "division"
+                                 else None)})
+        return shapes
+
+    def _assert_end_precondition(self, store, game_id, shape, where):
+        """The fixture really is what its label says, read from the store.
+
+        This is what makes the refusal below falsifiable. Without the
+        "exactly one end disagrees, and the rest are self-consistent" clauses
+        a shape could quietly regress into the classes above -- two ends
+        disagreeing at once -- and its refusal would prove nothing about the
+        end it names."""
+        game = store.get_game(game_id)
+        self.assertIsNotNone(game, f"{where}: the fixture Game was not stored")
+        for column, value in shape["parents"].items():
+            self.assertEqual(
+                getattr(game, column), value,
+                f"{where}: the store did not persist {column} -- every "
+                f"assertion about this shape would be vacuous")
+
+        if shape["binding"] is not None:
+            ls = store.get_league_season(shape["binding"])
+            self.assertIsNotNone(
+                ls, f"{where}: the injected LeagueSeason is not in the store")
+            self.assertEqual(
+                (ls.season_id, ls.league_id),
+                (shape["binding_season"], shape["binding_league"]),
+                f"{where}: the binding does not carry the season_id/league_id "
+                f"this shape is named after")
+            season = store.get_season(ls.season_id)
+            league = store.get_league(ls.league_id)
+            self.assertIsNotNone(
+                season, f"{where}: the binding's season_id DANGLES, so a "
+                        f"refusal would be the dangling rule")
+            self.assertIsNotNone(
+                league, f"{where}: the binding's league_id DANGLES, so a "
+                        f"refusal would be the dangling rule")
+            self.assertTrue(
+                season.program_id,
+                f"{where}: the binding's Season carries no Program")
+            self.assertTrue(
+                league.program_id,
+                f"{where}: the binding's League carries no Program")
+        if shape["division"] is not None:
+            division = store.get_division(shape["division"])
+            self.assertIsNotNone(
+                division,
+                f"{where}: the injected Division is not in the store")
+            self.assertEqual(
+                division.league_season_id, shape["binding"],
+                f"{where}: the Division does not hang off the corrupt "
+                f"binding, so this shape never reaches it through "
+                f"division_id at all")
+
+        ends = game_parent_ends(store, game)
+        self.assertEqual(
+            set(ends),
+            {"season_id", "league_id", "league_season_id.season",
+             "league_season_id.league", "division_id.season",
+             "division_id.league"},
+            f"{where}: the resolved ends {sorted(ends)} are not the six this "
+            f"Game's four parent columns must contribute")
+        for label, resolved in ends.items():
+            self.assertIsNotNone(
+                resolved,
+                f"{where}: the {label} end does not resolve -- a refusal "
+                f"would be the DANGLING rule, not the disagreement rule")
+
+        reference = shape["reference"]
+        disagreeing = {label for label, resolved in ends.items()
+                       if end_disagreements(resolved, reference)}
+        if shape["end"] is None:
+            self.assertEqual(
+                disagreeing, set(),
+                f"{where}: the control's own ends disagree "
+                f"({sorted(ends.items())}), so its acceptance would prove "
+                f"nothing")
+            return
+
+        self.assertEqual(
+            disagreeing, {shape["end"]},
+            f"{where}: the disagreeing ends are {sorted(disagreeing)}, not "
+            f"exactly {{{shape['end']}}} -- with more than one end "
+            f"disagreeing this shape cannot isolate the end it is named "
+            f"after")
+        self.assertEqual(
+            end_disagreements(ends[shape["end"]], reference), shape["axes"],
+            f"{where}: {shape['end']} disagrees on "
+            f"{sorted(end_disagreements(ends[shape['end']], reference))}, not "
+            f"on {sorted(shape['axes'])}")
+        rest = [resolved for label, resolved in ends.items()
+                if label != shape["end"]]
+        programs = {resolved[0] for resolved in rest}
+        seasons = {resolved[1] for resolved in rest if resolved[1] is not None}
+        leagues = {resolved[2] for resolved in rest if resolved[2] is not None}
+        self.assertEqual(
+            (len(programs), len(seasons), len(leagues)), (1, 1, 1),
+            f"{where}: with {shape['end']} removed the remaining ends still "
+            f"disagree ({programs}/{seasons}/{leagues}) -- some OTHER end "
+            f"could catch this Game, so the refusal would not falsify "
+            f"{shape['end']}")
+        self.assertEqual(
+            (programs.pop(), seasons.pop(), leagues.pop()), reference,
+            f"{where}: the remaining ends agree on something other than the "
+            f"caller's own Program/Season/League")
+
+    def test_every_binding_end_is_validated_on_each_backend(self):
+        for backend, store in _backends():
+            with self.subTest(backend=backend):
+                api = ApiService(store)
+                caller = (self.CALLER, Role.LEAGUE_ADMIN, {})
+                a = _binding_end_world(api, store, "A", self.OWNER_A)
+                b = _binding_end_world(api, store, "B", self.OWNER_B)
+                corrupt = _inject_corrupt_bindings(store, a, b)
+                # Program A + Season 1 + NO League: the union selection whose
+                # League comparison is legitimately skipped, and the context
+                # the blocker was reported under.
+                api.set_active_context(*caller, a["program"], a["seasons"][0])
+
+                for offset, shape in enumerate(self._shapes(a, corrupt)):
+                    where = f"[{backend}] {shape['label']}"
+                    game_id = _inject_parented_draft_game(
+                        store, a["team"], offset, shape["parents"])
+                    self._assert_end_precondition(store, game_id, shape, where)
+                    # An injected draft has NO creation audit row, so rule 6
+                    # (unlinked -> creator only) can never explain a True.
+                    self.assertEqual(
+                        created_by(store, "game", game_id), set(),
+                        f"{where}: the injected Game has a creator audit row, "
+                        f"so an acceptance could come from creator ownership "
+                        f"rather than from its parent chain")
+                    self.assertIs(
+                        api.setup_target_accessible("game", game_id, *caller),
+                        shape["allowed"],
+                        f"{where}: expected accessible={shape['allowed']}. "
+                        f"Exactly ONE end of this Game's binding disagrees; "
+                        f"if that end is not judged, nothing else refuses "
+                        f"this row")
+                    if shape["end"] == "league_season_id.league":
+                        # A row whose OWN binding is inconsistent is
+                        # linked-but-UNAUTHORIZED, not merely out of scope:
+                        # selecting the foreign League's Program must not
+                        # rescue it either.
+                        api.set_active_context(*caller, b["program"],
+                                               b["seasons"][0])
+                        self.assertIs(
+                            api.setup_target_accessible("game", game_id,
+                                                        *caller),
+                            False,
+                            f"{where}: selecting Program B made the "
+                            f"inconsistent binding reachable -- the gate "
+                            f"picked ONE end as the row's home instead of "
+                            f"refusing a row that straddles both")
+                        api.set_active_context(*caller, a["program"],
+                                               a["seasons"][0])
+                self.assertIs(
+                    api.setup_target_accessible("game", "be_no_such_game",
+                                                *caller),
+                    False,
+                    f"[{backend}] a nonexistent Game did not fail closed")
+                _close(store)
+
+
+class SetupTargetBindingEndConsistencyHttpTest(unittest.TestCase):
+    """#372, the BINDING-END leg over AUTHENTICATED v1 and v2 HTTP.
+
+    Same shapes as the predicate class above, driven through
+    ``POST /api/setup/game/<id>/delete`` and
+    ``POST /api/v2/setup/game/<id>/delete``. Each refusal is compared as RAW
+    BYTES with the same call against a nonexistent Game id (only the echoed id
+    masked), and the Game row and setup-audit trail are asserted unchanged
+    afterwards."""
+
+    OWNER_A = "bex_owner_a"
+    OWNER_B = "bex_owner_b"
+
+    @classmethod
+    def setUpClass(cls):
+        srv = __import__("hockey_scheduler.web.server", fromlist=["x"])
+        cls.srv = srv
+        os.environ.pop("DATABASE_URL", None)
+        srv.STATE.reset(seed=False)
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.Handler)
+        cls.port = cls.httpd.server_address[1]
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
+                                      daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.thread.join(timeout=5)
+
+    # -- plumbing (the game-parent HTTP class's shape, verbatim) ------------
+    _reset_backend = SetupTargetAxisConsistencyTest._reset_backend
+    _client = SetupTargetAxisConsistencyTest._client
+    _raw = SetupTargetAxisConsistencyTest._raw
+    _post = SetupTargetAxisConsistencyTest._post
+    _select = SetupTargetAxisConsistencyTest._select
+    _ok = SetupTargetAxisConsistencyTest._ok
+    _audit_rows = SetupTargetAxisConsistencyTest._audit_rows
+    _blind = staticmethod(SetupTargetAxisConsistencyTest._blind)
+    _refused = SetupTargetGameParentConsistencyHttpTest._refused
+    _shapes = SetupTargetBindingEndConsistencyTest._shapes
+    _assert_end_precondition = \
+        SetupTargetBindingEndConsistencyTest._assert_end_precondition
+
+    def _account(self, username, role):
+        account = self.srv.STATE.api.accounts.create_account(
+            username, "bindingend-pw", role, scope={}, actor_id="test_seed")
+        opener = self._client()
+        status, resp, _ = self._post(opener, "/api/auth/login",
+                                     {"username": username,
+                                      "password": "bindingend-pw"})
+        self.assertEqual(status, 200, (username, resp))
+        return opener, account.id
+
+    def _world(self, opener, tag):
+        """The HTTP twin of ``_binding_end_world``: two Seasons, two Leagues
+        crossed over them, the product's own Season-1 binding, a Division under
+        it, and a Team."""
+        store = self.srv.STATE.api.store
+        program = self._ok(opener, "/api/v2/setup/program",
+                           {"name": f"BEX {tag} Program"})
+        self._select(opener, program["id"])
+        seasons = []
+        for n in (1, 2):
+            season = self._ok(opener, "/api/v2/setup/season",
+                              {"program_id": program["id"],
+                               "name": f"BEX {tag} Season {n}"})
+            seasons.append(season["id"])
+        self._select(opener, program["id"], seasons[0])
+        league = self._ok(opener, "/api/v2/setup/league",
+                          {"season_id": seasons[0],
+                           "name": f"BEX {tag} League"})
+        self._select(opener, program["id"], seasons[1])
+        sibling = self._ok(opener, "/api/v2/setup/league",
+                           {"season_id": seasons[1],
+                            "name": f"BEX {tag} Sibling League"})
+        self._select(opener, program["id"], seasons[0])
+        binding = store.league_season_for(league["id"], seasons[0])
+        self.assertIsNotNone(binding,
+                             f"fixture: the {tag} Season-1 binding")
+        division = self._ok(opener, "/api/v2/setup/division",
+                            {"league_id": league["id"],
+                             "season_id": seasons[0],
+                             "name": f"BEX {tag} Division"})
+        team = self._ok(opener, "/api/v2/setup/team",
+                        {"league_id": league["id"], "name": f"BEX {tag} Team"})
+        return {"program": program["id"], "seasons": seasons,
+                "league": league["id"], "sibling_league": sibling["id"],
+                "binding": binding.id, "division": division["id"],
+                "team": team["id"]}
+
+    def _run(self, database_url, backend):
+        self._reset_backend(database_url, backend)
+        store = self.srv.STATE.api.store
+        owner_a, _uid_a = self._account(f"{self.OWNER_A}_{backend}",
+                                        Role.LEAGUE_ADMIN)
+        owner_b, _uid_b = self._account(f"{self.OWNER_B}_{backend}",
+                                        Role.LEAGUE_ADMIN)
+        a = self._world(owner_a, "A")
+        b = self._world(owner_b, "B")
+        corrupt = _inject_corrupt_bindings(store, a, b)
+        # The reported context: Program A, Season 1, NO League.
+        self._select(owner_a, a["program"], a["seasons"][0])
+
+        offset = 0
+        for shape in self._shapes(a, corrupt):
+            for base in ("/api/setup", "/api/v2/setup"):
+                where = f"[{backend}] {shape['label']}"
+                offset += 1
+                # A fresh Game per version: the control's delete CONSUMES it,
+                # and a refusal must be measured against an untouched row.
+                game_id = _inject_parented_draft_game(store, a["team"], offset,
+                                                      shape["parents"])
+                # Per-version subTest: the two routes are separate contracts,
+                # and a v1 failure must not hide whether v2 still leaks.
+                with self.subTest(api=base, shape=shape["label"]):
+                    self._assert_end_precondition(store, game_id, shape, where)
+                    self.assertEqual(
+                        created_by(store, "game", game_id), set(),
+                        f"{where} [{base}]: the injected Game has a creator "
+                        f"audit row, so a 200 could come from creator "
+                        f"ownership")
+                    if shape["allowed"]:
+                        self._ok(owner_a, f"{base}/game/{game_id}/delete", {},
+                                 why=f"{where} [{base}] consistent-Game "
+                                     f"control")
+                        self.assertIsNone(
+                            store.get_game(game_id),
+                            f"{where} [{base}]: the control delete answered "
+                            f"200 without deleting anything")
+                    else:
+                        self._refused(owner_a, base, game_id, where)
+
+    def test_binding_end_consistency_memory(self):
+        self._run(None, "memory")
+
+    def test_binding_end_consistency_sqlite_file(self):
+        # FILE-BACKED, matching the classes above: ":memory:" cannot express
+        # the real cross-connection semantics this suite proves.
+        tmp = tempfile.mkdtemp(prefix="hs-bindingend-")
+        self._run(f"sqlite:///{os.path.join(tmp, 'bindingend.db')}", "sqlite")
+
+    @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                         "PostgreSQL required (set TEST_DATABASE_URL)")
+    def test_binding_end_consistency_postgres(self):
+        self._run(os.environ["TEST_DATABASE_URL"], "postgres")
+
+
+# ==========================================================================
 # IN-TRANSACTION interleaving and the row locks (#369 re-review, blocking
 # test gap).
 #
