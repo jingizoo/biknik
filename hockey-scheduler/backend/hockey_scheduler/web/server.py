@@ -797,6 +797,169 @@ class Handler(BaseHTTPRequestHandler):
             return True
         return False
 
+    # -- setup TARGET-RECORD authorization (#369) --------------------------
+    #
+    # ``authorize()`` gates the ROLE: may this caller use a setup verb at all.
+    # It says nothing about WHICH records that verb may touch — which is exactly
+    # the blocker. An Arena Manager POSTed
+    # ``/api/v2/setup/venue/<foreign-id>/delete`` for a Venue created by another
+    # account in another Program; the route returned 200, ECHOED the foreign
+    # record's own fields back (its name included — an information leak on top
+    # of the write), deleted it, and wrote a ``venue_deleted`` audit row.
+    # Permission to use a setup capability is not authorization over every
+    # record in the installation.
+    #
+    # ``_reject_target_outside_scope`` below is THE one gate every setup
+    # mutation that accepts an EXISTING entity id routes through, so the rule
+    # cannot drift between v1 and v2, or between delete / reassign / in-place
+    # edit. The decision itself lives in ONE predicate —
+    # ``ApiService.setup_target_accessible`` — and nothing here re-derives it.
+
+    # Canonical setup kind → the label the FACADE's own NotFoundError uses.
+    # Reused verbatim so a refusal is byte-identical to a genuinely nonexistent
+    # id and can never be turned into an existence oracle for another Program's
+    # records.
+    _SETUP_TARGET_LABELS = {
+        "program": "Program", "season": "Season", "league": "League",
+        "league_season": "LeagueSeason", "division": "Division",
+        "team": "Team", "player": "Player", "game": "Game", "club": "Club",
+        "official": "Official", "venue": "Venue", "rink": "Rink",
+        "ice_slot": "Ice slot", "organization": "Organization",
+        # Bridge rows (below) — the facade's wording for those two ids.
+        "registration": "Registration",
+        "season_venue_access": "Season-venue access",
+    }
+
+    # The two BRIDGE rows (registration / season-venue-access) carry no Program
+    # of their own and are judged by the parent that names one — but that
+    # resolution is DOMAIN knowledge and lives in
+    # ``ApiService._SETUP_BRIDGE_TARGETS``, not here. It used to live in this
+    # file and ran outside even the authorization transaction, which is exactly
+    # the hole #369's re-review closed: the parent a request was judged against
+    # could be re-pointed before the mutation ran. This layer keeps only the
+    # LABELS above, because the wire wording is genuinely transport.
+
+    # Transport alias → canonical kind, for the v1 (/api/setup/) surface ONLY.
+    # v1 "league" is TODAY'S PROGRAM and v1 "level" is today's competition
+    # LEAGUE — the pre-#233 vocabulary, still the v1 wire contract (v1 dispatches
+    # league→delete_program and level→delete_league). Passing the raw v1 word
+    # through would gate every v1 Program delete as a competition League; because
+    # Program and League ids are drawn from the SAME "league_" id sequence they
+    # never collide, so the lookup would simply miss and refuse EVERY v1 program
+    # delete with a not-found. v2 already speaks canonical names and needs no
+    # translation.
+    _V1_SETUP_KIND = {"league": "program", "level": "league"}
+
+    def _refuse_target(self, kind, record_id, rule="scope") -> None:
+        """Send THE refusal for ``rule``.
+
+        For the generic ceiling and the facility-tree exception that is the
+        facade's own not-found, reusing the label verbatim and naming the id the
+        caller ASKED about (a bridge row is judged by its parent but never named
+        as one), so an inaccessible record is byte-identical to a nonexistent
+        one and can never be turned into an existence oracle for another
+        Program's records.
+
+        ``active_program_league`` (#367's create-side rule) keeps the
+        ContextService wording it has always sent — equally generic, equally
+        non-oracle, and already a fixed wire contract asserted by the League
+        context tests."""
+        if rule == "active_program_league":
+            return self._send_json({"error": {
+                "code": "not_found",
+                "message": "League not found or not accessible for this "
+                           "context.",
+                "details": {"reason": "league_not_accessible"}}}, 404)
+        self._send_api({"error": {
+            "code": "not_found",
+            "message": (f"{self._SETUP_TARGET_LABELS.get(kind, kind)} "
+                        f"{record_id} not found.")}})
+
+    def _reject_target_outside_scope(self, kind, record_id, user_id, role,
+                                     scope, rule="scope") -> bool:
+        """PREFLIGHT ONLY (#369 re-review): send the generic not-found and
+        return True when this caller may not act on THIS setup record; return
+        False to proceed.
+
+        This is NOT the security boundary and must never be the only gate on a
+        mutation. It answers for the instant it read and then closes its
+        transaction, so between its answer and the write the target's chain can
+        move — which is precisely the blocker. ``_guarded_mutation`` below is
+        the boundary; this runs ahead of it so an unauthorized caller is refused
+        cheaply, without opening a transaction or contending for a single row
+        lock on records it has no business touching.
+
+        ``rule`` selects the predicate: ``"scope"`` for the generic ceiling,
+        ``"grantable"`` for the facility-tree exception (the Venue argument of
+        the venue-access grant, and nothing else), ``"active_program_league"``
+        for #367's create-side League rule.
+
+        Three cases deliberately pass through untouched:
+
+        * ``record_id`` falsy or not a string. Not this gate's business: the
+          route's own ``check_body`` and the facade already own that error, and
+          turning a precise ``validation_error`` into a generic not-found would
+          be a regression.
+        * ``setup_target_allowed`` returns **None** — no user context was
+          supplied at all (``role is None``). Legacy identity-less internal
+          callers, the demo/full seeds and the acceptance harnesses drive the
+          facade with no identity and must be completely unaffected. This is NOT
+          a bypass for synthetic actor labels: an identified caller with a real
+          role is gated no matter what its actor string looks like.
+        * A bridge row (registration / season-venue-access) that does not
+          resolve. There is nothing to judge, and the facade emits the
+          byte-identical wording a step later.
+        """
+        if not isinstance(record_id, str) or not record_id:
+            return False
+        kind = kind.replace("-", "_")
+        if STATE.api.setup_target_allowed(
+                kind, record_id, user_id, role, scope, rule) is not False:
+            return False
+        self._refuse_target(kind, record_id, rule)
+        return True
+
+    def _guarded_mutation(self, targets, mutation, user_id, role, scope):
+        """THE gate every setup mutation on an EXISTING record goes through:
+        run ``mutation`` with its authorization, its row locks, its write and
+        its audit inside ONE store transaction (#369 re-review).
+
+        ``targets`` is the list of records the request names, in the order the
+        caller wants them reported: ``(kind, record_id)`` for the generic
+        ceiling, or ``(kind, record_id, rule)`` for one of the two narrower
+        rules (``"grantable"``, ``"active_program_league"``). A reassign passes
+        BOTH ends — the SOURCE record being moved and any non-null DESTINATION
+        it is moving into (an explicit null unassign has no destination to
+        check).
+
+        ``mutation`` is a zero-argument callable returning the exact payload to
+        send, response mapping included. It runs INSIDE the transaction, so a
+        refusal — of a target or by the mutation itself — rolls the whole thing
+        back: no row written, no audit entry, and not one lookup-derived field
+        serialized into the response.
+
+        Why a callable rather than the previous check-then-call: the two must be
+        one unit. The old shape finished the authorization transaction and then
+        started a separate one for the facade, and a commit that landed in
+        between (moving the target into another Program, or re-pointing a bridge
+        row's parent) left the original request authorized against a world that
+        no longer existed. It returned 200 and wrote to the new owner's row.
+        """
+        for target in targets:
+            if self._reject_target_outside_scope(
+                    target[0], target[1], user_id, role, scope,
+                    target[2] if len(target) > 2 else "scope"):
+                return
+        payload, refused = STATE.api.setup_guarded_mutation(
+            [(t[0], t[1], t[2] if len(t) > 2 else "scope") for t in targets],
+            mutation, user_id, role, scope)
+        if refused is not None:
+            target = targets[refused]
+            return self._refuse_target(
+                target[0].replace("-", "_"), target[1],
+                target[2] if len(target) > 2 else "scope")
+        return self._send_api(payload)
+
     def _require_player_scope(self):
         """Resolve the signed-in player's id + user id from the session for a
         player-scoped route (#110), so the browser never passes a player_id.
@@ -2242,6 +2405,9 @@ class Handler(BaseHTTPRequestHandler):
         # (enforced above), but canonical request bodies and canonical
         # (_serialize) responses — NO v1 adapter mapping. Checked before the v1
         # prefix so /api/v2/setup/ never falls through to /api/setup/.
+        # ``role``/``scope`` come from the SAME _resolve_role() call that
+        # produced ``user_id`` above (#369), so the identity the target-record
+        # gate checks is exactly the identity the audit trail records.
         if path.startswith("/api/v2/setup/"):
             return self._handle_setup_v2(path[len("/api/v2/setup/"):], body,
                                          user_id, role, scope)
@@ -2296,8 +2462,8 @@ class Handler(BaseHTTPRequestHandler):
 
         # Setup create endpoints — operator creates real records via the API.
         if path.startswith("/api/setup/"):
-            return self._handle_setup(path[len("/api/setup/"):], body,
-                                      user_id, role, scope)
+            return self._handle_setup(path[len("/api/setup/"):], body, user_id,
+                                      role, scope)
 
         # Pilot onboarding import dry-run (#92): validates CSV-shaped rows and
         # always returns 200 with the report itself (ok true/false) — nothing
@@ -2618,13 +2784,14 @@ class Handler(BaseHTTPRequestHandler):
         return self._unmatched_route("POST")
 
     def _handle_reassign(self, entity: str, record_id: str, target: str,
-                         body: dict, actor_id: str, role=None, scope=None):
+                         body: dict, actor_id: str, role, scope):
         """Dispatch /api/setup/<entity>/<id>/assign-<target> (#166 PR D).
 
         Each moves ``record_id`` under a new parent id read from the body; the
         facade validates the target exists (or accepts null to unassign the
         nullable links) and audits the old→new ids. ``actor_id`` is the
-        server-resolved session user (#136), never client-supplied.
+        server-resolved session user (#136), never client-supplied, and
+        ``role``/``scope`` come from that same resolution (#369).
         """
         api = STATE.api
         b = body
@@ -2661,37 +2828,80 @@ class Handler(BaseHTTPRequestHandler):
                 check_body(b, **_V1_REASSIGN_SCHEMA[combo])
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
-        # #369 review: the new parent must be one this caller may already
-        # reach -- the same gate, and the same refusal, as the creates.
-        if combo in _REASSIGN_PARENTS:
-            _kind, _key = _REASSIGN_PARENTS[combo]
-            if self._reject_parent_outside_scope(
-                    _kind, b.get(_key), role, scope, actor_id):
+        # #369 — target-record authorization, BOTH ENDS. A reassign moves a
+        # record out of one parent and into another, so the caller must be
+        # entitled to the SOURCE record it is moving AND to any non-null
+        # DESTINATION it is moving into; an explicit null (unassign) has no
+        # destination to check. Both ends, the write and the audit run inside
+        # ONE transaction with both rows locked (`_guarded_mutation`), so a
+        # commit that moves either end mid-request cannot slip between the
+        # decision and the write. A refusal serializes nothing, saves nothing
+        # and audits nothing. The v1 wire word is translated first: "league"
+        # here is a PROGRAM.
+        # combo → (canonical kind of the destination, its v1 body key). "level"
+        # is v1 for the competition LEAGUE, so the destination kind is "league".
+        _V1_REASSIGN_DEST = {
+            ("league", "organization"): ("organization", "organization_id"),
+            ("venue", "organization"): ("organization", "organization_id"),
+            ("rink", "venue"): ("venue", "venue_id"),
+            ("division", "level"): ("league", "level_id"),
+            ("team", "club"): ("club", "club_id"),
+            ("player", "team"): ("team", "team_id"),
+        }
+        dest = _V1_REASSIGN_DEST.get(combo)
+        targets = [(self._V1_SETUP_KIND.get(entity, entity), record_id)]
+        if dest is not None:
+            targets.append((dest[0], b.get(dest[1]) or None))
+        # ...and for the four relations a CREATE can also reach by id, the
+        # destination must additionally satisfy the WRITE-side parent rule
+        # (#369 review) — the same gate, and the same refusal, as the creates.
+        # It is a SECOND, narrower question than the generic ceiling above
+        # ("may this caller attach a new child here", answered from the read
+        # it mirrors), so the destination is listed twice and must pass both:
+        # a gate on creates alone left the identical cross-owner write open
+        # behind `assign-<target>`, and an Arena Manager really did move its
+        # own Rink under another creator's Venue and get a 200. Carried as a
+        # `_guarded_mutation` TARGET rather than a bare preflight so the parent
+        # decision is taken under the destination row's lock, inside the same
+        # transaction as the move (#369 re-review's atomicity rule).
+        parent = _REASSIGN_PARENTS.get(combo)
+        if parent is not None:
+            targets.append((parent[0], b.get(parent[1]) or None,
+                            "writable_parent"))
+        # The preflight runs here rather than only inside `_guarded_mutation`
+        # so an unauthorized target is still refused AHEAD of the unknown-combo
+        # 404 below, exactly as before: a caller is never told a route shape is
+        # wrong about a record it may not see.
+        for target in targets:
+            if self._reject_target_outside_scope(
+                    target[0], target[1], actor_id, role, scope,
+                    target[2] if len(target) > 2 else "scope"):
                 return
         # v1 boundary (#233 C1b): legacy request keys map straight onto the
         # canonical facade args (same id values), and canonical result dicts are
         # mapped back to the exact legacy v1 response keys via _v1.
-        if combo == ("league", "organization"):
-            return self._send_api(_v1.program_to_v1(api.assign_program_organization(
-                record_id, b.get("organization_id") or None, actor_id)))
-        if combo == ("venue", "organization"):
-            return self._send_api(api.assign_venue_organization(
-                record_id, b.get("organization_id") or None, actor_id))
-        if combo == ("rink", "venue"):
-            return self._send_api(api.assign_rink_venue(
-                record_id, b.get("venue_id"), actor_id))
-        if combo == ("division", "level"):
-            return self._send_api(_v1.division_to_v1(api.assign_division_league(
-                record_id, b.get("level_id") or None, actor_id)))
-        if combo == ("team", "club"):
-            return self._send_api(_v1.team_to_v1(api.assign_team_club(
-                record_id, b.get("club_id") or None, actor_id)))
-        # ("team", "division") reassignment removed (#180): a Team's seasonal
-        # division is set through its SeasonTeamRegistration, not the legacy
-        # Team.division_id.
-        if combo == ("player", "team"):
-            return self._send_api(api.assign_player_team(
-                record_id, b.get("team_id"), actor_id))
+        _V1_REASSIGN_CALL = {
+            ("league", "organization"): lambda: _v1.program_to_v1(
+                api.assign_program_organization(
+                    record_id, b.get("organization_id") or None, actor_id)),
+            ("venue", "organization"): lambda: api.assign_venue_organization(
+                record_id, b.get("organization_id") or None, actor_id),
+            ("rink", "venue"): lambda: api.assign_rink_venue(
+                record_id, b.get("venue_id"), actor_id),
+            ("division", "level"): lambda: _v1.division_to_v1(
+                api.assign_division_league(
+                    record_id, b.get("level_id") or None, actor_id)),
+            ("team", "club"): lambda: _v1.team_to_v1(api.assign_team_club(
+                record_id, b.get("club_id") or None, actor_id)),
+            # ("team", "division") reassignment removed (#180): a Team's
+            # seasonal division is set through its SeasonTeamRegistration, not
+            # the legacy Team.division_id.
+            ("player", "team"): lambda: api.assign_player_team(
+                record_id, b.get("team_id"), actor_id),
+        }
+        call = _V1_REASSIGN_CALL.get(combo)
+        if call is not None:
+            return self._guarded_mutation(targets, call, actor_id, role, scope)
         return self._send_json({"error": {
             "code": "not_found",
             "message": f"Unknown reassignment {entity}/assign-{target}."}}, 404)
@@ -2754,11 +2964,13 @@ class Handler(BaseHTTPRequestHandler):
         if not parent_id:
             return False
         label = _SETUP_PARENT_LISTS[kind]
-        accessible = None
-        if role is not None:
-            accessible = STATE.api.writable_setup_parent_ids(
-                kind, user_id, role, scope)
-        if accessible is not None and parent_id in accessible:
+        # The decision itself is ``ApiService.setup_parent_writable`` — the
+        # same predicate the ``writable_parent`` reassign target runs under the
+        # destination row's lock (#369 re-review), so the create gate and the
+        # reassign gate can never fork into two policies. It answers None only
+        # for a falsy id, which never reaches here.
+        if STATE.api.setup_parent_writable(
+                kind, parent_id, user_id, role, scope) is not False:
             return False
         self._send_json({"error": {
             "code": "not_found",
@@ -2766,15 +2978,18 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def _handle_setup(self, entity: str, body: dict, actor_id: str,
-                      role=None, scope=None):
+                      role, scope):
         """Dispatch /api/setup/<entity> to the matching facade create method.
 
         ``actor_id`` is always the caller's server-resolved session user id
         (#136) — never a client-supplied body field, so the setup audit
         trail can't be forged. ``role``/``scope`` come from the SAME
-        ``_resolve_role()`` call that produced ``actor_id`` and are used only
-        by ``_reject_parent_outside_scope`` (#369 review), so the write gate
-        reads the identical identity the audit trail records.
+        ``_resolve_role()`` call that produced ``actor_id`` and feed BOTH #369
+        write gates — ``_reject_parent_outside_scope`` on the create routes'
+        caller-supplied parent ids, and ``_reject_target_outside_scope`` /
+        ``_guarded_mutation`` on every route that names an EXISTING record —
+        so the identity those gates check is exactly the identity the audit
+        trail records.
         """
         api = STATE.api
         b = body
@@ -2782,8 +2997,8 @@ class Handler(BaseHTTPRequestHandler):
         # Move a record under a new parent, recording the old→new ids in audit.
         m = re.match(r"^(league|venue|rink|division|team|player)/([^/]+)/assign-(\w+)$", entity)
         if m:
-            return self._handle_reassign(m.group(1), m.group(2), m.group(3),
-                                         b, actor_id, role, scope)
+            return self._handle_reassign(m.group(1), m.group(2), m.group(3), b,
+                                         actor_id, role, scope)
         # Season team registrations (#180): register a permanent league team for
         # a season, reassign its division for that season, or remove it from the
         # season. All League-Admin (MANAGE_SETUP) via the /api/setup/ authz
@@ -2816,17 +3031,30 @@ class Handler(BaseHTTPRequestHandler):
                            types={"division_id": (str, type(None))})
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
-            return self._send_api(_v1.registration_to_v1(
-                api.assign_season_team_division(
-                    ma.group(1), b.get("division_id") or None, actor_id)))
+            # #369 — both ends: the registration being edited (judged by its
+            # LeagueSeason) and the destination Division when one is given. The
+            # bridge row's PARENT lookup runs inside the guard's transaction,
+            # under the bridge row's own lock — outside it, the registration
+            # could be re-pointed at another LeagueSeason after it was judged.
+            return self._guarded_mutation(
+                [("registration", ma.group(1)),
+                 ("division", b.get("division_id") or None)],
+                lambda: _v1.registration_to_v1(
+                    api.assign_season_team_division(
+                        ma.group(1), b.get("division_id") or None, actor_id)),
+                actor_id, role, scope)
         mx = re.match(r"^season-team-registration/([^/]+)/remove$", entity)
         if mx:
             try:
                 check_body(b, allowed=set())  # no body
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
-            return self._send_api(_v1.registration_to_v1(
-                api.unregister_team_from_season(mx.group(1), actor_id)))
+            # #369 — an unassign still mutates an existing record: gate it.
+            return self._guarded_mutation(
+                [("registration", mx.group(1))],
+                lambda: _v1.registration_to_v1(
+                    api.unregister_team_from_season(mx.group(1), actor_id)),
+                actor_id, role, scope)
         # Safe destructive deletion (#215): /api/setup/<entity>/<id>/delete.
         # League-Admin only via the /api/setup MANAGE_SETUP catch-all; the actor
         # is the server-resolved session user. Each facade method runs a
@@ -2851,13 +3079,23 @@ class Handler(BaseHTTPRequestHandler):
                 "venue": api.delete_venue, "rink": api.delete_rink,
                 "ice-slot": api.delete_ice_slot, "game": api.delete_game,
             }[kind]
+            # #369 — THE blocker's dispatch point on v1. The target row is
+            # LOCKED and re-authorized inside the same transaction that runs the
+            # delete and its audit, so a record moved into another Program after
+            # the preflight is refused, not deleted: the foreign record is never
+            # serialized into the response, never deleted, and never audited.
+            # "league" here is a PROGRAM and "level" is a competition League —
+            # translate before gating.
             # v1 boundary (#233 C1b): the deleted record is returned serialized,
             # so canonical entities are mapped back to their legacy v1 shape.
             _to_v1 = {"league": _v1.program_to_v1, "season": _v1.season_to_v1,
                       "division": _v1.division_to_v1, "team": _v1.team_to_v1,
                       "game": _v1.game_to_v1}
             mapper = _to_v1.get(kind, lambda r: r)
-            return self._send_api(mapper(deleter(md.group(2), actor_id)))
+            return self._guarded_mutation(
+                [(self._V1_SETUP_KIND.get(kind, kind), md.group(2))],
+                lambda: mapper(deleter(md.group(2), actor_id)),
+                actor_id, role, scope)
         # Player/Official delete moved to v2 (#232/#271): the v1 delete regex
         # above deliberately excludes them, so the old v1 path would otherwise
         # fall through to a bare "Unknown setup entity" 404. Return an explicit
@@ -3006,7 +3244,7 @@ class Handler(BaseHTTPRequestHandler):
                                           "message": "Unknown setup entity."}}, 404)
 
     def _handle_reassign_v2(self, entity: str, record_id: str, target: str,
-                            body: dict, actor_id: str, role=None, scope=None):
+                            body: dict, actor_id: str, role, scope):
         """Dispatch /api/v2/setup/<entity>/<id>/assign-<target> (#233 Slice C2).
 
         Canonical reassign per the ADR 0001 new tree: division→league (the
@@ -3015,7 +3253,8 @@ class Handler(BaseHTTPRequestHandler):
         There is NO team→program (a Team is program-permanent) and NO
         division→level (division's parent is now a League). Canonical request
         keys and canonical (_serialize) responses — no v1 mapping. ``actor_id``
-        is the server-resolved session user (#136), never client-supplied.
+        is the server-resolved session user (#136), never client-supplied, and
+        ``role``/``scope`` come from that same resolution (#369).
         """
         api = STATE.api
         b = body
@@ -3056,29 +3295,52 @@ class Handler(BaseHTTPRequestHandler):
                 check_body(b, **_V2_REASSIGN_SCHEMA[combo])
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
-        # #369 review: the new parent must be one this caller may already
-        # reach -- the same gate, and the same refusal, as the creates.
-        if combo in _REASSIGN_PARENTS:
-            _kind, _key = _REASSIGN_PARENTS[combo]
-            if self._reject_parent_outside_scope(
-                    _kind, b.get(_key), role, scope, actor_id):
+        # #369 — target-record authorization, BOTH ENDS: the SOURCE record being
+        # moved and any non-null DESTINATION it is moving into (an explicit null
+        # unassign has no destination to check). Both ends, the write and the
+        # audit run inside ONE transaction with both rows locked
+        # (`_guarded_mutation`), so a commit that moves either end mid-request
+        # cannot slip between the decision and the write. A refusal serializes
+        # nothing, saves nothing and audits nothing. v2 already speaks canonical
+        # kind names, so no alias translation here.
+        _V2_REASSIGN_DEST = {
+            ("program", "organization"): ("organization",
+                                          "operator_organization_id"),
+            ("division", "league"): ("league", "league_id"),
+            ("team", "club"): ("club", "club_id"),
+            ("team", "league"): ("league", "league_id"),
+            ("player", "team"): ("team", "team_id"),
+            ("rink", "venue"): ("venue", "venue_id"),
+            ("venue", "organization"): ("organization", "organization_id"),
+        }
+        dest = _V2_REASSIGN_DEST.get(combo)
+        targets = [(entity, record_id)]
+        if dest is not None:
+            targets.append((dest[0], b.get(dest[1]) or None))
+        # ...and for the relations a CREATE can also reach by id, the
+        # destination must additionally satisfy the WRITE-side parent rule
+        # (#369 review) — the same gate, and the same refusal, as the creates,
+        # on BOTH API versions: v2 is not a bypass for v1's gate and v1 is not
+        # a bypass for v2's. Listing the destination a second time under
+        # ``writable_parent`` asks the narrower "may this caller attach a new
+        # child here" question alongside the generic ceiling; both must pass.
+        # It rides as a `_guarded_mutation` TARGET, not a bare preflight, so
+        # the parent decision is taken under the destination row's lock inside
+        # the same transaction as the move (#369 re-review's atomicity rule).
+        parent = _REASSIGN_PARENTS.get(combo)
+        if parent is not None:
+            targets.append((parent[0], b.get(parent[1]) or None,
+                            "writable_parent"))
+        # Preflighted here rather than only inside `_guarded_mutation` so an
+        # unauthorized target is still refused AHEAD of both the ("team",
+        # "league") body check and the unknown-combo 404 below, exactly as
+        # before: a caller is never told a body or route shape is wrong about a
+        # record it may not see.
+        for target in targets:
+            if self._reject_target_outside_scope(
+                    target[0], target[1], actor_id, role, scope,
+                    target[2] if len(target) > 2 else "scope"):
                 return
-        if combo == ("program", "organization"):
-            # v2 Program operator reassignment (#233 Slice C2 review): the
-            # canonical umbrella owner move, using ``operator_organization_id``.
-            # The facade preserves the temporary Venue-link safety rule (the
-            # operator can't change while venues are still attached).
-            return self._send_api(api.assign_program_organization(
-                record_id, b.get("operator_organization_id") or None, actor_id))
-        if combo == ("division", "league"):
-            # v2 Division reparent: League REQUIRED + dependent-record integrity.
-            return self._send_api(api.assign_division_league(
-                record_id, b.get("league_id") or None, actor_id, v2=True))
-        if combo == ("team", "club"):
-            # Club is optional in both v1 and v2 (#233 Slice D): a null
-            # club_id unassigns the team's Club.
-            return self._send_api(api.assign_team_club(
-                record_id, b.get("club_id") or None, actor_id))
         if combo == ("team", "league"):
             # #283 Slice B: move a Team to a different PERMANENT League
             # (promotion/relegation/transfer, rule 10). League is required —
@@ -3086,65 +3348,49 @@ class Handler(BaseHTTPRequestHandler):
             if not (b.get("league_id") or None):
                 return self._send_api({"error": {"code": "validation_error",
                     "message": "A league_id is required."}})
-            return self._send_api(api.transfer_team_to_league(
-                record_id, b.get("league_id"), actor_id))
-        if combo == ("player", "team"):
-            return self._send_api(api.assign_player_team(
-                record_id, b.get("team_id"), actor_id))
-        if combo == ("rink", "venue"):
-            return self._send_api(api.assign_rink_venue(
-                record_id, b.get("venue_id"), actor_id))
-        if combo == ("venue", "organization"):
+        _V2_REASSIGN_CALL = {
+            # v2 Program operator reassignment (#233 Slice C2 review): the
+            # canonical umbrella owner move, using ``operator_organization_id``.
+            # The facade preserves the temporary Venue-link safety rule (the
+            # operator can't change while venues are still attached).
+            ("program", "organization"): lambda: api.assign_program_organization(
+                record_id, b.get("operator_organization_id") or None, actor_id),
+            # v2 Division reparent: League REQUIRED + dependent-record integrity.
+            ("division", "league"): lambda: api.assign_division_league(
+                record_id, b.get("league_id") or None, actor_id, v2=True),
+            # Club is optional in both v1 and v2 (#233 Slice D): a null
+            # club_id unassigns the team's Club.
+            ("team", "club"): lambda: api.assign_team_club(
+                record_id, b.get("club_id") or None, actor_id),
+            ("team", "league"): lambda: api.transfer_team_to_league(
+                record_id, b.get("league_id"), actor_id),
+            ("player", "team"): lambda: api.assign_player_team(
+                record_id, b.get("team_id"), actor_id),
+            ("rink", "venue"): lambda: api.assign_rink_venue(
+                record_id, b.get("venue_id"), actor_id),
             # Canonical Venue is org-owned only — strip the legacy league_id.
-            return self._send_api(_v2p.venue_to_v2(api.assign_venue_organization(
-                record_id, b.get("organization_id") or None, actor_id)))
+            ("venue", "organization"): lambda: _v2p.venue_to_v2(
+                api.assign_venue_organization(
+                    record_id, b.get("organization_id") or None, actor_id)),
+        }
+        call = _V2_REASSIGN_CALL.get(combo)
+        if call is not None:
+            return self._guarded_mutation(targets, call, actor_id, role, scope)
         return self._send_json({"error": {
             "code": "not_found",
             "message": f"Unknown reassignment {entity}/assign-{target}."}}, 404)
 
-    def _reject_league_outside_active_program(self, league_id) -> bool:
-        """True (and a response already sent) when ``league_id`` does not
-        belong to the caller's ACTIVE Program (#367 prerequisite).
-
-        The write-side half of scoping the setup hierarchy. The read fix stops
-        another Program's Leagues being OFFERED; this stops them being
-        ACCEPTED, which is the part that actually matters — the id arrives in
-        a request body and a client can send any value it likes.
-
-        Deliberately binds to the ACTIVE Program rather than the caller's
-        whole authorized set: a global League Admin is authorized for every
-        Program, so an authorization-only check would not stop the reported
-        case (an operator working in Program B creating into Program A). You
-        create where you are working; switching Program is the context bar's
-        job.
-
-        The refusal reuses ``ContextService``'s existing generic League
-        message, so an inaccessible League is indistinguishable from a
-        nonexistent one and this never becomes an existence oracle.
-        """
-        api = STATE.api
-        role, scope, user_id, err = self._resolve_role()
-        if err is not None:
-            code, payload = err
-            self._send_json(payload, code)
-            return True
-        if role is None:
-            return False          # unscoped/demo caller: unchanged behavior
-        program, _season, _league = api.context.resolve_with_league(
-            user_id, role, scope)
-        league = api.store.get_league(league_id) if league_id else None
-        if (program is None or league is None
-                or league.program_id != program.id):
-            self._send_json({"error": {
-                "code": "not_found",
-                "message": "League not found or not accessible for this "
-                           "context.",
-                "details": {"reason": "league_not_accessible"}}}, 404)
-            return True
-        return False
+    # #367's create-side League rule is now a ``_guarded_mutation`` target with
+    # ``rule="active_program_league"`` (the decision itself lives in
+    # ``ApiService.setup_league_in_active_program``, beside the other two target
+    # rules). It had exactly the blocker's shape: resolve the context and read
+    # the League in one transaction, then create in another, so a League moved
+    # to a different Program in between was still accepted. Its wire contract —
+    # the generic ``league_not_accessible`` — is unchanged; see
+    # ``_refuse_target``.
 
     def _handle_setup_v2(self, entity: str, body: dict, actor_id: str,
-                         role=None, scope=None):
+                         role, scope):
         """Dispatch /api/v2/setup/<entity> to the canonical facade (#233 Slice C2).
 
         The canonical write surface: canonical body keys (program_id /
@@ -3154,8 +3400,11 @@ class Handler(BaseHTTPRequestHandler):
         (League on division / registration / game); a missing one is a
         validation_error rather than a silent v1-style derivation. ``actor_id`` is
         always the server-resolved session user (#136); ``role``/``scope`` come
-        from that same ``_resolve_role()`` call and feed
-        ``_reject_parent_outside_scope`` (#369 review) only.
+        from that same ``_resolve_role()`` call and feed BOTH #369 write gates
+        — ``_reject_parent_outside_scope`` on this surface's caller-supplied
+        parent ids and the target gate (``_reject_target_outside_scope`` /
+        ``_guarded_mutation``) on every route naming an EXISTING record — so
+        the identity checked is the identity audited.
         """
         api = STATE.api
         b = body
@@ -3193,8 +3442,12 @@ class Handler(BaseHTTPRequestHandler):
                            "email": (str, type(None))})
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
-            return self._send_api(api.update_player(
-                mpu.group(1), actor_id=actor_id, **b))
+            # #369 — an in-place edit is a mutation of an EXISTING record and
+            # echoes that record back; gate it exactly like a delete.
+            return self._guarded_mutation(
+                [("player", mpu.group(1))],
+                lambda: api.update_player(mpu.group(1), actor_id=actor_id, **b),
+                actor_id, role, scope)
         # Deactivate/reactivate a Player without deleting history (#270): the
         # supported roster exit for IR / a move / a departure. `active` is a
         # REQUIRED bool; `reason` is an optional free-text note recorded in the
@@ -3209,9 +3462,13 @@ class Handler(BaseHTTPRequestHandler):
                                   "reason": (str, type(None))})
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
-            return self._send_api(api.set_player_active(
-                mpa.group(1), b["active"], actor_id=actor_id,
-                reason=b.get("reason")))
+            # #369 — same as /update: an existing-record lifecycle edit.
+            return self._guarded_mutation(
+                [("player", mpa.group(1))],
+                lambda: api.set_player_active(
+                    mpa.group(1), b["active"], actor_id=actor_id,
+                    reason=b.get("reason")),
+                actor_id, role, scope)
         # Season team registrations (canonical): league_id REQUIRED, division
         # optional. The result keeps its competition league_id (canonical).
         mr = re.match(r"^seasons/([^/]+)/team-registrations$", entity)
@@ -3237,8 +3494,15 @@ class Handler(BaseHTTPRequestHandler):
                            types={"league_id": str})
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
-            return self._send_api(api.assign_season_team_league(
-                ml.group(1), b.get("league_id") or None, actor_id))
+            # #369 — both ends: the registration (judged by its LeagueSeason)
+            # and the destination League. The bridge row's PARENT lookup runs
+            # inside the guard's transaction, under the bridge row's own lock.
+            return self._guarded_mutation(
+                [("registration", ml.group(1)),
+                 ("league", b.get("league_id") or None)],
+                lambda: api.assign_season_team_league(
+                    ml.group(1), b.get("league_id") or None, actor_id),
+                actor_id, role, scope)
         ma = re.match(r"^season-team-registration/([^/]+)/assign-division$", entity)
         if ma:
             # v2: clearing the Division PRESERVES the required league_id; a set
@@ -3250,16 +3514,28 @@ class Handler(BaseHTTPRequestHandler):
                            types={"division_id": (str, type(None))})
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
-            return self._send_api(api.assign_season_team_division(
-                ma.group(1), b.get("division_id") or None, actor_id, v2=True))
+            # #369 — both ends: the registration and the destination Division
+            # (an explicit null clears it and has no destination to check). The
+            # bridge row's PARENT lookup runs inside the guard's transaction,
+            # under the bridge row's own lock.
+            return self._guarded_mutation(
+                [("registration", ma.group(1)),
+                 ("division", b.get("division_id") or None)],
+                lambda: api.assign_season_team_division(
+                    ma.group(1), b.get("division_id") or None, actor_id,
+                    v2=True),
+                actor_id, role, scope)
         mx = re.match(r"^season-team-registration/([^/]+)/remove$", entity)
         if mx:
             try:
                 check_body(b, allowed=set())  # no body
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
-            return self._send_api(api.unregister_team_from_season(
-                mx.group(1), actor_id))
+            # #369 — an unassign still mutates an existing record: gate it.
+            return self._guarded_mutation(
+                [("registration", mx.group(1))],
+                lambda: api.unregister_team_from_season(mx.group(1), actor_id),
+                actor_id, role, scope)
         # Explicit permanent cleanup of an already-inactive, game-free
         # registration (#251). Distinct from "remove" above, which only
         # deactivates and preserves the row for history.
@@ -3270,8 +3546,12 @@ class Handler(BaseHTTPRequestHandler):
                 check_body(b, allowed=set())  # no body
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
-            return self._send_api(api.delete_season_team_registration(
-                mdr.group(1), actor_id))
+            # #369 — permanent cleanup of an existing record: gate it.
+            return self._guarded_mutation(
+                [("registration", mdr.group(1))],
+                lambda: api.delete_season_team_registration(
+                    mdr.group(1), actor_id),
+                actor_id, role, scope)
         # Season-venue access (#233 Slice E, E1): grant/revoke which Venues a
         # Season may use, independent of any Venue-Program ownership. Not a
         # v1 route — this is a new v2-only feature, no legacy shape to adapt.
@@ -3283,16 +3563,43 @@ class Handler(BaseHTTPRequestHandler):
                            types={"venue_id": str})
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
-            return self._send_api(api.grant_season_venue_access(
-                mva.group(1), b.get("venue_id"), actor_id))
+            # #369 — the ONE create the owner named explicitly, because both of
+            # its arguments are EXISTING records: the Season being granted
+            # access and the Venue it is being granted into. This is also the
+            # legitimate pending-link flow — a just-created, still-unlinked
+            # Venue is claimable only by the account that created it, which the
+            # predicate's rule 6 handles.
+            #
+            # The Venue end uses the FACILITY-TREE EXCEPTION, not the generic
+            # rule (#369 owner ruling) -- the "grantable" rule below. Applying
+            # the ceiling here deadlocked shared arenas: once one Program holds
+            # the grant, no other Program can ever obtain it. The Season end
+            # stays strictly ceilinged, and every other target on every other
+            # route keeps the generic rule -- the exception is this one
+            # argument. Both ends are still locked and re-judged inside the
+            # grant's own transaction: the exception changes WHICH predicate
+            # answers for the Venue, never whether the answer is atomic with the
+            # write.
+            venue_id = b.get("venue_id") or None
+            return self._guarded_mutation(
+                [("season", mva.group(1)), ("venue", venue_id, "grantable")],
+                lambda: api.grant_season_venue_access(
+                    mva.group(1), b.get("venue_id"), actor_id),
+                actor_id, role, scope)
         mvr = re.match(r"^season-venue-access/([^/]+)/remove$", entity)
         if mvr:
             try:
                 check_body(b, allowed=set())  # no body
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
-            return self._send_api(api.revoke_season_venue_access(
-                mvr.group(1), actor_id))
+            # #369 — revoke deactivates an existing grant: gate it. The grant is
+            # judged by its Season (the competition side names the Program), and
+            # that parent lookup runs inside the guard's transaction, under the
+            # grant row's own lock.
+            return self._guarded_mutation(
+                [("season_venue_access", mvr.group(1))],
+                lambda: api.revoke_season_venue_access(mvr.group(1), actor_id),
+                actor_id, role, scope)
         # Explicit permanent cleanup of an already-revoked access row (#255
         # review), mirroring #251's season-team-registration .../delete.
         mvd = re.match(r"^season-venue-access/([^/]+)/delete$", entity)
@@ -3301,8 +3608,11 @@ class Handler(BaseHTTPRequestHandler):
                 check_body(b, allowed=set())  # no body
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
-            return self._send_api(api.delete_season_venue_access(
-                mvd.group(1), actor_id))
+            # #369 — permanent cleanup of an existing grant: gate it.
+            return self._guarded_mutation(
+                [("season_venue_access", mvd.group(1))],
+                lambda: api.delete_season_venue_access(mvd.group(1), actor_id),
+                actor_id, role, scope)
         # Season rollover (canonical v2): each selection REQUIRES a target
         # league_id, honored verbatim on the resulting registration.
         mrf = re.match(r"^seasons/([^/]+)/roll-forward$", entity)
@@ -3318,10 +3628,18 @@ class Handler(BaseHTTPRequestHandler):
                 check_body(b, allowed={"reason"})
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
+            # #369 — archive/reopen are in-place edits of an EXISTING Season:
+            # they flip its status, echo the Season back and write an audit row,
+            # so they belong to the same class as player/update and are gated
+            # identically. Freezing or reopening another Program's Season is the
+            # blocker in a different costume.
             call = (api.archive_season if mar.group(2) == "archive"
                     else api.reopen_season)
-            return self._send_api(call(
-                mar.group(1), reason=b.get("reason"), actor_id=actor_id))
+            return self._guarded_mutation(
+                [("season", mar.group(1))],
+                lambda: call(mar.group(1), reason=b.get("reason"),
+                             actor_id=actor_id),
+                actor_id, role, scope)
         # Delete: /api/v2/setup/<entity>/<id>/delete — canonical names
         # (program-delete = umbrella, league-delete = the grouping League).
         md = re.match(
@@ -3346,9 +3664,19 @@ class Handler(BaseHTTPRequestHandler):
                 "ice-slot": api.delete_ice_slot, "game": api.delete_game,
                 "official": api.delete_official, "player": api.delete_player,
             }[kind]
+            # #369 — THE blocker's own dispatch point. The target row is LOCKED
+            # and re-authorized inside the same transaction that runs the delete
+            # and its audit, so nothing lands between the decision and the
+            # write: the foreign record's fields are never serialized into the
+            # response, never deleted, and never audited. v2 kind names are
+            # already canonical; the guard folds the hyphen in "ice-slot" /
+            # "league-season".
             # Canonical Venue responses drop the legacy league_id (org-owned only).
             mapper = _v2p.venue_to_v2 if kind == "venue" else (lambda r: r)
-            return self._send_api(mapper(deleter(md.group(2), actor_id)))
+            return self._guarded_mutation(
+                [(kind, md.group(2))],
+                lambda: mapper(deleter(md.group(2), actor_id)),
+                actor_id, role, scope)
 
         # Entity create — canonical bodies, canonical responses.
         if entity == "program":
@@ -3395,12 +3723,14 @@ class Handler(BaseHTTPRequestHandler):
             # read leak. The refusal is the same generic not-found the context
             # layer already uses for an inaccessible League, so this never
             # becomes an existence oracle for another Program's Leagues.
-            if self._reject_league_outside_active_program(b.get("league_id")):
-                return
-            return self._send_api(api.create_team(
-                b.get("club_id") or None, None, b.get("name"),
-                actor_id, program_id=b.get("program_id") or None,
-                league_id=b.get("league_id") or None))
+            return self._guarded_mutation(
+                [("league", b.get("league_id") or None,
+                  "active_program_league")],
+                lambda: api.create_team(
+                    b.get("club_id") or None, None, b.get("name"),
+                    actor_id, program_id=b.get("program_id") or None,
+                    league_id=b.get("league_id") or None),
+                actor_id, role, scope)
         if entity == "organization":
             return self._send_api(api.create_organization(
                 b.get("name"), b.get("short_name", ""), actor_id))

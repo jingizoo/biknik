@@ -932,6 +932,18 @@ class ScopedVenueAccessHttpTest(unittest.TestCase):
         return org, program, season
 
     def _grant(self, c, season_id, venue_id):
+        # The grant is a WRITE naming an EXISTING Season, so the Season end is
+        # ceilinged on the caller's ACTIVE Season (#369 target authorization):
+        # a grant made while a different Season is selected is refused with the
+        # generic "Season <id> not found.". Select the destination Season
+        # first, exactly as the UI's context bar does -- the production guard
+        # is honoured here, never bypassed. Each test sets the context it is
+        # actually about afterwards.
+        program_id = self.srv.STATE.api.store.get_season(season_id).program_id
+        status, raw = self._req(c, "POST", "/api/context",
+                                {"program_id": program_id,
+                                 "season_id": season_id})
+        self.assertEqual(status, 200, raw[:300])
         status, raw = self._req(
             c, "POST", f"/api/v2/setup/seasons/{season_id}/venue-access",
             {"venue_id": venue_id})
@@ -1124,6 +1136,18 @@ class SelectedSeasonCeilingHttpTest(unittest.TestCase):
         return json.loads(raw)
 
     def _grant(self, c, season_id, venue_id):
+        # The grant is a WRITE naming an EXISTING Season, so the Season end is
+        # ceilinged on the caller's ACTIVE Season (#369 target authorization):
+        # a grant made while a different Season is selected is refused with the
+        # generic "Season <id> not found.". Select the destination Season
+        # first, exactly as the UI's context bar does -- the production guard
+        # is honoured here, never bypassed. Each test sets the context it is
+        # actually about afterwards.
+        program_id = self.srv.STATE.api.store.get_season(season_id).program_id
+        status, raw = self._req(c, "POST", "/api/context",
+                                {"program_id": program_id,
+                                 "season_id": season_id})
+        self.assertEqual(status, 200, raw[:300])
         status, raw = self._req(
             c, "POST", f"/api/v2/setup/seasons/{season_id}/venue-access",
             {"venue_id": venue_id})

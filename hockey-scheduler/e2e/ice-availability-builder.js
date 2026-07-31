@@ -601,6 +601,12 @@ async function checkViewport(browser, viewport) {
         league_id: league.id, name: "DST Season",
         start_date: "2026-08-01", end_date: "2027-06-01" });
       const venue = await post("/api/setup/venue", { name: "DST Arena", league_id: league.id });
+      // This block builds a NEW Program, so the grant below targets a Season
+      // outside the currently active one. Setup mutations bind to the ACTIVE
+      // Program (#369 prerequisite), so move into the Program being built --
+      // the same explicit switch this journey already does at its first
+      // fixture. The guard is not weakened for the fixture's convenience.
+      await post("/api/context", { program_id: league.id, season_id: season.id });
       await post(`/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
       const rink = await post("/api/setup/rink", { venue_id: venue.id, name: "DST Sheet" });
       // #369: get_demo_overview's `seasons` (what #ib-season's <option>s

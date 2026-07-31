@@ -235,6 +235,13 @@ async function buildFixture(page) {
       const club = await post("/api/v2/setup/club", { name: `${tag}-Club` });
       const venue = await post("/api/v2/setup/venue",
         { name: `${tag}-Venue`, organization_id: org.id });
+      // The grant names an EXISTING Season, so its Season end is ceilinged on
+      // the ACTIVE Season (#369 target authorization) -- with more than one
+      // Season in the install, a grant made while another one is selected is
+      // refused. Select this Program's own Season first, exactly as the
+      // context bar does; the journey re-selects through the real UI later.
+      await post("/api/context",
+        { program_id: program.id, season_id: season.id });
       await post(`/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
       const rink = await post("/api/v2/setup/rink", { venue_id: venue.id, name: `${tag}-Rink` });
       await post("/api/v2/setup/ice-slot", {
@@ -298,10 +305,16 @@ async function buildFixture(page) {
       { league_id: leagueA3.id, name: "PROGA-Division-A3" });
     const venueA2 = await post("/api/v2/setup/venue",
       { name: "PROGA-Icehouse", organization_id: a.org.id });
+    // Same rule as in buildProgram: the grant's Season end is the ACTIVE
+    // Season, so select PROGA-Autumn for it, then put the context back on
+    // Program A's first Season where the rest of the fixture left it.
+    await post("/api/context",
+      { program_id: a.program.id, season_id: seasonA2.id });
     await post(`/api/v2/setup/seasons/${seasonA2.id}/venue-access`,
       { venue_id: venueA2.id });
     await post("/api/v2/setup/rink",
       { venue_id: venueA2.id, name: "PROGA-Padtwo" });
+    await useProgram(a);
 
     // The never-linked bootstrap pair (#369's `unassigned_*` contract): a
     // Club with no Team and an owner-less Venue with no Season grant. Neither

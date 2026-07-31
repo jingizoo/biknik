@@ -1266,7 +1266,13 @@ class SetupOverviewV2HttpTest(unittest.TestCase):
                                      "organization_id": org["id"]})
         v2 = self._post(c, "venue", {"name": "HTTP-V2",
                                      "organization_id": org["id"]})
+        # Each grant is a WRITE naming an EXISTING Season, so its Season end is
+        # ceilinged on the ACTIVE Season (#369 target authorization). Select
+        # the destination Season for each one — the guard is honoured, not
+        # bypassed; the assertions below set their own selection anyway.
+        self._select(c, program["id"], s1["id"])
         self._post(c, f"seasons/{s1['id']}/venue-access", {"venue_id": v1["id"]})
+        self._select(c, program["id"], s2["id"])
         self._post(c, f"seasons/{s2['id']}/venue-access", {"venue_id": v2["id"]})
         r1 = self._post(c, "rink", {"venue_id": v1["id"], "name": "HTTP-R1"})
         r2 = self._post(c, "rink", {"venue_id": v2["id"], "name": "HTTP-R2"})

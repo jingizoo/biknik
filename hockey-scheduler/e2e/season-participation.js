@@ -221,6 +221,28 @@ async function checkViewport(browser, viewport) {
     const waitForToast = (expected) => page.waitForFunction(
       (t) => (document.querySelector("#toast-root .toast-msg") || {}).textContent === t,
       expected, { timeout: 15000 });
+    // Every setup mutation on an EXISTING record binds to the ACTIVE Program +
+    // Season (#369 prerequisite: the target guard refuses a record whose Season
+    // isn't the selected one, with the same wording as a nonexistent id). With
+    // no saved context the fallback picks the latest-id active Season, so a
+    // fixture that builds two Seasons and then edits the FIRST one's rows would
+    // be silently refused. This journey therefore selects its target Season
+    // explicitly before each block of guarded edits rather than leaning on that
+    // fallback — the guard is never weakened for the fixture's convenience.
+    const selectContext = async (programId, seasonId) => {
+      const res = await page.evaluate(async ([pid, sid]) => {
+        const r = await fetch("/api/context", {
+          method: "POST", credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ program_id: pid, season_id: sid }),
+        });
+        return { status: r.status, body: await r.json().catch(() => ({})) };
+      }, [programId, seasonId]);
+      if (res.status !== 200 || (res.body.season || {}).id !== seasonId) {
+        throw new Error(`[${viewport.label}] could not select context `
+          + `${programId}/${seasonId}: ${JSON.stringify(res)}`);
+      }
+    };
 
     // Build a permanent program team under its PERMANENT League, plus two
     // seasons. #283 Slice E: a Team is created with a REQUIRED league_id (its
@@ -270,6 +292,12 @@ async function checkViewport(browser, viewport) {
     await enterSetupHierarchy(page);
     await page.waitForFunction(
       (sel) => !!document.querySelector(sel), `#reg-team-${ids.s1}-${ids.lg1}`, { timeout: 15000 });
+
+    // The Season-2 bootstrap + register + remove steps below all target s2
+    // rows, so make s2 the active context explicitly (rather than relying on
+    // the latest-id fallback that would otherwise pick it) before the first
+    // guarded s2 mutation.
+    await selectContext(ids.program, ids.s2);
 
     // #233 B2b review r3: the fixture Program above was created with no
     // operator_organization_id (optional on the canonical Program, B2a/ADR
@@ -415,6 +443,12 @@ async function checkViewport(browser, viewport) {
       return { lg1b: lg1b.id, divC: divC.id, club: club.id, bears: bears.id, lionsReg: lionsReg.id };
     }, ids);
     await refreshSetup({ selector: `#reg-league-${edit.lionsReg}`, optionValue: edit.lg1b });
+
+    // Every edit below acts on Lions' SEASON-1 registration (and the s1-scoped
+    // blocked-league-delete), so switch the active context to s1 before the
+    // first guarded edit — otherwise the guard refuses the assign-division with
+    // the nonexistent-id wording and the success toast never appears.
+    await selectContext(ids.program, ids.s1);
 
     // (1) Division change WITHIN the permanent League: move Lions from Gold to
     // Platinum (both Divisions of lg1). League is unchanged, so Save fires a
@@ -620,6 +654,13 @@ async function checkViewport(browser, viewport) {
       seasonId: repairFixture.seasonR, teamId: repairFixture.teamR,
     });
 
+    // The repair Save acts on a registration in seasonR (its ghost LeagueSeason
+    // binds seasonR), so select seasonR before driving the repair. The corrupt
+    // row's League is a GHOST — deliberately left judged by its own Season by
+    // the target guard so a broken-League registration stays repairable — and
+    // this journey is what proves that repair path end to end.
+    await selectContext(ids.program, repairFixture.seasonR);
+
     await refreshSetup({ selector: `[data-repair-save="${repairRegId}"]` });
 
     // The invalid row appears with its diagnostic and the offending team's
@@ -707,6 +748,10 @@ async function checkViewport(browser, viewport) {
     const strayRegId = injectSecondActiveRegistration(databasePath, {
       seasonId: ids.s1, leagueId: dupFixture.stray, teamId: dupFixture.team,
     });
+    // The duplicate-registration coverage operates on s1 rows (Perma Wolves'
+    // two s1 registrations); the repair block above left the context on
+    // seasonR, so switch back to s1 before the keyboard-driven Remove.
+    await selectContext(ids.program, ids.s1);
     await refreshSetup({ selector: `[data-reg-remove="${strayRegId}"]` });
 
     // Both rows exist, are DISTINCT elements, and each names Perma Wolves —
@@ -772,7 +817,11 @@ async function checkViewport(browser, viewport) {
     }
     console.log(`[${viewport.label}] OK — one permanent team, two seasons under its permanent league, safe removal.`);
   } catch (error) {
-    throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
+    // Append the server tail WITHOUT discarding the original error: rewrapping
+    // in a new Error dropped the Playwright stack, so a timeout surfaced only as
+    // its message and never named the failing selector/assertion.
+    error.message = `${error.message}\n--- demo server output ---\n${serverOutput}`;
+    throw error;
   } finally {
     await context.close();
     await stopServer(server);

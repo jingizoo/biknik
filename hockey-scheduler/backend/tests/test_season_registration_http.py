@@ -47,7 +47,18 @@ class SeasonRegistrationHttpTest(unittest.TestCase):
 
     def _admin_setup(self):
         """Build a fresh league/season/division/club/team as League Admin over
-        HTTP and return the created ids."""
+        HTTP and return the created ids.
+
+        Clean slate first (#369). Every request in this class is an
+        identity-less ``X-Demo-Role`` call: no session, so no persisted active
+        context and no way to POST one. The context resolver therefore falls
+        back to the first authorized Program by id, and the registration
+        reassign/remove routes below are authorized against THAT Program — so
+        with any other Program in the store they correctly refuse this
+        fixture's records. Resetting to an empty store makes the Program this
+        fixture creates the one the caller is working in, regardless of test
+        order. The guard itself is untouched."""
+        STATE.reset(seed=False)
         _, league = self._req("POST", "/api/setup/league",
                                {"name": "Reg League"}, role="league_admin")
         _, season = self._req("POST", "/api/setup/season",

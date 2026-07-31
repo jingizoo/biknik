@@ -114,6 +114,43 @@ class SetupParentWriteScopeHttpTest(unittest.TestCase):
         self.assertNotIn("error", resp, (api, entity, resp))
         return resp
 
+    def _operated_org(self, admin, org_name, program_name):
+        """Create an Organization plus a Program it OPERATES, leaving the
+        caller's persisted context exactly as it found it.
+
+        The link step is ``assign-organization`` -- a reassign on an EXISTING
+        Program -- so its SOURCE end is ceilinged on the ACTIVE Program (#369
+        target authorization) and is only accepted while that Program is
+        selected. The fixture therefore selects the brand-new Program for that
+        one call and restores the previous selection immediately. Restoring is
+        not cosmetic: these tests need the operator org to be absent from the
+        ACTIVE Program's scoped lists (that is the whole gap they pin), and
+        the persisted context is per-USER, so a selection left behind would
+        leak into the next test in this class.
+        """
+        before = self._req(admin, "GET", "/api/context")[1]
+        org = self._post(admin, "organization", {"name": org_name})
+        program = self._post(admin, "program", {"name": program_name})
+        status, sel = self._req(admin, "POST", "/api/context",
+                                {"program_id": program["id"]})
+        self.assertEqual(status, 200, sel)
+        status, assigned = self._req(
+            admin, "POST", f"/api/v2/setup/program/{program['id']}/"
+            "assign-organization", {"operator_organization_id": org["id"]})
+        self.assertEqual(status, 200, assigned)
+        restore = {"program_id": before.get("program_id")}
+        for axis in ("season_id", "league_id"):
+            if before.get(axis):
+                restore[axis] = before[axis]
+        status, back = self._req(admin, "POST", "/api/context", restore)
+        self.assertEqual(status, 200, back)
+        self.assertEqual(
+            self._req(admin, "GET", "/api/context")[1].get("program_id"),
+            before.get("program_id"),
+            "fixture drifted: the pre-existing selection was not restored, so "
+            "the operator org could be in the ACTIVE Program's scoped list")
+        return org, program
+
     def _owner_parents(self, tag):
         """A full set of parents owned by the seeded admin, one per relation."""
         admin = self._login("admin")
@@ -197,12 +234,8 @@ class SetupParentWriteScopeHttpTest(unittest.TestCase):
                         "fixture needs a pre-existing active Program for the "
                         "new org's Program to NOT be the active one")
 
-        org = self._post(admin, "organization", {"name": "OPERATOR-ORG"})
-        program = self._post(admin, "program", {"name": "Operated Program"})
-        status, assigned = self._req(
-            admin, "POST", f"/api/v2/setup/program/{program['id']}/"
-            "assign-organization", {"operator_organization_id": org["id"]})
-        self.assertEqual(status, 200, assigned)
+        org, _program = self._operated_org(admin, "OPERATOR-ORG",
+                                           "Operated Program")
 
         ov = self._req(admin, "GET", "/api/v2/setup/overview")[1]
         self.assertNotIn(
@@ -314,13 +347,8 @@ class SetupParentWriteScopeHttpTest(unittest.TestCase):
         identical rather than merely both non-200.
         """
         admin = self._login("admin")
-        org = self._post(admin, "organization", {"name": "LEAGUEID-ORG"})
-        program = self._post(admin, "program", {"name": "LEAGUEID-PROGRAM"})
-        status, _ = self._req(
-            admin, "POST",
-            f"/api/v2/setup/program/{program['id']}/assign-organization",
-            {"operator_organization_id": org["id"]})
-        self.assertEqual(status, 200)
+        org, program = self._operated_org(admin, "LEAGUEID-ORG",
+                                          "LEAGUEID-PROGRAM")
 
         arena = self._login("arena")
         ov = self._req(arena, "GET", "/api/v2/setup/overview")[1]
@@ -398,12 +426,8 @@ class SetupParentWriteScopeHttpTest(unittest.TestCase):
         have been implemented as "allow linked rows" and still looked green.
         """
         admin = self._login("admin")
-        org = self._post(admin, "organization", {"name": "OPERATOR-ORG-2"})
-        program = self._post(admin, "program", {"name": "Operated Program 2"})
-        status, assigned = self._req(
-            admin, "POST", f"/api/v2/setup/program/{program['id']}/"
-            "assign-organization", {"operator_organization_id": org["id"]})
-        self.assertEqual(status, 200, assigned)
+        org, _program = self._operated_org(admin, "OPERATOR-ORG-2",
+                                           "Operated Program 2")
 
         arena = self._login("arena")
         self._assert_refused_like_nonexistent(

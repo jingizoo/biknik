@@ -157,10 +157,31 @@ async function checkViewport(browser, viewport) {
       // that grant is also what makes the venue — and its rinks and ice slots —
       // VISIBLE at all: the Calendar read is ceilinged on the active Season, so
       // ice granted only to s1 simply does not exist while s2 is active. This
-      // journey works the wizard in BOTH Seasons, so the one arena is granted to
-      // both (the same physical rink used across two seasons).
-      await post(`/api/v2/setup/seasons/${s1.id}/venue-access`, { venue_id: venue.id });
-      await post(`/api/v2/setup/seasons/${s2.id}/venue-access`, { venue_id: venue.id });
+      // journey works the wizard in BOTH Seasons (step (E) schedules in s2), so
+      // the one arena is granted to both — the same physical rink used across
+      // two seasons.
+      //
+      // Each grant is a WRITE gated on the ACTIVE Season (#369 prereq): the
+      // no-context fallback would resolve to the latest-id Season (s2), so a
+      // grant is only accepted while its own Season is selected. So the context
+      // is switched explicitly before each one and BOTH responses are asserted
+      // — this helper decodes the body without checking status, and a silent
+      // 404 would otherwise surface much later as an unexplained wizard
+      // timeout. The production guard is honoured, never bypassed. The context
+      // is left on s1, the Season steps (B)–(D) work in (step (A) reloads and
+      // calls switchSeason for s1 anyway, so this is belt-and-braces).
+      const grantVenue = async (seasonId, label) => {
+        const ctx = await post("/api/context", { program_id: league.id, season_id: seasonId });
+        if (!ctx || (ctx.season || {}).id !== seasonId) {
+          throw new Error(`could not select ${label} context: ${JSON.stringify(ctx)}`);
+        }
+        const grant = await post(`/api/v2/setup/seasons/${seasonId}/venue-access`, { venue_id: venue.id });
+        if (!grant || !grant.id) {
+          throw new Error(`${label} venue-access grant refused: ${JSON.stringify(grant)}`);
+        }
+      };
+      await grantVenue(s2.id, "s2");
+      await grantVenue(s1.id, "s1");
       const rink = await post("/api/setup/rink", { venue_id: venue.id, name: "R" });
       const club = await post("/api/setup/club", { name: "Club" });
       // #180/#283 Slice E: create every permanent Team under its permanent
@@ -426,7 +447,10 @@ async function checkViewport(browser, viewport) {
     }
     console.log(`[${viewport.label}] OK — one team across two seasons (each reached by switching the real context bar); wizard filters by registration; no implicit League selection; Exhibition friendly is season-scoped.`);
   } catch (error) {
-    throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
+    // Keep the original error (and its stack) so a timeout names the failing
+    // request/selector; just append the server tail to its message.
+    error.message = `${error.message}\n--- demo server output ---\n${serverOutput}`;
+    throw error;
   } finally {
     await context.close();
     await stopServer(server);

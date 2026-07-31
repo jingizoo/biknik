@@ -110,6 +110,41 @@ class V2SetupContractTest(unittest.TestCase):
                        "season_id": resp["id"]})
         return resp
 
+    def _select(self, c, program_id, season_id=None):
+        """Make ``program_id`` (and optionally ``season_id``) this caller's
+        PERSISTED active context (#369).
+
+        A setup mutation that names an EXISTING record is authorized against the
+        active context, not merely against the caller's role — holding
+        MANAGE_SETUP does not confer authority over every record in the
+        installation. So a test that builds a fresh Program and then deletes,
+        reassigns or edits records under it has to SAY so; otherwise the admin
+        is still sitting in whichever Program resolved first and every one of
+        those mutations is correctly refused as not-found.
+
+        ``season_id`` matters for the same reason one axis down (#369
+        re-review): a SEASON-BOUND target — a venue-access grant, a
+        registration, a Division, a LeagueSeason — is judged against the ACTIVE
+        SEASON too, and a Program-only context fails closed against it. Passing
+        the Season is how a test says which Season it is working in; the guard
+        is never relaxed to accommodate a test that did not say.
+        """
+        body = {"program_id": program_id}
+        if season_id is not None:
+            body["season_id"] = season_id
+        status, ctx = self._req(c, "POST", "/api/context", body)
+        self.assertEqual(status, 200, ctx)
+        if season_id is not None:
+            self.assertEqual((ctx.get("season") or {}).get("id"), season_id,
+                             ctx)
+        return ctx
+
+    def _program(self, c, body):
+        """Create a Program and select it as the active context (#369)."""
+        program = self._v2(c, "program", body)
+        self._select(c, program["id"])
+        return program
+
     # -- exact canonical key sets, end to end -------------------------------
     def test_v2_end_to_end_canonical_keys(self):
         c = self._admin()
@@ -117,7 +152,7 @@ class V2SetupContractTest(unittest.TestCase):
         org = self._v2(c, "organization", {"name": "Twin Rinks", "short_name": "TR"})
 
         # program: operator_organization_id, NOT organization_id.
-        program = self._v2(c, "program",
+        program = self._program(c,
                            {"name": "Adult Men", "country": "US",
                             "operator_organization_id": org["id"]})
         self.assertEqual(set(program), PROGRAM_KEYS, program)
@@ -225,7 +260,7 @@ class V2SetupContractTest(unittest.TestCase):
     def test_v2_exhibition_game_needs_no_league_and_reports_type(self):
         c = self._admin()
         org = self._v2(c, "organization", {"name": "Ex Org", "short_name": "EX"})
-        program = self._v2(c, "program",
+        program = self._program(c,
                           {"name": "Ex Prog", "operator_organization_id": org["id"]})
         season = self._v2(c, "season",
                         {"program_id": program["id"], "name": "ExS"})
@@ -430,7 +465,7 @@ class V2SetupContractTest(unittest.TestCase):
     def test_v2_assign_league_and_division(self):
         c = self._admin()
         org = self._v2(c, "organization", {"name": "A Org", "short_name": "AO"})
-        program = self._v2(c, "program",
+        program = self._program(c,
                           {"name": "A Prog", "operator_organization_id": org["id"]})
         season = self._v2(c, "season",
                         {"program_id": program["id"], "name": "S"})
@@ -494,7 +529,7 @@ class V2SetupContractTest(unittest.TestCase):
     def test_v2_permanent_league_tree_and_team_transfer(self):
         c = self._admin()
         org = self._v2(c, "organization", {"name": "P Org", "short_name": "PO"})
-        program = self._v2(c, "program",
+        program = self._program(c,
                           {"name": "P Prog", "operator_organization_id": org["id"]})
         season = self._v2(c, "season",
                         {"program_id": program["id"], "name": "S"})
@@ -563,7 +598,7 @@ class V2SetupContractTest(unittest.TestCase):
         c = self._admin()
         org1 = self._v2(c, "organization", {"name": "Org1", "short_name": "O1"})
         org2 = self._v2(c, "organization", {"name": "Org2", "short_name": "O2"})
-        program = self._v2(c, "program",
+        program = self._program(c,
                           {"name": "P", "operator_organization_id": org1["id"]})
         self.assertEqual(program["operator_organization_id"], org1["id"])
 
@@ -595,7 +630,7 @@ class V2SetupContractTest(unittest.TestCase):
     def test_v2_deletes_canonical(self):
         c = self._admin()
         org = self._v2(c, "organization", {"name": "D Org", "short_name": "DO"})
-        program = self._v2(c, "program",
+        program = self._program(c,
                           {"name": "D Prog", "operator_organization_id": org["id"]})
         season = self._v2(c, "season",
                         {"program_id": program["id"], "name": "S"})
@@ -625,6 +660,10 @@ class V2SetupContractTest(unittest.TestCase):
         status, dprog = self._req(
             c, "POST", f"/api/v2/setup/season/{season['id']}/delete", {})
         self.assertEqual(status, 200, dprog)
+        # Deleting the Season above left the persisted context resolving to
+        # some OTHER Program, so re-select this one: you delete where you are
+        # working, and the target guard binds to the ACTIVE Program.
+        self._select(c, program["id"])
         status, dprogram = self._req(
             c, "POST", f"/api/v2/setup/program/{program['id']}/delete", {})
         self.assertEqual(status, 200, dprogram)
@@ -638,7 +677,7 @@ class V2SetupContractTest(unittest.TestCase):
         active/game-backed blocking, and invalid-parent zero-mutation."""
         c = self._admin()
         org = self._v2(c, "organization", {"name": "R Org", "short_name": "RO"})
-        program = self._v2(c, "program",
+        program = self._program(c,
                           {"name": "R Prog", "operator_organization_id": org["id"]})
         season = self._v2(c, "season",
                          {"program_id": program["id"], "name": "R Season"})
@@ -809,7 +848,7 @@ class V2SetupContractTest(unittest.TestCase):
         and duplicate-grant / not-found error shapes."""
         c = self._admin()
         org = self._v2(c, "organization", {"name": "SVA Org", "short_name": "SO"})
-        program = self._v2(c, "program",
+        program = self._program(c,
                           {"name": "SVA Prog", "operator_organization_id": org["id"]})
         season = self._v2(c, "season",
                          {"program_id": program["id"], "name": "SVA Season"})
@@ -868,18 +907,36 @@ class V2SetupContractTest(unittest.TestCase):
                          {venue["id"], venue2["id"]})
 
         # -- one Venue can host multiple Programs/Seasons ---------------------
-        program2 = self._v2(c, "program",
+        # Cross-Program venue sharing over the REAL route. #369 gates both
+        # ends of this create, but the Venue end uses the facility-tree
+        # exception (an arena serves several leagues), so a Venue already
+        # linked to SVA Prog's Season is still grantable to SVA Prog 2 --
+        # otherwise the capability would deadlock the moment the first Program
+        # took the grant. The SEASON end remains strictly ceilinged, which is
+        # why the context is switched to SVA Prog 2 first.
+        program2 = self._program(c,
                            {"name": "SVA Prog 2",
                             "operator_organization_id": org["id"]})
         season2 = self._v2(c, "season",
                           {"program_id": program2["id"], "name": "SVA Season 2"})
+        self._select(c, program2["id"], season2["id"])
         status, granted3 = self._req(
             c, "POST", f"/api/v2/setup/seasons/{season2['id']}/venue-access",
             {"venue_id": venue["id"]})
-        self.assertEqual(status, 200, granted3)
+        self.assertEqual(
+            status, 200,
+            f"the shared arena was refused to a second Program, which "
+            f"deadlocks venue sharing: {granted3}")
         self.assertNotEqual(granted3["id"], granted["id"])
+        self.assertEqual(
+            {a.season_id for a in self.srv.STATE.api.store
+             .season_venue_access_for_venue(venue["id"])},
+            {season["id"], season2["id"]})
 
         # -- remove deactivates; not-found and missing-venue_id are reported --
+        # Back to the Program that owns `granted` — the remove below targets
+        # SVA Prog's grant, and SVA Prog 2 is (correctly) not authorized over it.
+        self._select(c, program["id"], season["id"])
         status, removed = self._req(
             c, "POST",
             f"/api/v2/setup/season-venue-access/{granted['id']}/remove", {})
@@ -901,7 +958,7 @@ class V2SetupContractTest(unittest.TestCase):
         via POST /api/v2/setup/season-venue-access/{id}/delete."""
         c = self._admin()
         org = self._v2(c, "organization", {"name": "SVD Org", "short_name": "SO"})
-        program = self._v2(c, "program",
+        program = self._program(c,
                           {"name": "SVD Prog", "operator_organization_id": org["id"]})
         season = self._v2(c, "season",
                          {"program_id": program["id"], "name": "SVD Season"})
@@ -984,7 +1041,7 @@ class V2SetupContractTest(unittest.TestCase):
         delete_season_team_registration."""
         c = self._admin()
         org = self._v2(c, "organization", {"name": "SVGH Org", "short_name": "SO"})
-        program = self._v2(c, "program",
+        program = self._program(c,
                           {"name": "SVGH Prog", "operator_organization_id": org["id"]})
         season = self._v2(c, "season",
                          {"program_id": program["id"], "name": "SVGH Season"})
@@ -1116,7 +1173,7 @@ class V2SetupContractTest(unittest.TestCase):
         precedent (e.g. the league-delete test above reads
         ``self.srv.STATE.api.store...`` directly); the request under actual
         test below is still made over real HTTP."""
-        program = self._v2(c, "program", {"name": "DivCtx Prog", "country": "US"})
+        program = self._program(c, {"name": "DivCtx Prog", "country": "US"})
         s1 = self._v2(c, "season", {"program_id": program["id"], "name": "S1"})
         s2 = self._v2(c, "season", {"program_id": program["id"], "name": "S2"})
         league = self._v2(c, "league", {"season_id": s1["id"], "name": "Shared"})
@@ -1278,7 +1335,7 @@ class V2SetupContractTest(unittest.TestCase):
     def _playable(self, c):
         """A full canonical hierarchy + a bookable game ice slot (no regs yet)."""
         org = self._v2(c, "organization", {"name": "P Org", "short_name": "PO"})
-        program = self._v2(c, "program",
+        program = self._program(c,
                           {"name": "P Prog", "operator_organization_id": org["id"]})
         season = self._v2(c, "season",
                         {"program_id": program["id"], "name": "S"})
