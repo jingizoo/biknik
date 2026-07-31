@@ -22,13 +22,83 @@ pairing/ice-assignment core:
 
 `_assign_ice` greedily assigns each pairing (in round-robin order) the
 earliest still-free candidate slot that satisfies every constraint
-(season/holiday/team/rink blackouts, the #277 scheduling-policy advisory);
-a pairing with no satisfying slot is reported in `unscheduled[]` with
-structured `reason_codes` (`season_blackout`, `holiday`, `team_blackout`,
-`rink_blackout`, `max_per_day`, `min_rest`, `no_ice_available`,
-`turnover_buffer_conflict`, `insufficient_playable_time`,
-`curfew_violation`), and `unschedulable_teams[]` rolls up any team whose
-*every* pairing failed.
+(season/holiday/team/rink blackouts, the #277 scheduling-policy advisory,
+the #373 team-occupancy check); a pairing with no satisfying slot is
+reported in `unscheduled[]` with structured `reason_codes`
+(`season_blackout`, `holiday`, `team_blackout`, `rink_blackout`,
+`max_per_day`, `min_rest`, `no_ice_available`, `turnover_buffer_conflict`,
+`insufficient_playable_time`, `curfew_violation`, `team_overlap`), and
+`unschedulable_teams[]` rolls up any team whose *every* pairing failed.
+
+## Team occupancy in the preview (#373)
+
+Generation used to carry no team-wide notion of "already playing". Slot
+candidacy was physical (is this ice free?) and per-rink (the #277 policy
+advisory), so with two rinks free at the same time the greedy walk would
+hand the *same* team both sheets — consecutive round-robin pairings share a
+team by construction. The preview rendered two committable rows and
+headlined `2 game(s), 0 conflict(s)`, with **Commit as draft** enabled. The
+commit gate refused the batch, so nothing impossible was ever persisted;
+what was broken was that an operator was shown, and invited to commit, a
+schedule that could not physically happen.
+
+`_assign_ice` now carries an occupancy map, `{team_id: [(start, end,
+game_id_or_None)]}`, and refuses any candidate slot that would double-book
+either team:
+
+* **Seeded from persisted games** — `_persisted_team_spans` over
+  `_active_game_slot_pairs`, the run's single snapshot of every
+  non-cancelled Game that resolves to a real slot. That read-set matches
+  the commit gate's own scan exactly: no Season, League, Division,
+  draft/published, or GameType filter. A team is one physical roster; it
+  cannot be on two sheets of ice because the second booking happens to be
+  an exhibition, an unpublished draft, or a fixture in another Division.
+  Filtering here would make the preview propose rows the gate is
+  guaranteed to refuse — the very divergence this closes. A **cancelled**
+  Game holds no ice and is excluded, again matching the gate.
+* **Grown as candidates are accepted** — each chosen slot is added to both
+  teams' spans with `game_id=None`, so a later pairing in the same batch is
+  checked against the earlier ones and not merely against the database.
+  This is the half that closes the reported defect: both offending rows
+  were new candidates in one preview.
+* **Keyed by stable team id and real interval** — never by rink or display
+  name. Overlap is the shared half-open `intervals_overlap`, so a partial
+  overlap starting at a different minute is refused while a back-to-back
+  game beginning exactly when the previous one ends stays legal. Home and
+  away appearances are recorded identically, so all four home/home,
+  home/away, away/home and away/away permutations resolve through one map.
+
+A blocked pairing lands in `unscheduled[]` with the `team_overlap`
+reason code — deliberately the *same* string the commit gate raises in
+`details["reason"]`, so an operator sees one stable code (and the move
+panel's existing label copy) whichever layer caught it — plus a structured
+`team_conflicts[]`: `{team_id, team_name, conflict_source, conflict_game_id}`,
+where `conflict_source` is `existing_game` (with the Game id) or
+`proposed_game` (another row of this batch, so no id yet). The list is
+deduplicated and canonically ordered, and is bound into
+`draft_fingerprint` for the same reason round 11 bound `reason`: the
+diagnosis is part of what the operator reviewed, and a conflicting game
+cancelled or created between Generate and Commit rewrites it while every
+placement stays byte-identical.
+
+The check runs **after** `_slot_reason` and the policy advisory, following
+the same append-a-new-check convention the #277 Slice B codes used: it can
+only ever appear where the generator previously reported nothing at all, so
+no reason code an existing slot already reported changes.
+
+**This is a preview correction, not a new integrity boundary.** The gate
+(`_assert_slot_free_for_game`, revalidated per row inside the commit's own
+transaction under the Team locks) remains the thing that makes an
+impossible schedule unreachable, including for a direct or stale commit
+request that never went through a preview at all.
+`test_scheduler_team_overlap.py` pins both halves across Memory,
+file-backed SQLite and PostgreSQL, and proves each is load-bearing by
+deleting it: dropping candidate-to-candidate occupancy reproduces the
+original two-rinks-one-team preview, dropping persisted occupancy lets a
+candidate land on top of a real fixture, and reducing the gate to its
+physical half persists an impossible batch. The browser journey
+`e2e/scheduler-team-overlap.js` covers the operator-facing half at desktop
+and 390px against the real backend.
 
 ## Existing-pairing exclusion (#206 slice 1)
 
@@ -1008,8 +1078,11 @@ reverted.
 ## Reason codes referenced here
 
 Unscheduled-pairing codes are generation-time (`services/scheduler.py`,
-listed above under Model). `pairing_already_scheduled`, `preview_required`,
-and `preview_stale` are commit-time reasons defined in
+listed above under Model). `team_overlap` (#373) is the one code that is
+both: generation reports it on an unscheduled pairing, and the commit gate
+raises it in `details["reason"]` — deliberately the same string, since it
+names the same fact from either side. `pairing_already_scheduled`,
+`preview_required`, and `preview_stale` are commit-time reasons defined in
 `api/service.py`/`api/league_scoped_service.py`:
 
 * `pairing_already_scheduled` (`ConcurrencyConflictError`) — the narrow,

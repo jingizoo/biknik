@@ -28,6 +28,7 @@
     "team-division-participation": "node team-division-participation.js",
     "scheduler-empty-state": "node scheduler-empty-state.js",
     "scheduler-already-scheduled": "node scheduler-already-scheduled.js",
+    "scheduler-team-overlap": "node scheduler-team-overlap.js",
     "ice-availability-builder": "node ice-availability-builder.js",
     "allowed-venues": "node allowed-venues.js",
     "venue-access-cleanup": "node venue-access-cleanup.js",

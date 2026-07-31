@@ -483,26 +483,79 @@ class DraftReviewHttpTest(unittest.TestCase):
 
     def test_commit_rejects_team_overlap_over_http(self):
         # #277: over HTTP too, draft commit runs the SAME final conflict check as
-        # manual moves — team-overlap included. The demo seeds a full schedule, so
-        # re-drafting its division proposes fixtures that overlap teams' existing
-        # games; the commit is refused with team_overlap and writes nothing (no
-        # draft games, no batch audit). No draft-only exception.
+        # manual moves — team-overlap included. The commit is refused with
+        # team_overlap and writes nothing (no draft games, no batch audit). No
+        # draft-only exception.
+        #
+        # #373: this test used to reach that state simply by re-drafting the
+        # demo's already-full division — generation would happily propose
+        # fixtures overlapping teams' existing games and let the gate catch
+        # them. That IS the bug #373 fixed: the generator now carries persisted
+        # team occupancy, so it no longer proposes a row it knows the gate must
+        # refuse. The commit-side assertion is still worth making (the gate is
+        # the integrity boundary; the preview is a courtesy), so the
+        # precondition is now built explicitly and forced through, exactly as
+        # test_commit_rolls_back_over_http_on_a_slot_conflict does for the
+        # slot half — capture a clean proposal, plant the conflicting Game
+        # afterwards, and hold the stale plan still so the gate is what
+        # decides.
         c = self._client()
         self._req(c, "POST", "/api/auth/login",
                   {"username": "admin", "password": "demo"})
-        store = srv.STATE.api.store
+        self._clear_schedule()     # isolate the TEAM conflict from slot reuse
+        api = srv.STATE.api
+        store = api.store
+        proposal = api.draft_season_schedule(division_id=self.div)
+        rows = proposal["draft_games"]
+        self.assertGreaterEqual(len(rows), 2, proposal)
+        # The LAST row, so the loop allocates the earlier rows first and only
+        # then hits the conflict — proving earlier work rolls back too.
+        row = rows[-1]
+        # A DIFFERENT pairing sharing one team (never the row's own opponent —
+        # an identical pairing is caught earlier by pairing_already_scheduled),
+        # on another rink at the row's exact time: team_overlap in isolation.
+        other = next(
+            t for r in rows for t in (r["home_team_id"], r["away_team_id"])
+            if t not in (row["home_team_id"], row["away_team_id"]))
+        # A rink of its own, not one of the demo's: any EXISTING rink may
+        # already carry another proposed row at this same time, and planting
+        # the clash there would trip the same-rink slot_overlap_conflict on
+        # that row first — masking the team check under test.
+        store.add_rink(Rink(id="http_overlap_rink", name="Overlap",
+                            venue_id=store.get_rink(row["rink_id"]).venue_id))
+        store.add_ice_slot(IceSlot(
+            id="http_overlap_slot", rink_id="http_overlap_rink",
+            start_time=datetime.fromisoformat(row["start_time"]),
+            end_time=datetime.fromisoformat(row["end_time"])))
+        store.add_game(Game(
+            id="http_overlap_game", home_team_id=row["home_team_id"],
+            away_team_id=other,
+            start_time=datetime.fromisoformat(row["start_time"]),
+            end_time=datetime.fromisoformat(row["end_time"]),
+            ice_slot_id="http_overlap_slot", division_id=self.div))
         drafts_before = len([g for g in store.all_games() if g.is_draft])
         audit_before = len(store.all_setup_audit())
-        _, preview = self._req(c, "POST", "/api/scheduler/draft",
-                               {"division_id": self.div})
-        status, res = self._req(c, "POST", "/api/scheduler/commit",
-                                {"division_id": self.div,
-                                 "draft_fingerprint": preview["draft_fingerprint"]})
+        orig = api.draft_season_schedule
+        api.draft_season_schedule = lambda *a, **k: proposal  # force the plan
+        try:
+            status, res = self._req(
+                c, "POST", "/api/scheduler/commit",
+                {"division_id": self.div,
+                 "draft_fingerprint": proposal["draft_fingerprint"]})
+        finally:
+            api.draft_season_schedule = orig
+            store.delete_game("http_overlap_game")
+            store.delete_ice_slot("http_overlap_slot")
+            store.delete_rink("http_overlap_rink")
         self.assertNotEqual(status, 200, res)
         self.assertEqual(res["error"]["details"]["reason"], "team_overlap")
         self.assertEqual(
             len([g for g in store.all_games() if g.is_draft]), drafts_before)
         self.assertEqual(len(store.all_setup_audit()), audit_before)
+        # Atomic: every earlier row's slot the loop had already flipped is back.
+        for r in rows[:-1]:
+            self.assertEqual(store.get_ice_slot(r["ice_slot_id"]).status,
+                             IceSlotStatus.AVAILABLE, r["ice_slot_id"])
 
     def test_commit_rolls_back_over_http_on_a_slot_conflict(self):
         # #277/#314: the authenticated draft-commit endpoint runs the shared final
