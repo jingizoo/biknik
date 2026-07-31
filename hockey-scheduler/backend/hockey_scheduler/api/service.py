@@ -1715,7 +1715,8 @@ class ApiService:
 
         workflows = []
 
-        def add(key, label, done, detail, primary_action, *, attention=None):
+        def add(key, label, done, detail, primary_action, *, attention=None,
+                prerequisites=None):
             entry = {
                 "key": key, "label": label,
                 "status": "done" if done else "todo",
@@ -1730,6 +1731,13 @@ class ApiService:
             # `next_blocked` being absent when nothing is blocked.
             if attention:
                 entry["attention"] = attention
+            # #365 review (Facilities fail-open): the per-workflow, ASSERTED
+            # prerequisite facts for THIS resolved tuple -- additive and
+            # independent of `status`/`attention` exactly as those are of
+            # each other. See _venue_access_prerequisite below for why this
+            # cannot be left to `next_blocked`.
+            if prerequisites:
+                entry["prerequisites"] = prerequisites
             workflows.append(entry)
 
         # 1. League profile and seasons: every Season this Program has must
@@ -1877,7 +1885,9 @@ class ApiService:
         add("facilities", "Venues, rinks and ice", bool(available_game_slots),
             (f"{len(available_game_slots)} available game slot(s)"
              if available_game_slots else "No available game ice slot yet."),
-            "Add Ice")
+            "Add Ice",
+            prerequisites=[self._venue_access_prerequisite(
+                season, schedulable_rink_ids)])
 
         # 6. Imports and onboarding — see docstring: "optional", not
         # done/todo, since there is no real Program-scoped completion signal
@@ -1963,6 +1973,68 @@ class ApiService:
             "next_blocked": next_blocked,
             "complete": complete if role_sees_every_workflow else None,
         }
+
+    @staticmethod
+    def _venue_access_prerequisite(season, schedulable_rink_ids):
+        """The "facilities" workflow's own asserted prerequisite row: is at
+        least ONE Rink reachable through ACTIVE ``SeasonVenueAccess`` for
+        THIS exact resolved Season (#365 review, Facilities fail-open).
+
+        Why this has to exist as a per-workflow field rather than being left
+        to ``next_blocked`` or inferred by the caller:
+
+        * ``next_blocked`` describes only the FIRST permitted TODO workflow
+          (see the `next`/`next_blocked` loop above). For a League Admin,
+          "facilities" is the fifth of six, so an earlier TODO workflow --
+          participation, roster, anything -- consumes that one slot and the
+          facilities gap is simply never reported. A card that reads its own
+          prerequisite off `next_blocked` therefore fails OPEN for the exact
+          role that CAN resolve it.
+        * The Setup overview's Venue/Rink lists deliberately include
+          revoked-grant history and creator-owned pending rows
+          (``get_setup_overview_v2``: a revoked grant to the ACTIVE Season
+          keeps the Venue in scope so the cleanup section can name it; a
+          just-created Venue has no grant yet and arrives via
+          ``pending_link_venues``). That is a correct READ contract and is
+          not narrowed. But it means "a Venue/Rink is VISIBLE" and "a Rink is
+          SCHEDULABLE this Season" are different claims, and only this
+          computation answers the second one. A client that asked the first
+          question offered a dead-end "Add Ice" against a revoked grant.
+
+        ``schedulable_rink_ids`` is the SAME set the facilities done/todo
+        check and ``_workflow_prerequisite_gap`` already read -- passed in,
+        never recomputed here, so the card, the roll-up and the Ice Builder's
+        own ``venue_access_missing`` refusal can never disagree.
+
+        Emitted for EVERY role that can see the workflow at all (both League
+        Admin and Arena Manager hold MANAGE_ARENA), because the fact is
+        exactly as load-bearing for the role that cannot fix it: an Arena
+        Manager who is handed "Add Ice" here reaches a builder that can only
+        generate zero slots.
+
+        Deliberately ROLE-INVARIANT, which is why no "can you fix it" flag
+        lives here. This is a statement about the selected Season's data, and
+        the two roles that can see the workflow must receive byte-identical
+        rows for it (test_league_filtered_setup_progress asserts exactly that
+        for the whole facilities row). WHO may resolve the gap is a
+        permission question -- granting ``SeasonVenueAccess`` requires
+        MANAGE_SETUP, which an Arena Manager does not hold -- and it is
+        already answered by the caller's own permission set, which the client
+        reads through the same ``hasPerm`` every other control is gated on.
+        Restating it in the payload would create a second authority on
+        permissions that could drift from the first.
+        """
+        met = bool(schedulable_rink_ids)
+        row = {"key": "venue_access", "met": met}
+        if met:
+            return row
+        where = f"Season '{season.name}'" if season is not None else "this season"
+        row["reason"] = "venue_access_missing"
+        row["detail"] = (
+            f"No rink is reachable through active venue access for {where} "
+            f"yet, so ice can't be added to it — a League Admin must allow a "
+            f"venue with a rink for this season.")
+        return row
 
     @staticmethod
     def _workflow_prerequisite_gap(key, season, schedulable_rink_ids,

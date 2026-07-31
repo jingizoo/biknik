@@ -30,6 +30,7 @@
     "scheduler-already-scheduled": "node scheduler-already-scheduled.js",
     "scheduler-team-overlap": "node scheduler-team-overlap.js",
     "ice-availability-builder": "node ice-availability-builder.js",
+    "facilities-venue-access": "node facilities-venue-access.js",
     "allowed-venues": "node allowed-venues.js",
     "venue-access-cleanup": "node venue-access-cleanup.js",
     "venue-sharing": "node venue-sharing.js",

@@ -1502,6 +1502,21 @@ function focusContentHeading(attempt) {
 // permanent team is already registered for this Season -- falls back to
 // focusContentHeading()'s generic content-region landing rather than
 // polling forever for something that will never appear.
+//
+// THE give-up condition is "loading finished and the control still isn't
+// there", not the tick count -- the count is only a safety net against an
+// infinite poll if a render never settles. It was 40 (2s), copied from
+// focusContentHeading(), and that is the wrong budget for a DEEP LINK: the
+// Setup hierarchy tree issues its own chain of scoped reads (setup overview,
+// hierarchy, players, the selected Season's venue-access and grant
+// candidates, setup progress) before it paints once, and on a loaded machine
+// that regularly runs past two seconds -- so the poll expired while the
+// skeleton was still up and the deep link silently degraded to the generic
+// content-region landing. focusContentHeading() can afford the short budget
+// because its fallback IS its contract; here the fallback is the loss of it.
+// (#365 review, reproduced as a real browser-journey failure: "the resolution
+// path did not focus the Allow picker; focus is on {id: content}".)
+const DEEP_LINK_FOCUS_ATTEMPTS = 200;   // x 50ms = 10s, only while still loading
 function focusParticipationRegisterControl(attempt) {
   const seasonId = contextOptions && contextOptions.selected
     && contextOptions.selected.season_id;
@@ -1510,8 +1525,39 @@ function focusParticipationRegisterControl(attempt) {
   if (btn) { btn.focus(); return; }
   const content = document.getElementById("content");
   const stillLoading = !content || content.querySelector(".skeleton");
-  if (stillLoading && (attempt || 0) < 40) {
+  if (stillLoading && (attempt || 0) < DEEP_LINK_FOCUS_ATTEMPTS) {
     setTimeout(() => focusParticipationRegisterControl((attempt || 0) + 1), 50);
+    return;
+  }
+  focusContentHeading();
+}
+
+// The same deep-link, for the selected Season's "Allow a venue" picker (#365
+// review, Facilities fail-open). This is the control that actually creates
+// the missing SeasonVenueAccess, so an operator sent here from the Facilities
+// card lands ON it rather than at the top of the hierarchy tree.
+//
+// Prefers the <select> (the field that must be filled before the Allow button
+// can do anything) and falls back to the Allow button itself. Identical
+// poll-while-loading / give-up-to-the-heading shape as
+// focusParticipationRegisterControl above, sharing its budget for exactly the
+// reason documented there: switchTab renders asynchronously, this destination
+// is the slowest-loading Setup surface there is, and a Season that has no
+// grantable venue left renders explanatory copy instead of a picker rather
+// than nothing at all.
+function focusVenueAccessControl(attempt) {
+  const seasonId = contextOptions && contextOptions.selected
+    && contextOptions.selected.season_id;
+  // getElementById, not a selector: the id embeds a raw Season id.
+  const picker = seasonId && document.getElementById(`va-add-${seasonId}`);
+  if (picker) { picker.focus(); return; }
+  const allow = seasonId && document.querySelector(
+    `[data-va-add="${CSS.escape(seasonId)}"]`);
+  if (allow) { allow.focus(); return; }
+  const content = document.getElementById("content");
+  const stillLoading = !content || content.querySelector(".skeleton");
+  if (stillLoading && (attempt || 0) < DEEP_LINK_FOCUS_ATTEMPTS) {
+    setTimeout(() => focusVenueAccessControl((attempt || 0) + 1), 50);
     return;
   }
   focusContentHeading();
@@ -3644,8 +3690,11 @@ function leagueScopedTeams(sv) {
 //
 // Each step is `{ met, action, why }`:
 //   met(facts)  whether this prerequisite is satisfied, read from the LIVE
-//               counts of the same payload the card's own summary came from
-//               (setupPrereqFacts) -- never from a declared default.
+//               payload the card's own summary came from (setupPrereqFacts)
+//               -- never from a declared default. Usually a COUNT of visible
+//               rows; for a step about a CAPABILITY rather than an inventory
+//               (facilities/venue_access) it is an ASSERTED backend fact read
+//               through setupAssertedPrereq, because no count can answer it.
 //   action      the ONE control offered while it is not. `act`/`go` are the
 //               ordinary landing action kinds; `open` is the third kind this
 //               ruling needs -- the missing record belongs to ANOTHER
@@ -3656,8 +3705,15 @@ function leagueScopedTeams(sv) {
 //               be committed under THIS card's identity while changing a
 //               DIFFERENT card's data, which is precisely the per-card
 //               binding #365 exists to hold.
-//   why         the sentence the EMPTY body uses to name the blocker, so the
+//               An action may also declare `perm`: the permission its
+//               destination genuinely requires. A role that lacks it gets NO
+//               action rather than a control it cannot execute -- see
+//               setupEffectiveAction.
+//   why         the sentence the card body uses to name the blocker, so the
 //               copy and the action can never describe different problems.
+//               A function of the facts where the sentence is itself an
+//               asserted, scoped claim (naming the exact Season), so the copy
+//               is the backend's own statement rather than a paraphrase.
 //
 // The chain is walked in order and the FIRST unmet step wins; all met means
 // the declared primary is genuinely the resolving action. Only the EMPTY
@@ -3759,13 +3815,39 @@ const SETUP_WORKFLOWS = [
     // Owner ruling, verbatim: "Facilities: Add Venue -> Add Rink -> Add Ice."
     // Ice is generated onto a Rink, and a Rink hangs off a Venue, so the
     // highest-leverage action is also the LAST one that becomes possible.
+    //
+    // ...and a Rink is not enough, which is the #365 review's Facilities
+    // fail-open. The first two steps ask whether a Venue/Rink is VISIBLE, and
+    // the scoped overview's lists deliberately include revoked-grant history
+    // and creator-owned pending rows -- both correct reads, neither of which
+    // makes a Rink schedulable. So the chain has a THIRD step, and it is not
+    // a count: "is any Rink reachable through ACTIVE SeasonVenueAccess for
+    // THIS exact selected Season", asserted by the backend
+    // (get_setup_progress's `prerequisites`, computed from the same
+    // `schedulable_rink_ids` set the Ice Builder's own `venue_access_missing`
+    // refusal uses) and read here through the fail-closed accessor. Without
+    // it, a Venue+Rink whose grant was revoked settled READY with no blocker
+    // and offered "Add Ice" into a builder that can only generate zero slots.
+    //
+    // The resolution needs MANAGE_SETUP -- granting venue access is a League
+    // Admin action -- so the step's action declares it and
+    // setupEffectiveAction withdraws the control entirely for an Arena
+    // Manager, who would otherwise be handed a second dead end. The `why`
+    // sentence is the BACKEND's own, so it names the exact Season the claim
+    // is scoped to instead of a client-side paraphrase.
     prereq: [
       { met: (f) => f.venues > 0,
         action: { label: "Add venue", act: "venue" },
         why: "Ice is booked on a rink inside a venue, and there is no venue yet." },
       { met: (f) => f.rinks > 0,
         action: { label: "Add rink", act: "rink" },
-        why: "Ice is booked on a rink, and this venue has none yet." }],
+        why: "Ice is booked on a rink, and this venue has none yet." },
+      { met: (f) => setupAssertedPrereq(f, "facilities", "venue_access").met,
+        action: { label: "Allow a venue for this season", go: "venue_access",
+                  perm: "manage_setup" },
+        why: (f) => setupAssertedPrereq(f, "facilities", "venue_access").detail
+          || "No rink is reachable through active venue access for the"
+            + " selected season yet, so ice can't be added to it." }],
     summary: (sv) => [
       { label: "Venues", n: withPendingLink(sv, "venues").length },
       { label: "Rinks", n: withPendingLink(sv, "rinks").length }] },
@@ -3840,6 +3922,18 @@ function openSetupWorkflowLanding(key) {
     ? setupWorkflowsFor().find((w) => w.key === key) : null;
   if (key && !workflow) return false;
   view = "setup";
+  // The landing (and the hub index it belongs to) renders ONLY inside the
+  // "hub" sub-view -- renderSetup branches on `setupView` before it ever looks
+  // at `setupWorkflow`. Establishing only `view` + `setupWorkflow` therefore
+  // left this composite destination half-applied whenever the operator was on
+  // Hierarchy or Records: the Facilities nav entry, a hub card's "Open …" and
+  // the landing's own "← All setup workflows" all silently rendered the tree
+  // instead. Latent before (only a manual sub-view toggle could set it up),
+  // but #365's venue-access resolution path deep-links THROUGH the Hierarchy
+  // tree on purpose, so returning to the card was the very next step of the
+  // flow this fix creates. Set here, with the other halves, so no transition
+  // can establish one without the others.
+  setupView = "hub";
   setupWorkflow = key || null;
   toast = "";
   // The SAME per-destination reset switchTab() applies. Bypassing switchTab is
@@ -3865,6 +3959,22 @@ function runSetupWorkflowGo(key) {
   // "onboarding" is the guided Initial Setup wizard, a top-level view rather
   // than one of goToSetupWorkflow's six workflow destinations.
   if (key === "onboarding") { switchTab("onboarding"); focusContentHeading(); return; }
+  // The REAL venue-access resolution path (#365 review, Facilities
+  // fail-open). SeasonVenueAccess is not one of the six workflows and has no
+  // create drawer: it is granted from the selected Season's own "Allowed
+  // venues" section on the Setup hierarchy tree, which is exactly where the
+  // #369 contract put the picker (and which renderSeasonParticipation gates
+  // on MANAGE_SETUP -- the same permission the step's action declares, so
+  // this destination is only ever offered to a role that finds a live control
+  // when it arrives). Same deep-link idiom as "participation" above: set the
+  // sub-view, switch, then focus the real control rather than dropping the
+  // operator at the top of a long tree to hunt for it.
+  if (key === "venue_access") {
+    setupView = "hierarchy";
+    switchTab("setup");
+    focusVenueAccessControl();
+    return;
+  }
   goToSetupWorkflow(key);
 }
 async function openSetupWorkflowDrawer(kind) {
@@ -3922,8 +4032,38 @@ async function openSetupWorkflowDrawer(kind) {
 // Scoped exactly as the summaries are (leagueScopedTeams / withPendingLink),
 // so "this workflow says it has no teams" and "the chain says a team is
 // missing" are the same claim about the same rows.
+//
+// COUNTS ARE NOT CAPABILITIES (#365 review, Facilities fail-open). Every
+// field above is a count of rows the scoped overview VISIBLY reports, and
+// that read contract deliberately includes revoked-grant history and
+// creator-owned pending rows (get_setup_overview_v2). So `venues`/`rinks`
+// answer "is there a Venue/Rink on this operator's screen", which is exactly
+// the right question for "is this card EMPTY" and exactly the WRONG question
+// for "can ice be generated here". A Rink at a Venue whose grant to the
+// selected Season was revoked is visible, correctly, and is not schedulable:
+// the Ice Builder refuses it with `venue_access_missing` and a preview
+// provably generates zero slots. Asking only the visibility question is what
+// let Facilities settle READY with `blockedBecause: null` and a dead-end "Add
+// Ice" primary.
+//
+// A claim like that cannot be recovered from row counts at all, so it is not
+// inferred here: it arrives ASSERTED, from the same /api/v2/setup/progress
+// read the card's status comes from, computed server-side from the exact
+// active SeasonVenueAccess set the real write enforces. `asserted` is that
+// dictionary, keyed "<workflow>/<prerequisite>" — and it is read from
+// `src.progress` (a setupProgressRead record, never a payload-or-null), so a
+// failed or unauthorized read yields NO assertions rather than a manufactured
+// "met". See setupAssertedPrereq below for the fail-closed accessor.
 function setupPrereqFacts(src) {
   const sv = (src && src.sv) || {};
+  const read = (src && src.progress && src.progress.outcome)
+    ? src.progress : setupProgressRead(CARD_READ.FAILED, null);
+  const asserted = {};
+  Object.keys(read.byKey).forEach((key) => {
+    ((read.byKey[key] || {}).prerequisites || []).forEach((p) => {
+      if (p && p.key) asserted[key + "/" + p.key] = p;
+    });
+  });
   return {
     programs: (sv.programs || []).length,
     seasons: (sv.seasons || []).length,
@@ -3933,7 +4073,21 @@ function setupPrereqFacts(src) {
     venues: withPendingLink(sv, "venues").length,
     rinks: withPendingLink(sv, "rinks").length,
     players: ((src && src.players) || []).length,
+    asserted: asserted,
   };
+}
+
+// An asserted prerequisite row, or a fail-CLOSED stand-in. "The backend did
+// not assert this" is never evidence that the prerequisite is satisfied — it
+// means the claim is unavailable, and a capability claim that cannot be
+// verified must not be acted on. Structurally unreachable today for
+// facilities/venue_access (a role that can see the Facilities card holds
+// MANAGE_ARENA, which is exactly what the progress route requires, and a
+// FAILED read makes a required card ERROR before any derivation runs), so
+// this is the discipline rather than a live branch.
+function setupAssertedPrereq(facts, workflowKey, prereqKey) {
+  return (facts && facts.asserted && facts.asserted[workflowKey + "/" + prereqKey])
+    || { key: prereqKey, met: false, detail: null };
 }
 
 // THE effective action: the single control a landing offers while a
@@ -3971,13 +4125,32 @@ function setupPrereqFacts(src) {
 // is the true statement — this role cannot resolve this emptiness itself.
 // (Unreachable today: every cross-workflow step targets a workflow carrying
 // the same `perm` as its source, so a role that can see one can see both.)
+//
+// ...and fails closed the SAME way on a step whose resolution needs a
+// permission this role does not hold (#365 review, Facilities fail-open).
+// That case is REACHABLE and is the whole point: an Arena Manager can see and
+// run Facilities (MANAGE_ARENA) but cannot grant SeasonVenueAccess
+// (MANAGE_SETUP), so substituting "Allow a venue for this season" for a dead
+// "Add Ice" would only trade one dead end for another. They get no mutation
+// control at all plus the sentence — which the card body completes with "Ask
+// a league admin to set that up" — while a League Admin gets the real
+// resolution path. Declared as `perm` ON THE STEP'S ACTION rather than tested
+// at a call site, so a future step cannot forget to ask.
+//
+// `why` may be a function of the facts, so a step whose explanation is an
+// ASSERTED backend sentence (naming the exact Season the claim is about)
+// renders that sentence rather than a client-side paraphrase of it.
 function setupEffectiveAction(w, facts) {
   const step = (w.prereq || []).find((s) => !s.met(facts));
   if (!step) return { action: w.primary, why: null };
+  const why = typeof step.why === "function" ? step.why(facts) : step.why;
   if (step.action.open && !setupWorkflowsFor().some((x) => x.key === step.action.open)) {
-    return { action: null, why: step.why };
+    return { action: null, why: why };
   }
-  return { action: step.action, why: step.why };
+  if (step.action.perm && !hasPerm(step.action.perm)) {
+    return { action: null, why: why };
+  }
+  return { action: step.action, why: why };
 }
 
 function buildSetupWorkflowCardModel(w, src) {
