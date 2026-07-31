@@ -35,6 +35,32 @@ from .store import InMemoryStore
 # A fixed demo "Saturday".
 _DAY = datetime(2026, 9, 5, tzinfo=timezone.utc)
 
+# Every seeded record is attributed to the demo's REAL League-Admin account,
+# by its account id — not to a synthetic label (#367 owner ruling).
+#
+# This used to be the string ``"league_admin"``, which is a role NAME, not an
+# account id: no account anywhere ever has it, so no session's ``user_id``
+# could ever equal it. Under the creator-owned pending-link contract
+# (``ApiService._creator_created_ids``) that made every seeded record with no
+# validated Program link owned by NOBODY and therefore visible to NOBODY — the
+# 17 seeded Officials who have neither a home Club with a Team nor a game
+# assignment vanished from the Setup surface entirely, present in the store
+# and unreachable in the UI. The ruling's remedy is to attribute the data to a
+# real account, never to special-case a synthetic actor label in the read (a
+# label bypass would re-open the installation-wide disclosure the ruling
+# reversed, since any caller could then be handed rows nobody authenticated
+# for).
+#
+# The value MUST stay equal to the ``account_id`` the demo bootstrap mints for
+# the "admin" persona (``_seed_demo_accounts`` / ``_seed_admin_account`` in
+# ``web/server.py``, both ``account_id="user_admin"``). Seeding order is
+# store-then-accounts, so this id names an account that exists a moment later
+# in the same atomic rebuild; ``tests/test_pending_link_ownership.py`` asserts
+# the two really do match by resolving this actor against the seeded accounts,
+# so a rename on either side fails there rather than silently orphaning the
+# demo data again.
+DEMO_ADMIN_ACCOUNT_ID = "user_admin"
+
 _LIONS_SKATERS = [
     "Aarav M.", "Kabir S.", "Rohan P.", "Dev K.", "Neil R.", "Sam T.",
     "Leo V.", "Max W.", "Ivan O.", "Theo L.", "Finn B.", "Zane H.",
@@ -56,7 +82,7 @@ def build_full_demo_store(store=None) -> Tuple[InMemoryStore, str, dict]:
     store = store if store is not None else InMemoryStore()
     setup = SetupService(store)
     roster = RosterService(store)
-    admin = "league_admin"
+    admin = DEMO_ADMIN_ACCOUNT_ID
 
     # Facility owner that operates the league and owns its arenas (#166/#173) —
     # a rink company, distinct from a hockey Club. The league links up to it,

@@ -373,6 +373,24 @@ class V2SetupContractTest(unittest.TestCase):
         venue = self._v2(c, "venue",
                         {"name": "OvV", "organization_id": org["id"]})
 
+        # #369 review: /api/v2/setup/overview now ceilings its `programs`
+        # (and everything under it) to the caller's ACTIVE Program rather
+        # than every authorized Program -- this shared-store test class
+        # (setUpClass runs once) may have created other Programs in earlier
+        # test methods, so pin the context to THIS test's own Program
+        # explicitly rather than relying on whichever one the auto-fallback
+        # happens to pick.
+        #
+        # #367 owner ruling: the active SEASON is a ceiling here too, so the
+        # Season is pinned as well -- a Program-only context would (by
+        # design, and asserted in test_league_filtered_overview_v2.py)
+        # return no seasons and no divisions at all, and this contract test
+        # is about the canonical DTO SHAPE, not the scoping rule.
+        status, _ = self._req(c, "POST", "/api/context",
+                              {"program_id": program["id"],
+                               "season_id": season["id"]})
+        self.assertEqual(status, 200)
+
         status, ov = self._req(c, "GET", "/api/v2/setup/overview")
         self.assertEqual(status, 200, ov)
         # Flat canonical lists exist for every setup entity.
@@ -394,9 +412,20 @@ class V2SetupContractTest(unittest.TestCase):
 
         t = next(x for x in ov["teams"] if x["id"] == team["id"])
         self.assertEqual(t["program_id"], program["id"])
-        self.assertNotIn("league_id", t)
+        # #367: additive — the real competition league_id (Team.league_id,
+        # #283), previously the one clearly-missing parent-id-chain field a
+        # League-aware consumer needs to filter client-side.
+        self.assertEqual(t["league_id"], league["id"])
 
-        v = next(x for x in ov["venues"] if x["id"] == venue["id"])
+        # #369 review: a Venue is only in the strictly-scoped `venues` list
+        # once it has a SeasonVenueAccess grant into the ACTIVE Season -- a
+        # just-created, not-yet-granted Venue like this one reaches the
+        # payload through `pending_link_venues` instead (#367 owner ruling:
+        # it is linked to no Program at all AND this caller created it, so
+        # it is offered to this caller's create-then-link flow and to nobody
+        # else).
+        v = next(x for x in ov["venues"] + ov["pending_link_venues"]
+                if x["id"] == venue["id"])
         self.assertEqual(v["organization_id"], org["id"])
         # Canonical Venue is org-owned only — the temporary program link is NOT
         # exposed here (managed via the v1 assign-league bridge until Slice E).

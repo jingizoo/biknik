@@ -15,7 +15,19 @@
 //     a backend test), leaving the same challenge usable for a retry;
 //   * on the correct inputs completes, signs the operator out to the login
 //     screen, and leaves the installation recoverable (the preserved admin can
-//     sign back in).
+//     sign back in);
+//   * keeps the dialog focus contract on the SUCCESS step — focus is moved into
+//     the success dialog, Tab/Shift+Tab stay trapped inside it, and "Return to
+//     sign-in" is reachable and activatable from the keyboard alone (#369
+//     review's required regression; see checkSuccessDialogFocus below for why
+//     this step in particular is the fragile one).
+//
+// Explicitly NOT re-tested here: the generic dialog focus lifecycle itself
+// (open/close/restore across ordinary modals and drawers) — that is
+// accessibility-foundations.js / shell-accessibility-coverage.js's scope. What
+// is proven here is only that the factory-reset SUCCESS step, which paints
+// through its own bespoke render() early return, is wired into that shared
+// lifecycle like every other surface.
 const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
@@ -31,6 +43,21 @@ const VIEWPORTS = [
 const ADMIN = "prod_admin";
 const PW = "a-real-production-password";
 const PHRASE = "DELETE ALL PRODUCTION DATA";
+// setShellTitle("login") in app.js — the sign-in surface's own title, asserted
+// verbatim so "we ended up somewhere signed-out" isn't mistaken for "we ended
+// up on the sign-in screen".
+const SIGN_IN_TITLE = "Sign in — Hockey Scheduler";
+// Mirrors app.js's OVERLAY_SEL / FOCUSABLE_SEL (dialog focus management) and
+// the visibility filter overlayFocusables() applies, so the first/last Tab
+// stops asserted below are the ones the REAL trap computes rather than a
+// hard-coded guess that would quietly stop matching if the modal's markup
+// gained or lost a control.
+const OVERLAY_SEL = ".modal, .drawer";
+const FOCUSABLE_SEL = [
+  "a[href]", "button:not([disabled])", "input:not([disabled])",
+  "select:not([disabled])", "textarea:not([disabled])",
+  '[tabindex]:not([tabindex="-1"])',
+].join(",");
 
 function waitForServer(url, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
@@ -159,6 +186,138 @@ function previewTotal(page) {
     .then((t) => parseInt(t.trim(), 10));
 }
 
+// --- #369 review: the success step's dialog focus contract ------------------
+// Where document.activeElement sits relative to the topmost open overlay,
+// resolved exactly the way app.js's openOverlayElement() does (last match
+// wins). `index` is the position among the dialog's sequential Tab stops and
+// is -1 when focus is elsewhere — including on the tabindex="-1" CONTAINER,
+// which overlayFocusables() deliberately excludes and which is precisely where
+// focusOverlayContainer() parks focus. Everything needed for a self-explaining
+// failure message comes back in the same round trip.
+function dialogFocusState(page) {
+  return page.evaluate(([oSel, fSel]) => {
+    const describe = (el) => {
+      if (!el) return "(none)";
+      if (el === document.body) return "<body>";
+      const bits = Array.from(el.attributes || [])
+        .filter((a) => a.name === "id" || a.name === "class"
+          || a.name.slice(0, 5) === "data-")
+        .map((a) => `${a.name}="${a.value}"`);
+      const text = (el.textContent || "").trim().replace(/\s+/g, " ").slice(0, 32);
+      return `<${el.tagName.toLowerCase()}${bits.length ? ` ${bits.join(" ")}` : ""}>${text}`;
+    };
+    const all = document.querySelectorAll(oSel);
+    const overlay = all.length ? all[all.length - 1] : null;
+    const active = document.activeElement;
+    if (!overlay) return { overlay: false, active: describe(active) };
+    const stops = Array.from(overlay.querySelectorAll(fSel)).filter(
+      (el) => el.offsetParent !== null || el.getClientRects().length > 0);
+    return {
+      overlay: true,
+      inside: !!(active && overlay.contains(active)),
+      isContainer: active === overlay,
+      index: stops.indexOf(active),
+      count: stops.length,
+      stops: stops.map(describe),
+      active: describe(active),
+    };
+  }, [OVERLAY_SEL, FOCUSABLE_SEL]);
+}
+
+// Park focus on a known edge of the trap (0 = first stop, -1 = last) so the
+// wrap assertions below start from a defined position.
+function focusDialogStop(page, which) {
+  return page.evaluate(([oSel, fSel, w]) => {
+    const all = document.querySelectorAll(oSel);
+    const overlay = all.length ? all[all.length - 1] : null;
+    if (!overlay) return false;
+    const stops = Array.from(overlay.querySelectorAll(fSel)).filter(
+      (el) => el.offsetParent !== null || el.getClientRects().length > 0);
+    if (!stops.length) return false;
+    const el = w < 0 ? stops[stops.length - 1] : stops[w];
+    el.focus();
+    return document.activeElement === el;
+  }, [OVERLAY_SEL, FOCUSABLE_SEL, which]);
+}
+
+// The success modal is the ONE dialog in the app that does not paint through
+// the normal render() pipeline: render() has a dedicated early return for
+// `modal.type === "factory-reset" && modal.step === "success"`, because the
+// reset already signed this session out server-side and the pipeline's
+// session-gated /api/demo/overview read would 401 and replace the success
+// confirmation with an error banner the operator never asked for. That early
+// return has to end with the SAME shared syncOverlayFocus() every other
+// render() path ends with. When it did not, focus was left on the removed
+// "Resetting…" control — i.e. it fell to <body> — so the dialog was visibly on
+// screen while keyboard and screen-reader users had silently lost it. These
+// assertions fail if that call is ever dropped again.
+async function checkSuccessDialogFocus(page, L) {
+  // (1) Focus is INSIDE the dialog. focusOverlayContainer() targets the dialog
+  //     CONTAINER (tabindex="-1"), never a form control, so containment is the
+  //     assertable contract — not an exact element match. The move can be
+  //     established from a queued requestAnimationFrame, so poll for it rather
+  //     than reading activeElement once.
+  await page.waitForFunction(([oSel]) => {
+    const all = document.querySelectorAll(oSel);
+    const overlay = all.length ? all[all.length - 1] : null;
+    return !!(overlay && document.activeElement
+      && overlay.contains(document.activeElement));
+  }, [OVERLAY_SEL], { timeout: 5000 }).catch(async () => {
+    const s = await dialogFocusState(page);
+    throw new Error(`[${L}] after a completed reset, focus is NOT inside the `
+      + `success dialog (activeElement=${s.active}) — render()'s `
+      + `factory-reset-success early return must still call syncOverlayFocus(), `
+      + `like every other render() path does`);
+  });
+
+  const opened = await dialogFocusState(page);
+  if (opened.count < 2) {
+    throw new Error(`[${L}] the success dialog exposes ${opened.count} keyboard `
+      + `stop(s) (${JSON.stringify(opened.stops)}) — the wrap assertions below `
+      + `need at least two to mean anything; update this check if the modal's `
+      + `markup legitimately changed`);
+  }
+
+  // (2a) ENTRY BOUNDARY. Focus lands on the container, which is NOT one of the
+  //      sequential stops, so the very first keystroke is the one that used to
+  //      escape: backward navigation from a tabindex="-1" element walks to
+  //      whatever precedes it in the document, straight out of the dialog.
+  //      Only assert this when focus really is on the container (that is what
+  //      the lifecycle promises) so the check can never pass vacuously.
+  if (opened.isContainer) {
+    await page.keyboard.press("Shift+Tab");
+    const entry = await dialogFocusState(page);
+    if (entry.index !== entry.count - 1) {
+      throw new Error(`[${L}] Shift+Tab from the focused dialog CONTAINER must `
+        + `enter the trap at its LAST stop, not leave the dialog — landed on `
+        + `${entry.active} (index ${entry.index}/${entry.count}, `
+        + `inside=${entry.inside})`);
+    }
+  }
+
+  // (2b) The trap wraps in both directions.
+  if (!(await focusDialogStop(page, -1))) {
+    throw new Error(`[${L}] could not focus the success dialog's last keyboard stop`);
+  }
+  await page.keyboard.press("Tab");
+  let s = await dialogFocusState(page);
+  if (s.index !== 0) {
+    throw new Error(`[${L}] Tab from the LAST focusable in the success dialog `
+      + `must wrap to the FIRST — landed on ${s.active} (index ${s.index}, `
+      + `inside=${s.inside}, stops=${JSON.stringify(s.stops)})`);
+  }
+  if (!(await focusDialogStop(page, 0))) {
+    throw new Error(`[${L}] could not focus the success dialog's first keyboard stop`);
+  }
+  await page.keyboard.press("Shift+Tab");
+  s = await dialogFocusState(page);
+  if (s.index !== s.count - 1) {
+    throw new Error(`[${L}] Shift+Tab from the FIRST focusable in the success `
+      + `dialog must wrap to the LAST — landed on ${s.active} (index `
+      + `${s.index}/${s.count}, inside=${s.inside}, stops=${JSON.stringify(s.stops)})`);
+  }
+}
+
 async function checkFlagFlow(browser, viewport) {
   const base = `http://${HOST}:${viewport.flagPort}`;
   const server = startServer(viewport.flagPort, {
@@ -242,13 +401,31 @@ async function checkFlagFlow(browser, viewport) {
     await page.click("[data-fr-confirm]");
     // Success step, then return to sign-in.
     await page.waitForSelector("[data-fr-done]", { timeout: 15000 });
-    await page.click("[data-fr-done]");
+    // #369 review: the success dialog must still hold the keyboard before we
+    // leave it — focus inside, Tab/Shift+Tab trapped.
+    await checkSuccessDialogFocus(page, L);
+    // ...and "Return to sign-in" is activated from the KEYBOARD, not a mouse
+    // click: the whole point of the contract is that an operator who never
+    // touches a pointer can still get off this screen.
+    await page.focus("[data-fr-done]");
+    await page.keyboard.press("Enter");
     await page.waitForSelector("#login-screen:not([hidden])", { timeout: 10000 });
     // The whole authenticated shell is hidden behind body.signed-out while the
     // operator is logged out — proving the sign-out actually took effect, not
     // just that a success card was shown.
     await page.waitForFunction(() => document.body.classList.contains("signed-out"),
                                null, { timeout: 10000 });
+    // The keyboard activation reached the sign-in SURFACE, not merely some
+    // signed-out state: setShellTitle("login") is what a screen-reader user
+    // actually hears on arrival, so assert the real string.
+    await page.waitForFunction((t) => document.title === t,
+                               SIGN_IN_TITLE, { timeout: 10000 })
+      .catch(async () => {
+        const actual = await page.evaluate(() => document.title);
+        throw new Error(`[${L}] keyboard-activating "Return to sign-in" must land `
+          + `on the sign-in surface — expected document.title `
+          + `${JSON.stringify(SIGN_IN_TITLE)}, got ${JSON.stringify(actual)}`);
+      });
 
     // Re-login through the REAL sign-in UI (not a raw fetch): filling the login
     // form and submitting drives signIn(), which clears hs_signed_out, restores
@@ -274,7 +451,8 @@ async function checkFlagFlow(browser, viewport) {
     if (errors.length) {
       throw new Error(`[${L}] flag-flow console/page errors:\n${errors.join("\n")}`);
     }
-    console.log(`[${L}] OK — preview, gating, cancel, denied (no wipe), reset + re-login.`);
+    console.log(`[${L}] OK — preview, gating, cancel, denied (no wipe), reset, `
+      + `success-dialog focus trap, keyboard return to sign-in + re-login.`);
   } catch (error) {
     throw new Error(`${error.message}\n--- flag server output ---\n${out}`);
   } finally {

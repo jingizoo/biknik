@@ -1,7 +1,9 @@
 """Shared test helpers: a deterministic clock and a small game builder."""
 
 import os
+import re
 import sys
+import tempfile
 from datetime import datetime, timedelta, timezone
 from http.cookies import SimpleCookie
 from pathlib import Path
@@ -48,6 +50,107 @@ def suspend_program_org_fks(store):
                 f"ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {constraint}")
     else:
         store.conn.execute("PRAGMA foreign_keys = OFF")
+
+
+_PG_WORKER_DB_SUFFIX = re.compile(r"_p\d+$")
+
+
+def _assert_disposable_test_database(url):
+    """Hard-assert that ``url`` unambiguously names a disposable, per-worker
+    test database — the one fact that must be PROVEN, not assumed, before
+    ``fresh_sql_store`` is allowed to drop anything (#369 follow-up review:
+    the original recovery path caught bare ``Exception`` and dropped
+    unconditionally, which could just as easily erase a real database as the
+    one known poisoned fixture).
+
+    Pure string-parsing — no I/O, no live connection — so it is exercised the
+    same way with or without a real PostgreSQL/SQLite database behind it:
+
+    * PostgreSQL (``postgres://`` / ``postgresql://``): ``run_parallel.py``
+      hands every worker its OWN database, named by suffixing the base
+      database with ``_p<N>`` (see ``_pg_db_url``/``_ensure_pg_database``).
+      That exact suffix is the only guarantee anywhere in the suite that a
+      Postgres URL names a private per-worker throwaway rather than a
+      developer's real or shared database, so it is required verbatim.
+    * SQLite: only the literal ``:memory:`` database (private to one
+      connection, gone the instant it closes) or a file that lives inside the
+      OS temp directory (``tempfile.gettempdir()`` — exactly where this
+      suite's own ``tempfile.mkstemp()`` fixtures live, and nowhere a real
+      project database would ever be pointed) counts as disposable.
+
+    Anything else raises ``AssertionError`` — never guesses, never drops.
+    """
+    if url.startswith(("postgres://", "postgresql://")):
+        dbname = url.split("?", 1)[0].rsplit("/", 1)[-1]
+        if _PG_WORKER_DB_SUFFIX.search(dbname):
+            return
+        raise AssertionError(
+            f"refusing to drop schema on postgres database {dbname!r}: its "
+            "name does not carry the per-worker '_p<N>' suffix run_parallel.py "
+            "gives every worker's disposable test database, so it cannot be "
+            "proven to be a throwaway. Aborting rather than guessing.")
+    if url == ":memory:":
+        return
+    tmp_root = os.path.realpath(tempfile.gettempdir())
+    if os.path.commonpath([tmp_root, os.path.realpath(url)]) == tmp_root:
+        return
+    raise AssertionError(
+        f"refusing to drop schema on sqlite database {url!r}: it is neither "
+        "the private ':memory:' database nor a file under the OS temp "
+        "directory, so it cannot be proven to be a disposable test database. "
+        "Aborting rather than guessing.")
+
+
+def fresh_sql_store(url):
+    """A migrated, EMPTY ``SqlStore`` on ``url``, tolerant of the ONE known,
+    deliberately-poisoned condition a previous test module in this same
+    worker can leave behind (#369): ``test_iceslot_venue_fks`` downgrades
+    migration 041 to plant rinks/ice-slots/games/season-venue-access rows
+    whose parents do not exist, which makes ``assert_iceslot_venue_fks_ready``
+    raise ``MigrationDataError`` on the very next ``SqlStore(url)`` — before
+    ``clear_all_data`` is ever reachable — for any module scheduled behind it
+    in the same worker (``run_parallel.py`` gives each worker its own
+    PostgreSQL database but runs that worker's modules SERIALLY against it).
+
+    A prior version of this helper caught bare ``Exception`` and dropped the
+    schema unconditionally, on ANY open failure. That is exactly the
+    destructive, non-falsifiable pattern a repo-owner review flagged (#369
+    follow-up): a migration regression that fails only against existing data
+    would raise on the first open, get silently erased here, and then PASS on
+    the automatic retry against an empty database — hiding the very
+    regression the test exists to catch. This version narrows the catch to
+    the *exact* intentional poison — ``MigrationDataError``, imported from its
+    real module, never a bare ``Exception`` — and additionally hard-asserts
+    (see ``_assert_disposable_test_database``) that ``url`` names a provably
+    disposable per-worker database before it drops anything. Any OTHER
+    exception, or any URL that isn't provably disposable, propagates
+    UNCAUGHT, with the schema and data left exactly as they were.
+    """
+    from hockey_scheduler.store import SqlStore
+    from hockey_scheduler.store.db import connect
+    from hockey_scheduler.store.integrity_checks import MigrationDataError
+    try:
+        store = SqlStore(url)
+    except MigrationDataError:
+        _assert_disposable_test_database(url)
+        # Unopenable: tear the schema down at the raw-connection level (no
+        # SqlStore can be constructed to do it for us) and re-migrate.
+        conn, dialect, _path = connect(url)
+        cur = conn.cursor()
+        if dialect.backend == "postgres":
+            cur.execute("DROP SCHEMA public CASCADE")
+            cur.execute("CREATE SCHEMA public")
+        else:
+            cur.execute("PRAGMA writable_schema = ON")
+            for (name,) in cur.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'").fetchall():
+                cur.execute(f'DROP TABLE IF EXISTS "{name}"')
+            cur.execute("PRAGMA writable_schema = OFF")
+        conn.commit()
+        conn.close()
+        store = SqlStore(url)
+    store.clear_all_data()
+    return store
 
 
 def cookie_from_set_cookie(set_cookie_header, name):

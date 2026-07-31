@@ -1238,6 +1238,9 @@ class ApiService:
         * ``rule="active_program_league"`` → #367's create-side rule
           (``setup_league_in_active_program``), for a League id supplied in a
           CREATE body;
+        * ``rule="writable_parent"`` → #369 review's WRITE-side parent rule
+          (``setup_parent_writable``), for a destination parent id supplied in
+          a reassign body;
         * a bridge pseudo-kind is resolved to the parent that names its Program
           first; an unresolvable bridge row returns None (nothing to judge — the
           facade emits the byte-identical wording a step later).
@@ -1246,6 +1249,17 @@ class ApiService:
         It is NOT the security boundary: its answer is already stale by the time
         anyone acts on it. ``setup_guarded_mutation`` is the boundary.
         """
+        if rule == "writable_parent":
+            # Deliberately BEFORE the `role is None` pass-through below. The
+            # parent gate fails CLOSED on an unresolvable identity (see
+            # ``setup_parent_writable``) — the create routes have always
+            # refused an identity-less caller rather than letting a
+            # caller-supplied parent id through, and the reassign that reaches
+            # the same relation by the other verb must not be looser. A parent
+            # is never a bridge pseudo-kind, so no resolution is needed first.
+            return self.setup_parent_writable(
+                (kind or "").replace("-", "_"), record_id, user_id, role,
+                scope)
         if role is None:
             return None
         normalized = (kind or "").replace("-", "_")
@@ -1320,10 +1334,16 @@ class ApiService:
 
         ``targets`` is a sequence of ``(kind, record_id, rule)`` triples in the
         caller's own order. ``rule`` is ``"scope"`` for the generic
-        ``setup_target_accessible`` gate or ``"grantable"`` for the facility-tree
+        ``setup_target_accessible`` gate, ``"grantable"`` for the facility-tree
         exception (``setup_venue_grantable``), which governs ONLY the Venue
-        argument of the venue-access grant. ``kind`` may be a bridge pseudo-kind
-        (``registration`` / ``season_venue_access``); hyphens are folded.
+        argument of the venue-access grant, ``"active_program_league"`` for
+        #367's create-side League rule, or ``"writable_parent"`` for #369
+        review's write-side parent rule (``setup_parent_writable``) — a
+        reassign's DESTINATION parent, which must be re-decided under that
+        row's lock rather than only preflighted. The same record may appear
+        twice under two different rules; both must pass. ``kind`` may be a
+        bridge pseudo-kind (``registration`` / ``season_venue_access``);
+        hyphens are folded.
 
         Returns ``(payload, refused_index)``:
 
@@ -1444,6 +1464,12 @@ class ApiService:
             elif rule == "active_program_league":
                 allowed = self.setup_league_in_active_program(
                     record_id, user_id, role, scope)
+            elif rule == "writable_parent":
+                # #369 review's write-side parent rule, re-decided HERE under
+                # the destination row's lock so a reassign's parent check is
+                # atomic with the move it authorizes — not merely preflighted.
+                allowed = self.setup_parent_writable(
+                    kind, record_id, user_id, role, scope)
             else:
                 allowed = self.setup_target_accessible(
                     kind, record_id, user_id, role, scope)
@@ -1583,8 +1609,44 @@ class ApiService:
         fully visible and reachable the whole time, per #330. Recorded as
         decision 9 in ``docs/product/operator-ux-requirements.md``'s
         "Product decisions and sign-off" section.
+
+        #367: also resolves the persisted League (the third #345 context
+        axis, previously ignored here). A selected League narrows
+        "Permanent teams", "Clubs, players and staff", and "Season
+        participation and divisions" to that League's own Teams/LeagueSeason
+        (``Team.league_id`` is the real, permanent competition-League field
+        (#283) -- unrelated to this file's OWN legacy ``league_id``-means-
+        Program naming elsewhere, e.g. ``get_demo_overview``'s team rows).
+        "League profile and seasons" (a Program-wide integrity check: does
+        EVERY Season have a League) and "Venues, rinks and ice" (physical
+        facility resources with no competition-League axis by design, see
+        ``SeasonVenueAccess``) are unaffected by League selection -- narrowing
+        either would not correspond to anything real in the domain model.
+        Explicit "No League" keeps the full Program/Season-wide view,
+        byte-identical to pre-#367 behavior.
+
+        The #367 owner ruling also makes the active-Season ceiling explicit
+        and non-optional here, exactly as it already is for
+        ``get_demo_overview``: a workflow is **Season-bound** when it counts
+        or gates on rows that reach a Season only through a
+        SeasonTeamRegistration/Division's LeagueSeason, or a
+        SeasonVenueAccess grant -- "Season participation and divisions" and
+        "Venues, rinks and ice" are the two here, and BOTH must go EMPTY
+        under a Program-only context (no Season resolved), never fall back
+        to the union of every Season the Program has. See
+        ``in_scope_season_ids`` at their shared computation below, which
+        mirrors ``get_demo_overview``'s own
+        ``in_scope_season_ids = {season.id} if season is not None else set()``
+        idiom byte-for-byte (docs/architecture/active-context-scoping.md).
+        "League profile and seasons" (a Program-WIDE integrity check ABOUT
+        every Season collectively, not a per-Season fact) and "Permanent
+        teams"/"Clubs, players and staff" (Team/Player carry no Season field
+        at all -- see ``domain.models.Team``/``Player``) are NOT Season-bound
+        by this test, and correctly stay invariant to the active Season,
+        Program-only included.
         """
-        program, season = self.context.resolve(user_id, role, scope)
+        program, season, league = self.context.resolve_with_league(
+            user_id, role, scope)
         if program is None:
             return {"program_id": None, "program": None, "workflows": [],
                     "next": None, "next_blocked": None, "complete": False}
@@ -1596,25 +1658,60 @@ class ApiService:
                                   if ls.season_id in season_ids]
         teams = self.store.teams_for_program(program.id)
         team_ids = {t.id for t in teams}
+        # #367: "Permanent teams" and "Clubs, players and staff" narrow to the
+        # selected League's own Teams once one is active -- league-less teams
+        # never included in this narrowed set (unlike the eligibility check
+        # below, which deliberately still counts them). "No League" selected
+        # keeps the full Program-wide set, identical to pre-#367 behavior.
+        league_teams = (
+            [t for t in teams if t.league_id == league.id] if league
+            else teams)
+        league_team_ids = {t.id for t in league_teams}
         # Participation and facilities are inherently per-Season concepts —
         # narrowed to the RESOLVED active Season's own LeagueSeasons/venue
         # access below, never every Season the Program has, so an older
         # Season's registrations or granted ice can't mask required work in
         # a newly-selected Season (#330 review round 1 finding 2). No Season
         # resolved (a Program-only context) means neither can be done yet.
-        season_ls_ids = ({ls.id for ls in program_league_seasons
-                          if ls.season_id == season.id} if season else set())
-        # The resolved Season's own League ids (via its LeagueSeasons) --
-        # used below by _workflow_prerequisite_gap to check whether ANY
-        # Program Team is even eligible to register here (#331 review round
-        # 5 finding 2): a Team with a permanent League can only ever
-        # register into a LeagueSeason of that same League
-        # (register_team_for_season rule 7, team_league_mismatch), so if no
-        # Team's permanent League appears here (and none is league-less),
-        # every possible registration attempt in this Season is a
-        # guaranteed rejection.
-        season_league_ids = ({ls.league_id for ls in program_league_seasons
-                              if ls.season_id == season.id} if season else set())
+        # #367 owner ruling: this is the active-Season CEILING, not merely a
+        # convenience narrowing -- a Program-only context MUST make both
+        # workflows empty, never silently widen back to "every Season the
+        # Program has". `in_scope_season_ids` names the ceiling as its own
+        # value (instead of two independent `if season else ...` ternaries)
+        # so it matches, textually, the identical
+        # `in_scope_season_ids = {season.id} if season is not None else set()`
+        # idiom `get_demo_overview` uses for its own Season-scoped
+        # collections (docs/architecture/active-context-scoping.md) -- the
+        # cross-check the #367 review round used to confirm this ceiling is
+        # real and not merely coincidentally empty. "League profile and
+        # seasons" (Program-wide over every Season COLLECTIVELY, computed
+        # above from `seasons`/`program_league_seasons`) and "Permanent
+        # teams"/"Clubs, players and staff" (`league_teams`/
+        # `program_players` -- Team/Player have no Season field at all) are
+        # NOT Season-bound and deliberately never read `in_scope_season_ids`.
+        in_scope_season_ids = {season.id} if season is not None else set()
+        # #367: a selected League further narrows the candidate LeagueSeason
+        # set to that League's own binding for the resolved Season -- "No
+        # League" considers every League's binding, identical to pre-#367
+        # behavior.
+        season_league_seasons = [
+            ls for ls in program_league_seasons
+            if ls.season_id in in_scope_season_ids]
+        if league:
+            season_league_seasons = [
+                ls for ls in season_league_seasons
+                if ls.league_id == league.id]
+        season_ls_ids = {ls.id for ls in season_league_seasons}
+        # The resolved Season's (and, when selected, League's) own League ids
+        # (via its LeagueSeasons) -- used below by
+        # _workflow_prerequisite_gap to check whether ANY Program Team is
+        # even eligible to register here (#331 review round 5 finding 2): a
+        # Team with a permanent League can only ever register into a
+        # LeagueSeason of that same League (register_team_for_season rule 7,
+        # team_league_mismatch), so if no Team's permanent League appears
+        # here (and none is league-less), every possible registration
+        # attempt in this Season is a guaranteed rejection.
+        season_league_ids = {ls.league_id for ls in season_league_seasons}
 
         workflows = []
 
@@ -1640,7 +1737,11 @@ class ApiService:
         # scoped to the selected Season like participation/facilities below:
         # this is an integrity check ("does EVERY Season have a League"),
         # mirroring get_onboarding_status_v2's own "league" step exactly, not
-        # a per-selected-Season fact.
+        # a per-selected-Season fact. NOT Season-bound under the #367 owner
+        # ruling (it is precisely the "Program-wide structural check ABOUT
+        # Seasons collectively" that ruling names as the non-Season-bound
+        # case) -- stays identical across every Season selection and
+        # Program-only alike.
         seasons_without_league = [
             s for s in seasons
             if s.id not in {ls.season_id for ls in program_league_seasons}]
@@ -1651,8 +1752,14 @@ class ApiService:
             "Add Season")
 
         # 2. Permanent teams — Program-level, no Season dimension at all.
-        add("teams", "Permanent teams", bool(teams),
-            f"{len(teams)} team(s)" if teams else "No team added yet.",
+        # NOT Season-bound (``domain.models.Team`` has no season_id field to
+        # gate on) -- identical across every Season selection, Program-only
+        # included. #367: narrowed to the selected League's own Teams when
+        # one is active (league_teams); "No League" keeps the full Program
+        # set.
+        add("teams", "Permanent teams", bool(league_teams),
+            f"{len(league_teams)} team(s)" if league_teams
+            else "No team added yet.",
             "Add Team")
 
         # 3. Season participation/divisions: at least one active
@@ -1732,9 +1839,15 @@ class ApiService:
 
         # 4. Clubs, players and staff: at least one player on one of this
         # Program's teams. Program-level like Teams — a Player belongs to a
-        # Team, never a Season directly.
+        # Team, never a Season directly. NOT Season-bound for the same
+        # reason as "Permanent teams" above (``domain.models.Player`` has no
+        # season_id field either, only ``team_id``) -- identical across
+        # every Season selection, Program-only included.
+        # #367: narrowed to the selected League's own Teams (league_team_ids)
+        # when one is active, matching "Permanent teams" above; "No League"
+        # keeps the full Program set.
         program_players = [p for p in self.store.all_players()
-                           if p.team_id in team_ids]
+                           if p.team_id in league_team_ids]
         add("roster", "Clubs, players and staff", bool(program_players),
             (f"{len(program_players)} player(s)" if program_players
              else "No player added yet."),
@@ -1742,10 +1855,17 @@ class ApiService:
 
         # 5. Venues, rinks and ice: at least one available GAME slot at a
         # rink whose Venue holds active SeasonVenueAccess to the SELECTED
-        # Season specifically (not any of the Program's Seasons).
-        venue_access_venue_ids = ({
+        # Season specifically (not any of the Program's Seasons). Season-
+        # bound under the #367 owner ruling (same `in_scope_season_ids`
+        # ceiling computed above for participation) -- empty under a
+        # Program-only context, never any OTHER Season's grant. Deliberately
+        # has NO League axis anywhere in this computation: Venue/Rink/IceSlot
+        # reach a Season only through SeasonVenueAccess and carry no
+        # competition-League field at all (see "Venues have no League axis",
+        # docs/architecture/active-context-scoping.md).
+        venue_access_venue_ids = {
             a.venue_id for a in self.store.all_season_venue_access()
-            if a.active and a.season_id == season.id} if season else set())
+            if a.active and a.season_id in in_scope_season_ids}
         schedulable_rink_ids = {
             r.id for r in self.store.all_rinks()
             if r.venue_id in venue_access_venue_ids}
@@ -4049,14 +4169,136 @@ class ApiService:
         r = self.store.result_for_game(game_id)
         return _serialize(r) if r is not None else {"game_id": game_id, "status": None}
 
+    def _game_matches_active(self, game, season_ids, league_id, team_ids):
+        """Whether ``game`` belongs to the active ``(Season, League)`` — the
+        ONE Game-scoping predicate, shared by every scoped read that has to
+        answer it (the Dashboard's schedule/ice/audit, and the Setup
+        surface's Official-by-assignment edge). Two copies of this rule drifted
+        apart once already inside a single method, so it lives here.
+
+        A Game's own ``season_id``/``league_id`` (real, permanent fields —
+        #233 Slice C1b, unrelated to any legacy naming elsewhere) are the
+        direct join.
+
+        #367 owner ruling on the league-less EXHIBITION: it "may appear under
+        a selected League only when at least one participating Team validates
+        into that League; otherwise omit it". An earlier revision treated
+        every ``league_id is None`` game as universally eligible — "a
+        league-less Team is universally eligible, so a league-less Game must
+        be too". That analogy does not hold: a league-less Team has no League
+        to disagree with, while an exhibition between two League B teams is
+        concretely League B's fixture. It surfaced League B-vs-C exhibitions
+        (with both teams' NAMES, venue and time) on League A's Dashboard.
+
+        ``team_ids`` is the caller's ALREADY Program+League-narrowed Team
+        collection (any container supporting ``in``), so membership in it IS
+        the validation — the caller never has to re-derive it.
+        """
+        if game.season_id not in season_ids:
+            return False
+        if league_id is None:
+            return True                          # "No League": the union
+        if game.league_id is not None:
+            return game.league_id == league_id
+        return any(tid in team_ids
+                   for tid in (game.home_team_id, game.away_team_id) if tid)
+
+    def _division_league_season_chain(self, division_id):
+        """The Division's own ``(league_season, season)`` — ``(None, None)``
+        if the Division, its LeagueSeason, or Season is missing/dangling
+        (#367/#369)."""
+        division = self.store.get_division(division_id)
+        if division is None or not division.league_season_id:
+            return None, None
+        league_season = self.store.get_league_season(division.league_season_id)
+        if league_season is None:
+            return None, None
+        season = self.store.get_season(league_season.season_id)
+        if season is None:
+            return None, None
+        return league_season, season
+
+    def _division_matches_active_context(self, division_id, program, season,
+                                         league):
+        """Whether ``division_id``'s validated LeagueSeason -> Season ->
+        Program chain matches the ACTIVE resolved tuple.
+
+        Program is the hard ceiling, and a Season MUST be active and match
+        EXACTLY (#367 owner ruling: "Season-bound rows must match the active
+        Season; a Program-only context returns EMPTY for Season-bound data").
+        Standings are Season-bound by construction — a Division reaches its
+        Season only through its LeagueSeason — so a Program-only context can
+        never satisfy this and returns the generic empty shape for EVERY
+        Division, indistinguishably from a nonexistent one.
+
+        An earlier revision enforced the Season axis only ``if season is not
+        None``, which silently WIDENED the read exactly where it should have
+        closed: a caller whose active context resolved to Program-only (a
+        saved Program-only selection, or a Program whose Seasons are all
+        unauthorized) could read the standings of ANY Division in that
+        Program, in any Season. "No Season selected" is not "every Season" —
+        the same rule ``get_demo_overview`` already applies to its
+        Season-scoped collections.
+
+        The League axis stays conditional, and that is deliberate rather than
+        an inconsistency: "No League" is a first-class SELECTION meaning the
+        Program+active-Season union across every League, whereas "no Season"
+        is the absence of the ceiling this read is bound to.
+
+        A caller authorized for many Programs/Seasons/Leagues must still be
+        bound to the ONE it is currently active in, not merely "any of them" —
+        otherwise a global League Admin active in Program A could pull
+        Program B's (or another League's) standings just by being globally
+        authorized, which is exactly the leak #369 review flags."""
+        if program is None or season is None:
+            return False
+        league_season, div_season = self._division_league_season_chain(
+            division_id)
+        if league_season is None or div_season.program_id != program.id:
+            return False
+        if league_season.season_id != season.id:
+            return False
+        if league is not None and league_season.league_id != league.id:
+            return False
+        return True
+
     @catch
-    def get_standings(self, division_id: str) -> dict:
+    def get_standings(self, division_id: str, user_id=None, role=None,
+                      scope=None) -> dict:
         """Standings for a division from FINAL results only (#31).
 
         Points: win = 2, tie = 1, loss = 0. Ranked by points, then goal
         difference, then goals for, then name. Counts every division game
         (operator view); the public variant is filtered to published games.
+
+        #369 review correction: when a real user context is supplied
+        (``role`` is not ``None`` — the HTTP route always supplies one
+        now), the Division's validated LeagueSeason -> Season -> Program
+        chain must match the caller's ACTIVE resolved tuple
+        (``ContextService.resolve_with_league``), not merely be *some*
+        Program the caller is broadly authorized for — a global League
+        Admin active in Program A/Season A/League A must not be able to
+        pull a division from Program B, a different Season, or a different
+        League just by asking for its id. A mismatch returns the same empty
+        shape a nonexistent ``division_id`` already does — generic and
+        non-oracle, so an inaccessible-from-here Division looks identical
+        to one that doesn't exist at all. Called with no arguments beyond
+        ``division_id`` (the default), performs no ownership check —
+        unchanged pre-#367 behavior for existing direct/internal callers.
+
+        #367 owner ruling: a scoped read REQUIRES an active Season and must
+        match it exactly. A Program-only context is therefore
+        indistinguishable from "the Division does not exist" for EVERY
+        Division of that Program — see
+        ``_division_matches_active_context``, which is where the whole
+        tuple check lives.
         """
+        if role is not None:
+            program, season, league = self.context.resolve_with_league(
+                user_id, role, scope)
+            if not self._division_matches_active_context(
+                    division_id, program, season, league):
+                return {"division_id": division_id, "standings": []}
         return self._standings_for_division(division_id, public_only=False)
 
     def _league_season_mismatch_error(self, game, expected_ls_id) -> dict:
@@ -5169,22 +5411,155 @@ class ApiService:
             return False
         return True
 
-    def get_demo_overview(self) -> dict:
+    def get_demo_overview(self, user_id=None, role=None, scope=None) -> dict:
         """Assemble the League/Arena/Schedule/Public view for the E2E demo.
 
         The ``public`` section deliberately contains NO player names or any
         personal data — only fixture information that is safe to show fans.
+
+        #369 review correction: when a real user context is supplied
+        (``role`` is not ``None`` — the HTTP route at ``/api/demo/overview``
+        always supplies one now), every collection with a real Program/
+        Season/League join is scoped to the resolved active context:
+        mandatory Program, the resolved Season as a HARD ceiling (an
+        operator active in Season S1 never sees S2's divisions,
+        registrations, games, ice or standings-snapshot data — even
+        archived S2 history, even under the same League), and to the
+        selected League (else every League's data within that Season — the
+        "No League" broader view, matching the #364 ruling's own
+        semantics). An earlier revision of this method deliberately treated
+        Season as NOT a hard filter, reasoning that two existing journeys
+        needed cross-Season visibility; #369 review correctly rejected
+        that as silently widening the released active-context contract —
+        those journeys were fixed instead (explicitly switch Season via the
+        context bar before the cross-Season action, exactly as switching
+        Program/League already requires). A Program-only active context
+        (no Season resolved — a brand-new/empty Program, or no authorized
+        active Season exists) narrows every Season-scoped collection to
+        EMPTY rather than falling back to "every Season", so a missing
+        Season selection can never silently re-widen the read.
+
+        Clubs/Organizations/Officials carry no direct Program FK, but they
+        are NOT therefore unfiltered — #369 review's "apply the same
+        deny-by-default rule to other unjoinable global reference
+        collections" applies here, and each is scoped through the strongest
+        relationship that actually exists (#367 owner ruling), never a
+        synthetic League foreign key:
+
+        * **Clubs** are League-bound *through their Teams*, so they derive
+          from the already Program+League-narrowed ``teams`` set.
+        * **Officials** are League-bound through an in-scope home Club or an
+          assignment whose Game passes the COMPLETE active Season+League
+          predicate (``_in_scope_game``).
+        * **Organizations** follow the FACILITY axis, which has a Season axis
+          (SeasonVenueAccess) but no competition-League axis: owners of the
+          active-Season venues, plus the active Program's own operating
+          Organization (permanent Program structure).
+
+        Two successive revisions got this wrong: the first returned all three
+        wholesale whenever a Program resolved ("no foreign key" meaning "no
+        scope to apply"), the second narrowed them to the Program but not the
+        League — so with Program A / Season A1 / League Aa active, sibling
+        League A2's Club and Official still came back, ``home_club_name`` and
+        all. Unlike the Setup surface there is no bootstrap counterpart: this
+        is an operational read, so a record linked to nothing is simply not
+        Dashboard data.
+
+        ``setup_audit`` resolves each row through its own ``entity_type``
+        against that SAME COMPLETE tuple — reusing the very sets that decide
+        whether the row's entity is returned at all — so activity can never
+        stay in the feed for an entity the payload withholds.
+
+        When no Program resolves at all the read fails CLOSED with NO
+        exception: a scoped account with a missing/revoked/unassigned link
+        gets the same empty shape whether or not other Programs exist in
+        the installation. (Pre-Program bootstrap reference data is served
+        from the explicitly authorized Setup-management contract,
+        ``get_setup_overview_v2``.) Called with no
+        arguments (``role`` left ``None``, the default), returns the full,
+        unfiltered installation view exactly as before #367 — this is what
+        every existing internal caller that inspects whole-store state
+        (tests exercising other subsystems) keeps using unchanged; only the
+        HTTP route's own per-user Dashboard read opts into scoping.
         """
-        divisions = {d.id: d for d in self.store.all_divisions()}
-        levels = {lv.id: lv for lv in self.store.all_leagues()}
+        program = league = None
+        in_scope_season_ids = None  # None == no Program scoping active (legacy)
+        if role is not None:
+            program, season, league = self.context.resolve_with_league(
+                user_id, role, scope)
+            if program is None:
+                # #369 review correction: fail CLOSED with NO exception --
+                # a scoped account with no authorized active Program must
+                # never see installation-wide Club/Organization/Official
+                # names (that bootstrap need is served by
+                # get_setup_overview_v2 instead, not this operational read).
+                return {
+                    "league": None, "leagues": [], "seasons": [], "levels": [],
+                    "divisions": [], "clubs": [], "teams": [],
+                    "organizations": [], "venues": [], "rinks": [],
+                    "ice_slots": [], "officials": [],
+                    "schedule": [], "public_fixtures": [], "registrations": [],
+                    "setup_audit": [], "setup_audit_count": 0,
+                }
+            # #369 review correction: the resolved Season is now a HARD
+            # ceiling -- {} (never "every Season") when Program-only (no
+            # Season resolved), {season.id} otherwise. See docstring.
+            in_scope_season_ids = {season.id} if season is not None else set()
+
+        all_ls = self.store.all_league_seasons()
+        # #367: the League(+Season)-scoped LeagueSeason ids, when Program
+        # scoping is active — narrows Divisions/registrations/games below to
+        # the resolved context. `None` (scoping inactive) keeps every
+        # LeagueSeason, identical to pre-#367 behavior.
+        in_scope_ls_ids = None
+        if in_scope_season_ids is not None:
+            in_scope_ls_ids = {
+                ls.id for ls in all_ls
+                if ls.season_id in in_scope_season_ids
+                and (league is None or ls.league_id == league.id)}
+
+        all_divisions = self.store.all_divisions()
+        if in_scope_ls_ids is not None:
+            all_divisions = [d for d in all_divisions
+                             if d.league_season_id in in_scope_ls_ids]
+        divisions = {d.id: d for d in all_divisions}
+        all_levels = self.store.all_leagues()
+        if program is not None:
+            all_levels = [lv for lv in all_levels if lv.program_id == program.id]
+        levels = {lv.id: lv for lv in all_levels}
         # Division/registration Season + League resolve via LeagueSeason (#283).
-        ls_by_id = {ls.id: ls for ls in self.store.all_league_seasons()}
+        ls_by_id = {ls.id: ls for ls in all_ls}
         clubs = {c.id: c for c in self.store.all_clubs()}
-        teams = {t.id: t for t in self.store.all_teams()}
+        all_teams = self.store.all_teams()
+        if program is not None:
+            all_teams = [
+                t for t in all_teams if t.program_id == program.id
+                and (league is None or t.league_id == league.id)]
+        teams = {t.id: t for t in all_teams}
         orgs = {o.id: o for o in self.store.all_organizations()}
         leagues_by_id = {lg.id: lg for lg in self.store.all_programs()}
-        venues = {v.id: v for v in self.store.all_venues()}
-        rinks = {r.id: r for r in self.store.all_rinks()}
+        # #369: Venues/Rinks/Ice slots have no competition-League axis at all
+        # (SeasonVenueAccess is the ONLY join between the physical and
+        # competition trees), so they are never narrowed by League. They ARE
+        # narrowed by Season: `in_scope_season_ids` is the single ACTIVE
+        # Season (empty for a Program-only context), so only a Venue granted
+        # to THAT Season is in scope. An earlier revision scoped these to any
+        # of the Program's Seasons; #369 review rejected that as silently
+        # widening the released contract, and this comment described it for
+        # one commit after the code had already stopped doing it.
+        in_scope_venue_ids = None
+        if in_scope_season_ids is not None:
+            in_scope_venue_ids = {
+                a.venue_id for a in self.store.all_season_venue_access()
+                if a.active and a.season_id in in_scope_season_ids}
+        all_venues = self.store.all_venues()
+        if in_scope_venue_ids is not None:
+            all_venues = [v for v in all_venues if v.id in in_scope_venue_ids]
+        venues = {v.id: v for v in all_venues}
+        all_rinks = self.store.all_rinks()
+        if in_scope_venue_ids is not None:
+            all_rinks = [r for r in all_rinks if r.venue_id in in_scope_venue_ids]
+        rinks = {r.id: r for r in all_rinks}
 
         def is_junior(div):
             if div is None:
@@ -5235,19 +5610,29 @@ class ApiService:
             for v in venues.values()
         ]
 
+        # `None` season ids == no scoping active (the legacy no-role call).
+        def _in_scope_game(g):
+            if in_scope_season_ids is None:
+                return True
+            return self._game_matches_active(
+                g, in_scope_season_ids,
+                league.id if league is not None else None, teams)
+
         # Draft games (#86) are proposals under review — they must never surface
         # in the operator slot grid / schedule / calendar until published, so
         # they are excluded from the LABELS here. The dedicated draft-review
         # view lists them.
         game_by_slot = {g.ice_slot_id: g for g in self.store.all_games()
-                        if g.ice_slot_id and not g.is_draft}
+                        if g.ice_slot_id and not g.is_draft
+                        and _in_scope_game(g)}
         # Reserved ice, however, is PHYSICAL (#277 Slice B review): an active
         # committed draft blocks warm-up/resurfacing facility time exactly
         # like a published game — the placement gate counts it — so the
         # reserved derivation looks at EVERY active occupant while the grid
         # label above stays published-only.
         occupant_by_slot = {g.ice_slot_id: g for g in self.store.all_games()
-                            if g.ice_slot_id and not g.cancelled}
+                            if g.ice_slot_id and not g.cancelled
+                            and _in_scope_game(g)}
         slot_rows = []
         # #277 Slice B — reserved-vs-playable visibility: a slot's stored span
         # is PLAYABLE time; the derived reserved facility span around a
@@ -5256,8 +5641,10 @@ class ApiService:
         # the operator surfaces cannot disagree.
         _policy_cache = {}
 
-        for s in sorted(self.store.all_ice_slots(),
-                        key=lambda x: (x.rink_id, x.start_time)):
+        all_slots = self.store.all_ice_slots()
+        if in_scope_venue_ids is not None:
+            all_slots = [s for s in all_slots if s.rink_id in rinks]
+        for s in sorted(all_slots, key=lambda x: (x.rink_id, x.start_time)):
             g = game_by_slot.get(s.id)
             slot_rows.append({
                 "id": s.id, "rink_id": s.rink_id,
@@ -5276,6 +5663,8 @@ class ApiService:
         for g in self.store.all_games():
             if g.is_draft:
                 continue  # unpublished draft — kept out of normal views (#86)
+            if not _in_scope_game(g):
+                continue
             div = divisions.get(g.division_id)
             rstatus = self.roster.compute_roster_status(g.id)
             venue_name = None
@@ -5321,36 +5710,226 @@ class ApiService:
                     "is_junior": is_junior(div),
                 })
 
-        leagues = [program_to_v1(_serialize(x)) for x in self.store.all_programs()]
-        seasons = [season_to_v1(_serialize(x)) for x in self.store.all_seasons()]
-        # `/api/demo/overview` is unauthenticated (do_GET in web/server.py
-        # serves it with no session/permission check) — actor_id/detail must
-        # NOT be exposed for every setup-audit action, only for import
-        # batches (#102's Activity drill-down needs them there). Other
-        # actions' detail dicts can carry things this endpoint has no
-        # business handing to an anonymous caller (e.g. user_account_created
-        # stores {"username", "role"}). Scope the extra fields to exactly
-        # the import-batch summary row and its linked per-row children.
+        # #367: the "leagues"/"league" (legacy-vocabulary Program list) and
+        # "seasons" lists scope to the resolved Program when active — this
+        # is the per-user Dashboard's own single-Program view, not a
+        # cross-Program picker. `None` scoping (role not supplied) keeps
+        # every Program/Season, identical to pre-#367 behavior.
+        all_programs = self.store.all_programs()
+        if program is not None:
+            all_programs = [p for p in all_programs if p.id == program.id]
+        leagues = [program_to_v1(_serialize(x)) for x in all_programs]
+        all_seasons = self.store.all_seasons()
+        if in_scope_season_ids is not None:
+            all_seasons = [s for s in all_seasons if s.id in in_scope_season_ids]
+        seasons = [season_to_v1(_serialize(x)) for x in all_seasons]
+        # `/api/demo/overview` requires a signed-in session as of #367, but
+        # this per-row redaction predates that and is kept as defense in
+        # depth: actor_id/detail must NOT be exposed for every setup-audit
+        # action, only for import batches (#102's Activity drill-down needs
+        # them there). Other actions' detail dicts can carry things no
+        # caller of this endpoint needs (e.g. user_account_created stores
+        # {"username", "role"}). Scope the extra fields to exactly the
+        # import-batch summary row and its linked per-row children.
         def _is_import_related(a):
             return a.entity_type == "import_batch" or (a.detail or {}).get(
                 "import_batch_id") is not None
+        registration_rows = [
+            {"team_id": r.team_id,
+             "season_id": self._season_id_via(ls_by_id, r.league_season_id),
+             "division_id": r.division_id,
+             "league_id": self._league_id_via(ls_by_id, r.league_season_id)}
+            for r in self.store.all_season_team_registrations()
+            if r.active and self._registration_is_operational(r)
+            and (in_scope_ls_ids is None or r.league_season_id in in_scope_ls_ids)
+        ]
+        # -- the derived-join reference sets (Clubs / Organizations /
+        #    Officials), computed BEFORE the audit filter because the audit
+        #    filter resolves `club`/`organization`/`official` rows through
+        #    exactly these sets. Keeping one definition per axis is the point:
+        #    two parallel derivations drifted apart once already (the audit
+        #    filter's own `audit_club_ids` was Program-wide while the returned
+        #    `clubs` was not), which is how an out-of-tuple Club id reached
+        #    the Activity feed while its name was correctly withheld from the
+        #    Clubs list.
+        #
+        # #367 owner ruling: Clubs are LEAGUE-bound "through their Teams", so
+        # they derive from `teams` — already narrowed to the active
+        # Program AND selected League — not from every Team in the Program.
+        # Officials are League-bound too, "through an in-scope home Club or
+        # assignment", and an assignment only counts when its Game passes the
+        # COMPLETE active Season+League predicate (`_in_scope_game`, which
+        # also decides the league-less exhibition case identically).
+        # Organizations follow the FACILITY axis instead: Venue/Rink/IceSlot
+        # and their owning Organization have a Season axis (SeasonVenueAccess)
+        # but NO competition-League axis, so `venues` is already
+        # active-Season-wide-under-a-League and the owners derive from it;
+        # the active Program's own operating Organization is permanent
+        # Program structure and stays in scope regardless of any Venue.
+        #
+        # `in_scope_season_ids is None` is precisely "no scoping active",
+        # i.e. the legacy no-role call. Do NOT branch on `program is None`
+        # here: that is ALSO true for the legacy path (nothing was ever
+        # resolved), so keying off it silently emptied the unfiltered
+        # contract every internal caller depends on. The scoped-role-with-
+        # no-Program case cannot reach this point at all -- it already
+        # returned the fully-empty shape far above.
+        def _official_has_in_scope_assignment(official_id):
+            if not official_id:
+                return False
+            for a in self.store.assignments_for_official(official_id):
+                g = self.store.get_game(a.game_id)
+                if g is not None and _in_scope_game(g):
+                    return True
+            return False
+
+        if in_scope_season_ids is None:
+            ref_clubs = list(clubs.values())
+            ref_orgs = list(orgs.values())
+            ref_officials = list(self.store.all_officials())
+        else:
+            scoped_club_ids = {t.club_id for t in teams.values() if t.club_id}
+            ref_clubs = [c for c in clubs.values() if c.id in scoped_club_ids]
+            scoped_org_ids = {v.organization_id for v in venues.values()
+                              if v.organization_id}
+            if program is not None and program.operator_organization_id:
+                scoped_org_ids.add(program.operator_organization_id)
+            ref_orgs = [o for o in orgs.values() if o.id in scoped_org_ids]
+            ref_officials = [
+                o for o in self.store.all_officials()
+                if o.home_club_id in scoped_club_ids
+                or _official_has_in_scope_assignment(o.id)]
+        ref_club_ids = {c.id for c in ref_clubs}
+        ref_org_ids = {o.id for o in ref_orgs}
+        ref_official_ids = {o.id for o in ref_officials}
+
+        # #369 review correction: a pre-#369 revision left the audit log
+        # UNFILTERED regardless of Program scoping, reasoning that a
+        # "best-effort" id-membership filter risked hiding legitimate
+        # same-Program activity worse than showing everything. Review
+        # correctly rejected that: an unfiltered audit log is a real
+        # cross-Program leak (actor id + detail dict for another Program's
+        # activity). Every entity_type the audit log currently records
+        # resolves through its own real parent chain below; a row that
+        # cannot be validated (an unjoinable row, or a genuinely
+        # Program-agnostic event type — a bare account/auth action) is
+        # OMITTED entirely when Program scoping is active, never guessed
+        # or shown globally.
+        #
+        # #367 owner ruling: that chain resolves against the COMPLETE active
+        # tuple, not the Program alone. A Program-level-only audit filter
+        # re-widened every axis the rest of this method narrows — with
+        # Program A / Season A1 / League Aa active it still listed Season A2's
+        # divisions, registrations, games and venue grants, and League Ab's
+        # teams, by id and action. Each branch below therefore reuses the very
+        # set that decides whether the row's own entity is returned at all
+        # (`divisions`, `teams`, `in_scope_ls_ids`, `venues`, `rinks`,
+        # `ref_*_ids`, `_in_scope_game`), so an entity can never be filtered
+        # out of the payload while its activity stays in the feed.
+        def _feed_actor_matches_active(actor_type, actor_ref):
+            """A CalendarFeedToken's own actor (team/division/official/
+            player) resolved against the active tuple, mirroring the
+            equivalent entity_type branches below -- this is exactly the
+            "legitimate same-Program activity a partial filter would hide"
+            case a pre-#369 revision cited as its reason to leave the whole
+            audit log unfiltered; handled correctly here instead of
+            omitted."""
+            if actor_type == "team":
+                return actor_ref in teams
+            if actor_type == "division":
+                return actor_ref in divisions
+            if actor_type == "official":
+                return actor_ref in ref_official_ids
+            if actor_type == "player":
+                p = self.store.get_player(actor_ref)
+                return p is not None and p.team_id in teams
+            return False
+
+        def _audit_matches_active(a):
+            et, eid, store = a.entity_type, a.entity_id, self.store
+            if et in ("program", "league"):        # legacy vocabulary: Program
+                return eid == program.id
+            if et == "season":
+                # Season-BOUND: the active Season itself, never a sibling
+                # Season of the same Program (empty set when Program-only).
+                return eid in in_scope_season_ids
+            if et == "level":                       # legacy vocabulary: League
+                # A League is permanent Program structure, so the Program is
+                # its ceiling -- but a SELECTED League narrows to itself, the
+                # same way `teams`/`divisions` narrow.
+                lv = store.get_league(eid)
+                return (lv is not None and lv.program_id == program.id
+                        and (league is None or eid == league.id))
+            if et == "league_season":
+                return eid in in_scope_ls_ids
+            if et == "division":
+                return eid in divisions
+            if et == "team":
+                return eid in teams
+            if et == "season_team_registration":
+                r = store.get_season_team_registration(eid)
+                return r is not None and r.league_season_id in in_scope_ls_ids
+            if et == "season_venue_access":
+                sva = store.get_season_venue_access(eid)
+                return sva is not None and sva.season_id in in_scope_season_ids
+            if et in ("game", "game_result"):
+                g = store.get_game(eid)
+                return g is not None and _in_scope_game(g)
+            if et == "official_assignment":
+                oa = store.get_official_assignment(eid)
+                g = store.get_game(oa.game_id) if oa else None
+                return g is not None and _in_scope_game(g)
+            if et == "official_availability":
+                av = store.get_official_availability(eid)
+                return av is not None and av.official_id in ref_official_ids
+            if et == "official":
+                return eid in ref_official_ids
+            if et == "club":
+                return eid in ref_club_ids
+            if et == "organization":
+                return eid in ref_org_ids
+            if et == "venue":
+                return eid in venues
+            if et == "rink":
+                return eid in rinks
+            if et == "ice_slot":
+                slot = store.get_ice_slot(eid)
+                return slot is not None and slot.rink_id in rinks
+            if et == "calendar_feed_token":
+                tok = store.get_calendar_feed_token(eid)
+                return tok is not None and _feed_actor_matches_active(
+                    tok.actor_type, tok.actor_ref)
+            # user_account, auth, guardian_link, import_batch, and any
+            # future/unrecognized type: no reliable Program chain at all --
+            # omit rather than guess.
+            return False
+
         setup_audit = []
         for a in self.store.all_setup_audit():
+            if program is not None and not _audit_matches_active(a):
+                continue
             entry = {"action": a.action, "entity_type": a.entity_type,
                      "entity_id": a.entity_id, "at": a.at.isoformat()}
             if _is_import_related(a):
                 entry["actor_id"] = a.actor_id
                 entry["detail"] = a.detail
             setup_audit.append(entry)
+        # (`ref_clubs`/`ref_orgs`/`ref_officials` are derived far above, next
+        # to the audit filter that shares their sets -- see the comment
+        # there. `clubs`/`orgs` stay whole as NAME-RESOLUTION lookups:
+        # labelling a row that is already independently authorized leaks
+        # nothing; only what is RETURNED is scoped. Unlike the Setup surface
+        # there is no bootstrap counterpart here -- this is an operational
+        # read, so a record linked to nothing is simply not Dashboard data.)
         return {
             "league": leagues[0] if leagues else None,
             "leagues": leagues,
             "seasons": seasons,
             "levels": [self._league_dict(lv) for lv in levels.values()],
             "divisions": division_rows,
-            "clubs": [_serialize(c) for c in clubs.values()],
+            "clubs": [_serialize(c) for c in ref_clubs],
             "teams": team_rows,
-            "organizations": [_serialize(o) for o in orgs.values()],
+            "organizations": [_serialize(o) for o in ref_orgs],
             "venues": venue_rows,
             "rinks": rink_rows,
             "ice_slots": slot_rows,
@@ -5358,7 +5937,7 @@ class ApiService:
                 {"id": o.id, "name": o.name,
                  "home_club_name": (clubs[o.home_club_id].name
                                     if o.home_club_id in clubs else None)}
-                for o in self.store.all_officials()
+                for o in ref_officials
             ],
             "schedule": schedule,
             "public_fixtures": public_fixtures,
@@ -5373,20 +5952,299 @@ class ApiService:
             # picker. `league_id` is the competition (grouping) League the
             # wizard's League picker needs — required on the registration since
             # #233 Slice C2, so always present for an operational row.
-            "registrations": [
-                {"team_id": r.team_id,
-                 "season_id": self._season_id_via(ls_by_id, r.league_season_id),
-                 "division_id": r.division_id,
-                 "league_id": self._league_id_via(ls_by_id, r.league_season_id)}
-                for r in self.store.all_season_team_registrations()
-                if r.active and self._registration_is_operational(r)
-            ],
+            "registrations": registration_rows,
             "setup_audit": setup_audit,
             "setup_audit_count": len(setup_audit),
         }
 
+    # The six entity kinds that can exist before any link to a Program does,
+    # and are therefore eligible for the creator-owned pending-link contract
+    # (#367 owner ruling). Every one of them records a `<entity>_created`
+    # audit entry carrying the acting account id at create time
+    # (SetupService.create_club/_organization/_venue/_rink/_ice_slot/
+    # _official), which is the installation's own authoritative answer to
+    # "who made this".
+    _PENDING_LINK_ENTITY_TYPES = ("club", "organization", "official",
+                                  "venue", "rink", "ice_slot")
+
+    # The four setup-create PARENT relations a caller supplies by id
+    # (rink->venue, ice-slot->rink, venue->organization, official->club),
+    # mapped to the `get_setup_overview_v2` lists that name what this caller
+    # may already reach for that entity kind. See `writable_setup_parent_ids`.
+    _SETUP_PARENT_KEYS = {
+        "venue": ("venues", "pending_link_venues"),
+        "rink": ("rinks", "pending_link_rinks"),
+        "organization": ("organizations", "pending_link_organizations"),
+        "club": ("clubs", "pending_link_clubs"),
+        # A Program has no pending-link list: it IS the thing everything else
+        # links TO, so it is never "linked to no Program". The legacy v1-only
+        # `Venue.league_id` names one (that field stores a PROGRAM id despite
+        # its name -- see the vocabulary note in the module docstring).
+        "program": ("programs", None),
+    }
+
+    # Setup-audit entity types differ from the parent-kind names above where
+    # the LEGACY vocabulary survives in the audit trail: `create_program`
+    # writes action "league_created" / entity_type "league", because pre-#233
+    # "League" meant what is now a Program. Looking up "program" finds nothing
+    # and would silently deny a creator its own Program. Only kinds that
+    # actually differ appear here.
+    _SETUP_PARENT_AUDIT_TYPE = {"program": "league"}
+
+    def writable_setup_parent_ids(self, kind, user_id, role, scope):
+        """Ids of `kind` this caller may attach a NEW child to, or ``None``
+        if that cannot be determined (the caller must then refuse).
+
+        The write gate for the four parent-by-id creates (#369 review). It
+        lives here, beside the read it mirrors, so the set a caller may WRITE
+        under is computed from the same pass that decides what it may READ
+        and cannot drift into a second, weaker policy.
+
+        Three sources, and each is load-bearing:
+
+        * the ACTIVE scoped list -- the ordinary case, the active-tuple
+          ceiling exactly as the read applies it;
+        * this caller's own ``pending_link_*`` -- its create-then-link chain,
+          where a parent is linked to no Program yet (a Rink under a Venue it
+          just made, before any grant exists);
+        * rows this caller CREATED, whatever their link state. Without this
+          the gate refuses a legitimate flow it must allow: create an
+          Organization, create a Program it OPERATES, then add that
+          Organization's first Venue. Operating a Program is a real Program
+          link, so the row is correctly absent from ``pending_link_*``; and
+          while the caller's context still points at some OTHER Program it is
+          equally correctly absent from the scoped list. It falls between the
+          two -- visible in neither, though the caller made it moments ago.
+          Creator-ownership is the same authenticated, unforgeable signal the
+          pending-link contract already rests on (``_creator_created_ids``:
+          CREATE actions only, real account ids only, so a probe can never
+          become permission), and it is strictly narrower than authorization:
+          a global role is authorized for every Program but has still created
+          only its own rows, which is why the ruling's rejected
+          authorized-set alternative is not what this is.
+
+        What stays refused is the whole of the reported IDOR: another
+        creator's pending row, a foreign Program's linked row, a guessed id
+        that never existed, and a deactivated creator's orphans. None of
+        those are in any of the three sources.
+        """
+        overview = self.get_setup_overview_v2(user_id, role, scope)
+        if not isinstance(overview, dict) or "error" in overview:
+            return None
+        scoped_key, pending_key = self._SETUP_PARENT_KEYS[kind]
+        ids = {row["id"] for row in overview.get(scoped_key) or []}
+        if pending_key:
+            ids |= {row["id"] for row in overview.get(pending_key) or []}
+        ids |= self._created_ids_of_type(
+            self._SETUP_PARENT_AUDIT_TYPE.get(kind, kind), user_id)
+        return ids
+
+    def setup_parent_writable(self, kind, parent_id, user_id, role, scope):
+        """May this caller attach a child to THIS parent? True / False / None.
+
+        The predicate form of ``writable_setup_parent_ids`` (#369 review), so
+        the ONE write-side parent decision can be taken in either place it is
+        needed and can never fork into two policies:
+
+        * as the transport preflight (``Handler._reject_parent_outside_scope``),
+          where a create's caller-supplied parent id is refused before the
+          facade is called at all;
+        * as a ``setup_guarded_mutation`` target with ``rule="writable_parent"``
+          (#369 re-review's atomicity requirement), where a REASSIGN's
+          destination parent is re-decided under that row's own lock, inside
+          the same transaction as the move and its audit. A reassign is the
+          same attachment reached by the other verb, so leaving its parent
+          check outside the transaction would reopen, for
+          ``assign-<target>``, exactly the check/use gap the guard closes for
+          everything else.
+
+        Fails CLOSED, unlike the generic ``setup_target_accessible`` ceiling:
+        ``role is None`` and an errored overview both return **False** rather
+        than "do not gate". A caller-supplied parent id is an attachment point
+        for a NEW row; there is no legitimate identity-less client that needs
+        to name one, and the create routes have refused that case since this
+        gate was written. A falsy ``parent_id`` is not this gate's business
+        (nothing to leak, nothing to probe) — it returns None so the facade's
+        own validation/not-found error is left exactly as it was.
+        """
+        if not parent_id:
+            return None
+        accessible = self.writable_setup_parent_ids(
+            kind, user_id, role, scope) if role is not None else None
+        if accessible is None:
+            return False
+        return parent_id in accessible
+
+    def _created_ids_of_type(self, entity_type, user_id):
+        """``{entity_id, ...}`` of `entity_type` rows ``user_id`` CREATED.
+
+        The same ownership signal as ``_creator_created_ids`` and with the
+        same two restrictions (CREATE actions only, so probing an id can
+        never become permission to use it; a real account id only, so an
+        identity-less caller owns nothing) -- but not restricted to the
+        pending-link entity types, because a Program is a valid write parent
+        and is never a pending-link row.
+        """
+        if not user_id:
+            return set()
+        return {a.entity_id for a in self.store.all_setup_audit()
+                if a.actor_id == user_id and a.entity_type == entity_type
+                and a.action == f"{entity_type}_created"}
+
+    def _creator_created_ids(self, user_id):
+        """``{entity_type: {entity_id, ...}}`` for the rows ``user_id``
+        CREATED, from the audit trail (#367 owner ruling's "separately
+        authorized creator-owned contract").
+
+        Two deliberate restrictions make this an ownership signal rather than
+        a second disclosure path:
+
+        * only ``<entity_type>_created`` actions count. Any later write
+          (rename, reassign, delete) is ignored, so poking an id you were
+          never shown can never turn into permission to enumerate it
+          afterwards.
+        * ``user_id`` must be a real account id. An identity-less caller
+          (``None``) owns nothing and gets empty sets, so the contract fails
+          closed rather than matching every ``actor_id=None`` audit row ever
+          written by an internal/seed call path.
+
+        The caller intersects these with "has no validated link to any
+        Program" — ownership alone never surfaces a row that belongs to some
+        Program, which stays governed by the active-tuple ceiling.
+        """
+        out = {et: set() for et in self._PENDING_LINK_ENTITY_TYPES}
+        if not user_id:
+            return out
+        for a in self.store.all_setup_audit():
+            bucket = out.get(a.entity_type)
+            if (bucket is not None and a.actor_id == user_id
+                    and a.action == f"{a.entity_type}_created"):
+                bucket.add(a.entity_id)
+        return out
+
     @catch
-    def get_setup_overview_v2(self) -> dict:
+    def get_venue_grant_candidates(self, season_id, user_id=None, role=None,
+                                   scope=None) -> dict:
+        """Venues that MAY be granted to ``season_id`` -- the grant-only
+        facility contract (#369 review).
+
+        This exists because the alternative failed review. The candidate list
+        was first emitted as ``grantable_venues`` on ``get_setup_overview_v2``,
+        and that turned the ordinary scoped overview into an
+        installation-wide Venue directory: ``/api/v2/setup/overview`` is gated
+        MANAGE_ARENA, the grant POST needs MANAGE_SETUP, so an Arena Manager --
+        a role that cannot perform the sharing action at all -- received every
+        linked Venue's id and name, independent of its active Program. Ordinary
+        read visibility is not write authorization, and the ceiling cannot be
+        widened for every reader to serve one capability.
+
+        So the disclosure is bound to the feature that needs it, three ways:
+
+        1. **Its own route**, gated MANAGE_SETUP -- the same permission as the
+           grant it feeds, so no role learns anything it could not already act
+           on. The overview stays Program/active-Season scoped.
+        2. **The SELECTED destination Season** -- ``season_id`` must BE the
+           caller's persisted active Season, not merely some Season of the
+           active Program (#369 owner ruling). A foreign or nonexistent
+           ``season_id`` is refused identically, so this never becomes a
+           Season oracle either.
+        3. **Candidates only**: id and name, for Venues that are either linked
+           to some Program (an established shared facility) or unlinked and
+           created by THIS caller (its own create-then-grant draft). Another
+           operator's unlinked draft is never a candidate -- that case leaked
+           in an earlier round of this work.
+
+        On (2) the ceiling was first written as a Program comparison
+        (``season.program_id == program.id``), which answered 200 for any
+        SIBLING Season of the active Program. The owner ruled that incorrect:
+        the active tuple is what the operator actually selected, and a
+        same-Program/other-Season 200 hands out a grant surface for a Season
+        the caller is not working in. So the check is now identity against the
+        resolved active Season, which also makes a Program-only context (no
+        Season selected) fail closed -- there is no selected Season for the
+        request to equal, and inventing one would be exactly the widening the
+        ruling forbids.
+
+        The ceiling being tightened is the DESTINATION Season, never WHICH
+        Venues may be offered: the candidate set is still deliberately NOT
+        filtered to the active Program, because a Venue already linked to
+        another Program is exactly what sharing means, and filtering it out is
+        what deadlocked the capability (once one Program holds the grant, no
+        other could obtain it). Rinks, IceSlots and every competition record
+        keep the ordinary ceiling.
+
+        4. **An ARCHIVED destination is refused outright** (#369 owner ruling,
+           follow-up). An archived Season is read-only history: every write it
+           owns -- ``grant_season_venue_access`` included -- fails
+           ``season_archived`` at :func:`require_active_season`. This method
+           exists ONLY to feed that write, so answering it for an archived
+           Season advertised a mutation nobody could perform, and did so by
+           handing out the one facility list that deliberately reaches ACROSS
+           the Program ceiling: a cross-Program Venue directory disclosed for a
+           capability the destination cannot exercise. The refusal is
+           deliberately GENERIC -- the same ``NotFoundError`` as a foreign,
+           sibling, nonexistent or Program-only miss -- so an archived Season is
+           not distinguishable from any of them, and it is raised BEFORE any
+           Venue is read or serialized, so no candidate is even computed.
+
+        :meth:`list_season_venue_access` is deliberately NOT narrowed the same
+        way: it reports the Season's OWN grant history (active and revoked,
+        each naming its own Venue), which is precisely what a read-only
+        historical Season is FOR. Reading what a Season used is not being
+        offered something to change.
+        """
+        if role is None:
+            return {"error": {"code": "forbidden",
+                              "message": "An identity is required."}}
+        program, active_season, _league = self.context.resolve_with_league(
+            user_id, role, scope)
+        # The EXACT selected-Season ceiling (#369 owner ruling). One generic
+        # refusal for every miss -- foreign Program, sibling Season of the
+        # active Program, nonexistent id, and Program-only context alike -- so
+        # none of them is distinguishable from the others.
+        if (program is None or active_season is None
+                or not season_id or season_id != active_season.id):
+            raise NotFoundError(f"Season {season_id} not found.")
+        # ...and an ARCHIVED selected Season joins them, down the SAME path.
+        # Positioned here deliberately: AFTER the equality check (so it can
+        # never become an archived-vs-active oracle for a Season the caller did
+        # not select) and BEFORE any Venue is resolved or serialized (so the
+        # cross-Program candidate directory is never even built for a
+        # destination whose grant would fail `season_archived` anyway).
+        if active_season.status == SeasonStatus.ARCHIVED:
+            raise NotFoundError(f"Season {season_id} not found.")
+        season = active_season
+        granted = {a.venue_id for a in
+                   self.store.season_venue_access_for_season(season.id)
+                   if a.active}
+        own = self._created_ids_of_type("venue", user_id)
+        out = [{"id": v.id, "name": v.name}
+               for v in self.store.all_venues()
+               if v.id not in granted            # already allowed here
+               and (self._venue_program_ids_for_grant(v) or v.id in own)]
+        return {"season_id": season.id, "candidates": out}
+
+    def _venue_program_ids_for_grant(self, venue):
+        """Program ids this Venue is linked to, for candidacy purposes.
+
+        Every ``SeasonVenueAccess`` grant counts, ACTIVE OR REVOKED -- revoking
+        deactivates the row rather than deleting it, so history still makes the
+        Venue an established facility rather than a private draft -- plus the
+        legacy ``Venue.league_id``, which despite its name stores a PROGRAM id.
+        """
+        ids = {a.season_id for a in
+               self.store.season_venue_access_for_venue(venue.id)}
+        out = set()
+        for sid in ids:
+            s = self.store.get_season(sid)
+            if s is not None:
+                out.add(s.program_id)
+        if venue.league_id:
+            out.add(venue.league_id)
+        return out
+
+    @catch
+    def get_setup_overview_v2(self, user_id=None, role=None, scope=None) -> dict:
         """Canonical flat setup-entity lists for the Setup/Records UI (#233 B2a).
 
         The v1 ``get_demo_overview`` stays the (legacy-shaped) source for the
@@ -5399,22 +6257,357 @@ class ApiService:
         E), not part of this structural read. It exposes only structural
         records plus resolved parent names — no rosters, schedule, games or
         PII — so it is gated like the hierarchy read.
-        """
-        programs = self.store.all_programs()
-        seasons = self.store.all_seasons()
-        leagues = self.store.all_leagues()      # grouping League (was Level)
-        divisions = self.store.all_divisions()
-        teams = self.store.all_teams()
-        clubs = self.store.all_clubs()
-        orgs = self.store.all_organizations()
-        venues = self.store.all_venues()
-        rinks = self.store.all_rinks()
 
-        orgs_by_id = {o.id: o for o in orgs}
-        clubs_by_id = {c.id: c for c in clubs}
+        #369 review correction: when a real user context is supplied
+        (``role`` is not ``None``), every collection scopes to the persisted
+        ACTIVE tuple (``ContextService.resolve_with_league`` — the SAME
+        ceiling the Dashboard and Setup Progress reads already use), never
+        the caller's full authorized set. ``programs`` itself collapses to
+        ``[active_program]`` (or ``[]``) — the context BAR
+        (``options_with_league``, #366) is the cross-Program picker; this
+        structural surface only ever operates within whichever one Program
+        is currently active.
+
+        **The active Season is a hard ceiling here too** (#367 owner
+        ruling), for the Setup hub, all six workflow landings and Setup
+        Records alike. An earlier revision resolved the Season and then
+        deliberately ignored it, returning every Season of the Program and
+        every Season-derived record under it, reasoning that a management
+        surface "needs to see and create against every Season". The ruling
+        rejects that: Season-bound rows must match the active Season, and a
+        Program-only context returns EMPTY for Season-bound data rather than
+        falling back to the union. Concretely, ``seasons`` is the active
+        Season alone (``[]`` when Program-only), and ``divisions``, the
+        facility tree and Official assignments narrow with it. Seeing
+        another Season means SELECTING it in the context bar — the same
+        thing switching Program or League already requires.
+
+        Two axes are deliberately NOT narrowed, and the ruling names both:
+
+        * ``leagues`` — a League is PERMANENT Program structure (#283), not
+          Season-bound data, so it stays Program-scoped and is not narrowed
+          by the League selection either (the selection narrows what is
+          *under* a League; the pickers still need the Program's set). The
+          per-League ``season_ids`` binding list is likewise reported whole.
+        * The FACILITY tree (Venue → Rink → IceSlot and the owning
+          Organization) has a Season axis via SeasonVenueAccess but NO
+          competition-League axis, so a League selection never narrows it:
+          under any League it stays active-Season-wide. "No League" is
+          therefore exactly the Program + active-Season union. Do not invent
+          a schema edge here — ``Venue.league_id`` is legacy vocabulary
+          storing a PROGRAM id, never a competition League.
+
+        Club/Organization/Official/Venue/Rink/IceSlot carry no direct
+        Program FK, but each has a real, validatable chain into the active
+        tuple: a Club with >=1 Team in it (Clubs reach a League through
+        their Teams), an Official whose home Club is in-scope or who has an
+        assignment in the active Season, an Organization owning an in-scope
+        Venue or operating the active Program, a Venue granted to the active
+        Season (Rinks/IceSlots cascade from Venue).
+
+        **An unjoinable record is omitted, not disclosed.** A record with no
+        chain to ANY Program is NOT thereby "nobody's data": the previous
+        revision published every such row to every scoped caller in additive
+        ``unassigned_*`` lists, which let ANY Arena Manager — including one
+        authorized for zero Programs — enumerate every never-linked Club,
+        Organization, Venue, Rink, IceSlot and Official in the installation
+        by name, Officials' personal names included. That mechanism is
+        REVERSED. What replaces it is the narrow, separately-authorized
+        creator-owned contract the ruling permits: the ``pending_link_*``
+        lists carry exactly the rows that (a) have no validated link to any
+        Program AND (b) THIS caller created, per the installation's own
+        audit trail (``<entity>_created`` with ``actor_id == user_id``).
+        That keeps every create-then-link flow working for the operator who
+        is actually performing it — a just-created Club has no Team yet, a
+        just-created Venue no grant — while a second operator, or an
+        identity with no authorized Program at all, sees nothing. Ownership
+        is only ever read from a CREATE entry, never from any later write,
+        so touching a record cannot become a way to start seeing it; and
+        ``user_id=None`` (an identity-less caller) owns nothing.
+
+        **A zero-Program installation is not an exception to any of that**,
+        and an earlier revision's carve-out saying otherwise is REVERSED.
+        That revision let any authenticated caller whose context resolved no
+        Program fall through to the fully unfiltered legacy shape whenever
+        the store happened to hold zero Programs, reasoning that a brand-new
+        install has no "other Program" to leak from. The reasoning does not
+        hold: an install with no Program still accumulates pre-Program setup
+        rows — Clubs, Organizations, Venues, Rinks, IceSlots and Officials,
+        the last of which carry people's personal names — so two
+        setup-capable accounts on the same fresh install could each
+        enumerate everything the other had created, and an account holding
+        the read permission but authorized for nothing could enumerate all
+        of it. Absence of a Program is not an authorization, and this was
+        neither the owner-approved creator-owned contract nor a separately
+        authorized install-admin boundary.
+
+        So an authenticated caller with zero Programs now gets exactly what
+        an authenticated caller denied by scope gets: the scoped-empty shape
+        plus its OWN ``pending_link_*`` rows. That is all a bootstrap ever
+        needed — the operator building a brand-new install IS the account
+        that created the rows it is working on, so create-then-link keeps
+        working end to end, and the first Program's creation immediately
+        resolves a real active context (``ContextService._fallback`` selects
+        the only authorized Program) from which the normal scoped chains
+        take over. No install-bootstrap authorization is introduced, because
+        none is needed to keep the flow working; a second operator's
+        pre-Program rows simply stay that operator's.
+
+        A role authorized for zero Programs while OTHER Programs exist gets
+        the identical answer, deliberately: the two cases are now one code
+        path, so no future "but the install is empty" special case can
+        reopen the hole.
+
+        Called with no arguments (``role`` left ``None``, the default),
+        returns the full, unfiltered installation view exactly as before
+        #367 — unchanged for existing direct/internal callers. Additive DTO
+        change regardless of scoping: ``teams`` rows also carry the real
+        competition ``league_id`` (``Team.league_id``, #283) alongside
+        ``program_id``.
+        """
+        scoped = role is not None
+        active_program = active_season = active_league = None
+        if scoped:
+            # An authenticated caller is ALWAYS scoped -- including on an
+            # installation with zero Programs. There is deliberately no
+            # "brand-new install" fall-through to the unfiltered shape here:
+            # a Program-less install still holds pre-Program Clubs,
+            # Organizations, Venues, Rinks, IceSlots and Officials (personal
+            # names), and the absence of a Program never authorized a second
+            # setup-capable account to enumerate them. Such a caller gets the
+            # scoped-empty shape plus its OWN pending_link_* rows, which is
+            # exactly what a create-then-link bootstrap needs. See the
+            # docstring; the regression lives in
+            # tests/test_zero_program_bootstrap_scoping.py.
+            active_program, active_season, active_league = (
+                self.context.resolve_with_league(user_id, role, scope))
+
+        if not scoped:
+            programs = self.store.all_programs()
+            seasons = self.store.all_seasons()
+            leagues = self.store.all_leagues()
+            in_scope_season_ids = None
+            active_league_id = None
+        else:
+            programs = [active_program] if active_program is not None else []
+            # #367 owner ruling: the ACTIVE Season is the ceiling, not the
+            # Program's whole set -- and a Program-only context (no Season
+            # resolved) is EMPTY here, never a silent fall-back to "every
+            # Season". `leagues` stays the Program's own set: a League is
+            # permanent Program structure, not Season-bound data.
+            in_scope_season_ids = (
+                {active_season.id} if active_season is not None else set())
+            seasons = ([active_season] if active_season is not None else [])
+            leagues = (self.store.leagues_for_program(active_program.id)
+                      if active_program is not None else [])
+            active_league_id = (
+                active_league.id if active_league is not None else None)
+
+        ls_by_id = {ls.id: ls for ls in self.store.all_league_seasons()}
+        in_scope_ls_ids = None
+        if in_scope_season_ids is not None:
+            in_scope_ls_ids = {
+                ls.id for ls in ls_by_id.values()
+                if ls.season_id in in_scope_season_ids
+                and (active_league_id is None
+                     or ls.league_id == active_league_id)}
+        divisions = self.store.all_divisions()
+        if in_scope_ls_ids is not None:
+            divisions = [d for d in divisions
+                        if d.league_season_id in in_scope_ls_ids]
+
+        # A Team is PERMANENT Program+League structure (#283) -- not
+        # Season-bound -- so the Season ceiling deliberately does not narrow
+        # it; the selected League does.
+        all_teams = self.store.all_teams()
+        if not scoped:
+            teams = all_teams
+        elif active_program is not None:
+            teams = [t for t in all_teams
+                    if t.program_id == active_program.id
+                    and (active_league_id is None
+                         or t.league_id == active_league_id)]
+        else:
+            teams = []
+
+        # -- Club/Organization/Official/Venue/Rink/IceSlot: derived joins --
+        # (see docstring). Each entity gets a SCOPED list (a validated chain
+        # into the active tuple) and, only when `scoped`, a `pending_link_*`
+        # list: rows with NO validated link to ANY Program that THIS caller
+        # created, so its own create-then-link flow can still reach them.
+        all_clubs = self.store.all_clubs()
+        all_orgs = self.store.all_organizations()
+        all_venues = self.store.all_venues()
+        all_rinks = self.store.all_rinks()
+        all_officials = self.store.all_officials()
+        all_slots = self.store.all_ice_slots()
+        pending_clubs = pending_orgs = []
+        pending_venues = pending_rinks = []
+        pending_officials = pending_slots = []
+
+        if not scoped:
+            clubs, orgs, venues, rinks = all_clubs, all_orgs, all_venues, all_rinks
+            officials, ice_slots = all_officials, all_slots
+        else:
+            # Rows this CALLER created, by entity type -- the ownership half
+            # of the pending-link contract (the other half being "linked to
+            # no Program at all"). See _creator_created_ids: CREATE entries
+            # only, and nothing at all for an identity-less caller.
+            created = self._creator_created_ids(user_id)
+
+            # #367 owner ruling: a Club reaches a League THROUGH ITS TEAMS, so
+            # the in-scope set derives from `teams` (already Program+League
+            # narrowed), not from every Team in the Program.
+            club_ids_any = {t.club_id for t in all_teams if t.club_id}
+            club_ids_active = {t.club_id for t in teams if t.club_id}
+            clubs = [c for c in all_clubs if c.id in club_ids_active]
+            pending_clubs = [c for c in all_clubs
+                             if c.id not in club_ids_any
+                             and c.id in created["club"]]
+
+            # "Linked to SOME Program" must be computed over EVERY edge into
+            # Program, or a record that belongs to another Program falls
+            # through into the pending-link list and leaks there -- to its
+            # creator only now, but a leak is a leak. For a Venue that means
+            # three edges, not one:
+            #   * an ACTIVE grant (in scope only when it names the ACTIVE
+            #     Season);
+            #   * an INACTIVE/revoked grant -- history still ties the Venue to
+            #     that Program, so it is not "nobody's data";
+            #   * the legacy `Venue.league_id`, which despite its name stores
+            #     a PROGRAM id (integrity_checks.py joins it to
+            #     seasons.program_id). It is in scope for the active Program
+            #     and a foreign link otherwise.
+            all_sva = self.store.all_season_venue_access()
+            venue_ids_any = {a.venue_id for a in all_sva}       # active OR revoked
+            # A REVOKED grant to the ACTIVE Season keeps the Venue in scope,
+            # deliberately: revoking only deactivates the row (history is
+            # preserved), the Setup tree renders a "Revoked venue access"
+            # section to manage exactly those rows, and delete_venue still
+            # blocks on them regardless of active status. Scoping to ACTIVE
+            # grants alone made such a Venue vanish from the payload
+            # entirely -- unresolvable name in the very section that exists
+            # to clean it up, and unreachable for the cleanup the
+            # Season/Venue delete path requires first.
+            #
+            # #367 owner ruling: the facility tree has a SEASON axis
+            # (SeasonVenueAccess) and NO competition-League axis, so
+            # `in_scope_season_ids` -- the ACTIVE Season alone, empty for a
+            # Program-only context -- is the whole filter here. It stays
+            # active-Season-wide under ANY League selection, deliberately.
+            venue_ids_active = {
+                a.venue_id for a in all_sva
+                if a.season_id in in_scope_season_ids}
+            # `active_program` is None here whenever a SCOPED role resolves no
+            # Program at all (a Coach with a dangling team_id) -- that path
+            # still runs this branch, with every set already empty, so every
+            # active-Program edge below must be guarded rather than assumed.
+            venues = [v for v in all_venues
+                     if v.id in venue_ids_active
+                     or (active_program is not None and v.league_id
+                         and v.league_id == active_program.id)]
+            venue_ids_active = {v.id for v in venues}
+            pending_venues = [v for v in all_venues
+                              if v.id not in venue_ids_any and not v.league_id
+                              and v.id in created["venue"]]
+
+            rinks = [r for r in all_rinks if r.venue_id in venue_ids_active]
+            # A Rink/IceSlot has no Program edge of its own: it is linked
+            # exactly as far as its Venue/Rink is, so the pending-link
+            # cascade runs over the UNLINKED venue set (every Venue with no
+            # Program edge -- NOT just this caller's own), while ownership is
+            # still required on the Rink/Slot row itself. Cascading over
+            # `pending_venues` instead would hide a Rink the caller added to
+            # an unlinked Venue somebody else created.
+            unlinked_venue_ids = {v.id for v in all_venues
+                                  if v.id not in venue_ids_any and not v.league_id}
+            pending_rinks = [r for r in all_rinks
+                             if r.venue_id in unlinked_venue_ids
+                             and r.id in created["rink"]]
+
+            rink_ids_scoped = {r.id for r in rinks}
+            unlinked_rink_ids = {r.id for r in all_rinks
+                                 if r.venue_id in unlinked_venue_ids}
+            ice_slots = [s for s in all_slots if s.rink_id in rink_ids_scoped]
+            pending_slots = [s for s in all_slots
+                             if s.rink_id in unlinked_rink_ids
+                             and s.id in created["ice_slot"]]
+
+            # An Organization reaches a Program by TWO edges, and missing
+            # either one leaks: it can own a Venue the Program uses, and it
+            # can BE a Program's `operator_organization_id` (permanent Program
+            # structure, which the ruling keeps Program-scoped). Leaving the
+            # operator edge out put every other Program's operating
+            # organization into the pending-link list -- i.e. disclosed its
+            # name while the caller was working in a different Program,
+            # exactly the leak that list must never reintroduce.
+            #
+            # Note the venue edge for "linked to SOME Program" uses
+            # `venue_ids_any` (any grant, active or revoked, plus the legacy
+            # Program link above); owning only a genuinely unlinked Venue is
+            # NOT a Program link, and treating it as one previously put such
+            # an Organization in NEITHER list -- invisible on the Setup
+            # facility tree, taking its Venues down with it, since a Venue
+            # renders under its owner and only a NULL-owner Venue reaches
+            # the orphan section.
+            linked_venue_ids = venue_ids_any | {v.id for v in all_venues
+                                                if v.league_id}
+            operator_org_ids_any = {p.operator_organization_id
+                                    for p in self.store.all_programs()
+                                    if p.operator_organization_id}
+            org_ids_any = {v.organization_id for v in all_venues
+                          if v.organization_id and v.id in linked_venue_ids}
+            org_ids_any |= operator_org_ids_any
+            org_ids_active = {v.organization_id for v in all_venues
+                              if v.organization_id and v.id in venue_ids_active}
+            if (active_program is not None
+                    and active_program.operator_organization_id):
+                org_ids_active.add(active_program.operator_organization_id)
+            orgs = [o for o in all_orgs if o.id in org_ids_active]
+            pending_orgs = [o for o in all_orgs
+                            if o.id not in org_ids_any
+                            and o.id in created["organization"]]
+
+            # The Official edges, in the two forms this method needs them:
+            # "assigned to a Game in the ACTIVE tuple" (in scope) and
+            # "assigned to any resolvable Game at all" (linked to SOME
+            # Program, and therefore never a pending-link row). The first
+            # runs through the SHARED `_game_matches_active` -- the same
+            # predicate the Dashboard applies, exhibition rule included --
+            # because the ruling makes Officials League-bound "through an
+            # in-scope home Club or assignment", so an assignment in a
+            # sibling League's game is no more this League's data than that
+            # game is.
+            team_ids_active = {t.id for t in teams}
+
+            def _official_games(official_id):
+                for a in self.store.assignments_for_official(official_id):
+                    g = self.store.get_game(a.game_id)
+                    if g is not None and g.season_id:
+                        yield g
+
+            officials, pending_officials = [], []
+            for o in all_officials:
+                o_games = list(_official_games(o.id))
+                in_active = ((o.home_club_id in club_ids_active)
+                            or any(self._game_matches_active(
+                                g, in_scope_season_ids, active_league_id,
+                                team_ids_active) for g in o_games))
+                has_any_link = ((o.home_club_id in club_ids_any)
+                                or bool(o_games))
+                if in_active:
+                    officials.append(o)
+                elif not has_any_link and o.id in created["official"]:
+                    pending_officials.append(o)
+
+        # Name-resolution lookups read from the FULL unfiltered store data
+        # (never leaks anything -- these only resolve a name/label onto a
+        # row that is already independently authorized to be shown).
+        orgs_by_id = {o.id: o for o in all_orgs}
+        clubs_by_id = {c.id: c for c in all_clubs}
         leagues_by_id = {lg.id: lg for lg in leagues}
-        venues_by_id = {v.id: v for v in venues}
-        rinks_by_id = {r.id: r for r in rinks}
+        venues_by_id = {v.id: v for v in all_venues}
+        rinks_by_id = {r.id: r for r in all_rinks}
         # A League's Season and a Division's Season + League resolve through
         # LeagueSeason now (#283); ``season_by_league`` maps a League to A
         # participating Season so the DTO keeps its legacy ``season_id`` (a
@@ -5422,8 +6615,11 @@ class ApiService:
         # fine for that single display field, but ``seasons_by_league`` (#345)
         # additionally carries EVERY binding, because a consumer that needs to
         # know whether a League participates in a SPECIFIC Season (not just
-        # "a" Season) cannot answer that from the lossy singular field).
-        ls_by_id = {ls.id: ls for ls in self.store.all_league_seasons()}
+        # "a" Season) cannot answer that from the lossy singular field). Built
+        # from every LeagueSeason (not the Program-narrowed set above) — an
+        # in-scope League's own bindings are already guaranteed in-Program by
+        # the League/Season/Program invariant, so no extra narrowing changes
+        # the result here.
         season_by_league = {}
         seasons_by_league = {}
         for ls in ls_by_id.values():
@@ -5442,6 +6638,81 @@ class ApiService:
                     "is_junior": is_junior(d), "league_id": lid,
                     "league_name": (leagues_by_id[lid].name
                                     if lid in leagues_by_id else None)}
+
+        # Row-shape builders, applied identically to a main (scoped/
+        # unfiltered) list and its `pending_link_*` counterpart, so both read
+        # as the exact same DTO shape client-side.
+        #
+        # `visible` is the ownership contract's second half (#367 owner
+        # ruling: visibility "cannot be gained by probing/replaying an id").
+        # A pending-link row is offered because the caller CREATED it — and
+        # that authorizes THE ROW, never the foreign records it happens to
+        # point at. Every create route takes its parent id verbatim from the
+        # request body and does not check that the caller may see that
+        # parent, so resolving a parent's NAME from the full store turned the
+        # create routes into a name oracle for exactly the identity the
+        # ruling names: an Arena Manager (MANAGE_ARENA covers venue/rink/
+        # ice-slot/organization creates AND this read, at zero authorized
+        # Programs) POSTs a Rink at `venue_N`, an IceSlot at `rink_N`, a
+        # Venue at `org_N` or an Official homed at `club_N` — ids are
+        # sequential — and reads another operator's never-linked
+        # `venue_name` / `rink_name` / `organization_name` / `home_club_name`
+        # straight back out of its own pending row. Verified by probe before
+        # this guard existed. So on a pending row every parent LABEL resolves
+        # only against what this caller can already see (its scoped list plus
+        # its own pending list) and is None otherwise; the parent id the
+        # caller itself supplied stays, since it is not new information.
+        # `visible=None` (every main list, and the whole unfiltered shape)
+        # keeps the previous full resolution.
+        def _resolved_name(by_id, parent_id, visible):
+            if visible is not None and parent_id not in visible:
+                return None
+            parent = by_id.get(parent_id)
+            return parent.name if parent is not None else None
+
+        def _club_row(c):
+            return {"id": c.id, "name": c.name}
+
+        def _org_row(o):
+            return {"id": o.id, "name": o.name, "short_name": o.short_name}
+
+        def _official_row(o, visible=None):
+            return {"id": o.id, "name": o.name,
+                    "home_club_name": _resolved_name(
+                        clubs_by_id, o.home_club_id, visible)}
+
+        def _venue_row(v, visible=None):
+            return {"id": v.id, "name": v.name, "address": v.address,
+                    "timezone": v.timezone,
+                    "organization_id": v.organization_id,
+                    "organization_name": _resolved_name(
+                        orgs_by_id, v.organization_id, visible)}
+
+        def _rink_row(r, visible=None):
+            return {"id": r.id, "venue_id": r.venue_id, "name": r.name,
+                    "venue_name": _resolved_name(
+                        venues_by_id, r.venue_id, visible)}
+
+        def _slot_row(ic, visible=None):
+            return {"id": ic.id, "rink_id": ic.rink_id,
+                    "start_time": ic.start_time.isoformat(),
+                    "end_time": ic.end_time.isoformat(),
+                    "slot_type": ic.slot_type.value, "status": ic.status.value,
+                    "rink_name": _resolved_name(
+                        rinks_by_id, ic.rink_id, visible)}
+
+        # What a PENDING row may resolve a parent name against: this caller's
+        # scoped list for that kind, plus its own pending list for that kind
+        # (a Rink the caller created under a Venue it also created must still
+        # render the Venue's name — that is the create-then-link flow itself).
+        # Anything else is a record this caller was never shown, so its name
+        # is withheld. Built unconditionally: in the unfiltered shape every
+        # pending list is empty, so these sets are never consulted there.
+        visible_club_ids = {c.id for c in clubs} | {c.id for c in pending_clubs}
+        visible_org_ids = {o.id for o in orgs} | {o.id for o in pending_orgs}
+        visible_venue_ids = ({v.id for v in venues}
+                             | {v.id for v in pending_venues})
+        visible_rink_ids = {r.id for r in rinks} | {r.id for r in pending_rinks}
 
         return {
             "programs": [
@@ -5471,44 +6742,46 @@ class ApiService:
             "divisions": [_division_row_v2(d) for d in divisions],
             "teams": [
                 {"id": t.id, "name": t.name, "club_id": t.club_id,
-                 "program_id": t.program_id,
+                 "program_id": t.program_id, "league_id": t.league_id,
                  "club_name": (clubs_by_id[t.club_id].name
                                if t.club_id in clubs_by_id else None)}
                 for t in teams],
-            "clubs": [{"id": c.id, "name": c.name} for c in clubs],
-            "organizations": [
-                {"id": o.id, "name": o.name, "short_name": o.short_name}
-                for o in orgs],
+            "clubs": [_club_row(c) for c in clubs],
+            "organizations": [_org_row(o) for o in orgs],
             # Officials are shown on the Setup surface (no legacy field rename);
             # sourced here so the whole Setup page reads from this canonical
             # endpoint rather than the v1 demo overview.
-            "officials": [
-                {"id": o.id, "name": o.name,
-                 "home_club_name": (clubs_by_id[o.home_club_id].name
-                                    if o.home_club_id in clubs_by_id else None)}
-                for o in self.store.all_officials()],
-            "venues": [
-                {"id": v.id, "name": v.name, "address": v.address,
-                 "timezone": v.timezone,
-                 "organization_id": v.organization_id,
-                 "organization_name": (orgs_by_id[v.organization_id].name
-                                       if v.organization_id in orgs_by_id
-                                       else None)}
-                for v in venues],
-            "rinks": [
-                {"id": r.id, "venue_id": r.venue_id, "name": r.name,
-                 "venue_name": (venues_by_id[r.venue_id].name
-                                if r.venue_id in venues_by_id else None)}
-                for r in rinks],
-            "ice_slots": [
-                {"id": ic.id, "rink_id": ic.rink_id,
-                 "start_time": ic.start_time.isoformat(),
-                 "end_time": ic.end_time.isoformat(),
-                 "slot_type": ic.slot_type.value, "status": ic.status.value,
-                 "rink_name": (rinks_by_id[ic.rink_id].name
-                               if ic.rink_id in rinks_by_id else None)}
-                for ic in sorted(self.store.all_ice_slots(),
-                                 key=lambda x: (x.rink_id, x.start_time))],
+            "officials": [_official_row(o) for o in officials],
+            "venues": [_venue_row(v) for v in venues],
+            "rinks": [_rink_row(r) for r in rinks],
+            "ice_slots": [_slot_row(ic) for ic in
+                         sorted(ice_slots, key=lambda x: (x.rink_id, x.start_time))],
+            # #367 owner ruling: the CREATOR-OWNED create-then-link lists,
+            # replacing the reversed installation-wide `unassigned_*`
+            # mechanism (see docstring). A row appears here only when it has
+            # no validated link to ANY Program AND this caller created it, so
+            # a freshly-created Club/Venue/Organization/Official/Rink/IceSlot
+            # stays pickable and manageable by the operator performing the
+            # flow, and by nobody else. Always empty for the unfiltered
+            # (`role=None` / zero-Program bootstrap) case, where the main
+            # lists above are already unfiltered.
+            # Parent LABELS on these rows resolve only against what this
+            # caller can already see -- its own scoped list plus its own
+            # pending list -- so creating a child under a guessed parent id
+            # cannot read that parent's name back out (see `_resolved_name`).
+            "pending_link_clubs": [_club_row(c) for c in pending_clubs],
+            "pending_link_organizations": [_org_row(o) for o in pending_orgs],
+            "pending_link_officials": [
+                _official_row(o, visible_club_ids)
+                for o in pending_officials],
+            "pending_link_venues": [
+                _venue_row(v, visible_org_ids) for v in pending_venues],
+            "pending_link_rinks": [
+                _rink_row(r, visible_venue_ids) for r in pending_rinks],
+            "pending_link_ice_slots": [
+                _slot_row(ic, visible_rink_ids) for ic in
+                sorted(pending_slots,
+                       key=lambda x: (x.rink_id, x.start_time))],
         }
 
     @catch
@@ -6187,9 +7460,68 @@ class ApiService:
             access_id, actor_id))
 
     @catch
-    def list_season_venue_access(self, season_id: str) -> dict:
-        rows = [_serialize(a)
-                for a in self.store.season_venue_access_for_season(season_id)]
+    def list_season_venue_access(self, season_id: str, user_id=None, role=None,
+                                 scope=None) -> dict:
+        """This Season's venue grants, each naming its own Venue.
+
+        SCOPED exactly like :meth:`get_venue_grant_candidates` (#369 review):
+        ``season_id`` must BE the caller's persisted active Season, and a
+        foreign, sibling or nonexistent ``season_id`` takes the same generic
+        not-found path -- so this is neither a Season oracle nor a way to name
+        another Program's facilities.
+
+        That check is the whole point of the identity parameters. This read had
+        only a role-level MANAGE_SETUP gate on its route and took the requested
+        id on trust, which was survivable while it echoed opaque grant rows but
+        stopped being so the moment ``venue_name`` was added below: with
+        Program A active, asking for Program B's Season answered 200 with B's
+        Venue id AND its name, while a guessed id answered 200 with an empty
+        list -- a cross-Program facility disclosure and an existence oracle in
+        one route. Role-level permission says the caller may manage SOME
+        Season's grants; it never says which Season, and only the persisted
+        active tuple can say that.
+
+        ``venue_name`` itself is additive and stays, but only past that check. A
+        Season may hold a grant to a Venue belonging to ANOTHER Program -- that
+        is what shared arenas are -- and once cross-Program Venues stopped
+        appearing in the ordinary scoped overview, there was nowhere left for
+        the client to resolve that name from, so the Allowed-venues row
+        rendered a bare id. Naming the Venue on a grant the caller's OWN active
+        Program already holds is not a cross-Program directory: it discloses
+        only a facility that Season demonstrably already uses, to a caller who
+        has been proven entitled to that Season's grants.
+
+        Ceilinged to the EXACT selected Season, deliberately and identically to
+        the candidate route (#369 owner ruling). The first version of this
+        check compared Programs, so any SIBLING Season of the active Program
+        answered 200 with its grants and its Venue names; the owner ruled that
+        same-Program/other-Season 200 incorrect. It was written that way to
+        serve the client, which walked every Season of the active Program in
+        ``get_setup_hierarchy_v2`` and read allowed venues for each -- i.e.
+        used this route as an all-Seasons inventory. That use has stopped:
+        ``app.js`` now reads this route for the selected Season only, and
+        renders a non-identifying placeholder for the rest. A Program-only
+        context (no Season selected) fails closed for the same reason -- there
+        is no selected Season for the request to equal.
+        """
+        if role is None:
+            return {"error": {"code": "forbidden",
+                              "message": "An identity is required."}}
+        program, active_season, _league = self.context.resolve_with_league(
+            user_id, role, scope)
+        # One generic refusal for every miss -- foreign Program, sibling Season
+        # of the active Program, nonexistent id, Program-only context -- so no
+        # one of them is distinguishable from the others.
+        if (program is None or active_season is None
+                or not season_id or season_id != active_season.id):
+            raise NotFoundError(f"Season {season_id} not found.")
+        season = active_season
+        names = {v.id: v.name for v in self.store.all_venues()}
+        rows = []
+        for a in self.store.season_venue_access_for_season(season.id):
+            row = _serialize(a)
+            row["venue_name"] = names.get(a.venue_id)
+            rows.append(row)
         return {"venue_access": rows}
 
     @catch
@@ -6478,9 +7810,49 @@ class ApiService:
 
     @catch
     def list_players(self, team_id: Optional[str] = None,
-                     include_email: bool = False) -> List[dict]:
+                     include_email: bool = False, user_id=None, role=None,
+                     scope=None) -> List[dict]:
+        """#369 self-audit: when a real user context is supplied, the
+        unfiltered list narrows to Teams in the caller's ACTIVE Program.
+
+        This is the Setup "Clubs, players and staff" list, and it was the one
+        Setup collection still answering installation-wide after the rest of
+        the surface was ceilinged — it returned every Player NAME (and, on
+        this MANAGE_SETUP route, every email) in the installation, including
+        other Programs'. Names here are usually juniors, which is why the
+        route already refuses to be bundled into an unauthenticated payload;
+        the same reasoning makes a cross-Program answer wrong. Called with no
+        user context (the default), behavior is unchanged for existing
+        internal callers.
+        """
         players = (self.store.players_for_team(team_id) if team_id
                   else self.store.all_players())
+        # The Program ceiling applies to BOTH forms. An earlier revision
+        # scoped only the unfiltered form (`team_id is None and role is not
+        # None`), which left an IDOR: `?team_id=<another Program's team>`
+        # skipped the gate entirely and returned that Team's players -- and,
+        # on this MANAGE_SETUP route, their emails. `team_id` is a caller-
+        # supplied identifier, so it selects WHICH rows to consider; it can
+        # never be evidence of authorization for them.
+        if role is not None:
+            program, _season, league = self.context.resolve_with_league(
+                user_id, role, scope)
+            if program is None:
+                players = []
+            else:
+                # A selected League narrows here too, via the Team's REAL
+                # permanent competition League (`Team.league_id`, #283 -- not
+                # any of the legacy `league_id` fields that store a Program).
+                # Players are League-narrowable in a way Clubs/Organizations/
+                # Venues are not, and the rest of the surface already treats
+                # them that way: get_setup_progress's "roster" workflow and
+                # the Setup roster summary both League-filter players, and
+                # get_setup_overview_v2 League-narrows teams. Leaving the
+                # Players card Program-wide contradicted its own screen.
+                in_scope = {t.id for t in self.store.all_teams()
+                            if t.program_id == program.id
+                            and (league is None or t.league_id == league.id)}
+                players = [p for p in players if p.team_id in in_scope]
         rows = [_serialize(p) for p in players]
         # The Player DTO deliberately carries no email (it reaches coach/roster
         # views). Only the MANAGE_SETUP-gated operator list opts in, so the edit

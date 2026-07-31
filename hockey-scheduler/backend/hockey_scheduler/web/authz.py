@@ -50,6 +50,15 @@ def _v2_setup_permission(rest: str):
         return Permission.MANAGE_SETUP
     if re.match(r"^seasons/[^/]+/venue-access$", rest):
         return Permission.MANAGE_SETUP
+    # #369 review: the grant-CANDIDATE read carries the same permission as the
+    # grant it feeds, deliberately. It is the one facility contract that
+    # reaches across the Program ceiling, and binding it to MANAGE_SETUP is
+    # what keeps that reach inside the capability that needs it -- the previous
+    # attempt put the list on the MANAGE_ARENA-gated overview, disclosing every
+    # linked Venue to a role that cannot grant anything. Ordinary read
+    # visibility is not write authorization.
+    if re.match(r"^seasons/[^/]+/venue-candidates$", rest):
+        return Permission.MANAGE_SETUP
     if re.match(r"^programs/[^/]+/teams$", rest):
         return Permission.MANAGE_SETUP
     if rest == "hierarchy":

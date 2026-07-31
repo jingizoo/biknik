@@ -11,6 +11,7 @@ import json
 import os
 import re
 import ssl
+import sys
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -151,6 +152,54 @@ ERROR_HTTP_STATUS = {
 # schema check (#271) can't drift from what the service accepts.
 _AVAILABILITY_VALUES = frozenset(s.value for s in AvailabilityStatus)
 
+# The four setup-create PARENT relations a caller supplies by id (#369
+# review): rink→venue, ice-slot→rink, venue→organization, official→club.
+# Each maps its parent entity kind to the exact noun the facade's own
+# ``NotFoundError`` uses for a genuinely missing parent (see
+# ``setup_service.create_rink``/``create_ice_slot``/``create_venue``/
+# ``create_official``) -- reusing that wording verbatim is what makes an
+# inaccessible parent byte-identical to a nonexistent one.
+#
+# WHICH ids are reachable is not decided here: ``ApiService.
+# writable_setup_parent_ids`` answers that beside the read it mirrors, so the
+# write gate cannot drift into a second, weaker policy than the read.
+#
+# See ``Handler._reject_parent_outside_scope``.
+_SETUP_PARENT_LISTS = {
+    "venue": "Venue",
+    "rink": "Rink",
+    "organization": "Organization",
+    "club": "Club",
+    # The legacy v1-only `Venue.league_id` names a PROGRAM. The facade already
+    # says "Program <id> not found." for a missing one, so a refused
+    # inaccessible Program is byte-identical to a nonexistent one here too.
+    "program": "Program",
+}
+
+# The same four relations reached by the OTHER verb (#369 review). A create is
+# not the only way to attach a record to a parent: ``assign-<target>`` moves an
+# existing one, and a gate on creates alone leaves the identical cross-owner
+# write open behind a different URL — proven, before this was added, by an
+# Arena Manager moving its own Rink under another creator's Venue and getting a
+# 200 on BOTH API versions.
+#
+# ``(entity, target)`` -> ``(parent kind, body key naming the new parent)``.
+# Only relations whose parent is one of the four kinds above appear here;
+# division→league / team→league / player→team have different parent kinds and
+# are governed elsewhere. A null id (the explicit unassign on the nullable
+# relations) is not gated — there is no parent to leak and nothing to probe.
+#
+# ``("league", "organization")`` is v1-only and ``("program", "organization")``
+# v2-only (legacy vocabulary: v1 "league" IS today's Program), so one table
+# serves both handlers without collision.
+_REASSIGN_PARENTS = {
+    ("league", "organization"): ("organization", "organization_id"),
+    ("program", "organization"): ("organization", "operator_organization_id"),
+    ("venue", "organization"): ("organization", "organization_id"),
+    ("rink", "venue"): ("venue", "venue_id"),
+    ("team", "club"): ("club", "club_id"),
+}
+
 
 # Method-405 routing table (#271). Two ordered lists of compiled path patterns
 # transcribed from the ``do_GET``/``do_POST`` dispatch below (an explicitly
@@ -168,6 +217,7 @@ _GET_ROUTES = [re.compile(p) for p in (
     r"^/api/setup/seasons/[^/]+/team-registrations$",
     r"^/api/onboarding/status$",
     r"^/api/v2/setup/overview$",
+    r"^/api/v2/setup/seasons/[^/]+/venue-candidates$",  # #369 grant candidates
     r"^/api/v2/setup/hierarchy$",
     r"^/api/v2/setup/progress$",
     r"^/api/v2/setup/programs/[^/]+/teams$",
@@ -1091,7 +1141,21 @@ class Handler(BaseHTTPRequestHandler):
                     "code": "not_found", "message": "Calendar not found."}}, 404)
             return self._send_ics(ics)
         if path == "/api/demo/overview":
-            return self._send_api(api.get_demo_overview())
+            # #367: Dashboard read, scoped to the caller's persisted active
+            # Program/Season/League context — a per-user read, so it needs a
+            # real session (same requirement as /api/context and
+            # /api/v2/setup/progress), not the identity-less X-Demo-Role/
+            # headerless demo fallbacks alone.
+            role, scope, user_id, err = self._resolve_role()
+            if err is not None:
+                code, payload = err
+                return self._send_json(payload, code)
+            if user_id is None:
+                return self._send_json({"error": {
+                    "code": "unauthorized",
+                    "message": "A signed-in account is required."}}, 401)
+            return self._send_api(
+                api.get_demo_overview(user_id, role, scope))
         if path == "/api/context":
             # The signed-in user's active Program/Season/League selection (#159,
             # League axis #345), filtered through their real role/scope.
@@ -1188,15 +1252,57 @@ class Handler(BaseHTTPRequestHandler):
                 scope_id=(qs.get("scope_id") or [None])[0],
                 season_id=(qs.get("season_id") or [None])[0]))
 
+        # #369 review: grant CANDIDATES for one destination Season -- the only
+        # facility contract that reaches across the Program ceiling, and the
+        # reason it is its own route rather than a field on the overview below.
+        # The destination Season must be the caller's persisted ACTIVE Season
+        # (#369 owner ruling); a sibling Season of the active Program is
+        # refused exactly like a foreign or nonexistent one.
+        # The overview is MANAGE_ARENA; this is MANAGE_SETUP, the same
+        # permission as the grant it feeds, so no role learns a Venue it could
+        # not already act on. Emitting these on the overview meant an Arena
+        # Manager received every linked Venue's id and name while being unable
+        # to grant anything.
+        mvc = re.match(r"^/api/v2/setup/seasons/([^/]+)/venue-candidates$", path)
+        if mvc:
+            guard = f"/api/v2/setup/seasons/{mvc.group(1)}/venue-candidates"
+            if self._operator_only(guard):
+                return
+            role, scope, user_id, err = self._resolve_role()
+            if err is not None:
+                code, payload = err
+                return self._send_json(payload, code)
+            return self._send_api(api.get_venue_grant_candidates(
+                mvc.group(1), user_id, role, scope))
+
         if path == "/api/v2/setup/overview":
             # Canonical flat setup-entity lists for the Setup/Records UI (#233
             # Slice B2a). Gated MANAGE_ARENA (not MANAGE_SETUP like hierarchy)
             # — both League Admin and Arena Manager hold it, and Arena
             # Managers need the facility portion (organizations/venues/rinks)
             # for their own Setup cards; the payload has no PII/roster counts.
-            if self._operator_only("/api/v2/setup/overview"):
-                return
-            return self._send_api(api.get_setup_overview_v2())
+            # #367: now Program-scoped via the persisted active context, so
+            # (like /api/v2/setup/progress) it needs a real session, not the
+            # identity-less X-Demo-Role/headerless demo fallbacks alone.
+            role, scope, user_id, err = self._resolve_role()
+            if err is not None:
+                code, payload = err
+                return self._send_json(payload, code)
+            if user_id is None:
+                return self._send_json({"error": {
+                    "code": "unauthorized",
+                    "message": "A signed-in account is required."}}, 401)
+            if not authorize(role, "/api/v2/setup/overview"):
+                perm = required_permission("/api/v2/setup/overview")
+                return self._send_json({"error": {
+                    "code": "forbidden",
+                    "message": (f"Your role ({ROLE_LABELS[role]}) can't do "
+                                f"this (requires {perm.value})."),
+                    "details": {"role": role.value,
+                                "required": perm.value if perm else None},
+                }}, 403)
+            return self._send_api(
+                api.get_setup_overview_v2(user_id, role, scope))
         if path == "/api/v2/setup/hierarchy":
             if self._operator_only("/api/v2/setup/player"):
                 return
@@ -1259,9 +1365,22 @@ class Handler(BaseHTTPRequestHandler):
                 api.list_season_team_registrations(mv2tr.group(1)))
         mv2va = re.match(r"^/api/v2/setup/seasons/([^/]+)/venue-access$", path)
         if mv2va:
+            # #369 review: MANAGE_SETUP below is a ROLE gate — it says the
+            # caller may manage grants somewhere, never that THIS Season is
+            # theirs. The identity goes through to the service so the requested
+            # Season is checked against the persisted active SEASON (#369 owner
+            # ruling — the exact selected tuple, not merely its Program), the
+            # same ceiling the venue-candidates route above applies; without
+            # it, adding venue_name turned this read into a cross-Program
+            # facility disclosure and a Season-existence oracle.
             if self._operator_only("/api/v2/setup/player"):
                 return
-            return self._send_api(api.list_season_venue_access(mv2va.group(1)))
+            role, scope, user_id, err = self._resolve_role()
+            if err is not None:
+                code, payload = err
+                return self._send_json(payload, code)
+            return self._send_api(api.list_season_venue_access(
+                mv2va.group(1), user_id, role, scope))
         if path == "/api/v2/onboarding/status":
             if self._operator_only("/api/v2/onboarding/status"):
                 return
@@ -1365,10 +1484,23 @@ class Handler(BaseHTTPRequestHandler):
             from urllib.parse import parse_qs, urlparse
             qs = parse_qs(urlparse(self.path).query)
             team_id = (qs.get("team_id") or [None])[0]
+            # #369: pass the caller's identity so the unfiltered (no team_id)
+            # form narrows to their ACTIVE Program rather than answering
+            # installation-wide. `_resolve_role` may legitimately yield no
+            # user_id here (the demo X-Demo-Role / headerless-admin operator
+            # fallbacks this route has always accepted); that resolves to no
+            # active context and therefore no rows, which is the correct
+            # fail-closed direction for a list of player names.
+            role, scope, user_id, err = self._resolve_role()
+            if err is not None:
+                code, payload = err
+                return self._send_json(payload, code)
             # This list feeds the operator Player edit drawer (#268), so it
             # opts into the current email — safe here because the route is
             # MANAGE_SETUP-gated (an operator), never a coach/public surface.
-            return self._send_api(api.list_players(team_id, include_email=True))
+            return self._send_api(api.list_players(
+                team_id, include_email=True, user_id=user_id, role=role,
+                scope=scope))
         if path == "/api/reschedule/pending":
             # League-wide "awaiting my decision" queue (#29) — the opponent
             # has already accepted; a league admin/arena manager just needs
@@ -1505,7 +1637,19 @@ class Handler(BaseHTTPRequestHandler):
                 api.get_substitute_opportunity(jid, mgo.group(2)))
         sd = re.match(r"^/api/standings/([^/]+)$", path)
         if sd:
-            return self._send_api(api.get_standings(sd.group(1)))
+            # #367: the Division's Program must be in the caller's
+            # authorized set (see get_standings's own docstring) — needs a
+            # real session, same requirement as /api/demo/overview above.
+            role, scope, user_id, err = self._resolve_role()
+            if err is not None:
+                code, payload = err
+                return self._send_json(payload, code)
+            if user_id is None:
+                return self._send_json({"error": {
+                    "code": "unauthorized",
+                    "message": "A signed-in account is required."}}, 401)
+            return self._send_api(
+                api.get_standings(sd.group(1), user_id, role, scope))
         # #283 Slice D: LeagueSeason-wide standings (across all its Divisions),
         # keyed by (league_id, season_id). Exhibition games are excluded.
         lss = re.match(
@@ -2708,13 +2852,30 @@ class Handler(BaseHTTPRequestHandler):
         targets = [(self._V1_SETUP_KIND.get(entity, entity), record_id)]
         if dest is not None:
             targets.append((dest[0], b.get(dest[1]) or None))
+        # ...and for the four relations a CREATE can also reach by id, the
+        # destination must additionally satisfy the WRITE-side parent rule
+        # (#369 review) — the same gate, and the same refusal, as the creates.
+        # It is a SECOND, narrower question than the generic ceiling above
+        # ("may this caller attach a new child here", answered from the read
+        # it mirrors), so the destination is listed twice and must pass both:
+        # a gate on creates alone left the identical cross-owner write open
+        # behind `assign-<target>`, and an Arena Manager really did move its
+        # own Rink under another creator's Venue and get a 200. Carried as a
+        # `_guarded_mutation` TARGET rather than a bare preflight so the parent
+        # decision is taken under the destination row's lock, inside the same
+        # transaction as the move (#369 re-review's atomicity rule).
+        parent = _REASSIGN_PARENTS.get(combo)
+        if parent is not None:
+            targets.append((parent[0], b.get(parent[1]) or None,
+                            "writable_parent"))
         # The preflight runs here rather than only inside `_guarded_mutation`
         # so an unauthorized target is still refused AHEAD of the unknown-combo
         # 404 below, exactly as before: a caller is never told a route shape is
         # wrong about a record it may not see.
         for target in targets:
             if self._reject_target_outside_scope(
-                    target[0], target[1], actor_id, role, scope):
+                    target[0], target[1], actor_id, role, scope,
+                    target[2] if len(target) > 2 else "scope"):
                 return
         # v1 boundary (#233 C1b): legacy request keys map straight onto the
         # canonical facade args (same id values), and canonical result dicts are
@@ -2745,16 +2906,90 @@ class Handler(BaseHTTPRequestHandler):
             "code": "not_found",
             "message": f"Unknown reassignment {entity}/assign-{target}."}}, 404)
 
+    def _reject_parent_outside_scope(self, kind: str, parent_id,
+                                     role, scope, user_id) -> bool:
+        """Refuse a create whose caller-supplied PARENT id is not one this
+        caller may already see. Sends the refusal and returns True when it
+        refuses; returns False (nothing sent, nothing written) otherwise.
+
+        #369 review — the cross-owner write IDOR. Redacting the resolved
+        parent NAME out of ``pending_link_*`` closed the read-side oracle but
+        left the write itself wide open: every create route below took its
+        parent id verbatim from the request body, so an operator authorized
+        for zero of the relevant Programs could still POST a Rink under
+        another creator's guessed ``venue_N``, an IceSlot under a foreign
+        ``rink_N``, a Venue under a foreign ``org_N`` or an Official homed at
+        a foreign ``club_N``. Two things leak even with the name withheld:
+        success-versus-not-found is itself an existence oracle over
+        sequential ids, and the attacker MUTATES another creator's pending
+        setup graph (its Venue grows a Rink, its Rink grows ice). Creator-
+        owned visibility cannot be secure while crafted writes may attach
+        children to foreign creator-owned parents, so the parent id is
+        validated here, BEFORE the facade call.
+
+        The acceptance rule is computed by
+        ``ApiService.writable_setup_parent_ids`` from the read itself rather
+        than re-derived here, so the write gate can never drift from what the
+        caller can see: the ACTIVE scoped list for that entity kind, UNION
+        this caller's own pending-link list, UNION the rows this caller
+        CREATED. See that method for why the third source is required rather
+        than merely convenient. Everything else — another creator's pending
+        row, a foreign Program's linked row, a guessed id that never existed,
+        a deactivated creator's orphaned row — is refused.
+
+        The refusal is BYTE-IDENTICAL to the nonexistent case, because both
+        take this exact path: a foreign parent is not in the accessible set,
+        and neither is a nonexistent one. The message is the same
+        ``"<Label> <id> not found."`` ``NotFoundError`` the facade itself
+        raises for a genuinely missing parent (``setup_service.create_rink``
+        et al), so an honest 404 is unchanged on the wire and an
+        inaccessible parent is indistinguishable from one that was never
+        there. Only the caller's OWN id is echoed back — never new
+        information.
+
+        Fails CLOSED: an unresolvable identity or an errored overview refuses
+        rather than falling through to the write. A falsy ``parent_id`` is
+        NOT this gate's business (there is no id to leak and no record to
+        probe) — a required-but-missing parent stays the facade's own
+        validation/not-found error, unchanged.
+
+        Bootstrap needs no exception here. An authenticated read is scoped
+        even on an installation with zero Programs (that carve-out was
+        removed in this same round), and the operator building a fresh
+        install is by definition the account that created its rows — so the
+        creator-owned source above carries the whole bootstrap chain, and a
+        SECOND setup-capable account on that same empty install is still
+        correctly refused.
+        """
+        if not parent_id:
+            return False
+        label = _SETUP_PARENT_LISTS[kind]
+        # The decision itself is ``ApiService.setup_parent_writable`` — the
+        # same predicate the ``writable_parent`` reassign target runs under the
+        # destination row's lock (#369 re-review), so the create gate and the
+        # reassign gate can never fork into two policies. It answers None only
+        # for a falsy id, which never reaches here.
+        if STATE.api.setup_parent_writable(
+                kind, parent_id, user_id, role, scope) is not False:
+            return False
+        self._send_json({"error": {
+            "code": "not_found",
+            "message": f"{label} {parent_id} not found."}}, 404)
+        return True
+
     def _handle_setup(self, entity: str, body: dict, actor_id: str,
                       role, scope):
         """Dispatch /api/setup/<entity> to the matching facade create method.
 
         ``actor_id`` is always the caller's server-resolved session user id
         (#136) — never a client-supplied body field, so the setup audit
-        trail can't be forged. ``role``/``scope`` come from that SAME
-        ``_resolve_role()`` call and feed ``_reject_target_outside_scope``
-        (#369), so the identity the target gate checks is exactly the identity
-        the audit records.
+        trail can't be forged. ``role``/``scope`` come from the SAME
+        ``_resolve_role()`` call that produced ``actor_id`` and feed BOTH #369
+        write gates — ``_reject_parent_outside_scope`` on the create routes'
+        caller-supplied parent ids, and ``_reject_target_outside_scope`` /
+        ``_guarded_mutation`` on every route that names an EXISTING record —
+        so the identity those gates check is exactly the identity the audit
+        trail records.
         """
         api = STATE.api
         b = body
@@ -2934,13 +3169,40 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(api.create_organization(
                 b.get("name"), b.get("short_name", ""), actor_id))
         if entity == "venue":
+            # #369 review: the caller-supplied parent must be one this caller
+            # can already see, or the create is refused exactly as if the id
+            # did not exist (see _reject_parent_outside_scope). Same gate on
+            # both API versions — v1 is not a bypass.
+            if self._reject_parent_outside_scope(
+                    "organization", b.get("organization_id"),
+                    role, scope, actor_id):
+                return
+            # ...and `league_id` is a SECOND parent on this same route (the
+            # legacy v1-only Venue→Program link; that field stores a PROGRAM
+            # id despite its name). Gating only organization_id left the
+            # identical attachment reachable one field over: create_venue
+            # resolves the Program's operator and OVERWRITES organization_id
+            # with it (setup_service.create_venue), so a caller refused at
+            # `organization_id: org_N` one line above could pass
+            # `league_id: <the Program org_N operates>` and land a Venue
+            # carrying org_N anyway — with 200-vs-404 as an existence oracle
+            # over Program ids on top. Same gate, same generic refusal.
+            if self._reject_parent_outside_scope(
+                    "program", b.get("league_id"), role, scope, actor_id):
+                return
             return self._send_api(api.create_venue(
                 b.get("name"), b.get("address", ""), b.get("timezone", "UTC"),
                 b.get("organization_id") or None, b.get("league_id") or None, actor_id))
         if entity == "rink":
+            if self._reject_parent_outside_scope(
+                    "venue", b.get("venue_id"), role, scope, actor_id):
+                return
             return self._send_api(api.create_rink(
                 b.get("venue_id"), b.get("name"), actor_id))
         if entity == "ice-slot":
+            if self._reject_parent_outside_scope(
+                    "rink", b.get("rink_id"), role, scope, actor_id):
+                return
             return self._send_api(api.create_ice_slot(
                 b.get("rink_id"), b.get("start_time"), b.get("end_time"),
                 b.get("slot_type", "game"), actor_id))
@@ -2954,6 +3216,9 @@ class Handler(BaseHTTPRequestHandler):
                 allow_division_override=bool(b.get("allow_division_override")),
                 actor_id=actor_id)))
         if entity == "official":
+            if self._reject_parent_outside_scope(
+                    "club", b.get("home_club_id"), role, scope, actor_id):
+                return
             return self._send_api(api.create_official(
                 b.get("name"), b.get("home_club_id"), actor_id))
         if entity == "player":
@@ -3052,6 +3317,20 @@ class Handler(BaseHTTPRequestHandler):
         targets = [(entity, record_id)]
         if dest is not None:
             targets.append((dest[0], b.get(dest[1]) or None))
+        # ...and for the relations a CREATE can also reach by id, the
+        # destination must additionally satisfy the WRITE-side parent rule
+        # (#369 review) — the same gate, and the same refusal, as the creates,
+        # on BOTH API versions: v2 is not a bypass for v1's gate and v1 is not
+        # a bypass for v2's. Listing the destination a second time under
+        # ``writable_parent`` asks the narrower "may this caller attach a new
+        # child here" question alongside the generic ceiling; both must pass.
+        # It rides as a `_guarded_mutation` TARGET, not a bare preflight, so
+        # the parent decision is taken under the destination row's lock inside
+        # the same transaction as the move (#369 re-review's atomicity rule).
+        parent = _REASSIGN_PARENTS.get(combo)
+        if parent is not None:
+            targets.append((parent[0], b.get(parent[1]) or None,
+                            "writable_parent"))
         # Preflighted here rather than only inside `_guarded_mutation` so an
         # unauthorized target is still refused AHEAD of both the ("team",
         # "league") body check and the unknown-combo 404 below, exactly as
@@ -3059,7 +3338,8 @@ class Handler(BaseHTTPRequestHandler):
         # record it may not see.
         for target in targets:
             if self._reject_target_outside_scope(
-                    target[0], target[1], actor_id, role, scope):
+                    target[0], target[1], actor_id, role, scope,
+                    target[2] if len(target) > 2 else "scope"):
                 return
         if combo == ("team", "league"):
             # #283 Slice B: move a Team to a different PERMANENT League
@@ -3120,8 +3400,11 @@ class Handler(BaseHTTPRequestHandler):
         (League on division / registration / game); a missing one is a
         validation_error rather than a silent v1-style derivation. ``actor_id`` is
         always the server-resolved session user (#136); ``role``/``scope`` come
-        from that same ``_resolve_role()`` call and feed the #369 target gate,
-        so the identity checked is the identity audited.
+        from that same ``_resolve_role()`` call and feed BOTH #369 write gates
+        — ``_reject_parent_outside_scope`` on this surface's caller-supplied
+        parent ids and the target gate (``_reject_target_outside_scope`` /
+        ``_guarded_mutation``) on every route naming an EXISTING record — so
+        the identity checked is the identity audited.
         """
         api = STATE.api
         b = body
@@ -3455,13 +3738,26 @@ class Handler(BaseHTTPRequestHandler):
             # v2 omits league_id — venue↔program is a legacy v1-only relation
             # (Slice E decouples it); the v2 route never accepts it in the request
             # and strips it from the response (canonical Venue is org-owned only).
+            # #369 review: the caller-supplied parent must be one this caller can
+            # already see, or the create is refused exactly as if the id did not
+            # exist (see _reject_parent_outside_scope).
+            if self._reject_parent_outside_scope(
+                    "organization", b.get("organization_id"),
+                    role, scope, actor_id):
+                return
             return self._send_api(_v2p.venue_to_v2(api.create_venue(
                 b.get("name"), b.get("address", ""), b.get("timezone", "UTC"),
                 b.get("organization_id") or None, None, actor_id)))
         if entity == "rink":
+            if self._reject_parent_outside_scope(
+                    "venue", b.get("venue_id"), role, scope, actor_id):
+                return
             return self._send_api(api.create_rink(
                 b.get("venue_id"), b.get("name"), actor_id))
         if entity == "ice-slot":
+            if self._reject_parent_outside_scope(
+                    "rink", b.get("rink_id"), role, scope, actor_id):
+                return
             return self._send_api(api.create_ice_slot(
                 b.get("rink_id"), b.get("start_time"), b.get("end_time"),
                 b.get("slot_type", "game"), actor_id))
@@ -3481,6 +3777,9 @@ class Handler(BaseHTTPRequestHandler):
                 actor_id=actor_id, league_id=b.get("league_id") or None,
                 game_type=game_type))
         if entity == "official":
+            if self._reject_parent_outside_scope(
+                    "club", b.get("home_club_id"), role, scope, actor_id):
+                return
             return self._send_api(api.create_official(
                 b.get("name"), b.get("home_club_id"), actor_id))
         if entity == "player":
@@ -3504,6 +3803,28 @@ class Handler(BaseHTTPRequestHandler):
                                           "message": "Unknown setup entity."}}, 404)
 
 
+class Server(ThreadingHTTPServer):
+    """``ThreadingHTTPServer`` that quietly drops an ordinary client
+    disconnect mid-response instead of dumping a full traceback to stderr.
+
+    A page navigating away (a reload, or this app's own render() firing a
+    fresh /api/demo/overview fetch that a subsequent action makes moot) closes
+    the connection while a handler may still be mid-``wfile.write`` -- entirely
+    normal, not a bug, but the default socketserver.BaseServer.handle_error
+    prints the full traceback for every one of these (#369 review: exactly the
+    "concurrent BrokenPipeError while /api/demo/overview was writing the
+    abandoned response" the browser-smoke CI log showed). The socket is
+    already gone; there is nothing left to send. Anything else still gets the
+    default traceback so a genuine bug is never silently swallowed.
+    """
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+            return
+        super().handle_error(request, client_address)
+
+
 def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
     # Configure the delivery worker loop from env and start it if enabled (#79).
     # ApiService keeps a disabled loop by default (safe for tests); only the
@@ -3514,7 +3835,7 @@ def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
         print(f"Delivery worker loop started "
               f"(every {STATE.api.delivery_loop.interval_seconds}s, "
               f"batch {STATE.api.delivery_loop.batch_size}).")
-    httpd = ThreadingHTTPServer((host, port), Handler)
+    httpd = Server((host, port), Handler)
     print(f"Hockey Scheduler demo running at http://{host}:{port}")
     print("Open that URL in your browser. Press Ctrl+C to stop.")
     try:

@@ -90,6 +90,41 @@ function stopServer(server) {
   });
 }
 
+// Each check function wraps its failures with the demo server's own output.
+// Building a bare `new Error(...)` for that threw away the ORIGINAL stack and
+// left every failure pointing at the wrapper's own `throw` line instead of
+// the assertion that actually failed -- for a bare Playwright timeout
+// ("Timeout 10000ms exceeded.") that erased the only clue there was. Keep the
+// original stack attached.
+function withServerOutput(error, serverOutput) {
+  const message = `${error && error.message ? error.message : error}`
+    + `\n--- demo server output ---\n${serverOutput}`;
+  const wrapped = new Error(message);
+  wrapped.stack = `${message}\n--- original stack ---\n`
+    + `${error && error.stack ? error.stack : "(no stack)"}`;
+  return wrapped;
+}
+
+// Labelled wait: `page.waitForFunction` alone reports only "Timeout 10000ms
+// exceeded.", which names neither the condition nor the step. Mirrors the
+// helper in context-switcher.js.
+async function waitFor(page, label, fn, arg, timeoutMs) {
+  try {
+    await page.waitForFunction(fn, arg, { timeout: timeoutMs || 10000 });
+  } catch (error) {
+    throw new Error(`timed out waiting for: ${label}\n${error.message}`);
+  }
+}
+
+// Same, for selector waits.
+async function waitForSel(page, label, selector, options) {
+  try {
+    await page.waitForSelector(selector, Object.assign({ timeout: 10000 }, options || {}));
+  } catch (error) {
+    throw new Error(`timed out waiting for: ${label} (selector ${selector})\n${error.message}`);
+  }
+}
+
 // Read the rendered Home/Tasks card into a plain object for assertions.
 function cardState(page) {
   return page.evaluate((headings) => {
@@ -165,27 +200,27 @@ async function assertCardHasNoA11yViolations(page, viewportLabel, stateLabel) {
 }
 
 async function reachDashboard(page) {
-  await page.waitForFunction(
+  await waitFor(page, "boot to settle on the onboarding wizard or the Dashboard",
     () => document.body.dataset.view === "onboarding"
-      || document.body.dataset.view === "dashboard", null, { timeout: 10000 });
+      || document.body.dataset.view === "dashboard", null, 10000);
   if (await page.evaluate(() => document.body.dataset.view) === "onboarding") {
     await page.click('[data-onboarding-goto="dashboard"]');
   }
-  await page.waitForFunction(
-    () => document.body.dataset.view === "dashboard", null, { timeout: 10000 });
+  await waitFor(page, "the Dashboard view (body.dataset.view === 'dashboard')",
+    () => document.body.dataset.view === "dashboard", null, 10000);
 }
 
 // Wait past the Dashboard's loading skeleton for the real card (any h3) or,
 // once setup is fully done, for the plain Dashboard content with no card.
 async function waitForCardSettled(page) {
-  await page.waitForFunction(() => {
+  await waitFor(page, "the setup-progress card's own loading skeleton to clear", () => {
     // #331 review round 2 finding 3: the card now loads independently of
     // the rest of the Dashboard, so ".dash-stats" existing no longer means
     // the card's own fetch has resolved too -- check its slot specifically.
     const slot = document.getElementById("sp-card-slot");
     if (slot) return !slot.querySelector(".skeleton");
     return !!document.querySelector(".dash-stats");  // no slot at all (no permission) -- Dashboard itself settled
-  }, null, { timeout: 10000 });
+  }, null, 10000);
 }
 
 // Waits specifically for the complete-state heading, rather than relying on
@@ -194,11 +229,12 @@ async function waitForCardSettled(page) {
 // PRIOR state (e.g. the error state) had no skeleton of its own either --
 // this waits for the actual expected outcome instead of a proxy for it.
 async function waitForCompleteHeading(page) {
-  await page.waitForFunction((headings) => {
-    const h3 = Array.from(document.querySelectorAll(".dash-card h3")).find(
-      (el) => headings.some((h) => el.textContent.trim().startsWith(h)));
-    return !!(h3 && h3.textContent.includes("All setup steps complete"));
-  }, KNOWN_CARD_HEADINGS, { timeout: 10000 });
+  await waitFor(page, `the card's complete-state heading ("All setup steps complete")`,
+    (headings) => {
+      const h3 = Array.from(document.querySelectorAll(".dash-card h3")).find(
+        (el) => headings.some((h) => el.textContent.trim().startsWith(h)));
+      return !!(h3 && h3.textContent.includes("All setup steps complete"));
+    }, KNOWN_CARD_HEADINGS, 10000);
 }
 
 // Destination focus management (#331 review round 1 finding 4): a non-drawer
@@ -212,12 +248,13 @@ async function waitForCompleteHeading(page) {
 // content is later replaced, and focus resets to <body> for good, so a
 // bounded poll surfaces that failure clearly instead of racily passing.
 async function assertFocusLandedInContent(page) {
-  await page.waitForFunction(() => {
-    const active = document.activeElement;
-    const content = document.getElementById("content");
-    return !!(active && active.getAttribute("tabindex") === "-1"
-      && content && content.contains(active));
-  }, null, { timeout: 10000 });
+  await waitFor(page, `keyboard focus to land on a tabindex="-1" heading inside #content`,
+    () => {
+      const active = document.activeElement;
+      const content = document.getElementById("content");
+      return !!(active && active.getAttribute("tabindex") === "-1"
+        && content && content.contains(active));
+    }, null, 10000);
 }
 
 // Context-switch race coverage deliberately leaves an OLD request in flight
@@ -259,7 +296,11 @@ async function selectContextAndWaitForStableView(page, base, {
       + `requested Program/Season: POST=${JSON.stringify(persisted)}, `
       + `options=${JSON.stringify(selected)}`);
   }
-  await page.waitForFunction(
+  await waitFor(page,
+    `the ${viewName} view to hold steady across two paints after switching to `
+      + `${contextValue} (bound select ${selector} === ${seasonId}`
+      + `${requiredSelectors.length ? `, required ${requiredSelectors.join("/")}` : ""}`
+      + `${absentSelectors.length ? `, absent ${absentSelectors.join("/")}` : ""})`,
     ({ viewName, selector, seasonId, contextValue,
       requiredSelectors, absentSelectors }) =>
       new Promise((resolve) => {
@@ -287,8 +328,7 @@ async function selectContextAndWaitForStableView(page, base, {
       }),
     { viewName, selector, seasonId, contextValue,
       requiredSelectors, absentSelectors },
-    { timeout: 10000 }
-  );
+    10000);
 }
 
 async function apiPost(page, p, body) {
@@ -937,7 +977,7 @@ async function checkViewport(browser, viewport) {
       + `with a keyboard-operable Schedule link, and recovers via Retry from `
       + `a failed fetch.`);
   } catch (error) {
-    throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
+    throw withServerOutput(error, serverOutput);
   } finally {
     await context.close();
     await stopServer(server);
@@ -1309,12 +1349,29 @@ async function checkRoleScenarios(browser, viewport) {
 
     // ---- (D) Two Programs, A created first / B active (#331 review round
     // 5 finding 4): every hub-driven create-drawer/Ice-Builder destination
-    // must seed its parent field from the ACTIVE Program/Season -- these
-    // fields' own option lists span every Program, unfiltered, so left
-    // unseeded they fall back to whichever entity happens to sort first
-    // GLOBALLY, which is Program A's here by construction (created, hence
-    // id-ordered, first). A silent wrong default would let a real submit
-    // create data under A while the operator is acting from B.
+    // must seed its parent field from the ACTIVE Program/Season.
+    //
+    // The failure guarded here is a cross-PROGRAM one: an unseeded field
+    // falls back to whichever entity sorts first GLOBALLY -- Program A's
+    // here by construction (created, hence id-ordered, first) -- letting a
+    // real submit create data under A while the operator acts from B.
+    //
+    // #369 changed how much of that is still reachable, and the two halves
+    // are worth keeping straight:
+    //   * Fields fed by get_setup_overview_v2 (the Program select, and the
+    //     Season/League selects derived from it) can no longer offer
+    //     another Program at all -- `programs` is now the ACTIVE Program
+    //     alone. Those assertions are consequently upheld by the ceiling
+    //     rather than by the seeding, and would survive the seeding being
+    //     removed. They are kept as ceiling regression cover.
+    //   * `#f-team-perm-league` is NOT one of those. It renders from
+    //     `allPermLeagues`, built in render() from `hv`
+    //     (/api/v2/setup/hierarchy -> get_setup_hierarchy_v2), which takes
+    //     no user/role/scope and is still installation-wide -- its options
+    //     are deliberately labelled "&lt;programName&gt; · &lt;leagueName&gt;" because
+    //     they span Programs. So the League-B-not-League-A assertion below
+    //     remains a REAL cross-Program seeding guard with genuine force,
+    //     and is the load-bearing assertion of this case.
     await logout(page);
     await loginAs(page, "admin", "demo");
     const d = await page.evaluate(async () => {
@@ -1626,8 +1683,9 @@ async function checkRoleScenarios(browser, viewport) {
     await new Promise((r) => setTimeout(r, 200));
     const switchValue = `${e.progE1}|`;
     await page.selectOption("#ctx-select", switchValue);
-    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
-      switchValue, { timeout: 10000 });
+    await waitFor(page,
+      `the context switcher to settle on ${switchValue} (#ctx-select.value)`,
+      (v) => document.getElementById("ctx-select").value === v, switchValue, 10000);
     releaseHierarchy();
     await page.unroute("**/api/v2/setup/hierarchy");
     await page.waitForFunction(
@@ -1684,8 +1742,9 @@ async function checkRoleScenarios(browser, viewport) {
     await freshLoad();
     const switchToE3 = `${e3.progE3}|`;
     await page.selectOption("#ctx-select", switchToE3);
-    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
-      switchToE3, { timeout: 10000 });
+    await waitFor(page,
+      `the context switcher to settle on ${switchToE3} (#ctx-select.value)`,
+      (v) => document.getElementById("ctx-select").value === v, switchToE3, 10000);
     await freshLoad();
     s = await cardState(page);
     if (!s || s.nextTitle !== "Permanent teams") {
@@ -1912,16 +1971,37 @@ async function checkRoleScenarios(browser, viewport) {
     // -- Switch to a Program-ONLY context (no Season selected at all) --
     // the explicit "fail closed when no valid in-context Season resolves"
     // requirement, distinct from rebinding Season-to-Season above: the
-    // field must show no real selection (never a silent global-first
-    // fallback disguised as one), and Commit must stay disabled.
+    // operator must be offered no real Season selection (never a silent
+    // global-first fallback disguised as one), and Commit must stay
+    // disabled.
+    //
+    // #345/#369: the REQUIREMENT is unchanged, but what "fails closed"
+    // looks like on screen is now stronger. renderImport() builds its
+    // Season field from `ov.seasons`, i.e. get_demo_overview, whose
+    // resolved Season is a HARD ceiling as of #369 -- and a Program-only
+    // active context resolves NO Season, so `in_scope_season_ids` is empty
+    // and `ov.seasons` comes back empty rather than "every Season in the
+    // Program". renderImport() therefore drops the <select
+    // id="import-season"> entirely in favour of its "Create a season
+    // first." note. This supersedes the older expectation asserted here (a
+    // select still present, its value "" because no <option> carried
+    // `selected`): a global-first Season is no longer merely left
+    // unselected, it is not offerable at all. Assert the field genuinely
+    // rebound to that state -- rather than just waiting on #ctx-select's
+    // value, which settles earlier in the same render() cycle than
+    // renderImport()'s own repaint (the same gap the F1->F2 switch above
+    // documents).
     const switchToF2ProgramOnly = `${f.progF2}|`;
     await page.selectOption("#ctx-select", switchToF2ProgramOnly);
+    await waitFor(page,
+      `the context switcher to settle on ${switchToF2ProgramOnly} (#ctx-select.value)`,
+      (v) => document.getElementById("ctx-select").value === v, switchToF2ProgramOnly, 10000);
     await page.waitForFunction(
-      (v) => document.getElementById("ctx-select").value === v,
-      switchToF2ProgramOnly, { timeout: 10000 });
-    await page.waitForFunction(
-      () => (document.getElementById("import-season") || {}).value === "",
-      null, { timeout: 10000 });
+      () => {
+        const form = document.querySelector(".import-form");
+        return !!form && !document.getElementById("import-season")
+          && /Create a season first/.test(form.textContent);
+      }, null, { timeout: 10000 });
     const noSeasonCommitEnabled = await page.evaluate(() => {
       const btn = document.querySelector("[data-import-commit]");
       return btn ? !btn.disabled : null;
@@ -2012,7 +2092,7 @@ async function checkRoleScenarios(browser, viewport) {
         + `ACTIVE Season G1 (${g.seasonG1}), got ${ibSeasonSelected}`);
     }
     // -- Select G1's own rink and preview under A.
-    await page.click(`.ib-rink[value="${g.rinkG1}"]`);
+    await page.check(`.ib-rink[value="${g.rinkG1}"]`);
     const previewResp = page.waitForResponse((r) =>
       r.url() === `${base}/api/setup/ice-availability/preview` && r.request().method() === "POST");
     await page.click("[data-ib-preview]");
@@ -2043,7 +2123,7 @@ async function checkRoleScenarios(browser, viewport) {
         + "carried over, after switching to Program G2");
     }
     // -- A fresh preview+create now targets G2 only, all the way through.
-    await page.click(`.ib-rink[value="${g.rinkG2}"]`);
+    await page.check(`.ib-rink[value="${g.rinkG2}"]`);
     const previewResp2 = page.waitForResponse((r) =>
       r.url() === `${base}/api/setup/ice-availability/preview` && r.request().method() === "POST");
     await page.click("[data-ib-preview]");
@@ -2119,8 +2199,9 @@ async function checkRoleScenarios(browser, viewport) {
     releaseContextH1();
     await page.unroute("**/api/v2/setup/hierarchy");
     await page.unroute("**/api/context");
-    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
-      switchToH2, { timeout: 10000 });
+    await waitFor(page,
+      `the context switcher to settle on ${switchToH2} (#ctx-select.value)`,
+      (v) => document.getElementById("ctx-select").value === v, switchToH2, 10000);
     // #ctx-select's own value is an EARLY signal within a render() cycle
     // (renderContextSwitcher() runs partway through it, same gap steps
     // F/G/K's own comments document elsewhere in this file) -- but here BOTH
@@ -2154,8 +2235,9 @@ async function checkRoleScenarios(browser, viewport) {
     releaseHierarchyH2b();
     await page.unroute("**/api/v2/setup/hierarchy");
     await page.unroute("**/api/context");
-    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
-      switchToH2, { timeout: 10000 });
+    await waitFor(page,
+      `the context switcher to settle on ${switchToH2} (#ctx-select.value)`,
+      (v) => document.getElementById("ctx-select").value === v, switchToH2, 10000);
     // Same reasoning as sub-case 1 above: wait for the network (both
     // renders' own fetch chains) to actually go quiet, not a fixed delay,
     // before asserting against #content.
@@ -2188,8 +2270,9 @@ async function checkRoleScenarios(browser, viewport) {
     await page.focus("#f-team-perm-league");
     await page.focus("#ctx-select");
     await page.selectOption("#ctx-select", switchToH2);
-    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
-      switchToH2, { timeout: 10000 });
+    await waitFor(page,
+      `the context switcher to settle on ${switchToH2} (#ctx-select.value)`,
+      (v) => document.getElementById("ctx-select").value === v, switchToH2, 10000);
     if (await page.$(".drawer") || await page.$(".drawer-scrim")) {
       fail("(I) expected the open drawer to be DISMISSED immediately after "
         + "a keyboard-driven context switch, not still present");
@@ -2616,17 +2699,50 @@ async function checkRoleScenarios(browser, viewport) {
         + "content trivially matches the first load");
     }
 
-    // ---- (J, season-switch reorder) #import-season's own onchange only
-    // ever assigned importState.seasonId -- it never bumped
-    // importOperationSeq or otherwise participated in Commit's response
-    // ownership check (#331 review round 11 finding 1b). Switching to a
-    // DIFFERENT Season in the SAME context doesn't touch contextRevision (no
-    // context change) and, by design, must NOT touch report/validatedKey
-    // either (Validate's own dry-run is deliberately season-agnostic -- its
-    // result stays valid regardless of which Season is selected). Without
-    // its own operation bump, a Commit response captured for the
-    // PREVIOUSLY selected Season would still pass every remaining check and
-    // land as if it were the NEWLY selected Season's own result.
+    // ---- (J, season-switch reorder) A Commit response captured for the
+    // PREVIOUSLY targeted Season must never land as if it were the NEWLY
+    // targeted Season's own result -- and, more seriously, must never null
+    // out a genuinely fresh validation the operator has ALREADY completed
+    // against that new Season by the time the stale response arrives
+    // (#331 review round 11 finding 1b).
+    //
+    // #345/#369: the REQUIREMENT is unchanged; the way an operator
+    // RETARGETS Import's Season is what changed, so this case now drives it
+    // the only way that remains real. renderImport() builds #import-season
+    // from `ov.seasons`, i.e. get_demo_overview, whose resolved Season is
+    // now a HARD ceiling -- so that <select> offers exactly the ONE active
+    // Season (or none at all, in a Program-only context; see step F above).
+    // Picking "a different Season without changing the context" is
+    // therefore no longer an action the UI can express: retargeting Import
+    // means moving the active Season, which is the header context
+    // switcher's job. This case accordingly switches Season JSS-A ->
+    // JSS-B through #ctx-select, within the SAME Program, rather than
+    // through the now-single-option #import-season -- a Season-only move,
+    // distinct from (J2)/(J3)'s own Program+Season switches.
+    //
+    // The switch does bump contextRevision, which by design clears
+    // report/validatedKey, so this case re-validates under Season B before
+    // releasing A's held response. That keeps the ASSERTION honest --
+    // "Season B's own Commit availability must remain exactly as it was
+    // before A's response landed" is a real check here, not the weaker
+    // "Commit happens to be disabled anyway" the context switch alone would
+    // make trivially true.
+    //
+    // Be precise about what this case no longer proves, though. Commit
+    // ownership is `... || contextRevision !== requestRevision ||
+    // requestOp !== importOperationSeq`. Retargeting via #import-season
+    // bumped ONLY importOperationSeq, which made the seq leg the SOLE
+    // discriminator -- precisely the isolation #331 review round 11 finding
+    // 1b added this case for. Routing the retarget through #ctx-select
+    // bumps contextRevision too, so that leg alone now discards the stale
+    // response and this case would still pass with the seq leg deleted.
+    // The seq leg's isolated coverage is NOT lost -- it lives in the
+    // same-context reorder cases below, untouched: (J, commit reorder),
+    // (J, type-switch reorder) and (J, sample-reload reorder) all hold
+    // context constant so only the seq can discriminate. What IS gone is
+    // this case's uniqueness, and with it the last live exercise of
+    // importSeason.onchange's own importOperationSeq bump, which the
+    // single-option ceiling now makes unreachable from the UI.
     const jSeasonSwitch = await page.evaluate(async () => {
       const post = async (p, b) => (await fetch(p, {
         method: "POST", credentials: "same-origin",
@@ -2676,8 +2792,29 @@ async function checkRoleScenarios(browser, viewport) {
     });
     await page.click("[data-import-commit]");  // captures & sends season_id = JSS-A
     await new Promise((r) => setTimeout(r, 200));  // let the request actually leave
-    await page.selectOption("#import-season", jSeasonSwitch.seasonJSSB);
-    await new Promise((r) => setTimeout(r, 100));
+    // Retarget Import onto Season B via the REAL header switcher (see this
+    // step's own comment above) -- a Season-only move inside the same
+    // Program. Wait for the Import view's OWN re-render to rebind the
+    // season field, not just #ctx-select's value (the same gap steps
+    // F/G/K's own comments document elsewhere in this file).
+    await page.selectOption("#ctx-select",
+      `${jSeasonSwitch.progJSS}|${jSeasonSwitch.seasonJSSB}`);
+    await page.waitForFunction(
+      (v) => (document.getElementById("import-season") || {}).value === v,
+      jSeasonSwitch.seasonJSSB, { timeout: 10000 });
+    // Season B's OWN fresh validation, completed by the operator before A's
+    // straggler lands -- this is the state A's stale "Committed" response
+    // must leave untouched (it would otherwise null out report/validatedKey
+    // and silently un-commit work the operator had already reviewed here).
+    await page.click("[data-import-sample]");
+    const jSeasonSwitchRevalidateResp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/import/dry-run` && r.request().method() === "POST");
+    await page.click("[data-import-validate]");
+    await jSeasonSwitchRevalidateResp;
+    await page.waitForFunction(() => {
+      const btn = document.querySelector("[data-import-commit]");
+      return !!(btn && !btn.disabled);
+    }, null, { timeout: 10000 });
     releaseSeasonSwitchCommit();
     await page.unroute("**/api/import/commit/**");
     await new Promise((r) => setTimeout(r, 300));  // let the stale A response's own (discarded) handler run
@@ -2703,10 +2840,10 @@ async function checkRoleScenarios(browser, viewport) {
       return btn ? !btn.disabled : null;
     });
     if (!jSeasonSwitchCommitStillEnabled) {
-      fail("(J, season-switch reorder) expected Season B's own Commit "
-        + "availability -- never legitimately touched by A's stale response, "
-        + "since Validate's dry-run is deliberately season-agnostic -- to "
-        + "remain exactly as it was before A's response landed");
+      fail("(J, season-switch reorder) expected Season B's OWN freshly "
+        + "validated report -- reviewed under B, never legitimately touched "
+        + "by A's stale response -- to still leave Commit enabled exactly "
+        + "as it was before A's response landed");
     }
 
     // ---- (K) Ice Builder Create must be uncommittable the INSTANT a
@@ -2803,7 +2940,7 @@ async function checkRoleScenarios(browser, viewport) {
     await page.waitForFunction(
       (v) => (document.getElementById("ib-season") || {}).value === v,
       k.seasonK1, { timeout: 10000 });
-    await page.click(`.ib-rink[value="${k.rinkK1}"]`);
+    await page.check(`.ib-rink[value="${k.rinkK1}"]`);
     const kPreviewResp = page.waitForResponse((r) =>
       r.url() === `${base}/api/setup/ice-availability/preview` && r.request().method() === "POST");
     await page.click("[data-ib-preview]");
@@ -2875,7 +3012,7 @@ async function checkRoleScenarios(browser, viewport) {
     await page.waitForFunction(
       (v) => (document.getElementById("ib-season") || {}).value === v,
       k.seasonK3, { timeout: 10000 });
-    await page.click(`.ib-rink[value="${k.rinkK3}"]`);
+    await page.check(`.ib-rink[value="${k.rinkK3}"]`);
     let releasePreviewK3;
     const previewHoldK3 = new Promise((resolve) => { releasePreviewK3 = resolve; });
     await page.route("**/api/setup/ice-availability/preview", async (route) => {
@@ -2921,7 +3058,7 @@ async function checkRoleScenarios(browser, viewport) {
     await page.waitForFunction(
       (v) => (document.getElementById("ib-season") || {}).value === v,
       k.seasonK4, { timeout: 10000 });
-    await page.click(`.ib-rink[value="${k.rinkK4}"]`);
+    await page.check(`.ib-rink[value="${k.rinkK4}"]`);
     const k4PreviewResp = page.waitForResponse((r) =>
       r.url() === `${base}/api/setup/ice-availability/preview` && r.request().method() === "POST");
     await page.click("[data-ib-preview]");
@@ -2980,7 +3117,7 @@ async function checkRoleScenarios(browser, viewport) {
     await page.waitForFunction(
       (v) => (document.getElementById("ib-season") || {}).value === v,
       k.seasonK5, { timeout: 10000 });
-    await page.click(`.ib-rink[value="${k.rinkK5}"]`);
+    await page.check(`.ib-rink[value="${k.rinkK5}"]`);
     let releasePreviewA;
     const previewHoldA = new Promise((resolve) => { releasePreviewA = resolve; });
     await page.route("**/api/setup/ice-availability/preview", async (route) => {
@@ -3016,7 +3153,7 @@ async function checkRoleScenarios(browser, viewport) {
     await page.waitForFunction(
       (v) => (document.getElementById("ib-season") || {}).value === v,
       k.seasonK5, { timeout: 10000 });
-    await page.click(`.ib-rink[value="${k.rinkK5}"]`);
+    await page.check(`.ib-rink[value="${k.rinkK5}"]`);
     const kCrPreviewResp = page.waitForResponse((r) =>
       r.url() === `${base}/api/setup/ice-availability/preview` && r.request().method() === "POST");
     await page.click("[data-ib-preview]");
@@ -3066,7 +3203,7 @@ async function checkRoleScenarios(browser, viewport) {
     await page.waitForFunction(
       (v) => (document.getElementById("ib-season") || {}).value === v,
       k.seasonK5, { timeout: 10000 });
-    await page.click(`.ib-rink[value="${k.rinkK5}"]`);
+    await page.check(`.ib-rink[value="${k.rinkK5}"]`);
     const kReorderBaselineResp = page.waitForResponse((r) =>
       r.url() === `${base}/api/setup/ice-availability/preview` && r.request().method() === "POST");
     await page.click("[data-ib-preview]");
@@ -3151,7 +3288,7 @@ async function checkRoleScenarios(browser, viewport) {
     await page.waitForFunction(
       (v) => (document.getElementById("ib-season") || {}).value === v,
       k.seasonK5, { timeout: 10000 });
-    await page.click(`.ib-rink[value="${kRp.rinkKRp}"]`);
+    await page.check(`.ib-rink[value="${kRp.rinkKRp}"]`);
     const kRpPreviewResp = page.waitForResponse((r) =>
       r.url() === `${base}/api/setup/ice-availability/preview` && r.request().method() === "POST");
     await page.click("[data-ib-preview]");
@@ -3213,7 +3350,7 @@ async function checkRoleScenarios(browser, viewport) {
     await page.waitForFunction(
       (v) => (document.getElementById("ib-season") || {}).value === v,
       k.seasonK5, { timeout: 10000 });
-    await page.click(`.ib-rink[value="${k.rinkK5}"]`);
+    await page.check(`.ib-rink[value="${k.rinkK5}"]`);
     let releaseEditPreview;
     const holdEditPreview = new Promise((resolve) => { releaseEditPreview = resolve; });
     await page.route("**/api/setup/ice-availability/preview", async (route) => {
@@ -3254,7 +3391,7 @@ async function checkRoleScenarios(browser, viewport) {
     await page.waitForFunction(
       (v) => (document.getElementById("ib-season") || {}).value === v,
       k.seasonK5, { timeout: 10000 });
-    await page.click(`.ib-rink[value="${k.rinkK5}"]`);
+    await page.check(`.ib-rink[value="${k.rinkK5}"]`);
     let releaseExclPreview;
     const holdExclPreview = new Promise((resolve) => { releaseExclPreview = resolve; });
     await page.route("**/api/setup/ice-availability/preview", async (route) => {
@@ -3294,7 +3431,7 @@ async function checkRoleScenarios(browser, viewport) {
     await page.waitForFunction(
       (v) => (document.getElementById("ib-season") || {}).value === v,
       k.seasonK5, { timeout: 10000 });
-    await page.click(`.ib-rink[value="${k.rinkK5}"]`);
+    await page.check(`.ib-rink[value="${k.rinkK5}"]`);
     let releaseInputPreview;
     const holdInputPreview = new Promise((resolve) => { releaseInputPreview = resolve; });
     await page.route("**/api/setup/ice-availability/preview", async (route) => {
@@ -3434,8 +3571,9 @@ async function checkRoleScenarios(browser, viewport) {
     releaseL3();
     await page.unroute("**/api/context");
     page.off("request", trackL);
-    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
-      switchToL3, { timeout: 10000 });
+    await waitFor(page,
+      `the context switcher to settle on ${switchToL3} (#ctx-select.value)`,
+      (v) => document.getElementById("ctx-select").value === v, switchToL3, 10000);
     await page.waitForLoadState("networkidle").catch(() => {});
     if (seenRequestsL.length !== 2 || seenRequestsL.includes(l.progL1)) {
       fail(`(L) expected L1 to NEVER reach the network across the whole `
@@ -3492,8 +3630,9 @@ async function checkRoleScenarios(browser, viewport) {
         (document.querySelector("#toast-root .toast-msg") || {}).textContent || ""),
       null, { timeout: 10000 });
     await page.unroute("**/api/context");
-    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
-      switchToL3, { timeout: 10000 });
+    await waitFor(page,
+      `the context switcher to settle on ${switchToL3} (#ctx-select.value)`,
+      (v) => document.getElementById("ctx-select").value === v, switchToL3, 10000);
     const lServerContextAfterFailure = await apiGet(page, "/api/context");
     if (!lServerContextAfterFailure || lServerContextAfterFailure.program_id !== l.progL3) {
       fail(`(L, failure convergence) expected the server's own context to `
@@ -3574,8 +3713,9 @@ async function checkRoleScenarios(browser, viewport) {
         (document.querySelector("#toast-root .toast-msg") || {}).textContent || ""),
       null, { timeout: 10000 });  // LH3's own dequeued request lands and is rejected
     await page.unroute("**/api/context");
-    await page.waitForFunction((v) => document.getElementById("ctx-select").value === v,
-      switchToLH2, { timeout: 10000 });
+    await waitFor(page,
+      `the context switcher to settle on ${switchToLH2} (#ctx-select.value)`,
+      (v) => document.getElementById("ctx-select").value === v, switchToLH2, 10000);
     const lhServerContext = await apiGet(page, "/api/context");
     if (!lhServerContext || lhServerContext.program_id !== lh.progLH2) {
       fail(`(L, hash sync) expected the server's own context to be LH2 `
@@ -3705,9 +3845,13 @@ async function checkRoleScenarios(browser, viewport) {
     // scenario is that the queued switch never gets a chance to be sent
     // under the identity that queued it, let alone the one it lands under.
     await page.selectOption("#role-switch", "arena");
-    await page.waitForFunction(
+    await waitFor(page,
+      "(L, identity supersession) the persona switch to arena to complete "
+        + "(sidebar #user-name === 'arena'); signIn() only renders it AFTER "
+        + "loadContextOptions() + restoreContextDeepLink() both resolve, so a "
+        + "stall here means boot is blocked on an /api/context round trip",
       () => (document.getElementById("user-name") || {}).textContent === "arena",
-      null, { timeout: 10000 });
+      null, 10000);
     releaseLI2();
     await page.unroute("**/api/context");
     page.off("request", trackLI);
@@ -3782,15 +3926,17 @@ async function checkRoleScenarios(browser, viewport) {
         .catch(() => null);
       await page.click('.tab[data-tab="import"]');
       await hierarchyCodesResp;
-      await page.waitForSelector("[data-import-sample]", { timeout: 10000 });
+      await waitForSel(page, "(M seed) the Import wizard's sample-data control",
+        "[data-import-sample]");
       // Wait for the Import view's OWN re-render to bind M1's Season, same
       // gap steps F/G/J/K/L's own comments document elsewhere in this file
       // -- needed here now (round 9) because Commit's own enabled state
       // below additionally requires importState.seasonId, not just a valid
       // report.
-      await page.waitForFunction(
+      await waitFor(page,
+        "(M seed) #import-season to rebind to M1's Season " + m.seasonM1,
         (v) => (document.getElementById("import-season") || {}).value === v,
-        m.seasonM1, { timeout: 10000 });
+        m.seasonM1, 10000);
       // Load the app's own known-valid sample (same proven flow as step
       // J's own Validate coverage above) rather than hand-typed text, so
       // Commit reliably becomes enabled below -- it still reads as
@@ -3802,35 +3948,43 @@ async function checkRoleScenarios(browser, viewport) {
         r.url() === `${base}/api/import/dry-run` && r.request().method() === "POST");
       await page.click("[data-import-validate]");
       await mValidateResp;
-      await page.waitForFunction(() => {
-        const btn = document.querySelector("[data-import-commit]");
-        return !!(btn && !btn.disabled);
-      }, null, { timeout: 10000 });
+      await waitFor(page,
+        "(M seed) Import's Commit to become enabled from a real validated report",
+        () => {
+          const btn = document.querySelector("[data-import-commit]");
+          return !!(btn && !btn.disabled);
+        }, null, 10000);
       await page.click('.tab[data-tab="calendar"]');
-      await page.waitForFunction(() => document.body.dataset.view === "calendar",
-        null, { timeout: 10000 });
-      await page.waitForSelector("[data-ice-builder-open]", { timeout: 10000 });
+      await waitFor(page, "(M seed) the calendar view",
+        () => document.body.dataset.view === "calendar", null, 10000);
+      await waitForSel(page, "(M seed) the Ice Builder entry point",
+        "[data-ice-builder-open]");
       await page.click("[data-ice-builder-open]");
-      await page.waitForFunction(
+      await waitFor(page,
+        "(M seed) #ib-season to bind M1's Season " + m.seasonM1,
         (v) => (document.getElementById("ib-season") || {}).value === v,
-        m.seasonM1, { timeout: 10000 });
-      await page.click(`.ib-rink[value="${m.rinkM1}"]`);
+        m.seasonM1, 10000);
+      await page.check(`.ib-rink[value="${m.rinkM1}"]`);
       const previewResp = page.waitForResponse((r) =>
         r.url() === `${base}/api/setup/ice-availability/preview` && r.request().method() === "POST");
       await page.click("[data-ib-preview]");
       await previewResp;
-      await page.waitForSelector("[data-ib-commit]", { timeout: 10000 });
+      await waitForSel(page, "(M seed) the Ice Builder's live Create control",
+        "[data-ib-commit]");
     };
     const assertMClearedFor = async (label) => {
-      await page.waitForFunction(() => !document.querySelector(".skeleton"),
-        null, { timeout: 10000 });
+      await waitFor(page,
+        `(M, ${label}) the post-identity-switch render to settle (no skeleton)`,
+        () => !document.querySelector(".skeleton"), null, 10000);
       if (await page.$("[data-ib-commit]") || await page.$(".ib-form")) {
         fail(`(M, ${label}) expected the Ice Builder to be fully closed for `
           + `the newly signed-in identity, not still showing the prior `
           + `identity's open form/preview`);
       }
       await page.click('.tab[data-tab="import"]');
-      await page.waitForSelector("[data-import-sample]", { timeout: 10000 });
+      await waitForSel(page,
+        `(M, ${label}) the Import wizard to render for the new identity`,
+        "[data-import-sample]");
       const textAfter = await page.evaluate(() => {
         const el = document.querySelector('textarea[id^="import-"]');
         return el ? el.value : null;
@@ -3863,8 +4017,9 @@ async function checkRoleScenarios(browser, viewport) {
     // since Legs 1/2's admin<->arena pair (both manage_arena) can never
     // exercise it.
     const assertMHiddenForLowerPrivilege = async (label) => {
-      await page.waitForFunction(() => !document.querySelector(".skeleton"),
-        null, { timeout: 10000 });
+      await waitFor(page,
+        `(M, ${label}) the post-identity-switch render to settle (no skeleton)`,
+        () => !document.querySelector(".skeleton"), null, 10000);
       if (await page.$("[data-ib-commit]") || await page.$(".ib-form")) {
         fail(`(M, ${label}) expected no leftover Ice Builder form/preview `
           + `to be reachable by a role without manage_arena`);
@@ -3893,9 +4048,10 @@ async function checkRoleScenarios(browser, viewport) {
     await freshLoad();
     await seedImportAndIceForM();
     await page.selectOption("#role-switch", "arena");
-    await page.waitForFunction(
+    await waitFor(page,
+      "(M, persona switch) the role-switch dropdown to land on arena (#user-name)",
       () => (document.getElementById("user-name") || {}).textContent === "arena",
-      null, { timeout: 10000 });
+      null, 10000);
     await assertMClearedFor("persona switch");
 
     // -- Leg 2: a real sign-out immediately followed by a DIFFERENT
@@ -3910,11 +4066,14 @@ async function checkRoleScenarios(browser, viewport) {
     await seedImportAndIceForM();
     await page.waitForLoadState("networkidle").catch(() => {});
     await page.click("#signout-btn");
-    await page.waitForSelector('[data-persona="arena"]', { state: "visible", timeout: 10000 });
+    await waitForSel(page,
+      "(M, sign-out/sign-in) the arena persona button on the login screen",
+      '[data-persona="arena"]', { state: "visible" });
     await page.click('[data-persona="arena"]');
-    await page.waitForFunction(
+    await waitFor(page,
+      "(M, sign-out/sign-in) the arena sign-in to complete (#user-name)",
       () => (document.getElementById("user-name") || {}).textContent === "arena",
-      null, { timeout: 10000 });
+      null, 10000);
     await assertMClearedFor("sign-out/sign-in");
     // Restore the admin session this file's remaining teardown expects.
     await logout(page);
@@ -3930,11 +4089,14 @@ async function checkRoleScenarios(browser, viewport) {
     await seedImportAndIceForM();
     await page.waitForLoadState("networkidle").catch(() => {});
     await page.click("#signout-btn");
-    await page.waitForSelector('[data-persona="coach"]', { state: "visible", timeout: 10000 });
+    await waitForSel(page,
+      "(M, lower privilege) the coach persona button on the login screen",
+      '[data-persona="coach"]', { state: "visible" });
     await page.click('[data-persona="coach"]');
-    await page.waitForFunction(
+    await waitFor(page,
+      "(M, lower privilege) the coach sign-in to complete (#user-name)",
       () => (document.getElementById("user-name") || {}).textContent === "coach",
-      null, { timeout: 10000 });
+      null, 10000);
     await assertMHiddenForLowerPrivilege("sign-out/sign-in to lower privilege");
     // Restore the admin session this file's remaining teardown expects.
     await logout(page);
@@ -3953,7 +4115,7 @@ async function checkRoleScenarios(browser, viewport) {
       + `and that seeding fails closed (no drawer, an actionable retry) on `
       + `a hierarchy-fetch error or a Program switch mid-flight.`);
   } catch (error) {
-    throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
+    throw withServerOutput(error, serverOutput);
   } finally {
     await context.close();
     await stopServer(server);
@@ -4082,7 +4244,7 @@ async function checkImportLeagueConflict(browser, viewport) {
       + `conflict is rejected with a structured error, never a false `
       + `Committed success state.`);
   } catch (error) {
-    throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
+    throw withServerOutput(error, serverOutput);
   } finally {
     await context.close();
     await stopServer(server);
@@ -4195,7 +4357,7 @@ async function checkImportAmbiguousDivisionRejection(browser, viewport) {
       + `two different leagues is rejected with a structured error for a `
       + `league-less team's row, never a false Committed success state.`);
   } catch (error) {
-    throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
+    throw withServerOutput(error, serverOutput);
   } finally {
     await context.close();
     await stopServer(server);
@@ -4218,7 +4380,10 @@ async function main() {
     console.log("Home/Tasks hub browser journey passed.");
   } catch (error) {
     console.error("Home/Tasks hub browser journey FAILED.");
-    console.error(error && error.message ? error.message : error);
+    // Print the stack, not just the message: a bare Playwright timeout
+    // ("Timeout 10000ms exceeded.") names neither the assertion nor the
+    // line, which makes a failure here undiagnosable from CI output alone.
+    console.error(error && error.stack ? error.stack : (error && error.message) || error);
     process.exitCode = 1;
   } finally {
     if (browser) await browser.close();

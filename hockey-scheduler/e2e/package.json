@@ -5,7 +5,11 @@
   "scripts": {
     "smoke": "node smoke.js",
     "context-switcher": "node context-switcher.js",
+    "context-identity-withdrawal": "node context-identity-withdrawal.js",
     "league-context-bar": "node league-context-bar.js",
+    "league-filtered-data": "node league-filtered-data.js",
+    "dashboard-season-ceiling": "node dashboard-season-ceiling.js",
+    "setup-v2-context-scope": "node setup-v2-context-scope.js",
     "setup-claim": "node setup-claim.js",
     "onboarding-wizard": "node onboarding-wizard.js",
     "accessibility-foundations": "node accessibility-foundations.js",

@@ -117,6 +117,7 @@ let allPermLeagues = [];            // [{id,name,programName}] across all progra
 let teamPermLeague = {};            // team_id -> {id,name} permanent League (#283 Slice E)
 let seasonRegs = {};                // season_id -> [{id,team_id,league_id,division_id,active}] registrations (#180/#233 v2)
 let seasonVenueAccess = {};         // season_id -> [{id,season_id,venue_id,active}] (#233 Slice E)
+let seasonVenueCandidates = {};     // season_id -> [{id,name}] grantable Venues (#369; MANAGE_SETUP-gated route)
 let leagueDivisions = {};           // league_id -> [{id,name,...}] — cascade data for the League→Division
                                      // selects in Season participation / Rollover (#233 Slice B2b), populated
                                      // each render from hv and read by the onchange handlers that rescope a
@@ -1230,6 +1231,61 @@ function renderCoachQuickLinks() {
 }
 
 /* ---------- Setup ---------- */
+// get_setup_overview_v2's Club/Organization/Official/Venue/Rink/IceSlot
+// lists are STRICTLY scoped to the active Program/Season/League (a record
+// with no validated chain into it is omitted, never shown globally) -- but
+// a freshly-created record of one of these kinds has NO chain to ANY
+// Program yet (a just-created Club has no Team; a just-created Venue has no
+// SeasonVenueAccess grant), so it would otherwise vanish from its own "just
+// created this" card and from every picker that exists to link it to
+// something.
+//
+// #367 owner ruling: an unlinked record is NOT thereby "nobody's data", so
+// the old installation-wide `unassigned_<key>` buckets are gone -- they let
+// any operator enumerate every never-linked record in the installation,
+// Officials' personal names included. What the backend returns instead is
+// `pending_link_<key>`: the unlinked records THIS caller created, per the
+// audit trail. Every list/options function below that reads one of these
+// six kinds unions the scoped list with its own pending-link counterpart
+// through this one helper, so the operator running a create-then-link flow
+// keeps seeing their fresh record right up until its first real link
+// narrows it -- and nobody else ever sees it at all.
+function withPendingLink(sv, key) {
+  return (sv[key] || []).concat((sv["pending_link_" + key]) || []);
+}
+
+// The ACTIVE Program's authorized Seasons, from the context bar's own
+// options payload (/api/context/options -- filtered through the same
+// context_scope rules as every other read, and already rendered in
+// #ctx-select on this page).
+//
+// #367 owner ruling: the Setup surface is ceilinged on the ACTIVE Season, so
+// `sv.seasons` holds exactly one Season (or none, in a Program-only
+// context). That is right for what the surface SHOWS, and wrong for the one
+// control that has to point AT a Season the operator is not currently in:
+// the League create drawer's Season picker. Reading it from here keeps the
+// create-then-link flow alive without widening any scoped read, and without
+// disclosing a Season the context bar would not already offer.
+function contextSeasonOptions() {
+  const sel = contextOptions && contextOptions.selected;
+  const programId = sel && sel.program_id;
+  if (!programId) return [];
+  const program = (contextOptions.programs || [])
+    .find((p) => p.id === programId);
+  return (program && program.seasons) || [];
+}
+// A Season's display name for a row that is NOT itself Season-narrowed (a
+// permanent League's subtitle): prefer the ceilinged payload, fall back to
+// the authorized context options, so the label never renders blank just
+// because that Season is not the active one.
+function contextSeasonName(sv, seasonId) {
+  if (!seasonId) return "";
+  const own = (sv.seasons || []).find((s) => s.id === seasonId);
+  if (own) return own.name;
+  const opt = contextSeasonOptions().find((s) => s.id === seasonId);
+  return opt ? opt.name : "";
+}
+
 // Data-driven Setup (#44): each entity declares its card list projection and
 // its create-form fields once, so the record cards and the create drawer stay
 // in sync. The API endpoints are unchanged — the drawer just POSTs to them.
@@ -1249,7 +1305,7 @@ const SETUP_ENTITIES = [
       // forcing an organization to exist before a Program can be created.
       { id: "f-league-org", label: "Operating organization (optional)", type: "select",
         ofNoun: "organization", ofNounDisplay: "operating organization",
-        options: (ov) => [["", "— none —"]].concat((ov.organizations || []).map((o) => [o.id, o.name])) },
+        options: (ov) => [["", "— none —"]].concat(withPendingLink(ov, "organizations").map((o) => [o.id, o.name])) },
       // The Program timezone anchors date-only Season boundaries (#272): an
       // IANA name, defaulting to UTC. A bad name is rejected server-side with
       // invalid_timezone and surfaced in the drawer.
@@ -1278,11 +1334,24 @@ const SETUP_ENTITIES = [
   // client confirmed this after B2b, correcting an earlier reversed example).
   { key: "level", title: "Leagues", icon: "🎚️", noun: "level", displayNoun: "league",
     perm: "manage_setup", delKind: "level",
+    // A League is permanent Program structure, so the card itself is never
+    // Season-narrowed -- but its Season SUBTITLE has to resolve names the
+    // ceilinged `sv.seasons` no longer carries, hence contextSeasonName.
     list: (ov) => (ov.leagues || []).map((lv) => ({
-      id: lv.id, title: lv.name, sub: nameById(ov.seasons, lv.season_id) })),
+      id: lv.id, title: lv.name, sub: contextSeasonName(ov, lv.season_id) })),
     fields: [
+      // #367 owner ruling: `sv.seasons` is now the ACTIVE Season alone, and a
+      // Program-only context makes it EMPTY -- so sourcing this picker from
+      // it would dead-end the ordinary "create the Season, then its League"
+      // flow with "Create a season first." while the Season the operator just
+      // made sat right there in the Records card. The context bar's own
+      // authorized Season list is the right source: it is authorization-
+      // filtered by the same context_scope rules, and it is ALREADY rendered
+      // on this very page in #ctx-select, so offering it here discloses
+      // nothing new. What it must not do is widen the READ -- the card lists
+      // above still show only the active Season's records.
       { id: "f-level-season", label: "Season", type: "select", required: true, ofNoun: "season",
-        options: (ov) => (ov.seasons || []).map((s) => [s.id, s.name]) },
+        options: () => contextSeasonOptions().map((s) => [s.id, s.name]) },
       { id: "f-level", label: "League name", required: true, placeholder: "e.g. Adult League" },
       { id: "f-level-sort", label: "Sort order (optional)", type: "number", placeholder: "e.g. 1" }] },
   // Division (#245): the optional split WITHIN a League (e.g. Gold, Silver,
@@ -1294,8 +1363,11 @@ const SETUP_ENTITIES = [
       sub: [d.league_name, d.is_junior ? "Junior" : ""].filter(Boolean).join(" · ") })),
     fields: [
       // A v2 division is parented by a League (season is derived) — required.
+      // The League options stay the active Program's own (permanent Program
+      // structure); only their Season LABEL needs the context fallback, for
+      // a League whose binding is not the active Season.
       { id: "f-div-league", label: "League", type: "select", required: true, ofNoun: "level",
-        options: (ov) => (ov.leagues || []).map((lv) => [lv.id, `${nameById(ov.seasons, lv.season_id)} · ${lv.name}`]) },
+        options: (ov) => (ov.leagues || []).map((lv) => [lv.id, `${contextSeasonName(ov, lv.season_id)} · ${lv.name}`]) },
       { id: "f-div", label: "Division name", required: true, placeholder: "e.g. Gold" },
       { id: "f-div-age", label: "Age group", placeholder: "e.g. U14 (optional)" },
       // Carries the active Season a #345 context-seeded open resolved the
@@ -1307,7 +1379,7 @@ const SETUP_ENTITIES = [
       { id: "f-div-season", type: "hidden" }] },
   { key: "club", title: "Clubs", icon: "🏒", noun: "club", perm: "manage_setup",
     delKind: "club",  // a club with no team can be deleted from here (#215)
-    list: (ov) => (ov.clubs || []).map((c) => ({ id: c.id, title: c.name })),
+    list: (ov) => withPendingLink(ov, "clubs").map((c) => ({ id: c.id, title: c.name })),
     fields: [{ id: "f-club", label: "Club name", required: true, placeholder: "e.g. Eagles HC" }] },
   { key: "team", title: "Teams", icon: "👥", noun: "team", perm: "manage_setup",
     delKind: "team",
@@ -1328,7 +1400,7 @@ const SETUP_ENTITIES = [
     }),
     fields: [
       { id: "f-team-club", label: "Club (optional)", type: "select", ofNoun: "club",
-        options: (ov) => [["", "— none —"]].concat((ov.clubs || []).map((c) => [c.id, c.name])) },
+        options: (ov) => [["", "— none —"]].concat(withPendingLink(ov, "clubs").map((c) => [c.id, c.name])) },
       // #283 Slice E: a Team is created under its PERMANENT League (required);
       // the backend derives its Program from that League, so no Program field is
       // needed. A league-less Team is only a legacy/migration remediation state,
@@ -1341,7 +1413,7 @@ const SETUP_ENTITIES = [
   // company, distinct from a hockey Club. Arena-side, like venue/rink.
   { key: "organization", title: "Facility owners", icon: "🏢", noun: "facility owner", perm: "manage_arena",
     delKind: "organization",
-    list: (ov) => (ov.organizations || []).map((o) => ({
+    list: (ov) => withPendingLink(ov, "organizations").map((o) => ({
       id: o.id, title: o.name, sub: o.short_name || "" })),
     fields: [
       { id: "f-org", label: "Facility owner name", required: true, placeholder: "e.g. Summit Ice Facilities" },
@@ -1351,7 +1423,7 @@ const SETUP_ENTITIES = [
     // A venue is owned by an organization (#233 canonical) — show its facility
     // owner. Which Seasons may use a venue's ice is a separate, independent
     // grant (SeasonVenueAccess, #233 Slice E) managed under each Season.
-    list: (ov) => (ov.venues || []).map((v) => ({
+    list: (ov) => withPendingLink(ov, "venues").map((v) => ({
       id: v.id, title: v.name,
       sub: [v.organization_name].filter(Boolean).join(" · ") || "Unassigned" })),
     // No Program field on this form (#233 B2a review r1): canonical Venue
@@ -1359,20 +1431,20 @@ const SETUP_ENTITIES = [
     fields: [
       { id: "f-venue", label: "Venue name", required: true, placeholder: "e.g. South Arena" },
       { id: "f-venue-org", label: "Facility owner (organization)", type: "select", ofNoun: "organization", ofNounDisplay: "facility owner",
-        options: (ov) => [["", "— none —"]].concat((ov.organizations || []).map((o) => [o.id, o.name])) }] },
+        options: (ov) => [["", "— none —"]].concat(withPendingLink(ov, "organizations").map((o) => [o.id, o.name])) }] },
   { key: "rink", title: "Rinks", icon: "⛸️", noun: "rink", perm: "manage_arena",
     delKind: "rink",
-    list: (ov) => (ov.rinks || []).map((r) => ({
+    list: (ov) => withPendingLink(ov, "rinks").map((r) => ({
       id: r.id, title: r.name, sub: r.venue_name || "" })),
     fields: [
       { id: "f-rink-venue", label: "Venue", type: "select", required: true, ofNoun: "venue",
-        options: (ov) => (ov.venues || []).map((v) => [v.id, v.name]) },
+        options: (ov) => withPendingLink(ov, "venues").map((v) => [v.id, v.name]) },
       { id: "f-rink", label: "Rink name", required: true, placeholder: "e.g. Rink 3" }] },
   { key: "ice-slot", title: "Ice slots", icon: "🧊", noun: "ice slot", perm: "manage_arena",
     list: null,  // ice inventory is managed visually on the Arena Calendar
     fields: [
       { id: "f-slot-rink", label: "Rink", type: "select", required: true, ofNoun: "rink",
-        options: (ov) => (ov.rinks || []).map((r) => [r.id, `${r.venue_name ? r.venue_name + " · " : ""}${r.name}`]) },
+        options: (ov) => withPendingLink(ov, "rinks").map((r) => [r.id, `${r.venue_name ? r.venue_name + " · " : ""}${r.name}`]) },
       { id: "f-slot-date", label: "Date", type: "date", required: true, value: "2026-09-05" },
       { id: "f-slot-start", label: "Start", type: "time", required: true, value: "21:00" },
       { id: "f-slot-end", label: "End", type: "time", required: true, value: "22:30" },
@@ -1381,12 +1453,18 @@ const SETUP_ENTITIES = [
                         ["maintenance", "Maintenance"], ["tournament", "Tournament"]] }] },
   { key: "official", title: "Officials", icon: "🧑‍⚖️", noun: "official", perm: "manage_schedule",
     delKind: "official",
-    list: (ov) => (ov.officials || []).map((o) => ({
+    // An Official reaches the active context through a home Club or an
+    // assignment, so a just-created one has neither yet: union in the
+    // caller's own pending-link officials, exactly like Clubs/Venues above
+    // (and matching the Officials count on the Setup hub, which already
+    // did). Without it, the operator could create an Official and then not
+    // see the row they just made — nor delete it.
+    list: (ov) => withPendingLink(ov, "officials").map((o) => ({
       id: o.id, title: o.name, sub: o.home_club_name || "" })),
     fields: [
       { id: "f-official", label: "Official name", required: true, placeholder: "e.g. Riley Whistle" },
       { id: "f-official-club", label: "Home club (optional — for conflict checks)", type: "select",
-        options: (ov) => [["", "— none —"]].concat((ov.clubs || []).map((c) => [c.id, c.name])) }] },
+        options: (ov) => [["", "— none —"]].concat(withPendingLink(ov, "clubs").map((c) => [c.id, c.name])) }] },
   // Players (#114): a manual-create path so a late-arriving player doesn't
   // force an operator through the CSV Import wizard for one row. Sourced
   // from its own /api/players call (playersList, fetched in render() only
@@ -1501,10 +1579,12 @@ const capWord = (s) => (s ? String(s).charAt(0).toUpperCase() + String(s).slice(
 const REASSIGN = {
   "venue:organization": {
     perm: "manage_arena", noun: "facility owner", nullable: true, risky: false,
-    options: (ov) => (ov.organizations || []).map((o) => [o.id, o.name]) },
+    fromSetupRead: true,
+    options: (sv) => withPendingLink(sv, "organizations").map((o) => [o.id, o.name]) },
   "rink:venue": {
     perm: "manage_arena", noun: "venue", nullable: false, risky: false,
-    options: (ov) => (ov.venues || []).map((v) => [v.id, v.name]) },
+    fromSetupRead: true,
+    options: (sv) => withPendingLink(sv, "venues").map((v) => [v.id, v.name]) },
   "division:level": {
     // Not nullable (#233 B2a review r1): v2 division create/reassign REQUIRES
     // a League, so the panel must never offer "— none —" here — it would
@@ -1518,7 +1598,8 @@ const REASSIGN = {
     // Club is optional on a Team (#233 Slice D): nullable lets the operator
     // unassign a Team's Club from the reassign panel.
     perm: "manage_setup", noun: "club", nullable: true, risky: false,
-    options: (ov) => (ov.clubs || []).map((c) => [c.id, c.name]) },
+    fromSetupRead: true,
+    options: (sv) => withPendingLink(sv, "clubs").map((c) => [c.id, c.name]) },
   // team:league (#283 Slice B): move a Team to a different PERMANENT League —
   // promotion/relegation/transfer (rule 10). Not nullable (a Team is always
   // league-permanent once assigned) and risky (it changes the Team's standing
@@ -1544,7 +1625,8 @@ const REASSIGN = {
   // change regardless of Venue state.
   "league:organization": {
     perm: "manage_setup", noun: "facility owner", displayNoun: "operating organization", nullable: true, risky: false,
-    options: (ov) => (ov.organizations || []).map((o) => [o.id, o.name]) },
+    fromSetupRead: true,
+    options: (sv) => withPendingLink(sv, "organizations").map((o) => [o.id, o.name]) },
 };
 // v2 route + canonical body-key mapping for the reassignments moved to v2
 // (#233 B2a review r1): frontend kind/parent tokens stay frozen (league =
@@ -1575,12 +1657,21 @@ function reassignBtn(kind, parent, rec, curId, seasonId, programId) {
     title="Move to a different ${esc(entNoun(cfg))}">⇄ Move</button>`;
 }
 // The confirm panel: pick a new parent, see a warning for risky moves, commit.
-function reassignPanelHtml(ov) {
+// #369: takes `sv` (the Setup v2 read) as well as `ov`, because the
+// Club/Organization/Venue pickers must come from the Setup surface, not the
+// Dashboard. `ov`'s reference collections are now scoped to what the active
+// Program actually USES, which is right for a Dashboard but wrong for a
+// reassign panel: the whole point of "move this Team to a Club" is to link a
+// Club that is not linked yet, and a just-created Club has no Team, so it is
+// absent from `ov.clubs` by construction. `sv` carries the additive
+// `unassigned_*` buckets for exactly this create-then-link case.
+function reassignPanelHtml(ov, sv) {
   if (!pendingReassign) return "";
   const pr = pendingReassign;
   const cfg = REASSIGN[`${pr.kind}:${pr.parent}`];
   if (!cfg) return "";
-  const rows = (cfg.nullable ? [["", "— none —"]] : []).concat(cfg.options(ov, pr));
+  const rows = (cfg.nullable ? [["", "— none —"]] : []).concat(
+    cfg.options(cfg.fromSetupRead ? (sv || {}) : ov, pr));
   const optsHtml = rows.map(([v, label]) =>
     `<option value="${esc(v)}"${v === (pr.curId || "") ? " selected" : ""}>${esc(label)}</option>`).join("");
   const empty = !rows.length;
@@ -2204,7 +2295,8 @@ function renderSetupHierarchy(sv, hv, ov) {
   // A brand-new demo (or any empty setup) opens on the "Start your league"
   // card rather than empty trees (#215).
   if (hasPerm("manage_setup") && !(sv.programs || []).length
-      && !(sv.teams || []).length && !(sv.organizations || []).length) {
+      && !(sv.teams || []).length
+      && !withPendingLink(sv, "organizations").length) {
     return startYourLeagueCard();
   }
   const canSeePlayers = hasPerm("manage_setup");
@@ -2219,7 +2311,7 @@ function renderSetupHierarchy(sv, hv, ov) {
   //    org-owned, independent of any competition Program). Which Seasons may
   //    use a Venue's ice is managed under each Season (SeasonVenueAccess,
   //    #233 Slice E), not here on the facility tree. --
-  const rinksByVenue = groupBy(sv.rinks, "venue_id");
+  const rinksByVenue = groupBy(withPendingLink(sv, "rinks"), "venue_id");
   const venueNode = (v) => {
     const rinks = rinksByVenue[v.id] || [];
     const badge = rinks.length
@@ -2234,8 +2326,8 @@ function renderSetupHierarchy(sv, hv, ov) {
     </details>`;
   };
   // A facility owner (organization) groups the venues it owns.
-  const venuesByOrg = groupBy(sv.venues, "organization_id");
-  const orgSections = (sv.organizations || []).map((o) => {
+  const venuesByOrg = groupBy(withPendingLink(sv, "venues"), "organization_id");
+  const orgSections = withPendingLink(sv, "organizations").map((o) => {
     const vs = venuesByOrg[o.id] || [];
     const venueRows = vs.map(venueNode).join("")
       || `<div class="tn-empty">No venues yet. Add a venue owned by ${esc(o.name)}.</div>`;
@@ -2512,7 +2604,7 @@ function renderSetupHierarchy(sv, hv, ov) {
     ? `<section class="tree-panel na"><div class="tree-head"><span class="tree-title">⚠ Needs assignment</span></div>
         <div class="tree-note">These records can't be scheduled until they're assigned.</div>${naBody}</section>` : "";
 
-  return `${reassignPanelHtml(ov)}<div class="setup-trees">${facility}${permanentTeams}${competition}${renderSeasonParticipation(hv, ov, sv)}${renderRollover(hv, ov)}${roster}${needsAssignment}</div>`;
+  return `${reassignPanelHtml(ov, sv)}<div class="setup-trees">${facility}${permanentTeams}${competition}${renderSeasonParticipation(hv, ov, sv)}${renderRollover(hv, ov)}${roster}${needsAssignment}</div>`;
 }
 
 // Season participation (#180, cut to v2 canonical #233 Slice B2b): permanent
@@ -2529,7 +2621,57 @@ function renderSeasonParticipation(hv, ov, sv) {
   if (!hasPerm("manage_setup")) return "";
   const programs = (hv.programs || []).filter((p) => (p.seasons || []).length);
   if (!programs.length) return "";
-  const allVenues = (sv && sv.venues) || [];
+  // #369: unions the additive `unassigned_venues` bucket -- this is the
+  // "Allow a venue" picker, i.e. the very control that CREATES a Venue's
+  // first link to a Season. A just-created Venue has no SeasonVenueAccess
+  // grant yet, so under the strict active-Program scoping it is by
+  // definition not in `sv.venues`; without the union it could never be
+  // granted to anything and the Setup flow would deadlock.
+  const allVenues = sv ? withPendingLink(sv, "venues") : [];
+  // The facility-tree exception (#369 owner ruling): a Season may be granted
+  // access to ANY Venue, including one another Program already uses -- an
+  // arena serves several leagues. `grantable_venues` carries id+name only, and
+  // deliberately nothing about Rinks, IceSlots or the competition tree.
+  // Falls back to the scoped union so an older payload still renders.
+  // Established shared facilities, UNIONED with this caller's own scoped and
+  // pending-link venues -- a Venue it just created is linked to nothing yet, so
+  // it is deliberately absent from `grantable_venues` (that list must not carry
+  // other operators' unlinked drafts) and comes in through the union instead.
+  // Per-Season grant candidates, unioned with this caller's own scoped and
+  // pending-link venues. Keyed by Season because the contract is per
+  // destination Season -- see get_venue_grant_candidates.
+  const grantableFor = (seasonId) => {
+    const seen = new Set();
+    const out = [];
+    for (const v of (seasonVenueCandidates[seasonId] || []).concat(allVenues)) {
+      if (v && v.id && !seen.has(v.id)) { seen.add(v.id); out.push(v); }
+    }
+    return out;
+  };
+  // #369 owner ruling: the venue-access list and the candidate route both
+  // require the requested Season to BE the persisted selected Season, so this
+  // tree is no longer an all-Seasons venue inventory. Only the selected Season
+  // renders its allowed venues, its Revoke controls, its revoked-access
+  // cleanup rows and its Allow picker; every other Season of the Program gets
+  // a placeholder that names nothing (no venue id, no venue name, no count)
+  // and for which render() issued no request at all. `allVenues` is the reason
+  // this gate has to exist on the render side too and not only in the fetch
+  // loop: `grantableFor` unions the scoped overview venues, so an ungated
+  // Allow picker would still list real facilities under a Season the operator
+  // has not selected.
+  const selectedSeasonId = (contextOptions && contextOptions.selected
+    && contextOptions.selected.season_id) || null;
+  // ...and when that selection is ARCHIVED the surface is HISTORY, not a
+  // workbench (#369 owner ruling, follow-up). An archived Season is read-only:
+  // grant, revoke and permanent-cleanup all fail `season_archived`, and the
+  // candidate route now refuses the read that feeds the Allow picker. So the
+  // selected Season still shows its OWN allowed-venues history, names included
+  // -- that is what a historical Season is for -- but offers no control that
+  // cannot succeed. Read off `contextOptions.selected.read_only`, the same
+  // signal behind the switcher's "archived (read-only)" label and #ctx-ro
+  // badge, so this can never disagree with what the context bar shows.
+  const selectionIsReadOnly = !!(contextOptions && contextOptions.selected
+    && contextOptions.selected.read_only);
 
   const programBlocks = programs.map((program) => {
     const permanentTeams = leagueTeams[program.id] || [];
@@ -2613,28 +2755,87 @@ function renderSeasonParticipation(hv, ov, sv) {
       // game ice on, via SeasonVenueAccess — independent of any Venue-Program
       // ownership. A Venue may be granted to several Seasons/Programs at
       // once, and a Season may use several Venues.
+      // Resolve names from the grantable set too: a Venue this Season holds a
+      // grant to may belong to another Program, so its name is not in the
+      // Season-ceilinged `venues` -- and the "Allowed venues" row must still
+      // name it rather than showing a bare id.
+      // ...but only for the SELECTED Season (#369 owner ruling). Every other
+      // Season here has no grant rows and no candidates because render()
+      // deliberately asked for neither, so it renders a placeholder rather
+      // than an empty-looking list that would read as "this season has no
+      // venues" — a claim this surface is no longer entitled to make.
+      // ...and when the SELECTED Season is archived it is read-only HISTORY:
+      // its own grant rows still render, names and all, but every control that
+      // would mutate them is gone (see `selectionIsReadOnly` above).
+      const isSelectedSeason = s.id === selectedSeasonId;
+      const isHistoricalSeason = isSelectedSeason && selectionIsReadOnly;
+      const seasonAccessRows = isSelectedSeason
+        ? (seasonVenueAccess[s.id] || []) : [];
       const venueNameById = {};
+      // No candidates were fetched for a read-only selection, and `grantable`
+      // also unions the scoped overview venues -- so this gate has to exist
+      // here and not only in the fetch loop, or the picker would still list
+      // real facilities under an archived Season that can grant none of them.
+      const grantable = (isSelectedSeason && !isHistoricalSeason)
+        ? grantableFor(s.id) : [];
+      grantable.forEach((v) => { venueNameById[v.id] = v.name; });
       allVenues.forEach((v) => { venueNameById[v.id] = v.name; });
-      const grantedAccess = (seasonVenueAccess[s.id] || []).filter((a) => a.active);
+      // A Venue this Season ALREADY holds a grant to is deliberately not a
+      // candidate, and a cross-Program one is not in the scoped `venues`
+      // either -- so the grant row itself is the only place its name survives.
+      // That is the `venue_name` resolution the selected Season still needs
+      // for a shared arena owned by another Program, whose name is in neither
+      // the scoped venue list nor the candidate list.
+      seasonAccessRows.forEach((a) => {
+        if (a.venue_name) venueNameById[a.venue_id] = a.venue_name;
+      });
+      const grantedAccess = seasonAccessRows.filter((a) => a.active);
       const grantedVenueIds = new Set(grantedAccess.map((a) => a.venue_id));
-      const venueAccessRows = grantedAccess.map((a) => `<div class="tn-leaf reg-row">
-          <span class="tn-label">🏟️ ${esc(venueNameById[a.venue_id] || a.venue_id)}</span>
+      // A historical row names its Venue and carries NO Revoke control — the
+      // revoke would fail `season_archived`, so offering it would be a button
+      // that cannot succeed.
+      const venueAccessRows = grantedAccess.map((a) => {
+        const venueName = venueNameById[a.venue_id] || a.venue_id;
+        return isHistoricalSeason
+          ? `<div class="tn-leaf reg-row">
+          <span class="tn-label">🏟️ ${esc(venueName)}</span>
+          <span class="tn-meta">read-only history</span></div>`
+          : `<div class="tn-leaf reg-row">
+          <span class="tn-label">🏟️ ${esc(venueName)}</span>
           <button class="icon-btn danger" data-va-revoke="${esc(a.id)}"
-            title="Revoke venue access" aria-label="Revoke ${esc(venueNameById[a.venue_id] || a.venue_id)} from ${esc(s.name)}">${ICONS.circleMinus}</button></div>`).join("")
-        || `<div class="tn-empty">No venues allowed for this season yet — games can't be scheduled until one is added.</div>`;
-      const availableVenues = allVenues.filter((v) => !grantedVenueIds.has(v.id));
-      const venueAddCtl = availableVenues.length
-        ? `<div class="tn-leaf reg-add">
+            title="Revoke venue access" aria-label="Revoke ${esc(venueName)} from ${esc(s.name)}">${ICONS.circleMinus}</button></div>`;
+      }).join("")
+        || (isHistoricalSeason
+            ? `<div class="tn-empty">This archived season never had a venue allowed.</div>`
+            : `<div class="tn-empty">No venues allowed for this season yet — games can't be scheduled until one is added.</div>`);
+      const availableVenues = grantable.filter(
+        (v) => !grantedVenueIds.has(v.id));
+      // The archived branch replaces the Allow picker with explicit read-only
+      // copy: no <select>, no Allow button, and nothing that reads as "you
+      // could add one here".
+      const venueAddCtl = isHistoricalSeason
+        ? `<div class="tn-empty" data-va-readonly="${esc(s.id)}">This season is archived and read-only — venue access can't be allowed, revoked or removed. Reopen the season to change it.</div>`
+        : (availableVenues.length
+          ? `<div class="tn-leaf reg-add">
             <select id="va-add-${esc(s.id)}"><option value="">Add a venue…</option>${
               availableVenues.map((v) => opt(v.id, v.name)).join("")}</select>
             <button class="act primary" data-va-add="${esc(s.id)}">Allow</button></div>`
-        : (allVenues.length
-            ? `<div class="tn-empty">Every venue is already allowed for this season.</div>`
-            : `<div class="tn-empty">Create a venue on the Facility tree first, then allow it here.</div>`);
-      const venueAccessSection = `<details class="tn" open><summary class="tn-sum">
+          : (grantable.length
+              ? `<div class="tn-empty">Every venue is already allowed for this season.</div>`
+              : `<div class="tn-empty">Create a venue on the Facility tree first, then allow it here.</div>`));
+      // The placeholder for a non-selected Season carries NO venue id, NO
+      // venue name and NO count — a count would still be an inventory, just a
+      // coarser one — and offers no Allow picker, because granting is a write
+      // against a Season this operator has not selected.
+      const venueAccessSection = isSelectedSeason
+        ? `<details class="tn" open><summary class="tn-sum">
           <span class="tn-label">🏟️ Allowed venues</span>
-          <span class="tn-meta">${grantedAccess.length} venue${grantedAccess.length === 1 ? "" : "s"}</span></summary>
-        <div class="tn-children">${venueAccessRows}${venueAddCtl}</div></details>`;
+          <span class="tn-meta">${grantedAccess.length} venue${grantedAccess.length === 1 ? "" : "s"}${isHistoricalSeason ? " · archived (read-only)" : ""}</span></summary>
+        <div class="tn-children">${venueAccessRows}${venueAddCtl}</div></details>`
+        : `<details class="tn"><summary class="tn-sum">
+          <span class="tn-label">🏟️ Allowed venues</span>
+          <span class="tn-meta">not loaded</span></summary>
+        <div class="tn-children"><div class="tn-empty">Select this season to manage its venues.</div></div></details>`;
 
       // Revoked venue access (#233 Slice E, mirrors #251's inactive
       // registrations exactly): revoke only deactivates a row, preserving
@@ -2642,13 +2843,29 @@ function renderSeasonParticipation(hv, ov, sv) {
       // access row REGARDLESS of active status, so a revoked row still needs
       // this explicit, audited permanent-cleanup path before the Season or
       // Venue it references can ever be deleted.
-      const revokedAccess = (seasonVenueAccess[s.id] || []).filter((a) => !a.active);
+      // Selected-Season-only for the same reason: a revoked row names its
+      // Venue and carries a permanent-delete control, so it is exactly the
+      // kind of row a non-selected Season must not put on screen.
+      // Suppressed WHOLESALE for an archived selection: this section exists
+      // only to host the permanent-cleanup action, and that delete fails
+      // `season_archived` like every other write the Season owns. The
+      // read-only copy in the Allowed-venues section above says so explicitly,
+      // so the surface still explains itself rather than silently dropping it.
+      // Revoked grants are HISTORY, and history stays readable on an archived
+      // Season exactly as the active grants above do -- the API preserves these
+      // rows deliberately. An earlier revision of this read-only work emptied
+      // the list, which hid a Season's own past instead of hiding the controls
+      // that act on it. Only the permanent-cleanup button is a mutation, so
+      // only that is withheld.
+      const revokedAccess = seasonAccessRows.filter((a) => !a.active);
       const revokedAccessRows = revokedAccess.map((a) => {
         const venueName = venueNameById[a.venue_id] || a.venue_id;
         return `<div class="tn-leaf reg-row inactive-reg">
           <span class="tn-label">🏟️ ${esc(venueName)}</span>
-          <span class="tn-meta">revoked · <code>${esc(a.id)}</code></span>
-          ${delBtn("season-venue-access", a.id, `${venueName} access`,
+          <span class="tn-meta">revoked · <code>${esc(a.id)}</code>${
+            isHistoricalSeason ? " · read-only history" : ""}</span>
+          ${isHistoricalSeason ? "" : delBtn("season-venue-access", a.id,
+            `${venueName} access`,
             "Permanently remove this revoked venue access")}</div>`;
       }).join("");
       const revokedAccessSection = revokedAccess.length
@@ -2946,6 +3163,23 @@ function updateRolloverCommitState(c) {
 // audit explicitly demotes. That table is a checklist, not a design decision
 // taken here: one `.act.primary` per screen, everything else secondary or
 // tertiary.
+// #367: the selected League's own Teams, when one is active -- mirrors
+// get_setup_progress's server-side narrowing of its "Permanent teams"/
+// "Clubs, players and staff" workflows for the SAME two axes here.
+// get_setup_overview_v2 (`sv`) is deliberately Program-wide for every
+// authorized Program (a structural/management read, never League-narrowed
+// server-side -- see that method's own docstring), so this is a client-side
+// filter using the additive `sv.teams[].league_id` field (Team.league_id,
+// the real competition-League id) -- the same client-side-filter idiom the
+// division drawer already uses against `leagues[].season_ids`. "No League"
+// selected (`league_id` falsy) keeps the full Program-wide set.
+function leagueScopedTeams(sv) {
+  const lid = contextOptions && contextOptions.selected
+    && contextOptions.selected.league_id;
+  const teams = sv.teams || [];
+  return lid ? teams.filter((t) => t.league_id === lid) : teams;
+}
+
 const SETUP_WORKFLOWS = [
   { key: "league_season", title: "League profile and seasons", icon: "🗓️",
     purpose: "The program's identity, and the seasons that give it schedulable time.",
@@ -2962,8 +3196,8 @@ const SETUP_WORKFLOWS = [
     primary: { label: "Add Team", go: "teams" },
     secondary: [{ label: "Clubs", act: "club" }],
     summary: (sv) => [
-      { label: "Teams", n: (sv.teams || []).length },
-      { label: "Clubs", n: (sv.clubs || []).length }] },
+      { label: "Teams", n: leagueScopedTeams(sv).length },
+      { label: "Clubs", n: withPendingLink(sv, "clubs").length }] },
   { key: "participation", title: "Season participation and divisions", icon: "🏅",
     purpose: "Which teams play in which league-season, and the divisions that split them.",
     perm: "manage_setup",
@@ -2976,9 +3210,18 @@ const SETUP_WORKFLOWS = [
     perm: "manage_setup",
     primary: { label: "Add Player", go: "roster" },
     secondary: [{ label: "Officials", act: "official" }],
-    summary: (sv) => [
-      { label: "Players", n: (playersList || []).length },
-      { label: "Officials", n: (sv.officials || []).length }] },
+    summary: (sv) => {
+      const lid = contextOptions && contextOptions.selected
+        && contextOptions.selected.league_id;
+      let players = playersList || [];
+      if (lid) {
+        const teamIds = new Set(leagueScopedTeams(sv).map((t) => t.id));
+        players = players.filter((p) => teamIds.has(p.team_id));
+      }
+      return [
+        { label: "Players", n: players.length },
+        { label: "Officials", n: withPendingLink(sv, "officials").length }];
+    } },
   { key: "facilities", title: "Venues, rinks and ice", icon: "🏟️",
     purpose: "Where games can be played, and the recurring ice that makes them schedulable.",
     perm: "manage_arena",
@@ -2989,8 +3232,8 @@ const SETUP_WORKFLOWS = [
     secondary: [{ label: "Venues", act: "venue" }, { label: "Rinks", act: "rink" }],
     tertiary: [{ label: "Add one ice slot", act: "ice-slot" }],
     summary: (sv) => [
-      { label: "Venues", n: (sv.venues || []).length },
-      { label: "Rinks", n: (sv.rinks || []).length }] },
+      { label: "Venues", n: withPendingLink(sv, "venues").length },
+      { label: "Rinks", n: withPendingLink(sv, "rinks").length }] },
   // Workflow 6 is OPTIONAL (Decision 9): always visible and always reachable,
   // never the hub's `next` recommendation, and never blocking the complete
   // state. It carries its own status wording rather than done/todo.
@@ -3061,6 +3304,45 @@ function setupSummaryHtml(w, sv, ov) {
 // undifferentiated Setup mega-page as the DEFAULT route -- the mega-page's
 // two sub-views stay reachable from the toggle, so nothing that was
 // reachable before becomes unreachable.
+// #367 owner ruling: the whole Setup surface -- hub, every workflow landing
+// and Records -- is ceilinged on the ACTIVE Season, and the copy has to SAY
+// so. An operator who cannot find last season's division must be able to
+// tell a SELECTION from a deletion, and one working in a Program-only
+// context must know why the season-bound cards are empty rather than
+// concluding the data is gone.
+//
+// The second sentence is the deliberate asymmetry the ruling calls out and
+// requires stating explicitly: Venue/Rink/IceSlot (and their owning
+// facility organization) have a Season axis, through SeasonVenueAccess, but
+// NO competition-League axis at all -- so selecting a League never narrows
+// them. They stay season-wide across every league, on purpose, and that is
+// a fact about the domain rather than a filter someone forgot to apply.
+function setupScopeNote(sv) {
+  // Guard the payload, not each accessor -- the same reason (and the same
+  // convention) as setupSummaryHtml above: renderSetup is reachable before
+  // or without a successful overview load (an early return, a failed fetch,
+  // a view that changed while render() was awaiting), and a note about
+  // scope must degrade to nothing rather than throw and blank the view.
+  if (!sv) return "";
+  const season = (sv.seasons || [])[0];
+  if (!season) {
+    return `<p class="muted setup-scope-note" data-setup-scope-note>
+      No season is selected, so season records — seasons, divisions, venues,
+      rinks and ice — stay hidden. Pick a season in the context bar to work
+      on it. Programs, leagues, teams and clubs are not season-bound and are
+      shown as usual.</p>`;
+  }
+  const lid = contextOptions && contextOptions.selected
+    && contextOptions.selected.league_id;
+  const league = lid && (sv.leagues || []).find((lg) => lg.id === lid);
+  return `<p class="muted setup-scope-note" data-setup-scope-note>
+    Showing the <strong>${esc(season.name)}</strong> season${league
+      ? `, league <strong>${esc(league.name)}</strong>` : ", all leagues"}.
+    Switch in the context bar to set up a different one. Venues, rinks and
+    ice belong to a season, not a league, so they always show the whole
+    ${esc(season.name)} season across every league.</p>`;
+}
+
 function renderSetupHub(sv, ov) {
   const mine = setupWorkflowsFor();
   if (!mine.length) {
@@ -3081,6 +3363,7 @@ function renderSetupHub(sv, ov) {
     </section>`).join("");
   return `${pageIntro("Setup is six focused workflows. Open the one you need — "
     + "each opens on a summary, not a form.")}
+    ${setupScopeNote(sv)}
     <div class="swf-grid">${cards}</div>`;
 }
 
@@ -3104,6 +3387,7 @@ function renderSetupWorkflowLanding(w, sv, ov) {
       <button class="linklike swf-back" data-setup-workflow="">← All setup workflows</button>
       <h2 class="swf-landing-title">${w.icon} ${esc(w.title)}</h2>
       <p class="swf-purpose">${esc(w.purpose)}</p>
+      ${setupScopeNote(sv)}
       ${w.optional ? `<p class="swf-optional-note">This step is optional — you can
         set everything up by hand instead, and skipping it never blocks the
         rest of setup.</p>` : ""}
@@ -3138,6 +3422,7 @@ function renderSetup(sv, hv, ov) {
     const cards = SETUP_ENTITIES.map((ent) => setupCard(ent, sv)).join("");
     body = `<div class="setup-intro">Create your competition structure and arena. Tap
       <strong>＋ New</strong> on any card to open a form.</div>
+      ${setupScopeNote(sv)}
       <div class="setup-grid">${cards}</div>`;
   }
   return `${toggle}${body}${renderDrawer(sv)}`;
@@ -6322,6 +6607,22 @@ async function submitSetup(kind) {
     return render();
   }
   drawer = null; drawerError = ""; drawerValues = {};
+  // Creating a Program or a Season changes the set of contexts this account
+  // may select, and `contextOptions` is otherwise loaded ONCE per page load
+  // (never re-polled by render()) -- so without this the context bar could
+  // not offer the Season that was just created until a full reload.
+  //
+  // That went from a papercut to a dead end under the #367 owner ruling: the
+  // active Season is now a hard ceiling on this surface, so a Season the
+  // context bar cannot offer is one the operator cannot switch to, and the
+  // League create drawer's Season picker (sourced from these same options,
+  // see contextSeasonOptions) would have nothing to point at right after the
+  // Season was made. Refreshing here is what keeps "create the Season, then
+  // its League" a single uninterrupted flow.
+  if (!editing && (kind === "season" || kind === "league")) {
+    await loadContextOptions();
+    renderContextSwitcher();
+  }
   const noun = entNoun(ent);
   toast = `${noun[0].toUpperCase() + noun.slice(1)} ${editing ? "updated" : "created"}.`;
   await render();
@@ -6384,15 +6685,48 @@ async function render() {
   updateToast();
   const c = document.getElementById("content");
   document.body.dataset.view = view;
+  // #367 review: a completed factory reset (#256) already cleared this
+  // browser's session cookie server-side (the execute response signs every
+  // session out) BEFORE this render() is called to show the success modal --
+  // so /api/demo/overview's now-session-required read would always 401 here,
+  // throwing and replacing the success confirmation with an error banner the
+  // operator never asked for, even though the reset itself genuinely
+  // succeeded. The success modal needs no overview data at all (it's a
+  // static "you're signed out" confirmation), so it paints on its own,
+  // skipping the normal ov-dependent pipeline entirely rather than reworking
+  // that pipeline to tolerate a caller it already knows is signed out.
+  if (modal && modal.type === "factory-reset" && modal.step === "success") {
+    setPageTitle(view);
+    c.innerHTML = renderModal();
+    wireModal(c);  // same generic modal wiring every other modal gets
+    // #369 review: this early return must still run the SAME shared
+    // dialog focus lifecycle every other render() path gets (line ~8332) --
+    // skipping it left focus on the removed "Resetting…" control (or on
+    // <body>), so keyboard/screen-reader users lost the dialog/focus-trap
+    // contract even though the success modal was visibly on-screen.
+    syncOverlayFocus();
+    return;
+  }
   // #345 review: set BEFORE the awaited overview load and before either
   // early return below (backend-error banner, restricted roster/sheet), so an
   // error or restricted state still announces the destination the user chose
   // rather than the previous view's title.
   setPageTitle(view);
+  // #367: snapshotted before any fetch below, so a context switch that lands
+  // WHILE this render() is still awaiting its now-context-scoped reads
+  // (/api/demo/overview, /api/v2/setup/overview, /api/standings/*) can be
+  // detected -- same idiom as importState/iceBuilder's own contextRevision
+  // checks. setActiveContext()/sendContextSwitch() guarantee a fresh render()
+  // always follows a switch (success or failure path), so bailing out here
+  // is safe: the newer render() already in flight (or about to fire) repaints
+  // correctly: this stale one just leaves the loading skeleton up briefly
+  // rather than flashing another Program/Season/League's data.
+  const myRenderContext = contextRevision;
   let ov, sv, hv, board, lineups, standings, inbox, playerHome;
   try {
     c.innerHTML = `<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>`;
     ov = await getJSON("/api/demo/overview");
+    if (contextRevision !== myRenderContext) return;  // #367: superseded, a fresh render() is already coming
     if (ov && ov.error) throw new Error(ov.error.message);
     // Default the working game to the first one this user can actually open —
     // for a coach that's their own team's game, not an arbitrary game[0] that
@@ -6474,6 +6808,7 @@ async function render() {
     // used to crash for them, since it was fetched only under manage_setup).
     if (view === "setup" && (hasPerm("manage_setup") || hasPerm("manage_arena"))) {
       const svr = await getJSON("/api/v2/setup/overview");
+      if (contextRevision !== myRenderContext) return;  // #367: superseded, a fresh render() is already coming
       if (svr && !svr.error) sv = svr;
     }
     // The Competition tree, Setup Player card, and season participation are
@@ -6482,12 +6817,26 @@ async function render() {
     // bundled into the public demo overview.
     if (view === "setup" && hasPerm("manage_setup")) {
       const pl = await getJSON("/api/players");
+      // #367 owner ruling / observed flake: this generation check was
+      // MISSING here, and `playersList` is MODULE-level state read at paint
+      // time rather than a local like `ov`/`sv`. So a superseded render()
+      // that was still awaiting /api/players could assign the OLD context's
+      // player list after a newer render() had already fetched everything
+      // else -- and the newer render then painted its own correctly-scoped
+      // Programs/Seasons/Leagues/Divisions/Teams/Clubs cards NEXT TO another
+      // Program's player NAMES. It reproduced as exactly that mixed grid in
+      // e2e/setup-v2-context-scope.js. Bailing before the assignment (the
+      // same idiom used after the two fetches above) is what makes the
+      // guard cover module-level state too; every module-level assignment
+      // below this line is inside the same guarded stretch.
+      if (contextRevision !== myRenderContext) return;  // superseded
       playersList = Array.isArray(pl) ? pl : [];
       // The canonical Program→Season→League→Division tree (#233 B2a review
       // r1): consumed as-is rather than reconstructed from flat `sv` lists,
       // so needs_assignment/teams_without_division match the canonical
       // parentage rules exactly instead of a client-side reinterpretation.
       const hvr = await getJSON("/api/v2/setup/hierarchy");
+      if (contextRevision !== myRenderContext) return;  // superseded
       if (hvr && !hvr.error) hv = hvr;
       // Season participation (#180, cut to v2 canonical #233 Slice B2b): a
       // program's permanent teams and each season's registrations, each its
@@ -6498,9 +6847,45 @@ async function render() {
       // requested ids are consistently canonical; hv is only populated under
       // manage_setup, which already gates this whole block.
       leagueTeams = {}; seasonRegs = {}; leagueDivisions = {}; seasonVenueAccess = {};
+      // Reset alongside seasonVenueAccess (#369 owner ruling): both maps are
+      // keyed by Season id and both are now filled for the SELECTED Season
+      // only, so a stale entry left over from a previous context is the one
+      // way a Season could still paint venue data it no longer fetched.
+      seasonVenueCandidates = {};
       permLeaguesByProgram = {}; allPermLeagues = []; teamPermLeague = {};
+      // #369 owner ruling: `/venue-access` and `/venue-candidates` are
+      // ceilinged to the EXACT persisted selected Season -- a sibling Season of
+      // the active Program is refused just like a foreign one. This loop used
+      // to fetch BOTH for every Season in the tree, which is precisely the
+      // "Records using the endpoint as an all-Seasons inventory" the ruling
+      // ends: it would now 404 once per non-selected Season. So they are
+      // fetched for the selected Season alone, and every other Season renders a
+      // non-identifying placeholder instead (see renderSeasonParticipation) --
+      // no venue ids, no venue names, and no request issued. Deliberately NOT
+      // replaced by a new batch endpoint: that would re-create the inventory
+      // the ruling removed, one HTTP hop further down.
+      const selectedSeasonId = (contextOptions && contextOptions.selected
+        && contextOptions.selected.season_id) || null;
+      // ...and an ARCHIVED selection fetches no candidates at all (#369 owner
+      // ruling, follow-up). An archived Season is read-only history: the grant
+      // this list feeds fails `season_archived`, so asking for candidates both
+      // advertised an impossible mutation and pulled in the one facility list
+      // that deliberately reaches ACROSS the Program ceiling. The server now
+      // refuses that read generically, so issuing it would only produce a 404
+      // per render; the gate is here so the request is never made and the
+      // read-only surface holds nothing to render a picker from.
+      // `read_only` is the SAME signal the context bar's "archived
+      // (read-only)" option label and #ctx-ro badge already use -- it comes
+      // straight off /api/context/options' `selected`.
+      const selectionIsReadOnly = !!(contextOptions && contextOptions.selected
+        && contextOptions.selected.read_only);
       for (const program of (hv.programs || [])) {
         const r = await getJSON(`/api/v2/setup/programs/${program.id}/teams`);
+        // Same reason as the player list above, and more acute: this loop
+        // awaits once per Program and twice per Season, so it is the widest
+        // window in render() for a context switch to land mid-flight while
+        // module-level state is still being filled in.
+        if (contextRevision !== myRenderContext) return;  // superseded
         leagueTeams[program.id] = (r && r.teams) || [];
         // #283 Slice B: the program's permanent Leagues (from the canonical
         // hierarchy) back both the permanent-team tree and the team transfer/
@@ -6518,11 +6903,35 @@ async function render() {
         }
         for (const s of (program.seasons || [])) {
           const rr = await getJSON(`/api/v2/setup/seasons/${s.id}/team-registrations`);
+          if (contextRevision !== myRenderContext) return;  // superseded
           seasonRegs[s.id] = (rr && rr.registrations) || [];
-          // Allowed venues (#233 Slice E): which Venues this Season may use
-          // for game ice, independent of any Venue-Program ownership.
-          const va = await getJSON(`/api/v2/setup/seasons/${s.id}/venue-access`);
-          seasonVenueAccess[s.id] = (va && va.venue_access) || [];
+          // The SELECTED Season only -- see the ruling note above. Every other
+          // Season of this Program is skipped outright, so nothing about its
+          // venues is requested, held or painted.
+          if (s.id === selectedSeasonId) {
+            // Allowed venues (#233 Slice E): which Venues this Season may use
+            // for game ice, independent of any Venue-Program ownership.
+            const va = await getJSON(`/api/v2/setup/seasons/${s.id}/venue-access`);
+            if (contextRevision !== myRenderContext) return;  // superseded
+            seasonVenueAccess[s.id] = (va && va.venue_access) || [];
+            // Grant CANDIDATES for this Season (#369 review): its own
+            // MANAGE_SETUP-gated route, not a field on the overview. The
+            // candidate list is the one facility contract that reaches across
+            // the Program ceiling, so it is fetched only where it is used and
+            // only by a caller that could actually perform the grant -- an
+            // Arena Manager gets a 403 here and simply has no picker, rather
+            // than being handed every linked Venue in the installation by the
+            // overview.
+            // Skipped outright for a READ-ONLY (archived) selection: no
+            // request is issued, so the archived surface can render no picker
+            // even by accident.
+            if (!selectionIsReadOnly) {
+              const vc = await getJSON(
+                `/api/v2/setup/seasons/${s.id}/venue-candidates`);
+              if (contextRevision !== myRenderContext) return;  // superseded
+              seasonVenueCandidates[s.id] = (vc && vc.candidates) || [];
+            }
+          }
         }
       }
     }
@@ -6625,12 +7034,16 @@ async function render() {
     }
     // Import wizard (#96): bind the season picker to the ACTIVE #159
     // Season, not "the first Season that happens to exist" (#331 review
-    // round 7) — `ov.seasons` is unfiltered (every Program), and
-    // goToSetupWorkflow("import") does no seeding of its own (it only
-    // switches tabs), so the old fallback was a silent, COMMITTABLE
+    // round 7). When that rule was written `ov.seasons` was unfiltered
+    // (every Program), so the old fallback was a silent, COMMITTABLE
     // cross-Program default: needsSeason import types send seasonId
-    // verbatim to commit_import, and #159's context is display-only, not
-    // a backend filter, so nothing else would have caught it. Re-binds on
+    // verbatim to commit_import, and #159's context was display-only, not
+    // a backend filter, so nothing else would have caught it. #369 has
+    // since made `ov.seasons` the ACTIVE Season only, which independently
+    // closes the cross-Program half — but this binding stays load-bearing:
+    // goToSetupWorkflow("import") still does no seeding of its own (it
+    // only switches tabs), so without it the picker is simply unseeded.
+    // Re-binds on
     // ANY context revision, not just the first visit, since the operator
     // can reach Import once and then switch Program via the switcher
     // while still on this view. Fails CLOSED, not to a fresh global
@@ -6701,10 +7114,12 @@ async function render() {
       }
       standings = standingsDivision
         ? await getJSON(`/api/standings/${standingsDivision}`) : null;
+      if (contextRevision !== myRenderContext) return;  // #367: superseded, a fresh render() is already coming
     }
     // The Dashboard shows a standings snapshot for the first division.
     if (view === "dashboard" && ov.divisions[0]) {
       standings = await getJSON(`/api/standings/${ov.divisions[0].id}`);
+      if (contextRevision !== myRenderContext) return;  // #367: superseded, a fresh render() is already coming
     }
     // Home/Tasks hub setup-progress card (#330) — only for a role that can
     // act on Setup (League Admin/Arena Manager); a Coach also lands on
@@ -8764,15 +9179,72 @@ function syncContextHash() {
   const sel = contextOptions && contextOptions.selected;
   const want = (sel && sel.program_id)
     ? encodeContextHash(sel.program_id, sel.season_id, sel.league_id) : "";
+  writeContextHash(want);
+}
+// #369 root cause (reproduced deterministically by holding POST /api/context's
+// RESPONSE while letting the request itself reach the server, at desktop AND
+// 390px). syncContextHash() above can only ever run AFTER a switch's POST
+// response is delivered, because it reads the POST echo out of
+// contextOptions.selected. That leaves a window in which the SERVER has
+// already accepted the new context while location.hash still encodes the OLD
+// one -- and the whole window is exactly as long as that response takes to
+// arrive (unbounded on a slow/mobile connection; this is why CI's phone leg
+// was where it bit). A reload landing inside that window boots into
+// restoreContextDeepLink(), which sees hash != persisted selection, cannot
+// tell "my own hash has not caught up yet" from "someone handed me a deep
+// link", and so applies the documented deep-link-wins rule to a STALE hash --
+// POSTing the old context back and silently reverting a switch the user made
+// and the server already took. Observed reverting request is
+// restoreContextDeepLink()'s own three-key body {program_id, season_id,
+// league_id}, the same fingerprint this bug left in venue-sharing.js.
+//
+// Fix: mirror the INTENDED selection into the hash immediately BEFORE the POST
+// goes out (below, in sendContextSwitch), so the hash always leads or equals
+// the server and can never lag it. A reload anywhere in the window then finds
+// a hash describing what the user actually chose: if the POST already landed,
+// hash == persisted and boot does nothing; if it did not, deep-link-wins
+// re-applies the user's own intent instead of undoing it. Either way the
+// switch converges on what was asked for. Deliberately NOT done in
+// setActiveContext(): a switch that is merely QUEUED there may still be
+// discarded by resetTransientUiState() on an identity change, and must not
+// leave a phantom hash behind for the next identity's boot to adopt.
+function writeContextHash(want) {
+  if (!currentUser || location.hash === "#public") return;
   if (location.hash !== want) {
     history.replaceState(null, "", location.pathname + location.search + want);
   }
 }
 // Load the caller's AUTHORIZED options + current selection. Session-only; a
 // signed-out user has no context.
+//
+// #369 review (root cause, reproduced via delayed /api/context/options
+// responses, not just delayed requests): this is called from several
+// independent places -- bootstrap()/signIn(), restoreContextDeepLink(), and
+// BOTH branches of sendContextSwitch() -- and two of its GETs can genuinely
+// be in flight at once (sendContextSwitch() only serializes the /api/context
+// POSTs themselves via contextSwitchInFlight/contextSwitchQueued; that flag
+// is already reset to false, and the NEXT switch's own POST+load already
+// under way, well before THIS call's trailing GET here resolves). Without a
+// sequence guard, whichever response happens to be DELIVERED last wins the
+// unconditional assignment below, regardless of which call was issued last
+// -- a slow, already-superseded load can clobber `contextOptions` with a
+// stale selection AFTER a newer switch's load already set the correct one.
+// sendContextSwitch()'s own `mySeq !== contextSwitchSeq` check catches this
+// far too late: it only skips the stale call's OWN render()/hash-sync, not
+// the assignment here, so the corruption sits silently in `contextOptions`
+// until the next unrelated render() (a toast, a poll, any of this file's
+// many other render() call sites) reads it and visibly reverts the switcher
+// to the stale choice with no user action. Fixed with the same
+// "only the latest-issued call may write" idiom already used for
+// contextSwitchSeq/iceOperationSeq/importOperationSeq elsewhere in this
+// file: bump a dedicated sequence BEFORE the await, and refuse to write
+// `contextOptions` if a newer load has started since.
+let contextOptionsLoadSeq = 0;
 async function loadContextOptions() {
   if (!currentUser) { contextOptions = null; return; }
+  const mySeq = ++contextOptionsLoadSeq;
   const o = await getJSON("/api/context/options");
+  if (mySeq !== contextOptionsLoadSeq) return;  // superseded by a newer load
   contextOptions = (o && !o.error) ? o : null;
 }
 // Restore on load: the persisted context is already loaded above; if the URL
@@ -8879,6 +9351,18 @@ function invalidateContextScopedMutations() {
 // trivially equivalent to "last intent wins" -- there is no window left
 // for the two to disagree, on any backend.
 let contextSwitchInFlight = false;
+// #369: "the URL currently advertises an intent the server has NOT yet
+// confirmed", tracked INDEPENDENTLY of the network-in-flight flag. The two are
+// not the same window and conflating them left a hole: contextSwitchInFlight
+// clears the instant the POST resolves, but on the FAILURE path the rejected
+// intent stays in the hash across the awaited loadContextOptions()
+// reconciliation. An identity change in that window saw the flag already
+// false, left the hash alone, and the next identity's restoreContextDeepLink()
+// adopted the previous identity's REJECTED choice -- persisting it silently
+// whenever the new identity happened to be authorized for it. This flag stays
+// set from the moment intent is published until a syncContextHash() has
+// reconciled the URL with canonical truth, on EVERY success and failure path.
+let contextHashIntentPending = false;
 let contextSwitchQueued = null;  // {programId, seasonId, leagueId, mySeq} -- the one pending switch not yet sent, if any
 
 // Persist a switcher pick, then reflect it in the hash and re-render.
@@ -8909,6 +9393,10 @@ async function setActiveContext(programId, seasonId, leagueId) {
 }
 async function sendContextSwitch(mySeq, programId, seasonId, leagueId) {
   contextSwitchInFlight = true;
+  // #369: publish the intent to the hash BEFORE the server can act on it, so
+  // the hash never lags an already-mutated server. See writeContextHash().
+  writeContextHash(encodeContextHash(programId, seasonId || null, leagueId || null));
+  contextHashIntentPending = true;
   const r = await post("/api/context",
     { program_id: programId, season_id: seasonId || null, league_id: leagueId || null });
   contextSwitchInFlight = false;
@@ -8951,6 +9439,7 @@ async function sendContextSwitch(mySeq, programId, seasonId, leagueId) {
     // restoreContextDeepLink(), treats the stale hash as an intentional
     // deep link, and silently POSTs the persisted context back to it.
     syncContextHash();
+    contextHashIntentPending = false;
     render();
     return;
   }
@@ -8981,6 +9470,7 @@ async function sendContextSwitch(mySeq, programId, seasonId, leagueId) {
   await loadContextOptions();
   if (mySeq !== contextSwitchSeq) return;  // superseded during the refetch
   syncContextHash();
+  contextHashIntentPending = false;
   toast = "";
   render();
 }
@@ -9349,6 +9839,42 @@ function resetTransientUiState() {
   // superseded switch already does.
   contextSwitchQueued = null;
   contextSwitchSeq += 1;
+  // ...and the same for a switch whose POST has already LEFT but has not yet
+  // been ANSWERED. #369 made sendContextSwitch() publish the intended
+  // selection into location.hash BEFORE its POST, so the hash can never lag
+  // an already-mutated server. The flip side is that an unacknowledged switch
+  // now leaves the DEPARTING identity's raw intent sitting in the URL.
+  // Bumping contextSwitchSeq above only makes that POST's own completion skip
+  // its reconciliation; it does nothing about the hash. So the next
+  // identity's boot runs restoreContextDeepLink(), sees hash != its persisted
+  // selection, applies deep-link-wins, and re-POSTs the OLD identity's
+  // never-acknowledged choice as the NEW identity's context -- precisely the
+  // cross-identity leak discarding contextSwitchQueued above exists to
+  // prevent, just carried by a stronger vehicle.
+  //
+  // contextOptions.selected is still the last SERVER-CONFIRMED selection
+  // (sendContextSwitch only overwrites it after its POST resolves), so
+  // syncContextHash() here rewinds the hash to the context the server
+  // actually holds. It is a no-op on an ordinary identity transition: a
+  // reconciled switch's hash already equals contextOptions.selected, and
+  // inheriting a CONFIRMED context across a persona switch is the
+  // pre-existing, intended deep-link behavior -- only an unconfirmed phantom
+  // is withdrawn.
+  //
+  // Keyed on contextHashIntentPending, NOT contextSwitchInFlight. Those are
+  // different windows, and an earlier revision of this guard used the wrong
+  // one: contextSwitchInFlight clears the moment the POST resolves, but on
+  // the REJECTED path the hash still advertises the refused intent across the
+  // awaited loadContextOptions() reconciliation that follows. An identity
+  // change in that window found the flag already false, left the phantom in
+  // the URL, and handed the next identity a rejected choice to adopt --
+  // silently persisted if that identity happened to be authorized for it.
+  // The intent flag stays set until a syncContextHash() has actually
+  // reconciled, on every path, so no window is left uncovered.
+  if (contextHashIntentPending) {
+    syncContextHash();
+    contextHashIntentPending = false;
+  }
 }
 function setUser(user) {
   const prevId = currentUser ? currentUser.username : null;

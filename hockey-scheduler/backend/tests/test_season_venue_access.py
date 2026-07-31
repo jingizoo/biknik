@@ -18,13 +18,17 @@ import unittest
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api.service import ApiService
-from hockey_scheduler.domain import Program, Season, Venue
+from hockey_scheduler.domain import Program, Role, Season, Venue
 from hockey_scheduler.domain.errors import IntegrityConflictError
 from hockey_scheduler.store import InMemoryStore, SqlStore
 from hockey_scheduler.store.integrity_checks import MigrationDataError
 from hockey_scheduler.store.sql_store import migrate
 
 ACTOR = "user_admin"
+# The listing read is bound to the caller's persisted active Program (#369
+# review), so it takes an identity and the fixtures below select their own
+# context explicitly rather than reading a Season on trust.
+IDENT = (ACTOR, Role.LEAGUE_ADMIN, {})
 
 
 def _sql_backends():
@@ -74,6 +78,18 @@ class SeasonVenueAccessContract:
         venue = self.api.create_venue(
             "V1", organization_id=org, actor_id=ACTOR)["id"]
         return org, program, season, venue
+
+    def _access_rows(self, program, season):
+        """This Season's grant rows, read with the context that entitles them.
+
+        ``list_season_venue_access`` no longer takes the requested Season on
+        trust (#369 review) — it is ceilinged to the caller's persisted active
+        Program — so the read is performed as an operator who has actually
+        selected this Program/Season, not by an identity-less call."""
+        self.api.set_active_context(*IDENT, program, season)
+        result = self.api.list_season_venue_access(season, *IDENT)
+        self.assertNotIn("error", result, result)
+        return result["venue_access"]
 
     def test_grant_creates_active_access_with_audit(self):
         _, _, season, venue = self._fixture()
@@ -133,7 +149,7 @@ class SeasonVenueAccessContract:
     def test_regrant_after_revoke_reactivates_same_row(self):
         # Mirrors register_team_for_season's Rule 5: a prior inactive row is
         # reactivated in place rather than duplicated.
-        _, _, season, venue = self._fixture()
+        _, program, season, venue = self._fixture()
         granted = self.api.grant_season_venue_access(season, venue, actor_id=ACTOR)
         self.api.revoke_season_venue_access(granted["id"], actor_id=ACTOR)
         audits_before = len(self.store.all_setup_audit())
@@ -143,7 +159,7 @@ class SeasonVenueAccessContract:
         self.assertEqual(regranted["id"], granted["id"])
         self.assertTrue(regranted["active"])
         # Exactly one new row, not a duplicate.
-        rows = self.api.list_season_venue_access(season)["venue_access"]
+        rows = self._access_rows(program, season)
         self.assertEqual(len(rows), 1)
         audits = [a for a in self.store.all_setup_audit()
                   if a.action == "season_venue_access_granted"]
@@ -159,17 +175,17 @@ class SeasonVenueAccessContract:
         self.api.grant_season_venue_access(season, venue, actor_id=ACTOR)
         self.api.grant_season_venue_access(season, other_venue, actor_id=ACTOR)
         self.api.grant_season_venue_access(other_season, venue, actor_id=ACTOR)
-        rows = self.api.list_season_venue_access(season)["venue_access"]
+        rows = self._access_rows(program, season)
         self.assertEqual({r["venue_id"] for r in rows}, {venue, other_venue})
         self.assertTrue(all(r["season_id"] == season for r in rows))
 
     def test_one_season_can_use_multiple_venues(self):
-        org, _, season, venue = self._fixture()
+        org, program, season, venue = self._fixture()
         venue2 = self.api.create_venue(
             "V2", organization_id=org, actor_id=ACTOR)["id"]
         self.api.grant_season_venue_access(season, venue, actor_id=ACTOR)
         self.api.grant_season_venue_access(season, venue2, actor_id=ACTOR)
-        rows = self.api.list_season_venue_access(season)["venue_access"]
+        rows = self._access_rows(program, season)
         self.assertEqual({r["venue_id"] for r in rows}, {venue, venue2})
 
     def test_one_venue_can_host_multiple_seasons_across_programs(self):
