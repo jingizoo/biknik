@@ -537,15 +537,28 @@ async function checkCore(browser, viewport) {
 
     // (K) Drawer seeding respects the active League (#364 fixes to
     // contextSeededDrawerValues 'division'/'team') -- the concrete
-    // "existing screens now respect the tuple" evidence. The "Divisions"
-    // demoted action lives on the "Season participation and divisions"
-    // workflow landing ([data-setup-workflow-act="division"]) and routes
-    // through contextSeededDrawerValues, unlike the hierarchy tree's own
-    // per-row "+ Add division" buttons (independently, directly prefilled
-    // from the row they're rendered under -- a different, unrelated seeding
-    // path). Set the context to (S2, Dual League) -- valid -- then confirm
-    // the opened drawer seeds Dual League, not Solo League (Solo isn't even
+    // "existing screens now respect the tuple" evidence. The Divisions
+    // control lives on the "Season participation and divisions" workflow
+    // landing ([data-setup-workflow-act="division"]) and routes through
+    // contextSeededDrawerValues, unlike the hierarchy tree's own per-row
+    // "+ Add division" buttons (independently, directly prefilled from the
+    // row they're rendered under -- a different, unrelated seeding path).
+    // Set the context to (S2, Dual League) -- valid -- then confirm the
+    // opened drawer seeds Dual League, not Solo League (Solo isn't even
     // in S2).
+    //
+    // WHICH control carries that hook is STATE-DEPENDENT since #365, and this
+    // fixture reaches it in the EMPTY state (S2 has no division of its own):
+    // the landing withdraws its demoted actions and offers the one action its
+    // prerequisite chain resolves to, which here IS "Add division" -- the same
+    // [data-setup-workflow-act="division"] hook, the same
+    // openSetupWorkflowDrawer('division') -> contextSeededDrawerValues path,
+    // now painted as the primary. (This leg is what caught the one-commit
+    // window where the withdrawal had landed and the substitution had not: the
+    // landing then offered only the declared "Register Team" and no Divisions
+    // control existed at all. Nothing about the tuple, the select or the
+    // browser was involved -- see the (K1) tuple assertion below, which is now
+    // asserted directly rather than inferred from the seeding.)
     if ((await loginAs(page, "admin")).status !== 200) throw new Error(`[${L}] admin re-login (drawer) failed`);
     await apiPost(page, "/api/context", { program_id: f.zulu, season_id: f.s2, league_id: f.dual });
     await clearHash(page);
@@ -562,6 +575,67 @@ async function checkCore(browser, viewport) {
     await page.click('[data-setup-workflow="participation"]');
     await page.waitForFunction(
       () => !!document.querySelector('[data-setup-workflow-act="division"]'), null, { timeout: 10000 });
+
+    // (K1) The PRODUCTION CONTEXT TUPLE behind the control this leg is about
+    // to press (#365 round 2 investigation). The control that carries
+    // [data-setup-workflow-act="division"] on this landing is state-dependent:
+    // with no division in the active Season the card is EMPTY and the derived
+    // effective action IS the Divisions control; with one it is the demoted
+    // secondary. Either way the drawer it opens is seeded from the ACTIVE
+    // tuple, so the drawer assertions below are only meaningful if the surface
+    // that offered the control was itself bound to the tuple the server has
+    // persisted. That is asserted here, directly, rather than inferred from the
+    // seeding it is supposed to be checking:
+    //
+    //   * the PERSISTED row (/api/context), read through the page's own fetch;
+    //   * the RENDERED bar, both selects;
+    //   * the card's own committed IDENTITY -- the (program, season, league)
+    //     it was bound to when its model was committed -- and that the card
+    //     is not reading STALE, which is exactly how a surface left standing
+    //     from an earlier tuple would present itself.
+    //
+    // Runs at BOTH viewports, because checkCore does.
+    const tupleAgreement = await page.evaluate(async () => {
+      const ctx = await (await fetch("/api/context",
+        { credentials: "same-origin" })).json();
+      const entry = readCardState("setup/participation");
+      const pick = (id) => {
+        const el = document.getElementById(id);
+        return el && !el.hidden ? el.value : null;
+      };
+      return {
+        server: { p: ctx.program_id || null, s: ctx.season_id || null,
+                  l: ctx.league_id || null },
+        bar: { prog: pick("ctx-select"), league: pick("ctx-league-select") },
+        card: entry.identity
+          ? { p: entry.identity.program_id || null, s: entry.identity.season_id || null,
+              l: entry.identity.league_id || null }
+          : null,
+        state: entry.state,
+      };
+    });
+    const wantTuple = { p: f.zulu, s: f.s2, l: f.dual };
+    if (JSON.stringify(tupleAgreement.server) !== JSON.stringify(wantTuple)) {
+      throw new Error(`[${L}] (K) the PERSISTED context is `
+        + `${JSON.stringify(tupleAgreement.server)}, expected ${JSON.stringify(wantTuple)}`);
+    }
+    if (tupleAgreement.bar.prog !== `${f.zulu}|${f.s2}`
+        || tupleAgreement.bar.league !== f.dual) {
+      throw new Error(`[${L}] (K) the rendered context bar `
+        + `${JSON.stringify(tupleAgreement.bar)} contradicts the persisted tuple `
+        + `${JSON.stringify(tupleAgreement.server)}`);
+    }
+    if (JSON.stringify(tupleAgreement.card) !== JSON.stringify(wantTuple)) {
+      throw new Error(`[${L}] (K) the participation card on screen is bound to `
+        + `${JSON.stringify(tupleAgreement.card)}, not the persisted tuple `
+        + `${JSON.stringify(tupleAgreement.server)} -- the control below would be `
+        + `acting from one context while the surface shows another`);
+    }
+    if (tupleAgreement.state === "stale" || tupleAgreement.state === "loading") {
+      throw new Error(`[${L}] (K) the participation card reads "${tupleAgreement.state}", `
+        + `so the control below was painted from data that is not this tuple's`);
+    }
+
     await page.click('[data-setup-workflow-act="division"]');
     await page.waitForSelector('.drawer[role="dialog"]', { timeout: 10000 });
     const seededLeague = await page.$eval("#f-div-league", (el) => el.value).catch(() => null);

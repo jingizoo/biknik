@@ -3936,11 +3936,33 @@ function setupPrereqFacts(src) {
   };
 }
 
-// THE effective action: the single control an EMPTY landing offers. Walks the
-// declared chain against live facts and returns the first UNMET step's action
-// plus the sentence naming why; all met (or no chain at all) resolves to the
-// declared primary, which is then genuinely the action that resolves the
-// state.
+// THE effective action: the single control a landing offers while a
+// prerequisite is missing. Walks the declared chain against live facts and
+// returns the first UNMET step's action plus the sentence naming why; all met
+// (or no chain at all) resolves to the declared primary, which is then
+// genuinely the action that resolves the state.
+//
+// Derived for EVERY SETTLED card, not only for EMPTY ones (#365 owner ruling,
+// round 2). EMPTY was never the whole defect: "Venues, rinks and ice" with one
+// venue and no rinks is READY, not EMPTY -- it has records to count -- and it
+// went on offering "Add Ice", which needs a rink that does not exist. A "Rinks"
+// link sitting next to it does not make that primary action live; it just means
+// the operator has to work out for themselves which of the three controls is
+// the one that can succeed. The same shape reaches Participation (divisions
+// registered but no team to register), "Clubs, players and staff" (officials
+// but, under the active League, no team to add a player to) and "Permanent
+// teams" (a club, but no league to hang a team off). The chain answers all of
+// them with the same question -- which record does the declared primary need
+// that is not there -- so it is asked for every card whose data has settled.
+//
+// Scope, deliberately: the SETUP cards only. The Home/Tasks card's "Continue
+// setup" CTA is not derived here and does not need to be -- it points at the
+// roll-up's `next`, which walks the ORDERED REQUIRED PREFIX and therefore
+// cannot recommend a workflow whose predecessor is unfinished (setupHubRollup).
+// It also has no `sv` of its own to derive from: its model comes from the
+// backend progress payload, and reading the setup overview on Home to answer a
+// question the ordering already answers would be a new data dependency, not a
+// fix.
 //
 // Fails CLOSED on an `open` step whose target workflow this role may not
 // open: openSetupWorkflowLanding() refuses an unauthorized key, so offering
@@ -3983,10 +4005,29 @@ function buildSetupWorkflowCardModel(w, src) {
     return Object.assign(base, { state: CARD_STATE.ERROR, stats: null,
       failed: "this workflow's setup status" });
   }
+  // THE derivation, for every settled state below (#365 owner ruling round 2).
+  // Computed from the SAME `src` the stats are, at the same moment, and
+  // committed into the model under the card's own identity -- so the action a
+  // landing offers and the counts beside it can never be answers about
+  // different context tuples, and nothing is re-derived at paint time.
+  //
+  // Deliberately NOT reached from the ERROR branches above: an ERROR card has
+  // no asserted payload to derive from (`sv` degrades to an empty shape on a
+  // failed read, which would fake every count to zero and manufacture a
+  // prerequisite that may well exist). ERROR keeps its declared actions and
+  // says only the summary is missing, exactly as before.
+  const derived = () => {
+    const eff = setupEffectiveAction(w, setupPrereqFacts(src));
+    return { effective: eff.action, blockedBecause: eff.why };
+  };
   // A workflow with no inventory of its own (Workflow 6) has no data
   // dependency, so it is never loading, empty or errored -- it is simply
-  // there, always reachable, which is what "optional" means here.
-  if (!w.summary) return Object.assign(base, { state: CARD_STATE.READY, stats: null });
+  // there, always reachable, which is what "optional" means here. It still
+  // carries a derivation: an empty chain resolves to the declared primary, so
+  // "every settled card has an effective action" holds without an exception.
+  if (!w.summary) {
+    return Object.assign(base, { state: CARD_STATE.READY, stats: null }, derived());
+  }
   if (!src.svOk) {
     return Object.assign(base, { state: CARD_STATE.ERROR, stats: null,
       failed: "the setup overview" });
@@ -4006,17 +4047,27 @@ function buildSetupWorkflowCardModel(w, src) {
   // an EMPTY landing offers is always bound to the same identity as the
   // counts beside it.
   if (stats.every((s) => !s.n)) {
-    const eff = setupEffectiveAction(w, setupPrereqFacts(src));
     return Object.assign(base, { state: CARD_STATE.EMPTY, stats: stats,
-      reason: "no_records", effective: eff.action, blockedBecause: eff.why });
+      reason: "no_records" }, derived());
   }
   // SUCCESS/complete for a landing is the workflow's own backend status
   // reading "done" -- the same signal the Home/Tasks card badges, so the two
   // surfaces can never disagree about whether a workflow is finished.
+  //
+  // Derived here too rather than assumed: "done" is the BACKEND's judgement
+  // about this workflow, and the chain's question is a different one (can the
+  // declared primary create anything RIGHT NOW, under this tuple). A League
+  // selection that narrows teams to zero makes "Add Player" dead on a roster
+  // the backend still calls done, and a done card that offers a dead action is
+  // the same dead end as an empty one.
   if (status === CARD_STATUS.DONE) {
-    return Object.assign(base, { state: CARD_STATE.SUCCESS, stats: stats });
+    return Object.assign(base, { state: CARD_STATE.SUCCESS, stats: stats }, derived());
   }
-  return Object.assign(base, { state: CARD_STATE.READY, stats: stats });
+  // PARTIAL -- the state the ruling's second round is about. Some of this
+  // workflow's counts are non-zero, so it is not EMPTY and the card has real
+  // records to show; that says nothing about whether the DECLARED primary can
+  // still create the next one.
+  return Object.assign(base, { state: CARD_STATE.READY, stats: stats }, derived());
 }
 
 // Bind every visible workflow card to a fresh identity and commit its model.
@@ -4149,6 +4200,18 @@ function setupCardBodyHtml(w, landing) {
     ? `<div class="swf-stats">${rows.map((s) =>
         `<span class="swf-stat"><strong>${s.n}</strong> ${esc(s.label)}</span>`).join("")}</div>`
     : "";
+  // The blocker sentence for a card that is NOT empty (#365 owner ruling round
+  // 2). A partial card shows real counts, so the EMPTY copy ("nothing here
+  // yet") would be a false statement — but the missing prerequisite is exactly
+  // as load-bearing, because it is why the action below is not this workflow's
+  // declared primary. Same committed field the withdrawal above reads, so the
+  // explanation and the control can never describe different problems, and no
+  // sentence at all when nothing is blocked.
+  const blockedNote = () => !entry.blockedBecause ? "" : `<p class="swf-card-blocked">
+    ${esc(entry.blockedBecause)}${entry.effective === null
+      ? " Ask a league admin to set that up."
+      : " Start with the action below — this workflow's usual next step can't"
+        + " be taken until then."}</p>`;
   if (entry.state === CARD_STATE.LOADING) {
     return `<div class="skeleton"><span class="sr-only">Loading ${
       esc(w.title.toLowerCase())}…</span></div>`;
@@ -4207,9 +4270,9 @@ function setupCardBodyHtml(w, landing) {
   if (entry.state === CARD_STATE.SUCCESS) {
     return `${stats(entry.stats)}
       <p class="swf-card-done">✓ This workflow is set up. You can still add
-        more whenever you need to.</p>`;
+        more whenever you need to.</p>${blockedNote()}`;
   }
-  return stats(entry.stats);
+  return `${stats(entry.stats)}${blockedNote()}`;
 }
 
 // One card body per surface, wrapped in the slot a per-card retry/refresh
@@ -4497,6 +4560,19 @@ function renderSetupHub(sv, ov) {
 //            with it) for a role lacking its `perm`, and an `open` step
 //            targeting a workflow this role cannot open resolves to no action
 //            at all rather than to a dead control.
+//   BLOCKED  the same withdrawal, in ANY settled state, whenever the card's
+//            model carries an unmet prerequisite (#365 owner ruling round 2).
+//            This is not a seventh CARD_STATE — it is a property of the
+//            derivation, and it is deliberately not folded into EMPTY: a
+//            PARTIAL card (venues but no rinks, divisions but no team to
+//            register) genuinely has records and must keep showing them, while
+//            still offering only the one action that can create the next one.
+//            The owner's ruling is that a neighbouring "Rinks" link does not
+//            make a dead "Add Ice" acceptable, so the demoted groups are
+//            withdrawn here exactly as they are in EMPTY: while a prerequisite
+//            is missing the landing exposes EXACTLY the effective action, and
+//            the card body carries the `blockedBecause` sentence that explains
+//            it.
 //   ERROR    keeps all three, deliberately and consistently with the copy the
 //            card body shows in this state: "The action below still works —
 //            only these counts are missing." Nothing about the actions is
@@ -4511,7 +4587,15 @@ function renderSetupHub(sv, ov) {
 // "may this control commit right now" — only the intent flag can, and it
 // clears only once a reconciliation has actually happened, on every success
 // and failure path. Same idiom as #369's contextHashIntentPending.
-function setupLandingActions(state) {
+//
+// `blocked` is the model's own answer (a committed `blockedBecause`), never a
+// re-derivation: the withdrawal and the sentence explaining it come from the
+// same committed field, so a landing can never withdraw its demoted actions
+// while the copy claims nothing is missing, or the reverse. It is consulted
+// AFTER the three withdrawal states above, which withdraw everything anyway --
+// a STALE card keeps whatever `blockedBecause` it settled with, and that
+// answer belongs to the tuple the operator has left.
+function setupLandingActions(state, blocked) {
   if (contextSwitchIntentPending) {
     return { primary: false, secondary: false, tertiary: false };
   }
@@ -4519,7 +4603,7 @@ function setupLandingActions(state) {
       || state === CARD_STATE.LOADING) {
     return { primary: false, secondary: false, tertiary: false };
   }
-  if (state === CARD_STATE.EMPTY) {
+  if (state === CARD_STATE.EMPTY || blocked) {
     return { primary: true, secondary: false, tertiary: false };
   }
   return { primary: true, secondary: true, tertiary: true };
@@ -4553,18 +4637,20 @@ function setupLandingActionsHtml(w) {
   const act = (a, cls, i, group) =>
     `<button class="act ${cls}" ${attr(a, i, group)}>${esc(a.label)}</button>`;
   const entry = readCardState(setupWorkflowCardId(w.key));
-  const allow = setupLandingActions(entry.state);
-  // THE effective action. In EMPTY it is whatever the committed model
-  // resolved from the prerequisite chain — which may be a demoted control, a
-  // sibling workflow, or (when this role cannot resolve it) nothing at all.
-  // In every other state the declared primary is already the resolving one.
+  const allow = setupLandingActions(entry.state, !!entry.blockedBecause);
+  // THE effective action, in EVERY settled state (#365 owner ruling round 2):
+  // whatever the committed model resolved from the prerequisite chain — which
+  // may be a demoted control, a sibling workflow, or (when this role cannot
+  // resolve it) nothing at all — and the declared primary only when the chain
+  // says that is genuinely the resolving action.
+  //
   // Read off the MODEL, never re-derived here: re-deriving would read live
   // module state at paint time and could answer for a tuple the card is not
-  // bound to.
+  // bound to. `undefined` means this card never carried a derivation (ERROR,
+  // or a model committed before one was computed), which falls back to the
+  // declared primary rather than silently rendering no action.
   const primaryAction = !allow.primary ? null
-    : entry.state === CARD_STATE.EMPTY
-      ? (entry.effective === undefined ? w.primary : entry.effective)
-      : w.primary;
+    : entry.effective === undefined ? w.primary : entry.effective;
   const secondary = allow.secondary
     ? (w.secondary || []).map((a, i) => act(a, "ghost", i, "secondary")).join("") : "";
   const tertiary = allow.tertiary
