@@ -573,29 +573,98 @@ class ApiService:
                 return {(league.program_id, None, league_id)}, True
         return set(), False
 
-    def _game_league_id(self, game):
-        """The competition League a Game belongs to, or None.
+    def _game_parent_constraints(self, game):
+        """``(constraints, broken)`` — the ``(program, season, league)`` each
+        NON-NULL Game parent names, every one resolved INDEPENDENTLY.
 
-        The explicit ``Game.league_id`` wins; otherwise the League is read off
-        the Game's ``league_season_id``, else its Division's LeagueSeason. An
-        unresolvable walk yields None (no League axis) rather than a guess —
-        the Program and Season ceilings still apply to that Game, and inventing
-        a League here would be exactly the "no invented League axis" mistake in
-        another costume."""
-        if game.league_id:
-            return game.league_id
-        ls_id = getattr(game, "league_season_id", None)
-        if ls_id:
-            ls = self.store.get_league_season(ls_id)
-            if ls is not None and ls.league_id:
-                return ls.league_id
-        if game.division_id:
-            division = self.store.get_division(game.division_id)
-            if division is not None and division.league_season_id:
-                ls = self.store.get_league_season(division.league_season_id)
-                if ls is not None and ls.league_id:
-                    return ls.league_id
-        return None
+        #372. The previous cut resolved ONE League for a Game by PRECEDENCE —
+        the explicit ``league_id``, else via ``league_season_id``, else via
+        ``division_id`` — and the gate then validated only that single winner.
+        A Game carries FOUR independent, nullable foreign keys (``season_id``,
+        ``league_id``, ``league_season_id``, ``division_id``) and the schema
+        ties none of them to any other, so a legitimate Program-A ``league_id``
+        HID the rest: a ``league_season_id`` or ``division_id`` pointing into
+        Program B was never examined and the Game was authorized. First-match
+        precedence is the wrong instrument for an authorization decision —
+        every parent that is really persisted is really reachable (the
+        scheduler, the standings walk and the league-scope helpers each follow
+        a DIFFERENT one of these columns), so every one of them must be judged.
+
+        What each non-null parent contributes:
+
+        * ``season_id``        → its Season's Program, and that Season.
+        * ``league_id``        → that League's Program, and that League.
+        * ``league_season_id`` → BOTH ends of the binding, as two SEPARATE
+          constraints: its Season (Program + Season) and its League (Program +
+          League). A binding whose own two ends disagree is therefore caught by
+          the very same fold as any other disagreeing pair, with no extra rule.
+        * ``division_id``      → its LeagueSeason, judged identically.
+
+        A NULL parent contributes NOTHING. It names no axis, and inventing one
+        would refuse both real supported states this file already protects: the
+        Season-less exhibition (#283 Slice D) and the not-yet-parented draft.
+        This is the "no invented League axis" rule, unchanged.
+
+        ``broken`` is True when a non-null parent does NOT resolve — a dangling
+        id, or a Season/League row carrying no Program. That is exactly the
+        ``saw_link`` treatment used throughout this file: the link exists, it
+        cannot be judged, so it fails closed. Silently skipping an unresolvable
+        parent instead would make CORRUPTING the graph (or racing a delete) a
+        way to erase a constraint, i.e. a privilege gain earned by breaking
+        data rather than by holding rights."""
+        constraints, broken = [], False
+        bindings = []                        # LeagueSeason ids still to judge
+
+        season_id = getattr(game, "season_id", None) or None
+        league_id = getattr(game, "league_id", None) or None
+        league_season_id = getattr(game, "league_season_id", None) or None
+        division_id = getattr(game, "division_id", None) or None
+
+        if season_id:
+            season = self.store.get_season(season_id)
+            if season is None or not season.program_id:
+                broken = True
+            else:
+                constraints.append((season.program_id, season.id, None))
+
+        if league_id:
+            league = self.store.get_league(league_id)
+            if league is None or not league.program_id:
+                broken = True
+            else:
+                constraints.append((league.program_id, None, league.id))
+
+        if league_season_id:
+            bindings.append(league_season_id)
+
+        if division_id:
+            # A Division is a child of a LeagueSeason, so it imposes precisely
+            # the constraints that binding does — no more, no less.
+            division = self.store.get_division(division_id)
+            if division is None or not division.league_season_id:
+                broken = True
+            else:
+                bindings.append(division.league_season_id)
+
+        for binding_id in bindings:
+            ls = self.store.get_league_season(binding_id)
+            if ls is None:
+                broken = True
+                continue
+            season = (self.store.get_season(ls.season_id)
+                      if ls.season_id else None)
+            if season is None or not season.program_id:
+                broken = True
+            else:
+                constraints.append((season.program_id, season.id, None))
+            league = (self.store.get_league(ls.league_id)
+                      if ls.league_id else None)
+            if league is None or not league.program_id:
+                broken = True
+            else:
+                constraints.append((league.program_id, None, league.id))
+
+        return constraints, broken
 
     def _venue_program_ids(self, venue):
         """Program ids a Venue is linked to — the Program component of
@@ -674,7 +743,9 @@ class ApiService:
         team                own/     — (permanent; the Season   Team.league_id
                             League   lives on its registration)
         player              its Team — (as Team)                as its Team
-        game                chain    Game.season_id when set    resolved League
+        game                all its  all its parents' Seasons   all its
+                            parents  — they must AGREE (#372)   parents'
+                                                                Leagues
         club                Teams    — (as Teams)               its Teams'
         official            club +   its Games' Seasons         club + Games'
                             Games
@@ -755,47 +826,48 @@ class ApiService:
             return self._team_edges(team)
 
         if kind == "game":
-            # A REGULAR game's Season is its Program chain. An exhibition may
-            # carry no Season (#283 Slice D); only then are its League and
-            # Division consulted, so a set season_id is never second-guessed
-            # FOR THE PROGRAM/SEASON components. The League axis, when one
-            # resolves, must still AGREE with that Season's Program (#369
-            # re-review 2): ``Game.season_id`` and ``Game.league_id`` /
-            # ``league_season_id`` are independent FKs, so a game whose named
-            # League lives in another Program is a persisted disagreement and
-            # is linked-but-unauthorized, never an edge the No-League union
-            # could authorize.
-            league_id = self._game_league_id(record)
-            if record.season_id:
-                season = self.store.get_season(record.season_id)
-                if season is None:
-                    return edges, True
-                if not season.program_id:
-                    return edges, True
-                # Reject only a REAL cross-Program disagreement (the resolved
-                # League lives in another Program than the Game's Season); a
-                # dangling/absent League leaves ``league_id`` None and is judged
-                # by the Season, consistent with the Team and LeagueSeason edges.
-                if league_id is not None:
-                    league = self.store.get_league(league_id)
-                    if (league is not None and league.program_id
-                            and league.program_id != season.program_id):
-                        return edges, True  # real cross-Program disagreement
-                return ({(season.program_id, season.id, league_id)}, True)
-            if record.league_id:
-                league = self.store.get_league(record.league_id)
-                if league is None:
-                    return edges, True
-                if league.program_id:
-                    # No Season: a Season-less exhibition genuinely has none.
-                    return ({(league.program_id, None, record.league_id)}, True)
+            # EVERY non-null parent, judged INDEPENDENTLY, failing closed on
+            # ANY disagreement (#372).
+            #
+            # A Game is the one setup record with four independent parent FKs,
+            # and the earlier gate validated only the highest-precedence League
+            # SOURCE: a valid Program-A ``league_id`` masked a
+            # ``league_season_id`` or ``division_id`` in Program B — or in a
+            # different Season of the same Program — and the row answered 200.
+            # Two independently persisted parents that disagree mean this row's
+            # parent graph STRADDLES the ceiling. That is linked-but-
+            # UNAUTHORIZED: never an edge, so the No-League union (whose League
+            # comparison is legitimately skipped) can never rescue it, and
+            # never creator-claimable either.
+            #
+            # The Program and Season axes are the ceiling itself. The League
+            # axis is folded on the same terms because a Game's League sources
+            # are REDUNDANT by construction rather than independent facts —
+            # ``league_season_id`` is documented as "its single source of
+            # competition identity, so season_id and league_id can never drift
+            # apart", and `move`/`publish` already reject the drift outright
+            # (``game_league_season_mismatch``). Two parents naming DIFFERENT
+            # Leagues inside one Program/Season is the same cross-League IDOR
+            # #369's re-review closed for Players, reached through a Game.
+            #
+            # A NULL parent constrains nothing, so a Season-less exhibition
+            # (#283 Slice D) still genuinely has no Season and no League axis
+            # is invented for it.
+            constraints, broken = self._game_parent_constraints(record)
+            if broken:
+                # A non-null parent that does not resolve: linked, unjudgeable.
                 return edges, True
-            if record.division_id:
-                division = self.store.get_division(record.division_id)
-                if division is None:
-                    return edges, True
-                return self._setup_target_edges("division", division)
-            return edges, saw_link
+            if not constraints:
+                # No parent at all — a genuinely unparented draft. The
+                # pending-link/creator contract applies, exactly as before.
+                return edges, saw_link
+            programs = {axes[0] for axes in constraints}
+            seasons = {axes[1] for axes in constraints if axes[1] is not None}
+            leagues = {axes[2] for axes in constraints if axes[2] is not None}
+            if len(programs) > 1 or len(seasons) > 1 or len(leagues) > 1:
+                return edges, True           # the parents DISAGREE
+            return ({(programs.pop(), next(iter(seasons), None),
+                      next(iter(leagues), None))}, True)
 
         if kind == "club":
             # A Club owns Teams across Programs and Leagues; its links are its

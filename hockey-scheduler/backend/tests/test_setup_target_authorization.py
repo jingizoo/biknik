@@ -4102,6 +4102,484 @@ class SetupTargetAxisConsistencyTest(unittest.TestCase):
 
 
 # ==========================================================================
+# A GAME'S FOUR PARENTS, EACH VALIDATED INDEPENDENTLY (#372).
+#
+# The blocker `SetupTargetAxisConsistencyTest` above did NOT catch: the gate
+# resolved a Game's League by PRECEDENCE -- explicit `league_id`, else via
+# `league_season_id`, else via `division_id` -- and then validated only that
+# one winner against the Game's Season. So a legitimate Program-A `league_id`
+# HID the other two parents: a `league_season_id` or `division_id` pointing
+# into Program B (or into a different Season of the same Program) was never
+# examined at all, and `POST /api/{,v2/}setup/game/<id>/delete` deleted a Game
+# whose persisted parent graph straddled the ceiling.
+#
+# The shape above varies `game.league_id` -- the WINNER of that precedence --
+# which is why it passed while the losers went unchecked. This class varies
+# each LOSER in turn, on both axes:
+#
+#   * a valid Program-A `league_id` + a `league_season_id` in Program B
+#   * a valid Program-A `league_id` + a `division_id` in Program B
+#   * both again with the foreign parent in another SEASON of the SAME
+#     Program, so the Program ceiling cannot explain the refusal
+#   * every parent column dangling in turn (the `saw_link` fail-closed rule)
+#   * the fully consistent Game, which must still SUCCEED -- the fix is a
+#     scope decision, not a blanket block on Games carrying several parents.
+#
+# Every precondition is read out of the STORED ROWS (not out of
+# `_setup_target_edges`, and not out of `chain_axes`, which mirrors the OLD
+# first-match walk on purpose): the parents really do disagree, and in the
+# disagreement cases every referenced row really exists, so no refusal below
+# can be explained by a dangling id instead of by the disagreement.
+# ==========================================================================
+
+def _game_parent_world(api, store, tag, actor):
+    """One Program with TWO Seasons, one PERMANENT League bound to BOTH, and a
+    Division under each binding.
+
+    Two Seasons per Program are what make the same-Program/other-Season half of
+    this class expressible: the foreign parent then differs from the Game's own
+    Season in the SEASON axis alone -- same Program, same League -- so no
+    refusal it produces can be explained by the Program ceiling that the rest
+    of this file already proves."""
+    program = api.create_program(f"GP-{tag} Program", "US", "UTC", None, actor)
+    assert "error" not in program, program
+    seasons = []
+    for n in (1, 2):
+        season = api.create_season(program["id"], f"GP-{tag} Season {n}",
+                                   actor_id=actor)
+        assert "error" not in season, season
+        seasons.append(season)
+    league = api.create_league(seasons[0]["id"], f"GP-{tag} League", 0, actor)
+    assert "error" not in league, league
+    bindings, divisions = [], []
+    for index, season in enumerate(seasons):
+        if index == 0:
+            binding = store.league_season_for(league["id"], season["id"])
+        else:
+            # The permanent League joins a SECOND Season (#283 rule 5). There
+            # is no v1/v2 route for binding an existing League to another
+            # Season, so the product's own service method does it.
+            binding = api.setup.create_league_season(league["id"],
+                                                     season["id"], actor)
+        assert binding is not None, (tag, season["id"])
+        bindings.append(binding.id)
+        division = api.create_division_v2(league["id"],
+                                          f"GP-{tag} Division {index + 1}", "",
+                                          actor, season_id=season["id"])
+        assert "error" not in division, division
+        divisions.append(division["id"])
+    club = api.create_club(f"GP-{tag} Club", "", actor)
+    team = api.create_team(club["id"], None, f"GP-{tag} Team", actor,
+                           league_id=league["id"])
+    assert "error" not in team, team
+    return {"program": program["id"],
+            "seasons": [season["id"] for season in seasons],
+            "league": league["id"], "league_seasons": bindings,
+            "divisions": divisions, "team": team["id"]}
+
+
+def _inject_parented_draft_game(store, home_team_id, offset_hours, parents):
+    """A draft Game carrying exactly ``parents``.
+
+    Injected rather than created through a route for the same reason every
+    other draft in this file is: a draft is minted by the scheduler, never by a
+    setup route -- and `create_game` derives the very consistency this class
+    exists to violate, so it cannot express these shapes at all."""
+    from hockey_scheduler.domain.models import Game
+    game = Game(id=store.next_id("game"), home_team_id=home_team_id,
+                start_time=_FUTURE + timedelta(hours=offset_hours),
+                is_draft=True, **parents)
+    store.add_game(game)
+    return game.id
+
+
+def game_parent_axes(store, game):
+    """Each NON-NULL parent of ``game``, resolved from the STORED ROWS to the
+    ``(program, season, league)`` it names -- or None when it dangles.
+
+    Deliberately NOT `chain_axes`: that helper mirrors the FIRST-MATCH walk and
+    therefore reports one League for the whole Game, which is exactly the
+    collapse under test. This one keeps the parents apart, so a precondition
+    here can state "these two parents disagree" as a fact about the database
+    rather than as an opinion of the code being measured."""
+    def _binding(league_season_id):
+        ls = store.get_league_season(league_season_id)
+        if ls is None:
+            return None
+        season = store.get_season(ls.season_id) if ls.season_id else None
+        league = store.get_league(ls.league_id) if ls.league_id else None
+        if season is None or league is None:
+            return None
+        return (season.program_id, season.id, league.id)
+
+    axes = {}
+    if game.season_id:
+        season = store.get_season(game.season_id)
+        axes["season_id"] = (None if season is None
+                             else (season.program_id, season.id, None))
+    if game.league_id:
+        league = store.get_league(game.league_id)
+        axes["league_id"] = (None if league is None
+                             else (league.program_id, None, league.id))
+    if getattr(game, "league_season_id", None):
+        axes["league_season_id"] = _binding(game.league_season_id)
+    if game.division_id:
+        division = store.get_division(game.division_id)
+        axes["division_id"] = (
+            None if division is None or not division.league_season_id
+            else _binding(division.league_season_id))
+    return axes
+
+
+class SetupTargetGameParentConsistencyTest(unittest.TestCase):
+    """#372, the PREDICATE leg: every Game parent on every backend."""
+
+    OWNER_A = "gp_owner_a"
+    OWNER_B = "gp_owner_b"
+    CALLER = "gp_caller"
+
+    # -- the shapes, and the precondition each one has to establish ----------
+    #
+    # (label, parent overrides, expected verdict, precondition). The base row
+    # is Program A / Season 1 / League A, CONSISTENT across all four columns;
+    # every shape moves exactly ONE parent, so nothing else can explain its
+    # outcome.
+    def _shapes(self, a, b):
+        consistent = {"season_id": a["seasons"][0],
+                      "league_id": a["league"],
+                      "league_season_id": a["league_seasons"][0],
+                      "division_id": a["divisions"][0]}
+        return [
+            ("the fully consistent Game", consistent, True,
+             ("consistent", None)),
+            ("a valid Program-A league_id hiding a Program-B "
+             "league_season_id",
+             {**consistent, "league_season_id": b["league_seasons"][0]},
+             False, ("disagree", "program")),
+            ("a valid Program-A league_id hiding a Program-B division_id",
+             {**consistent, "division_id": b["divisions"][0]},
+             False, ("disagree", "program")),
+            ("a valid Season-1 parent set hiding a Season-2 "
+             "league_season_id",
+             {**consistent, "league_season_id": a["league_seasons"][1]},
+             False, ("disagree", "season")),
+            ("a valid Season-1 parent set hiding a Season-2 division_id",
+             {**consistent, "division_id": a["divisions"][1]},
+             False, ("disagree", "season")),
+            ("a DANGLING league_season_id",
+             {**consistent, "league_season_id": "gp_league_season_vanished"},
+             False, ("dangling", "league_season_id")),
+            ("a DANGLING division_id",
+             {**consistent, "division_id": "gp_division_vanished"},
+             False, ("dangling", "division_id")),
+            ("a DANGLING league_id",
+             {**consistent, "league_id": "gp_league_vanished"},
+             False, ("dangling", "league_id")),
+            ("a DANGLING season_id",
+             {**consistent, "season_id": "gp_season_vanished"},
+             False, ("dangling", "season_id")),
+        ]
+
+    def _assert_precondition(self, store, game_id, parents, precondition,
+                             where):
+        """The fixture really is what its label says, read from the store.
+
+        Without this, every refusal below is satisfied by a gate that refuses
+        Games outright, by a store that silently dropped a parent column, or by
+        a fixture whose "foreign" parent turned out to be a dangling id."""
+        game = store.get_game(game_id)
+        self.assertIsNotNone(game, f"{where}: the fixture Game was not stored")
+        for column, value in parents.items():
+            self.assertEqual(
+                getattr(game, column), value,
+                f"{where}: the store did not persist {column} -- every "
+                f"assertion about this shape would be vacuous")
+        axes = game_parent_axes(store, game)
+        self.assertEqual(
+            set(axes), set(parents),
+            f"{where}: the resolved parents {sorted(axes)} are not the four "
+            f"columns the fixture set")
+        rule, subject = precondition
+
+        if rule == "dangling":
+            self.assertIsNone(
+                axes[subject],
+                f"{where}: {subject} RESOLVES, so this is not the dangling "
+                f"case it claims to be")
+            for column, resolved in axes.items():
+                if column != subject:
+                    self.assertIsNotNone(
+                        resolved,
+                        f"{where}: {column} dangles too, so a refusal cannot "
+                        f"be attributed to {subject}")
+            return
+
+        for column, resolved in axes.items():
+            self.assertIsNotNone(
+                resolved,
+                f"{where}: the {column} parent does not resolve -- a refusal "
+                f"would be the DANGLING rule, not the disagreement rule")
+        programs = {resolved[0] for resolved in axes.values()}
+        seasons = {resolved[1] for resolved in axes.values()
+                   if resolved[1] is not None}
+        leagues = {resolved[2] for resolved in axes.values()
+                   if resolved[2] is not None}
+
+        if rule == "consistent":
+            self.assertEqual(
+                (len(programs), len(seasons), len(leagues)), (1, 1, 1),
+                f"{where}: the control's own parents disagree "
+                f"({programs}/{seasons}/{leagues}), so its acceptance would "
+                f"prove nothing")
+            return
+
+        self.assertEqual(rule, "disagree", rule)
+        if subject == "program":
+            self.assertEqual(
+                len(programs), 2,
+                f"{where}: the parents agree on Program ({programs}) -- the "
+                f"fixture does not reproduce the reported blocker")
+        else:
+            self.assertEqual(
+                len(programs), 1,
+                f"{where}: the parents ALSO cross the Program ceiling "
+                f"({programs}), so a refusal could be the Program rule rather "
+                f"than the Season rule this shape is about")
+            self.assertEqual(
+                len(seasons), 2,
+                f"{where}: the parents agree on Season ({seasons}) -- this "
+                f"shape does not vary the axis it claims to")
+
+    def test_every_game_parent_is_validated_on_each_backend(self):
+        for backend, store in _backends():
+            with self.subTest(backend=backend):
+                api = ApiService(store)
+                caller = (self.CALLER, Role.LEAGUE_ADMIN, {})
+                a = _game_parent_world(api, store, "A", self.OWNER_A)
+                b = _game_parent_world(api, store, "B", self.OWNER_B)
+                # Program A + Season 1 + NO League: the union selection whose
+                # League comparison is legitimately skipped, and the exact
+                # context the blocker was reported under. A refusal here
+                # therefore cannot come from an unmatched League component.
+                api.set_active_context(*caller, a["program"], a["seasons"][0])
+
+                for offset, (label, parents, expected, precondition) in \
+                        enumerate(self._shapes(a, b)):
+                    where = f"[{backend}] {label}"
+                    game_id = _inject_parented_draft_game(
+                        store, a["team"], offset, parents)
+                    self._assert_precondition(store, game_id, parents,
+                                              precondition, where)
+                    # An injected draft has NO creation audit row, so rule 6
+                    # (unlinked -> creator only) can never explain a True.
+                    self.assertEqual(
+                        created_by(store, "game", game_id), set(),
+                        f"{where}: the injected Game has a creator audit row, "
+                        f"so an acceptance could come from creator ownership "
+                        f"rather than from its parent chain")
+                    self.assertIs(
+                        api.setup_target_accessible("game", game_id, *caller),
+                        expected,
+                        f"{where}: expected accessible={expected}. A Game "
+                        f"whose parents disagree is linked-but-UNAUTHORIZED; "
+                        f"a Game whose parents all agree must stay manageable")
+                # The gate is still a scope decision on this backend: a
+                # nonexistent Game and the foreign world's consistent Game both
+                # fail closed, and switching context reaches the latter.
+                foreign = _inject_parented_draft_game(
+                    store, b["team"], 90,
+                    {"season_id": b["seasons"][0], "league_id": b["league"],
+                     "league_season_id": b["league_seasons"][0],
+                     "division_id": b["divisions"][0]})
+                self.assertIs(
+                    api.setup_target_accessible("game", foreign, *caller),
+                    False, f"[{backend}] a Program-B Game was accessible")
+                self.assertIs(
+                    api.setup_target_accessible("game", "gp_no_such_game",
+                                                *caller),
+                    False, f"[{backend}] a nonexistent Game did not fail "
+                           f"closed")
+                api.set_active_context(*caller, b["program"], b["seasons"][0])
+                self.assertIs(
+                    api.setup_target_accessible("game", foreign, *caller),
+                    True,
+                    f"[{backend}] selecting the Game's OWN Program/Season did "
+                    f"not make it accessible -- the refusals above are a "
+                    f"blanket block on multi-parent Games, not a scope "
+                    f"decision")
+                _close(store)
+
+
+class SetupTargetGameParentConsistencyHttpTest(unittest.TestCase):
+    """#372 over AUTHENTICATED v1 and v2 HTTP, on every backend.
+
+    Same shapes as the predicate class above, driven through
+    ``POST /api/setup/game/<id>/delete`` and
+    ``POST /api/v2/setup/game/<id>/delete`` -- the two routes the blocker was
+    reported against. Each refusal is compared as RAW BYTES with the same call
+    against a nonexistent Game id (only the echoed id masked), and the Game row
+    and setup-audit trail are asserted unchanged afterwards."""
+
+    OWNER_A = "gpx_owner_a"
+    OWNER_B = "gpx_owner_b"
+
+    @classmethod
+    def setUpClass(cls):
+        srv = __import__("hockey_scheduler.web.server", fromlist=["x"])
+        cls.srv = srv
+        os.environ.pop("DATABASE_URL", None)
+        srv.STATE.reset(seed=False)
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.Handler)
+        cls.port = cls.httpd.server_address[1]
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
+                                      daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.thread.join(timeout=5)
+
+    # -- plumbing (the axis-consistency class's shape, verbatim) ------------
+    _reset_backend = SetupTargetAxisConsistencyTest._reset_backend
+    _client = SetupTargetAxisConsistencyTest._client
+    _raw = SetupTargetAxisConsistencyTest._raw
+    _post = SetupTargetAxisConsistencyTest._post
+    _select = SetupTargetAxisConsistencyTest._select
+    _ok = SetupTargetAxisConsistencyTest._ok
+    _audit_rows = SetupTargetAxisConsistencyTest._audit_rows
+    _blind = staticmethod(SetupTargetAxisConsistencyTest._blind)
+    _shapes = SetupTargetGameParentConsistencyTest._shapes
+    _assert_precondition = \
+        SetupTargetGameParentConsistencyTest._assert_precondition
+
+    def _account(self, username, role):
+        account = self.srv.STATE.api.accounts.create_account(
+            username, "gameparent-pw", role, scope={}, actor_id="test_seed")
+        opener = self._client()
+        status, resp, _ = self._post(opener, "/api/auth/login",
+                                     {"username": username,
+                                      "password": "gameparent-pw"})
+        self.assertEqual(status, 200, (username, resp))
+        return opener, account.id
+
+    def _world(self, opener, tag):
+        """The HTTP twin of ``_game_parent_world``: two Seasons, one permanent
+        League bound to both, a Division under each binding, and a Team."""
+        store = self.srv.STATE.api.store
+        program = self._ok(opener, "/api/v2/setup/program",
+                           {"name": f"GPX {tag} Program"})
+        self._select(opener, program["id"])
+        seasons = []
+        for n in (1, 2):
+            season = self._ok(opener, "/api/v2/setup/season",
+                              {"program_id": program["id"],
+                               "name": f"GPX {tag} Season {n}"})
+            seasons.append(season["id"])
+        self._select(opener, program["id"], seasons[0])
+        league = self._ok(opener, "/api/v2/setup/league",
+                          {"season_id": seasons[0],
+                           "name": f"GPX {tag} League"})
+        bindings, divisions = [], []
+        for index, season_id in enumerate(seasons):
+            if index == 0:
+                binding = store.league_season_for(league["id"], season_id)
+            else:
+                # No route binds an EXISTING League to a second Season; the
+                # product's own service method does it (#283 rule 5).
+                binding = self.srv.STATE.api.setup.create_league_season(
+                    league["id"], season_id, "test_seed")
+            self.assertIsNotNone(binding,
+                                 f"fixture: the {tag}/{index} binding")
+            bindings.append(binding.id)
+            division = self._ok(opener, "/api/v2/setup/division",
+                                {"league_id": league["id"],
+                                 "season_id": season_id,
+                                 "name": f"GPX {tag} Division {index + 1}"})
+            divisions.append(division["id"])
+        team = self._ok(opener, "/api/v2/setup/team",
+                        {"league_id": league["id"], "name": f"GPX {tag} Team"})
+        return {"program": program["id"], "seasons": seasons,
+                "league": league["id"], "league_seasons": bindings,
+                "divisions": divisions, "team": team["id"]}
+
+    def _refused(self, opener, base, game_id, why):
+        """The delete is refused, byte-identically to a nonexistent id, and
+        writes nothing -- neither the Game row nor the setup-audit trail."""
+        store = self.srv.STATE.api.store
+        before_audit = self._audit_rows()
+        before_row = dict(vars(store.get_game(game_id)))
+        ghost = "gpx_game_does_not_exist"
+        g_status, g_raw = self._raw(opener, "POST",
+                                    f"{base}/game/{ghost}/delete", {})
+        status, raw = self._raw(opener, "POST",
+                                f"{base}/game/{game_id}/delete", {})
+        self.assertEqual(status, 404, (why, base, raw))
+        self.assertEqual(g_status, 404, (why, base, "ghost probe", g_raw))
+        self.assertEqual(
+            self._blind(raw, game_id), self._blind(g_raw, ghost),
+            f"{why} [{base}]: the disagreeing-parent refusal is "
+            f"distinguishable from a nonexistent id -- an existence oracle")
+        row = store.get_game(game_id)
+        self.assertIsNotNone(row, f"{why} [{base}]: the Game was DELETED")
+        self.assertEqual(dict(vars(row)), before_row,
+                         f"{why} [{base}]: the refused delete edited the row")
+        self.assertEqual(self._audit_rows(), before_audit,
+                         f"{why} [{base}]: the refused delete wrote audit")
+
+    def _run(self, database_url, backend):
+        self._reset_backend(database_url, backend)
+        store = self.srv.STATE.api.store
+        owner_a, _uid_a = self._account(f"{self.OWNER_A}_{backend}",
+                                        Role.LEAGUE_ADMIN)
+        owner_b, _uid_b = self._account(f"{self.OWNER_B}_{backend}",
+                                        Role.LEAGUE_ADMIN)
+        a = self._world(owner_a, "A")
+        b = self._world(owner_b, "B")
+        # The reported context: Program A, Season 1, NO League.
+        self._select(owner_a, a["program"], a["seasons"][0])
+
+        offset = 0
+        for label, parents, allowed, precondition in self._shapes(a, b):
+            for base in ("/api/setup", "/api/v2/setup"):
+                where = f"[{backend}] {label}"
+                offset += 1
+                # A fresh Game per version: the control's delete CONSUMES it,
+                # and a refusal must be measured against an untouched row.
+                game_id = _inject_parented_draft_game(store, a["team"],
+                                                      offset, parents)
+                self._assert_precondition(store, game_id, parents,
+                                          precondition, where)
+                self.assertEqual(
+                    created_by(store, "game", game_id), set(),
+                    f"{where} [{base}]: the injected Game has a creator audit "
+                    f"row, so a 200 could come from creator ownership")
+                if allowed:
+                    self._ok(owner_a, f"{base}/game/{game_id}/delete", {},
+                             why=f"{where} [{base}] consistent-Game control")
+                    self.assertIsNone(
+                        store.get_game(game_id),
+                        f"{where} [{base}]: the control delete answered 200 "
+                        f"without deleting anything")
+                else:
+                    self._refused(owner_a, base, game_id, where)
+
+    def test_game_parent_consistency_memory(self):
+        self._run(None, "memory")
+
+    def test_game_parent_consistency_sqlite_file(self):
+        # FILE-BACKED, matching the axis-consistency class: ":memory:" cannot
+        # express the real cross-connection semantics this suite proves.
+        tmp = tempfile.mkdtemp(prefix="hs-gameparent-")
+        self._run(f"sqlite:///{os.path.join(tmp, 'gameparent.db')}", "sqlite")
+
+    @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                         "PostgreSQL required (set TEST_DATABASE_URL)")
+    def test_game_parent_consistency_postgres(self):
+        self._run(os.environ["TEST_DATABASE_URL"], "postgres")
+
+
+# ==========================================================================
 # IN-TRANSACTION interleaving and the row locks (#369 re-review, blocking
 # test gap).
 #
