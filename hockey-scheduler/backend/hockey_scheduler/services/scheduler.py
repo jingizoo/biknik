@@ -21,6 +21,12 @@ is reported in ``already_scheduled``, never re-proposed and never silently
 dropped (#206 slice 1) — re-running Generate against a Division that
 already has some Games fills in only the missing matchups; it never
 duplicates the ones that exist.
+
+A team is never proposed for two overlapping games (#373). Occupancy is
+team-wide — keyed by stable team id and actual interval, never by rink or
+display name — and covers BOTH already-persisted games and the candidates
+this very batch has already accepted, so the preview can no longer show (and
+offer to commit) a physically impossible schedule.
 """
 
 import hashlib
@@ -29,6 +35,7 @@ from datetime import date, timedelta
 
 from ..domain import GameType, IceSlotStatus, IceSlotType
 from ..domain.errors import ValidationError
+from ..domain.time_utils import intervals_overlap
 from .league_scope import (
     registered_team_ids_in_division,
     registered_teams_by_division_in_league,
@@ -211,6 +218,16 @@ CURFEW_VIOLATION = "curfew_violation"
 # #318 review — physical overlap is refused by the gate UNCONDITIONALLY
 # (zero/absent policies change nothing), so the advisory mirrors it too.
 SLOT_OVERLAP_CONFLICT = "slot_overlap_conflict"
+# #373 — the preview's mirror of the commit gate's team-wide double-booking
+# refusal (SetupService._assert_slot_free_for_game). Deliberately the SAME
+# string the gate raises in details["reason"], so an operator sees one stable
+# code (and the move panel's existing label copy) whether the conflict was
+# caught in preview or at commit. Evaluated LAST, after _slot_reason and the
+# policy advisory: like the #277 Slice B codes before it, appending the new
+# check keeps every reason code an existing slot already reported unchanged —
+# TEAM_OVERLAP only ever appears where the generator previously reported
+# nothing at all, which is precisely the impossible-schedule bug it closes.
+TEAM_OVERLAP = "team_overlap"
 
 
 def _slot_reason(slot, home, away, con, team_slots):
@@ -242,19 +259,23 @@ def _slot_reason(slot, home, away, con, team_slots):
     return None, None
 
 
-def _policy_advisor(store, season_id):
-    """Per-run advisory closure over the shared policy evaluation (#277
-    Slice B). Returns ``check(slot, tentative_spans) -> (code, message)`` or
-    ``(None, None)``; ``tentative_spans`` is this run's not-yet-persisted
-    same-rink picks as ``(slot_id, start, end)``. Plain reads only. ALWAYS
-    active (#318 review): the gate's slot_overlap_conflict is unconditional
-    — it binds with zero policy rows and even when no season resolves
-    (season-less legacy divisions) — so the advisory mirrors it through the
-    same shared implementation. The active-game inventory is snapshotted
-    ONCE per run and handed down, so a draft over N candidate slots never
-    re-scans the game table N times; with no policies and no overlapping
-    candidates the proposal output remains byte-identical to pre-Slice-B."""
-    setup = _PolicySetup(store)
+def _active_game_slot_pairs(store):
+    """Every non-cancelled Game that actually occupies ice, paired with its
+    resolved ``IceSlot`` — the run's single snapshot of the active-game
+    inventory, taken ONCE and handed to both the policy advisory (#277
+    Slice B) and the team-occupancy seed (#373) so a draft over N candidate
+    slots never re-scans the game table N times.
+
+    Exactly the read-set the commit gate's own scan uses
+    (``SetupService._assert_slot_free_for_game``): a game is in scope iff it
+    is not cancelled and resolves to a real slot — no Season, League,
+    Division, draft/published, or GameType filtering. That is deliberate on
+    both sides. A team is one physical roster: it cannot be on two sheets of
+    ice at once because the second booking happens to be an EXHIBITION, a
+    still-unpublished draft, or a fixture in another Division or Season.
+    Filtering here would make the preview propose rows the gate is
+    guaranteed to refuse — the exact divergence #373 exists to close.
+    """
     pairs = []
     for g in store.all_games():
         if g.cancelled or not g.ice_slot_id:
@@ -262,6 +283,92 @@ def _policy_advisor(store, season_id):
         s = store.get_ice_slot(g.ice_slot_id)
         if s is not None:
             pairs.append((g, s))
+    return pairs
+
+
+def _persisted_team_spans(pairs):
+    """``{team_id: [(start, end, game_id)]}`` occupancy from the persisted
+    games in ``pairs`` (#373).
+
+    Keyed by stable team id, never by rink or display name, and a team's HOME
+    and AWAY appearances are recorded identically — the conflict is "this
+    roster is already on the ice", which has no home/away asymmetry, so all
+    four home/home, home/away, away/home and away/away permutations resolve
+    through this one map.
+
+    The interval is the SLOT's, not the Game's own ``start_time``/
+    ``end_time``: those are copied onto the Game at creation and the gate
+    likewise compares slot to slot, so reading the slot keeps preview and
+    commit measuring the same edges."""
+    spans = {}
+    for g, s in pairs:
+        for tid in (g.home_team_id, g.away_team_id):
+            if tid:
+                spans.setdefault(tid, []).append((s.start_time, s.end_time, g.id))
+    return spans
+
+
+def _team_overlap_reason(store, slot, home, away, team_spans):
+    """Why ``slot`` would double-book ``home`` or ``away`` (#373), as
+    ``(code, message, conflicts)``, or ``(None, None, ())`` if it would not.
+
+    ``team_spans`` is ``{team_id: [(start, end, game_id_or_None)]}`` — the
+    persisted occupancy from :func:`_persisted_team_spans` PLUS every
+    candidate this batch has already accepted (``game_id`` ``None``, since
+    nothing is persisted yet). Checking the two together is the point: a
+    batch's own rows conflict with each other exactly as readily as with the
+    existing schedule, and a preview that only consulted the database would
+    still happily emit the two-rinks-one-team pair this closes.
+
+    Overlap is a half-open INTERVAL test via the shared
+    :func:`~..domain.time_utils.intervals_overlap`, not a same-start-time
+    test: a partial overlap starting at a different minute is just as
+    impossible, while a back-to-back game beginning exactly when the
+    previous one ends stays legal.
+
+    ``conflicts`` names each affected team (and the persisted game it
+    collides with, when there is one) so the caller can report a structured
+    result rather than only prose."""
+    conflicts = []
+    for tid in (home, away):
+        for start, end, game_id in team_spans.get(tid, ()):
+            if not intervals_overlap(slot.start_time, slot.end_time, start, end):
+                continue
+            conflicts.append({
+                "team_id": tid,
+                "team_name": _team_name(store, tid),
+                "conflict_source": ("existing_game" if game_id is not None
+                                    else "proposed_game"),
+                "conflict_game_id": game_id,
+            })
+            break  # one conflicting booking per team is enough to refuse
+    if not conflicts:
+        return None, None, ()
+    names = sorted({c["team_name"] for c in conflicts})
+    verb = "has" if len(names) == 1 else "have"
+    return (TEAM_OVERLAP,
+            f"{' and '.join(names)} already {verb} an overlapping game",
+            tuple(conflicts))
+
+
+def _policy_advisor(store, season_id, pairs=None):
+    """Per-run advisory closure over the shared policy evaluation (#277
+    Slice B). Returns ``check(slot, tentative_spans) -> (code, message)`` or
+    ``(None, None)``; ``tentative_spans`` is this run's not-yet-persisted
+    same-rink picks as ``(slot_id, start, end)``. Plain reads only. ALWAYS
+    active (#318 review): the gate's slot_overlap_conflict is unconditional
+    — it binds with zero policy rows and even when no season resolves
+    (season-less legacy divisions) — so the advisory mirrors it through the
+    same shared implementation. ``pairs`` is the run's shared active-game
+    snapshot (:func:`_active_game_slot_pairs`), so a draft over N candidate
+    slots never re-scans the game table N times; with no policies and no
+    overlapping candidates the proposal output remains byte-identical to
+    pre-Slice-B. It is optional purely so a caller with no snapshot to share
+    (a direct unit test of this advisory) still gets one — every draft path
+    passes the run's own."""
+    setup = _PolicySetup(store)
+    if pairs is None:
+        pairs = _active_game_slot_pairs(store)
 
     def check(slot, tentative_spans):
         violation = setup._slot_policy_violation(
@@ -284,7 +391,8 @@ def _resolve_division_season_id(store, division_id):
     return ls.season_id if ls is not None else None
 
 
-def _assign_ice(store, pairings, slots, constraints, policy_check=None):
+def _assign_ice(store, pairings, slots, constraints, policy_check=None,
+                team_spans=None):
     """Greedy earliest-slot-first assignment shared by every entry point.
 
     ``pairings`` is ``[(home_team_id, away_team_id, division_id_or_None), ...]``
@@ -292,14 +400,26 @@ def _assign_ice(store, pairings, slots, constraints, policy_check=None):
     are actually registered in (or ``None``), so the resulting rows stay
     per-pairing accurate even though one draft can span several Divisions.
     Returns ``(draft_games, unscheduled)``.
+
+    ``team_spans`` (#373) is the persisted team occupancy from
+    :func:`_persisted_team_spans`; it is COPIED, then grown in place as each
+    candidate is accepted, so a later pairing in this same batch is checked
+    against the earlier ones and not merely against the database. The copy
+    keeps the caller's snapshot reusable and this function free of
+    side effects on it.
     """
     con = _normalize_constraints(constraints)
     draft_games, unscheduled = [], []
     used = set()
     team_slots = {}  # team_id -> [assigned start_time]
     rink_spans = {}  # rink_id -> [(slot_id, start, end)] picked this run (#277)
+    # team_id -> [(start, end, game_id_or_None)]: persisted bookings plus this
+    # run's accepted candidates (#373).
+    occupancy = {tid: list(spans)
+                 for tid, spans in (team_spans or {}).items()}
     for home, away, division_id in pairings:
         chosen, messages, codes = None, [], []
+        team_conflicts = []
         for s in slots:
             if s.id in used:
                 continue
@@ -307,6 +427,10 @@ def _assign_ice(store, pairings, slots, constraints, policy_check=None):
             if code is None and policy_check is not None:
                 code, message = policy_check(
                     s, rink_spans.get(s.rink_id, ()))
+            if code is None:
+                code, message, conflicts = _team_overlap_reason(
+                    store, s, home, away, occupancy)
+                team_conflicts.extend(conflicts)
             if code is None:
                 chosen = s
                 break
@@ -316,6 +440,9 @@ def _assign_ice(store, pairings, slots, constraints, policy_check=None):
             used.add(chosen.id)
             team_slots.setdefault(home, []).append(chosen.start_time)
             team_slots.setdefault(away, []).append(chosen.start_time)
+            for tid in (home, away):
+                occupancy.setdefault(tid, []).append(
+                    (chosen.start_time, chosen.end_time, None))
             rink_spans.setdefault(chosen.rink_id, []).append(
                 (chosen.id, chosen.start_time, chosen.end_time))
             rink = store.get_rink(chosen.rink_id) if chosen.rink_id else None
@@ -345,8 +472,34 @@ def _assign_ice(store, pairings, slots, constraints, policy_check=None):
                 "away_team_name": _team_name(store, away),
                 "division_id": division_id, "reason": reason,
                 "reason_codes": reason_codes,
+                # #373 — the structured half of the team-conflict report:
+                # WHICH team is already booked, and against what. The prose
+                # ``reason`` above names the team too, but only a
+                # machine-readable row lets a caller act on it without
+                # parsing English. Empty for every pairing blocked purely by
+                # blackouts/rest/policy, so it is a positive signal rather
+                # than a field that is always present and usually noise.
+                "team_conflicts": _dedupe_team_conflicts(team_conflicts),
             })
     return draft_games, unscheduled
+
+
+def _dedupe_team_conflicts(conflicts):
+    """Collapse the per-candidate-slot conflict records (#373) into one
+    deterministic list. A pairing is tried against EVERY free slot, so the
+    same team can be reported blocked several times over — once per slot it
+    collides with — and the same (team, conflicting game) pair naturally
+    repeats. Order is canonical, never generation order, so two runs over the
+    same facts produce the identical list (and therefore the identical
+    ``draft_fingerprint``)."""
+    seen, out = set(), []
+    for c in conflicts:
+        key = (c["team_id"], c["conflict_source"], c["conflict_game_id"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(c)
+    return sorted(out, key=_canonical_sort_key)
 
 
 def _unschedulable_teams(store, team_ids, pairings, unscheduled):
@@ -601,6 +754,15 @@ def _draft_fingerprint(league_season_id, team_ids, draft_games, unscheduled,
             "away_team_name": u.get("away_team_name"),
             "reason_codes": sorted(u.get("reason_codes") or ()),
             "reason": u.get("reason") or "",
+            # #373 — bound for the same reason round 11 bound `reason`: this
+            # is part of what the operator reviewed. A team's conflicting
+            # game being cancelled (or a NEW one appearing) between Generate
+            # and Commit rewrites which team is named and which
+            # `conflict_game_id` it points at, while the pairing, its reason
+            # codes, and every placement above can stay byte-for-byte
+            # identical — the reviewed diagnosis has changed even though the
+            # reviewed batch looks unmoved.
+            "team_conflicts": list(u.get("team_conflicts") or ()),
         }
         for u in unscheduled), key=_canonical_sort_key)
     blocked_teams = sorted((
@@ -653,10 +815,12 @@ def draft_schedule(store, division_id, slot_ids=None, constraints=None):
     pairings, already_scheduled = _split_already_scheduled(
         store, all_pairings, _existing_pairing_games(store, scope), ls_id)
     slots = _available_game_slots(store, slot_ids)
+    active = _active_game_slot_pairs(store)
     draft_games, unscheduled = _assign_ice(
         store, pairings, slots, constraints,
         policy_check=_policy_advisor(
-            store, _resolve_division_season_id(store, division_id)))
+            store, _resolve_division_season_id(store, division_id), active),
+        team_spans=_persisted_team_spans(active))
     unschedulable_teams = _unschedulable_teams(
         store, teams, pairings, unscheduled)
     return {
@@ -702,9 +866,11 @@ def draft_schedule_for_league(store, season_id, league_id, division_id=None,
     pairings, already_scheduled = _split_already_scheduled(
         store, all_pairings, _existing_pairing_games(store, scope), ls_id)
     slots = _available_game_slots(store, slot_ids)
+    active = _active_game_slot_pairs(store)
     draft_games, unscheduled = _assign_ice(
         store, pairings, slots, constraints,
-        policy_check=_policy_advisor(store, season_id))
+        policy_check=_policy_advisor(store, season_id, active),
+        team_spans=_persisted_team_spans(active))
     unschedulable_teams = _unschedulable_teams(
         store, all_teams, pairings, unscheduled)
     return {
