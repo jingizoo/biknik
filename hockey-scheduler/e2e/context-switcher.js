@@ -231,7 +231,8 @@ async function checkSwitcher(browser, viewport) {
     if (errors.length) throw new Error(`[${L}] console/page errors:\n${errors.join("\n")}`);
     console.log(`[${L}] OK — Program-only + Season, keyboard, deep-link adopt/normalize, #ctx=, archived read-only.`);
   } catch (error) {
-    throw new Error(`${error.message}\n--- server output ---\n${out}`);
+    error.message = `${error.message}\n--- server output ---\n${out}`;
+    throw error;
   } finally {
     await context.close();
     await stopServer(server);
@@ -296,7 +297,8 @@ async function checkChip(browser, viewport) {
     if (errors.length) throw new Error(`[${L}] console/page errors:\n${errors.join("\n")}`);
     console.log(`[${L}] OK — seasonless Program chip names the Program and survives deep-link reload.`);
   } catch (error) {
-    throw new Error(`${error.message}\n--- server output ---\n${out}`);
+    error.message = `${error.message}\n--- server output ---\n${out}`;
+    throw error;
   } finally {
     await context.close();
     await stopServer(server);
@@ -363,6 +365,22 @@ async function checkReconcile(browser, viewport) {
 
     // (2) Reopen: the reverse also reconciles without reload — badge clears, the
     //     archived marker drops. Toggle away first so re-selecting Winter fires.
+    //
+    //     The admin ACTOR (a separate page from the viewer subject) carries no
+    //     saved context, so its active Season is the fallback's pick — and the
+    //     fallback excludes archived Seasons (context_service). Once the archive
+    //     above lands, the only Season is archived, so admin resolves to
+    //     Program-only and the reopen's target guard (#369 prereq) refuses
+    //     ("season season_1 not found."). Reopen is the documented exemption
+    //     from the archived-Season read-only guard, and ContextService.set
+    //     accepts an archived Season as a read-only historical context — so
+    //     select Winter explicitly on the admin page first. Issued on
+    //     admin.page ONLY: the viewer subject's stale-option state must not be
+    //     disturbed.
+    if ((await apiPost(admin.page, "/api/context",
+      { program_id: programId, season_id: winterId })).status !== 200) {
+      throw new Error(`[${L}] admin could not enter the archived Season before reopen`);
+    }
     if ((await apiPost(admin.page, `/api/v2/setup/seasons/${winterId}/reopen`, { reason: "back" })).status !== 200) {
       throw new Error(`[${L}] concurrent reopen failed`);
     }
@@ -397,7 +415,8 @@ async function checkReconcile(browser, viewport) {
     if (errors.length) throw new Error(`[${L}] console/page errors:\n${errors.join("\n")}`);
     console.log(`[${L}] OK — no-reload reconciliation: archive→read-only, reopen→writable, newly-available Season surfaced.`);
   } catch (error) {
-    throw new Error(`${error.message}\n--- server output ---\n${out}`);
+    error.message = `${error.message}\n--- server output ---\n${out}`;
+    throw error;
   } finally {
     await admin.context.close();
     await context.close();

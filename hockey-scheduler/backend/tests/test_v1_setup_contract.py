@@ -95,6 +95,44 @@ class V1SetupContractTest(unittest.TestCase):
         self.assertNotIn("error", resp, (entity, resp))
         return resp
 
+    def _select(self, c, program_id, season_id=None):
+        """Make ``program_id`` (and optionally ``season_id``) this caller's
+        PERSISTED active context (#369).
+
+        A setup mutation that names an EXISTING record is authorized against the
+        active context, not merely against the caller's role. A test that builds
+        a fresh Program and then reassigns, edits or deletes records under it
+        has to say which Program it is working in; otherwise the admin is still
+        sitting in whichever Program resolved first and every one of those
+        mutations is correctly refused as not-found.
+
+        The same is true one axis down (#369 re-review): a SEASON-BOUND target
+        — a Division, a registration, a venue-access grant — is judged against
+        the ACTIVE SEASON as well, and a Program-only context fails closed
+        against it. Passing the Season is how this file states which Season the
+        v1 contract legs below are working in.
+        """
+        body = {"program_id": program_id}
+        if season_id is not None:
+            body["season_id"] = season_id
+        status, ctx = self._req(c, "POST", "/api/context", body)
+        self.assertEqual(status, 200, ctx)
+        if season_id is not None:
+            self.assertEqual((ctx.get("season") or {}).get("id"), season_id,
+                             ctx)
+        return ctx
+
+    def _program(self, c, body):
+        """Create a Program via the v1 "league" route and select it (#369).
+
+        v1 spells today's Program "league" — the pre-#233 vocabulary this whole
+        file exists to pin — but ``/api/context`` is canonical, so the same id
+        goes in as ``program_id``.
+        """
+        program = self._create(c, "league", body)
+        self._select(c, program["id"])
+        return program
+
     # -- exact legacy key sets on every create response ---------------------
     def test_v1_create_responses_have_exact_legacy_key_sets(self):
         c = self._admin()
@@ -159,10 +197,11 @@ class V1SetupContractTest(unittest.TestCase):
     def test_v1_reassign_responses_have_exact_legacy_key_sets(self):
         c = self._admin()
         org = self._create(c, "organization", {"name": "Reorg", "short_name": "REO"})
-        league = self._create(c, "league",
-                              {"name": "Reassign", "organization_id": org["id"]})
+        league = self._program(c,
+                               {"name": "Reassign", "organization_id": org["id"]})
         season = self._create(c, "season",
                               {"league_id": league["id"], "name": "S"})
+        self._select(c, league["id"], season["id"])
         level = self._create(c, "level", {"season_id": season["id"], "name": "L"})
         division = self._create(c, "division",
                                 {"season_id": season["id"], "name": "D",
@@ -192,10 +231,11 @@ class V1SetupContractTest(unittest.TestCase):
     def _build_playable(self, c):
         """Full hierarchy with two registered teams + a valid game ice slot."""
         org = self._create(c, "organization", {"name": "Game Org", "short_name": "GMO"})
-        league = self._create(c, "league",
-                              {"name": "Game Prog", "organization_id": org["id"]})
+        league = self._program(c,
+                               {"name": "Game Prog", "organization_id": org["id"]})
         season = self._create(c, "season",
                               {"league_id": league["id"], "name": "Fall"})
+        self._select(c, league["id"], season["id"])
         division = self._create(c, "division",
                                 {"season_id": season["id"], "name": "Div A"})
         club = self._create(c, "club", {"name": "Game Club"})

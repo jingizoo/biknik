@@ -145,6 +145,35 @@ def _parse_dt(value, field_name: str):
     return parsed.astimezone(timezone.utc)
 
 
+class _SetupTargetRefused(Exception):
+    """Internal signal (#369): a gated target is not this caller's to touch.
+
+    Raised INSIDE ``setup_guarded_mutation``'s transaction purely so the
+    transaction rolls back and the refusal provably leaves no row, no audit
+    entry and no serialized field behind. Deliberately NOT a ``DomainError``:
+    it carries the target's INDEX, never wire wording, so the transport layer
+    keeps sole ownership of the generic ``"<Label> <id> not found."`` body that
+    makes a refusal byte-identical to a nonexistent id."""
+
+    def __init__(self, index: int):
+        super().__init__(f"setup target {index} is outside the caller's scope")
+        self.index = index
+
+
+class _SetupMutationRefused(Exception):
+    """Internal signal (#369): the MUTATION itself returned a domain error.
+
+    The facade's ``@catch`` converts a DomainError into a dict at a level BELOW
+    the guard's transaction, and a nested ``transaction()`` only joins — it does
+    not roll back. So a swallowed error would otherwise let a half-applied
+    mutation commit under an error response. Raising here restores exactly what
+    the facade got when it owned the outermost transaction: error ⇒ rollback."""
+
+    def __init__(self, payload: dict):
+        super().__init__("mutation refused")
+        self.payload = payload
+
+
 def catch(fn: Callable):
     """Wrap a facade method so domain errors become structured dicts."""
 
@@ -297,6 +326,1138 @@ class ApiService:
                               and sel_season.status == SeasonStatus.ARCHIVED),
             },
         }
+
+    # -- setup TARGET-RECORD authorization (#369) --------------------------
+    #
+    # Holding a setup CAPABILITY (MANAGE_SETUP / MANAGE_ARENA) says the caller
+    # may use a setup verb. It says nothing about WHICH records that verb may
+    # touch. The two are checked in different places and must both pass:
+    # `web/authz.py` gates the role, and this predicate gates the target record.
+    #
+    # `entity_type` names in the SETUP AUDIT TRAIL are historical, not canonical
+    # (see `_SETUP_CREATION_AUDIT_KEYS`). Only these CANONICAL kind strings are
+    # accepted here; a transport-layer alias ("league" meaning a Program on the
+    # v1 route, "level" meaning a League, the hyphenated v2 "ice-slot" /
+    # "league-season") MUST be translated by its caller. Hyphens are folded to
+    # underscores as a convenience; nothing else is guessed, because guessing
+    # between the two meanings of "league" is exactly how #369's sibling defects
+    # were introduced.
+    _SETUP_TARGET_KINDS = frozenset({
+        "program", "season", "league", "league_season", "division", "team",
+        "player", "game", "club", "official", "venue", "rink", "ice_slot",
+        "organization",
+    })
+
+    # Join rows that carry NO Program of their own: a SeasonTeamRegistration IS
+    # the (Team, LeagueSeason) join and a SeasonVenueAccess IS the (Season,
+    # Venue) join, so neither is a `_SETUP_TARGET_KINDS` member. Each is judged
+    # by the parent that names its Program, while still being REPORTED under its
+    # own id and label by the transport layer. Maps pseudo-kind → (the plain
+    # store getter, the ROW-LOCKING one, the attribute holding the parent id,
+    # the canonical kind of that parent).
+    #
+    # #369 review: this lookup used to live in `web/server.py` and ran OUTSIDE
+    # even the authorization transaction, so the parent a request was judged
+    # against could be re-pointed before the mutation ran. It is domain
+    # knowledge, not transport, and the authoritative pass belongs inside the
+    # one transaction — hence the second, *_for_update getter, which reads the
+    # bridge row and locks it in a single statement. The plain getter is for the
+    # unlocked preflight only.
+    _SETUP_BRIDGE_TARGETS = {
+        "registration": ("get_season_team_registration",
+                         "get_season_team_registration_for_update",
+                         "league_season_id", "league_season"),
+        "season_venue_access": ("get_season_venue_access",
+                                "get_season_venue_access_for_update",
+                                "season_id", "season"),
+    }
+
+    # Canonical kind → the store getter that reads the row AND takes its write
+    # lock (`SELECT ... FOR UPDATE` on PostgreSQL; the process-wide lock already
+    # covers Memory/SQLite). `setup_guarded_mutation` takes these before it
+    # authorizes, so the authorization snapshot is established no earlier than
+    # the lock and nothing that touches a named row can commit between the
+    # decision and the write.
+    _SETUP_TARGET_LOCKS = {
+        "program": "get_program_for_update",
+        "season": "get_season_for_update",
+        "league": "get_league_for_update",
+        "league_season": "get_league_season_for_update",
+        "division": "get_division_for_update",
+        "team": "get_team_for_update",
+        "player": "get_player_for_update",
+        "game": "get_game_for_update",
+        "club": "get_club_for_update",
+        "official": "get_official_for_update",
+        "venue": "get_venue_for_update",
+        "rink": "get_rink_for_update",
+        "ice_slot": "get_ice_slot_for_update",
+        "organization": "get_organization_for_update",
+    }
+
+    # (action, entity_type) pairs a "this user created this record" audit row
+    # can legitimately carry, per canonical kind. NOT simply
+    # f"{kind}_created" — the trail predates #233's vocabulary and was never
+    # rewritten:
+    #
+    #   * `create_program` writes ("league_created", "league") against the
+    #     PROGRAM's id, because pre-#233 "League" meant today's Program. A
+    #     lookup for ("program_created", "program") finds NOTHING for every
+    #     interactively-created Program.
+    #   * `upsert_imported_program` (the hierarchy import) DOES write
+    #     ("program_created", "program"), so both spellings are live and a
+    #     Program may legitimately carry either.
+    #   * `create_league` writes ("level_created", "level") against the
+    #     competition LEAGUE's id — "level" was the pre-#283 name — while
+    #     `upsert_imported_league` writes ("league_created", "league") against
+    #     that same kind of id. So ("league_created", "league") is ambiguous
+    #     BETWEEN Program and League on its face.
+    #   * `add_player` — the INTERACTIVE Player create, i.e. every Player not
+    #     imported — writes ("player_added", "player"); only the CSV import's
+    #     `upsert_imported_player` writes ("player_created", "player"). Both
+    #     spellings are live, exactly like the Program pair above, so both are
+    #     listed. Omitting "player_added" made `_setup_target_created_by`
+    #     answer False for every hand-entered Player, which fails CLOSED today
+    #     (a Player is always bound to a Team, so its chain never empties and
+    #     rule 6 is unreachable) but would deny an operator their own record
+    #     the moment an unbound Player became representable.
+    #
+    # The ambiguity is resolved by `entity_id`, which is always matched too:
+    # `next_id` hands out one monotonic sequence per prefix, and both
+    # `create_program` and `create_league` draw from the SAME "league" prefix,
+    # so a Program id and a League id can never be equal. Matching the id (not
+    # just the action) is therefore what makes the overlapping row safe.
+    _SETUP_CREATION_AUDIT_KEYS = {
+        "program": {("league_created", "league"),
+                    ("program_created", "program")},
+        "league": {("level_created", "level"), ("league_created", "league")},
+        "season": {("season_created", "season")},
+        "league_season": {("league_season_created", "league_season")},
+        "division": {("division_created", "division")},
+        "team": {("team_created", "team")},
+        "player": {("player_added", "player"), ("player_created", "player")},
+        "game": {("game_created", "game")},
+        "club": {("club_created", "club")},
+        "official": {("official_created", "official")},
+        "venue": {("venue_created", "venue")},
+        "rink": {("rink_created", "rink")},
+        "ice_slot": {("ice_slot_created", "ice_slot")},
+        "organization": {("organization_created", "organization")},
+    }
+
+    def _setup_target_record(self, kind, record_id):
+        """The stored record for a canonical setup ``kind``, or None.
+
+        None means "no such record" for EVERY reason — unknown kind, falsy id,
+        or a genuinely absent row — because the caller renders one generic
+        not-found for all of them. An unrecognized kind failing closed here is
+        deliberate: a mis-spelled or untranslated kind must refuse, never
+        silently skip the gate."""
+        if not record_id or not isinstance(record_id, str):
+            return None
+        getter = {
+            "program": self.store.get_program,
+            "season": self.store.get_season,
+            "league": self.store.get_league,
+            "league_season": self.store.get_league_season,
+            "division": self.store.get_division,
+            "team": self.store.get_team,
+            "player": self.store.get_player,
+            "game": self.store.get_game,
+            "club": self.store.get_club,
+            "official": self.store.get_official,
+            "venue": self.store.get_venue,
+            "rink": self.store.get_rink,
+            "ice_slot": self.store.get_ice_slot,
+            "organization": self.store.get_organization,
+        }.get(kind)
+        return getter(record_id) if getter else None
+
+    # -- the LINK TRIPLE ("edge") every chain walk below produces ----------
+    #
+    # #369 re-review. The first cut of this gate resolved all three axes and
+    # then THREW TWO AWAY: it reduced every record to a set of Program ids and
+    # authorized on `program.id in program_ids`. With Program P / Season S /
+    # League A persisted, `POST /api/v2/setup/player/<League-B-player>/update`
+    # returned 200 and renamed a Player in a League the caller had not
+    # selected — a same-Program, cross-League IDOR — and the identical
+    # construction let a Season-A caller mutate Season-B rows.
+    #
+    # So a chain walk no longer yields Program ids. It yields EDGES: one
+    # ``(program_id, season_id | None, league_id | None)`` triple per real link
+    # the record carries. A ``None`` component means "this link genuinely names
+    # no such axis" — a permanent League has no Season, a Venue has no League —
+    # NOT "unknown" and NOT "any". Nothing is invented: the facility tree
+    # (Organization → Venue → Rink → IceSlot) reaches the competition tree only
+    # through ``SeasonVenueAccess``, which names a Season and never a League, so
+    # a facility edge's League component is always None.
+    #
+    # Judging EDGE BY EDGE rather than by three independent unions is the point.
+    # A record with several links (a Club owning Teams in two Leagues, an
+    # Organization that both operates a Program and owns a granted Venue) must
+    # be judged by whether ONE WHOLE link matches the caller's context, never by
+    # a cross product of components taken from different links — that cross
+    # product would authorize a (Season S, League B) context against a record
+    # whose only links are (S, A) and (S', B).
+    #
+    # ``saw_link`` keeps its exact pre-existing meaning: a linking row existed
+    # even if it could not be resolved, so corrupt data can never demote a
+    # linked record into the permissive creator branch.
+
+    def _team_edges(self, team):
+        """Link edges for a Team: ``(program, None, league)``.
+
+        ``Team.program_id`` is the permanent owner and is authoritative whenever
+        it is set. It is NULLABLE, though, and a Team also belongs permanently to
+        exactly one competition ``League`` whose ``program_id`` names the same
+        Program (the service layer enforces the invariant). So when — and ONLY
+        when — ``program_id`` is null, the League edge is walked instead for the
+        PROGRAM component: that Team is still part of a Program's competition
+        chain, and the owner's rule is that a LINKED record is judged by its
+        chain, not by who typed it in. The League is never consulted FOR THE
+        PROGRAM COMPONENT while ``program_id`` is set — but it IS resolved and
+        checked for AGREEMENT (#369 re-review 2): the two columns are
+        independent FKs with no database constraint tying the League's Program
+        to ``Team.program_id``, so legacy data, imports or a prior partial
+        write can persist a Team whose ``league_id`` names a League in ANOTHER
+        Program. Emitting that pair as one edge lets an explicit-No-League
+        caller (whose League comparison is legitimately skipped) mutate a
+        record whose persisted graph crosses the Program ceiling. A found-but-
+        disagreeing pair is therefore LINKED BUT UNAUTHORIZED — ``(set(),
+        True)`` — never an edge and never creator-claimable.
+
+        The LEAGUE component is ``Team.league_id`` verbatim — the REAL
+        competition League (never ``Venue.league_id``, which is a Program id
+        under a legacy name). It is taken UNRESOLVED into the edge on purpose:
+        a dangling League id can then never equal the caller's selected League,
+        so it fails closed under a specific League instead of decaying into "no
+        League axis", while under No League (the League comparison skipped) the
+        Team stays manageable by its authoritative Program. A Team with no
+        League at all is a real, supported state (#345: "Teams with a Program
+        but no League yet"), and it carries no League axis to check — refusing
+        it whenever any League is selected would make a league-less Team
+        permanently unmanageable.
+
+        The disagreement check is therefore SURGICAL: it fires ONLY when the
+        League RESOLVES to a real League in ANOTHER Program (the owner's exact
+        repro: ``program_id`` = A, ``league_id`` → a valid League in B). A
+        merely dangling id is not a cross-Program handle — it points at nothing
+        — so it is left to the verbatim-edge behavior above rather than
+        rejected outright, which keeps a program-owned Team with broken League
+        data repairable instead of permanently frozen.
+
+        The Season axis is deliberately ABSENT: a Team is PERMANENT. Its
+        participation in a Season is a separate SeasonTeamRegistration record,
+        which carries the Season axis itself. Deriving a Season for the Team
+        from its registrations would make a newly created, not-yet-registered
+        Team unmanageable in every context.
+        """
+        if team is None:
+            return set(), False
+        league_id = team.league_id or None
+        if team.program_id:
+            if league_id is not None:
+                league = self.store.get_league(league_id)
+                if (league is not None and league.program_id
+                        and league.program_id != team.program_id):
+                    # #369 re-review 2: independently persisted axes DISAGREE —
+                    # the named League resolves into another Program. Linked but
+                    # unauthorized, so No-League union semantics can't reach it.
+                    return set(), True
+            return {(team.program_id, None, league_id)}, True
+        if team.league_id:
+            league = self.store.get_league(team.league_id)
+            if league is None:
+                return set(), True          # dangling edge → linked, unresolvable
+            if league.program_id:
+                return {(league.program_id, None, league_id)}, True
+        return set(), False
+
+    def _game_parent_constraints(self, game):
+        """``(constraints, broken)`` — the ``(program, season, league)`` each
+        NON-NULL Game parent names, every one resolved INDEPENDENTLY.
+
+        #372. The previous cut resolved ONE League for a Game by PRECEDENCE —
+        the explicit ``league_id``, else via ``league_season_id``, else via
+        ``division_id`` — and the gate then validated only that single winner.
+        A Game carries FOUR independent, nullable foreign keys (``season_id``,
+        ``league_id``, ``league_season_id``, ``division_id``) and the schema
+        ties none of them to any other, so a legitimate Program-A ``league_id``
+        HID the rest: a ``league_season_id`` or ``division_id`` pointing into
+        Program B was never examined and the Game was authorized. First-match
+        precedence is the wrong instrument for an authorization decision —
+        every parent that is really persisted is really reachable (the
+        scheduler, the standings walk and the league-scope helpers each follow
+        a DIFFERENT one of these columns), so every one of them must be judged.
+
+        What each non-null parent contributes:
+
+        * ``season_id``        → its Season's Program, and that Season.
+        * ``league_id``        → that League's Program, and that League.
+        * ``league_season_id`` → BOTH ends of the binding, as two SEPARATE
+          constraints: its Season (Program + Season) and its League (Program +
+          League). A binding whose own two ends disagree is therefore caught by
+          the very same fold as any other disagreeing pair, with no extra rule.
+        * ``division_id``      → its LeagueSeason, judged identically.
+
+        A NULL parent contributes NOTHING. It names no axis, and inventing one
+        would refuse both real supported states this file already protects: the
+        Season-less exhibition (#283 Slice D) and the not-yet-parented draft.
+        This is the "no invented League axis" rule, unchanged.
+
+        ``broken`` is True when a non-null parent does NOT resolve — a dangling
+        id, or a Season/League row carrying no Program. That is exactly the
+        ``saw_link`` treatment used throughout this file: the link exists, it
+        cannot be judged, so it fails closed. Silently skipping an unresolvable
+        parent instead would make CORRUPTING the graph (or racing a delete) a
+        way to erase a constraint, i.e. a privilege gain earned by breaking
+        data rather than by holding rights."""
+        constraints, broken = [], False
+        bindings = []                        # LeagueSeason ids still to judge
+
+        season_id = getattr(game, "season_id", None) or None
+        league_id = getattr(game, "league_id", None) or None
+        league_season_id = getattr(game, "league_season_id", None) or None
+        division_id = getattr(game, "division_id", None) or None
+
+        if season_id:
+            season = self.store.get_season(season_id)
+            if season is None or not season.program_id:
+                broken = True
+            else:
+                constraints.append((season.program_id, season.id, None))
+
+        if league_id:
+            league = self.store.get_league(league_id)
+            if league is None or not league.program_id:
+                broken = True
+            else:
+                constraints.append((league.program_id, None, league.id))
+
+        if league_season_id:
+            bindings.append(league_season_id)
+
+        if division_id:
+            # A Division is a child of a LeagueSeason, so it imposes precisely
+            # the constraints that binding does — no more, no less.
+            division = self.store.get_division(division_id)
+            if division is None or not division.league_season_id:
+                broken = True
+            else:
+                bindings.append(division.league_season_id)
+
+        for binding_id in bindings:
+            ls = self.store.get_league_season(binding_id)
+            if ls is None:
+                broken = True
+                continue
+            season = (self.store.get_season(ls.season_id)
+                      if ls.season_id else None)
+            if season is None or not season.program_id:
+                broken = True
+            else:
+                constraints.append((season.program_id, season.id, None))
+            league = (self.store.get_league(ls.league_id)
+                      if ls.league_id else None)
+            if league is None or not league.program_id:
+                broken = True
+            else:
+                constraints.append((league.program_id, None, league.id))
+
+        return constraints, broken
+
+    def _venue_program_ids(self, venue):
+        """Program ids a Venue is linked to — the Program component of
+        :meth:`_venue_edges`, for the venue-grant EXCEPTION only.
+
+        The exception deliberately judges the Program axis and nothing else (a
+        shared arena is grantable across Programs), so it reads the edges'
+        Program component rather than re-walking the Venue itself."""
+        edges, saw_link = self._venue_edges(venue)
+        return {edge[0] for edge in edges}, saw_link
+
+    def _venue_edges(self, venue):
+        """Link edges for a Venue — the union of BOTH bridges, and NO League.
+
+        1. ``SeasonVenueAccess`` is the only real join between the facility tree
+           (Organization → Venue → Rink → IceSlot) and the competition tree
+           (Program → Season → League → Division). It names a SEASON, so each
+           grant is a ``(program, season, None)`` edge — the facility tree has a
+           Season axis and no League axis whatever, and none is invented here.
+           EVERY grant counts, ACTIVE OR REVOKED: revoking deactivates the row
+           rather than deleting it, so a revoked grant is durable evidence that
+           this Venue was used by that Program's Season. Treating a revoked
+           grant as "no link" would let a Program revoke its own access and
+           thereby turn a shared Venue into an unlinked record that some
+           unrelated account could claim by creator ownership — a privilege
+           *gain* produced by giving something up.
+        2. ``Venue.league_id`` is the LEGACY pre-#233 bridge and, despite the
+           name, holds a PROGRAM id — `store/integrity_checks.py` joins it to
+           ``seasons.program_id``. It is NEVER a competition League id, and it
+           names no Season, so it is a ``(program, None, None)`` edge. It is
+           taken verbatim and is deliberately NOT filtered against existing
+           Programs: a dangling legacy value must keep the Venue LINKED (and so
+           refuse everyone) rather than decay into "unlinked" and become
+           claimable.
+
+        Returns ``(edges, saw_link)``; ``saw_link`` is True when a linking row
+        existed even if its Program could not be resolved, so corrupt data can
+        never demote a linked record into the permissive creator branch."""
+        if venue is None:
+            return set(), False
+        edges, saw_link = set(), False
+        for grant in self.store.season_venue_access_for_venue(venue.id):
+            saw_link = True                 # active or revoked — both are links
+            season = self.store.get_season(grant.season_id)
+            if season is not None and season.program_id:
+                edges.add((season.program_id, season.id, None))
+        if venue.league_id:
+            saw_link = True
+            # LEGACY: this IS a Program id, and it binds no Season.
+            edges.add((venue.league_id, None, None))
+        return edges, saw_link
+
+    def _setup_target_edges(self, kind, record):
+        """``(edges, saw_link)`` — every ``(program, season, league)`` link
+        ``record`` carries. See the block comment above for what an edge is and
+        why the three axes must travel together.
+
+        ``saw_link`` distinguishes "this record has no chain at all" (empty set,
+        False → the pending-link/creator contract applies) from "this record HAS
+        a chain but a row in it is missing" (empty set, True → refuse). Without
+        that distinction a dangling FK would silently promote a linked record
+        into the permissive branch, which is a privilege escalation reachable by
+        breaking data rather than by holding rights.
+
+        Which axes each kind really carries:
+
+        ==================  =======  =========================  ==============
+        kind                Program  Season                     League
+        ==================  =======  =========================  ==============
+        program             itself   —                          —
+        season              parent   ITSELF                     —
+        league              parent   — (permanent across        ITSELF
+                                     Seasons)
+        league_season       season   its Season                 its League
+        division            chain    its LeagueSeason's Season  ditto League
+        team                own/     — (permanent; the Season   Team.league_id
+                            League   lives on its registration)
+        player              its Team — (as Team)                as its Team
+        game                all its  all its parents' Seasons   all its
+                            parents  — they must AGREE (#372)   parents'
+                                                                Leagues
+        club                Teams    — (as Teams)               its Teams'
+        official            club +   its Games' Seasons         club + Games'
+                            Games
+        venue               grants + its grants' Seasons        — (facility
+                            legacy                              tree: none)
+        rink                its      as its Venue               —
+                            Venue
+        ice_slot            its Rink as its Rink                —
+        organization        operated its Venues' Seasons        —
+                            + Venues
+        ==================  =======  =========================  ==============
+
+        The two BRIDGE rows the transport layer gates (SeasonTeamRegistration,
+        SeasonVenueAccess) carry no chain of their own and are judged by the
+        parent that names one — a registration by its LeagueSeason (Program +
+        Season + League), a venue-access grant by its Season (Program + Season,
+        and no League, because the facility join has none)."""
+        edges, saw_link = set(), False
+
+        if kind == "program":
+            return {(record.id, None, None)}, True
+
+        if kind == "season":
+            if record.program_id:
+                return {(record.program_id, record.id, None)}, True
+            return edges, saw_link
+
+        if kind == "league":
+            # The REAL competition League — its parent is a Program directly.
+            # A League is PERMANENT (it outlives every Season it plays in), so
+            # it carries no Season axis; its per-Season participation is the
+            # separate LeagueSeason row, which does.
+            if record.program_id:
+                return {(record.program_id, None, record.id)}, True
+            return edges, saw_link
+
+        if kind == "league_season":
+            season = self.store.get_season(record.season_id)
+            if season is None:
+                return edges, True
+            if not season.program_id:
+                return edges, True
+            # #369 re-review 2: ``season_id`` and ``league_id`` are independent
+            # FKs — nothing in the schema forces the named League to belong to
+            # the same Program as the named Season. When the League RESOLVES
+            # into a DIFFERENT Program (the owner's repro: an A-Season
+            # LeagueSeason whose league_id names a valid B League), the No-League
+            # union — which rightly skips the League comparison — would otherwise
+            # authorize a graph that crosses the Program ceiling; reject it as
+            # linked-but-unauthorized. A DANGLING league_id is left in the edge
+            # verbatim (as the Team edge does): it is not a cross-Program handle,
+            # it fails closed under a selected League, and leaving it judged by
+            # its Season keeps a corrupt-but-own-Program registration
+            # REPAIRABLE (the ``registration_league_not_in_season`` fix flow
+            # relies on exactly this). A Division inherits this verdict through
+            # its delegation below.
+            if record.league_id:
+                league = self.store.get_league(record.league_id)
+                if (league is not None and league.program_id
+                        and league.program_id != season.program_id):
+                    return edges, True      # real cross-Program disagreement
+            return ({(season.program_id, season.id,
+                      record.league_id or None)}, True)
+
+        if kind == "division":
+            ls = self.store.get_league_season(record.league_season_id)
+            if ls is None:
+                return edges, True
+            return self._setup_target_edges("league_season", ls)
+
+        if kind == "team":
+            return self._team_edges(record)
+
+        if kind == "player":
+            team = self.store.get_team(record.team_id) if record.team_id else None
+            if record.team_id and team is None:
+                return edges, True
+            return self._team_edges(team)
+
+        if kind == "game":
+            # EVERY non-null parent, judged INDEPENDENTLY, failing closed on
+            # ANY disagreement (#372).
+            #
+            # A Game is the one setup record with four independent parent FKs,
+            # and the earlier gate validated only the highest-precedence League
+            # SOURCE: a valid Program-A ``league_id`` masked a
+            # ``league_season_id`` or ``division_id`` in Program B — or in a
+            # different Season of the same Program — and the row answered 200.
+            # Two independently persisted parents that disagree mean this row's
+            # parent graph STRADDLES the ceiling. That is linked-but-
+            # UNAUTHORIZED: never an edge, so the No-League union (whose League
+            # comparison is legitimately skipped) can never rescue it, and
+            # never creator-claimable either.
+            #
+            # The Program and Season axes are the ceiling itself. The League
+            # axis is folded on the same terms because a Game's League sources
+            # are REDUNDANT by construction rather than independent facts —
+            # ``league_season_id`` is documented as "its single source of
+            # competition identity, so season_id and league_id can never drift
+            # apart", and `move`/`publish` already reject the drift outright
+            # (``game_league_season_mismatch``). Two parents naming DIFFERENT
+            # Leagues inside one Program/Season is the same cross-League IDOR
+            # #369's re-review closed for Players, reached through a Game.
+            #
+            # A NULL parent constrains nothing, so a Season-less exhibition
+            # (#283 Slice D) still genuinely has no Season and no League axis
+            # is invented for it.
+            constraints, broken = self._game_parent_constraints(record)
+            if broken:
+                # A non-null parent that does not resolve: linked, unjudgeable.
+                return edges, True
+            if not constraints:
+                # No parent at all — a genuinely unparented draft. The
+                # pending-link/creator contract applies, exactly as before.
+                return edges, saw_link
+            programs = {axes[0] for axes in constraints}
+            seasons = {axes[1] for axes in constraints if axes[1] is not None}
+            leagues = {axes[2] for axes in constraints if axes[2] is not None}
+            if len(programs) > 1 or len(seasons) > 1 or len(leagues) > 1:
+                return edges, True           # the parents DISAGREE
+            return ({(programs.pop(), next(iter(seasons), None),
+                      next(iter(leagues), None))}, True)
+
+        if kind == "club":
+            # A Club owns Teams across Programs and Leagues; its links are its
+            # Teams' links, EDGE BY EDGE. A Club with no Team is genuinely
+            # unlinked.
+            for team in self.store.all_teams():
+                if team.club_id == record.id:
+                    team_edges, team_link = self._team_edges(team)
+                    edges |= team_edges
+                    saw_link = saw_link or team_link
+            return edges, saw_link
+
+        if kind == "official":
+            # Two independent links: the home Club used for conflict-of-interest
+            # checks (Program + League, no Season), and the Games actually
+            # officiated (which carry a Season too).
+            if record.home_club_id:
+                club = self.store.get_club(record.home_club_id)
+                if club is None:
+                    saw_link = True
+                else:
+                    club_edges, club_link = self._setup_target_edges(
+                        "club", club)
+                    edges |= club_edges
+                    saw_link = saw_link or club_link
+            for assignment in self.store.assignments_for_official(record.id):
+                game = self.store.get_game(assignment.game_id)
+                if game is None:
+                    saw_link = True
+                    continue
+                game_edges, game_link = self._setup_target_edges("game", game)
+                edges |= game_edges
+                saw_link = saw_link or game_link
+            return edges, saw_link
+
+        if kind == "venue":
+            return self._venue_edges(record)
+
+        if kind == "rink":
+            venue = self.store.get_venue(record.venue_id) if record.venue_id else None
+            if record.venue_id and venue is None:
+                return edges, True
+            return self._venue_edges(venue)
+
+        if kind == "ice_slot":
+            rink = self.store.get_rink(record.rink_id) if record.rink_id else None
+            if record.rink_id and rink is None:
+                return edges, True
+            if rink is None:
+                return edges, saw_link
+            return self._setup_target_edges("rink", rink)
+
+        if kind == "organization":
+            # A facility Organization reaches the competition tree two ways: the
+            # Programs it OPERATES — a whole-Program link that names no Season —
+            # and the Programs its Venues serve, which carry their Venue's
+            # Season edges verbatim.
+            for program in self.store.all_programs():
+                if program.operator_organization_id == record.id:
+                    edges.add((program.id, None, None))
+                    saw_link = True
+            for venue in self.store.all_venues():
+                if venue.organization_id == record.id:
+                    venue_edges, venue_link = self._venue_edges(venue)
+                    edges |= venue_edges
+                    saw_link = saw_link or venue_link
+            return edges, saw_link
+
+        return edges, saw_link
+
+    @staticmethod
+    def _setup_target_edge_allows(edge, program, season, league):
+        """Does this ONE link put the record inside the caller's whole context?
+
+        The three comparisons the first cut of #369 was missing two of. Each
+        component is checked against the axis the caller has actually
+        persisted, and a link is only satisfied when EVERY axis it names is:
+
+        * **Program** — the hard ceiling, always compared. A record whose link
+          names another Program is out of scope no matter what else matches.
+        * **Season** — compared whenever the link names one. ``season is None``
+          (a Program-only selection) therefore FAILS CLOSED against a
+          Season-bound link: nothing has been validated to compare against, and
+          a Program-only caller must not reach Season-bound rows.
+        * **League** — compared whenever the link names one AND a League is
+          selected. An explicit NO LEAGUE (``league is None``) is a first-class
+          selection meaning the approved Program + active-Season union, so it
+          permits every League inside that already-validated Program/Season and
+          nothing outside it. A link that names no League (the whole facility
+          tree, a permanent League-less Team) has no League axis to check —
+          inventing one would refuse records that legitimately have none.
+        """
+        program_id, season_id, league_id = edge
+        if program_id != program.id:
+            return False
+        if season_id is not None and (season is None
+                                      or season_id != season.id):
+            return False
+        if (league_id is not None and league is not None
+                and league_id != league.id):
+            return False
+        return True
+
+    def setup_venue_grantable(self, venue_id, user_id, role, scope):
+        """The FACILITY-TREE EXCEPTION for the venue-access write (#369 ruling).
+
+        ``setup_target_accessible`` is the right rule for every other target,
+        but applying it to the Venue end of a venue-access grant DEADLOCKS the
+        shared-arena capability: an arena serves several leagues, and the moment
+        Program A grants itself access the Venue is linked to A, so it fails the
+        active-context check for every other Program -- which can then never
+        obtain the grant that would have made it accessible. The capability
+        fails on its own first use.
+
+        The owner's ruling: the ceiling governs the COMPETITION tree, while a
+        Venue stays grantable across Programs. So this predicate replaces the
+        generic one for that ONE argument, and nothing else -- the Season end of
+        the same grant stays strictly ceilinged, and Rinks, IceSlots and every
+        competition record keep the generic rule.
+
+        Grantable means:
+
+        * the Venue is linked to SOME Program (any grant, active or revoked, or
+          the legacy Program link) -- an established facility; or
+        * it is linked to nothing AND this caller created it -- its own
+          create-then-grant draft.
+
+        The second clause is the load-bearing one. "Any Venue at all" was the
+        first attempt and leaked: on an installation with no Programs yet it
+        offered one operator the other's never-linked arena by name. An unlinked
+        Venue is somebody's private draft and stays creator-only.
+        """
+        if role is None:
+            return None
+        program, _season, _league = self.context.resolve_with_league(
+            user_id, role, scope)
+        if program is None:
+            return False
+        venue = self.store.get_venue(venue_id) if venue_id else None
+        if venue is None:
+            return False
+        # `_venue_program_ids` returns (ids, saw_link) -- unpack it. Testing
+        # the 2-tuple directly is ALWAYS truthy, which made this "any Venue at
+        # all" and silently reinstated the exact leak the docstring above
+        # records: on a Program-less install one operator was offered the
+        # other's never-linked arena by name.
+        program_ids, saw_link = self._venue_program_ids(venue)
+        if program_ids:
+            return True                      # an established shared facility
+        if saw_link:
+            # A link that exists but does not resolve (a dangling season or
+            # Program reference) is NOT "unlinked" -- treating it as such would
+            # hand a corrupt row to the creator clause below. Fail closed.
+            return False
+        return self._setup_target_created_by("venue", venue.id, user_id)
+
+    def setup_league_in_active_program(self, league_id, user_id, role, scope):
+        """The #367 CREATE-side rule: does ``league_id`` belong to the caller's
+        ACTIVE Program? True / False / None (no identity — do not gate).
+
+        The write-side half of scoping the setup hierarchy. The read fix stops
+        another Program's Leagues being OFFERED; this stops them being
+        ACCEPTED, which is the part that actually matters — the id arrives in a
+        request body and a client can send any value it likes.
+
+        Deliberately binds to the ACTIVE Program rather than the caller's whole
+        authorized set: a global League Admin is authorized for every Program,
+        so an authorization-only check would not stop the reported case (an
+        operator working in Program B creating into Program A). You create where
+        you are working; switching Program is the context bar's job.
+
+        Lives here, beside the other two target rules, so
+        ``setup_guarded_mutation`` can run it under the same lock and inside the
+        same transaction as the create it guards (#369 re-review): resolving the
+        context and reading the League in one transaction and then creating in
+        another is the very check/use gap that was the blocker."""
+        if role is None:
+            return None
+        program, _season, _league = self.context.resolve_with_league(
+            user_id, role, scope)
+        if program is None:
+            return False
+        league = self.store.get_league(league_id) if league_id else None
+        return league is not None and league.program_id == program.id
+
+    def _setup_target_created_by(self, kind, record_id, user_id) -> bool:
+        """True when ``user_id`` is the recorded CREATOR of this record.
+
+        Reads the setup audit trail through ``_SETUP_CREATION_AUDIT_KEYS``,
+        matching the (action, entity_type) pair AND the entity id AND the actor
+        — see that map for why f"{kind}_created" alone is wrong and why the id
+        is what disambiguates the one overlapping pair. A falsy ``user_id``
+        (an unauthenticated or identity-less caller) owns nothing, ever."""
+        if not user_id:
+            return False
+        keys = self._SETUP_CREATION_AUDIT_KEYS.get(kind)
+        if not keys:
+            return False
+        for row in self.store.all_setup_audit():
+            if (row.entity_id == record_id
+                    and row.actor_id == user_id
+                    and (row.action, row.entity_type) in keys):
+                return True
+        return False
+
+    def setup_target_accessible(self, kind, record_id, user_id, role, scope):
+        """May this caller act on THIS setup record? True / False / None.
+
+        #369. The blocker this closes: an Arena Manager POSTed
+        ``/api/v2/setup/venue/<foreign-id>/delete`` for a Venue created by a
+        different account in a different Program. The route returned 200, echoed
+        the foreign record's own fields back (including its name — an
+        information leak on top of the write), deleted it, and wrote a
+        ``venue_deleted`` audit row. Nothing was wrong with the role gate: an
+        Arena Manager genuinely may delete Venues. What was missing is any check
+        of the TARGET. *Permission to use a setup capability is not authority
+        over every record in the installation.*
+
+        This is the ONE predicate every setup mutation that accepts an EXISTING
+        entity id routes through, so the rule cannot drift between v1 and v2, or
+        between delete / reassign / in-place edit. Callers must apply it BEFORE
+        calling the facade — i.e. before any lookup-derived field is serialized
+        into a response and before any save or audit row — and must refuse with
+        the facade's own byte-identical ``"<Label> <id> not found."`` wording, so
+        an inaccessible record is indistinguishable from a nonexistent one and
+        this never becomes an existence oracle. A falsy id is not this gate's
+        business; leave the facade's own validation error alone.
+
+        Rules, applied in order:
+
+        1. ``role is None`` → **None**, meaning "no user context was supplied,
+           do not gate". Returned rather than True so the caller can tell
+           "legacy identity-less call" from "authorized", and so no call site
+           can accidentally read a skipped gate as an approval. Very many
+           internal call sites, the demo/full seeds, and the acceptance
+           harnesses drive this facade with no identity at all; they must be
+           completely unaffected. This is NOT a bypass for synthetic actor
+           labels or for the seed — an identified caller with a real role is
+           gated no matter what its actor string looks like.
+
+        2. Resolve the caller's persisted active context via
+           ``resolve_with_league`` — **all three axes**, not just the Program.
+           **A null Program fails CLOSED (False).** No active Program means
+           nothing has been validated to compare against, so there is no record
+           this caller may mutate. Failing open here would reinstate the exact
+           blocker for any account that has not selected a context.
+
+        3. Look the record up. Missing → False, the same value an inaccessible
+           record gets, because the caller emits one generic not-found for both.
+
+        4. Walk the record's chain into ``(program, season, league)`` LINK
+           TRIPLES (see ``_setup_target_edges`` for the per-kind axis table).
+
+        5. **Any edge → the record is LINKED: return whether ONE WHOLE edge
+           satisfies the caller's whole context** (see
+           ``_setup_target_edge_allows``). The first cut of this gate resolved
+           all three axes and then discarded Season and League, authorizing on
+           the Program alone: with Program P / Season S / League A persisted, a
+           League-B Player in the SAME Program could be renamed through
+           ``/api/v2/setup/player/<id>/update``, and the same construction let
+           a Season-A caller mutate Season-B rows. Every axis a record really
+           carries is compared, a Program-only context fails closed against a
+           Season-bound row, and an explicit No League means the approved
+           Program + active-Season union rather than "no ceiling".
+
+           Creator ownership deliberately does NOT apply here. Permanent creator
+           authority surviving Program linking was ruled a blocker in its own
+           right: whoever first typed a record in would keep delete rights over
+           it forever, across every Program it was later bound into and every
+           operator handover — an unrevokable, invisible back door that no
+           Program admin could see or remove. Once a record joins a chain, the
+           chain is the sole authority.
+
+        6. **No edge at all → the record is genuinely UNLINKED**, the pending-link
+           state a two-step setup flow legitimately passes through (create a
+           Venue, then grant a Season access to it). Only its authenticated
+           CREATOR may act on it, read from the setup audit trail. This is the
+           narrowest rule that keeps that flow working: without it the operator
+           could not finish, or even delete, the record they just made.
+
+        A record whose chain EXISTS but cannot be resolved (a dangling FK) is
+        treated as linked-and-unmatched → False, never as unlinked. Corrupting
+        data must not be a way into the permissive branch.
+
+        ``kind`` must be one of ``_SETUP_TARGET_KINDS`` (hyphens are folded to
+        underscores). Transport aliases — v1's "league" for a Program and
+        "level" for a League — MUST be translated by the caller; they are
+        rejected here rather than guessed, because guessing between the two
+        meanings of "league" is precisely the vocabulary trap that produced
+        this class of defect.
+        """
+        # -- rule 1: no identity → no gate ---------------------------------
+        if role is None:
+            return None
+
+        normalized = (kind or "").replace("-", "_")
+        if normalized not in self._SETUP_TARGET_KINDS:
+            return False                     # untranslated/unknown → fail closed
+
+        # -- rule 2: the persisted active context, failing closed ----------
+        program, season, league = self.context.resolve_with_league(
+            user_id, role, scope)
+        if program is None:
+            return False
+
+        # ONE read snapshot for the whole chain walk. Rules 5 and 6 branch on
+        # whether a set assembled from MANY separate reads is empty (an
+        # Organization alone walks all_programs + all_venues + one grant query
+        # per venue), so a torn read is a correctness question, not a cosmetic
+        # one. Plain `transaction()` would be READ COMMITTED on PostgreSQL —
+        # every statement re-snapshots — so the isolation is requested
+        # explicitly; on memory/SQLite it is a documented no-op because the
+        # process-wide lock already serializes the block.
+        #
+        # Requesting isolation is legal on the outermost transaction, and also
+        # on a join whose open transaction ALREADY guarantees at least this much
+        # (#369) — which is how `setup_guarded_mutation` runs this predicate,
+        # the context resolve above and the mutation itself as ONE SERIALIZABLE
+        # unit. Standalone (the read-only predicate call), this is the outermost
+        # transaction and behaves exactly as before. READ-ONLY at REPEATABLE
+        # READ cannot raise a serialization conflict, so no retry loop is needed
+        # here (unlike the context service's `_snapshot`); when nested, the
+        # guard's own bounded retry owns that.
+        #
+        # NOTE this predicate is NOT a security boundary on its own: it answers
+        # for the instant it read, and by the time a caller acts on the answer
+        # the chain may have moved. Only `setup_guarded_mutation`, which holds
+        # the row locks and the transaction across the mutation, is.
+        with self.store.transaction(isolation="REPEATABLE READ"):
+            # -- rule 3: existence (indistinguishable from inaccessible) ---
+            record = self._setup_target_record(normalized, record_id)
+            if record is None:
+                return False
+
+            # -- rule 4: the record's chain, as WHOLE link triples ----------
+            edges, saw_link = self._setup_target_edges(normalized, record)
+
+            # -- rule 5: LINKED → the chain decides, creator is irrelevant --
+            # ONE whole link must place the record inside the caller's whole
+            # persisted context. Judging edge by edge (rather than testing each
+            # axis against a union of components taken from DIFFERENT links) is
+            # what stops a (Season S, League B) caller from being authorized by
+            # a record whose only links are (S, League A) and (S', League B).
+            if edges:
+                return any(
+                    self._setup_target_edge_allows(edge, program, season,
+                                                   league)
+                    for edge in edges)
+            if saw_link:
+                return False                 # linked but unresolvable → closed
+
+            # -- rule 6: genuinely UNLINKED → creator only -----------------
+            return self._setup_target_created_by(
+                normalized, record_id, user_id)
+
+    def setup_target_allowed(self, kind, record_id, user_id, role, scope,
+                             rule="scope"):
+        """The bridge-aware, UNLOCKED answer to "may this caller act on this
+        record": True / False / None (no identity — do not gate).
+
+        One entry point covering both rules and both bridge rows, so the
+        transport layer never re-derives any of it:
+
+        * ``rule="scope"`` → the generic ``setup_target_accessible`` ceiling;
+        * ``rule="grantable"`` → the facility-tree exception
+          (``setup_venue_grantable``), which governs ONLY the Venue argument of
+          the venue-access grant;
+        * ``rule="active_program_league"`` → #367's create-side rule
+          (``setup_league_in_active_program``), for a League id supplied in a
+          CREATE body;
+        * a bridge pseudo-kind is resolved to the parent that names its Program
+          first; an unresolvable bridge row returns None (nothing to judge — the
+          facade emits the byte-identical wording a step later).
+
+        This is a PREFLIGHT, for a cheap, lock-free, early, well-worded refusal.
+        It is NOT the security boundary: its answer is already stale by the time
+        anyone acts on it. ``setup_guarded_mutation`` is the boundary.
+        """
+        if role is None:
+            return None
+        normalized = (kind or "").replace("-", "_")
+        bridge = self._SETUP_BRIDGE_TARGETS.get(normalized)
+        if bridge is not None:
+            getter, _locking, attr, parent_kind = bridge
+            row = getattr(self.store, getter)(record_id)
+            parent_id = getattr(row, attr, None) if row is not None else None
+            if not parent_id:
+                return None
+            normalized, record_id = parent_kind, parent_id
+        if rule == "grantable":
+            return self.setup_venue_grantable(record_id, user_id, role, scope)
+        if rule == "active_program_league":
+            return self.setup_league_in_active_program(
+                record_id, user_id, role, scope)
+        return self.setup_target_accessible(
+            normalized, record_id, user_id, role, scope)
+
+    # -- the ATOMIC guard: authorize + lock + mutate + audit, one txn (#369) --
+    #
+    # The blocker this closes. `setup_target_accessible` above is a PREDICATE:
+    # it snapshots, decides, and CLOSES its transaction. The transport layer
+    # then called the facade in a second, independent transaction. Between the
+    # two the target's chain could move, and it did: an authorized Program-A
+    # delete of Venue V raced a commit that moved V into Program B, and the
+    # Program-A request returned 200 and deleted B's row. Snapshot isolation
+    # inside the predicate never helped — it makes the WALK coherent, but it
+    # ends before the write, so the check and the use were never one unit.
+    # Source/destination reassigns had the same gap, and the bridge-row parent
+    # lookup sat outside even the predicate's transaction.
+    #
+    # The rule now: target lookup, bridge-parent resolution, active-tuple
+    # authorization, source AND destination validation, the mutation and its
+    # audit all run inside ONE `store.transaction(isolation="SERIALIZABLE")`,
+    # and every named row is ROW-LOCKED before the decision is taken.
+    #
+    # Why SERIALIZABLE and not REPEATABLE READ: the participants inside this
+    # transaction ask for their own isolation — `ContextService._snapshot`
+    # needs SERIALIZABLE (#159's linearizability with scope-changing writes)
+    # and the chain walk needs REPEATABLE READ. A nested join may not RAISE
+    # isolation, so the outer unit adopts the strongest level any participant
+    # needs. Nothing is silently downgraded.
+    #
+    # Why LOCK rather than only re-read: under snapshot isolation a re-read
+    # inside the same transaction returns the SAME data, so "re-validate just
+    # before the write" is worthless on its own — it cannot see what committed
+    # after the snapshot. The locks are taken as the transaction's FIRST
+    # statements, which does two things at once: it establishes the snapshot no
+    # earlier than the lock (so anything committed before the lock IS visible to
+    # the authorization that follows), and it holds those rows until commit (so
+    # nothing that touches them can commit before the mutation). A writer that
+    # updated a named row after our snapshot makes the lock raise 40001, which
+    # the store translates into ConcurrencyConflictError and the bounded retry
+    # below re-runs from a fresh snapshot — at which point the authorization
+    # sees the moved record and refuses generically.
+    #
+    # What this locks, and why that is the right set: the rows the request
+    # NAMES — every gated target plus a bridge row's resolved parent. Locking
+    # the transitive chain (a Club's every Team, an Organization's every Venue
+    # and grant) is not expressible as a row lock at all — those are predicates,
+    # not rows. It is also unnecessary: every OTHER way to change a target's
+    # chain is itself a setup mutation that NAMES the record whose chain it
+    # changes (a venue-access grant names the Venue, a registration's
+    # league/division reassign names the registration), so it runs through this
+    # same guard and contends for the same lock.
+    _GUARDED_MUTATION_RETRIES = 10
+
+    def setup_guarded_mutation(self, targets, mutation, user_id, role, scope):
+        """Run ``mutation`` only if every target is still authorized, with the
+        authorization, the locks, the write and its audit in ONE transaction.
+
+        ``targets`` is a sequence of ``(kind, record_id, rule)`` triples in the
+        caller's own order. ``rule`` is ``"scope"`` for the generic
+        ``setup_target_accessible`` gate or ``"grantable"`` for the facility-tree
+        exception (``setup_venue_grantable``), which governs ONLY the Venue
+        argument of the venue-access grant. ``kind`` may be a bridge pseudo-kind
+        (``registration`` / ``season_venue_access``); hyphens are folded.
+
+        Returns ``(payload, refused_index)``:
+
+        * ``(payload, None)`` — the mutation ran and COMMITTED; ``payload`` is
+          whatever ``mutation()`` returned.
+        * ``(None, i)`` — target ``i`` is not this caller's to touch. NOTHING
+          ran: no lookup-derived field was serialized, no row written, no audit
+          row. The caller renders its own generic not-found for
+          ``targets[i]`` — this method deliberately does not know the wire
+          wording, so a refusal stays byte-identical to a nonexistent id.
+        * ``(error_dict, None)`` — the mutation itself refused (a domain error).
+          The transaction is ROLLED BACK first: the facade's ``@catch`` turns a
+          DomainError into a dict at a level BELOW this transaction, so without
+          an explicit rollback a half-applied mutation would commit under an
+          error response. Before this guard the facade owned the outermost
+          transaction and got that rollback from the store; it still does.
+
+        ``role is None`` (a legacy identity-less internal caller, the demo/full
+        seeds, the acceptance harnesses) is completely ungated AND completely
+        untouched: no transaction is opened and no lock is taken, so such a
+        caller cannot be made to wait on, or deadlock with, anybody.
+        """
+        checks = [(index, (kind or "").replace("-", "_"), record_id, rule)
+                  for index, (kind, record_id, rule) in enumerate(targets)
+                  if isinstance(record_id, str) and record_id]
+        if role is None or not checks:
+            return mutation(), None
+        try:
+            for attempt in range(self._GUARDED_MUTATION_RETRIES):
+                try:
+                    return self._guarded_attempt(
+                        checks, mutation, user_id, role, scope)
+                except _SetupTargetRefused as exc:
+                    return None, exc.index      # rolled back: nothing happened
+                except _SetupMutationRefused as exc:
+                    return exc.payload, None    # rolled back: nothing happened
+                except ConcurrencyConflictError:
+                    # A named row moved under us (or the DB detected a cycle).
+                    # Everything rolled back, so a fresh attempt re-reads a
+                    # snapshot that INCLUDES the winner and either authorizes
+                    # against the new truth or refuses. Bounded, like
+                    # ContextService._snapshot; the last attempt surfaces the
+                    # stable retryable conflict instead of spinning.
+                    if attempt == self._GUARDED_MUTATION_RETRIES - 1:
+                        raise
+        except DomainError as exc:
+            # The facade's own @catch sits INSIDE this transaction, so a domain
+            # error raised by the transaction boundary itself (a translated DB
+            # conflict, the itemised has-dependencies re-resolution) would
+            # otherwise escape as an exception and become a 500.
+            return exc.to_dict(), None
+        raise AssertionError("guarded mutation retry loop exited without a "
+                             "result")
+
+    def _guarded_attempt(self, checks, mutation, user_id, role, scope):
+        """One all-or-nothing attempt. See ``setup_guarded_mutation``."""
+        with self.store.transaction(isolation="SERIALIZABLE"):
+            refused = self._authorize_setup_targets(
+                checks, user_id, role, scope)
+            if refused is not None:
+                raise _SetupTargetRefused(refused)
+            payload = mutation()
+            if isinstance(payload, dict) and "error" in payload:
+                raise _SetupMutationRefused(payload)
+            return payload, None
+
+    def _authorize_setup_targets(self, checks, user_id, role, scope):
+        """Lock every named row, then authorize every target under those locks.
+
+        Returns the index of the FIRST target this caller may not act on, or
+        None when all pass. Must run inside ``setup_guarded_mutation``'s
+        transaction — the locks are meaningless outside one.
+        """
+        # -- phase 1: lock the NAMED rows, resolving each bridge row's parent
+        # FROM THE LOCKED ROW (one statement reads and locks it, so the parent
+        # cannot be re-pointed between the two). This runs first so the
+        # transaction's snapshot is established by a locking statement rather
+        # than by a bare read: anything committed before the lock is therefore
+        # visible to the authorization below, and anything after it is excluded.
+        #
+        # Locks are taken in a canonical (kind, id) order in both phases, so two
+        # guarded mutations naming an overlapping set can never take them in
+        # opposite orders. (PostgreSQL would detect a deadlock and the retry
+        # loop would recover, but not provoking one is cheaper.)
+        resolved, parents = [], []
+        for index, kind, record_id, rule in sorted(
+                checks, key=lambda c: (c[1], c[2])):
+            bridge = self._SETUP_BRIDGE_TARGETS.get(kind)
+            if bridge is None:
+                self._lock_setup_row(kind, record_id)
+                resolved.append((index, kind, record_id, rule))
+                continue
+            _plain, getter, attr, parent_kind = bridge
+            row = getattr(self.store, getter)(record_id)   # locks the join row
+            parent_id = getattr(row, attr, None) if row is not None else None
+            if not parent_id:
+                # An unresolvable bridge row has no parent to judge. Not this
+                # gate's business: the facade emits the byte-identical wording
+                # a step later, inside this same transaction.
+                continue
+            resolved.append((index, parent_kind, parent_id, rule))
+            parents.append((parent_kind, parent_id))
+
+        # -- phase 2: lock the resolved bridge PARENTS (the rows that actually
+        # name the Program a bridge row is judged by).
+        for kind, record_id in sorted(set(parents)):
+            self._lock_setup_row(kind, record_id)
+
+        # -- phase 3: decide, under the locks, on the post-lock snapshot. In the
+        # CALLER's order, so the target reported back is the first one the
+        # caller listed, never whichever happened to sort first.
+        for index, kind, record_id, rule in sorted(resolved):
+            if rule == "grantable":
+                # The facility-tree exception: a shared arena stays grantable
+                # across Programs (#369 owner ruling). One argument, one route.
+                allowed = self.setup_venue_grantable(
+                    record_id, user_id, role, scope)
+            elif rule == "active_program_league":
+                allowed = self.setup_league_in_active_program(
+                    record_id, user_id, role, scope)
+            else:
+                allowed = self.setup_target_accessible(
+                    kind, record_id, user_id, role, scope)
+            if allowed is False:
+                return index
+        return None
+
+    def _lock_setup_row(self, kind, record_id):
+        """Take the write lock on one setup row (a no-op read on Memory/SQLite,
+        ``SELECT ... FOR UPDATE`` on PostgreSQL). An unknown kind locks nothing
+        — it cannot be authorized either, so the decision still fails closed."""
+        getter = self._SETUP_TARGET_LOCKS.get(kind)
+        if getter is not None:
+            getattr(self.store, getter)(record_id)
 
     # The permission each Setup workflow's own primary action needs (#330
     # review round 1 finding 1). Facilities is MANAGE_ARENA — the one

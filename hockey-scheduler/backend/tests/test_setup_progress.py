@@ -1020,6 +1020,15 @@ class SetupProgressHttpTest(unittest.TestCase):
         status, season = self._req(admin, "POST", "/api/v2/setup/season",
                                    {"program_id": program["id"], "name": "Fall"})
         self.assertEqual(status, 200, season)
+        # Select the new context BEFORE the venue-access grant instead of after
+        # (#369): granting access names two EXISTING records — the Season and
+        # the Venue — and is authorized against the caller's active Program, so
+        # while admin is still in whichever Program resolved first the grant is
+        # correctly refused. The selection was always part of this test; it just
+        # has to happen before the first mutation that depends on it.
+        status, _ = self._req(admin, "POST", "/api/context",
+                              {"program_id": program["id"], "season_id": season["id"]})
+        self.assertEqual(status, 200)
         status, venue = self._req(admin, "POST", "/api/v2/setup/venue",
                                   {"name": "V"})
         self.assertEqual(status, 200, venue)
@@ -1029,9 +1038,6 @@ class SetupProgressHttpTest(unittest.TestCase):
         status, _ = self._req(
             admin, "POST", f"/api/v2/setup/seasons/{season['id']}/venue-access",
             {"venue_id": venue["id"]})
-        self.assertEqual(status, 200)
-        status, _ = self._req(admin, "POST", "/api/context",
-                              {"program_id": program["id"], "season_id": season["id"]})
         self.assertEqual(status, 200)
 
         status, admin_progress = self._req(admin, "GET", "/api/v2/setup/progress")

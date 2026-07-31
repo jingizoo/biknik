@@ -97,8 +97,22 @@ async function checkViewport(browser, viewport) {
       const dOther = await post("/api/setup/division", { season_id: s1.id, level_id: lv2.id, name: "S1 L2 Div" });
       const venue = await post("/api/setup/venue", { name: "V", league_id: league.id });
       // Game ice eligibility (#233 Slice E) requires the venue to hold active
-      // SeasonVenueAccess for the season the game is scheduled in.
-      await post(`/api/v2/setup/seasons/${s1.id}/venue-access`, { venue_id: venue.id });
+      // SeasonVenueAccess for the season the game is scheduled in. That grant is
+      // gated on the ACTIVE Season (#369 prereq): with two Seasons present the
+      // no-context fallback would resolve to the latest-id one (s2), so the
+      // grant for s1 must be made with s1 explicitly selected — and its response
+      // asserted, since this helper decodes the body without checking status and
+      // a silent 404 would otherwise surface later as an unexplained wizard
+      // timeout. Both games this journey creates are in s1, so one grant covers
+      // it. The production guard is honoured, never bypassed.
+      const ctx = await post("/api/context", { program_id: league.id, season_id: s1.id });
+      if (!ctx || (ctx.season || {}).id !== s1.id) {
+        throw new Error(`could not select s1 context: ${JSON.stringify(ctx)}`);
+      }
+      const grant = await post(`/api/v2/setup/seasons/${s1.id}/venue-access`, { venue_id: venue.id });
+      if (!grant || !grant.id) {
+        throw new Error(`s1 venue-access grant refused: ${JSON.stringify(grant)}`);
+      }
       const rink = await post("/api/setup/rink", { venue_id: venue.id, name: "R" });
       const club = await post("/api/setup/club", { name: "Club" });
       // #180/#283 Slice E: create every permanent Team under its permanent
@@ -297,7 +311,10 @@ async function checkViewport(browser, viewport) {
     }
     console.log(`[${viewport.label}] OK — one team across two seasons; wizard filters by registration; no implicit League selection; Exhibition friendly is season-scoped.`);
   } catch (error) {
-    throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
+    // Keep the original error (and its stack) so a timeout names the failing
+    // request/selector; just append the server tail to its message.
+    error.message = `${error.message}\n--- demo server output ---\n${serverOutput}`;
+    throw error;
   } finally {
     await context.close();
     await stopServer(server);
