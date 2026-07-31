@@ -232,8 +232,22 @@ async function buildFixture(page) {
       { name, organization_id: org.id });
     const s1Venue = await venue("S1-Venue");
     const s2Venue = await venue("S2-Venue");
-    await post(`/api/v2/setup/seasons/${s1.id}/venue-access`, { venue_id: s1Venue.id });
-    await post(`/api/v2/setup/seasons/${s2.id}/venue-access`, { venue_id: s2Venue.id });
+    // A venue-access grant is Season-bound (#369 prereq, merged from #372):
+    // it binds to the ACTIVE Season, so this two-Season fixture selects each
+    // destination before granting into it, and asserts the grant landed rather
+    // than parsing a refusal as ordinary JSON. Leaves the context on s1, which
+    // is what the ceiling assertions below expect.
+    const grantVenue = async (seasonId, venueId, label) => {
+      await post("/api/context", { program_id: program.id, season_id: seasonId });
+      const granted = await post(`/api/v2/setup/seasons/${seasonId}/venue-access`,
+        { venue_id: venueId });
+      if (!granted || !granted.id || granted.error) {
+        throw new Error(`${label} venue-access grant did not succeed: `
+          + JSON.stringify(granted));
+      }
+    };
+    await grantVenue(s2.id, s2Venue.id, "S2");
+    await grantVenue(s1.id, s1Venue.id, "S1");
     const s1Rink = await post("/api/v2/setup/rink",
       { venue_id: s1Venue.id, name: "S1-Rink" });
     const s2Rink = await post("/api/v2/setup/rink",
@@ -512,8 +526,16 @@ async function checkCeiling(browser, viewport) {
     // (the Season lifecycle is API-only today -- app.js only ever RENDERS the
     // resulting "archived (read-only)" option label), so this is a raw
     // authenticated POST to the same route context-switcher.js uses.
+    // Season lifecycle is Season-BOUND (#367 ruling, enforced since #372):
+    // archive acts on S2, so select S2 first. The context is restored to S1
+    // immediately after, because every assertion below reads the Dashboard
+    // under S1 and would otherwise be measuring the wrong Season.
+    await apiPost(page, "/api/context",
+      { program_id: f.program, season_id: f.s2 });
     const archived = await apiPost(page,
       `/api/v2/setup/seasons/${f.s2}/archive`, { reason: "season complete" });
+    await apiPost(page, "/api/context",
+      { program_id: f.program, season_id: f.s1 });
     if (archived.status !== 200) {
       fail(`[${L}/E] archiving S2 failed: ${archived.status} `
         + `${JSON.stringify(archived.json)}`);
