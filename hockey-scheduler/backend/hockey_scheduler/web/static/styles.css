@@ -1264,6 +1264,14 @@ details.tn > .tn-sum:hover { background: #f6f7fb; }
 .swf-back { align-self: flex-start; }
 /* One primary action per screen: the demoted controls sit beside it as ghost
    buttons, and the tertiary row below as plain links. */
+/* The stable container a per-card repaint rewrites the landing's action
+   groups through (#365). Layout-transparent on purpose: .swf-landing is a
+   flex column with its own gap, and this wrapper exists for the DOM write,
+   not for layout -- `display: contents` keeps .swf-actions/.swf-tertiary as
+   direct flex children exactly as before, so nothing about the landing's
+   spacing changes. A plain <div> with no implicit role, so it carries no
+   accessibility semantics that `display: contents` could drop. */
+.swf-landing-actions { display: contents; }
 .swf-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .swf-tertiary { display: flex; flex-wrap: wrap; gap: 12px; font-size: 13px; }
 .swf-detail { border-top: 1px solid var(--sep); padding-top: 12px;

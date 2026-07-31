@@ -281,6 +281,18 @@ async function checkViewport(browser, viewport) {
       // genuinely has no Season, since /api/context auto-selects one whenever
       // the chosen Program has any.
       const pC = await post("/api/v2/setup/program", { name: "ZZZ Ctx Program C", country: "US" });
+      // One EXISTING division under the active season's own league. #365
+      // makes a landing's demoted actions state-dependent -- an EMPTY card
+      // (the "Season participation and divisions" card counts divisions, so
+      // zero of them IS empty) offers only its one authorized primary action,
+      // so the "Divisions" secondary this leg drives is not on an empty
+      // landing. Seeding one division does NOT weaken what follows: the
+      // assertion is about where the NEXT division the drawer commits is
+      // PERSISTED, and the trap (drawerField()'s first-global-row fallback,
+      // which points at Program A's league) is untouched by an existing row
+      // in Program B.
+      await post("/api/v2/setup/division",
+        { league_id: l2.id, season_id: s2.id, name: "ZZZ Existing Division S2" });
       return { pA: pA.id, sA: sA.id, lA: lA.id, pB: pB.id, pC: pC.id,
                s1: s1.id, s2: s2.id, l1: l1.id, l2: l2.id };
     });
@@ -453,6 +465,35 @@ async function checkViewport(browser, viewport) {
     }, [fx.pB, fx.s2]);
     await page.reload();
     await page.waitForSelector("#content", { timeout: 15000 });
+    // One venue + rink, granted into the ACTIVE season, before opening the
+    // landing. #365 makes a landing's demoted actions state-dependent, and
+    // this workflow's card counts venues and rinks -- with none of either the
+    // card is EMPTY and offers only its one authorized primary action, so the
+    // Rink/Ice-slot controls this leg is about are not on the landing to
+    // click. What the leg asserts is unchanged and still exactly as strong:
+    // an OFFERED control must open a real drawer rather than being
+    // permanently-failing decoration. Uses the same public endpoints
+    // dashboard-season-ceiling.js already seeds venues through.
+    const facilitiesSeed = await page.evaluate(async ([season_id]) => {
+      const post = async (path, body) => (await fetch(path, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      })).json();
+      const org = await post("/api/v2/setup/organization", { name: "ZZZ Facilities Org" });
+      const venue = await post("/api/v2/setup/venue",
+        { name: "ZZZ Facilities Venue", organization_id: org.id });
+      if (venue.error) return { error: `venue create failed: ${JSON.stringify(venue.error)}` };
+      const granted = await post(`/api/v2/setup/seasons/${season_id}/venue-access`,
+        { venue_id: venue.id });
+      if (!granted || granted.error) {
+        return { error: `venue-access grant failed: ${JSON.stringify(granted)}` };
+      }
+      const rink = await post("/api/v2/setup/rink",
+        { venue_id: venue.id, name: "ZZZ Facilities Rink" });
+      if (rink.error) return { error: `rink create failed: ${JSON.stringify(rink.error)}` };
+      return { venue: venue.id, rink: rink.id };
+    }, [fx.s2]);
+    if (facilitiesSeed.error) fail(`[${L}] ${facilitiesSeed.error}`);
     await openSetupHub(page, `${L}/facilities-live`);
     await page.click('[data-setup-workflow="facilities"]');
     await page.waitForSelector(".swf-landing", { timeout: 10000 });
