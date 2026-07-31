@@ -2851,14 +2851,21 @@ function renderSeasonParticipation(hv, ov, sv) {
       // `season_archived` like every other write the Season owns. The
       // read-only copy in the Allowed-venues section above says so explicitly,
       // so the surface still explains itself rather than silently dropping it.
-      const revokedAccess = isHistoricalSeason
-        ? [] : seasonAccessRows.filter((a) => !a.active);
+      // Revoked grants are HISTORY, and history stays readable on an archived
+      // Season exactly as the active grants above do -- the API preserves these
+      // rows deliberately. An earlier revision of this read-only work emptied
+      // the list, which hid a Season's own past instead of hiding the controls
+      // that act on it. Only the permanent-cleanup button is a mutation, so
+      // only that is withheld.
+      const revokedAccess = seasonAccessRows.filter((a) => !a.active);
       const revokedAccessRows = revokedAccess.map((a) => {
         const venueName = venueNameById[a.venue_id] || a.venue_id;
         return `<div class="tn-leaf reg-row inactive-reg">
           <span class="tn-label">🏟️ ${esc(venueName)}</span>
-          <span class="tn-meta">revoked · <code>${esc(a.id)}</code></span>
-          ${delBtn("season-venue-access", a.id, `${venueName} access`,
+          <span class="tn-meta">revoked · <code>${esc(a.id)}</code>${
+            isHistoricalSeason ? " · read-only history" : ""}</span>
+          ${isHistoricalSeason ? "" : delBtn("season-venue-access", a.id,
+            `${venueName} access`,
             "Permanently remove this revoked venue access")}</div>`;
       }).join("");
       const revokedAccessSection = revokedAccess.length

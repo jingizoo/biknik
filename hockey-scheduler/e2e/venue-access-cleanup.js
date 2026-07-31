@@ -543,9 +543,18 @@ async function checkViewport(browser, viewport) {
       throw new Error(`[${viewport.label}] the archived season's shared arena rendered as a `
         + `bare venue id instead of its name`);
     }
-    if (/Revoked venue access/i.test(archivedPanelText)) {
-      throw new Error(`[${viewport.label}] the archived season still renders the "Revoked `
-        + `venue access" cleanup section`);
+    // Revoked grants are HISTORY and MUST still render on an archived Season --
+    // the API preserves them deliberately. The earlier revision of this
+    // assertion required the section to vanish, which encoded the defect: it
+    // hid a Season's own past rather than the controls that mutate it. What
+    // must be absent is only the permanent-cleanup button, asserted above.
+    if (!/Revoked venue access/i.test(archivedPanelText)) {
+      throw new Error(`[${viewport.label}] the archived season dropped its "Revoked venue `
+        + `access" HISTORY; only the cleanup control may be withheld`);
+    }
+    if (!archivedPanelText.includes("VA-ARCHIVE-RETIRED")) {
+      throw new Error(`[${viewport.label}] the archived season's revoked history does not `
+        + `name VA-ARCHIVE-RETIRED: ${archivedPanelText.slice(0, 400)}`);
     }
     if (!/archived and read-only/i.test(archivedPanelText)) {
       throw new Error(`[${viewport.label}] the archived season's venue section carries no `
