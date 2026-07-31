@@ -24,7 +24,27 @@
 //       that is the only explicit record of why a Game's ice was allowed
 //       must never be purgeable — clicking its cleanup trash action shows
 //       the blocked modal (mentioning the Game), not a silent success, with
-//       zero mutation on both the access row and the Game.
+//       zero mutation on both the access row and the Game;
+//   (8) an ARCHIVED selected Season (#369 owner ruling, follow-up) — the
+//       read-only half of this very surface. This journey owns all three
+//       control families the ruling removes there (Allow picker, Revoke,
+//       revoked permanent-cleanup), so the archived case is asserted against
+//       the same real panel rather than in a journey of its own:
+//         * a THIRD fixture whose Season holds two ACTIVE grants (one of them
+//           an arena owned by a second Organization and shared with ANOTHER
+//           Program, so its name can only come from the grant row's additive
+//           `venue_name`) plus one REVOKED grant;
+//         * FIRST, while the Season is still active, the precondition: the
+//           Allow picker, the Revoke buttons and the revoked-cleanup trash
+//           action are all PRESENT and a /venue-candidates request WAS
+//           issued — without this the post-archive "absent" assertions would
+//           pass against a surface that never rendered them at all;
+//         * then the Season is archived and re-selected, /api/context is
+//           confirmed to report read_only, and the SAME panel must render the
+//           allowed-venues history WITH its venue names while the Allow
+//           picker, every Revoke control and the whole "Revoked venue access"
+//           cleanup section are gone, explicit read-only copy is shown, and
+//           NO /venue-candidates request is issued.
 // Fails on any browser console/page error.
 const { chromium } = require("playwright");
 const { spawn } = require("child_process");
@@ -81,6 +101,14 @@ async function checkViewport(browser, viewport) {
   page.on("pageerror", (e) => errors.push(`[pageerror] ${e.message}`));
   const consoleErrorHandler = (m) => { if (m.type() === "error") errors.push(`[console] ${m.text()}`); };
   page.on("console", consoleErrorHandler);
+  // Step (8) asserts that an ARCHIVED selection issues NO grant-candidate
+  // request at all — not merely that it renders no picker — so every request
+  // the page makes is recorded from the first navigation onward and the log is
+  // cleared immediately before the archived reload.
+  let candidateRequests = [];
+  page.on("request", (r) => {
+    if (/\/venue-candidates(\?|$)/.test(r.url())) candidateRequests.push(r.url());
+  });
 
   try {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
@@ -333,10 +361,202 @@ async function checkViewport(browser, viewport) {
     if (stillGameBacked.accessGone) throw new Error(`[${viewport.label}] revoked access vanished despite the block`);
     if (stillGameBacked.gameGone) throw new Error(`[${viewport.label}] Game vanished despite the block`);
 
+    // (8) The ARCHIVED selected Season (#369 owner ruling, follow-up).
+    //
+    // The reviewer's reproduction: an archived Season, explicitly selected,
+    // with /api/context reporting read_only:true, still received grant
+    // candidates and still rendered the Allow picker — controls that cannot
+    // succeed (the grant fails `season_archived`), fed by the one facility
+    // read that deliberately reaches ACROSS the Program ceiling.
+    //
+    // `shared` is owned by a SECOND Organization and is granted to ANOTHER
+    // Program's Season too, so it is absent from this Program's scoped venue
+    // list: its name on the archived history can only come from the grant
+    // row's additive `venue_name`. If the read-only branch lost that
+    // resolution the row would render a bare id, and the name assertion below
+    // is what catches it.
+    const fx3 = await page.evaluate(async () => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      const orgA = await post("/api/v2/setup/organization", { name: "VA Archive Org A" });
+      const programA = await post("/api/v2/setup/program",
+        { name: "VA Archive Program A", operator_organization_id: orgA.id });
+      const seasonA = await post("/api/v2/setup/season",
+        { program_id: programA.id, name: "2031-32" });
+      const orgB = await post("/api/v2/setup/organization", { name: "VA Archive Org B" });
+      const programB = await post("/api/v2/setup/program",
+        { name: "VA Archive Program B", operator_organization_id: orgB.id });
+      const seasonB = await post("/api/v2/setup/season",
+        { program_id: programB.id, name: "2031-32 B" });
+      const home = await post("/api/v2/setup/venue",
+        { name: "VA-ARCHIVE-HOME", organization_id: orgA.id });
+      const shared = await post("/api/v2/setup/venue",
+        { name: "VA-ARCHIVE-SHARED", organization_id: orgB.id });
+      const retired = await post("/api/v2/setup/venue",
+        { name: "VA-ARCHIVE-RETIRED", organization_id: orgA.id });
+      // A grant binds to the SELECTED destination Season (#369 target
+      // authorization), so each destination is selected before granting into
+      // it — the production guard is honoured, never bypassed.
+      await post("/api/context", { program_id: programB.id, season_id: seasonB.id });
+      await post(`/api/v2/setup/seasons/${seasonB.id}/venue-access`, { venue_id: shared.id });
+      await post("/api/context", { program_id: programA.id, season_id: seasonA.id });
+      const gHome = await post(`/api/v2/setup/seasons/${seasonA.id}/venue-access`,
+        { venue_id: home.id });
+      const gShared = await post(`/api/v2/setup/seasons/${seasonA.id}/venue-access`,
+        { venue_id: shared.id });
+      const gRetired = await post(`/api/v2/setup/seasons/${seasonA.id}/venue-access`,
+        { venue_id: retired.id });
+      await post(`/api/v2/setup/season-venue-access/${gRetired.id}/remove`, {});
+      return {
+        program: programA.id, season: seasonA.id,
+        home: home.id, shared: shared.id, retired: retired.id,
+        gHome: gHome.id, gShared: gShared.id, gRetired: gRetired.id,
+      };
+    });
+    if (!fx3.gHome || !fx3.gShared || !fx3.gRetired) {
+      throw new Error(`[${viewport.label}] archived-season fixture grants did not land: `
+        + JSON.stringify(fx3));
+    }
+
+    // Same deep-link drop as the earlier fixtures: the hash still names the
+    // PREVIOUS selection, which bootstrap() would faithfully re-adopt.
+    const enterSetup = async () => {
+      await page.evaluate(() => history.replaceState(
+        null, "", location.pathname + location.search));
+      await page.reload({ waitUntil: "domcontentloaded" });
+      await page.waitForSelector("#content > *", { timeout: 10000 });
+      await page.click('.tab[data-tab="setup"]');
+      await page.click('[data-setup-view="hierarchy"]');
+    };
+    await enterSetup();
+
+    // PRECONDITION, while the Season is still ACTIVE: all three control
+    // families really do render here, and the candidate request really is
+    // issued. Without this the "absent" assertions after the archive would
+    // pass just as happily against a panel that never showed them.
+    await page.waitForSelector(`#va-add-${fx3.season}`, { timeout: 15000 });
+    for (const [label, selector] of [
+      ["Allow button", `[data-va-add="${fx3.season}"]`],
+      ["Revoke (home)", `[data-va-revoke="${fx3.gHome}"]`],
+      ["Revoke (shared)", `[data-va-revoke="${fx3.gShared}"]`],
+      ["revoked cleanup", `#season-participation [data-del="season-venue-access"][data-del-id="${fx3.gRetired}"]`],
+    ]) {
+      if (await page.locator(selector).count() === 0) {
+        throw new Error(`[${viewport.label}] precondition failed: the ACTIVE season's `
+          + `${label} is already absent, so its absence after archiving would prove nothing`);
+      }
+    }
+    const activePanelText = await page.textContent("#season-participation");
+    for (const name of ["VA-ARCHIVE-HOME", "VA-ARCHIVE-SHARED"]) {
+      if (!activePanelText.includes(name)) {
+        throw new Error(`[${viewport.label}] precondition failed: "${name}" is not on the `
+          + `ACTIVE season's Allowed venues list`);
+      }
+    }
+    if (!/Revoked venue access/i.test(activePanelText)) {
+      throw new Error(`[${viewport.label}] precondition failed: the ACTIVE season shows no `
+        + `"Revoked venue access" section, so its absence after archiving proves nothing`);
+    }
+    if (candidateRequests.length === 0) {
+      throw new Error(`[${viewport.label}] precondition failed: no /venue-candidates request `
+        + `was issued for the ACTIVE selected season, so "no request" after archiving `
+        + `would be vacuously true`);
+    }
+
+    // Archive it and re-select it explicitly, exactly as the reviewer did.
+    // There is no archive control in the shipped UI (#159 — a Season is
+    // archived through the API), so this is a raw POST; the SELECTION that
+    // follows goes through the same /api/context the switcher posts.
+    const archivedCtx = await page.evaluate(async (i) => {
+      const post = async (p, b) => (await fetch(p, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+      })).json();
+      const archived = await post(`/api/v2/setup/seasons/${i.season}/archive`,
+        { reason: "season complete" });
+      await post("/api/context", { program_id: i.program, season_id: i.season });
+      const ctx = await (await fetch("/api/context", { credentials: "same-origin" })).json();
+      return { archived, ctx };
+    }, { program: fx3.program, season: fx3.season });
+    if (archivedCtx.archived.error || archivedCtx.archived.status !== "archived") {
+      throw new Error(`[${viewport.label}] archiving the season failed: `
+        + JSON.stringify(archivedCtx.archived));
+    }
+    if (archivedCtx.ctx.season_id !== fx3.season || archivedCtx.ctx.read_only !== true) {
+      throw new Error(`[${viewport.label}] /api/context does not report the archived season `
+        + `as the selected, read-only one: ${JSON.stringify(archivedCtx.ctx)}`);
+    }
+
+    // Re-enter with the archived selection, watching for any candidate request.
+    candidateRequests = [];
+    await enterSetup();
+    // Wait on something the panel paints in BOTH the gated and the ungated
+    // build — this Season's own allowed-venue name — so a regression is caught
+    // by the specific assertions below rather than by a bare selector timeout.
+    await page.waitForFunction((name) => {
+      const el = document.querySelector("#season-participation");
+      return !!el && el.textContent.includes(name);
+    }, "VA-ARCHIVE-HOME", { timeout: 15000 }).catch(() => {
+      throw new Error(`[${viewport.label}] the archived season's allowed-venues history `
+        + `never rendered at all`);
+    });
+
+    // The context bar's own read-only signal is what the panel keys off, so
+    // assert the two agree rather than trusting the panel alone.
+    if (!(await page.locator("#ctx-ro").isVisible())) {
+      throw new Error(`[${viewport.label}] the context bar's read-only badge is hidden for `
+        + `the selected archived season`);
+    }
+
+    // Every control that cannot succeed is GONE.
+    for (const [label, selector] of [
+      ["Allow picker", `#va-add-${fx3.season}`],
+      ["Allow button", `[data-va-add="${fx3.season}"]`],
+      ["Revoke control", "[data-va-revoke]"],
+      ["revoked permanent-cleanup control", '#season-participation [data-del="season-venue-access"]'],
+    ]) {
+      const count = await page.locator(selector).count();
+      if (count !== 0) {
+        throw new Error(`[${viewport.label}] the archived season still offers its ${label} `
+          + `(${count} matching "${selector}") — a control whose write fails season_archived`);
+      }
+    }
+    // ...and the candidate directory was never even asked for.
+    if (candidateRequests.length) {
+      throw new Error(`[${viewport.label}] the archived selection still requested grant `
+        + `candidates: ${candidateRequests.join(", ")}`);
+    }
+
+    // The history itself still renders, NAMES included — including the
+    // cross-Program arena whose name only the grant row can supply — and says
+    // in so many words why nothing here can be changed.
+    const archivedPanelText = await page.textContent("#season-participation");
+    for (const name of ["VA-ARCHIVE-HOME", "VA-ARCHIVE-SHARED"]) {
+      if (!archivedPanelText.includes(name)) {
+        throw new Error(`[${viewport.label}] the archived season's allowed-venues history `
+          + `lost "${name}" — read-only history is exactly what this surface is for`);
+      }
+    }
+    if (archivedPanelText.includes(fx3.shared)) {
+      throw new Error(`[${viewport.label}] the archived season's shared arena rendered as a `
+        + `bare venue id instead of its name`);
+    }
+    if (/Revoked venue access/i.test(archivedPanelText)) {
+      throw new Error(`[${viewport.label}] the archived season still renders the "Revoked `
+        + `venue access" cleanup section`);
+    }
+    if (!/archived and read-only/i.test(archivedPanelText)) {
+      throw new Error(`[${viewport.label}] the archived season's venue section carries no `
+        + `explicit read-only copy: ${archivedPanelText.slice(0, 400)}`);
+    }
+
     if (errors.length) {
       throw new Error(`[${viewport.label}] console/page errors:\n${errors.join("\n")}`);
     }
-    console.log(`[${viewport.label}] OK — venue access cleanup UI verified.`);
+    console.log(`[${viewport.label}] OK — venue access cleanup UI verified, `
+      + `including the archived season's read-only history.`);
   } catch (error) {
     throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {

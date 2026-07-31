@@ -6172,6 +6172,26 @@ class ApiService:
         what deadlocked the capability (once one Program holds the grant, no
         other could obtain it). Rinks, IceSlots and every competition record
         keep the ordinary ceiling.
+
+        4. **An ARCHIVED destination is refused outright** (#369 owner ruling,
+           follow-up). An archived Season is read-only history: every write it
+           owns -- ``grant_season_venue_access`` included -- fails
+           ``season_archived`` at :func:`require_active_season`. This method
+           exists ONLY to feed that write, so answering it for an archived
+           Season advertised a mutation nobody could perform, and did so by
+           handing out the one facility list that deliberately reaches ACROSS
+           the Program ceiling: a cross-Program Venue directory disclosed for a
+           capability the destination cannot exercise. The refusal is
+           deliberately GENERIC -- the same ``NotFoundError`` as a foreign,
+           sibling, nonexistent or Program-only miss -- so an archived Season is
+           not distinguishable from any of them, and it is raised BEFORE any
+           Venue is read or serialized, so no candidate is even computed.
+
+        :meth:`list_season_venue_access` is deliberately NOT narrowed the same
+        way: it reports the Season's OWN grant history (active and revoked,
+        each naming its own Venue), which is precisely what a read-only
+        historical Season is FOR. Reading what a Season used is not being
+        offered something to change.
         """
         if role is None:
             return {"error": {"code": "forbidden",
@@ -6184,6 +6204,14 @@ class ApiService:
         # none of them is distinguishable from the others.
         if (program is None or active_season is None
                 or not season_id or season_id != active_season.id):
+            raise NotFoundError(f"Season {season_id} not found.")
+        # ...and an ARCHIVED selected Season joins them, down the SAME path.
+        # Positioned here deliberately: AFTER the equality check (so it can
+        # never become an archived-vs-active oracle for a Season the caller did
+        # not select) and BEFORE any Venue is resolved or serialized (so the
+        # cross-Program candidate directory is never even built for a
+        # destination whose grant would fail `season_archived` anyway).
+        if active_season.status == SeasonStatus.ARCHIVED:
             raise NotFoundError(f"Season {season_id} not found.")
         season = active_season
         granted = {a.venue_id for a in

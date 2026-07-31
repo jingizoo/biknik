@@ -51,7 +51,7 @@ from http.server import ThreadingHTTPServer
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import Role
+from hockey_scheduler.domain import Role, SeasonStatus
 from hockey_scheduler.store import InMemoryStore, SqlStore
 
 ADMIN = ("admin", Role.LEAGUE_ADMIN, {})
@@ -1396,3 +1396,520 @@ class SelectedSeasonCeilingHttpTest(unittest.TestCase):
                          grants_before, "a refused read changed grants")
         self.assertEqual(len(store.all_setup_audit()), audit_before,
                          "a refused read wrote an audit row")
+
+
+# -- the ARCHIVED destination Season (#369 OWNER RULING, follow-up) ---------
+#
+# The exact-selected-Season ceiling above was necessary but not sufficient, and
+# the repository owner reproduced what it still let through:
+#
+#     "An explicitly selected archived Season still receives mutation
+#     candidates. I archived season_1, explicitly selected it, and confirmed
+#     /api/context reports read_only:true. list_season_venue_access correctly
+#     returned its historical rows. get_venue_grant_candidates for the same
+#     selected archived Season returned 200-equivalent data with three
+#     candidates; the first was CEIL-RETIRED-RINK-A1. Attempting the advertised
+#     grant then failed with season_archived."
+#
+# Equality with the selected Season proves the caller is working IN that
+# Season. It never proves the Season can still be WRITTEN. An archived Season
+# is read-only history: every write it owns -- `grant_season_venue_access`
+# included -- fails `season_archived` at `require_active_season`. So a
+# candidate list for it advertised a mutation nobody could perform, and paid
+# for the advertisement with the one facility read that deliberately reaches
+# ACROSS the Program ceiling -- a cross-Program Venue directory handed out to
+# serve a capability the destination cannot exercise.
+#
+# What these cases pin:
+#   * `get_venue_grant_candidates` refuses an archived SELECTED Season down the
+#     SAME generic path as a foreign, sibling, nonexistent or Program-only miss
+#     -- raw-byte identically once the echoed id is masked -- and refuses
+#     BEFORE any Venue is resolved or serialized, so no candidate is computed
+#     and no Venue id or name can ride along.
+#   * `list_season_venue_access` is deliberately NOT narrowed: reading which
+#     Venues a historical Season used is exactly what a read-only Season is
+#     FOR, and the additive `venue_name` on a legitimately shared cross-Program
+#     arena must still resolve.
+#   * a refused candidate read is still a READ: no grant and no audit row moves.
+#
+# The single most important assertion in the whole file is the NON-VACUITY
+# precondition below: the candidate set is read once while the Season is still
+# ACTIVE and asserted NON-EMPTY (and named), so "refused" can never be
+# indistinguishable from "there was nothing to offer in the first place".
+
+
+class ArchivedSelectedSeasonCandidateTest(unittest.TestCase):
+    """The archived selected Season, on every configured store backend."""
+
+    def _arm(self, api, store, fx, backend):
+        """Select Season A1, record what the candidate route WOULD have served,
+        then archive it and re-select it explicitly.
+
+        Returns the pre-archive candidate rows. Asserting them non-empty here
+        -- while the Season is still active, through the very method under test
+        -- is what makes every refusal below non-vacuous: an empty candidate
+        set would make "refused" and "nothing to offer" the same observation.
+        """
+        sel = fx["A"]["season"]["id"]
+        program = fx["A"]["program"]["id"]
+        api.set_active_context(*ADMIN, program, sel)
+
+        pre = api.get_venue_grant_candidates(sel, *ADMIN)
+        self.assertNotIn(
+            "error", pre,
+            f"[{backend}] the candidate route already refused the ACTIVE "
+            f"selected Season, so archiving it could not be what refuses it: "
+            f"{pre}")
+        candidates = pre["candidates"]
+        self.assertTrue(
+            candidates,
+            f"[{backend}] the candidate set was EMPTY before archiving, so "
+            f"every refusal assertion below would pass vacuously -- 'refused' "
+            f"would be indistinguishable from 'nothing to offer'")
+        pre_ids = {c["id"] for c in candidates}
+        pre_names = {c["name"] for c in candidates}
+        # ...and it is genuinely the cross-Program directory, not one
+        # incidental row: the reviewer's reproduction named three candidates,
+        # one of them this Season's own retired rink.
+        self.assertIn(
+            fx["cross"]["id"], pre_ids,
+            f"[{backend}] the pre-archive candidate set carries no Venue "
+            f"belonging to ANOTHER Program, so refusing it would not be "
+            f"withholding a cross-Program directory: {candidates}")
+        self.assertIn(fx["retired"]["id"], pre_ids, (backend, candidates))
+        self.assertIn("CEIL-RETIRED-RINK-A1", pre_names, (backend, candidates))
+
+        archived = api.archive_season(sel, reason="season complete",
+                                      actor_id="admin")
+        self.assertNotIn("error", archived, (backend, archived))
+        # Explicitly RE-SELECT it, exactly as the reviewer did -- an archived
+        # Season is a first-class read-only historical context, not an error.
+        api.set_active_context(*ADMIN, program, sel)
+
+        # PRECONDITION, before a single refusal is examined: the Season really
+        # IS archived, really IS the selected one, and the context says so.
+        row = store.get_season(sel)
+        self.assertIsNotNone(row, f"[{backend}] the Season vanished")
+        self.assertEqual(
+            row.status, SeasonStatus.ARCHIVED,
+            f"[{backend}] the Season is not actually archived ({row.status}), "
+            f"so this case never exercises the archived destination at all")
+        ctx = api.get_active_context(*ADMIN)
+        self.assertEqual(
+            ctx["season_id"], sel,
+            f"[{backend}] the archived Season is not the SELECTED one "
+            f"({ctx['season_id']!r}); the refusal below would then be the "
+            f"ordinary selected-Season ceiling, not the archived one")
+        self.assertEqual(ctx["program_id"], program, (backend, ctx))
+        self.assertTrue(
+            ctx["read_only"],
+            f"[{backend}] the context does not report read_only for the "
+            f"selected archived Season: {ctx}")
+        return candidates
+
+    def _venue_tokens(self, fx):
+        """Every Venue id and name in the fixture: a refusal may name none."""
+        out = []
+        for key in ("home", "retired", "shared", "cross", "sibling_venue"):
+            out.append(fx[key]["id"])
+            out.append(fx[key]["name"])
+        return tuple(out)
+
+    def test_an_archived_selected_season_is_refused_exactly_like_a_missing_one(self):
+        for backend, store in _backends():
+            with self.subTest(backend=backend):
+                api = ApiService(store)
+                fx = _ceiling_fixture(api)
+                self._arm(api, store, fx, backend)
+                sel = fx["A"]["season"]["id"]
+                # Snapshot AFTER the archive, so the archive's own audit row is
+                # part of the baseline and only the refusals are measured.
+                grants_before = {g.id: g.active
+                                 for g in store.all_season_venue_access()}
+                audit_before = len(store.all_setup_audit())
+
+                archived = api.get_venue_grant_candidates(sel, *ADMIN)
+                missing = api.get_venue_grant_candidates("season_never_existed",
+                                                         *ADMIN)
+                self.assertIn(
+                    "error", archived,
+                    f"[{backend}] the SELECTED but ARCHIVED Season still "
+                    f"received grant candidates -- controls that cannot "
+                    f"succeed, plus a cross-Program facility directory: "
+                    f"{archived}")
+                self.assertIn("error", missing, missing)
+
+                raw_a = _mask(json.dumps(archived, sort_keys=True).encode(), sel)
+                raw_m = _mask(json.dumps(missing, sort_keys=True).encode(),
+                              "season_never_existed")
+                self.assertEqual(
+                    raw_a, raw_m,
+                    f"[{backend}] an ARCHIVED selected Season is "
+                    f"distinguishable from a nonexistent one: {raw_a!r} vs "
+                    f"{raw_m!r}")
+                # Not one Venue id or name survives the refusal -- the point of
+                # refusing BEFORE any Venue is resolved or serialized.
+                for label, raw in (("archived", raw_a), ("missing", raw_m)):
+                    for token in self._venue_tokens(fx):
+                        self.assertNotIn(
+                            token.encode(), raw,
+                            f"[{backend}/{label}] the refusal disclosed "
+                            f"{token!r}")
+
+                # A refused read is a READ.
+                self.assertEqual(
+                    {g.id: g.active for g in store.all_season_venue_access()},
+                    grants_before,
+                    f"[{backend}] a refused candidate read changed grants")
+                self.assertEqual(
+                    len(store.all_setup_audit()), audit_before,
+                    f"[{backend}] a refused candidate read wrote an audit row")
+
+                # ...and the advertised mutation really is impossible, which is
+                # why offering it was the defect.
+                blocked = api.grant_season_venue_access(sel, fx["cross"]["id"],
+                                                        "admin")
+                self.assertIn("error", blocked, (backend, blocked))
+                self.assertEqual(
+                    (blocked["error"].get("details") or {}).get("reason"),
+                    "season_archived",
+                    f"[{backend}] granting into the archived Season did NOT "
+                    f"fail season_archived, so the candidate list was not "
+                    f"advertising an impossible write: {blocked}")
+                _close(store)
+
+    def test_an_archived_selected_season_still_reads_its_own_grant_history(self):
+        for backend, store in _backends():
+            with self.subTest(backend=backend):
+                api = ApiService(store)
+                fx = _ceiling_fixture(api)
+                self._arm(api, store, fx, backend)
+                sel = fx["A"]["season"]["id"]
+                # The shared arena really is cross-Program -- naming it below
+                # is the additive behavior that must SURVIVE the archive.
+                self.assertIn(
+                    fx["shared"]["id"],
+                    {g.venue_id for g in store.season_venue_access_for_season(
+                        fx["B"]["season"]["id"])},
+                    f"[{backend}] the 'shared' arena is held by one Program "
+                    f"only, so naming it proves nothing about sharing")
+
+                listing = api.list_season_venue_access(sel, *ADMIN)
+                self.assertNotIn(
+                    "error", listing,
+                    f"[{backend}] archiving a Season made its OWN grant "
+                    f"history unreadable -- that history is exactly what a "
+                    f"read-only Season is for: {listing}")
+                rows = {r["venue_id"]: r for r in listing["venue_access"]}
+                self.assertEqual(
+                    set(rows), {fx["home"]["id"], fx["retired"]["id"],
+                                fx["shared"]["id"]}, (backend, rows))
+                self.assertTrue(rows[fx["home"]["id"]]["active"], backend)
+                self.assertFalse(
+                    rows[fx["retired"]["id"]]["active"],
+                    f"[{backend}] the revoked grant row vanished from the "
+                    f"archived Season's history")
+                self.assertEqual(rows[fx["home"]["id"]]["venue_name"],
+                                 "CEIL-HOME-RINK-A1", backend)
+                self.assertEqual(rows[fx["retired"]["id"]]["venue_name"],
+                                 "CEIL-RETIRED-RINK-A1", backend)
+                self.assertEqual(
+                    rows[fx["shared"]["id"]]["venue_name"], CEIL_SHARED,
+                    f"[{backend}] a legitimately shared cross-Program arena "
+                    f"lost its name on the archived Season's history")
+                # ...and the history is still only THIS Season's.
+                blob = json.dumps(listing)
+                for token in (fx["cross"]["id"], fx["cross"]["name"],
+                              fx["sibling_venue"]["id"],
+                              fx["sibling_venue"]["name"],
+                              fx["A"]["sibling"]["id"],
+                              fx["B"]["season"]["id"]):
+                    self.assertNotIn(token, blob, (backend, token))
+                _close(store)
+
+
+class ArchivedSelectedSeasonCandidateHttpTest(unittest.TestCase):
+    """The archived selected Season over the REAL transport, with a real
+    session -- the layer an operator actually reaches.
+
+    The facade cases above hand ``role``/``scope`` in by hand and would agree
+    with themselves even if the route never threaded the authenticated identity
+    through. Only here are the status codes, the raw response BYTES and
+    ``/api/context``'s own ``read_only`` observed together, which is exactly
+    the combination the reviewer reproduced.
+
+    Transport helpers are the same shape as the HTTP classes above; they are
+    repeated rather than shared so those classes stay untouched.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        srv = __import__("hockey_scheduler.web.server", fromlist=["x"])
+        cls.srv = srv
+        srv.STATE.reset()
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.Handler)
+        cls.port = cls.httpd.server_address[1]
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
+                                      daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.thread.join(timeout=5)
+
+    def _client(self):
+        return urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(CookieJar()))
+
+    def _req(self, opener, method, path, body=None):
+        url = f"http://127.0.0.1:{self.port}{path}"
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(url, data=data, method=method)
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        try:
+            with opener.open(req) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+        except (urllib.error.URLError, http.client.HTTPException) as e:
+            return 0, json.dumps({"transport_error": repr(e)}).encode()
+
+    def _login(self, username, password="demo"):
+        c = self._client()
+        status, _ = self._req(c, "POST", "/api/auth/login",
+                              {"username": username, "password": password})
+        self.assertEqual(status, 200)
+        return c
+
+    def _v2(self, c, entity, body):
+        status, raw = self._req(c, "POST", f"/api/v2/setup/{entity}", body)
+        self.assertEqual(status, 200, raw[:300])
+        return json.loads(raw)
+
+    def _select(self, c, program_id, season_id):
+        status, raw = self._req(c, "POST", "/api/context",
+                                {"program_id": program_id,
+                                 "season_id": season_id})
+        self.assertEqual(status, 200, raw[:300])
+        return json.loads(raw)
+
+    def _grant(self, c, season_id, venue_id):
+        # A grant is a WRITE naming an existing Season, ceilinged on the
+        # caller's ACTIVE Season (#369 target authorization) -- so select the
+        # destination first, exactly as the UI's context bar does. The
+        # production guard is honoured here, never bypassed.
+        program_id = self.srv.STATE.api.store.get_season(season_id).program_id
+        self._select(c, program_id, season_id)
+        status, raw = self._req(
+            c, "POST", f"/api/v2/setup/seasons/{season_id}/venue-access",
+            {"venue_id": venue_id})
+        self.assertEqual(status, 200, raw[:300])
+        return json.loads(raw)
+
+    def _fixture(self, c, tag):
+        """Two Programs; Season A1 holds an ACTIVE grant, a REVOKED one and a
+        genuinely SHARED cross-Program arena, while Program B alone holds
+        ``cross`` -- the Venue that keeps the candidate set non-empty."""
+        org_a = self._v2(c, "organization",
+                         {"name": f"RO Org A{tag}", "short_name": f"RA{tag}"})
+        prog_a = self._v2(c, "program",
+                          {"name": f"RO Prog A{tag}",
+                           "operator_organization_id": org_a["id"]})
+        season_a = self._v2(c, "season",
+                            {"program_id": prog_a["id"],
+                             "name": f"RO Season A1{tag}"})
+        org_b = self._v2(c, "organization",
+                         {"name": f"RO Org B{tag}", "short_name": f"RB{tag}"})
+        prog_b = self._v2(c, "program",
+                          {"name": f"RO Prog B{tag}",
+                           "operator_organization_id": org_b["id"]})
+        season_b = self._v2(c, "season",
+                            {"program_id": prog_b["id"],
+                             "name": f"RO Season B1{tag}"})
+
+        home = self._v2(c, "venue", {"name": f"RO-HOME-RINK-A1{tag}",
+                                     "organization_id": org_a["id"]})
+        self._grant(c, season_a["id"], home["id"])
+        retired = self._v2(c, "venue", {"name": f"RO-RETIRED-RINK-A1{tag}",
+                                        "organization_id": org_a["id"]})
+        gone = self._grant(c, season_a["id"], retired["id"])
+        status, raw = self._req(
+            c, "POST",
+            f"/api/v2/setup/season-venue-access/{gone['id']}/remove", {})
+        self.assertEqual(status, 200, raw[:300])
+        shared = self._v2(c, "venue", {"name": f"RO-{CEIL_SHARED}{tag}",
+                                       "organization_id": org_b["id"]})
+        self._grant(c, season_b["id"], shared["id"])
+        self._grant(c, season_a["id"], shared["id"])
+        cross = self._v2(c, "venue", {"name": f"RO-{CEIL_CROSS}{tag}",
+                                      "organization_id": org_b["id"]})
+        self._grant(c, season_b["id"], cross["id"])
+        return {"prog_a": prog_a, "season_a": season_a, "prog_b": prog_b,
+                "season_b": season_b, "home": home, "retired": retired,
+                "shared": shared, "cross": cross}
+
+    def _arm(self, c, fx):
+        """Select A1, read the candidate set it WOULD serve, archive it, and
+        re-select it -- then assert every precondition the refusal leans on.
+
+        The non-empty candidate read is the whole point: without it the 404
+        below could just as well mean "there was nothing to offer".
+        """
+        sel = fx["season_a"]["id"]
+        self._select(c, fx["prog_a"]["id"], sel)
+        status, raw = self._req(
+            c, "GET", f"/api/v2/setup/seasons/{sel}/venue-candidates")
+        self.assertEqual(
+            status, 200,
+            f"the candidate route already refused the ACTIVE selected Season "
+            f"({status}), so archiving cannot be what refuses it: {raw[:300]!r}")
+        candidates = json.loads(raw)["candidates"]
+        self.assertTrue(
+            candidates,
+            "the candidate set was EMPTY before archiving, so the refusal "
+            "below would pass vacuously -- 'refused' would be "
+            "indistinguishable from 'nothing to offer'")
+        ids = {x["id"] for x in candidates}
+        self.assertIn(
+            fx["cross"]["id"], ids,
+            f"the pre-archive candidate set carries no Venue belonging to "
+            f"ANOTHER Program, so refusing it would not be withholding a "
+            f"cross-Program directory: {candidates}")
+        self.assertIn(fx["retired"]["id"], ids, candidates)
+
+        # Archive it. A1 is the selected Season, which is what the archive
+        # write's own target authorization requires (#369).
+        status, raw = self._req(
+            c, "POST", f"/api/v2/setup/seasons/{sel}/archive",
+            {"reason": "season complete"})
+        self.assertEqual(status, 200, raw[:300])
+        # Explicitly re-select it, exactly as the reviewer did.
+        self._select(c, fx["prog_a"]["id"], sel)
+
+        # PRECONDITIONS, before a single refusal is examined.
+        row = self.srv.STATE.api.store.get_season(sel)
+        self.assertEqual(
+            row.status, SeasonStatus.ARCHIVED,
+            f"the Season is not actually archived ({row.status}), so this "
+            f"case never exercises the archived destination at all")
+        status, raw = self._req(c, "GET", "/api/context")
+        self.assertEqual(status, 200, raw[:300])
+        ctx = json.loads(raw)
+        self.assertEqual(
+            ctx.get("season_id"), sel,
+            f"the archived Season is not the SELECTED one "
+            f"({ctx.get('season_id')!r}); a refusal would then be the "
+            f"ordinary selected-Season ceiling, not the archived one")
+        self.assertEqual(ctx.get("program_id"), fx["prog_a"]["id"], raw[:300])
+        self.assertIs(
+            ctx.get("read_only"), True,
+            f"/api/context does not report read_only for the selected "
+            f"archived Season: {raw[:300]!r}")
+        return candidates
+
+    def _venue_tokens(self, fx):
+        out = []
+        for key in ("home", "retired", "shared", "cross"):
+            out.append(fx[key]["id"])
+            out.append(fx[key]["name"])
+        return tuple(out)
+
+    def test_over_http_an_archived_selection_answers_like_a_missing_season(self):
+        admin = self._login("admin")
+        fx = self._fixture(admin, "R")
+        self._arm(admin, fx)
+        sel = fx["season_a"]["id"]
+        store = self.srv.STATE.api.store
+        # Snapshot AFTER the archive, so only the refusals are measured.
+        grants_before = {g.id: g.active for g in store.all_season_venue_access()}
+        audit_before = len(store.all_setup_audit())
+
+        st_a, body_a = self._req(
+            admin, "GET", f"/api/v2/setup/seasons/{sel}/venue-candidates")
+        st_m, body_m = self._req(
+            admin, "GET",
+            "/api/v2/setup/seasons/season_never_existed/venue-candidates")
+        self.assertEqual(
+            st_a, 404,
+            f"the SELECTED but ARCHIVED Season answered {st_a} with grant "
+            f"candidates -- controls that cannot succeed, plus a "
+            f"cross-Program facility directory: {body_a[:300]!r}")
+        self.assertEqual(
+            st_m, 404,
+            f"a nonexistent Season answered {st_m}: {body_m[:300]!r}")
+        raw_a = _mask(body_a, sel)
+        raw_m = _mask(body_m, "season_never_existed")
+        self.assertEqual(
+            raw_a, raw_m,
+            f"the raw bodies differ beyond the echoed id, so an ARCHIVED "
+            f"selected Season is distinguishable from a nonexistent one: "
+            f"{raw_a!r} vs {raw_m!r}")
+        for label, raw in (("archived", raw_a), ("missing", raw_m)):
+            for token in self._venue_tokens(fx) + (fx["season_b"]["id"],
+                                                   fx["prog_b"]["id"]):
+                self.assertNotIn(token.encode(), raw,
+                                 f"[{label}] the refusal disclosed {token!r}")
+
+        self.assertEqual({g.id: g.active
+                          for g in store.all_season_venue_access()},
+                         grants_before,
+                         "a refused candidate read changed grants")
+        self.assertEqual(len(store.all_setup_audit()), audit_before,
+                         "a refused candidate read wrote an audit row")
+
+        # The advertised grant really is impossible -- the reason offering it
+        # was the defect. It is refused with zero mutation either way.
+        st_g, body_g = self._req(
+            admin, "POST", f"/api/v2/setup/seasons/{sel}/venue-access",
+            {"venue_id": fx["cross"]["id"]})
+        self.assertNotEqual(st_g, 200,
+                            f"the archived Season accepted a grant: {body_g[:300]!r}")
+        self.assertIn(b"season_archived", body_g, body_g[:300])
+        self.assertEqual({g.id: g.active
+                          for g in store.all_season_venue_access()},
+                         grants_before,
+                         "the refused grant changed grants")
+
+    def test_over_http_an_archived_selection_still_reads_its_grant_history(self):
+        admin = self._login("admin")
+        fx = self._fixture(admin, "H")
+        self._arm(admin, fx)
+        sel = fx["season_a"]["id"]
+        store = self.srv.STATE.api.store
+        # The shared arena really is cross-Program, so naming it below is the
+        # additive behavior that must SURVIVE the archive.
+        self.assertIn(
+            fx["shared"]["id"],
+            {g.venue_id for g in
+             store.season_venue_access_for_season(fx["season_b"]["id"])},
+            "the 'shared' arena is held by one Program only, so naming it "
+            "proves nothing about cross-Program sharing")
+
+        status, raw = self._req(
+            admin, "GET", f"/api/v2/setup/seasons/{sel}/venue-access")
+        self.assertEqual(
+            status, 200,
+            f"archiving a Season made its OWN grant history unreadable "
+            f"({status}) -- that history is exactly what a read-only Season "
+            f"is for: {raw[:300]!r}")
+        rows = {r["venue_id"]: r for r in json.loads(raw)["venue_access"]}
+        self.assertEqual(set(rows), {fx["home"]["id"], fx["retired"]["id"],
+                                     fx["shared"]["id"]}, raw[:400])
+        self.assertTrue(rows[fx["home"]["id"]]["active"])
+        self.assertFalse(rows[fx["retired"]["id"]]["active"],
+                         "the revoked grant row vanished from the archived "
+                         "Season's history")
+        self.assertEqual(rows[fx["home"]["id"]]["venue_name"],
+                         fx["home"]["name"])
+        self.assertEqual(rows[fx["retired"]["id"]]["venue_name"],
+                         fx["retired"]["name"])
+        self.assertEqual(
+            rows[fx["shared"]["id"]]["venue_name"], fx["shared"]["name"],
+            "a legitimately shared cross-Program arena lost its name on the "
+            "archived Season's history")
+        # ...and the history is still only THIS Season's.
+        for token in (fx["cross"]["id"], fx["cross"]["name"],
+                      fx["season_b"]["id"]):
+            self.assertNotIn(token.encode(), raw, token)

@@ -2661,6 +2661,17 @@ function renderSeasonParticipation(hv, ov, sv) {
   // has not selected.
   const selectedSeasonId = (contextOptions && contextOptions.selected
     && contextOptions.selected.season_id) || null;
+  // ...and when that selection is ARCHIVED the surface is HISTORY, not a
+  // workbench (#369 owner ruling, follow-up). An archived Season is read-only:
+  // grant, revoke and permanent-cleanup all fail `season_archived`, and the
+  // candidate route now refuses the read that feeds the Allow picker. So the
+  // selected Season still shows its OWN allowed-venues history, names included
+  // -- that is what a historical Season is for -- but offers no control that
+  // cannot succeed. Read off `contextOptions.selected.read_only`, the same
+  // signal behind the switcher's "archived (read-only)" label and #ctx-ro
+  // badge, so this can never disagree with what the context bar shows.
+  const selectionIsReadOnly = !!(contextOptions && contextOptions.selected
+    && contextOptions.selected.read_only);
 
   const programBlocks = programs.map((program) => {
     const permanentTeams = leagueTeams[program.id] || [];
@@ -2753,11 +2764,20 @@ function renderSeasonParticipation(hv, ov, sv) {
       // deliberately asked for neither, so it renders a placeholder rather
       // than an empty-looking list that would read as "this season has no
       // venues" — a claim this surface is no longer entitled to make.
+      // ...and when the SELECTED Season is archived it is read-only HISTORY:
+      // its own grant rows still render, names and all, but every control that
+      // would mutate them is gone (see `selectionIsReadOnly` above).
       const isSelectedSeason = s.id === selectedSeasonId;
+      const isHistoricalSeason = isSelectedSeason && selectionIsReadOnly;
       const seasonAccessRows = isSelectedSeason
         ? (seasonVenueAccess[s.id] || []) : [];
       const venueNameById = {};
-      const grantable = isSelectedSeason ? grantableFor(s.id) : [];
+      // No candidates were fetched for a read-only selection, and `grantable`
+      // also unions the scoped overview venues -- so this gate has to exist
+      // here and not only in the fetch loop, or the picker would still list
+      // real facilities under an archived Season that can grant none of them.
+      const grantable = (isSelectedSeason && !isHistoricalSeason)
+        ? grantableFor(s.id) : [];
       grantable.forEach((v) => { venueNameById[v.id] = v.name; });
       allVenues.forEach((v) => { venueNameById[v.id] = v.name; });
       // A Venue this Season ALREADY holds a grant to is deliberately not a
@@ -2771,21 +2791,38 @@ function renderSeasonParticipation(hv, ov, sv) {
       });
       const grantedAccess = seasonAccessRows.filter((a) => a.active);
       const grantedVenueIds = new Set(grantedAccess.map((a) => a.venue_id));
-      const venueAccessRows = grantedAccess.map((a) => `<div class="tn-leaf reg-row">
-          <span class="tn-label">🏟️ ${esc(venueNameById[a.venue_id] || a.venue_id)}</span>
+      // A historical row names its Venue and carries NO Revoke control — the
+      // revoke would fail `season_archived`, so offering it would be a button
+      // that cannot succeed.
+      const venueAccessRows = grantedAccess.map((a) => {
+        const venueName = venueNameById[a.venue_id] || a.venue_id;
+        return isHistoricalSeason
+          ? `<div class="tn-leaf reg-row">
+          <span class="tn-label">🏟️ ${esc(venueName)}</span>
+          <span class="tn-meta">read-only history</span></div>`
+          : `<div class="tn-leaf reg-row">
+          <span class="tn-label">🏟️ ${esc(venueName)}</span>
           <button class="icon-btn danger" data-va-revoke="${esc(a.id)}"
-            title="Revoke venue access" aria-label="Revoke ${esc(venueNameById[a.venue_id] || a.venue_id)} from ${esc(s.name)}">${ICONS.circleMinus}</button></div>`).join("")
-        || `<div class="tn-empty">No venues allowed for this season yet — games can't be scheduled until one is added.</div>`;
+            title="Revoke venue access" aria-label="Revoke ${esc(venueName)} from ${esc(s.name)}">${ICONS.circleMinus}</button></div>`;
+      }).join("")
+        || (isHistoricalSeason
+            ? `<div class="tn-empty">This archived season never had a venue allowed.</div>`
+            : `<div class="tn-empty">No venues allowed for this season yet — games can't be scheduled until one is added.</div>`);
       const availableVenues = grantable.filter(
         (v) => !grantedVenueIds.has(v.id));
-      const venueAddCtl = availableVenues.length
-        ? `<div class="tn-leaf reg-add">
+      // The archived branch replaces the Allow picker with explicit read-only
+      // copy: no <select>, no Allow button, and nothing that reads as "you
+      // could add one here".
+      const venueAddCtl = isHistoricalSeason
+        ? `<div class="tn-empty" data-va-readonly="${esc(s.id)}">This season is archived and read-only — venue access can't be allowed, revoked or removed. Reopen the season to change it.</div>`
+        : (availableVenues.length
+          ? `<div class="tn-leaf reg-add">
             <select id="va-add-${esc(s.id)}"><option value="">Add a venue…</option>${
               availableVenues.map((v) => opt(v.id, v.name)).join("")}</select>
             <button class="act primary" data-va-add="${esc(s.id)}">Allow</button></div>`
-        : (grantable.length
-            ? `<div class="tn-empty">Every venue is already allowed for this season.</div>`
-            : `<div class="tn-empty">Create a venue on the Facility tree first, then allow it here.</div>`);
+          : (grantable.length
+              ? `<div class="tn-empty">Every venue is already allowed for this season.</div>`
+              : `<div class="tn-empty">Create a venue on the Facility tree first, then allow it here.</div>`));
       // The placeholder for a non-selected Season carries NO venue id, NO
       // venue name and NO count — a count would still be an inventory, just a
       // coarser one — and offers no Allow picker, because granting is a write
@@ -2793,7 +2830,7 @@ function renderSeasonParticipation(hv, ov, sv) {
       const venueAccessSection = isSelectedSeason
         ? `<details class="tn" open><summary class="tn-sum">
           <span class="tn-label">🏟️ Allowed venues</span>
-          <span class="tn-meta">${grantedAccess.length} venue${grantedAccess.length === 1 ? "" : "s"}</span></summary>
+          <span class="tn-meta">${grantedAccess.length} venue${grantedAccess.length === 1 ? "" : "s"}${isHistoricalSeason ? " · archived (read-only)" : ""}</span></summary>
         <div class="tn-children">${venueAccessRows}${venueAddCtl}</div></details>`
         : `<details class="tn"><summary class="tn-sum">
           <span class="tn-label">🏟️ Allowed venues</span>
@@ -2809,7 +2846,13 @@ function renderSeasonParticipation(hv, ov, sv) {
       // Selected-Season-only for the same reason: a revoked row names its
       // Venue and carries a permanent-delete control, so it is exactly the
       // kind of row a non-selected Season must not put on screen.
-      const revokedAccess = seasonAccessRows.filter((a) => !a.active);
+      // Suppressed WHOLESALE for an archived selection: this section exists
+      // only to host the permanent-cleanup action, and that delete fails
+      // `season_archived` like every other write the Season owns. The
+      // read-only copy in the Allowed-venues section above says so explicitly,
+      // so the surface still explains itself rather than silently dropping it.
+      const revokedAccess = isHistoricalSeason
+        ? [] : seasonAccessRows.filter((a) => !a.active);
       const revokedAccessRows = revokedAccess.map((a) => {
         const venueName = venueNameById[a.venue_id] || a.venue_id;
         return `<div class="tn-leaf reg-row inactive-reg">
@@ -6816,6 +6859,19 @@ async function render() {
       // the ruling removed, one HTTP hop further down.
       const selectedSeasonId = (contextOptions && contextOptions.selected
         && contextOptions.selected.season_id) || null;
+      // ...and an ARCHIVED selection fetches no candidates at all (#369 owner
+      // ruling, follow-up). An archived Season is read-only history: the grant
+      // this list feeds fails `season_archived`, so asking for candidates both
+      // advertised an impossible mutation and pulled in the one facility list
+      // that deliberately reaches ACROSS the Program ceiling. The server now
+      // refuses that read generically, so issuing it would only produce a 404
+      // per render; the gate is here so the request is never made and the
+      // read-only surface holds nothing to render a picker from.
+      // `read_only` is the SAME signal the context bar's "archived
+      // (read-only)" option label and #ctx-ro badge already use -- it comes
+      // straight off /api/context/options' `selected`.
+      const selectionIsReadOnly = !!(contextOptions && contextOptions.selected
+        && contextOptions.selected.read_only);
       for (const program of (hv.programs || [])) {
         const r = await getJSON(`/api/v2/setup/programs/${program.id}/teams`);
         // Same reason as the player list above, and more acute: this loop
@@ -6859,10 +6915,15 @@ async function render() {
             // Arena Manager gets a 403 here and simply has no picker, rather
             // than being handed every linked Venue in the installation by the
             // overview.
-            const vc = await getJSON(
-              `/api/v2/setup/seasons/${s.id}/venue-candidates`);
-            if (contextRevision !== myRenderContext) return;  // superseded
-            seasonVenueCandidates[s.id] = (vc && vc.candidates) || [];
+            // Skipped outright for a READ-ONLY (archived) selection: no
+            // request is issued, so the archived surface can render no picker
+            // even by accident.
+            if (!selectionIsReadOnly) {
+              const vc = await getJSON(
+                `/api/v2/setup/seasons/${s.id}/venue-candidates`);
+              if (contextRevision !== myRenderContext) return;  // superseded
+              seasonVenueCandidates[s.id] = (vc && vc.candidates) || [];
+            }
           }
         }
       }
