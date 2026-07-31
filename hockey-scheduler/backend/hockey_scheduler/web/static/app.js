@@ -149,17 +149,14 @@ let gCheckout = null;        // {jid, game_id} while a junior's "Can't Play" con
 let gOpp = null;             // {jid, game_id} of the junior's opportunity detail open
 let gOppDetail = null;       // fetched detail payload for gOpp
 let activityExpandedBatches = new Set();  // import_batch_ids expanded in Activity (#102)
-let setupProgress = null;  // fetched /api/v2/setup/progress payload, Home/Tasks hub (#330)
-let setupProgressError = false;  // the fetch above failed (distinct from "no data")
-// Discards a stale /api/v2/setup/progress response (#330 review round 1
-// finding 4): a NEWER render() call — e.g. after a context switch — may
-// already have committed its own result while an OLDER call's fetch is
-// still in flight. No existing generation-counter/AbortController
-// convention exists elsewhere in this file to reuse (the closest precedent,
-// the CSV import flow's snapshot-before/compare-after style, depends on
-// re-derivable DOM form state that doesn't fit a server-resolved context
-// fetch), so a minimal monotonic sequence number is used directly instead.
-let setupProgressFetchSeq = 0;
+// Home/Tasks and Setup card state lives in the per-card store (#365 —
+// cardStates/cardGenerations, further down). It replaced the three
+// page-wide values that used to sit here: `setupProgress`,
+// `setupProgressError` and the single `setupProgressFetchSeq` counter that
+// guarded the whole setup-progress fetch. One counter for a whole surface
+// cannot express "this ONE card's retry superseded this ONE card's earlier
+// request", and one payload + one error boolean cannot express "this card
+// failed while its neighbours are fine" — both of which #365 requires.
 let setupView = "hub";  // "hub" | "hierarchy" | "records" — Setup sub-view
 // (#165; "hub" added by #345 batch 2). The workflow hub is the DEFAULT route
 // into Setup: the undifferentiated mega-page must not be the only way in.
@@ -548,6 +545,225 @@ function nextUpcomingGame(games) {
     .slice().sort((a, b) => new Date(a.start_time) - new Date(b.start_time))[0] || null;
 }
 
+/* ---------- Per-card state model (#365) ---------- */
+// Home/Tasks and each of the six Setup workflow cards/landings own their
+// state SEPARATELY, per context tuple — not as the one page-wide pair
+// (`setupProgress` + `setupProgressError`, behind the single page-wide
+// `setupProgressFetchSeq`) that this replaces. #365, verbatim: "Model state
+// per workflow/card and per context tuple, not as one page-wide boolean. A
+// retry should replace only the failed card generation. A response for an
+// older Program/Season/League tuple or older retry generation must be
+// discarded before it mutates DOM, focus, announcements, completion, or
+// next-task selection."
+//
+// TWO orthogonal, explicitly discriminated axes — deliberately not collapsed
+// into one enum:
+//
+//   CARD_STATE   the card's own data lifecycle. Every value is a decision the
+//                code MADE, never something inferred from a missing payload
+//                field: EMPTY means "resolved, and there is nothing here yet"
+//                (and carries its own `reason`), ERROR means "this card's own
+//                fetch failed", STALE means "held data whose context tuple is
+//                no longer the active one".
+//   CARD_STATUS  the workflow's own done/todo/OPTIONAL axis, which the
+//                BACKEND owns — get_setup_progress emits `status: "optional"`
+//                for Workflow 6 (api/service.py). Folding it into CARD_STATE
+//                would make "this card's fetch failed" and "this step is
+//                optional" mutually exclusive, which they are not: Workflow 6
+//                is optional whether its card is loading, ready, stale or
+//                errored.
+const CARD_STATE = Object.freeze({
+  LOADING: "loading",   // a request for this card is in flight
+  READY: "ready",       // resolved, with data to show
+  EMPTY: "empty",       // resolved, and there is genuinely nothing here yet
+  STALE: "stale",       // held data bound to a context tuple that is no longer active
+  ERROR: "error",       // this card's own fetch failed; retry is scoped to it
+  CONFIRM: "confirm",   // an in-card confirmation is awaiting the operator
+  SUCCESS: "success",   // resolved, and this card's work is complete
+});
+const CARD_STATUS = Object.freeze({
+  DONE: "done", TODO: "todo", OPTIONAL: "optional",
+  UNKNOWN: "unknown",   // no progress payload for this card (yet, or by role)
+});
+
+// Card ids — the first component of the identity record below. Setup's six
+// reuse the SAME keys `SETUP_WORKFLOWS` declares and the backend's
+// get_setup_progress reports, so a card can never be identified one way in
+// the model and another way anywhere else.
+const HOME_TASKS_CARD = "home/setup-progress";
+function setupWorkflowCardId(key) { return `setup/${key}`; }
+
+// card id -> newest generation issued for THAT card, and card id -> its
+// committed model. One counter per card (not one per surface, which is
+// exactly what `setupProgressFetchSeq` was) is what lets a retry supersede
+// only its own card's earlier request. Same snapshot-before-the-await /
+// re-check-after idiom as contextRevision, contextSwitchSeq, iceOperationSeq
+// and importOperationSeq elsewhere in this file, narrowed from "the page" to
+// "this card".
+const cardGenerations = {};
+const cardStates = {};
+
+// The active context tuple (#345's three axes). Read from
+// contextOptions.selected — the CONFIRMED selection, not a switch merely
+// attempted: setActiveContext() bumps contextRevision the instant a switch
+// starts but only updates `selected` once its POST succeeds, so a response
+// that resolves during that window is still answering for the tuple that is
+// genuinely on screen, and discarding it there would throw away good data.
+// A failed switch leaves the tuple untouched and nothing goes stale; a
+// successful one updates it before its own re-render, so the next commit
+// binds to the new tuple and everything held under the old one reads stale.
+function currentCardTuple() {
+  const sel = (contextOptions && contextOptions.selected) || {};
+  return { program_id: sel.program_id || null,
+           season_id: sel.season_id || null,
+           league_id: sel.league_id || null };
+}
+
+// Issue the identity a request must still match to be allowed to change
+// anything. Owner-specified shape: workflow/card id + the exact context tuple
+// (program_id, season_id, league_id) + the request generation. Captured
+// BEFORE the vulnerable `await` and re-checked after it at EVERY mutation
+// point — a stale response that skips the DOM write but still moves focus or
+// re-announces is the same defect.
+function beginCardRequest(cardId, opts) {
+  const t = currentCardTuple();
+  cardGenerations[cardId] = (cardGenerations[cardId] || 0) + 1;
+  return { card: cardId, program_id: t.program_id, season_id: t.season_id,
+           league_id: t.league_id, generation: cardGenerations[cardId],
+           // Whether a person asked for this load (a Retry/Refresh press), as
+           // opposed to a routine render-driven one. Only an operator-
+           // initiated load is allowed to move focus or announce — a routine
+           // refresh that did either would be a spurious repeat, not news.
+           userInitiated: !!(opts && opts.userInitiated) };
+}
+
+// THE gate. True only when `identity` is still the newest request for its own
+// card AND the context tuple it was issued under is still the active one.
+// Everything that a response could change — DOM, focus, announcement,
+// completion, next-task selection — asks this first.
+function cardIdentityCurrent(identity) {
+  if (!identity) return false;
+  if (cardGenerations[identity.card] !== identity.generation) return false;
+  const t = currentCardTuple();
+  return identity.program_id === t.program_id
+    && identity.season_id === t.season_id
+    && identity.league_id === t.league_id;
+}
+
+// Staleness is a TUPLE question, not a generation one — deliberately a
+// different predicate from cardIdentityCurrent() above. Held data goes stale
+// when the operator moves to another Program/Season/League, NOT merely
+// because a refresh for the same context happens to be in flight; answering
+// the second question with the first would flash every card to "stale" on
+// every ordinary reload.
+function cardTupleCurrent(identity) {
+  if (!identity) return false;
+  const t = currentCardTuple();
+  return identity.program_id === t.program_id
+    && identity.season_id === t.season_id
+    && identity.league_id === t.league_id;
+}
+
+// The ONE writer. Refuses outright when the response's identity is no longer
+// current, so a late loser never becomes the card's stored model in the first
+// place. Every downstream mutation point re-checks as well — this is only
+// where the corruption would otherwise begin, not the whole guard.
+function commitCardState(identity, next) {
+  if (!cardIdentityCurrent(identity)) return false;   // #365 identity gate — model commit
+  // `identity` last, so a `next` cloned from a previous entry can never carry
+  // that entry's older identity through into the new commit.
+  cardStates[identity.card] = Object.assign({}, next, { identity: identity });
+  return true;
+}
+
+// What a renderer paints. Downgrades any held model whose tuple is no longer
+// active to STALE — #365's "keep the last successful data visible only when
+// the stale contract calls for it, clearly labelled stale with an actionable
+// refresh path" — rather than silently painting one Program's numbers under
+// another Program's heading. A LOADING entry is left alone: it has no data to
+// mislabel, and a fresher commit is already on its way.
+function readCardState(cardId) {
+  const entry = cardStates[cardId];
+  if (!entry) return { state: CARD_STATE.LOADING, status: CARD_STATUS.UNKNOWN };
+  if (entry.state !== CARD_STATE.LOADING && !cardTupleCurrent(entry.identity)) {
+    return Object.assign({}, entry, { state: CARD_STATE.STALE, staleFrom: entry.state });
+  }
+  return entry;
+}
+
+// (3) live-region announcement, for the surfaces that have no live region of
+// their own. Routes through the ONE existing sitewide region — #toast-root,
+// `role="status" aria-live="polite"` in index.html, driven by updateToast() —
+// rather than minting a second one per card, so a confirmation or a success
+// is spoken exactly once. The Home/Tasks card deliberately does NOT use this:
+// #sp-card-slot is already its own polite live region, so settling it is what
+// speaks there, and adding a toast would be the same sentence twice.
+function announceCardStatus(identity, message, isError) {
+  if (!cardIdentityCurrent(identity)) return false;   // #365 identity gate — announcement
+  toast = message;
+  toastIsError = !!isError;
+  updateToast();
+  return true;
+}
+
+// (2) focus. Moves keyboard focus onto `el`, using the same tabindex="-1"
+// convention focusContentHeading() uses for a non-focusable destination
+// heading — but never stamping tabindex on a control that is already
+// focusable, which would pull it out of the sequential tab order. Refuses for
+// a superseded identity: a late loser that skipped the DOM write but still
+// yanked focus out of whatever the operator moved on to is the same defect
+// the DOM guard exists to prevent.
+function focusCardTarget(identity, el) {
+  if (!cardIdentityCurrent(identity)) return false;   // #365 identity gate — focus
+  if (!el) return false;
+  if (!el.hasAttribute("tabindex")
+      && !/^(BUTTON|A|INPUT|SELECT|TEXTAREA)$/.test(el.tagName)) {
+    el.setAttribute("tabindex", "-1");
+  }
+  el.focus();
+  return true;
+}
+
+// Structural optionality for Workflow 6 (Decision 9 / #365). `optional` is a
+// PARTITION of the workflow list, not a flag each call site is trusted to
+// remember: `required` is the ONLY list the completion and next-task
+// derivations are ever handed, so generic logic cannot count the optional
+// workflow even by accident. Derived from the BACKEND's own `status`
+// ("optional" — api/service.py get_setup_progress), never from a title, key
+// or list position.
+function partitionSetupWorkflows(rows) {
+  const workflows = (rows || []).map((w) => Object.assign({}, w, {
+    status: w.status === CARD_STATUS.DONE ? CARD_STATUS.DONE
+      : w.status === CARD_STATUS.OPTIONAL ? CARD_STATUS.OPTIONAL
+      : CARD_STATUS.TODO,
+    optional: w.status === CARD_STATUS.OPTIONAL,
+  }));
+  return {
+    workflows: workflows,
+    required: workflows.filter((w) => !w.optional),
+    optional: workflows.filter((w) => w.optional),
+  };
+}
+
+// (4) completion and (5) next-task, over a partition. Both read `required`
+// only — the optional partition is not in that list at all, which is what
+// makes "Workflow 6 never blocks completion and is never the next
+// recommendation" structural rather than a special case someone could forget.
+// `remaining` is deliberately a count of REQUIRED work, so the copy the card
+// renders says something an operator can act on.
+function setupWorkflowCompletion(part) {
+  const done = part.required.filter((w) => w.status === CARD_STATUS.DONE);
+  return { total: part.required.length, done: done.length,
+           remaining: part.required.length - done.length,
+           allDone: part.required.length > 0 && done.length === part.required.length };
+}
+// The next recommendation, in the fixed #204 workflow order. Only ever drawn
+// from `required`; an optional workflow cannot be returned because it is not
+// in the list being searched.
+function nextRequiredWorkflow(part) {
+  return part.required.find((w) => w.status !== CARD_STATUS.DONE) || null;
+}
+
 /* ---------- Home/Tasks hub setup-progress card (#204/#330) ---------- */
 // The hub's single primary action (§4 of the operator-UX requirements): a
 // dynamic "Continue setup" naming the actual next incomplete Setup workflow
@@ -565,7 +781,74 @@ function nextUpcomingGame(games) {
 // there's simply nothing left for THIS role to act on AND nothing blocked
 // to explain either, while other, not-this-role's workflows remain (three
 // different claims — see get_setup_progress's docstring).
-function renderSetupProgressCard(progress, hadError, loading) {
+//
+// #365: the payload is turned into an explicit discriminated model FIRST
+// (buildTasksCardModel below) and the renderer only ever switches on
+// `model.state`. Nothing downstream re-reads the raw response or infers a
+// state from an absent field, which is what let "no data" and "the fetch
+// failed" look alike before.
+function buildTasksCardModel(payload) {
+  if (!payload || payload.error) {
+    return { state: CARD_STATE.ERROR, status: CARD_STATUS.UNKNOWN,
+             error: (payload && payload.error && payload.error.message) || null };
+  }
+  // Two DIFFERENT empty answers, discriminated by `reason` rather than left
+  // to a `!progress.program_id` test at the render site. Both deliberately
+  // render nothing (see renderSetupProgressCard): bootstrapping the very
+  // first Program is the onboarding wizard's job, not this card's, and the
+  // "nothing left for THIS role" case must not claim anything about
+  // workflows this role cannot see (#331 review round 3 finding 1 / round 5
+  // finding 3). Naming them as states anyway is the point — an empty answer
+  // is now something the model asserts, not something the renderer infers
+  // from a missing field.
+  if (!payload.program_id) {
+    return { state: CARD_STATE.EMPTY, reason: "no_program", status: CARD_STATUS.UNKNOWN };
+  }
+  const part = partitionSetupWorkflows(payload.workflows);
+  // (5) next-task selection. The backend's recommendation is authoritative
+  // about which workflow is next (it alone knows role permissions and Season
+  // prerequisites), but it is ADMITTED here only if it is not optional —
+  // resolved through the same partition, so "Workflow 6 is never the next
+  // recommendation" holds on the client too, structurally, without a key or
+  // title check. An unrecognized key stays admitted: a workflow the payload
+  // named as `next` but did not include in `workflows` is not evidence that
+  // it is optional.
+  const nextRow = payload.next
+    ? (part.workflows.find((w) => w.key === payload.next.key) || null) : null;
+  const next = payload.next && !(nextRow && nextRow.optional) ? payload.next : null;
+  // (4) completion. `complete` stays the SERVER's claim — it is computed
+  // there over the FULL, unfiltered workflow list and is deliberately `null`
+  // for a role whose visible slice is narrower (get_setup_progress: a partial
+  // view can never truthfully verify a whole-Program claim). Re-deriving it
+  // from the visible rows here would manufacture exactly the overclaim that
+  // `null` exists to prevent. The client's OWN completion arithmetic is
+  // `progress` below, which is explicitly scoped to the workflows this role
+  // can see and reads the `required` partition only.
+  const model = { part: part, progress: setupWorkflowCompletion(part),
+                  program: payload.program, next: next,
+                  nextBlocked: payload.next_blocked || null,
+                  status: CARD_STATUS.UNKNOWN };
+  if (payload.complete === true) return Object.assign(model, { state: CARD_STATE.SUCCESS });
+  if (next || model.nextBlocked) return Object.assign(model, { state: CARD_STATE.READY });
+  return Object.assign(model, { state: CARD_STATE.EMPTY, reason: "nothing_actionable" });
+}
+
+// Client-side completion copy for this card (#365), derived from the
+// `required` partition only. Rendered under the workflow list so an operator
+// can see how much REQUIRED work is left without having to work out for
+// themselves that the optional row does not count towards it.
+function tasksProgressLine(model) {
+  const p = model.progress;
+  if (!p || !p.total) return "";
+  const optionalNote = model.part.optional.length
+    ? ` ${esc(model.part.optional.map((w) => w.label).join(", "))} is optional and never blocks completion.`
+    : "";
+  return `<p class="muted sp-progress-line">${p.done} of ${p.total} required
+    setup workflow${p.total === 1 ? "" : "s"} done.${optionalNote}</p>`;
+}
+
+function renderSetupProgressCard(model) {
+  const state = (model && model.state) || CARD_STATE.LOADING;
   // Per-card loading boundary (#331 review round 2 finding 3): the caller
   // paints this skeleton immediately, before the real fetch even starts, so
   // a slow setup-progress request only delays this one card, never the rest
@@ -580,13 +863,32 @@ function renderSetupProgressCard(progress, hadError, loading) {
   // itself (render()'s own wrapper, persisting across every re-render of
   // this function's output) carries the actual aria-busy/aria-live
   // semantics, so this is just the content that live region announces.
-  if (loading) {
+  if (state === CARD_STATE.LOADING) {
     return `<div class="dash-card sp-card" style="margin-bottom:16px">
       <div class="dash-card-head"><h3>Setup progress</h3></div>
       <div class="skeleton"><span class="sr-only">Loading setup progress…</span></div>
     </div>`;
   }
-  if (hadError) {
+  // #365: held data whose Program/Season/League tuple is no longer the active
+  // one. The numbers stay visible (they are the last thing that was true) but
+  // are labelled as belonging to an earlier context and carry a refresh path;
+  // the obsolete primary action is WITHDRAWN rather than left standing, so a
+  // stale model can never hand the operator a CTA bound to a context they
+  // have already left. Refresh is a ghost button, never .act.primary, so the
+  // one-primary-action-per-screen rule holds in this state too.
+  if (state === CARD_STATE.STALE) {
+    const label = model.next ? esc(model.next.label)
+      : model.program ? esc(model.program.name) : "an earlier selection";
+    return `<div class="dash-card sp-card" style="margin-bottom:16px">
+      <div class="dash-card-head"><h3>Setup progress — showing earlier data</h3></div>
+      <div class="banner neutral" role="status"><p>This is the setup progress for
+        ${label}, not the program, season and league you have selected now.</p></div>
+      <div class="actions">
+        <button class="act ghost" data-setup-progress-retry>Refresh setup progress</button>
+      </div>
+    </div>`;
+  }
+  if (state === CARD_STATE.ERROR) {
     // sp-card scopes the color overrides below (#331 review round 3
     // finding 4): .banner.alert's own white-on-red is a sitewide convention
     // used well below WCAG AA (~3.3:1) -- fixed here without touching the
@@ -603,8 +905,17 @@ function renderSetupProgressCard(progress, hadError, loading) {
       </div>
     </div>`;
   }
-  if (!progress || !progress.program_id) return "";
-  if (progress.complete) {
+  // Both EMPTY reasons (#365 buildTasksCardModel) deliberately render
+  // nothing, and for two different documented reasons rather than one
+  // accidental early return: "no_program" because bootstrapping the very
+  // first Program belongs to the onboarding wizard, and
+  // "nothing_actionable" because a role whose visible slice is narrower than
+  // the whole Program can neither be recommended anything nor be told
+  // anything verifiable about it (#331 review round 3 finding 1 / round 5
+  // finding 3). Naming them in the model is what stops a future change from
+  // conflating them.
+  if (state === CARD_STATE.EMPTY) return "";
+  if (state === CARD_STATE.SUCCESS) {
     // "Imports and onboarding" stays reachable even once every REQUIRED
     // workflow is done (#331 review round 2 finding 2) -- it's an
     // always-available alternative entry point (decision 9), not something
@@ -616,7 +927,11 @@ function renderSetupProgressCard(progress, hadError, loading) {
     // League Admin only), so rendering the button only when found redacts
     // it for Arena Manager instead of routing them to a surface they cannot
     // use, rather than falling back to a generic always-shown label.
-    const importWf = progress.workflows.find((w) => w.key === "import");
+    // Read off the OPTIONAL partition, not by key: "the always-available
+    // alternative entry point" IS the optional partition (#365), so this
+    // button follows the backend's own `status: "optional"` rather than a
+    // hardcoded "import" string that a renamed workflow would silently break.
+    const importWf = model.part.optional[0] || null;
     // #331 review round 21 finding 2: `complete` and a workflow's own
     // `attention` are independent by design (round 19's docstring) -- a
     // Team can be genuinely, validly participating (this workflow reads
@@ -627,7 +942,7 @@ function renderSetupProgressCard(progress, hadError, loading) {
     // Reuses the exact na-row/amber markup `next_blocked` below already
     // renders in this same card, rather than introducing an unreviewed
     // color combination.
-    const attentionRows = progress.workflows.filter((w) => w.attention).map((w) => `
+    const attentionRows = model.part.workflows.filter((w) => w.attention).map((w) => `
       <div class="na-row">
         <div class="na-ico amber">⚠️</div>
         <div class="na-body"><div class="na-title">${esc(w.label)}</div>
@@ -635,23 +950,27 @@ function renderSetupProgressCard(progress, hadError, loading) {
       </div>`).join("");
     return `<div class="dash-card sp-card" style="margin-bottom:16px">
       <div class="dash-card-head"><h3>✓ All setup steps complete</h3></div>
-      <p class="muted">Every Setup workflow is done for ${esc(progress.program.name)}.</p>
+      <p class="muted">Every Setup workflow is done for ${esc(model.program.name)}.</p>
+      ${tasksProgressLine(model)}
       ${attentionRows}
       <div class="actions">
         <button class="act primary" data-goto="calendar">Go to Schedule</button>
-        ${importWf ? `<button class="act ghost" data-setup-progress-action="import"
+        ${importWf ? `<button class="act ghost" data-setup-progress-action="${esc(importWf.key)}"
           >${esc(importWf.primary_action)}</button>` : ""}
       </div>
     </div>`;
   }
-  const rows = progress.workflows.map((w) => {
+  const rows = model.part.workflows.map((w) => {
     // "optional" (Imports and onboarding, #331 review round 1 finding 5) is
     // a standing alternative entry point, not a required step -- its badge
-    // must read as neither "Done" nor a to-do nag.
-    const cls = w.status === "done" ? "green"
-      : w.status === "optional" ? "blue" : "gray";
-    const text = w.status === "done" ? "Done"
-      : w.status === "optional" ? "Optional" : "To do";
+    // must read as neither "Done" nor a to-do nag. #365: `w.optional` is the
+    // partition flag partitionSetupWorkflows() derived from the backend's own
+    // `status`, so the badge and the completion arithmetic can never disagree
+    // about which workflow is the optional one.
+    const cls = w.status === CARD_STATUS.DONE ? "green"
+      : w.optional ? "blue" : "gray";
+    const text = w.status === CARD_STATUS.DONE ? "Done"
+      : w.optional ? "Optional" : "To do";
     // #331 review round 21 finding 2: surfaces `attention` here too --
     // reusing the existing `.li-sub.conflict` convention (draft scheduler)
     // -- so a workflow reading "To do" because its only registration(s)
@@ -665,7 +984,7 @@ function renderSetupProgressCard(progress, hadError, loading) {
         <div class="li-sub">${esc(w.detail)}</div>${attentionLine}</div>
     </div>`;
   }).join("");
-  const next = progress.next;
+  const next = model.next;
   if (next) {
     // #331 review round 21 finding 2: `next` is the same workflow object
     // `rows` renders below, carrying its own `attention` when present (e.g.
@@ -693,6 +1012,7 @@ function renderSetupProgressCard(progress, hadError, loading) {
       </div>
       <div class="section-title">Setup workflows</div>
       ${rows}
+      ${tasksProgressLine(model)}
     </div>`;
   }
   // Nothing is both permitted AND safe to execute right now (#331 review
@@ -701,8 +1021,11 @@ function renderSetupProgressCard(progress, hadError, loading) {
   // workflow this caller COULD act on except for an unmet Season
   // prerequisite (guidance to surface, not a CTA that would just fail), vs.
   // truly nothing left for this role while other, not-this-role's workflows
-  // remain (renders nothing -- see get_setup_progress's docstring).
-  const blocked = progress.next_blocked;
+  // remain (renders nothing -- see get_setup_progress's docstring). #365
+  // moved that second case into the model as EMPTY/"nothing_actionable",
+  // handled above, so reaching here always means there IS a blocked workflow
+  // to explain.
+  const blocked = model.nextBlocked;
   if (!blocked) return "";
   return `<div class="dash-card sp-card" style="margin-bottom:16px">
     <div class="dash-card-head"><span class="dch-dot"></span><h3>Continue setup</h3></div>
@@ -722,8 +1045,19 @@ function renderSetupProgressCard(progress, hadError, loading) {
 // only delays this one card's own content, never the Dashboard's first
 // paint. Also the card's own Retry action, so retrying only re-fetches
 // this one thing instead of the whole Dashboard (overview/standings too).
-async function loadSetupProgressCard() {
-  const mySeq = ++setupProgressFetchSeq;
+//
+// #365 replaced the single page-wide setupProgressFetchSeq with this card's
+// OWN generation inside a full identity record (card id + context tuple +
+// generation). The five mutation points a superseded response must not reach
+// are each gated separately below, and labelled — the issue names all five,
+// and a stale response that skips the DOM write but still moves focus or
+// re-announces is the same defect.
+async function loadSetupProgressCard(opts) {
+  const identity = beginCardRequest(HOME_TASKS_CARD, opts);
+  // Hold the card in LOADING under the NEW identity right away, so any full
+  // render() that happens while this request is in flight paints this card's
+  // loading state rather than the previous context's settled numbers.
+  commitCardState(identity, { state: CARD_STATE.LOADING, status: CARD_STATUS.UNKNOWN });
   // aria-busy (#331 review round 5 finding 5): re-asserted here, not just
   // left over from render()'s initial paint, so a RETRY (the slot's own
   // aria-busy already flipped back to "false" after the failed fetch that
@@ -731,18 +1065,45 @@ async function loadSetupProgressCard() {
   const busySlot = document.getElementById("sp-card-slot");
   if (busySlot) busySlot.setAttribute("aria-busy", "true");
   const sp = await getJSON("/api/v2/setup/progress");
-  if (mySeq !== setupProgressFetchSeq) return;  // a newer load already won
-  if (sp && !sp.error) { setupProgress = sp; setupProgressError = false; }
-  else { setupProgress = null; setupProgressError = true; }
+  // (4) completion update and (5) next-task selection. Both are computed by
+  // buildTasksCardModel and stored by commitCardState, which refuses a
+  // superseded identity -- so a late loser cannot revise which workflow is
+  // "next" or whether the Program reads complete, even if every DOM write
+  // below were somehow skipped. This is the FIRST of the five gates, not the
+  // only one, deliberately: the model is where a stale answer would do the
+  // most invisible damage.
+  if (!commitCardState(identity, buildTasksCardModel(sp))) return;
   const slot = document.getElementById("sp-card-slot");
   if (!slot) return;  // navigated away from Dashboard before this resolved
-  slot.innerHTML = renderSetupProgressCard(setupProgress, setupProgressError, false);
+  // Where focus is BEFORE the replacement below destroys it: an operator who
+  // pressed Retry is standing on a button inside this slot, and innerHTML
+  // would drop them on <body> for good.
+  const hadFocusInCard = !!(document.activeElement && slot.contains(document.activeElement));
+  // (1) DOM mutation and (3) live-region announcement, in one write: this
+  // slot IS the card's live region (role="status" aria-live="polite" --
+  // render()'s own wrapper, which persists across every replacement here), so
+  // settling it is also what speaks. Deliberately NOT also toasted: that
+  // would be the same sentence announced twice.
+  if (!cardIdentityCurrent(identity)) return;   // #365 identity gate — DOM + announcement
+  slot.innerHTML = renderSetupProgressCard(readCardState(HOME_TASKS_CARD));
   slot.setAttribute("aria-busy", "false");
   const spAction = slot.querySelector("[data-setup-progress-action]");
   if (spAction) spAction.onclick = () =>
     goToSetupWorkflow(spAction.dataset.setupProgressAction);
   const spRetry = slot.querySelector("[data-setup-progress-retry]");
-  if (spRetry) spRetry.onclick = () => loadSetupProgressCard();
+  // Retry/Refresh is scoped to THIS card and issues its own generation, so it
+  // replaces only this card's failed generation -- nothing else on the
+  // Dashboard is refetched or repainted. Flagged userInitiated so the settle
+  // is allowed to move focus (below); a routine render-driven load is not.
+  if (spRetry) spRetry.onclick = () => loadSetupProgressCard({ userInitiated: true });
+  // (2) focus change. Only for a load a person actually asked for, and only
+  // when they were standing inside this card when it was replaced -- and only
+  // through focusCardTarget(), which re-checks the identity, so a superseded
+  // response can never yank focus back into a card the operator has moved on
+  // from.
+  if (opts && opts.userInitiated && hadFocusInCard) {
+    focusCardTarget(identity, slot.querySelector(".dash-card h3"));
+  }
   // The complete state's "Go to Schedule" button uses the generic
   // data-goto convention (c.querySelectorAll("[data-goto]") in render()),
   // which only wires elements present at render()'s OWN paint -- this slot
@@ -3210,10 +3571,14 @@ const SETUP_WORKFLOWS = [
     perm: "manage_setup",
     primary: { label: "Add Player", go: "roster" },
     secondary: [{ label: "Officials", act: "official" }],
-    summary: (sv) => {
+    // Takes the player list as an ARGUMENT rather than reading the
+    // module-level `playersList` (#365): a per-card retry re-fetches
+    // /api/players for THIS card alone and must be able to compute its own
+    // summary from that response without writing the shared list other Setup
+    // surfaces (Records, the hierarchy tree) render from.
+    summary: (sv, ov, players) => {
       const lid = contextOptions && contextOptions.selected
         && contextOptions.selected.league_id;
-      let players = playersList || [];
       if (lid) {
         const teamIds = new Set(leagueScopedTeams(sv).map((t) => t.id));
         players = players.filter((p) => teamIds.has(p.team_id));
@@ -3237,11 +3602,36 @@ const SETUP_WORKFLOWS = [
   // Workflow 6 is OPTIONAL (Decision 9): always visible and always reachable,
   // never the hub's `next` recommendation, and never blocking the complete
   // state. It carries its own status wording rather than done/todo.
+  //
+  // #365: `optional: true` here is the DECLARED contract, used only as the
+  // fallback for a caller that has no progress payload to read (no Program
+  // resolved yet, or a role the progress route refuses). The LIVE model takes
+  // optionality from the backend's own `status: "optional"` instead
+  // (partitionSetupWorkflows), so client and server can never disagree about
+  // which workflow is the optional one. Nothing anywhere derives it from a
+  // title or a list position.
+  //
+  // No `summary`: this workflow has no Program-scoped inventory of its own to
+  // count (the same absence of a completion signal that makes it optional
+  // server-side), so its card has no data dependency and therefore no
+  // loading/empty/error of its own to reach.
   { key: "import", title: "Imports and onboarding", icon: "📥", optional: true,
     purpose: "Bring an existing league in from spreadsheets instead of typing it in.",
     perm: "manage_arena",
     primary: { label: "Import data", go: "import" },
-    secondary: [{ label: "Initial Setup wizard", go: "onboarding" }] },
+    // Re-entering the guided Initial Setup wizard replaces the whole working
+    // surface with a linear, start-from-the-top flow for the active Program.
+    // It is the only action on any of the six landings that is neither a
+    // create drawer nor a jump to an inventory screen, so it is the one that
+    // carries a card-scoped confirmation (#365's `confirmation` state). The
+    // MODEL supports `confirm` on any action; only this one declares it.
+    secondary: [{ label: "Initial Setup wizard", go: "onboarding",
+      confirm: {
+        prompt: "Restart the guided Initial Setup wizard? Your existing data "
+          + "isn't changed — you'll be taken through setup from the top.",
+        yes: "Start the wizard", no: "Stay here",
+        done: "Opening the Initial Setup wizard.",
+        cancelled: "Stayed on Imports and onboarding." } }] },
 ];
 
 // Which workflow landing is open, or null for the hub index.
@@ -3289,15 +3679,394 @@ function openSetupWorkflowLanding(key) {
   return true;
 }
 
-function setupSummaryHtml(w, sv, ov) {
-  // Guard the payload, not each accessor: renderSetup can be reached before
-  // (or without) a successful overview load -- an early return, a failed
-  // fetch, a role whose payload is redacted -- and a summary card must
-  // degrade to "no counts yet" rather than throwing and blanking the view.
-  if (!w.summary || !sv) return "";
-  const parts = w.summary(sv, ov).map((s) =>
-    `<span class="swf-stat"><strong>${s.n}</strong> ${esc(s.label)}</span>`).join("");
-  return `<div class="swf-stats">${parts}</div>`;
+// The two ways a Setup landing action leaves the landing, extracted (#365) so
+// a plain click and a confirmed one execute the SAME code -- a confirmation
+// that took a different route to the destination would be a second
+// implementation of the action, free to drift from the first.
+function runSetupWorkflowGo(key) {
+  // "onboarding" is the guided Initial Setup wizard, a top-level view rather
+  // than one of goToSetupWorkflow's six workflow destinations.
+  if (key === "onboarding") { switchTab("onboarding"); focusContentHeading(); return; }
+  goToSetupWorkflow(key);
+}
+async function openSetupWorkflowDrawer(kind) {
+  const mySeq = ++drawerSeedFetchSeq;
+  const seeded = await contextSeededDrawerValues(kind);
+  if (mySeq !== drawerSeedFetchSeq) return;  // a newer open already won
+  if (!seeded.ok) {
+    toast = seeded.needsContext
+      ? "Pick a program in the context bar first, so this is created in the right one."
+      : seeded.needsSeason
+        ? "Pick a season in the context bar first — this is created inside one."
+        : seeded.noLeagueInSeason
+          ? "That season has no leagues yet — add one before adding divisions."
+          : seeded.leagueNotInSeason
+            ? "Your active League isn't in this season — switch the context bar's League or clear it before adding divisions."
+            : "Couldn't load what's needed to open that — try again.";
+    toastIsError = true;
+    return render();
+  }
+  drawer = { kind }; drawerError = ""; drawerValues = seeded.values;
+  toast = "";
+  render();
+}
+
+/* ---------- Setup workflow card state (#365) ---------- */
+// Each of the six workflows is its own card in the per-card store, bound to
+// its own identity (card id + context tuple + generation). What matters here
+// that a single page-wide flag could not express: the six do NOT all share
+// one data source. "Clubs, players and staff" is the only one that needs
+// /api/players; the four with inventory counts need /api/v2/setup/overview;
+// Workflow 6 needs neither. So a /api/players outage is genuinely one card's
+// failure, and its Retry re-fetches only that endpoint and repaints only that
+// card -- the other five keep their own settled numbers on screen.
+//
+// `src` is what render() already fetched for the Setup view, plus an explicit
+// per-ENDPOINT outcome for each. The outcome flags are the point: `sv`
+// degrades to an empty shape on failure, so "the overview call failed" and
+// "this Program genuinely has nothing yet" are indistinguishable from the
+// payload alone -- exactly the "state inferred from missing payload fields"
+// #365 forbids.
+function buildSetupWorkflowCardModel(w, statusRow, src) {
+  // Optionality: the backend's own `status` when there is a progress payload
+  // for this card, the declared contract otherwise. Never a title or index.
+  const optional = statusRow ? !!statusRow.optional : !!w.optional;
+  const status = statusRow ? statusRow.status : CARD_STATUS.UNKNOWN;
+  const base = { status: status, optional: optional,
+                 attention: (statusRow && statusRow.attention) || null };
+  // A workflow with no inventory of its own (Workflow 6) has no data
+  // dependency, so it is never loading, empty or errored -- it is simply
+  // there, always reachable, which is what "optional" means here.
+  if (!w.summary) return Object.assign(base, { state: CARD_STATE.READY, stats: null });
+  if (!src.svOk) {
+    return Object.assign(base, { state: CARD_STATE.ERROR, stats: null,
+      failed: "the setup overview" });
+  }
+  if (w.key === "roster" && !src.playersOk) {
+    return Object.assign(base, { state: CARD_STATE.ERROR, stats: null,
+      failed: "the player list" });
+  }
+  const stats = w.summary(src.sv, src.ov, src.players || []);
+  // EMPTY is asserted, not inferred: every count this workflow tracks is
+  // zero, so there is nothing here yet and the card says what is missing.
+  if (stats.every((s) => !s.n)) {
+    return Object.assign(base, { state: CARD_STATE.EMPTY, stats: stats,
+      reason: "no_records" });
+  }
+  // SUCCESS/complete for a landing is the workflow's own backend status
+  // reading "done" -- the same signal the Home/Tasks card badges, so the two
+  // surfaces can never disagree about whether a workflow is finished.
+  if (status === CARD_STATUS.DONE) {
+    return Object.assign(base, { state: CARD_STATE.SUCCESS, stats: stats });
+  }
+  return Object.assign(base, { state: CARD_STATE.READY, stats: stats });
+}
+
+// Bind every visible workflow card to a fresh identity and commit its model.
+// Called from render()'s Setup branch, inside the same contextRevision-guarded
+// stretch as the fetches it consumes.
+function commitSetupWorkflowCards(src) {
+  const part = partitionSetupWorkflows(src.progress && src.progress.workflows);
+  const byKey = {};
+  part.workflows.forEach((row) => { byKey[row.key] = row; });
+  setupWorkflowsFor().forEach((w) => {
+    const identity = beginCardRequest(setupWorkflowCardId(w.key));
+    commitCardState(identity, buildSetupWorkflowCardModel(w, byKey[w.key], src));
+  });
+}
+
+// (4) completion and (5) next-task for the Setup hub — the client's OWN
+// arithmetic, over the cards this role can actually see, and explicitly
+// labelled as such so it never reads as a claim about workflows it cannot see
+// (the same boundary get_setup_progress holds by returning `complete: null`
+// to a partial view).
+//
+// Every card is read through readCardState(), so a card whose tuple has moved
+// contributes STALE rather than its old status: the roll-up can never be
+// computed from data bound to a context tuple that is no longer active.
+// `required` is a partition, not a filtered-at-each-use list, so an optional
+// workflow cannot reach the completion arithmetic or the recommendation.
+function setupHubRollup() {
+  const rows = setupWorkflowsFor().map((w) => {
+    const entry = readCardState(setupWorkflowCardId(w.key));
+    const settled = entry.state === CARD_STATE.READY || entry.state === CARD_STATE.EMPTY
+      || entry.state === CARD_STATE.SUCCESS || entry.state === CARD_STATE.CONFIRM;
+    return { key: w.key, label: w.title,
+             optional: entry.optional === undefined ? !!w.optional : !!entry.optional,
+             status: settled ? (entry.status || CARD_STATUS.UNKNOWN) : CARD_STATUS.UNKNOWN };
+  });
+  const required = rows.filter((r) => !r.optional);
+  const known = required.filter((r) => r.status !== CARD_STATUS.UNKNOWN);
+  const done = known.filter((r) => r.status === CARD_STATUS.DONE);
+  return {
+    required: required, optional: rows.filter((r) => r.optional),
+    total: required.length, known: known.length, done: done.length,
+    allDone: known.length === required.length && required.length > 0
+      && done.length === required.length,
+    // The recommendation is drawn from `required` alone. An optional workflow
+    // is not in the list being searched, so it can never be returned.
+    next: known.length ? (required.find((r) => r.status === CARD_STATUS.TODO) || null) : null,
+  };
+}
+
+// The hub's progress/next line. Text only, deliberately: a CTA here would be
+// a second primary action competing with each card's own (#204's
+// one-primary-action-per-screen rule).
+function setupHubProgressHtml() {
+  const roll = setupHubRollup();
+  if (!roll.total || !roll.known) return "";
+  const optionalNote = roll.optional.length
+    ? ` ${esc(roll.optional.map((r) => r.label).join(", "))} is optional and never blocks completion.`
+    : "";
+  const nextNote = roll.next
+    ? ` Next: <strong>${esc(roll.next.label)}</strong>.`
+    : roll.allDone ? " Every required workflow you manage is done." : "";
+  return `<p class="muted swf-progress" data-setup-hub-progress>${roll.done} of
+    ${roll.total} required setup workflow${roll.total === 1 ? "" : "s"} you manage
+    ${roll.done === 1 ? "is" : "are"} done.${nextNote}${optionalNote}</p>`;
+}
+
+// A card's status chip. Reads the model's `optional` partition flag, not a
+// key, so the Decision 9 wording follows the backend's own status.
+//
+// The optional chip keeps class `swf-optional` and the done/todo chips
+// deliberately do NOT: that class means Decision 9's optional workflow and
+// nothing else, everywhere it is looked for.
+function setupCardStatusChip(entry, w) {
+  const optional = entry.optional === undefined ? !!w.optional : !!entry.optional;
+  if (optional) return `<span class="swf-optional">Optional</span>`;
+  if (entry.status === CARD_STATUS.DONE) return `<span class="swf-status swf-done">Done</span>`;
+  if (entry.status === CARD_STATUS.TODO) return `<span class="swf-status swf-todo">To do</span>`;
+  return "";
+}
+
+// The per-card body: whichever of the discriminated states this card is in.
+// Shared by the hub card and the landing so the two surfaces can never drift
+// into showing different states for the same card. `landing` only widens the
+// copy (a landing has room to explain); it never changes which state is shown.
+function setupCardBodyHtml(w, landing) {
+  const entry = readCardState(setupWorkflowCardId(w.key));
+  const retry = (label) => `<div class="swf-card-actions">
+    <button class="act ghost" data-setup-card-retry="${esc(w.key)}"
+      >${label}</button></div>`;
+  const stats = (rows) => rows
+    ? `<div class="swf-stats">${rows.map((s) =>
+        `<span class="swf-stat"><strong>${s.n}</strong> ${esc(s.label)}</span>`).join("")}</div>`
+    : "";
+  if (entry.state === CARD_STATE.LOADING) {
+    return `<div class="skeleton"><span class="sr-only">Loading ${
+      esc(w.title.toLowerCase())}…</span></div>`;
+  }
+  if (entry.state === CARD_STATE.ERROR) {
+    // Scoped to THIS card: the neighbouring cards keep their own numbers, and
+    // Retry re-fetches only what this card needs. A real <button> in normal
+    // document order, so it is reachable by Tab like any other control.
+    return `<p class="swf-card-error" role="alert">Couldn't load ${
+      esc(entry.failed || "this workflow's summary")}.${landing
+        ? " The action below still works — only these counts are missing." : ""}</p>
+      ${retry("Retry")}`;
+  }
+  if (entry.state === CARD_STATE.STALE) {
+    // Held data from a context the operator has left. Shown, but labelled,
+    // with a refresh path -- never silently re-presented as current.
+    return `${stats(entry.stats)}
+      <p class="swf-card-stale">These counts are from the program, season or
+        league you had selected earlier.</p>
+      ${retry("Refresh")}`;
+  }
+  if (entry.state === CARD_STATE.CONFIRM) {
+    const c = entry.confirm || {};
+    return `${stats(entry.stats)}
+      <div class="swf-confirm" role="group" aria-label="${esc(c.yes || "Confirm")}">
+        <p class="swf-confirm-prompt">${esc(c.prompt || "Are you sure?")}</p>
+        <div class="swf-card-actions">
+          <button class="act ghost" data-setup-card-confirm-yes="${esc(w.key)}"
+            >${esc(c.yes || "Confirm")}</button>
+          <button class="act ghost" data-setup-card-confirm-no="${esc(w.key)}"
+            >${esc(c.no || "Cancel")}</button>
+        </div>
+      </div>`;
+  }
+  if (entry.state === CARD_STATE.EMPTY) {
+    // Explains what is missing, in this workflow's own terms, instead of
+    // showing a row of zeros and leaving the operator to infer it.
+    const missing = (entry.stats || []).map((s) => s.label.toLowerCase()).join(", ");
+    return `${stats(entry.stats)}
+      <p class="swf-card-empty">Nothing here yet — no ${esc(missing || "records")} for
+        this program, season and league. Start with the action below.</p>`;
+  }
+  if (entry.state === CARD_STATE.SUCCESS) {
+    return `${stats(entry.stats)}
+      <p class="swf-card-done">✓ This workflow is set up. You can still add
+        more whenever you need to.</p>`;
+  }
+  return stats(entry.stats);
+}
+
+// One card body per surface, wrapped in the slot a per-card retry/refresh
+// replaces. aria-busy is per card (not per page), so a card reloading on its
+// own is announced as busy without implying the rest of Setup is.
+// Deliberately NOT role="status"/aria-live: six polite live regions would all
+// speak on every context switch. Card-scoped confirmations and successes go
+// through the one existing sitewide live region instead (announceCardStatus).
+function setupCardSlotHtml(w, landing) {
+  const entry = readCardState(setupWorkflowCardId(w.key));
+  return `<div class="swf-card-body" data-setup-card-slot="${esc(w.key)}"
+    aria-busy="${entry.state === CARD_STATE.LOADING ? "true" : "false"}"
+    >${setupCardBodyHtml(w, landing)}</div>`;
+}
+
+// (1) DOM mutation, scoped to ONE card: repaints this workflow's slot(s) --
+// its hub card and/or the open landing -- its status chip, and the hub
+// roll-up line that reads from it. Nothing else on the Setup screen is
+// touched, which is what "a retry replaces only the failed card generation"
+// means in practice: a failed "Clubs, players and staff" card recovering must
+// not blank the five cards beside it.
+function repaintSetupWorkflowCard(key, identity) {
+  if (identity && !cardIdentityCurrent(identity)) return false;  // #365 identity gate — DOM
+  const w = setupWorkflowsFor().find((x) => x.key === key);
+  if (!w) return false;
+  const slots = document.querySelectorAll(`[data-setup-card-slot="${key}"]`);
+  if (!slots.length) return false;  // navigated away before this resolved
+  const entry = readCardState(setupWorkflowCardId(key));
+  slots.forEach((slot) => {
+    slot.innerHTML = setupCardBodyHtml(w, !!slot.closest(".swf-landing"));
+    slot.setAttribute("aria-busy", entry.state === CARD_STATE.LOADING ? "true" : "false");
+  });
+  const head = document.querySelector(`[data-setup-workflow-card="${key}"] .swf-head`);
+  if (head) {
+    const chip = head.querySelector(".swf-optional, .swf-status");
+    if (chip) chip.remove();
+    const next = setupCardStatusChip(entry, w);
+    if (next) head.insertAdjacentHTML("beforeend", next);
+  }
+  // The hub roll-up is derived from every card's model, so this one card
+  // changing genuinely changes it. Replaced in place only when it still has
+  // something to say, so a transient "no statuses known" never deletes the
+  // element a later repaint would need to find.
+  const progress = document.querySelector("[data-setup-hub-progress]");
+  const progressHtml = setupHubProgressHtml();
+  if (progress && progressHtml) progress.outerHTML = progressHtml;
+  wireSetupWorkflowCards(document);
+  return true;
+}
+
+// A per-card retry/refresh. Fetches ONLY what this card needs (the four cards
+// with inventory counts need the setup overview, "roster" additionally needs
+// the player list, Workflow 6 needs neither) and commits under this card's own
+// generation, so it can never disturb a neighbour's state or be overtaken by
+// an older response of its own.
+//
+// Deliberately does NOT write the module-level `playersList` the Records and
+// hierarchy views render from: this is one card's refresh, not the Setup
+// screen's.
+async function retrySetupWorkflowCard(key) {
+  const w = setupWorkflowsFor().find((x) => x.key === key);
+  if (!w) return;
+  const held = cardStates[setupWorkflowCardId(key)] || {};
+  const identity = beginCardRequest(setupWorkflowCardId(key), { userInitiated: true });
+  commitCardState(identity, { state: CARD_STATE.LOADING, status: CARD_STATUS.UNKNOWN,
+                              optional: held.optional === undefined ? !!w.optional : held.optional });
+  repaintSetupWorkflowCard(key, identity);
+  const needsPlayers = key === "roster";
+  const [svr, pl, pr] = await Promise.all([
+    w.summary ? getJSON("/api/v2/setup/overview") : Promise.resolve(null),
+    needsPlayers ? getJSON("/api/players") : Promise.resolve(null),
+    // Status comes from the same route the Home/Tasks card reads, gated on
+    // exactly the permission that route requires, so an unauthorized role
+    // simply has no status rather than a 403 that would read as a failure.
+    hasPerm("manage_arena") ? getJSON("/api/v2/setup/progress") : Promise.resolve(null),
+  ]);
+  const svOk = !w.summary || !!(svr && !svr.error);
+  const playersOk = !needsPlayers || Array.isArray(pl);
+  const progress = (pr && !pr.error) ? pr : null;
+  const row = partitionSetupWorkflows(progress && progress.workflows)
+    .workflows.find((r) => r.key === key) || null;
+  const model = buildSetupWorkflowCardModel(w, row, {
+    sv: svOk ? svr : null, ov: null, players: Array.isArray(pl) ? pl : [],
+    svOk: svOk, playersOk: playersOk });
+  // (4) completion and (5) next-task: both are read off this model by
+  // setupHubRollup(), and commitCardState refuses a superseded identity, so a
+  // late loser can revise neither.
+  if (!commitCardState(identity, model)) return;
+  if (!repaintSetupWorkflowCard(key, identity)) return;      // (1) DOM
+  const failed = model.state === CARD_STATE.ERROR;
+  announceCardStatus(identity, failed                        // (3) announcement
+    ? `Still couldn't load ${w.title}.` : `${w.title} updated.`, failed);
+  // (2) focus: the operator pressed Retry inside the slot that was just
+  // replaced, so land them on this card's own heading rather than <body>.
+  const landing = document.querySelector(`[data-setup-workflow-landing="${key}"]`);
+  focusCardTarget(identity, landing
+    ? landing.querySelector(".swf-landing-title")
+    : document.querySelector(`[data-setup-workflow-card="${key}"] .swf-title`));
+}
+
+// Resolve an action reference ("secondary:0") back to its declaration. Kept
+// as a lookup rather than stashing the action object on the DOM node so a
+// repaint can never resurrect an action from an earlier definition.
+function setupCardActionFor(w, ref) {
+  const parts = String(ref || "").split(":");
+  const list = parts[0] === "primary" ? [w.primary]
+    : parts[0] === "tertiary" ? (w.tertiary || []) : (w.secondary || []);
+  return list[Number(parts[1]) || 0] || null;
+}
+
+// The CONFIRM state (#365). Opens a card-scoped confirmation for an action
+// that declares one, bound to this card's identity so a context switch
+// withdraws it rather than leaving a prompt standing for a Program the
+// operator has left.
+function askSetupCardConfirm(key, ref) {
+  const w = setupWorkflowsFor().find((x) => x.key === key);
+  if (!w) return;
+  const action = setupCardActionFor(w, ref);
+  if (!action || !action.confirm) return;
+  const held = cardStates[setupWorkflowCardId(key)];
+  // A card holding data from a context the operator has left must not open a
+  // confirmation bound to it.
+  if (!held || !cardTupleCurrent(held.identity)) return;
+  const identity = beginCardRequest(setupWorkflowCardId(key), { userInitiated: true });
+  commitCardState(identity, Object.assign({}, held, {
+    state: CARD_STATE.CONFIRM, confirm: action.confirm,
+    pending: ref, resumeState: held.state }));
+  if (!repaintSetupWorkflowCard(key, identity)) return;
+  announceCardStatus(identity, action.confirm.prompt);
+  const slot = document.querySelector(`[data-setup-card-slot="${key}"]`);
+  focusCardTarget(identity, slot && slot.querySelector("[data-setup-card-confirm-yes]"));
+}
+
+function resolveSetupCardConfirm(key, yes) {
+  const w = setupWorkflowsFor().find((x) => x.key === key);
+  const held = cardStates[setupWorkflowCardId(key)];
+  if (!w || !held || held.state !== CARD_STATE.CONFIRM) return;
+  if (!cardTupleCurrent(held.identity)) return;
+  const action = setupCardActionFor(w, held.pending);
+  const c = (action && action.confirm) || {};
+  const identity = beginCardRequest(setupWorkflowCardId(key), { userInitiated: true });
+  commitCardState(identity, Object.assign({}, held, {
+    state: held.resumeState || CARD_STATE.READY, confirm: null, pending: null }));
+  repaintSetupWorkflowCard(key, identity);
+  // Success and cancellation both announce exactly once, through the one
+  // sitewide live region -- the card's own visible copy is not itself a live
+  // region, so neither is spoken twice.
+  announceCardStatus(identity, yes ? (c.done || "Continuing.")
+    : (c.cancelled || "Cancelled."));
+  if (!yes) {
+    focusCardTarget(identity, document.querySelector(`[data-setup-card-ask="${key}"]`));
+    return;
+  }
+  if (action.go) return runSetupWorkflowGo(action.go);
+  if (action.act) return openSetupWorkflowDrawer(action.act);
+}
+
+function wireSetupWorkflowCards(root) {
+  root.querySelectorAll("[data-setup-card-retry]").forEach((b) =>
+    b.onclick = () => retrySetupWorkflowCard(b.dataset.setupCardRetry));
+  root.querySelectorAll("[data-setup-card-ask]").forEach((b) =>
+    b.onclick = () => askSetupCardConfirm(b.dataset.setupCardAsk, b.dataset.setupCardAction));
+  root.querySelectorAll("[data-setup-card-confirm-yes]").forEach((b) =>
+    b.onclick = () => resolveSetupCardConfirm(b.dataset.setupCardConfirmYes, true));
+  root.querySelectorAll("[data-setup-card-confirm-no]").forEach((b) =>
+    b.onclick = () => resolveSetupCardConfirm(b.dataset.setupCardConfirmNo, false));
 }
 
 // Hub index: the six workflows as summary cards. This is what replaces the
@@ -3319,7 +4088,7 @@ function setupSummaryHtml(w, sv, ov) {
 // a fact about the domain rather than a filter someone forgot to apply.
 function setupScopeNote(sv) {
   // Guard the payload, not each accessor -- the same reason (and the same
-  // convention) as setupSummaryHtml above: renderSetup is reachable before
+  // convention) as buildSetupWorkflowCardModel above: renderSetup is reachable before
   // or without a successful overview load (an early return, a failed fetch,
   // a view that changed while render() was awaiting), and a note about
   // scope must degrade to nothing rather than throw and blank the view.
@@ -3354,16 +4123,17 @@ function renderSetupHub(sv, ov) {
       <header class="swf-head">
         <span class="swf-ico" aria-hidden="true">${w.icon}</span>
         <h3 class="swf-title">${esc(w.title)}</h3>
-        ${w.optional ? `<span class="swf-optional">Optional</span>` : ""}
+        ${setupCardStatusChip(readCardState(setupWorkflowCardId(w.key)), w)}
       </header>
       <p class="swf-purpose">${esc(w.purpose)}</p>
-      ${setupSummaryHtml(w, sv, ov)}
+      ${setupCardSlotHtml(w, false)}
       <button class="act ghost swf-open" data-setup-workflow="${esc(w.key)}">
         Open ${esc(w.title.toLowerCase())}</button>
     </section>`).join("");
   return `${pageIntro("Setup is six focused workflows. Open the one you need — "
     + "each opens on a summary, not a form.")}
     ${setupScopeNote(sv)}
+    ${setupHubProgressHtml()}
     <div class="swf-grid">${cards}</div>`;
 }
 
@@ -3375,25 +4145,39 @@ function renderSetupWorkflowLanding(w, sv, ov) {
   // (#331 review rounds 5/6) that binds a create drawer to the ACTIVE
   // Program/Season instead of letting it fall back to a global first option.
   // `act` opens a plain entity drawer, identical to Records' own "+ New".
-  const attr = (a) => a.go
+  // An action declaring `confirm` routes through the card's own CONFIRM state
+  // (#365) instead of firing straight away; everything else is unchanged.
+  const attr = (a, i, group) => a.confirm
+    ? `data-setup-card-ask="${esc(w.key)}" data-setup-card-action="${esc(group)}:${i}"`
+    : a.go
     ? `data-setup-workflow-go="${esc(a.go)}"` : `data-setup-workflow-act="${esc(a.act)}"`;
-  const act = (a, cls) =>
-    `<button class="act ${cls}" ${attr(a)}>${esc(a.label)}</button>`;
-  const secondary = (w.secondary || []).map((a) => act(a, "ghost")).join("");
-  const tertiary = (w.tertiary || []).map((a) =>
-    `<button class="linklike" ${attr(a)}>${esc(a.label)}</button>`).join("");
+  const act = (a, cls, i, group) =>
+    `<button class="act ${cls}" ${attr(a, i, group)}>${esc(a.label)}</button>`;
+  const secondary = (w.secondary || []).map((a, i) => act(a, "ghost", i, "secondary")).join("");
+  const tertiary = (w.tertiary || []).map((a, i) =>
+    `<button class="linklike" ${attr(a, i, "tertiary")}>${esc(a.label)}</button>`).join("");
+  // The optional note follows the LIVE model's partition flag (the backend's
+  // own `status: "optional"`), falling back to the declared contract when no
+  // progress payload is available -- same single source as the hub chip and
+  // the Home/Tasks badge, so no surface can call this step optional while
+  // another counts it as required work.
+  const landingEntry = readCardState(setupWorkflowCardId(w.key));
+  const isOptional = landingEntry.optional === undefined
+    ? !!w.optional : !!landingEntry.optional;
+  const optionalNote = isOptional
+    ? `<p class="swf-optional-note">This step is optional — you can
+        set everything up by hand instead, and skipping it never blocks the
+        rest of setup.</p>` : "";
   return `
     <div class="swf-landing" data-setup-workflow-landing="${esc(w.key)}">
       <button class="linklike swf-back" data-setup-workflow="">← All setup workflows</button>
       <h2 class="swf-landing-title">${w.icon} ${esc(w.title)}</h2>
       <p class="swf-purpose">${esc(w.purpose)}</p>
       ${setupScopeNote(sv)}
-      ${w.optional ? `<p class="swf-optional-note">This step is optional — you can
-        set everything up by hand instead, and skipping it never blocks the
-        rest of setup.</p>` : ""}
-      ${setupSummaryHtml(w, sv, ov)}
+      ${optionalNote}
+      ${setupCardSlotHtml(w, true)}
       <div class="swf-actions">
-        ${act(w.primary, "primary")}
+        ${act(w.primary, "primary", 0, "primary")}
         ${secondary}
       </div>
       ${tertiary ? `<div class="swf-tertiary">${tertiary}</div>` : ""}
@@ -6723,6 +7507,9 @@ async function render() {
   // rather than flashing another Program/Season/League's data.
   const myRenderContext = contextRevision;
   let ov, sv, hv, board, lineups, standings, inbox, playerHome;
+  // Per-ENDPOINT outcomes for the Setup view's own reads (#365) — see the
+  // Setup branch below for why the payloads alone cannot carry this.
+  let svOk = false, playersOk = false;
   try {
     c.innerHTML = `<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>`;
     ov = await getJSON("/api/demo/overview");
@@ -6800,6 +7587,14 @@ async function render() {
     if (view === "setup") {
       sv = { programs: [], seasons: [], leagues: [], divisions: [], teams: [], clubs: [], organizations: [], venues: [], rinks: [], ice_slots: [], officials: [] };
       hv = { programs: [] };
+      // #365: the empty shape above is exactly why the per-card model needs an
+      // explicit per-ENDPOINT outcome rather than reading the payload. `sv`
+      // degrades to zeroes on failure, so "the overview call failed" and "this
+      // Program genuinely has nothing yet" are indistinguishable from `sv`
+      // alone -- the "state inferred from missing payload fields" the issue
+      // forbids. These two flags carry the distinction to the cards.
+      svOk = false;
+      playersOk = false;
     }
     // Canonical Setup structure (#233 B2a). `sv` (the flat overview) is gated
     // MANAGE_ARENA server-side — both League Admin and Arena Manager hold it
@@ -6809,7 +7604,8 @@ async function render() {
     if (view === "setup" && (hasPerm("manage_setup") || hasPerm("manage_arena"))) {
       const svr = await getJSON("/api/v2/setup/overview");
       if (contextRevision !== myRenderContext) return;  // #367: superseded, a fresh render() is already coming
-      if (svr && !svr.error) sv = svr;
+      svOk = !!(svr && !svr.error);
+      if (svOk) sv = svr;
     }
     // The Competition tree, Setup Player card, and season participation are
     // MANAGE_SETUP-only (roster-adjacent / competition-structure data an
@@ -6830,7 +7626,8 @@ async function render() {
       // guard cover module-level state too; every module-level assignment
       // below this line is inside the same guarded stretch.
       if (contextRevision !== myRenderContext) return;  // superseded
-      playersList = Array.isArray(pl) ? pl : [];
+      playersOk = Array.isArray(pl);
+      playersList = playersOk ? pl : [];
       // The canonical Program→Season→League→Division tree (#233 B2a review
       // r1): consumed as-is rather than reconstructed from flat `sv` lists,
       // so needs_assignment/teams_without_division match the canonical
@@ -6934,6 +7731,27 @@ async function render() {
           }
         }
       }
+    }
+    // #365: bind each visible Setup workflow card to its OWN identity (card id
+    // + context tuple + generation) and commit its model, inside the same
+    // contextRevision-guarded stretch as the fetches it consumes — so the
+    // cards a paint renders were bound under the same context that paint was.
+    //
+    // The per-workflow done/todo/optional status comes from the SAME route the
+    // Home/Tasks card reads, so the hub chip, the landing's optional note and
+    // the Home/Tasks badge can never disagree. Gated on exactly the permission
+    // that route requires (MANAGE_ARENA — web/authz.py), so a role that cannot
+    // read it simply has no status rather than a 403 that would read as a
+    // per-card failure.
+    if (view === "setup" && setupWorkflowsFor().length) {
+      let progress = null;
+      if (hasPerm("manage_arena")) {
+        const pr = await getJSON("/api/v2/setup/progress");
+        if (contextRevision !== myRenderContext) return;  // superseded
+        if (pr && !pr.error) progress = pr;
+      }
+      commitSetupWorkflowCards({ sv: sv, ov: ov, players: playersList,
+        svOk: svOk, playersOk: playersOk, progress: progress });
     }
     // The game sheet also needs the officials pool for its assign control (#30).
     if (view === "sheet") {
@@ -7126,9 +7944,11 @@ async function render() {
     // "dashboard" (canSeeOpsConsole) but has nothing to do with this. The
     // fetch itself happens independently, in loadSetupProgressCard() below
     // (#331 review round 2 finding 3) — not awaited inline here, so it
-    // never blocks the rest of the Dashboard from painting.
-    setupProgress = null;
-    setupProgressError = false;
+    // never blocks the rest of the Dashboard from painting. Nothing is
+    // cleared here any more (#365): the card's own store entry is replaced by
+    // that load under its own identity, and readCardState() already labels a
+    // held model whose tuple has moved as stale, so blanking it from here
+    // would only discard data the stale contract says to keep showing.
   } catch (e) {
     setChrome(ov);
     c.innerHTML = `<div class="banner alert"><h2>Could not load data</h2>
@@ -7188,9 +8008,22 @@ async function render() {
   // announced automatically. aria-busy starts true (a fetch is about to
   // start, per the loading skeleton painted on the same line) and
   // loadSetupProgressCard() clears it once real content lands.
+  //
+  // #365: the one exception to "always start from the skeleton" is a held
+  // model whose context tuple has moved (readCardState returns STALE). That
+  // is precisely the case the stale contract covers -- last-good data stays
+  // visible, labelled as belonging to an earlier selection and with its own
+  // refresh path, while the fresh load for the new tuple runs -- instead of
+  // being blanked to a skeleton that says nothing. Every other case (no held
+  // model at all, or one for the tuple that is still active) starts from the
+  // loading state exactly as before, so an ordinary reload never shows one
+  // context's numbers under another's heading.
+  const spInitial = readCardState(HOME_TASKS_CARD);
   c.innerHTML =
     view === "dashboard" ? (showSetupCard
-        ? `<div id="sp-card-slot" role="status" aria-live="polite" aria-busy="true">${renderSetupProgressCard(null, false, true)}</div>` : "")
+        ? `<div id="sp-card-slot" role="status" aria-live="polite" aria-busy="true">${
+             renderSetupProgressCard(spInitial.state === CARD_STATE.STALE
+               ? spInitial : { state: CARD_STATE.LOADING })}</div>` : "")
       + renderDashboard(ov, standings)
     : view === "setup" ? renderSetup(sv, hv, ov)
     : view === "import" ? renderImport(ov)
@@ -7221,6 +8054,12 @@ async function render() {
   // (#331 review round 2 finding 3) -- the slot painted above is only ever
   // the loading skeleton at this point, so there's nothing of the card's
   // own to wire here yet.
+  // ...with ONE exception (#365): a stale card painted above already carries
+  // its own refresh control, which must work during the very window it is
+  // on screen, before that load settles and rewires the slot itself.
+  const spStaleRefresh = c.querySelector("[data-setup-progress-retry]");
+  if (spStaleRefresh) spStaleRefresh.onclick =
+    () => loadSetupProgressCard({ userInitiated: true });
   if (showSetupCard) loadSetupProgressCard();
   // Administration → Danger zone (#256): opens the guarded factory-reset modal.
   const frBtn = c.querySelector("[data-factory-reset]");
@@ -7573,38 +8412,17 @@ async function render() {
   // Primary actions route through goToSetupWorkflow -- the seeded, fail-closed
   // path -- rather than opening a raw drawer, so a landing's primary action
   // carries the same active-Program binding the Home/Tasks hub's does.
-  c.querySelectorAll("[data-setup-workflow-go]").forEach((b) => b.onclick = () => {
-    const key = b.dataset.setupWorkflowGo;
-    if (key === "onboarding") { switchTab("onboarding"); focusContentHeading(); return; }
-    goToSetupWorkflow(key);
-  });
+  c.querySelectorAll("[data-setup-workflow-go]").forEach((b) =>
+    b.onclick = () => runSetupWorkflowGo(b.dataset.setupWorkflowGo));
   // Demoted actions go through the SAME seeded, fail-closed path as the
   // primary ones. They used to open a raw drawer with drawerValues = {},
   // mirroring Records' own "+ New" -- which is correct on Records (a flat
   // record-management surface) and wrong here, because a workflow landing is
   // scoped to the active Program and its parent selects are not.
-  c.querySelectorAll("[data-setup-workflow-act]").forEach((b) => b.onclick = async () => {
-    const kind = b.dataset.setupWorkflowAct;
-    const mySeq = ++drawerSeedFetchSeq;
-    const seeded = await contextSeededDrawerValues(kind);
-    if (mySeq !== drawerSeedFetchSeq) return;  // a newer open already won
-    if (!seeded.ok) {
-      toast = seeded.needsContext
-        ? "Pick a program in the context bar first, so this is created in the right one."
-        : seeded.needsSeason
-          ? "Pick a season in the context bar first — this is created inside one."
-          : seeded.noLeagueInSeason
-            ? "That season has no leagues yet — add one before adding divisions."
-            : seeded.leagueNotInSeason
-              ? "Your active League isn't in this season — switch the context bar's League or clear it before adding divisions."
-              : "Couldn't load what's needed to open that — try again.";
-      toastIsError = true;
-      return render();
-    }
-    drawer = { kind }; drawerError = ""; drawerValues = seeded.values;
-    toast = "";
-    render();
-  });
+  c.querySelectorAll("[data-setup-workflow-act]").forEach((b) =>
+    b.onclick = () => openSetupWorkflowDrawer(b.dataset.setupWorkflowAct));
+  // Per-card retry/refresh and the card-scoped confirmation (#365).
+  wireSetupWorkflowCards(c);
   c.querySelectorAll("button[data-act]").forEach((b) => b.onclick = () => rosterAction(b.dataset.act, b.dataset.id));
   c.querySelectorAll(".seg[data-view]").forEach((b) => b.onclick = () => { gameView = b.dataset.view; toast = ""; render(); });
   c.querySelectorAll("[data-side]").forEach((b) => b.onclick = () => { rosterSide = b.dataset.side; toast = ""; render(); });

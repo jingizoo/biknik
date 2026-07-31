@@ -1269,3 +1269,34 @@ details.tn > .tn-sum:hover { background: #f6f7fb; }
 .swf-detail { border-top: 1px solid var(--sep); padding-top: 12px;
   display: flex; flex-wrap: wrap; gap: 12px; align-items: baseline; }
 .swf-detail .section-title { margin: 0; }
+
+/* Per-card state model (#365). Each workflow card's body is its own slot: a
+   retry/refresh replaces only this element, so a failed card recovering never
+   repaints (or blanks) the five beside it. The state copy below reuses the
+   already-verified color pairs from the .sp-card block at the top of this
+   file rather than introducing new, unmeasured combinations:
+   #167029-on-#e3f9e8 and #57575c-on-#ececf1 are the badge pairs that block
+   already established, and #c0271b (used there as a background under white
+   text) measures 5.9:1 as TEXT on #fff and 5.5:1 on the landing's #f4f5f8 —
+   both clear of WCAG AA for body text. */
+.swf-card-body { display: flex; flex-direction: column; gap: 8px; }
+.swf-card-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.swf-card-error { margin: 0; font-size: 13px; line-height: 1.45; color: #c0271b; }
+.swf-card-stale { margin: 0; font-size: 13px; line-height: 1.45; color: #57575c; }
+.swf-card-empty, .swf-card-done { margin: 0; font-size: 13px; line-height: 1.45;
+  color: var(--muted); }
+.swf-progress { margin: 0 0 12px; font-size: 13px; line-height: 1.45; }
+.sp-progress-line { margin: 8px 0 0; font-size: 13px; line-height: 1.45; }
+/* The confirmation state: the card's own prompt, in the card, rather than a
+   page-level modal — the decision belongs to this one workflow. */
+.swf-confirm { border: 1px solid var(--sep); border-radius: 10px; padding: 10px;
+  display: flex; flex-direction: column; gap: 8px; }
+.swf-confirm-prompt { margin: 0; font-size: 13px; line-height: 1.45; }
+/* Done/To-do chips share the .swf-optional pill SHAPE but deliberately not
+   its class: ".swf-optional" means Decision 9's optional workflow and nothing
+   else, on every surface and in every check that looks for it. */
+.swf-status { margin-left: auto; font-size: 11px; font-weight: 700; letter-spacing: .02em;
+  text-transform: uppercase; border: 1px solid transparent;
+  border-radius: 999px; padding: 2px 8px; }
+.swf-status.swf-done { color: #167029; background: #e3f9e8; }
+.swf-status.swf-todo { color: #57575c; background: #ececf1; }
