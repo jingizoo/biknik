@@ -698,7 +698,12 @@ class PostgresPlacementConcurrencyTest(_ForcedRaceHarnessMixin, unittest.TestCas
             self.assertTrue(any(a.action == "draft_schedule_committed"
                                for a in store.all_setup_audit()))
         else:
-            self.assertEqual(_reason(draft_res), "venue_access_missing", repr(out))
+            # #328 review round 15 finding 2 (service.py) — a revoke landing
+            # after commit's pre-lock regeneration but before/at its locked
+            # regeneration masks the narrower venue_access_missing into the
+            # general preview_stale recheck; both fire before any write.
+            self.assertIn(_reason(draft_res),
+                         ("venue_access_missing", "preview_stale"), repr(out))
             self.assertEqual(
                 len([g for g in store.all_games() if not g.cancelled]), 0)
             self.assertEqual(store.get_ice_slot("mB").status.value, "available")
@@ -724,7 +729,12 @@ class PostgresPlacementConcurrencyTest(_ForcedRaceHarnessMixin, unittest.TestCas
             self.assertTrue(any(a.action == "draft_schedule_committed"
                                for a in store.all_setup_audit()))
         else:
-            self.assertEqual(_reason(draft_res), "venue_access_missing", repr(out))
+            # #328 review round 15 finding 2 (service.py) — a reparent landing
+            # after commit's pre-lock regeneration but before/at its locked
+            # regeneration masks the narrower venue_access_missing into the
+            # general preview_stale recheck; both fire before any write.
+            self.assertIn(_reason(draft_res),
+                         ("venue_access_missing", "preview_stale"), repr(out))
             self.assertEqual(
                 len([g for g in store.all_games() if not g.cancelled]), 0)
             self.assertEqual(store.get_ice_slot("mC").status.value, "available")
