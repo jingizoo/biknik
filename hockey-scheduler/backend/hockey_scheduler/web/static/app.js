@@ -925,6 +925,16 @@ function tasksWorkflowRowsHtml(model) {
 
 function renderSetupProgressCard(model) {
   const state = (model && model.state) || CARD_STATE.LOADING;
+  // The Home/Tasks half of the context-switch withdrawal (#365 owner
+  // correction). The card's own CTA is a context-scoped mutation entry point
+  // -- goToSetupWorkflow() opens a seeded create drawer or a Setup
+  // destination -- so from the instant a switch is intended until it is
+  // reconciled it must not be painted, whatever state the model is in. Same
+  // flag, same window, same clearing points as the Setup landings'
+  // (setupLandingActions). Applied by suppressing the button rather than by
+  // an early return, so the retained rows/counts the operator was reading
+  // stay on screen; only the action goes.
+  const ctaWithdrawn = contextSwitchIntentPending;
   // Per-card loading boundary (#331 review round 2 finding 3): the caller
   // paints this skeleton immediately, before the real fetch even starts, so
   // a slow setup-progress request only delays this one card, never the rest
@@ -1061,7 +1071,7 @@ function renderSetupProgressCard(model) {
       ${attentionRows}
       <div class="actions">
         <button class="act primary" data-goto="calendar">Go to Schedule</button>
-        ${importWf ? `<button class="act ghost" data-setup-progress-action="${esc(importWf.key)}"
+        ${importWf && !ctaWithdrawn ? `<button class="act ghost" data-setup-progress-action="${esc(importWf.key)}"
           >${esc(importWf.primary_action)}</button>` : ""}
       </div>
     </div>`;
@@ -1089,10 +1099,10 @@ function renderSetupProgressCard(model) {
           <div class="na-sub">${esc(next.detail)}</div></div>
       </div>
       ${nextAttention}
-      <div class="actions">
+      ${ctaWithdrawn ? "" : `<div class="actions">
         <button class="act primary" data-setup-progress-action="${esc(next.key)}"
           >${esc(next.primary_action)}</button>
-      </div>
+      </div>`}
       <div class="section-title">Setup workflows</div>
       ${rows}
       ${tasksProgressLine(model)}
@@ -3624,12 +3634,46 @@ function leagueScopedTeams(sv) {
   return lid ? teams.filter((t) => t.league_id === lid) : teams;
 }
 
+// `prereq` (#365 owner ruling on EMPTY dead ends): the ordered chain of
+// records this workflow's DECLARED primary action needs before it can create
+// anything. "Primary" means the single action that resolves the state the
+// card is actually in, not necessarily the static `primary` above -- an EMPTY
+// Facilities landing that names the missing venues and rinks and then offers
+// "Add Ice" (which needs a rink, which needs a venue) is a dead end: it says
+// what is missing and hands over an action that cannot create it.
+//
+// Each step is `{ met, action, why }`:
+//   met(facts)  whether this prerequisite is satisfied, read from the LIVE
+//               counts of the same payload the card's own summary came from
+//               (setupPrereqFacts) -- never from a declared default.
+//   action      the ONE control offered while it is not. `act`/`go` are the
+//               ordinary landing action kinds; `open` is the third kind this
+//               ruling needs -- the missing record belongs to ANOTHER
+//               workflow, so the single action opens THAT workflow's landing
+//               (which derives its own effective action the same way, so the
+//               chain resolves recursively) rather than smuggling a foreign
+//               create drawer onto this card. A create committed here would
+//               be committed under THIS card's identity while changing a
+//               DIFFERENT card's data, which is precisely the per-card
+//               binding #365 exists to hold.
+//   why         the sentence the EMPTY body uses to name the blocker, so the
+//               copy and the action can never describe different problems.
+//
+// The chain is walked in order and the FIRST unmet step wins; all met means
+// the declared primary is genuinely the resolving action. Only the EMPTY
+// state renders a single action, so this is what that one action is; every
+// other state renders its declared groups exactly as before.
 const SETUP_WORKFLOWS = [
   { key: "league_season", title: "League profile and seasons", icon: "🗓️",
     purpose: "The program's identity, and the seasons that give it schedulable time.",
     perm: "manage_setup",
     primary: { label: "Add Season", go: "league_season" },
     secondary: [{ label: "Programs", act: "league" }, { label: "Leagues", act: "level" }],
+    // A Season hangs off a Program, so with no Program at all "Add Season"
+    // opens a drawer whose only required parent select has nothing in it.
+    prereq: [{ met: (f) => f.programs > 0,
+      action: { label: "Add program", act: "league" },
+      why: "A season belongs to a program, and there is no program yet." }],
     summary: (sv) => [
       { label: "Programs", n: (sv.programs || []).length },
       { label: "Seasons", n: (sv.seasons || []).length },
@@ -3639,6 +3683,13 @@ const SETUP_WORKFLOWS = [
     perm: "manage_setup",
     primary: { label: "Add Team", go: "teams" },
     secondary: [{ label: "Clubs", act: "club" }],
+    // A permanent Team hangs off a League (its `league_id`); a Club does NOT
+    // (team-club-optional.js / test_optional_club.py), so the Club is not a
+    // prerequisite for anything and never appears in this chain.
+    prereq: [{ met: (f) => f.leagues > 0,
+      action: { label: "Add a league first", open: "league_season" },
+      why: "A permanent team belongs to a league, and this program's active"
+        + " season has none yet." }],
     summary: (sv) => [
       { label: "Teams", n: leagueScopedTeams(sv).length },
       { label: "Clubs", n: withPendingLink(sv, "clubs").length }] },
@@ -3647,6 +3698,22 @@ const SETUP_WORKFLOWS = [
     perm: "manage_setup",
     primary: { label: "Register Team", go: "participation" },
     secondary: [{ label: "Divisions", act: "division" }],
+    // Owner ruling, verbatim: "Participation: Add Division before Register
+    // Team." A Division hangs off a League paired with the active Season, and
+    // a registration needs a permanent Team to register -- so the full chain
+    // is league -> division -> team -> register, and the EMPTY state (zero
+    // divisions) always stops at one of the first two.
+    prereq: [
+      { met: (f) => f.leagues > 0,
+        action: { label: "Add a league first", open: "league_season" },
+        why: "Divisions live inside a league, and this program's active season"
+          + " has none yet." },
+      { met: (f) => f.divisions > 0,
+        action: { label: "Add division", act: "division" },
+        why: "Teams are registered into a division, and there is none yet." },
+      { met: (f) => f.teams > 0,
+        action: { label: "Add a team first", open: "teams" },
+        why: "There is no permanent team to register yet." }],
     summary: (sv) => [
       { label: "Divisions", n: (sv.divisions || []).length }] },
   { key: "roster", title: "Clubs, players and staff", icon: "🧑",
@@ -3654,6 +3721,16 @@ const SETUP_WORKFLOWS = [
     perm: "manage_setup",
     primary: { label: "Add Player", go: "roster" },
     secondary: [{ label: "Officials", act: "official" }],
+    // The case the owner called out by name: "especially Roster when no Team
+    // exists." A Player hangs off a Team, so with no Team the declared
+    // primary opens a drawer whose required Team select is empty, and
+    // goToSetupWorkflow("roster") seeds it from a team list that is itself
+    // empty. The permanent Team belongs to the "teams" workflow, so the one
+    // action goes there.
+    prereq: [{ met: (f) => f.teams > 0,
+      action: { label: "Add a team first", open: "teams" },
+      why: "Players are added to a team, and this program, season and league"
+        + " has none yet." }],
     // Takes the player list as an ARGUMENT rather than reading the
     // module-level `playersList` (#365): a per-card retry re-fetches
     // /api/players for THIS card alone and must be able to compute its own
@@ -3679,6 +3756,16 @@ const SETUP_WORKFLOWS = [
     primary: { label: "Add Ice", go: "facilities" },
     secondary: [{ label: "Venues", act: "venue" }, { label: "Rinks", act: "rink" }],
     tertiary: [{ label: "Add one ice slot", act: "ice-slot" }],
+    // Owner ruling, verbatim: "Facilities: Add Venue -> Add Rink -> Add Ice."
+    // Ice is generated onto a Rink, and a Rink hangs off a Venue, so the
+    // highest-leverage action is also the LAST one that becomes possible.
+    prereq: [
+      { met: (f) => f.venues > 0,
+        action: { label: "Add venue", act: "venue" },
+        why: "Ice is booked on a rink inside a venue, and there is no venue yet." },
+      { met: (f) => f.rinks > 0,
+        action: { label: "Add rink", act: "rink" },
+        why: "Ice is booked on a rink, and this venue has none yet." }],
     summary: (sv) => [
       { label: "Venues", n: withPendingLink(sv, "venues").length },
       { label: "Rinks", n: withPendingLink(sv, "rinks").length }] },
@@ -3698,6 +3785,14 @@ const SETUP_WORKFLOWS = [
   // count (the same absence of a completion signal that makes it optional
   // server-side), so its card has no data dependency and therefore no
   // loading/empty/error of its own to reach.
+  //
+  // Consequently no `prereq` either, and that is an ASSERTION rather than an
+  // omission: with no EMPTY state to reach there is no emptiness for an
+  // effective action to resolve, and "Import data" needs no record to exist
+  // first -- importing is precisely how an operator with nothing gets
+  // started. buildSetupWorkflowCardModel derives an effective action for
+  // every workflow regardless, so an empty chain here resolves to the
+  // declared primary rather than to nothing.
   { key: "import", title: "Imports and onboarding", icon: "📥", optional: true,
     purpose: "Bring an existing league in from spreadsheets instead of typing it in.",
     perm: "manage_arena",
@@ -3817,6 +3912,52 @@ async function openSetupWorkflowDrawer(kind) {
 // each caller and passed in — a `statusRow` argument could arrive `null`
 // because the read failed, because this role may not read it, or because the
 // backend genuinely had no row, and this function could not tell which.
+// The facts a `prereq` chain is evaluated against, derived ONCE from the SAME
+// `src` the card's own stats come from — never re-read from a module-level
+// cache at render time. That matters for the identity discipline as much as
+// for correctness: an effective action computed here is committed into the
+// card's model under the card's own identity, so a landing can never offer an
+// action derived from one context's inventory while displaying another's.
+//
+// Scoped exactly as the summaries are (leagueScopedTeams / withPendingLink),
+// so "this workflow says it has no teams" and "the chain says a team is
+// missing" are the same claim about the same rows.
+function setupPrereqFacts(src) {
+  const sv = (src && src.sv) || {};
+  return {
+    programs: (sv.programs || []).length,
+    seasons: (sv.seasons || []).length,
+    leagues: (sv.leagues || []).length,
+    teams: leagueScopedTeams(sv).length,
+    divisions: (sv.divisions || []).length,
+    venues: withPendingLink(sv, "venues").length,
+    rinks: withPendingLink(sv, "rinks").length,
+    players: ((src && src.players) || []).length,
+  };
+}
+
+// THE effective action: the single control an EMPTY landing offers. Walks the
+// declared chain against live facts and returns the first UNMET step's action
+// plus the sentence naming why; all met (or no chain at all) resolves to the
+// declared primary, which is then genuinely the action that resolves the
+// state.
+//
+// Fails CLOSED on an `open` step whose target workflow this role may not
+// open: openSetupWorkflowLanding() refuses an unauthorized key, so offering
+// the button would be offering a dead control. Returning no action at all
+// leaves the EMPTY body's `why` sentence as the only thing on screen, which
+// is the true statement — this role cannot resolve this emptiness itself.
+// (Unreachable today: every cross-workflow step targets a workflow carrying
+// the same `perm` as its source, so a role that can see one can see both.)
+function setupEffectiveAction(w, facts) {
+  const step = (w.prereq || []).find((s) => !s.met(facts));
+  if (!step) return { action: w.primary, why: null };
+  if (step.action.open && !setupWorkflowsFor().some((x) => x.key === step.action.open)) {
+    return { action: null, why: step.why };
+  }
+  return { action: step.action, why: step.why };
+}
+
 function buildSetupWorkflowCardModel(w, src) {
   // Fail CLOSED on a caller that supplies no outcome at all: an unasserted
   // read is treated as a failed one, never as a silent success.
@@ -3857,9 +3998,17 @@ function buildSetupWorkflowCardModel(w, src) {
   const stats = w.summary(src.sv, src.ov, src.players || []);
   // EMPTY is asserted, not inferred: every count this workflow tracks is
   // zero, so there is nothing here yet and the card says what is missing.
+  //
+  // ...and, since #365's owner ruling on dead ends, what to DO about it: the
+  // effective action and the sentence naming the blocker are resolved HERE,
+  // from the same payload these counts came from, and committed with the
+  // model. The renderer reads them; it does not re-derive them, so the action
+  // an EMPTY landing offers is always bound to the same identity as the
+  // counts beside it.
   if (stats.every((s) => !s.n)) {
+    const eff = setupEffectiveAction(w, setupPrereqFacts(src));
     return Object.assign(base, { state: CARD_STATE.EMPTY, stats: stats,
-      reason: "no_records" });
+      reason: "no_records", effective: eff.action, blockedBecause: eff.why });
   }
   // SUCCESS/complete for a landing is the workflow's own backend status
   // reading "done" -- the same signal the Home/Tasks card badges, so the two
@@ -4037,10 +4186,23 @@ function setupCardBodyHtml(w, landing) {
   if (entry.state === CARD_STATE.EMPTY) {
     // Explains what is missing, in this workflow's own terms, instead of
     // showing a row of zeros and leaving the operator to infer it.
+    //
+    // `blockedBecause` (the owner's EMPTY dead-end ruling) names the
+    // PREREQUISITE that is missing when the workflow's own declared primary
+    // cannot be the resolving action — the same chain step that chose the one
+    // action below, so the copy and the control can never describe different
+    // problems. Absent it, the declared primary IS the resolving action and
+    // the generic sentence is the whole truth.
     const missing = (entry.stats || []).map((s) => s.label.toLowerCase()).join(", ");
+    const because = entry.blockedBecause
+      ? ` ${esc(entry.blockedBecause)}`
+      : "";
+    const lead = entry.effective === null && entry.blockedBecause
+      ? " Ask a league admin to set that up."
+      : " Start with the action below.";
     return `${stats(entry.stats)}
       <p class="swf-card-empty">Nothing here yet — no ${esc(missing || "records")} for
-        this program, season and league. Start with the action below.</p>`;
+        this program, season and league.${because}${lead}</p>`;
   }
   if (entry.state === CARD_STATE.SUCCESS) {
     return `${stats(entry.stats)}
@@ -4325,15 +4487,34 @@ function renderSetupHub(sv, ov) {
 //   LOADING  nothing is known about this card yet; the primary is held back
 //            with the rest rather than being the one control that outruns
 //            its own summary.
-//   EMPTY    only the authorized primary action — the single thing that
-//            starts this workflow. `w.primary` is already the role-authorized
-//            one: setupWorkflowsFor() refuses the whole workflow (and this
-//            landing with it) for a role lacking its `perm`.
+//   EMPTY    only the authorized EFFECTIVE action — the single thing that
+//            resolves THIS emptiness, derived from the workflow's declared
+//            prerequisite chain against live counts (setupEffectiveAction,
+//            committed into the model as `effective`) rather than the static
+//            `w.primary`, which for Facilities is "Add Ice" and needs a rink
+//            that needs a venue. Role authorization is already handled:
+//            setupWorkflowsFor() refuses the whole workflow (and this landing
+//            with it) for a role lacking its `perm`, and an `open` step
+//            targeting a workflow this role cannot open resolves to no action
+//            at all rather than to a dead control.
 //   ERROR    keeps all three, deliberately and consistently with the copy the
 //            card body shows in this state: "The action below still works —
 //            only these counts are missing." Nothing about the actions is
 //            unsafe; only the summary is missing.
+//
+// One withdrawal is NOT a state at all and deliberately precedes them: while
+// a context switch has been ATTEMPTED but not yet reconciled
+// (contextSwitchIntentPending, set synchronously at setActiveContext()'s
+// first invalidation boundary), every landing mutation control is withdrawn
+// no matter what state the card is holding. The card's own state still
+// describes the tuple the operator has LEFT, so no value of it can answer
+// "may this control commit right now" — only the intent flag can, and it
+// clears only once a reconciliation has actually happened, on every success
+// and failure path. Same idiom as #369's contextHashIntentPending.
 function setupLandingActions(state) {
+  if (contextSwitchIntentPending) {
+    return { primary: false, secondary: false, tertiary: false };
+  }
   if (state === CARD_STATE.STALE || state === CARD_STATE.CONFIRM
       || state === CARD_STATE.LOADING) {
     return { primary: false, secondary: false, tertiary: false };
@@ -4358,21 +4539,40 @@ function setupLandingActionsHtml(w) {
   // `act` opens a plain entity drawer, identical to Records' own "+ New".
   // An action declaring `confirm` routes through the card's own CONFIRM state
   // (#365) instead of firing straight away; everything else is unchanged.
+  // `open` is the third action kind (#365 owner ruling on EMPTY dead ends):
+  // the missing prerequisite belongs to another workflow, so the control
+  // opens THAT landing through the same permission-aware transition the hub's
+  // own "Open …" buttons use. No derived action ever carries `confirm`, so
+  // the confirmation branch is unreachable for one by construction.
   const attr = (a, i, group) => a.confirm
     ? `data-setup-card-ask="${esc(w.key)}" data-setup-card-action="${esc(group)}:${i}"`
+    : a.open
+    ? `data-setup-workflow="${esc(a.open)}"`
     : a.go
     ? `data-setup-workflow-go="${esc(a.go)}"` : `data-setup-workflow-act="${esc(a.act)}"`;
   const act = (a, cls, i, group) =>
     `<button class="act ${cls}" ${attr(a, i, group)}>${esc(a.label)}</button>`;
-  const allow = setupLandingActions(readCardState(setupWorkflowCardId(w.key)).state);
+  const entry = readCardState(setupWorkflowCardId(w.key));
+  const allow = setupLandingActions(entry.state);
+  // THE effective action. In EMPTY it is whatever the committed model
+  // resolved from the prerequisite chain — which may be a demoted control, a
+  // sibling workflow, or (when this role cannot resolve it) nothing at all.
+  // In every other state the declared primary is already the resolving one.
+  // Read off the MODEL, never re-derived here: re-deriving would read live
+  // module state at paint time and could answer for a tuple the card is not
+  // bound to.
+  const primaryAction = !allow.primary ? null
+    : entry.state === CARD_STATE.EMPTY
+      ? (entry.effective === undefined ? w.primary : entry.effective)
+      : w.primary;
   const secondary = allow.secondary
     ? (w.secondary || []).map((a, i) => act(a, "ghost", i, "secondary")).join("") : "";
   const tertiary = allow.tertiary
     ? (w.tertiary || []).map((a, i) =>
         `<button class="linklike" ${attr(a, i, "tertiary")}>${esc(a.label)}</button>`).join("")
     : "";
-  return `${allow.primary || secondary ? `<div class="swf-actions">
-      ${allow.primary ? act(w.primary, "primary", 0, "primary") : ""}
+  return `${primaryAction || secondary ? `<div class="swf-actions">
+      ${primaryAction ? act(primaryAction, "primary", 0, "primary") : ""}
       ${secondary}
     </div>` : ""}
     ${tertiary ? `<div class="swf-tertiary">${tertiary}</div>` : ""}`;
@@ -4395,6 +4595,14 @@ function wireSetupLandingActions(root) {
   // scoped to the active Program and its parent selects are not.
   root.querySelectorAll("[data-setup-workflow-act]").forEach((b) =>
     b.onclick = () => openSetupWorkflowDrawer(b.dataset.setupWorkflowAct));
+  // An `open` effective action (#365 owner ruling): the missing prerequisite
+  // belongs to a sibling workflow, so this jumps to that landing through the
+  // SAME permission-aware transition render()'s own [data-setup-workflow]
+  // pass uses. Wired here too because a per-card REPAINT rewrites this
+  // container without re-running render()'s wiring — a repainted cross-
+  // workflow action would otherwise be a dead control.
+  root.querySelectorAll("[data-setup-workflow]").forEach((b) =>
+    b.onclick = () => openSetupWorkflowLanding(b.dataset.setupWorkflow || null));
 }
 
 // A single workflow's LANDING: summary first, then exactly one primary
@@ -7758,7 +7966,54 @@ async function render() {
   // Setup branch below for why the payloads alone cannot carry this.
   let svOk = false, playersOk = false;
   try {
-    c.innerHTML = `<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>`;
+    // #365 owner correction — the render LIFECYCLE, not just the card model.
+    // This line used to blank #content unconditionally, and every card was
+    // re-committed only after the awaited reads below. Between the two there
+    // was no Setup DOM at all, so a settled card could never be PAINTED while
+    // its tuple was superseded: STALE was representable in the model and
+    // unreachable on all six Setup landings, which is exactly the state #365
+    // requires them to render.
+    //
+    // So when this render is re-entering a Setup surface that is already
+    // painted, the existing card DOM is RETAINED across the fetches instead
+    // of being blanked, and every card is repainted from its HELD model
+    // first. readCardState() answers STALE for anything bound to a tuple the
+    // operator has left, and setupLandingActions() withdraws that state's
+    // action groups -- so what stands during the fetch window is last-good
+    // data, labelled as earlier, with only its Refresh. When the reads land,
+    // the ordinary full paint below replaces it exactly as before.
+    //
+    // Conditioned on the SAME Setup surface already being on screen: the same
+    // workflow landing, or the same hub index. A NAVIGATION between Setup
+    // surfaces (landing -> index, index -> Records) is not a re-entry and must
+    // not leave the surface being left behind standing while the next one
+    // loads -- that would be a stale destination, not retained data. Every
+    // other view, and a first arrival on Setup, keeps the immediate skeleton
+    // it had.
+    const paintedLanding = c.querySelector("[data-setup-workflow-landing]");
+    const retainSetupCards = view === "setup" && setupView === "hub"
+      && (setupWorkflow
+        ? !!(paintedLanding
+             && paintedLanding.dataset.setupWorkflowLanding === setupWorkflow)
+        : !!c.querySelector(".swf-grid"));
+    if (retainSetupCards) {
+      // Retaining the SURFACE must not retain an overlay that has since been
+      // CLOSED. Blanking used to remove a dismissed drawer/modal as a side
+      // effect, synchronously, before any fetch -- a modal dialog left
+      // standing (still trapping focus) until a refetch resolves would be a
+      // strictly worse regression than the skeleton flash this removes. The
+      // open cases need nothing here: the paint below rebuilds them, exactly
+      // as it did when the surface was blanked first.
+      if (!drawer) {
+        c.querySelectorAll(".drawer-scrim, .drawer").forEach((el) => el.remove());
+      }
+      if (!modal) {
+        c.querySelectorAll(".modal-scrim, .modal").forEach((el) => el.remove());
+      }
+      setupWorkflowsFor().forEach((w) => repaintSetupWorkflowCard(w.key, null));
+    } else {
+      c.innerHTML = `<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>`;
+    }
     ov = await getJSON("/api/demo/overview");
     if (contextRevision !== myRenderContext) return;  // #367: superseded, a fresh render() is already coming
     if (ov && ov.error) throw new Error(ov.error.message);
@@ -10376,11 +10631,42 @@ async function restoreContextDeepLink() {
 // confirmed (setActiveContext()'s second bump, below) -- reseeding them here
 // too would only seed from the STILL-OLD selection this function runs
 // before that POST updates.
+//
+// #365 (owner): the drawer/Import/Ice-Builder trio was not the whole set. The
+// Home/Tasks "Continue setup" CTA (`[data-setup-progress-action]`) and every
+// button inside a Setup landing's `[data-setup-landing-actions]` container are
+// context-scoped mutation entry points too, and neither was withdrawn here --
+// so between the native <select> already showing Program B and the first
+// repaint (three awaits later: /api/context, /api/context/options, and the
+// next render's Setup reads), Program A's "Add Ice"/"Venues"/"Rinks" and A's
+// "Continue setup" stayed enabled and keyboard-activatable, able to open a
+// flow against a tuple changing underneath them.
+//
+// Withdrawn by REMOVAL, for the same reason the drawer's submit control is:
+// disabling can be undone by any repaint that runs before reconciliation,
+// while a removed control cannot receive pointer or keyboard activation
+// however the event was already on its way. The containers themselves
+// (`[data-setup-landing-actions]`, `#sp-card-slot`) are stable and survive,
+// so the later repaint refills them rather than having to recreate structure.
+//
+// Removal alone is not sufficient, and is not the guarantee: any render or
+// per-card repaint in the window would paint the controls straight back. The
+// standing guarantee is contextSwitchIntentPending, which setupLandingActions()
+// and renderSetupProgressCard() both consult -- this DOM pass only closes the
+// gap before the first such paint.
+function withdrawContextScopedActionControls() {
+  document.querySelectorAll(
+    "[data-setup-progress-action],"
+    + "[data-setup-landing-actions] button,"
+    + "[data-setup-card-ask],[data-setup-card-confirm-yes],[data-setup-card-confirm-no]"
+  ).forEach((el) => el.remove());
+}
 function invalidateContextScopedMutations() {
   importState.report = null;
   importState.validatedKey = null;
   importState.committed = null;
   if (iceBuilder) iceBuilder.preview = null;
+  withdrawContextScopedActionControls();
   if (drawer) {
     document.querySelectorAll(".drawer-scrim, .drawer").forEach((el) => el.remove());
     drawer = null; drawerError = ""; drawerValues = {};
@@ -10425,7 +10711,53 @@ let contextSwitchInFlight = false;
 // set from the moment intent is published until a syncContextHash() has
 // reconciled the URL with canonical truth, on EVERY success and failure path.
 let contextHashIntentPending = false;
+// #365, and structurally the SAME defect #369 fixed one layer over: "a
+// context switch has been intended but not yet reconciled". contextHashIntentPending
+// answers it for the URL; this answers it for every context-scoped ACTION
+// CONTROL -- the Home/Tasks setup CTA and the six Setup landings' mutation
+// buttons.
+//
+// Why it cannot be contextSwitchInFlight, and cannot be the cards' own state:
+// contextSwitchInFlight clears the instant the POST resolves, while the
+// repaint that rebinds those controls is still two awaits away
+// (loadContextOptions, then render()'s Setup reads); and a card's CARD_STATE
+// still describes the tuple the operator has LEFT, so no value of it can
+// answer "may this control commit right now". Set SYNCHRONOUSLY at
+// setActiveContext()'s first line -- before any await, before
+// invalidateContextScopedMutations()'s own DOM pass -- and cleared only where
+// a reconciliation has actually happened, which is every path that reaches a
+// syncContextHash() (success AND failure), never on the merely-queued path.
+let contextSwitchIntentPending = false;
 let contextSwitchQueued = null;  // {programId, seasonId, leagueId, mySeq} -- the one pending switch not yet sent, if any
+
+// Repaint the context-scoped cards from their HELD models, at the moment the
+// POST has confirmed and contextOptions.selected has moved (#365 owner
+// correction). readCardState() now answers STALE for every model still bound
+// to the tuple the operator left, so this is what turns retained data from
+// "silently presented as current, with live controls" into "explicitly
+// labelled as earlier data, with only a Refresh". Runs BEFORE the awaited
+// options/progress reads rather than after them, because that window is the
+// whole defect: three awaits during which A's numbers sat under B's heading.
+//
+// Deliberately in-place rather than through render(): render() would rebuild
+// #ctx-select from a contextOptions whose `programs` list has not been
+// refreshed yet, and its own reads are exactly what this is trying not to
+// wait for.
+function repaintContextScopedCardsAsStale() {
+  const slot = document.getElementById("sp-card-slot");
+  if (slot) {
+    // aria-busy stays true: a load for the NEW tuple is coming, and the card
+    // on screen is not the answer to it.
+    slot.setAttribute("aria-busy", "true");
+    slot.innerHTML = renderSetupProgressCard(readCardState(HOME_TASKS_CARD));
+    const refresh = slot.querySelector("[data-setup-progress-retry]");
+    if (refresh) refresh.onclick = () => loadSetupProgressCard({ userInitiated: true });
+  }
+  // `null` identity: this is not a response reconciling its own request, it
+  // is the tuple itself moving, so there is no generation to check -- only
+  // the held model and the new tuple, which readCardState() already compares.
+  setupWorkflowsFor().forEach((w) => repaintSetupWorkflowCard(w.key, null));
+}
 
 // Persist a switcher pick, then reflect it in the hash and re-render.
 // `leagueId` is the third axis (#345/#364), additive like the backend's own
@@ -10438,6 +10770,12 @@ let contextSwitchQueued = null;  // {programId, seasonId, leagueId, mySeq} -- th
 // leaving the previous League to survive a Program/Season-only switch.
 async function setActiveContext(programId, seasonId, leagueId) {
   const mySeq = ++contextSwitchSeq;
+  // FIRST statement, before every await and before the DOM pass below (#365
+  // owner correction): from this instant no Setup landing action group and no
+  // Home/Tasks setup CTA may be painted, whatever state any card is holding
+  // and whatever repaint runs next. Cleared only once a reconciliation has
+  // actually happened -- see the flag's own comment.
+  contextSwitchIntentPending = true;
   // Invalidate SYNCHRONOUSLY, before anything below (#331 review round 8) --
   // see invalidateContextScopedMutations()'s own comment for why.
   // contextRevision bumps here too, not just after success further down:
@@ -10502,6 +10840,13 @@ async function sendContextSwitch(mySeq, programId, seasonId, leagueId) {
     // deep link, and silently POSTs the persisted context back to it.
     syncContextHash();
     contextHashIntentPending = false;
+    // #365 owner correction: "a failed switch may restore the still-current
+    // tuple only through a fresh render." The tuple never moved, so nothing
+    // went stale and nothing may be repainted as actionable in place -- the
+    // withdrawal is released here and the render() below is the ONE thing
+    // that puts the controls back, rebuilt from the tuple that is still
+    // current rather than resurrected from the DOM they were removed from.
+    contextSwitchIntentPending = false;
     render();
     return;
   }
@@ -10522,6 +10867,14 @@ async function sendContextSwitch(mySeq, programId, seasonId, leagueId) {
   // stamp already "current" (from the first bump) and skipping the reseed.
   contextRevision += 1;
   syncContextHash();
+  // The tuple has now genuinely moved, so every held card model is bound to a
+  // context the operator has left. Repaint them as explicitly STALE HERE --
+  // before the awaited options reload below and the Setup reads after it --
+  // rather than leaving A's counts standing under B's heading for the length
+  // of two more round trips (#365 owner correction). The action controls stay
+  // withdrawn throughout: contextSwitchIntentPending is still set, and STALE
+  // withdraws them on its own account too.
+  repaintContextScopedCardsAsStale();
   // Then reconcile the whole option set from a fresh GET so the label/status/
   // read-only badge reflect canonical state at POST time — a Season may have
   // been archived/reopened or newly authorized since options loaded. Rendering
@@ -10533,6 +10886,12 @@ async function sendContextSwitch(mySeq, programId, seasonId, leagueId) {
   if (mySeq !== contextSwitchSeq) return;  // superseded during the refetch
   syncContextHash();
   contextHashIntentPending = false;
+  // Reconciliation has actually happened: canonical options are loaded and the
+  // hash matches them, so a control painted from here on is bound to the tuple
+  // that is genuinely current. Released immediately before the render() that
+  // repaints them, and never on a path that returns early -- a superseded or
+  // queued switch leaves it set for its successor to clear.
+  contextSwitchIntentPending = false;
   toast = "";
   render();
 }
@@ -10937,6 +11296,15 @@ function resetTransientUiState() {
     syncContextHash();
     contextHashIntentPending = false;
   }
+  // ...and the identical reasoning for the ACTION-CONTROL withdrawal (#365).
+  // The switch this flag was set for has just been orphaned: its POST's own
+  // completion will hit the `mySeq !== contextSwitchSeq` guard above and
+  // return without reaching either clearing point, so leaving the flag set
+  // would withdraw the NEXT identity's Setup landing actions and Home CTA
+  // permanently. Released here, where the departing identity's whole
+  // transient state is; the render() that follows setUser() is what paints
+  // the new identity's own controls.
+  contextSwitchIntentPending = false;
 }
 function setUser(user) {
   const prevId = currentUser ? currentUser.username : null;

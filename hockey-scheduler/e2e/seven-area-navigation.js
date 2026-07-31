@@ -675,6 +675,23 @@ async function run(browser, viewport) {
       { team_id: team.id, name: `Nav Player ${suffix}`, position: "forward" });
     const official = await mkFixture("/api/v2/setup/official",
       { name: `Nav Official ${suffix}` });
+    // A Venue and a Rink, granted to this Season (#365): the Facilities leg
+    // below asserts that the landing's primary action is "Add Ice" and that it
+    // opens the Ice Availability Builder. "Add Ice" is only the action that
+    // resolves this landing's state once a rink exists to hang ice on -- on an
+    // installation with no venue at all the landing is EMPTY and its single
+    // action is the one that CAN resolve that ("Add venue"), per #365's
+    // dead-end ruling. Seeding the real prerequisite is what makes the "Add
+    // Ice" assertion below a statement about the builder rather than about an
+    // empty install.
+    const org = await mkFixture("/api/v2/setup/organization",
+      { name: `Nav Facility Org ${suffix}` });
+    const venue = await mkFixture("/api/v2/setup/venue",
+      { name: `Nav Venue ${suffix}`, organization_id: org.id });
+    await mkFixture("/api/v2/setup/rink",
+      { venue_id: venue.id, name: `Nav Rink ${suffix}` });
+    await mkFixture(`/api/v2/setup/seasons/${season.id}/venue-access`,
+      { venue_id: venue.id });
 
     const PW = "nav-area-pw";
     const mk = (r) => `nav_${r}_${suffix}`;
