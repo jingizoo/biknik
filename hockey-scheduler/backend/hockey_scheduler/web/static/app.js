@@ -12167,6 +12167,92 @@ function repaintContextScopedCardsAsStale() {
   setupWorkflowsFor().forEach((w) => repaintSetupWorkflowCard(w.key, null));
 }
 
+// ============ THE IDENTITY BOUNDARY'S OWN DOM PASS (#365 round 8) ==========
+// The TUPLE boundary above has a synchronous repaint. The IDENTITY boundary had
+// none, and that was this round's defect. Verbatim from the review:
+//
+//   "setUser() adopts the new principal BEFORE those awaits.
+//   resetTransientUiState() destroys/quarantines the JS stores and clears the
+//   toast, but it does not synchronously repaint or blank the already-rendered
+//   card DOM. With /api/context/options delayed, the new session can remain on
+//   the departing principal's painted PENDING card and its permission-scoped
+//   counts until the later render replaces it."
+//
+// Round 7 fixed the STORES and only the stores: cardStates destroyed, the
+// ledger's held models overwritten with foreignCardWriteModel(), the live
+// region emptied. Every one of those surfaces was ALREADY PAINTED, so what the
+// arriving principal actually looked at did not change at all. A clean model
+// standing behind a stale painted card is the same disclosure by the same
+// route -- a rendered value standing in for an asserted one, inverted.
+//
+// IT CANNOT FETCH, and it cannot go through render(). It runs inside
+// resetTransientUiState(), which setUser() calls BEFORE it assigns
+// `currentUser` -- and everything after that point is an await (the options
+// load, the deep-link reconciliation, and only then a render). Anything
+// asynchronous here would sit inside the very window it exists to close.
+//
+// SO IT BLANKS RATHER THAN REPAINTS. Repainting would mean deriving a view for
+// a principal nobody has identified yet from data that belongs to the one
+// leaving -- and by the time this runs there is nothing left to derive from
+// anyway. Empty discloses nothing, and it is short-lived: the render() that
+// follows setUser() paints the arriving principal's own surfaces from their own
+// reads, under their own permissions.
+//
+// WHAT IS BLANKED, and why each one is context- or permission-scoped:
+//   * every context-scoped MUTATION CONTROL, by the same REMOVAL the tuple
+//     boundary uses (withdrawContextScopedActionControls) -- disabling can be
+//     undone by any repaint, a removed control cannot be activated however the
+//     event was already on its way.
+//   * the Home/Tasks card body (#sp-card-slot) -- workflow rows and completion
+//     counts read under the DEPARTING principal's permissions.
+//   * every Setup card slot ([data-setup-card-slot] -- the hub grid AND the
+//     open landing, which is why this is a querySelectorAll and not one lookup)
+//     -- counts, the blocker sentence, the server's error text, the departing
+//     operator's typed reason inside an open confirmation, and the busy copy of
+//     their own unresolved write.
+//   * every landing ACTION container, emptied WHOLE rather than only of its
+//     buttons: the withdrawn-action advice beside them is prose about the
+//     departing principal's blocked state.
+//   * every hub STATUS CHIP -- "Done"/"To do" is a permission-scoped assertion
+//     about this Program made by the previous reader, and it lives in the card
+//     header, outside the slot blanked above.
+//   * the hub ROLL-UP / NEXT-TASK line -- the same counts, one derivation up.
+//   * KEYBOARD FOCUS, when it is standing inside any of the above. Blanking
+//     destroys the focused node, and "wherever the removal happened to drop it"
+//     is not a place to hand a new principal: it is moved out deliberately,
+//     before the removal, so the arriving principal starts from the document
+//     rather than from inside a card that no longer exists.
+//
+// aria-busy stays TRUE on both card wrappers: this principal has not read these
+// cards yet and a load for them is what comes next, so "idle" would be a lie
+// told to assistive technology for the length of the window.
+function blankContextScopedCardSurfaces() {
+  withdrawContextScopedActionControls();
+  const scoped = "#sp-card-slot,[data-setup-card-slot],[data-setup-landing-actions],"
+    + "[data-setup-hub-progress-slot],[data-setup-workflow-card]";
+  const active = document.activeElement;
+  if (active && active !== document.body && active.closest
+      && active.closest(scoped)) {
+    active.blur();
+  }
+  const homeSlot = document.getElementById("sp-card-slot");
+  if (homeSlot) {
+    homeSlot.setAttribute("aria-busy", "true");
+    homeSlot.innerHTML = "";
+  }
+  document.querySelectorAll("[data-setup-card-slot]").forEach((slot) => {
+    slot.setAttribute("aria-busy", "true");
+    slot.innerHTML = "";
+  });
+  document.querySelectorAll("[data-setup-landing-actions]")
+    .forEach((box) => { box.innerHTML = ""; });
+  document.querySelectorAll("[data-setup-hub-progress-slot]")
+    .forEach((box) => { box.innerHTML = ""; });
+  document.querySelectorAll("[data-setup-workflow-card] .swf-status,"
+    + "[data-setup-workflow-card] .swf-optional")
+    .forEach((chip) => chip.remove());
+}
+
 // Persist a switcher pick, then reflect it in the hash and re-render.
 // `leagueId` is the third axis (#345/#364), additive like the backend's own
 // resolve_with_league/set_with_league -- every existing two-argument call
@@ -12711,6 +12797,16 @@ function resetTransientUiState() {
     identityToastRoot.classList.remove("error");
   }
   updateToast();
+  // (c3) THE ALREADY-PAINTED CARD SURFACES (#365 round 8). (b) and (c) above
+  //     destroy the STORES; the live region got its own DOM pass in (c2)
+  //     precisely because "hidden is not gone". Every OTHER context-scoped
+  //     surface was left exactly as the departing principal painted it, and a
+  //     painted card is what the operator actually sees -- the review's
+  //     "post-auth/pre-render privacy window". Blanked SYNCHRONOUSLY here,
+  //     before setUser() assigns `currentUser` and therefore before the
+  //     arriving principal is exposed at all, because everything after this
+  //     point is an await. See blankContextScopedCardSurfaces().
+  blankContextScopedCardSurfaces();
   // (d) cardGenerations — DELIBERATELY KEPT, and the reasoning is the reason
   //     the epoch had to exist at all. The counters hold no operator text:
   //     they are monotone integers, so there is nothing here to disclose.

@@ -266,6 +266,34 @@
 //           also restore controls/state that the arriving role ... may not be
 //           authorized to exercise" is what this sub-leg forbids.
 //
+//   (8) THE POST-AUTH / PRE-RENDER WINDOW (round 8). Everything in leg 7 is
+//       observed AFTER the arriving principal's own render, because both of its
+//       arrival helpers await the transition — and the transition's own last
+//       act is that render. Production adopts the new principal at setUser(),
+//       which is THREE awaits earlier, and round 7 cleaned only the STORES:
+//       the already-PAINTED card DOM was left exactly as the departing
+//       principal drew it. So /api/context/options is held open, the transition
+//       is STARTED and not awaited, and the page is sampled at the one instant
+//       `currentUser` is the arriving principal and nothing of theirs has been
+//       rendered. Nothing of the departing principal's may remain on any
+//       surface: reason, error text, busy copy, counts, status chips, roll-up /
+//       next-task line, controls, live region (markup included) or focus.
+//
+//      (8a) the LANDING with a 503'd confirmation — typed reason, the server's
+//           own message, a sticky error toast, focus on the reason field —
+//           through the in-app signIn().
+//      (8b) the LANDING with an UNRESOLVED write — busy copy, aria-busy, focus
+//           on the pending line, the busy sentence spoken — across a REAL
+//           sign-out and a REAL login-form sign-in.
+//      (8c) the same landing, actionable, arriving as a LOWER-PRIVILEGE Arena
+//           Manager: League-Admin-scoped counts and a MANAGE_SETUP control,
+//           neither of which that role may stand on for even one round trip.
+//      (8d) the SETUP HUB — six cards' counts, their Done/To-do chips and the
+//           roll-up/next-task line derived from all of them. None of those
+//           exist on a landing.
+//      (8e) the HOME/TASKS card and its "Continue setup" CTA, across the real
+//           sign-out/sign-in path.
+//
 // TECHNIQUE
 // ---------
 //   * Delayed responses use this repo's established idiom: capture the REAL
@@ -330,6 +358,56 @@ const SECOND_ADMIN = "second_admin";
 const SECOND_ADMIN_PW = "second-admin-pw";
 const ARENA_USER = "arena";
 const ARENA_PW = "demo";
+
+// ============ THE ONE RECONCILIATION ROUND TRIP, UNDER TEST CONTROL ========
+// /api/context/options is the second round trip of BOTH transitions this file
+// races. A context switch awaits it between moving `contextOptions.selected`
+// and releasing `contextSwitchIntentPending`; an in-app sign-in awaits it
+// between adopting the new principal and rendering anything for them. Both
+// windows were previously left to whatever the loopback happened to cost —
+// which is why the phone leg "passes or fails by timing" and why the
+// post-auth/pre-render window could not be sampled at all.
+//
+// So it is intercepted once per page and made CONTROLLABLE. Neither knob
+// changes a single response byte: `optionsDelayMs` only makes the window WIDE
+// enough that a wait which returns early is deterministically caught inside it,
+// and `optionsGate` holds it open until the test releases it, which is what
+// makes the identity window observable rather than raced. A build that closes
+// the window correctly is unaffected by either.
+const CONTEXT_OPTIONS_RE = /\/api\/context\/options(\?|$)/;
+// Wide enough that every step between an early-returning switch helper and the
+// assertion that follows it (a nav click, a settle poll, a card read) fits
+// comfortably inside the reconciliation window, on either viewport and on a
+// loaded machine. This is what turns "the old helper sometimes loses the race"
+// into "the old helper always loses it".
+const SWITCH_OPTIONS_DELAY_MS = 1500;
+let optionsDelayMs = 0;
+let optionsGate = null;
+// How many /api/context/options requests are sitting on the gate RIGHT NOW.
+// Leg 8 asserts this is non-zero at its sample point, which is what proves the
+// sample was taken INSIDE the post-auth/pre-render window rather than after the
+// render that closes it.
+let optionsHeldNow = 0;
+async function installContextOptionsControl(page) {
+  await page.route(CONTEXT_OPTIONS_RE, async (route) => {
+    const delay = optionsDelayMs;
+    const gate = optionsGate;
+    if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+    if (gate) {
+      optionsHeldNow += 1;
+      try { await gate; } finally { optionsHeldNow -= 1; }
+    }
+    try { await route.continue(); } catch (e) { /* page closed mid-hold */ }
+  });
+}
+// Hold EVERY subsequent /api/context/options open until the returned release()
+// is called. Returns the release function, so a leg can open the window, look
+// inside it, and close it again.
+function holdContextOptions() {
+  let release = () => {};
+  optionsGate = new Promise((resolve) => { release = resolve; });
+  return () => { optionsGate = null; release(); };
+}
 
 function waitForServer(url, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
@@ -606,25 +684,130 @@ async function openConfirmWithReason(page, step, reason) {
 // never through a raw /api/context POST, which bypasses setActiveContext()'s
 // whole invalidate/withdraw/re-render sequence and would prove nothing about
 // what a switch does to a card's identity.
+//
+// ===== IT WAITS FOR COMPLETED RECONCILIATION, NOT THE POST ECHO (round 8) ====
+// The previous version of this helper returned the instant
+// `contextOptions.selected.season_id` changed, and that is an EARLY RETURN, not
+// a settle. Verbatim from the review:
+//
+//   "The race is in the journey: switchContext() returns as soon as
+//   contextOptions.selected.season_id changes. Production changes `selected`
+//   immediately after the context POST, then awaits /api/context/options; only
+//   after that does it clear contextSwitchIntentPending and render the
+//   actionable surface. settled() checks only card state/Season and can
+//   therefore sample a settled model while the action groups are still
+//   intentionally withdrawn."
+//
+// That is a TEST defect and it is fixed here, not by relaxing what leg 6c
+// asserts. While `contextSwitchIntentPending` is set, setupLandingActions()
+// withdraws EVERY action group on purpose — so a landing sampled inside that
+// window has no controls for a reason that has nothing to do with the card, and
+// "the card came back non-actionable" is then a statement about the journey's
+// timing rather than about the product. On a fast loopback the reconciliation
+// usually won the race and the leg passed; on a slower one it lost.
+//
+// THREE CONJUNCTS, all necessary:
+//
+//   (1) THE CONFIRMED TUPLE — program AND season. The old wait read the season
+//       alone, so a switch that moved only the Program axis was not waited for
+//       at all.
+//   (2) contextSwitchIntentPending === false. This is the withdrawal itself.
+//       Until it clears, no landing action group and no Home/Tasks CTA may be
+//       painted whatever any card holds, so nothing about "is this card
+//       actionable" can be honestly sampled before it.
+//   (3) A REPAINT THAT HAPPENED AFTER (2). Observed, never timed, and never
+//       satisfiable by the earlier repaint: sendContextSwitch() also repaints
+//       the context-scoped cards as STALE *before* the awaited options reload,
+//       while the withdrawal is still in force. So the observer records a
+//       #content mutation ONLY when it is delivered at a moment when the
+//       withdrawal is already released and the confirmed tuple is already the
+//       requested one — which is true of render()'s own paint at the end of
+//       sendContextSwitch() and of nothing before it.
+//
+// The observer is armed BEFORE the change event, so the paint cannot land
+// between two polls of the wait.
+//
+// THE WINDOW-WIDENING IS HARNESS, NOT THE FIX, and it lives OUTSIDE the wait
+// deliberately. /api/context/options is slowed for the duration of the switch
+// (SWITCH_OPTIONS_DELAY_MS) so that a wait which returns on the POST echo is
+// caught inside the withdrawal window every time instead of once in a while —
+// the reviewer's own requirement that the phone proof stop "passing or failing
+// by timing". Keeping it in switchContext() rather than in
+// waitForContextReconciled() is what makes the falsifiability mutation for this
+// round a single honest edit: reverting the WAIT to its early-return form
+// leaves the window exactly as wide, so the resulting failure is deterministic
+// rather than a race that has merely been re-introduced.
 async function switchContext(page, programId, seasonId, step) {
-  const ok = await page.evaluate(([p, s]) => {
-    const sel = document.getElementById("ctx-select");
-    if (!sel) return "no #ctx-select";
-    const want = `${p}|${s}`;
-    if (!Array.from(sel.options).some((o) => o.value === want)) {
-      return `#ctx-select offers no option "${want}": `
-        + JSON.stringify(Array.from(sel.options).map((o) => o.value));
-    }
-    sel.value = want;
-    sel.dispatchEvent(new Event("change", { bubbles: true }));
-    return true;
-  }, [programId, seasonId]);
-  if (ok !== true) fail(`[${step}] ${ok}`);
-  await page.waitForFunction((s) => {
+  optionsDelayMs = SWITCH_OPTIONS_DELAY_MS;
+  try {
+    await page.evaluate(([p, s]) => {
+      if (window.__wiSwitchObs) window.__wiSwitchObs.disconnect();
+      window.__wiSwitchPainted = false;
+      const c = document.getElementById("content");
+      window.__wiSwitchObs = new MutationObserver(() => {
+        if (contextSwitchIntentPending) return;
+        const cur = (contextOptions && contextOptions.selected) || {};
+        if (cur.program_id !== p || cur.season_id !== s) return;
+        window.__wiSwitchPainted = true;
+      });
+      // DIRECT CHILDREN ONLY (`subtree: false`), and that is the whole point.
+      // sendContextSwitch()'s own repaintContextScopedCardsAsStale(), and
+      // render()'s retain-the-cards pass at its top, both rewrite card slots —
+      // DESCENDANTS of #content — from HELD models, before any of the new
+      // tuple's reads have landed. A subtree observer is satisfied by those and
+      // returns while the landing's action groups are still painted from a
+      // STALE model, which is the same early return one layer down. Only
+      // render()'s final `c.innerHTML = …` replaces #content's own children,
+      // and by then commitSetupWorkflowCards() has already committed every
+      // card from the new tuple's fresh reads.
+      if (c) window.__wiSwitchObs.observe(c, { childList: true, subtree: false });
+    }, [programId, seasonId]);
+
+    const ok = await page.evaluate(([p, s]) => {
+      const sel = document.getElementById("ctx-select");
+      if (!sel) return "no #ctx-select";
+      const want = `${p}|${s}`;
+      if (!Array.from(sel.options).some((o) => o.value === want)) {
+        return `#ctx-select offers no option "${want}": `
+          + JSON.stringify(Array.from(sel.options).map((o) => o.value));
+      }
+      sel.value = want;
+      sel.dispatchEvent(new Event("change", { bubbles: true }));
+      return true;
+    }, [programId, seasonId]);
+    if (ok !== true) fail(`[${step}] ${ok}`);
+
+    await waitForContextReconciled(page, programId, seasonId, step);
+  } finally {
+    optionsDelayMs = 0;
+    await page.evaluate(() => {
+      if (window.__wiSwitchObs) window.__wiSwitchObs.disconnect();
+      window.__wiSwitchObs = null;
+    }).catch(() => {});
+  }
+}
+
+// THE WAIT ITSELF — the whole of the helper's contract, in one function, so
+// that reverting it to the early-return form the review describes is a single
+// unambiguous edit and nothing else about the journey changes with it.
+async function waitForContextReconciled(page, programId, seasonId, step) {
+  await page.waitForFunction(([p, s]) => {
+    if (contextSwitchIntentPending) return false;
     const cur = (contextOptions && contextOptions.selected) || {};
-    return cur.season_id === s;
-  }, seasonId, { timeout: 15000 })
-    .catch(() => fail(`[${step}] the context never settled on season ${seasonId}`));
+    if (cur.program_id !== p || cur.season_id !== s) return false;
+    return window.__wiSwitchPainted === true;
+  }, [programId, seasonId], { timeout: 30000 })
+    .catch(async () => {
+      const why = await page.evaluate(() => ({
+        intentPending: !!contextSwitchIntentPending,
+        selected: (contextOptions && contextOptions.selected) || null,
+        painted: !!window.__wiSwitchPainted,
+      })).catch(() => null);
+      fail(`[${step}] the context switch to ${programId}/${seasonId} never `
+        + `RECONCILED — the confirmed tuple, the release of the action-control `
+        + `withdrawal and a repaint after it are all required before anything `
+        + `on this page can be sampled: ${JSON.stringify(why)}`);
+    });
 }
 
 // Re-enter the Facilities destination through the REAL navigation control —
@@ -769,6 +952,487 @@ async function arrivePrincipal(page, arrive, step) {
     return signOutThenIn(page, arrive.username, arrive.password, step);
   }
   return signInInApp(page, arrive.username, arrive.password, step);
+}
+
+// =============== LEG 8 HELPERS: THE PRE-RENDER WINDOW (#365 round 8) ========
+// Both helpers above AWAIT the transition, and that is exactly why neither can
+// see this round's defect. Verbatim from the review:
+//
+//   "signInInApp() does `await page.evaluate(() => signIn(...))`; signIn()
+//   resolves only after setUser(), the awaited context-options load/deep-link
+//   reconciliation, and render(). The test therefore begins its privacy
+//   assertions only after the new principal's full render. ... The current
+//   journey cannot fail on that window because it awaits the function that
+//   closes it."
+//
+// So leg 8 STARTS the same two transitions and does not await them. Both
+// starters return the moment the app has been asked to sign in; the window is
+// then held open by the intercepted /api/context/options, and the leg samples
+// the page at the one instant that matters — when `currentUser` has become the
+// arriving principal and not one line of rendering has run for them.
+
+// PATH (a), NOT AWAITED. The signIn() promise is parked on `window` so its
+// completion can be waited for later, after the window has been sampled.
+async function startSignInInApp(page, username, password) {
+  await page.evaluate(([u, p]) => {
+    window.__wiSignInDone = false;
+    window.__wiSignIn = Promise.resolve(signIn(u, p))
+      .then((r) => { window.__wiSignInDone = true; return r; },
+            (e) => { window.__wiSignInDone = true; throw e; });
+  }, [username, password]);
+}
+
+// PATH (b), NOT AWAITED PAST THE SIGN-IN. The sign-out half IS awaited: it is
+// its own transition with its own window, and the one under test here is the
+// arriving principal's. The login form's own handler calls signIn() without
+// awaiting it, so the click returns inside the window exactly as a real
+// operator's press does.
+async function startSignOutThenIn(page, username, password, step) {
+  const pressed = await page.evaluate(() => {
+    const btn = document.getElementById("signout-btn");
+    if (!btn) return false;
+    btn.click();
+    return true;
+  });
+  if (!pressed) fail(`[${step}] there is no real sign-out control to press`);
+  await page.waitForFunction(() => !currentUser, null, { timeout: 15000 })
+    .catch(() => fail(`[${step}] the real sign-out never cleared the session`));
+  await page.waitForSelector("#login-screen:not([hidden])", { timeout: 15000 })
+    .catch(() => fail(`[${step}] the sign-in screen never appeared`));
+  await page.fill("#login-user", username);
+  await page.fill("#login-pass", password);
+  await page.evaluate(() => { window.__wiSignInDone = false; });
+  await page.click("#login-form button[type=submit]");
+}
+
+async function startArrival(page, arrive, step) {
+  if (arrive.via === "sign-out") {
+    return startSignOutThenIn(page, arrive.username, arrive.password, step);
+  }
+  return startSignInInApp(page, arrive.username, arrive.password, step);
+}
+
+// EVERY CONTEXT-SCOPED THING THAT IS CURRENTLY PAINTED, as one record.
+//
+// Read at two moments and held to opposite expectations. BEFORE the identity
+// change it must be NON-EMPTY on the axes the sub-leg arranged — otherwise the
+// window assertion is vacuous and would pass on a page that never painted
+// anything. AT THE INSTANT `currentUser` becomes the arriving principal it must
+// be empty on every axis the review names: "no A-only reason, error, busy copy,
+// counts, controls, toast, live-region text, or focus target".
+//
+// Deliberately reads the DOM, not the stores. The stores were round 7's subject
+// and they are already clean; this round's defect is that a clean model was
+// standing behind a stale PAINTED card, and the painted card is what the
+// operator sees.
+async function paintedContextScopedSurface(page) {
+  return page.evaluate(() => {
+    const text = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
+    const all = (sel) => Array.from(document.querySelectorAll(sel));
+    const scoped = "#sp-card-slot,[data-setup-card-slot],[data-setup-landing-actions],"
+      + "[data-setup-hub-progress-slot],[data-setup-workflow-card]";
+    const active = document.activeElement;
+    const root = document.getElementById("toast-root");
+    return {
+      // (1) CONTROLS — every context-scoped mutation entry point there is,
+      //     wherever it is painted (card body, landing action group, Home CTA).
+      controls: all("[data-setup-progress-action],[data-setup-landing-actions] button,"
+        + "[data-setup-card-slot] button,#sp-card-slot button,[data-setup-card-ask],"
+        + "[data-setup-card-confirm-yes],[data-setup-card-confirm-no],"
+        + "[data-setup-card-retry],[data-setup-progress-retry]")
+        .map((b) => text(b) || b.tagName),
+      // (2) COUNTS — the per-card stat chips and the hub roll-up sentence they
+      //     are aggregated into. Both were read under the DEPARTING principal's
+      //     permissions.
+      counts: all(".swf-stat").map(text),
+      rollup: all("[data-setup-hub-progress]").map(text),
+      // (3) STATUS CHIPS — "Done"/"To do" is a permission-scoped assertion
+      //     about this Program, and it lives in the card HEADER, outside the
+      //     card slot.
+      chips: all("[data-setup-workflow-card] .swf-status,"
+        + "[data-setup-workflow-card] .swf-optional").map(text),
+      // (4) CARD COPY — the busy line, the blocker sentence, the server's error
+      //     message, the empty/done prose.
+      cardText: all("[data-setup-card-slot],#sp-card-slot").map(text).filter(Boolean),
+      actionsText: all("[data-setup-landing-actions]").map(text).filter(Boolean),
+      // (5) FIELD VALUES — an <input>'s typed value appears in no textContent
+      //     at all, and the operator's reason is exactly that.
+      fieldValues: all("[data-setup-card-slot] input,[data-setup-card-slot] textarea,"
+        + "#sp-card-slot input,#sp-card-slot textarea")
+        .map((el) => el.value).filter(Boolean),
+      // (6) THE ONE SITEWIDE LIVE REGION, markup included — hidden is not gone.
+      liveRegion: root ? text(root) : "",
+      liveRegionHtml: root ? root.innerHTML.replace(/\s+/g, " ").trim() : "",
+      // (7) FOCUS — a focus target left standing inside a card that belongs to
+      //     somebody else is the last of the surfaces the review enumerates.
+      focusInScoped: !!(active && active !== document.body && active.closest
+        && active.closest(scoped)),
+      focusDesc: active
+        ? `${active.tagName}[${active.className || ""}]`
+          + `[${(active.getAttribute && active.getAttribute("data-setup-card-pending")) || ""}]`
+        : "null",
+      // aria-busy must not report idle: this principal has read nothing yet and
+      // a load for them is what comes next.
+      busy: all("[data-setup-card-slot],#sp-card-slot")
+        .map((s) => s.getAttribute("aria-busy")),
+      // STRUCTURE, so "nothing painted" can never be true for the wrong reason:
+      // a page that simply lost its Setup DOM would satisfy every emptiness
+      // check above without withdrawing anything.
+      slots: all("[data-setup-card-slot]").length,
+      actionBoxes: all("[data-setup-landing-actions]").length,
+      landing: !!document.querySelector("[data-setup-workflow-landing]"),
+      homeSlot: !!document.getElementById("sp-card-slot"),
+      progressSlots: all("[data-setup-hub-progress-slot]").length,
+    };
+  });
+}
+
+// The structure each surface must still HAVE, before and after the boundary.
+// Blanking is an in-place withdrawal: the containers the arriving principal's
+// own render refills have to survive it, and every "nothing painted" assertion
+// has to be read against a surface that is genuinely there.
+function assertSurfaceStructure(painted, surface, L, step, when) {
+  const missing = [];
+  if (surface === "landing") {
+    if (!painted.landing) missing.push("the Facilities landing");
+    if (!painted.slots) missing.push("its card slot");
+    if (!painted.actionBoxes) missing.push("its action container");
+  } else if (surface === "hub") {
+    if (!painted.slots) missing.push("the hub's card slots");
+    if (!painted.progressSlots) missing.push("the hub roll-up container");
+  } else if (!painted.homeSlot) {
+    missing.push("the Home/Tasks card slot (#sp-card-slot)");
+  }
+  if (missing.length) {
+    fail(`[${L}/${step}/${when}] ${missing.join(", ")} is not on screen `
+      + `(${JSON.stringify({ landing: painted.landing, slots: painted.slots,
+        actionBoxes: painted.actionBoxes, homeSlot: painted.homeSlot,
+        progressSlots: painted.progressSlots })}), so every "nothing of the `
+      + `departing principal's remains" assertion would be true for the wrong `
+      + `reason`);
+  }
+}
+
+// The three CONTEXT-SCOPED SURFACES the correction names — "the Setup landing,
+// hub cards, the Home/Tasks card, and any roll-up/next-task line" — opened
+// through their own real navigation and waited until the card that owns them
+// has actually settled. They are not interchangeable: the roll-up/next-task
+// line and the per-card status chips exist ONLY on the hub, and the Home/Tasks
+// card and its "Continue setup" CTA exist only on the dashboard, so a leg that
+// only ever looked at a landing could never see either of them left painted.
+async function openScopedSurface(page, surface, step) {
+  if (surface === "landing") {
+    await openFacilitiesNoSettle(page, step);
+    await settled(page, step);
+    return;
+  }
+  if (surface === "hub") {
+    await page.click('.tab[data-tab="setup"]:not([data-setup-workflow-nav])');
+    await page.waitForSelector(".swf-grid", { timeout: 15000 })
+      .catch(() => fail(`[${step}] the Setup hub grid never rendered`));
+    await settled(page, step);
+    // The roll-up is derived from EVERY card, so it is only trustworthy once
+    // every card has settled — not just Facilities.
+    await page.waitForSelector("[data-setup-hub-progress]", { timeout: 15000 })
+      .catch(() => fail(`[${step}] the hub roll-up / next-task line never `
+        + `rendered, so there would be nothing for the boundary to withdraw`));
+    return;
+  }
+  await page.click('.tab[data-tab="dashboard"]');
+  await page.waitForSelector("#sp-card-slot", { timeout: 15000 })
+    .catch(() => fail(`[${step}] the Home/Tasks setup-progress card never rendered`));
+  await page.waitForFunction(() => {
+    const e = readCardState("home/setup-progress");
+    return e.state !== "loading" && e.state !== "stale";
+  }, null, { timeout: 15000 })
+    .catch(() => fail(`[${step}] the Home/Tasks card never settled`));
+  await page.waitForSelector("[data-setup-progress-action]", { timeout: 15000 })
+    .catch(() => fail(`[${step}] the Home/Tasks card offers no "Continue setup" `
+      + `CTA, so there would be no context-scoped control for the boundary to `
+      + `withdraw`));
+}
+
+// ONE sub-leg of leg 8, start to finish. Same parameterisation discipline as
+// crossPrincipalRelease(): what differs between sub-legs is an argument, what
+// must be identical is written once.
+//
+// `ctx`:
+//   sub      the label used in every failure message ("8a" …)
+//   season   the archived-Season fixture this sub-leg owns
+//   reason   the LITERAL the departing operator types
+//   arrive   { username, password, via: "in-app" | "sign-out" }
+//   surface  which context-scoped surface is left painted: "landing", "hub"
+//            (cards + status chips + roll-up/next-task line) or "home" (the
+//            Home/Tasks setup-progress card and its "Continue setup" CTA)
+//   shape    what state the DEPARTING principal leaves that surface in:
+//              "actionable" — settled and offering its real control
+//              "failed"     — a 503'd confirmation carrying the typed reason,
+//                             the server's own message and an error toast
+//              "pending"    — an unresolved write: busy copy, aria-busy, focus
+//                             on the pending line, the busy sentence spoken
+async function preRenderIdentityWindow(ctx) {
+  const { page, base, L, sub, arrive, shape } = ctx;
+  const surface = ctx.surface || "landing";
+  const step = `${L}/${sub}`;
+
+  await persistContextFor(page, arrive, ctx.program, ctx.season.season, step);
+  await reenter(page, base);
+  // The confirmation-bearing shapes are opened from the LANDING's own primary
+  // control, so they always start there whatever surface is left painted.
+  await openScopedSurface(page, shape === "actionable" ? surface : "landing", step);
+  await armAnnouncements(page);
+
+  if (surface !== "home") {
+    const opening = await readCard(page);
+    if (opening.effective !== "Reopen this season") {
+      fail(`[${step}] the fixture does not offer the reopen path (effective `
+        + `${JSON.stringify(opening.effective)}, state "${opening.state}") — there `
+        + `is no context-scoped surface to leave painted`);
+    }
+  }
+
+  // The A-ONLY LITERALS this sub-leg puts into the client. Each is either
+  // something the operator typed or something the server said to them; none is
+  // declared copy the arriving principal could legitimately be shown.
+  //
+  // `paintedLiterals` is the subset that must be VISIBLE before the boundary,
+  // and it is deliberately smaller. A PENDING card paints only its busy line —
+  // the operator's reason is held in the ledger, not on screen — so requiring
+  // the reason to be painted there would be requiring the very disclosure this
+  // journey forbids. It is still SEARCHED for afterwards: round 7 quarantines
+  // it, and an identity boundary that repainted a confirmation out of the held
+  // model would put it on screen for the first time at exactly the wrong
+  // moment.
+  const literals = [];
+  const paintedLiterals = [];
+  let heldHandler = null;
+  let releaseHeld = () => {};
+
+  if (shape === "failed" || shape === "pending") {
+    await openConfirmWithReason(page, step, ctx.reason);
+    literals.push(ctx.reason);
+    if (shape === "failed") paintedLiterals.push(ctx.reason);
+  }
+  if (shape === "failed") {
+    heldHandler = async (route) => {
+      ctx.allowResourceError();
+      await route.fulfill({ status: 503, contentType: "application/json",
+        body: JSON.stringify({ error: { code: "server_unavailable",
+          message: SERVER_503_MESSAGE } }) });
+    };
+    await page.route(REOPEN_RE, heldHandler);
+    await page.click("[data-setup-card-confirm-yes]");
+    await page.waitForFunction(() =>
+      readCardState("setup/facilities").state === "confirm", null, { timeout: 15000 })
+      .catch(() => fail(`[${step}] the failed reopen never restored the `
+        + `confirmation carrying the operator's reason and the server's message`));
+    await page.unroute(REOPEN_RE, heldHandler);
+    heldHandler = null;
+    literals.push(SERVER_503_MESSAGE);
+    paintedLiterals.push(SERVER_503_MESSAGE);
+  }
+  if (shape === "pending") {
+    const gate = new Promise((resolve) => { releaseHeld = resolve; });
+    let markHeld = () => {};
+    const held = new Promise((resolve) => { markHeld = resolve; });
+    heldHandler = async (route) => {
+      markHeld();
+      await gate;
+      ctx.allowResourceError();
+      await route.fulfill({ status: 503, contentType: "application/json",
+        body: JSON.stringify({ error: { code: "server_unavailable",
+          message: SERVER_503_MESSAGE } }) });
+    };
+    await page.route(REOPEN_RE, heldHandler);
+    await page.click("[data-setup-card-confirm-yes]");
+    await held;
+    await page.waitForTimeout(400);
+    literals.push(BUSY_TEXT);
+    paintedLiterals.push(BUSY_TEXT);
+  }
+
+  // ---- NON-VACUITY: the surface really IS painted with A's own material ----
+  const painted = await paintedContextScopedSurface(page);
+  assertSurfaceStructure(painted, surface, L, sub, "painted");
+  if (!painted.cardText.length) {
+    fail(`[${step}/painted] the departing principal's card body is empty before `
+      + `the identity change, so "nothing of theirs remains" would be vacuous`);
+  }
+  // Two surfaces legitimately have no mutation control of their own to
+  // withdraw, and requiring one would be asserting a control that should not
+  // exist. The SETUP HUB carries only navigation ("Open …", a
+  // [data-setup-workflow] transition) — its mutation actions live one level in,
+  // on each landing — so its evidence is counts, status chips and the roll-up.
+  // And a PENDING card withdraws every control on both surfaces by design,
+  // which is exactly what leg 1 asserts; its evidence is the busy copy, the
+  // focus target and the spoken sentence.
+  const expectPaintedControls = shape !== "pending" && surface !== "hub";
+  if (expectPaintedControls && !painted.controls.length) {
+    fail(`[${step}/painted] the departing principal's surface offers no control `
+      + `to withdraw: ${JSON.stringify(painted)}`);
+  }
+  if (shape === "pending" && !painted.cardText.join(" ").includes(BUSY_TEXT)) {
+    fail(`[${step}/painted] the departing principal's own busy copy is not `
+      + `painted in the card: ${JSON.stringify(painted.cardText)}`);
+  }
+  if (surface !== "home" && !painted.counts.length) {
+    fail(`[${step}/painted] the departing principal's cards show no counts, so `
+      + `"no counts remain" would be vacuous: ${JSON.stringify(painted.cardText)}`);
+  }
+  if (surface === "hub" && (!painted.rollup.length || !painted.chips.length)) {
+    fail(`[${step}/painted] the hub is missing its roll-up/next-task line `
+      + `(${JSON.stringify(painted.rollup)}) or its status chips `
+      + `(${JSON.stringify(painted.chips)}), so withdrawing them would prove `
+      + `nothing`);
+  }
+  if (shape === "failed" && !painted.fieldValues.includes(ctx.reason)) {
+    fail(`[${step}/painted] the typed reason is not standing in the restored `
+      + `confirmation: ${JSON.stringify(painted.fieldValues)}`);
+  }
+  if (shape === "pending" && !painted.focusInScoped) {
+    fail(`[${step}/painted] keyboard focus is not inside the pending card `
+      + `(${painted.focusDesc}), so "no focus target remains" would be vacuous`);
+  }
+  if ((shape === "failed" || shape === "pending") && !painted.liveRegion) {
+    fail(`[${step}/painted] the live region is silent before the identity `
+      + `change, so "no live-region text remains" would be vacuous`);
+  }
+  for (const literal of paintedLiterals) {
+    const sightings = await privateTextSightings(page, literal, false);
+    if (!sightings.length) {
+      fail(`[${step}/painted] ${JSON.stringify(literal)} is not on the rendered `
+        + `surface before the identity change, so searching for it afterwards `
+        + `would prove nothing`);
+    }
+  }
+
+  // The announcement history is reset HERE, immediately before the boundary,
+  // for the same reason leg 7 resets it at its own: everything said up to this
+  // point was said to the DEPARTING operator in their own session and is not a
+  // leak. What the searches below measure is a sentence CROSSING the boundary —
+  // and #toast-root's own markup, which is read separately and is not reset by
+  // this, is what says whether the region was actually emptied.
+  await resetAnnouncements(page);
+
+  // ================== THE WINDOW, HELD OPEN ON PURPOSE =================
+  // /api/context/options is the round trip signIn() awaits between adopting
+  // the new principal and rendering anything for them. Held here, so the
+  // window stops being a race and becomes a state the leg can stand inside.
+  const releaseOptions = holdContextOptions();
+  let released = false;
+  try {
+    await startArrival(page, arrive, step);
+    // ...and this is the ONE instant the review names: `currentUser` is the
+    // arriving principal, and not one line of their own rendering has run.
+    await page.waitForFunction((u) => !!currentUser && currentUser.username === u,
+      arrive.username, { timeout: 20000 })
+      .catch(() => fail(`[${step}/window] the app never adopted ${arrive.username}`));
+
+    const window0 = await paintedContextScopedSurface(page);
+    const sightings = [];
+    for (const literal of literals) {
+      const found = await privateTextSightings(page, literal, false);
+      if (found.length) sightings.push([literal, found]);
+    }
+    const stillHeld = optionsHeldNow;
+    const signInDone = await page.evaluate(() => window.__wiSignInDone === true);
+
+    // THE WINDOW IS REAL. If the options load had already returned, the render
+    // that closes the window could have run, and everything below would be
+    // measuring the ordinary post-render state — the exact blindness the review
+    // reports. Asserted, not assumed.
+    if (stillHeld < 1 || signInDone) {
+      fail(`[${step}/window] the arriving principal's context-options load is `
+        + `no longer outstanding (held=${stillHeld}, signIn resolved=${signInDone}), `
+        + `so this sample is AFTER the render rather than inside the `
+        + `post-auth/pre-render window and proves nothing about it`);
+    }
+    // ...and the surfaces are still THERE, so every emptiness below is a
+    // withdrawal rather than a page that lost its Setup DOM.
+    assertSurfaceStructure(window0, surface, L, sub, "window");
+
+    if (sightings.length) {
+      fail(`[${step}/window] the departing principal's own text is still on `
+        + `${arrive.username}'s screen at the instant they became the signed-in `
+        + `principal: ${JSON.stringify(sightings)}. The stores were cleared; the `
+        + `PAINTED surface was not, and the painted surface is what the operator `
+        + `sees.`);
+    }
+    for (const [what, value] of [
+        ["controls", window0.controls],
+        ["counts", window0.counts],
+        ["roll-up / next-task line", window0.rollup],
+        ["status chips", window0.chips],
+        ["card copy", window0.cardText],
+        ["landing action copy", window0.actionsText],
+        ["field values", window0.fieldValues]]) {
+      if (value.length) {
+        fail(`[${step}/window] the departing principal's ${what} is still `
+          + `painted for ${arrive.username} before any render of their own: `
+          + `${JSON.stringify(value)}`);
+      }
+    }
+    if (window0.liveRegion || window0.liveRegionHtml) {
+      fail(`[${step}/window] the live region still holds `
+        + `${JSON.stringify(window0.liveRegion || window0.liveRegionHtml)} at the `
+        + `identity boundary`);
+    }
+    if (window0.focusInScoped) {
+      fail(`[${step}/window] keyboard focus is still standing inside a `
+        + `context-scoped card surface (${window0.focusDesc}) that belongs to the `
+        + `departing principal`);
+    }
+    if (window0.busy.some((b) => b !== "true")) {
+      fail(`[${step}/window] a blanked card reports aria-busy=`
+        + `${JSON.stringify(window0.busy)} — the arriving principal has read `
+        + `nothing yet and a load for them is what comes next, so "idle" is a `
+        + `claim assistive technology should not be given`);
+    }
+    const spokenInWindow = await spoken(page);
+    if (spokenInWindow.some((a) => literals.some((l) => a.text.indexOf(l) !== -1))) {
+      fail(`[${step}/window] the departing principal's sentences are in the `
+        + `announcement history handed to ${arrive.username}: `
+        + `${JSON.stringify(spokenInWindow)}`);
+    }
+
+    releaseOptions();
+    released = true;
+  } finally {
+    if (!released) releaseOptions();
+  }
+
+  // ---- let the arriving principal's own render finish, and quiesce ----
+  await page.waitForFunction((u) => !!currentUser && currentUser.username === u,
+    arrive.username, { timeout: 20000 });
+  if (shape === "pending") {
+    // The held write is released only now, AFTER the window has been sampled:
+    // its settlement across an identity change is leg 7's subject, and this leg
+    // must not re-assert it. Drained so the target tuple is not left blocked
+    // for whatever runs next.
+    releaseHeld();
+    await page.waitForFunction(() => {
+      const per = cardWrites["setup/facilities"];
+      return !per || Object.keys(per).length === 0;
+    }, null, { timeout: 20000 })
+      .catch(() => fail(`[${step}] the held write never drained after the window`));
+  }
+  if (heldHandler) await page.unroute(REOPEN_RE, heldHandler);
+  await page.waitForTimeout(400);
+  // The blanking is a WINDOW, not a permanent withdrawal: the arriving
+  // principal's own render has to repaint their own surface from their own
+  // reads, or "blank it at the boundary" would have traded a disclosure for a
+  // dead page. Deliberately only that — WHAT the reconciled card then says
+  // under the arriving principal's own permissions is leg 7's subject, asserted
+  // there for all five of its sub-legs, and re-asserting it here would make one
+  // mutation fail two different cases.
+  await openScopedSurface(page, surface, `${step}/after`);
+  const after = await paintedContextScopedSurface(page);
+  assertSurfaceStructure(after, surface, L, sub, "after");
+  if (!after.cardText.length) {
+    fail(`[${step}/after] ${arrive.username}'s own render never repainted the `
+      + `surface the boundary blanked — it is still empty after the context `
+      + `options load completed: ${JSON.stringify(after)}`);
+  }
 }
 
 // EVERY rendered surface AND every store behind it, searched for a LITERAL
@@ -1368,6 +2032,14 @@ async function checkViewport(browser, viewport) {
   let reopenDeliveries = 0;
   page.on("response", (r) => { if (REOPEN_RE.test(new URL(r.url()).pathname)) reopenDeliveries++; });
   const L = viewport.label;
+  // Per-page, and reset per viewport: the two knobs are module-level because
+  // only one viewport's page is ever live at a time (checkViewport is awaited
+  // in sequence), but leaving one armed across viewports would silently change
+  // the next run's timing.
+  optionsDelayMs = 0;
+  optionsGate = null;
+  optionsHeldNow = 0;
+  await installContextOptionsControl(page);
 
   try {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
@@ -1438,6 +2110,17 @@ async function checkViewport(browser, viewport) {
     const s12 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A12");
     const s13 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A13");
     const s14 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A14");
+    // Leg 8's five sub-legs. None of them commits a reopen (every write in leg
+    // 8 is a 503 that never reaches the server, and two sub-legs issue no write
+    // at all), but they get their own Season each anyway, for the same reason
+    // every other leg does: a shared Season would couple their preconditions
+    // and a failure in one would be indistinguishable from a fixture the
+    // previous one changed.
+    const s15 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A15");
+    const s16 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A16");
+    const s17 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A17");
+    const s18 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A18");
+    const s19 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A19");
 
     // THE SECOND OPERATOR (#365 round 7). A real, separate account with the
     // SAME role as the first: the leak the review reports is not a permissions
@@ -2689,6 +3372,76 @@ async function checkViewport(browser, viewport) {
       expect: { effective: null, blocked: true, offersReopen: false },
     }));
 
+    // ======= (8) THE POST-AUTH / PRE-RENDER WINDOW (#365 round 8) =======
+    // Leg 7 proves what the arriving principal is shown ONCE THEIR OWN RENDER
+    // HAS RUN. This leg is about the gap before it. Verbatim from the review:
+    //
+    //   "In production, setUser() adopts the new principal BEFORE those awaits.
+    //   resetTransientUiState() destroys/quarantines the JS stores and clears
+    //   the toast, but it does not synchronously repaint or blank the
+    //   already-rendered card DOM. With /api/context/options delayed, the new
+    //   session can remain on the departing principal's painted PENDING card
+    //   and its permission-scoped counts until the later render replaces it.
+    //   The current journey cannot fail on that window because it awaits the
+    //   function that closes it."
+    //
+    // So every sub-leg here holds /api/context/options open, STARTS the
+    // transition without awaiting it, waits only until `currentUser` is the
+    // arriving principal, and samples the page at exactly that instant —
+    // asserting first that the sample really is inside the window (the options
+    // request is still outstanding and the sign-in has not resolved), then that
+    // nothing of the departing principal's is left painted on any axis the
+    // review names: reason, error, busy copy, counts, controls, toast/live
+    // region, focus target.
+    const legEight = {
+      page: page, base: base, L: L, program: shared.pa,
+      allowResourceError: () => { resourceAllowance += 1; },
+    };
+
+    // (8a) the richest LANDING surface: a 503'd confirmation still carrying the
+    // operator's typed reason, the server's own message, an error toast that
+    // does not auto-dismiss, focus on the reason field and live controls.
+    await preRenderIdentityWindow(Object.assign({}, legEight, {
+      sub: "8a", season: s15, surface: "landing", shape: "failed",
+      reason: "typed just before the switch", arrive: ADMIN_B,
+    }));
+
+    // (8b) an UNRESOLVED write across a REAL sign-out/sign-in: the busy copy,
+    // aria-busy, focus on the pending line and the busy sentence in the one
+    // sitewide live region. The other transition, and the one shape that has no
+    // controls of its own to withdraw.
+    await preRenderIdentityWindow(Object.assign({}, legEight, {
+      sub: "8b", season: s16, surface: "landing", shape: "pending",
+      reason: "unresolved across the sign-out", arrive: ADMIN_B_FORM,
+    }));
+
+    // (8c) a LOWER-PRIVILEGE arriving role. The counts on screen were read
+    // under a League Admin's permissions and the control beside them is
+    // MANAGE_SETUP — an Arena Manager standing on either of them, even for the
+    // length of one options round trip, is the disclosure this leg forbids.
+    await preRenderIdentityWindow(Object.assign({}, legEight, {
+      sub: "8c", season: s17, surface: "landing", shape: "actionable",
+      reason: "unused", arrive: ARENA_B,
+    }));
+
+    // (8d) the SETUP HUB rather than a landing: six cards' counts, their
+    // permission-scoped Done/To-do chips, and the roll-up/next-task line
+    // derived from all of them. None of those live on a landing, so no landing
+    // sub-leg could have caught them being left standing.
+    await preRenderIdentityWindow(Object.assign({}, legEight, {
+      sub: "8d", season: s18, surface: "hub", shape: "actionable",
+      reason: "unused", arrive: ADMIN_B,
+    }));
+
+    // (8e) the HOME/TASKS card and its "Continue setup" CTA, across the real
+    // sign-out/sign-in path — the third context-scoped surface, and the one
+    // whose CTA is a mutation entry point on a view the arriving principal
+    // lands on by default.
+    await preRenderIdentityWindow(Object.assign({}, legEight, {
+      sub: "8e", season: s19, surface: "home", shape: "actionable",
+      reason: "unused", arrive: ADMIN_B_FORM,
+    }));
+
     if (errors.length) fail(`[${L}] browser errors:\n${errors.join("\n")}`);
     console.log(`[${L}] OK — a held reopen POST leaves the Facilities card `
       + `PENDING and aria-busy with NO control on either surface, keyboard focus `
@@ -2752,7 +3505,21 @@ async function checkViewport(browser, viewport) {
       + `and on "Add Ice" when the server really did reopen it. An Arena `
       + `Manager arriving on the same authorized tuple is reconciled the same `
       + `way and is offered NO action at all, so no control the arriving role `
-      + `may not exercise is ever restored.`);
+      + `may not exercise is ever restored. And at the IDENTITY BOUNDARY `
+      + `itself — /api/context/options held open, the transition STARTED and `
+      + `never awaited, the page sampled at the exact instant currentUser `
+      + `became the arriving principal and while their options load is still `
+      + `outstanding and their sign-in still unresolved — the departing `
+      + `principal's already-PAINTED surfaces carry nothing of theirs: no `
+      + `typed reason, no server error text, no busy copy, no counts, no `
+      + `status chips, no roll-up or next-task line, no control on any card `
+      + `body, landing action group or Home CTA, an empty live region with `
+      + `empty markup, aria-busy still true, and keyboard focus moved out of `
+      + `the card rather than left standing inside it — on the Setup landing, `
+      + `on the hub, and on the Home/Tasks card, through the in-app signIn() `
+      + `and through the real sign-out/login-form path, with a lower-privilege `
+      + `arriving role included; the containers survive in place and the `
+      + `arriving principal's own render refills them.`);
   } catch (e) {
     if (serverOutput.trim()) {
       console.error("--- demo server output ---\n" + serverOutput.trim());
