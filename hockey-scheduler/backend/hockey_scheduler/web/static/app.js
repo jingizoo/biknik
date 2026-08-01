@@ -650,7 +650,7 @@ function setupWorkflowCardId(key) { return `setup/${key}`; }
 const cardGenerations = {};
 const cardStates = {};
 
-// card id -> the identity of an UNRESOLVED WRITE this card started, and the
+// card id -> target tuple -> an UNRESOLVED WRITE this card started, and the
 // enforcement behind the PENDING declaration above. That declaration says a
 // pending card is "terminal in one direction only: the write's own response —
 // verified still current — is what moves it, never a render that happens to
@@ -663,12 +663,11 @@ const cardStates = {};
 // standing in for an enforced one is not an invariant.
 //
 // ============================ THE SERIALIZATION RULE ======================
-// An unresolved card write is an OPERATION-level state. While
-// cardWrites[cardId] holds an identity whose tuple is still the active one:
+// An unresolved card write is an OPERATION-level state. While the ledger holds
+// an entry for this card AGAINST THE TUPLE THAT IS CURRENT NOW:
 //
-//  (1) REFUSED, not repainted. Any request for that card that is not the
-//      resolution of that exact write is refused OUTRIGHT by
-//      beginCardRequest(), which returns null WITHOUT touching
+//  (1) REFUSED, not repainted. Every request for that card is refused
+//      OUTRIGHT by beginCardRequest(), which returns null WITHOUT touching
 //      cardGenerations. The generation never advances, so the pending
 //      identity stays current, its committed model, aria-busy and focus
 //      target stay exactly as the write left them, and its eventual response
@@ -677,13 +676,12 @@ const cardStates = {};
 //      moved, and the write's own response would then be discarded as stale
 //      even though the server may well have committed it.
 //
-//  (2) ONLY ITS OWN TERMINAL RESPONSE ADVANCES IT. The one caller allowed
-//      through is the one that presents the pending identity as
-//      `opts.resolves` — reopenSelectedSeasonFromCard()'s two post-await
-//      branches, and only AFTER its own cardIdentityCurrent() re-check. That
-//      hand-off clears the registration and issues the next generation in a
-//      single step, so there is no instant in which the card is both
-//      unregistered and un-advanced.
+//  (2) ONLY ITS OWN SETTLEMENT ENDS IT. Nothing gets past the gate in (1) —
+//      there is no exempting token — because the registration is released by
+//      settleCardWrite() at the single point after the operation's own await,
+//      and only then does its terminal handling run. Settlement is
+//      unconditional and comes before every return on that path, so an
+//      operation cannot end without its record ending with it.
 //
 //  (3) NO SECOND USER-INITIATED WRITE. Every other operation entry point —
 //      the confirmation opener, its resolver, the per-card retry — is refused
@@ -693,37 +691,130 @@ const cardStates = {};
 //      (setupLandingActions), so there is nothing for a pointer to hit and
 //      nothing for the keyboard to reach in the first place.
 //
-//  (4) A DIFFERENT TUPLE RENDERS NORMALLY. currentCardWrite() answers null
-//      the moment the registered identity's tuple stops being the active one,
-//      and forgets the registration, so a switched-to Program/Season paints
-//      its own card with its own generations exactly as it always did.
+//  (4) A DIFFERENT TUPLE RENDERS NORMALLY. currentCardWrite() looks the
+//      registration up UNDER THE TUPLE THAT IS CURRENT NOW, so a switched-to
+//      Program/Season finds none of its own and paints its card with its own
+//      generations exactly as it always did — while the registration made
+//      against the tuple the operator left goes on existing.
 //
-// WHAT HAPPENS TO A PENDING WRITE WHOSE TUPLE THE OPERATOR LEAVES: it is
-// ABANDONED. The registration is dropped, renders under the new tuple issue
-// generations freely, and when the response finally arrives
-// cardIdentityCurrent() answers false, so it is DISCARDED — no model, DOM,
-// focus, announcement, completion or next-task change, on either tuple. That
-// is the right outcome and not a gap: the response describes a Season the
-// operator is no longer working in, so applying it to the card on screen
-// would paint one Season's outcome under another Season's heading (the
-// stale-response race legs 2 and 3 of setup-card-write-identity.js exist
-// for), and there is no card left for it to be applied to correctly. The
-// write itself may still commit server-side — that is a server fact, and the
-// operator sees it the moment they return to that Season and the card reads
-// its state fresh. What must never happen is the client acting on it blind,
-// which is exactly what the same-tuple refusal above prevents in the one case
-// where the card IS still on screen and the outcome IS still knowable.
+// ================ WHAT LEAVING THE TUPLE DOES *NOT* DO ====================
+// It does not end the operation, and the previous round of this comment said
+// it did. It called such a write "ABANDONED", dropped its registration, and
+// argued that discarding the eventual response "is the right outcome and not
+// a gap". That conflated two different facts, and only the first of them was
+// true:
+//
+//   * TRUE: the RESPONSE must be discarded when it arrives into a tuple the
+//     operator has moved on from. Applying it would paint one Season's
+//     outcome under another Season's heading — the race legs 2 and 3 of
+//     setup-card-write-identity.js exist for.
+//
+//   * FALSE: that this makes leaving harmless. Navigation cancelled NOTHING.
+//     The HTTP request is still in flight and the server transaction behind
+//     it may still commit. Discarding the response protects the UI; it does
+//     nothing whatever about the live write.
+//
+// So dropping the registration on tuple mismatch destroyed the only record
+// that the operation existed, and a short round trip — A, to B, back to A,
+// all before the first response settles — restored the mutation: the card
+// re-rendered READY with "Reopen this season" actionable, and confirming
+// again issued a SECOND concurrent lifecycle write against the same Season
+// while the outcome of the first was still unknown. Duplicated lifecycle and
+// audit effects, and a UI reasoning from neither write.
+//
+// ================== THE LEDGER: KEYED BY CARD *AND TARGET* =================
+// `cardWrites` is therefore an UNRESOLVED-OPERATION LEDGER, two levels deep:
+//
+//     cardWrites[cardId][cardTupleKey(target tuple)] -> entry
+//
+// and the second level is the whole correction. An operation belongs to a
+// CARD AND THE TUPLE/SEASON IT TARGETS, and ITS LIFETIME IS THE REQUEST'S,
+// NOT THE VIEW'S. Nothing about which tuple happens to be on screen creates
+// or destroys an entry:
+//
+//   * REGISTERED when the PENDING model commits (commitCardState), against
+//     the identity's own tuple, carrying the exact PENDING model so the
+//     presentation can be REBUILT after a round trip has destroyed the DOM
+//     and overwritten cardStates with the other tuple's model.
+//   * READ BY CURRENT TUPLE (currentCardWrite) — so B is free and A is
+//     blocked, at the same time, from the same ledger. A refusal that were
+//     global-by-card would freeze B, which is not the rule.
+//   * RELEASED ONLY BY SETTLEMENT (settleCardWrite), at the one point after
+//     the request's own await, on EVERY path — including the path where the
+//     initiating UI identity has gone stale, which is precisely the path a
+//     happy-path-only drain leaves blocked forever.
+//
+// A card with an entry for the CURRENT tuple reads as PENDING through
+// readCardState() whatever cardStates holds, so returning to the target of an
+// unresolved write repaints the non-actionable pending presentation rather
+// than a settled card with a live control on it.
 const cardWrites = {};
 
-// The unresolved write for `cardId`, or null. Forgets a registration whose
-// tuple is no longer active (see "abandoned", above) so the lapse is
-// deterministic — it happens on the next request for that card rather than
-// lingering until something else happens to look.
+// The three #345 axes as one comparable key. The Season axis is IN it, so
+// "card + target tuple" and "card + target Season" are the same lookup for
+// every write this file performs — each names the SELECTED Season as its
+// target. The entry carries `target` as well, mirroring the id the write
+// actually put in its URL, so a future card that reopened some OTHER Season
+// would have the explicit target to key on instead of inheriting it.
+// NUL-joined because ids are opaque strings and any printable separator could
+// in principle occur inside one.
+function cardTupleKey(t) {
+  return `${(t && t.program_id) || ""}\u0000${(t && t.season_id) || ""}`
+    + `\u0000${(t && t.league_id) || ""}`;
+}
+
+// The unresolved write registered for `cardId` AGAINST THE TUPLE THAT IS
+// CURRENT NOW, or null.
+//
+// It deliberately does NOT delete anything. The line that used to live here —
+// `if (!cardTupleCurrent(held)) { delete cardWrites[cardId]; return null; }` —
+// is the round-6 defect itself: it answered "no unresolved write" correctly
+// for the switched-to tuple, but paid for that answer by forgetting the
+// operation, so coming back found nothing to be blocked by. Answering by
+// LOOKUP gives the same freedom to B without costing A its record.
 function currentCardWrite(cardId) {
-  const held = cardWrites[cardId];
-  if (!held) return null;
-  if (!cardTupleCurrent(held)) { delete cardWrites[cardId]; return null; }
-  return held;
+  const ledger = cardWrites[cardId];
+  if (!ledger) return null;
+  return ledger[cardTupleKey(currentCardTuple())] || null;
+}
+
+// Open the ledger entry for `identity`'s operation, holding the PENDING model
+// it committed. Called from commitCardState alone, so "the card is PENDING"
+// and "an operation is registered" are the same event and cannot disagree.
+function registerCardWrite(identity, model) {
+  const ledger = cardWrites[identity.card] || (cardWrites[identity.card] = {});
+  ledger[cardTupleKey(identity)] = {
+    card: identity.card, identity: identity,
+    // The tuple this operation TARGETS — the key, spelled out — and the
+    // Season its URL names. Both are the identity's, captured before the
+    // await, never re-read from live context afterwards.
+    tuple: { program_id: identity.program_id, season_id: identity.season_id,
+             league_id: identity.league_id },
+    target: identity.season_id,
+    // What the card must be rebuilt as while this stays unresolved. The round
+    // trip repaints from readCardState(), and by then cardStates holds the
+    // OTHER tuple's model — so the pending presentation has to come from here
+    // or it does not come at all.
+    model: model,
+  };
+}
+
+// SETTLEMENT — the one and only place a registration is released, and the
+// reason the ledger cannot leak. Keyed by the identity's OWN tuple, not by
+// the current one, so it drains identically whether the operator is standing
+// on the target or three switches away from it. Returns the entry (so the
+// caller can tell a real settlement from a double one) or null.
+function settleCardWrite(identity) {
+  const ledger = identity && cardWrites[identity.card];
+  if (!ledger) return null;
+  const key = cardTupleKey(identity);
+  const entry = ledger[key];
+  // Identity equality, not just key equality: only THIS operation's own
+  // response may retire THIS operation's registration.
+  if (!entry || entry.identity !== identity) return null;
+  delete ledger[key];
+  if (!Object.keys(ledger).length) delete cardWrites[identity.card];
+  return entry;
 }
 
 // The active context tuple (#345's three axes). Read from
@@ -749,22 +840,32 @@ function currentCardTuple() {
 // point — a stale response that skips the DOM write but still moves focus or
 // re-announces is the same defect.
 //
-// Returns null when the serialization rule above REFUSES the request: this
-// card has a current unresolved write and `opts.resolves` is not it. The
-// refusal is taken BEFORE the counter moves, so a refused caller leaves no
-// trace at all — that is what makes the pending identity survive an ordinary
-// render rather than merely be painted back over a generation that has
-// already advanced past the write. Every call site treats null as "do
+// Returns null when the serialization rule above REFUSES the request: the
+// LEDGER holds an unresolved operation for THIS CARD AGAINST THE TUPLE THAT
+// IS CURRENT RIGHT NOW. That pairing is the rule, and both halves of it
+// matter: keyed on the card alone the refusal would freeze the switched-to
+// Program/Season as well, which is not the guarantee; keyed on "the write
+// whose tuple still happens to be active" — the old currentCardWrite() — the
+// registration was destroyed by merely looking from somewhere else, so a
+// round trip back to the target found nothing left to refuse.
+//
+// The refusal is taken BEFORE the counter moves, so a refused caller leaves
+// no trace at all — that is what makes the pending identity survive an
+// ordinary render rather than merely be painted back over a generation that
+// has already advanced past the write. Every call site treats null as "do
 // nothing"; commitCardState, repaintSetupWorkflowCard, announceCardStatus and
 // focusCardTarget all refuse a null identity on their own account too.
+//
+// There is no "resolving" token any more, and there must not be one: the
+// registration is released by SETTLEMENT (settleCardWrite, at the single
+// point after the operation's own await) rather than handed forward to the
+// one caller allowed past a still-standing gate. A token only works on the
+// paths that remember to carry it, and the path this round is about — the
+// response landing while the initiating identity is stale — is exactly the
+// one that would not have carried it.
 function beginCardRequest(cardId, opts) {
   const t = currentCardTuple();
-  const outstanding = currentCardWrite(cardId);
-  if (outstanding && (!opts || opts.resolves !== outstanding)) return null;
-  // The write's own terminal response is resolving it: clear the registration
-  // and issue its next generation in the same step, so the card is never both
-  // unregistered and still sitting in PENDING.
-  if (outstanding) delete cardWrites[cardId];
+  if (currentCardWrite(cardId)) return null;
   cardGenerations[cardId] = (cardGenerations[cardId] || 0) + 1;
   return { card: cardId, program_id: t.program_id, season_id: t.season_id,
            league_id: t.league_id, generation: cardGenerations[cardId],
@@ -811,11 +912,16 @@ function commitCardState(identity, next) {
   // `identity` last, so a `next` cloned from a previous entry can never carry
   // that entry's older identity through into the new commit.
   cardStates[identity.card] = Object.assign({}, next, { identity: identity });
-  // Committing PENDING is what REGISTERS the unresolved write, here rather
+  // Committing PENDING is what REGISTERS the unresolved operation, here rather
   // than at the writer, so the operation-level state and the card-level state
   // can never disagree about whether a write is outstanding: a card is
-  // PENDING exactly when there is a registered write for it, by construction.
-  if (next && next.state === CARD_STATE.PENDING) cardWrites[identity.card] = identity;
+  // PENDING exactly when there is a registered operation for it, by
+  // construction. The model just stored travels into the ledger, because it is
+  // what the card has to be REBUILT as if the operator leaves this tuple and
+  // comes back — by then cardStates holds the other tuple's model instead.
+  if (next && next.state === CARD_STATE.PENDING) {
+    registerCardWrite(identity, cardStates[identity.card]);
+  }
   return true;
 }
 
@@ -825,7 +931,20 @@ function commitCardState(identity, next) {
 // refresh path" — rather than silently painting one Program's numbers under
 // another Program's heading. A LOADING entry is left alone: it has no data to
 // mislabel, and a fresher commit is already on its way.
+//
+// AN UNRESOLVED OPERATION AGAINST THE CURRENT TUPLE OUTRANKS cardStates
+// ENTIRELY. Returning to the target of a write that has not settled has to
+// repaint the non-actionable pending presentation, and by then there is
+// nothing left to repaint it FROM: the round trip destroyed the DOM, and the
+// renders that ran under the other tuple overwrote cardStates with that
+// tuple's model. So the pending model is reconstructed from the LEDGER, which
+// is the only thing that survived — and every reader of a card's state goes
+// through this one function, so the card body, the landing's action groups,
+// aria-busy and the hub roll-up all agree with the operation rather than with
+// whatever the last render left behind.
 function readCardState(cardId) {
+  const outstanding = currentCardWrite(cardId);
+  if (outstanding) return outstanding.model;
   const entry = cardStates[cardId];
   if (!entry) return { state: CARD_STATE.LOADING, status: CARD_STATUS.UNKNOWN };
   if (entry.state !== CARD_STATE.LOADING && !cardTupleCurrent(entry.identity)) {
@@ -4923,7 +5042,11 @@ function restorePendingCardWriteFocus() {
     if (!held) return;
     const slot = document.querySelector(`[data-setup-card-slot="${w.key}"]`);
     const line = slot && slot.querySelector("[data-setup-card-pending]");
-    if (line) focusCardTarget(held, line);
+    // The LEDGER entry's identity. focusCardTarget refuses a superseded one on
+    // its own account, which is the right answer after a round trip: the
+    // operator navigated back here deliberately and their focus is on a real
+    // destination, so nothing may yank it onto the pending line.
+    if (line) focusCardTarget(held.identity, line);
   });
 }
 
@@ -5000,12 +5123,11 @@ async function retrySetupWorkflowCard(key, opts) {
   const w = setupWorkflowsFor().find((x) => x.key === key);
   if (!w) return;
   const held = cardStates[setupWorkflowCardId(key)] || {};
-  // `o.resolves` is the pending write's own identity when this refresh IS the
-  // success branch of that write (reopenSelectedSeasonFromCard). Any other
-  // caller — the operator's Retry press above all — presents nothing, and is
-  // refused while a write for this card is unresolved.
-  const identity = beginCardRequest(setupWorkflowCardId(key),
-    { userInitiated: true, resolves: o.resolves });
+  // Refused while an operation for this card against the CURRENT tuple is
+  // still unresolved — the operator's Retry press above all. The reopen
+  // writer reaches this function only AFTER settling its own registration, so
+  // it needs no exemption to get past the gate; nothing else may.
+  const identity = beginCardRequest(setupWorkflowCardId(key), { userInitiated: true });
   if (!identity) return;   // #365: refused — a write for this card is unresolved
   commitCardState(identity, { state: CARD_STATE.LOADING, status: CARD_STATUS.UNKNOWN,
                               optional: held.optional === undefined ? !!w.optional : held.optional });
@@ -5082,15 +5204,22 @@ function askSetupCardConfirm(key, ref) {
   if (!w) return;
   const action = setupCardActionFor(w, ref);
   if (!action || !action.confirm) return;
-  const held = cardStates[setupWorkflowCardId(key)];
+  // Through readCardState(), never the raw cardStates entry: on a card the
+  // operator has just come BACK to with a write still unresolved, the raw
+  // entry is whatever the other tuple's renders left behind, and this opener
+  // has to see the OPERATION. Reading the operation is what puts the refusal
+  // below on the serialization rule rather than on which tuple happened to
+  // commit last.
+  const held = readCardState(setupWorkflowCardId(key));
   // A card holding data from a context the operator has left must not open a
   // confirmation bound to it.
   if (!held || !cardTupleCurrent(held.identity)) return;
   const identity = beginCardRequest(setupWorkflowCardId(key), { userInitiated: true });
-  // Refused while this card's own write is unresolved: opening a second
-  // confirmation is how a second write starts. The PENDING body and the
-  // withdrawn landing groups mean no control exists to reach this, so this is
-  // the code-level floor under those two surfaces, not a substitute for them.
+  // Refused while this card's own write against this tuple is unresolved:
+  // opening a second confirmation is how a second write starts. The PENDING
+  // body and the withdrawn landing groups mean no control exists to reach
+  // this, so this is the code-level floor under those two surfaces, not a
+  // substitute for them.
   if (!identity) return;
   commitCardState(identity, Object.assign({}, held, {
     state: CARD_STATE.CONFIRM, confirm: action.confirm,
@@ -5106,7 +5235,11 @@ function askSetupCardConfirm(key, ref) {
 
 function resolveSetupCardConfirm(key, yes) {
   const w = setupWorkflowsFor().find((x) => x.key === key);
-  const held = cardStates[setupWorkflowCardId(key)];
+  // Same reason as askSetupCardConfirm: the OPERATION outranks the raw entry,
+  // so a card carrying an unresolved write reads PENDING here and this
+  // resolver declines rather than resolving a confirmation that is not the
+  // card's current state.
+  const held = readCardState(setupWorkflowCardId(key));
   if (!w || !held || held.state !== CARD_STATE.CONFIRM) return;
   if (!cardTupleCurrent(held.identity)) return;
   const action = setupCardActionFor(w, held.pending);
@@ -5283,35 +5416,76 @@ async function reopenSelectedSeasonFromCard(key, held, c, reason) {
   const r = await postScoped(`/api/v2/setup/seasons/${seasonId}/reopen`,
                              { reason: reason });
   // ======================= AFTER THE AWAIT =======================
-  // THE gate. Both terminal branches below move this card on to its NEXT
-  // generation — the failure branch by re-opening the confirmation, the
-  // success branch through retrySetupWorkflowCard's own refresh — so this one
-  // check is what stands between an older tuple's response and the current
-  // card's DOM, focus, live region, completion and next task. Nothing awaits
-  // between here and those mutations, so there is no window after it.
+  // SETTLEMENT, FIRST AND UNCONDITIONALLY. This is the instant the operation
+  // stops being unresolved, so it is the instant its ledger entry is
+  // released — before any question is asked about where the operator is, what
+  // the response says, or whether the initiating identity survived. Nothing
+  // below can return early past it, because it is above every return.
   //
-  // `cardIdentityCurrent` is the conjunct that carries the guarantee: same
-  // card, same Program/Season/League tuple, same generation as the request
-  // that started this.
+  // "Even when the initiating UI identity is stale" is the whole point. The
+  // operator can be standing on another Program/Season when this lands; the
+  // generation this card was on can have moved three times. None of that has
+  // any bearing on whether the REQUEST settled — it did — and a ledger that
+  // drained only on the path where the identity is still current would leave
+  // the target tuple's card blocked forever the moment the operator glanced
+  // at another Season.
+  const settled = settleCardWrite(identity);
+  // Nothing to settle: this operation was never registered (its PENDING
+  // commit was refused) or has already settled once. Either way there is no
+  // outstanding write here and nothing this response may act on.
+  if (!settled) return;
+  // ---- WHICH TUPLE IS ON SCREEN decides what may happen next. ----
+  //
+  // NOT the target's: the round-4 rule, unchanged and unweakened. The response
+  // describes a Season the operator is no longer working in, so applying any
+  // part of it would paint one Season's outcome under another Season's
+  // heading. It returns having done NOTHING at all — no toast, no live region,
+  // no repaint, no refresh, no focus, no completion or next-task change, on
+  // either tuple. postScoped() is what makes "nothing" literally true: post()
+  // would already have published the server's error message into the sitewide
+  // toast before this line was ever reached. The ledger is drained all the
+  // same, so returning to the target later reads the server rather than a
+  // permanent block.
   //
   // The `season_id` conjunct is REDUNDANT TODAY and is not a second
   // guarantee — say so plainly rather than let it read as one. `seasonId` is
   // read from contextOptions.selected.season_id, and `identity.season_id` is
   // set from currentCardTuple(), which reads that same field on the next
-  // synchronous line; the two cannot disagree, and cardIdentityCurrent already
+  // synchronous line; the two cannot disagree, and cardTupleCurrent already
   // compares identity.season_id against the live tuple. It is kept because
   // this write names its target EXPLICITLY in the URL rather than inheriting
   // it from the tuple: if a future card ever reopens a Season other than the
   // selected one, the tuple check alone would stop covering the target and
   // this line would become the thing that does. Do not cite it as proof of
-  // anything the identity check is not already proving.
+  // anything the tuple check is not already proving.
+  if (!cardTupleCurrent(identity) || identity.season_id !== seasonId) return;
+  // THE TARGET IS CURRENT, BUT THE INITIATING IDENTITY IS NOT. The operator
+  // left this tuple and came back while the request was in flight: the DOM
+  // this operation painted was destroyed, cardStates was overwritten by the
+  // other tuple's renders, and this card's generation moved on without it.
   //
-  // A superseded response returns here having done nothing at all — no toast,
-  // no live region, no repaint, no refresh, no focus, no completion or
-  // next-task change. postScoped() is what makes "nothing" literally true:
-  // post() would already have published the server's error message into the
-  // sitewide toast before this line was ever reached.
-  if (!cardIdentityCurrent(identity) || identity.season_id !== seasonId) return;
+  // The client therefore no longer knows what the server did — and, crucially,
+  // NEITHER DOES THIS RESPONSE. A 503 delivered here does not mean the write
+  // did not commit (navigation cancelled nothing, and the transaction behind
+  // it may have gone through); a 200 delivered here describes a Season the
+  // client has since stopped tracking. So NOTHING is restored from held state
+  // and no completion claim is made from the response. The card is RECONCILED
+  // FROM FRESH SERVER TRUTH instead — retrySetupWorkflowCard re-reads the
+  // overview and the progress payload for this card alone and rebuilds the
+  // model from what comes back, so the prerequisite chain decides the outcome:
+  // a Season the server still reports archived lands on the REAL recovery
+  // action, and one the server reports active advances to the next valid
+  // action. Its own generic sentence describes the reconcile and claims
+  // nothing about the write, which is the only honest thing left to say.
+  //
+  // It is refused by nothing: the registration was released above, so the gate
+  // this refresh has to pass is already open, and the LOADING model it commits
+  // synchronously keeps every action withdrawn until the fresh read lands.
+  if (!cardIdentityCurrent(identity)) return retrySetupWorkflowCard(key);
+  // ---- IN PLACE: never left, DOM intact, generation untouched. ----
+  // The round-4 terminal branches, exactly as they were: this response IS the
+  // one the card on screen is waiting for, and the client's held state is
+  // still a truthful description of the card the operator is looking at.
   if (!r || r.error) {
     // A CURRENT failure restores an actionable confirmation with the entered
     // reason retained — the operator's own words are not thrown away and made
@@ -5319,11 +5493,7 @@ async function reopenSelectedSeasonFromCard(key, held, c, reason) {
     // reason field so the retry is one keystroke away. `confirm`, `pending`
     // and `resumeState` ride along in `held`, so the restored confirmation is
     // the same one, resolvable by the same code path.
-    // `resolves` is what makes this the ONE caller the serialization rule lets
-    // past: this is the pending write's own terminal response, already
-    // re-verified as current on the line above, so it — and nothing else —
-    // advances the card off PENDING and clears its registration.
-    const next = beginCardRequest(cardId, { userInitiated: true, resolves: identity });
+    const next = beginCardRequest(cardId, { userInitiated: true });
     if (!next) return;
     const message = (r && r.error && r.error.message)
       || "The season could not be reopened.";
@@ -5341,14 +5511,12 @@ async function reopenSelectedSeasonFromCard(key, held, c, reason) {
   // A CURRENT success refreshes ONLY this card, and says so exactly once.
   // (4) completion and (5) next task are derived from the model that refresh
   // commits under its own identity gate, so a late loser can revise neither.
-  // `resolves` again: the refresh IS this write's terminal response, so it is
-  // allowed to advance the card off PENDING. Without it the refresh would be
-  // refused by its own serialization rule and the card would sit pending
-  // forever after a success.
+  // The refresh gets past the serialization gate because settlement above
+  // already released this operation's registration — not because it carries a
+  // token exempting it.
   return retrySetupWorkflowCard(key, {
     done: c.done || "Season reopened.",
-    failed: c.doneNoRefresh || c.done || "Season reopened.",
-    resolves: identity });
+    failed: c.doneNoRefresh || c.done || "Season reopened." });
 }
 
 function wireSetupWorkflowCards(root) {

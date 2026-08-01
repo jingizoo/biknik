@@ -120,6 +120,73 @@
 //           generation and committed model is byte-identical across the
 //           release — and says the one success sentence exactly once.
 //
+//  (6) A → B → A ROUND TRIP DURING AN UNRESOLVED WRITE — the round-6 blocker,
+//      verbatim from the review:
+//
+//        "Leaving a tuple deletes the unresolved-write registration, so
+//        returning to that same tuple before the response settles restores the
+//        mutation and permits a duplicate write. currentCardWrite() deletes
+//        cardWrites[cardId] as soon as cardTupleCurrent(held) becomes false.
+//        That makes Program/Season B render normally, but it permanently
+//        forgets that the first request against Program/Season A is still in
+//        flight; navigation did not cancel that HTTP request or its possible
+//        server transaction. ... A now renders READY at generation 5,
+//        aria-busy=false, with Reopen this season actionable, although its
+//        first write is still unresolved. Confirm again: A enters PENDING at
+//        generation 7 and the interceptor observes two concurrent reopen
+//        requests for the same Season.
+//
+//        This is the same unknown-outcome hazard across a short round trip
+//        rather than a same-tuple render. Calling the operation 'abandoned' is
+//        not a cancellation/serialization rule: the server may still commit
+//        it, its response is now correctly discarded as stale, and the
+//        restored control can issue a second lifecycle mutation before the
+//        client knows the first outcome."
+//
+//      Leg 5 is the case where the tuple never moves. Legs 2 and 3 are the
+//      case where it moves and does not come back. This is the case in
+//      between, and it is the one the previous round's own comment argued was
+//      no gap at all: it documented such a write as "ABANDONED" and called
+//      discarding its response "the right outcome". That conflated the
+//      RESPONSE being discarded (true, and legs 2/3 exist for it) with no harm
+//      being done (false — navigation cancels no HTTP request and no server
+//      transaction).
+//
+//      (6a) Held BEFORE the server; A → B → A through the REAL #ctx-select
+//           without releasing. B must render NORMALLY — its own Season, its
+//           own settled state, aria-busy=false and its own action offered —
+//           while returned A must come back NON-ACTIONABLE and
+//           operation-pending, rebuilt from the ledger rather than from
+//           anything the round trip left behind: the committed model was
+//           overwritten by B's renders and the DOM was destroyed, so the card
+//           reads pending at the generation it entered PENDING with even
+//           though the card's COUNTER has moved past it. That gap is asserted
+//           in both directions, because it is what proves the initiating UI
+//           identity is genuinely stale and the settlement below therefore
+//           takes the stale-identity path. Pointer, keyboard AND direct
+//           code-level attempts must leave the reopen-request count at exactly
+//           one. Released as a 503, returned A is then RECONCILED FROM FRESH
+//           SERVER TRUTH — a progress read is observed leaving the browser
+//           after the settlement, and the card lands on the REAL recovery
+//           action the server's own prerequisite answer implies, not on the
+//           held confirmation the client was carrying.
+//      (6b) The same round trip, released as a genuinely COMMITTED success:
+//           the reconcile must ADVANCE the card to the next valid action
+//           ("Add Ice"), which is a state no held value could have produced —
+//           the client's held model was blocked by season_active.
+//      (6c) Released while the operator is STILL ON B: B stays byte-identical
+//           by snapshot (the round-4 rule, unchanged), the LEDGER DRAINS
+//           anyway — asserted directly on cardWrites, not inferred — and a
+//           later return to A reads current server truth instead of sitting
+//           blocked forever behind a registration nothing would ever retire.
+//
+//      No completion sentence is allowed anywhere in leg 6, on either
+//      release. After a round trip the client cannot attribute what it now
+//      reads to its own write: a 503 delivered here does not prove the write
+//      did not commit, and a 200 describes a Season the client stopped
+//      tracking. Reconciling and saying so is honest; "Season reopened." is a
+//      stale claim.
+//
 // TECHNIQUE
 // ---------
 //   * Delayed responses use this repo's established idiom: capture the REAL
@@ -372,6 +439,22 @@ async function readCard(page) {
         .map((b) => b.textContent.trim()) : null,
       goRoutes: root ? Array.from(root.querySelectorAll("[data-setup-workflow-go]"))
         .map((b) => b.dataset.setupWorkflowGo) : null,
+      // Whether the two surfaces the "zero controls" assertions read are
+      // actually PAINTED. Without these, a landing that failed to render at
+      // all would satisfy "no buttons" for entirely the wrong reason.
+      hasLanding: !!root,
+      hasActionsBox: !!box,
+      // The card's own generation COUNTER, beside the generation the committed
+      // identity carries. After a round trip the two must differ: the counter
+      // moved under the other tuple's renders while the operation's identity
+      // stayed where it was, which is precisely what makes the initiating UI
+      // identity stale.
+      counter: cardGenerations["setup/facilities"],
+      // The switch-intent withdrawal is a DIFFERENT reason for a landing to
+      // have no controls (setupLandingActions checks it first). Read it, so
+      // "non-actionable because a write is unresolved" is never confused with
+      // "non-actionable because a switch has not reconciled yet".
+      intentPending: !!contextSwitchIntentPending,
       reasonValue: reason ? reason.value : null,
       confirmError: err ? err.textContent.replace(/\s+/g, " ").trim() : null,
       pendingText: slot && slot.querySelector("[data-setup-card-pending]")
@@ -470,6 +553,58 @@ async function sameTupleRenderThroughNav(page, step) {
   // The paint is the last thing render() does before its wiring; give anything
   // it kicked off (a per-card repaint, a focus poll) a beat to land, so the
   // assertions below read a quiesced page rather than a mid-flight one.
+  await page.waitForTimeout(600);
+}
+
+// The UNRESOLVED-OPERATION LEDGER itself, read straight out of the page. The
+// behavioural assertions below would catch a ledger that never drains only by
+// hanging on a later wait; this reads the record directly, so "the ledger
+// drained even though the operator was on another tuple when the response
+// landed" is proven rather than inferred from an absence.
+async function readLedger(page) {
+  return page.evaluate(() => {
+    const per = cardWrites["setup/facilities"];
+    return {
+      cards: Object.keys(cardWrites).sort(),
+      entries: per ? Object.keys(per).length : 0,
+      targets: per ? Object.keys(per).map((k) => per[k].target).sort() : [],
+    };
+  });
+}
+
+// Re-enter the Facilities destination through the REAL sidebar navigation
+// entry. Used after a context switch, where the previously painted landing
+// may or may not have survived: every "zero controls on both surfaces"
+// assertion below has to read a landing that is genuinely on screen, and
+// hasLanding/hasActionsBox above then prove it was.
+async function gotoFacilitiesLanding(page, step) {
+  const nav = await page.$('.tab[data-setup-workflow-nav="facilities"]');
+  if (!nav) fail(`[${step}] the real Facilities navigation control is not `
+    + `present, so the destination cannot be re-entered the way an operator does`);
+  await nav.click();
+  await page.waitForSelector('[data-setup-workflow-landing="facilities"]',
+    { timeout: 15000 })
+    .catch(() => fail(`[${step}] the facilities landing never rendered`));
+}
+
+// The counterpart of settled(): wait until the card is showing the
+// NON-ACTIONABLE PENDING presentation for `seasonId`, with the context switch
+// already reconciled. Both conjuncts matter — a card that is merely mid-switch
+// also paints no controls, and asserting on that would prove nothing about an
+// unresolved write.
+async function pendingPresentation(page, step, seasonId) {
+  await page.waitForFunction((sid) => {
+    if (contextSwitchIntentPending) return false;
+    const e = readCardState("setup/facilities");
+    return e.state === "pending" && e.identity && e.identity.season_id === sid;
+  }, seasonId, { timeout: 15000 })
+    .catch(() => fail(`[${step}] returning to the target of an unresolved `
+      + `write did not restore the card's pending presentation — the round `
+      + `trip destroyed the DOM and overwrote the committed model, so a card `
+      + `that cannot be rebuilt from the operation itself comes back settled `
+      + `and actionable with its first write still in flight`));
+  // Let anything the return render kicked off land, so the assertions read a
+  // quiesced page rather than a mid-flight one.
   await page.waitForTimeout(600);
 }
 
@@ -650,6 +785,12 @@ async function checkViewport(browser, viewport) {
     // next sub-leg's "still archived" precondition false.
     const s5 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A5");
     const s6 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A6");
+    // Leg 6's three sub-legs, same rule: one Season each, because two of them
+    // really are reopened and a reused Season would silently make the next
+    // sub-leg's "still archived" precondition false.
+    const s7 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A7");
+    const s8 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A8");
+    const s9 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A9");
 
     // =================== (1) HELD POST, THEN 503 =======================
     await apiPost(page, "/api/context", { program_id: shared.pa, season_id: s1.season });
@@ -1346,6 +1487,480 @@ async function checkViewport(browser, viewport) {
       }
     }
 
+    // ====== (6) A → B → A ROUND TRIP WHILE THE WRITE IS UNRESOLVED ======
+    // Leg 5 races a render under a tuple that never moves; legs 2/3 race a
+    // tuple that moves and stays moved. This races a tuple that moves AND
+    // COMES BACK before the response settles — the case the previous round
+    // documented as "abandoned" and dismissed. Navigation cancelled neither
+    // the HTTP request nor the server transaction behind it, so the operation
+    // is still live and the card it targets must still be non-actionable.
+    //
+    // Progress reads are counted where the BROWSER hands them over. "The card
+    // was reconciled from FRESH server truth" is a claim about a request that
+    // actually left after the settlement, so it is measured there rather than
+    // inferred from the state that happened to result.
+    let progressReads = 0;
+    page.on("request", (rq) => {
+      if (/\/api\/v2\/setup\/progress$/.test(new URL(rq.url()).pathname)) {
+        progressReads += 1;
+      }
+    });
+
+    // ------------- (6a) round trip, then released as a 503 --------------
+    await apiPost(page, "/api/context", { program_id: shared.pa, season_id: s7.season });
+    await reenter(page, base);
+    await openFacilities(page, `${L}/6a`);
+    await armAnnouncements(page);
+    const before6a = await readCard(page);
+    if (before6a.effective !== "Reopen this season") {
+      fail(`[${L}/6a] the fixture does not offer the reopen path (effective `
+        + `${JSON.stringify(before6a.effective)}, state "${before6a.state}") — `
+        + `there is no card write to race`);
+    }
+    const rollup6aBefore = await snapshot(page);
+    await openConfirmWithReason(page, `${L}/6a`, "round trip, held write");
+    await resetAnnouncements(page);
+
+    // Held BEFORE the server, and counted AT THE INTERCEPTOR: the harm is two
+    // writes ISSUED for one Season, not two the server chose to accept.
+    let reopen7Requests = 0;
+    let releaseSeven = () => {};
+    let markSevenHeld = () => {};
+    const sevenHeld = new Promise((resolve) => { markSevenHeld = resolve; });
+    const sevenGate = new Promise((resolve) => { releaseSeven = resolve; });
+    const holdRoundTripFail = async (route) => {
+      reopen7Requests += 1;
+      markSevenHeld();
+      await sevenGate;
+      resourceAllowance += 1;
+      await route.fulfill({ status: 503, contentType: "application/json",
+        body: JSON.stringify({ error: { code: "server_unavailable",
+          message: "The server is temporarily unavailable (503). Please try "
+            + "again in a moment." } }) });
+    };
+    await page.route(REOPEN_RE, holdRoundTripFail);
+    await page.click("[data-setup-card-confirm-yes]");
+    await sevenHeld;
+    await page.waitForTimeout(400);
+
+    const held7 = await readCard(page);
+    if (held7.state !== "pending") {
+      fail(`[${L}/6a] the card reads "${held7.state}" with its own reopen POST `
+        + `held before the server`);
+    }
+    const pendingGeneration7 = held7.generation;
+
+    // ---- A → B through the REAL #ctx-select, without releasing. ----
+    await switchContext(page, shared.pb, shared.sb, `${L}/6a`);
+    await gotoFacilitiesLanding(page, `${L}/6a/B`);
+    await settled(page, `${L}/6a/B`, shared.sb);
+    await page.waitForTimeout(300);
+
+    const bCard6 = await readCard(page);
+    if (bCard6.seasonId !== shared.sb || bCard6.programId !== shared.pb) {
+      fail(`[${L}/6a/B] B's card is bound to `
+        + `${JSON.stringify({ p: bCard6.programId, s: bCard6.seasonId })}, not `
+        + `to Program/Season B`);
+    }
+    if (bCard6.busy !== "false" || bCard6.intentPending) {
+      fail(`[${L}/6a/B] B's card is not idle (aria-busy ${bCard6.busy}, switch `
+        + `intent ${bCard6.intentPending}) — A's unresolved write is being `
+        + `charged to the tuple the operator switched TO`);
+    }
+    if (!bCard6.hasLanding || !bCard6.hasActionsBox) {
+      fail(`[${L}/6a/B] B's Facilities landing did not paint (landing `
+        + `${bCard6.hasLanding}, action container ${bCard6.hasActionsBox})`);
+    }
+    if (!(bCard6.actionButtons || []).length) {
+      fail(`[${L}/6a/B] B's card offers NO action `
+        + `(${JSON.stringify(bCard6.actionButtons)}) while A's write is `
+        + `unresolved — the refusal was made global-by-card and froze the `
+        + `Program/Season the operator switched to, which is not the rule: B `
+        + `has no unresolved operation of its own and must render normally`);
+    }
+    // THE registration, still standing. Deleting it here is the reported
+    // defect, and it is caught HERE — before any of its consequences — so the
+    // failure names the cause rather than a symptom three steps downstream.
+    const ledgerOnB = await readLedger(page);
+    if (ledgerOnB.entries !== 1 || ledgerOnB.targets[0] !== s7.season) {
+      fail(`[${L}/6a/B] the unresolved operation against Season A7 was `
+        + `forgotten the moment another tuple became current (ledger `
+        + `${JSON.stringify(ledgerOnB)}). Navigation cancelled neither the `
+        + `request nor its server transaction, so the operation is still live `
+        + `and its record must outlive the view that started it.`);
+    }
+
+    // ---- B → A, back onto the operation's own target. ----
+    await switchContext(page, shared.pa, s7.season, `${L}/6a`);
+    await gotoFacilitiesLanding(page, `${L}/6a/back`);
+    await pendingPresentation(page, `${L}/6a/back`, s7.season);
+
+    const back7 = await readCard(page);
+    if (back7.generation !== pendingGeneration7) {
+      fail(`[${L}/6a/back] the returned card reads generation `
+        + `${back7.generation}, not the ${pendingGeneration7} it entered `
+        + `PENDING with — the presentation was rebuilt from something other `
+        + `than the operation itself`);
+    }
+    // NON-VACUITY, and the point of the whole leg: the card's COUNTER moved
+    // while the operator was away, so the initiating UI identity is genuinely
+    // stale and the settlement below must take the stale-identity path. If
+    // these were equal, leg 6 would be re-testing leg 5.
+    if (!(back7.counter > pendingGeneration7)) {
+      fail(`[${L}/6a/back] the card's generation counter is ${back7.counter}, `
+        + `not past the pending ${pendingGeneration7}, so the round trip never `
+        + `superseded the initiating identity and this leg is not exercising `
+        + `the stale-identity path at all`);
+    }
+    if (back7.seasonId !== s7.season || back7.programId !== shared.pa) {
+      fail(`[${L}/6a/back] the restored pending identity is bound to `
+        + `${JSON.stringify({ p: back7.programId, s: back7.seasonId })}, not to `
+        + `the Program/Season the write targets`);
+    }
+    if (back7.busy !== "true") {
+      fail(`[${L}/6a/back] aria-busy is "${back7.busy}" on the target of a `
+        + `write that has not settled; assistive technology is told the region `
+        + `is idle while a lifecycle mutation is still in flight`);
+    }
+    if (back7.pendingText !== BUSY_TEXT) {
+      fail(`[${L}/6a/back] the pending line reads `
+        + `${JSON.stringify(back7.pendingText)}, expected `
+        + `${JSON.stringify(BUSY_TEXT)}`);
+    }
+    if (back7.intentPending) {
+      fail(`[${L}/6a/back] the context switch has not reconciled yet, so any `
+        + `"no controls" reading here would be the switch-intent withdrawal `
+        + `rather than the unresolved write`);
+    }
+    if (!back7.hasLanding || !back7.hasActionsBox) {
+      fail(`[${L}/6a/back] the Facilities landing did not paint on the return `
+        + `(landing ${back7.hasLanding}, action container `
+        + `${back7.hasActionsBox}), so "zero controls" would be true for the `
+        + `wrong reason`);
+    }
+    if ((back7.slotButtons || []).length !== 0
+        || (back7.actionButtons || []).length !== 0) {
+      fail(`[${L}/6a/back] the returned card is actionable again (card `
+        + `${JSON.stringify(back7.slotButtons)}, landing `
+        + `${JSON.stringify(back7.actionButtons)}) with its first write still `
+        + `unresolved — the reported "A now renders READY ... with Reopen this `
+        + `season actionable, although its first write is still unresolved"`);
+    }
+    const backSnap7 = await snapshot(page);
+    if (backSnap7.rollup !== rollup6aBefore.rollup) {
+      fail(`[${L}/6a/back] the completion count / next-task recommendation `
+        + `moved across the round trip while the write was unresolved.\n`
+        + `  before: ${rollup6aBefore.rollup}\n  after:  ${backSnap7.rollup}`);
+    }
+    // Attempted BEFORE the count is asserted, so a build that restored the
+    // control is measured by the duplicate POST it actually issues rather than
+    // stopped one assertion earlier.
+    await attemptSecondWrite(page);
+    if (reopen7Requests !== 1) {
+      fail(`[${L}/6a/back] ${reopen7Requests} reopen requests were issued for `
+        + `one Season across an A → B → A round trip while the first was still `
+        + `unresolved. Leaving the tuple destroyed the registration, so the `
+        + `return rendered the card actionable and the UI issued a second `
+        + `lifecycle mutation before it could know the outcome of the first — `
+        + `duplicated lifecycle and audit effects, from neither write.`);
+    }
+    if ((await readLedger(page)).entries !== 1) {
+      fail(`[${L}/6a/back] the attempts to start a second write disturbed the `
+        + `first operation's registration`);
+    }
+
+    // ---- released as a 503, then RECONCILED FROM FRESH SERVER TRUTH ----
+    const deliveriesBefore7 = reopenDeliveries;
+    const progressBefore7 = progressReads;
+    releaseSeven();
+    const deadline7 = Date.now() + 10000;
+    while (reopenDeliveries === deliveriesBefore7 && Date.now() < deadline7) {
+      await page.waitForTimeout(100);
+    }
+    if (reopenDeliveries === deliveriesBefore7) {
+      fail(`[${L}/6a] the released 503 never reached the page, so nothing was `
+        + `actually settled`);
+    }
+    await page.waitForFunction(() => {
+      const e = readCardState("setup/facilities");
+      return e.state !== "pending" && e.state !== "loading";
+    }, null, { timeout: 15000 })
+      .catch(() => fail(`[${L}/6a/settle] the card is STILL pending after its `
+        + `own request settled. The registration is only released on the path `
+        + `where the initiating identity survived, so an operation the `
+        + `operator stepped away from leaves its target blocked forever.`));
+    await page.waitForTimeout(700);
+    await page.unroute(REOPEN_RE, holdRoundTripFail);
+
+    if (progressReads <= progressBefore7) {
+      fail(`[${L}/6a/settle] not one /api/v2/setup/progress read left the `
+        + `browser after the settlement (${progressBefore7} -> `
+        + `${progressReads}), so the card was restored from state the client `
+        + `was HOLDING rather than reconciled from what the server now says. `
+        + `After a round trip the held state is exactly what the client is no `
+        + `longer entitled to trust.`);
+    }
+    const settled7 = await readCard(page);
+    if (settled7.state === "confirm" || settled7.reasonValue !== null) {
+      fail(`[${L}/6a/settle] the settlement restored the HELD confirmation `
+        + `(state "${settled7.state}", reason `
+        + `${JSON.stringify(settled7.reasonValue)}) instead of reconciling. A `
+        + `503 delivered after a round trip does not prove the write did not `
+        + `commit — navigation cancelled nothing — so handing back the `
+        + `operator's own pre-write state is a claim the client cannot support.`);
+    }
+    if (settled7.effective !== "Reopen this season") {
+      fail(`[${L}/6a/settle] the reconciled card offers `
+        + `${JSON.stringify(settled7.effective)}, but the server still reports `
+        + `Season A7 archived, so the REAL recovery action is "Reopen this `
+        + `season"`);
+    }
+    if (!(settled7.actionButtons || []).some((b) => /reopen this season/i.test(b))) {
+      fail(`[${L}/6a/settle] the reconciled landing offers no recovery control: `
+        + `${JSON.stringify(settled7.actionButtons)}`);
+    }
+    const spoken7 = await spoken(page);
+    if (spoken7.some((a) => a.text === DONE_TEXT)) {
+      fail(`[${L}/6a/settle] a completion sentence was announced for a write `
+        + `whose outcome the client could not know: ${JSON.stringify(spoken7)}`);
+    }
+    if (spoken7.some((a) => /503|unavailable|could not be reopened/i.test(a.text))) {
+      fail(`[${L}/6a/settle] the discarded response's own error text was `
+        + `announced: ${JSON.stringify(spoken7)}. That response was superseded `
+        + `by the round trip; the card was reconciled from the server instead, `
+        + `and speaking the stale outcome tells the operator something the `
+        + `client did not establish.`);
+    }
+    const ledgerAfter7 = await readLedger(page);
+    if (ledgerAfter7.entries !== 0 || ledgerAfter7.cards.length !== 0) {
+      fail(`[${L}/6a/settle] the ledger did not drain on settlement: `
+        + `${JSON.stringify(ledgerAfter7)}`);
+    }
+    if (reopen7Requests !== 1) {
+      fail(`[${L}/6a] ${reopen7Requests} reopen requests in total for one Season`);
+    }
+    if (await seasonActiveFloorMet(page) !== false) {
+      fail(`[${L}/6a] the Season is active after a 503 that never reached the `
+        + `server`);
+    }
+
+    // ------- (6b) the same round trip, released as a COMMITTED success -------
+    await apiPost(page, "/api/context", { program_id: shared.pa, season_id: s8.season });
+    await reenter(page, base);
+    await openFacilities(page, `${L}/6b`);
+    await armAnnouncements(page);
+    await openConfirmWithReason(page, `${L}/6b`, "round trip, committed write");
+    await resetAnnouncements(page);
+
+    let reopen8Requests = 0;
+    let releaseEight = () => {};
+    let markEightHeld = () => {};
+    const eightHeld = new Promise((resolve) => { markEightHeld = resolve; });
+    const eightGate = new Promise((resolve) => { releaseEight = resolve; });
+    let committed8Status = null;
+    let committed8Body = null;
+    // Held before the server (so the duplicate-write count stays honest across
+    // the round trip) and executed against the server only on RELEASE — by
+    // which time the operator is back on the target, so the single response
+    // this card receives is a genuinely committed reopen.
+    const holdRoundTripCommit = async (route) => {
+      reopen8Requests += 1;
+      markEightHeld();
+      await eightGate;
+      const response = await route.fetch();
+      committed8Status = response.status();
+      try { committed8Body = await response.json(); } catch (e) { committed8Body = null; }
+      await route.fulfill({ response });
+    };
+    await page.route(REOPEN_RE, holdRoundTripCommit);
+    await page.click("[data-setup-card-confirm-yes]");
+    await eightHeld;
+    await page.waitForTimeout(400);
+    const pendingGeneration8 = (await readCard(page)).generation;
+
+    await switchContext(page, shared.pb, shared.sb, `${L}/6b`);
+    await gotoFacilitiesLanding(page, `${L}/6b/B`);
+    await settled(page, `${L}/6b/B`, shared.sb);
+    const bCard8 = await readCard(page);
+    if (!(bCard8.actionButtons || []).length || bCard8.busy !== "false") {
+      fail(`[${L}/6b/B] B did not render normally while A's write was `
+        + `unresolved (actions ${JSON.stringify(bCard8.actionButtons)}, `
+        + `aria-busy ${bCard8.busy})`);
+    }
+    await switchContext(page, shared.pa, s8.season, `${L}/6b`);
+    await gotoFacilitiesLanding(page, `${L}/6b/back`);
+    await pendingPresentation(page, `${L}/6b/back`, s8.season);
+
+    const back8 = await readCard(page);
+    if (back8.generation !== pendingGeneration8 || !(back8.counter > pendingGeneration8)) {
+      fail(`[${L}/6b/back] the returned card is at generation `
+        + `${back8.generation} with counter ${back8.counter}, expected the `
+        + `pending ${pendingGeneration8} behind an advanced counter`);
+    }
+    if ((back8.slotButtons || []).length !== 0
+        || (back8.actionButtons || []).length !== 0) {
+      fail(`[${L}/6b/back] the returned card is actionable with its write `
+        + `still unresolved (card ${JSON.stringify(back8.slotButtons)}, landing `
+        + `${JSON.stringify(back8.actionButtons)})`);
+    }
+    await attemptSecondWrite(page);
+    if (reopen8Requests !== 1) {
+      fail(`[${L}/6b/back] ${reopen8Requests} reopen requests were issued for `
+        + `one Season across the round trip`);
+    }
+
+    const progressBefore8 = progressReads;
+    releaseEight();
+    await page.waitForFunction(() => {
+      const e = readCardState("setup/facilities");
+      return e.state !== "pending" && e.state !== "loading";
+    }, null, { timeout: 20000 })
+      .catch(() => fail(`[${L}/6b/settle] the card never left PENDING after its `
+        + `committed success settled — the registration outlived the request`));
+    await page.waitForTimeout(700);
+    await page.unroute(REOPEN_RE, holdRoundTripCommit);
+    if (committed8Status !== 200 || !committed8Body || committed8Body.error) {
+      fail(`[${L}/6b] the released response was not a committed success `
+        + `(status ${committed8Status}, body ${JSON.stringify(committed8Body)}) `
+        + `— the "advance to the next valid action" assertion below would then `
+        + `be measuring nothing`);
+    }
+    if (progressReads <= progressBefore8) {
+      fail(`[${L}/6b/settle] no progress read left the browser after the `
+        + `settlement, so the card was not reconciled from server truth`);
+    }
+    const settled8 = await readCard(page);
+    if (settled8.blockedBecause !== null || settled8.effective !== "Add Ice") {
+      fail(`[${L}/6b/settle] the reconciled card did not advance to the next `
+        + `valid action (blockedBecause `
+        + `${JSON.stringify(settled8.blockedBecause)}, effective `
+        + `${JSON.stringify(settled8.effective)}). The server has committed the `
+        + `reopen, so "Add Ice" is what fresh truth says — and it is a state no `
+        + `HELD value could have produced, because everything this client was `
+        + `carrying was blocked by season_active.`);
+    }
+    const spoken8 = await spoken(page);
+    if (spoken8.some((a) => a.text === DONE_TEXT)) {
+      fail(`[${L}/6b/settle] a completion sentence was announced for a write `
+        + `the client had stopped tracking: ${JSON.stringify(spoken8)}`);
+    }
+    if (reopen8Requests !== 1) {
+      fail(`[${L}/6b] ${reopen8Requests} reopen requests in total for one Season`);
+    }
+    const ledgerAfter8 = await readLedger(page);
+    if (ledgerAfter8.entries !== 0) {
+      fail(`[${L}/6b/settle] the ledger did not drain: `
+        + `${JSON.stringify(ledgerAfter8)}`);
+    }
+
+    // ---- (6c) released while the operator is STILL ON B ----
+    // The drain has to happen on the path where NOTHING else does: the
+    // response lands, the round-4 rule forbids it from touching anything on
+    // the tuple that is current, and it returns. If the registration is
+    // released only where the initiating identity survived, the target tuple
+    // is blocked the next time the operator looks at it — forever.
+    await apiPost(page, "/api/context", { program_id: shared.pa, season_id: s9.season });
+    await reenter(page, base);
+    await openFacilities(page, `${L}/6c`);
+    await armAnnouncements(page);
+    const rollup6cBefore = await snapshot(page);
+    await openConfirmWithReason(page, `${L}/6c`, "released while away");
+
+    let reopen9Requests = 0;
+    let releaseNine = () => {};
+    let markNineHeld = () => {};
+    const nineHeld = new Promise((resolve) => { markNineHeld = resolve; });
+    const nineGate = new Promise((resolve) => { releaseNine = resolve; });
+    const holdAwayFail = async (route) => {
+      reopen9Requests += 1;
+      markNineHeld();
+      await nineGate;
+      resourceAllowance += 1;
+      await route.fulfill({ status: 503, contentType: "application/json",
+        body: JSON.stringify({ error: { code: "server_unavailable",
+          message: "The server is temporarily unavailable (503). Please try "
+            + "again in a moment." } }) });
+    };
+    await page.route(REOPEN_RE, holdAwayFail);
+    await page.click("[data-setup-card-confirm-yes]");
+    await nineHeld;
+    await page.waitForTimeout(400);
+
+    await switchContext(page, shared.pb, shared.sb, `${L}/6c`);
+    await gotoFacilitiesLanding(page, `${L}/6c/B`);
+    await settled(page, `${L}/6c/B`, shared.sb);
+    await page.waitForTimeout(300);
+    // updateToast()'s 4-second auto-clear is a DISMISSAL, not a mutation.
+    // Wait for the region to be quiet before the baseline, so a dismissal
+    // landing between the two snapshots can never be read as the released
+    // response having changed B.
+    await page.waitForFunction(() => {
+      const root = document.getElementById("toast-root");
+      return !root || root.hidden;
+    }, null, { timeout: 15000 }).catch(() => {});
+    const b9Before = await snapshot(page);
+    assertDiffers(rollup6cBefore, b9Before, L, "6c/B");
+    await resetAnnouncements(page);
+    const deliveriesBefore9 = reopenDeliveries;
+
+    releaseNine();
+    const deadline9 = Date.now() + 10000;
+    while (reopenDeliveries === deliveriesBefore9 && Date.now() < deadline9) {
+      await page.waitForTimeout(100);
+    }
+    if (reopenDeliveries === deliveriesBefore9) {
+      fail(`[${L}/6c] the released response never reached the page, so nothing `
+        + `was actually settled`);
+    }
+    await page.waitForTimeout(1500);
+    await page.unroute(REOPEN_RE, holdAwayFail);
+
+    // The round-4 rule, unchanged: a response landing on another tuple changes
+    // NOTHING there — not the DOM, not focus, not the live region, not the
+    // completion line or the next task.
+    const b9After = await snapshot(page);
+    assertSame(b9Before, b9After, L, "6c");
+    const b9Spoken = await spoken(page);
+    if (b9Spoken.some((a) => /unavailable|503|reopen/i.test(a.text))) {
+      fail(`[${L}/6c] the settled response spoke into B's live region: `
+        + `${JSON.stringify(b9Spoken)}`);
+    }
+    // ...and the ledger drains ANYWAY, read directly rather than inferred.
+    const ledgerAfter9 = await readLedger(page);
+    if (ledgerAfter9.entries !== 0 || ledgerAfter9.cards.length !== 0) {
+      fail(`[${L}/6c] the operation settled while the operator was on B, but `
+        + `its registration survived: ${JSON.stringify(ledgerAfter9)}. `
+        + `Settlement must release the record even when the initiating UI `
+        + `identity is stale — otherwise the target tuple is blocked forever `
+        + `by an operation that has already finished.`);
+    }
+
+    // A later return to the target reads CURRENT SERVER TRUTH — it does not
+    // sit pending behind a registration nothing will ever retire.
+    await switchContext(page, shared.pa, s9.season, `${L}/6c/back`);
+    await gotoFacilitiesLanding(page, `${L}/6c/back`);
+    await settled(page, `${L}/6c/back`, s9.season);
+    const back9 = await readCard(page);
+    if (back9.effective !== "Reopen this season" || !back9.blockedBecause) {
+      fail(`[${L}/6c/back] returning to Season A9 did not read the server's `
+        + `current state (effective ${JSON.stringify(back9.effective)}, `
+        + `blockedBecause ${JSON.stringify(back9.blockedBecause)}) — the 503 `
+        + `never reached the server, so the Season is still archived and the `
+        + `card must say so`);
+    }
+    if (!(back9.actionButtons || []).length) {
+      fail(`[${L}/6c/back] the card came back non-actionable although its `
+        + `operation settled while the operator was away: `
+        + `${JSON.stringify(back9.actionButtons)}`);
+    }
+    if (reopen9Requests !== 1) {
+      fail(`[${L}/6c] ${reopen9Requests} reopen requests in total for one Season`);
+    }
+    if (await seasonActiveFloorMet(page) !== false) {
+      fail(`[${L}/6c] the Season is active after a 503 that never reached the `
+        + `server`);
+    }
+
     if (errors.length) fail(`[${L}] browser errors:\n${errors.join("\n")}`);
     console.log(`[${L}] OK — a held reopen POST leaves the Facilities card `
       + `PENDING and aria-busy with NO control on either surface, keyboard focus `
@@ -1371,7 +1986,24 @@ async function checkViewport(browser, viewport) {
       + `cards normally — and pointer, keyboard and direct code-level attempts `
       + `to start a second write leave the interceptor's reopen count at exactly `
       + `one; the held 503 then still restores the reason/error/focus recovery, `
-      + `and a held-then-committed success advances this card and only this card.`);
+      + `and a held-then-committed success advances this card and only this card. `
+      + `Switching A -> B -> A through the real #ctx-select without releasing, B `
+      + `renders normally — its own Season, aria-busy false, its own action `
+      + `offered — while the operation's registration goes on existing, and the `
+      + `returned card comes back rebuilt from that registration alone: pending `
+      + `at the generation it entered PENDING with, behind a counter that has `
+      + `moved past it, aria-busy true, an unchanged completion/next roll-up and `
+      + `zero controls on both the card body and the landing action groups, with `
+      + `pointer, keyboard and direct code-level attempts leaving the reopen `
+      + `count at exactly one. Settlement then drains the registration on every `
+      + `path and reconciles the returned card from a FRESH server read rather `
+      + `than from held state — a 503 lands on the real recovery action with the `
+      + `Season still archived server-side, a committed success advances to "Add `
+      + `Ice", and neither speaks a completion sentence or the discarded `
+      + `response's own text. Released while the operator is still on B, B stays `
+      + `snapshot-identical and silent, the ledger drains all the same, and a `
+      + `later return to the target reads current server truth instead of `
+      + `sitting blocked behind a registration nothing would retire.`);
   } catch (e) {
     if (serverOutput.trim()) {
       console.error("--- demo server output ---\n" + serverOutput.trim());
