@@ -527,8 +527,17 @@ async function checkViewport(browser, viewport) {
     // The card's OWN refresh is what the reopen triggers, so wait for that
     // settle rather than re-navigating (a navigation would re-derive
     // everything and prove nothing about this card's own path).
-    await page.waitForFunction(() =>
-      readCardState("setup/facilities").state !== "loading", null, { timeout: 15000 });
+    //
+    // "pending" is excluded as well as "loading" (#365 review round 4): the
+    // card now holds a PENDING state for as long as the reopen POST is
+    // unresolved, and Playwright learns of the response fractionally before
+    // the page's own handler runs. Waiting only for `!== "loading"` would
+    // therefore sample the card mid-write and read PENDING -- a stronger
+    // predicate, not a weaker one, since PENDING is never a settled state.
+    await page.waitForFunction(() => {
+      const s = readCardState("setup/facilities").state;
+      return s !== "loading" && s !== "pending";
+    }, null, { timeout: 15000 });
 
     const after = await readLanding(page, "facilities");
     if (after.blockedBecause !== null) {

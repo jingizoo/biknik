@@ -32,6 +32,7 @@
     "ice-availability-builder": "node ice-availability-builder.js",
     "facilities-venue-access": "node facilities-venue-access.js",
     "setup-prerequisite-floors": "node setup-prerequisite-floors.js",
+    "setup-card-write-identity": "node setup-card-write-identity.js",
     "allowed-venues": "node allowed-venues.js",
     "venue-access-cleanup": "node venue-access-cleanup.js",
     "venue-sharing": "node venue-sharing.js",

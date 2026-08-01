@@ -1291,6 +1291,15 @@ details.tn > .tn-sum:hover { background: #f6f7fb; }
 .swf-card-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .swf-card-error { margin: 0; font-size: 13px; line-height: 1.45; color: #c0271b; }
 .swf-card-stale { margin: 0; font-size: 13px; line-height: 1.45; color: #57575c; }
+/* A write this card started is in flight (#365 review round 4). Reuses the
+   stale sentence's measured #57575c-on-#fff / #f4f5f8 pair rather than
+   introducing an unmeasured colour. It carries tabindex="-1" because focus is
+   moved onto it when the confirmation it replaced is removed, so it keeps a
+   visible focus ring — a programmatic focus destination the operator cannot
+   see is the same defect as no destination at all. */
+.swf-card-pending { margin: 0; font-size: 13px; line-height: 1.45; color: #57575c; }
+.swf-card-pending:focus-visible { outline: 2px solid var(--accent, #2563eb);
+  outline-offset: 2px; border-radius: 4px; }
 /* `.swf-card-blocked` is the PARTIAL-state counterpart of `.swf-card-empty`
    (#365 owner ruling round 2): a card with real counts whose declared primary
    still cannot create the next record. Deliberately shares the empty state's

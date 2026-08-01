@@ -398,6 +398,28 @@ async function post(p, b) {
   if (d && d.error) { toast = d.error.message; toastIsError = true; }
   return d;
 }
+// The same transport as post(), minus its GLOBAL toast writes — for a write
+// whose outcome belongs to ONE card rather than to the page (#365).
+//
+// post() publishes the server's error message into the sitewide toast the
+// instant its own await resolves, which is a mutation of the CURRENT tuple
+// performed by a response that may already be superseded: the operator can
+// have switched Program/Season while the POST was in flight, and an older
+// tuple's failure would then speak over the new one. A card-scoped write has
+// to be able to decide, AFTER re-checking its identity, whether that message
+// is allowed to be said at all — so this hands the outcome back and says
+// nothing itself. Callers announce through announceCardStatus(), which is
+// identity-gated like every other mutation point.
+async function postScoped(p, b) {
+  try {
+    return await readApiResponse(await fetch(p, { method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(b || {}) }));
+  } catch (_) {
+    return networkErrorResult();
+  }
+}
 
 // Shared write-order logic for moving a season registration to a new
 // League/Division (#233 B2b review) — used by BOTH Season participation's
@@ -579,6 +601,15 @@ const CARD_STATE = Object.freeze({
   STALE: "stale",       // held data bound to a context tuple that is no longer active
   ERROR: "error",       // this card's own fetch failed; retry is scoped to it
   CONFIRM: "confirm",   // an in-card confirmation is awaiting the operator
+  // A WRITE this card itself started is in flight. Distinct from LOADING,
+  // which is a READ: a read can be superseded and forgotten, whereas an
+  // unresolved write has already left the browser and its outcome is not yet
+  // known. The card therefore keeps its counts, offers NO control (a second
+  // press would fire a second write), and holds keyboard focus itself rather
+  // than letting the replaced confirmation drop focus to <body>. Terminal in
+  // one direction only: the write's own response — verified still current —
+  // is what moves it, never a render that happens to run.
+  PENDING: "pending",
   SUCCESS: "success",   // resolved, and this card's work is complete
 });
 const CARD_STATUS = Object.freeze({
@@ -4168,7 +4199,18 @@ const SETUP_SEASON_REOPEN_ACTION = {
       + " selected, and its existing records are untouched.",
     reason: "Why is this season being reopened?",
     yes: "Reopen season", no: "Keep it archived",
-    done: "Season reopened.", cancelled: "The season stays archived." },
+    // `busy` is what the card says WHILE the write is in flight, and `done`
+    // is said ONLY after the server has confirmed it (#365 review round 4).
+    // Keeping both in the declaration is what makes it impossible for the
+    // writer to reuse the completion sentence as a progress one.
+    busy: "Reopening this season…",
+    done: "Season reopened — it can be changed again.",
+    // Said when the reopen SUCCEEDED but this card's own follow-up refresh
+    // did not: the operator must not be told only about the refresh, because
+    // the Season really did reopen and the audit trail really did record it.
+    doneNoRefresh: "Season reopened, but this card's summary couldn't be"
+      + " reloaded. Retry below.",
+    cancelled: "The season stays archived." },
 };
 
 // The RESOLUTION each asserted prerequisite has, keyed "<workflow>/<key>".
@@ -4489,8 +4531,18 @@ function commitSetupWorkflowCards(src) {
 function setupHubRollup() {
   const rows = setupWorkflowsFor().map((w) => {
     const entry = readCardState(setupWorkflowCardId(w.key));
+    // CONFIRM and PENDING count as settled for the SAME reason: neither has
+    // changed anything yet. A confirmation is a question, and a pending write
+    // is a request the server has not answered — the card is still holding
+    // exactly the status it settled with, so the completion count and the
+    // next-task recommendation must read exactly as they did before the
+    // operator pressed anything. Treating PENDING as unknown would move the
+    // roll-up on the strength of a write that has not happened, which is the
+    // same premature-completion claim #365 review round 4 forbids at every
+    // other mutation point.
     const settled = entry.state === CARD_STATE.READY || entry.state === CARD_STATE.EMPTY
-      || entry.state === CARD_STATE.SUCCESS || entry.state === CARD_STATE.CONFIRM;
+      || entry.state === CARD_STATE.SUCCESS || entry.state === CARD_STATE.CONFIRM
+      || entry.state === CARD_STATE.PENDING;
     return { key: w.key, label: w.title,
              optional: entry.optional === undefined ? !!w.optional : !!entry.optional,
              status: settled ? (entry.status || CARD_STATUS.UNKNOWN) : CARD_STATUS.UNKNOWN };
@@ -4635,6 +4687,26 @@ function setupCardBodyHtml(w, landing) {
         league you had selected earlier.</p>
       ${retry("Refresh")}`;
   }
+  if (entry.state === CARD_STATE.PENDING) {
+    // A write this card started is IN FLIGHT (#365 review round 4). Three
+    // things this body has to get right, all of them the reported defect:
+    //  * The counts STAY. Blanking them would claim the write has already
+    //    changed something, which is exactly the premature-success the
+    //    pending state exists to stop.
+    //  * NO control at all. The confirmation's own buttons are gone (a second
+    //    press would fire a second reopen), and no retry is offered while the
+    //    first attempt is unresolved.
+    //  * The sentence is FOCUSABLE and is where focus is put. The controls
+    //    the operator was standing on have just been replaced; without a
+    //    destination, focus falls to <body> and a keyboard or screen-reader
+    //    operator is stranded mid-operation with no idea anything is
+    //    happening. tabindex="-1" is the same non-focusable-destination
+    //    convention focusContentHeading() uses — reachable programmatically,
+    //    never inserted into the tab order.
+    return `${stats(entry.stats)}
+      <p class="swf-card-pending" data-setup-card-pending="${esc(w.key)}"
+        tabindex="-1">${esc(entry.pendingNote || "Working…")}</p>`;
+  }
   if (entry.state === CARD_STATE.CONFIRM) {
     const c = entry.confirm || {};
     // A confirmation may REQUIRE a reason (#365 review round 3): reopening an
@@ -4703,8 +4775,18 @@ function setupCardBodyHtml(w, landing) {
 function setupCardSlotHtml(w, landing) {
   const entry = readCardState(setupWorkflowCardId(w.key));
   return `<div class="swf-card-body" data-setup-card-slot="${esc(w.key)}"
-    aria-busy="${entry.state === CARD_STATE.LOADING ? "true" : "false"}"
+    aria-busy="${cardBusy(entry) ? "true" : "false"}"
     >${setupCardBodyHtml(w, landing)}</div>`;
+}
+
+// aria-busy is true for a card with an unresolved request of EITHER kind: a
+// read in flight (LOADING) or a write in flight (PENDING). Assistive
+// technology's question is "is this region still changing", and the answer is
+// yes in both — a pending write that reported itself idle would invite the
+// second press the state exists to prevent.
+function cardBusy(entry) {
+  return !!entry && (entry.state === CARD_STATE.LOADING
+    || entry.state === CARD_STATE.PENDING);
 }
 
 // (1) DOM mutation, scoped to ONE card: repaints this workflow's slot(s) --
@@ -4722,7 +4804,7 @@ function repaintSetupWorkflowCard(key, identity) {
   const entry = readCardState(setupWorkflowCardId(key));
   slots.forEach((slot) => {
     slot.innerHTML = setupCardBodyHtml(w, !!slot.closest(".swf-landing"));
-    slot.setAttribute("aria-busy", entry.state === CARD_STATE.LOADING ? "true" : "false");
+    slot.setAttribute("aria-busy", cardBusy(entry) ? "true" : "false");
   });
   const head = document.querySelector(`[data-setup-workflow-card="${key}"] .swf-head`);
   if (head) {
@@ -4762,7 +4844,17 @@ function repaintSetupWorkflowCard(key, identity) {
 // Deliberately does NOT write the module-level `playersList` the Records and
 // hierarchy views render from: this is one card's refresh, not the Setup
 // screen's.
-async function retrySetupWorkflowCard(key) {
+// `opts.done` / `opts.failed` let a CALLER THAT OWNS THE OUTCOME supply the
+// sentence instead of this function's generic one. The reopen writer is the
+// only such caller: without this, a successful reopen announced "Season
+// reopened." and was then immediately overwritten by this function's
+// "Venues, rinks and ice updated." — two announcements for one operation,
+// the second of which describes the refresh rather than what the operator
+// actually did. It is a SUBSTITUTION, never an addition: the announcement
+// still happens exactly once, at exactly this point, under exactly this
+// identity gate.
+async function retrySetupWorkflowCard(key, opts) {
+  const o = opts || {};
   const w = setupWorkflowsFor().find((x) => x.key === key);
   if (!w) return;
   const held = cardStates[setupWorkflowCardId(key)] || {};
@@ -4802,7 +4894,8 @@ async function retrySetupWorkflowCard(key) {
   if (!repaintSetupWorkflowCard(key, identity)) return;      // (1) DOM
   const failed = model.state === CARD_STATE.ERROR;
   announceCardStatus(identity, failed                        // (3) announcement
-    ? `Still couldn't load ${w.title}.` : `${w.title} updated.`, failed);
+    ? (o.failed || `Still couldn't load ${w.title}.`)
+    : (o.done || `${w.title} updated.`), failed);
   // (2) focus: the operator pressed Retry inside the slot that was just
   // replaced, so land them on this card's own heading rather than <body>.
   const landing = document.querySelector(`[data-setup-workflow-landing="${key}"]`);
@@ -4881,6 +4974,20 @@ function resolveSetupCardConfirm(key, yes) {
     focusCardTarget(stay, slot && slot.querySelector("[data-setup-card-confirm-reason]"));
     return;
   }
+  // A confirmed action that performs its OWN write from this card is handed
+  // straight to the writer, BEFORE anything here restores a settled state or
+  // announces (#365 review round 4). This is the fix for the reported defect:
+  // the code below restores READY, drops the confirmation and the reason, and
+  // announces `c.done` — all of which used to run BEFORE the reopen POST had
+  // even left the browser. That is a success claimed in advance, a recovery
+  // path thrown away while it is still needed, and a card left actionable
+  // with a write outstanding. The other three action kinds (`go`, `act`,
+  // `open`) navigate to a surface that owns its own write, so for them
+  // "confirmed" genuinely IS the end of this card's part and the restore
+  // below is correct.
+  if (yes && action && action.reopen) {
+    return reopenSelectedSeasonFromCard(key, held, c, reason);
+  }
   const identity = beginCardRequest(setupWorkflowCardId(key), { userInitiated: true });
   commitCardState(identity, Object.assign({}, held, {
     state: held.resumeState || CARD_STATE.READY, confirm: null, pending: null,
@@ -4895,7 +5002,6 @@ function resolveSetupCardConfirm(key, yes) {
     focusCardTarget(identity, document.querySelector(`[data-setup-card-ask="${key}"]`));
     return;
   }
-  if (action.reopen) return reopenSelectedSeasonFromCard(key, reason);
   if (action.go) return runSetupWorkflowGo(action.go);
   if (action.act) return openSetupWorkflowDrawer(action.act);
   if (action.open) return openSetupWorkflowLanding(action.open);
@@ -4923,8 +5029,65 @@ function resolveSetupCardConfirm(key, yes) {
 //    primary), under a fresh generation of this card and no other.
 //  * No page reload anywhere: the tuple is unchanged (same Season id), so the
 //    committed identity stays valid across the whole sequence.
-async function reopenSelectedSeasonFromCard(key, reason) {
-  const held = cardStates[setupWorkflowCardId(key)];
+//
+// #365 REVIEW ROUND 4 — WHAT WAS WRONG AND WHAT REPLACES IT
+// ---------------------------------------------------------
+// The first version was written as fire-and-forget optimism: the caller had
+// already restored READY, removed the reason field and announced "Season
+// reopened." before this function's `await` was even reached, and this
+// function checked the card's identity ONLY BEFORE that await. After it, both
+// the failure and the success branch wrote the sitewide toast, and the
+// success branch called retrySetupWorkflowCard() — bumping a generation,
+// re-committing a model, repainting and moving focus — without ever proving
+// the initiating card, tuple and generation were still the current ones. Held
+// open, an older Program/Season's response therefore reached in and changed
+// the NEW tuple's card: its generation, its committed model and DOM, its
+// focus, its announcement, and the completion and next-task lines derived
+// from it. That is precisely the stale-response race #365 requires every card
+// action to discard.
+//
+// The correction is not a new mechanism — it is the mechanism this slice
+// already uses everywhere else, applied here too:
+//
+//   IDENTITY IS ISSUED ONCE, UP FRONT, and carried through the WHOLE
+//   operation. `beginCardRequest` stamps card id + the exact
+//   Program/Season/League tuple + this card's generation, and every later
+//   step is gated on THAT record — not on a fresh one taken after the await,
+//   which would be trivially current and would prove nothing.
+//
+//   THE EXACT SEASON IS CARRIED TOO — as a pin, not as a second guarantee.
+//   `seasonId` is resolved once, here, and re-verified after the await. It
+//   cannot currently disagree with the identity's tuple (both read the same
+//   contextOptions.selected.season_id, synchronously, one line apart), so the
+//   protection above is entirely cardIdentityCurrent's; the pin exists because
+//   this write names its target explicitly in the URL instead of inheriting it
+//   from the tuple. See the gate itself for the full note.
+//
+//   NOTHING IS RESTORED OR ANNOUNCED BEFORE THE SERVER CONFIRMS. The card
+//   goes to PENDING, keeps its counts, offers no control at all, and holds
+//   focus on its own pending line. The only thing said out loud before the
+//   response is the progress sentence (`confirm.busy`), which claims nothing.
+//
+//   NOTHING HAPPENS AFTER THE AWAIT UNTIL THE INITIATING IDENTITY AND SEASON
+//   ARE RE-VERIFIED. Both terminal branches necessarily advance this card to
+//   its next generation — the failure branch by re-opening the confirmation,
+//   the success branch through retrySetupWorkflowCard's own refresh — so that
+//   one check, taken against the record captured BEFORE the await, is what
+//   stands between an older tuple's response and the current card's model,
+//   DOM, focus, live region, completion and next task. Everything after it is
+//   synchronous, so there is no second window; and each individual mutation
+//   still goes through the helper that enforces the same gate on its own
+//   account (commitCardState, repaintSetupWorkflowCard, announceCardStatus,
+//   focusCardTarget), exactly as every other card path in this file does.
+//   A superseded response returns having done nothing whatsoever — including
+//   nothing to the sitewide toast, which is why the transport here is
+//   postScoped() rather than post().
+async function reopenSelectedSeasonFromCard(key, held, c, reason) {
+  const cardId = setupWorkflowCardId(key);
+  // The EXACT Season this write targets, resolved ONCE. Everything after this
+  // line — the URL, the identity check before the await and the identity
+  // check after it — refers to this one value, so there is no second reading
+  // of live context that could disagree with the first.
   const seasonId = contextOptions && contextOptions.selected
     && contextOptions.selected.season_id;
   if (!seasonId || !held || !cardTupleCurrent(held.identity)
@@ -4934,14 +5097,85 @@ async function reopenSelectedSeasonFromCard(key, reason) {
     toastIsError = true;
     return updateToast();
   }
-  const r = await post(`/api/v2/setup/seasons/${seasonId}/reopen`,
-                       { reason: reason });
-  // post() already published the server's own error message into the toast.
-  if (!r || r.error) return updateToast();
-  toast = `Season reopened — it can be changed again.`;
-  toastIsError = false;
-  updateToast();
-  return retrySetupWorkflowCard(key);
+  // The INITIATING identity, issued once and carried through the whole
+  // operation — the record every later step is judged against. It stops being
+  // current the moment any other request for this card is started or the
+  // operator moves to another Program/Season/League.
+  const identity = beginCardRequest(cardId, { userInitiated: true });
+  // PENDING, BEFORE the request goes out. Counts stay, every control is
+  // withdrawn, and the reason travels with the state so the failure branch
+  // below can hand it straight back.
+  if (!commitCardState(identity, Object.assign({}, held, {
+        state: CARD_STATE.PENDING, confirmReason: reason, confirmError: null,
+        pendingNote: c.busy || "Working…" }))) return;
+  if (!repaintSetupWorkflowCard(key, identity)) return;
+  // A progress sentence, not a completion one. The confirmation's prompt is
+  // still standing in the live region otherwise, describing a question the
+  // operator has already answered.
+  announceCardStatus(identity, c.busy || "Working…");
+  const slot = document.querySelector(`[data-setup-card-slot="${key}"]`);
+  // Focus followed the controls that were just replaced; put it on the card's
+  // own pending line rather than letting it fall to <body>.
+  focusCardTarget(identity, slot && slot.querySelector("[data-setup-card-pending]"));
+  const r = await postScoped(`/api/v2/setup/seasons/${seasonId}/reopen`,
+                             { reason: reason });
+  // ======================= AFTER THE AWAIT =======================
+  // THE gate. Both terminal branches below move this card on to its NEXT
+  // generation — the failure branch by re-opening the confirmation, the
+  // success branch through retrySetupWorkflowCard's own refresh — so this one
+  // check is what stands between an older tuple's response and the current
+  // card's DOM, focus, live region, completion and next task. Nothing awaits
+  // between here and those mutations, so there is no window after it.
+  //
+  // `cardIdentityCurrent` is the conjunct that carries the guarantee: same
+  // card, same Program/Season/League tuple, same generation as the request
+  // that started this.
+  //
+  // The `season_id` conjunct is REDUNDANT TODAY and is not a second
+  // guarantee — say so plainly rather than let it read as one. `seasonId` is
+  // read from contextOptions.selected.season_id, and `identity.season_id` is
+  // set from currentCardTuple(), which reads that same field on the next
+  // synchronous line; the two cannot disagree, and cardIdentityCurrent already
+  // compares identity.season_id against the live tuple. It is kept because
+  // this write names its target EXPLICITLY in the URL rather than inheriting
+  // it from the tuple: if a future card ever reopens a Season other than the
+  // selected one, the tuple check alone would stop covering the target and
+  // this line would become the thing that does. Do not cite it as proof of
+  // anything the identity check is not already proving.
+  //
+  // A superseded response returns here having done nothing at all — no toast,
+  // no live region, no repaint, no refresh, no focus, no completion or
+  // next-task change. postScoped() is what makes "nothing" literally true:
+  // post() would already have published the server's error message into the
+  // sitewide toast before this line was ever reached.
+  if (!cardIdentityCurrent(identity) || identity.season_id !== seasonId) return;
+  if (!r || r.error) {
+    // A CURRENT failure restores an actionable confirmation with the entered
+    // reason retained — the operator's own words are not thrown away and made
+    // them type again — plus the server's own message, and focus on the
+    // reason field so the retry is one keystroke away. `confirm`, `pending`
+    // and `resumeState` ride along in `held`, so the restored confirmation is
+    // the same one, resolvable by the same code path.
+    const next = beginCardRequest(cardId, { userInitiated: true });
+    const message = (r && r.error && r.error.message)
+      || "The season could not be reopened.";
+    if (!commitCardState(next, Object.assign({}, held, {   // model + (4)/(5)
+          state: CARD_STATE.CONFIRM, confirmReason: reason,
+          confirmError: message }))) return;
+    if (!repaintSetupWorkflowCard(key, next)) return;      // (1) DOM
+    announceCardStatus(next, message, true);               // (3) announcement
+    const back = document.querySelector(`[data-setup-card-slot="${key}"]`);
+    focusCardTarget(next, back                             // (2) focus
+      && (back.querySelector("[data-setup-card-confirm-reason]")
+          || back.querySelector("[data-setup-card-confirm-yes]")));
+    return;
+  }
+  // A CURRENT success refreshes ONLY this card, and says so exactly once.
+  // (4) completion and (5) next task are derived from the model that refresh
+  // commits under its own identity gate, so a late loser can revise neither.
+  return retrySetupWorkflowCard(key, {
+    done: c.done || "Season reopened.",
+    failed: c.doneNoRefresh || c.done || "Season reopened." });
 }
 
 function wireSetupWorkflowCards(root) {
@@ -5094,8 +5328,15 @@ function setupLandingActions(state, blocked) {
   if (contextSwitchIntentPending) {
     return { primary: false, secondary: false, tertiary: false };
   }
+  // PENDING joins the withdrawal list for a reason the other three do not
+  // share: a control left standing here is not merely misleading, it is a
+  // SECOND WRITE one press away, against a Season whose first write has not
+  // reported back. "While current and pending, keep the card non-actionable"
+  // (#365 review round 4) is enforced HERE, on the landing's action groups,
+  // as well as in the card body — the two surfaces render the same card and
+  // either one left actionable would be the same defect.
   if (state === CARD_STATE.STALE || state === CARD_STATE.CONFIRM
-      || state === CARD_STATE.LOADING) {
+      || state === CARD_STATE.LOADING || state === CARD_STATE.PENDING) {
     return { primary: false, secondary: false, tertiary: false };
   }
   if (state === CARD_STATE.EMPTY || blocked) {
