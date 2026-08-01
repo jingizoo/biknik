@@ -78,6 +78,48 @@
 //      touches only this card: every other card's generation and committed
 //      model is byte-identical across the whole operation.
 //
+//  (5) SAME-TUPLE RENDER DURING AN UNRESOLVED WRITE — the round-5 blocker,
+//      verbatim from the review:
+//
+//        "A same-tuple render overwrites PENDING while the reopen POST is
+//        still unresolved, restores 'Reopen this season,' and permits a
+//        duplicate write. The new state says it is terminal until its own
+//        response, but commitSetupWorkflowCards() still issues a fresh
+//        generation and commits a newly fetched model for every workflow on
+//        an ordinary Setup render, without preserving a current same-tuple
+//        PENDING operation. ... After it settles, the same card is READY at
+//        generation 5, aria-busy=false, and Reopen this season is actionable
+//        again, even though the first write is still unresolved. Confirming
+//        again enters PENDING at generation 7 and produces a second reopen
+//        POST. The interceptor observed two concurrent writes for the same
+//        Season."
+//
+//      Legs 2 and 3 above prove a response arriving into a MOVED tuple is
+//      discarded. This leg is the opposite and previously unguarded case: the
+//      tuple does NOT move, an ordinary render runs underneath the write, and
+//      the write's identity must survive it intact. The request is held
+//      BEFORE it reaches the server (no route.fetch() until release), the
+//      render is triggered through the REAL Facilities navigation control,
+//      and the duplicate-write count is taken AT THE ROUTE INTERCEPTOR — so
+//      it counts writes ISSUED by the client, which is the actual harm,
+//      rather than writes the server happened to accept.
+//
+//      (5a) held-then-503: the card must retain the EXACT generation number
+//           it entered PENDING with (not merely `state === "pending"` — a
+//           repaint-back would satisfy that while having already superseded
+//           the write), aria-busy=true, its pending copy and focus, an
+//           unchanged completion/next roll-up, and ZERO actions on both the
+//           card body and the landing action groups; keyboard AND pointer
+//           activation must leave the reopen-request count at exactly one;
+//           and the eventual 503 must still produce the round-4 reason/error/
+//           focus recovery. Non-vacuity: the SAME render must be shown to
+//           have advanced the OTHER workflow cards' generations, or it would
+//           not have been a render at all.
+//      (5b) the same, released as a genuinely COMMITTED success: the one
+//           terminal response advances only this card — every other card's
+//           generation and committed model is byte-identical across the
+//           release — and says the one success sentence exactly once.
+//
 // TECHNIQUE
 // ---------
 //   * Delayed responses use this repo's established idiom: capture the REAL
@@ -393,6 +435,105 @@ async function switchContext(page, programId, seasonId, step) {
     .catch(() => fail(`[${step}] the context never settled on season ${seasonId}`));
 }
 
+// Re-enter the Facilities destination through the REAL navigation control —
+// the sidebar's own "Venues, rinks and ice" entry, which is what the reviewer
+// re-entered — and wait until the ordinary render pipeline has actually
+// REPLACED the painted surface. A synthetic render() call would prove nothing
+// about the destination transition; a fixed sleep would prove nothing about
+// the render having run at all.
+//
+// The wait is observed, not timed: the landing element is stamped before the
+// click and the stamp can only disappear when render()'s own
+// `c.innerHTML = renderSetup(...)` rebuilds it. That happens in BOTH a correct
+// build (which refuses the card's model commit but still repaints) and a
+// build without the preservation (which commits over it), so this wait cannot
+// mask the defect it is here to expose.
+async function sameTupleRenderThroughNav(page, step) {
+  const marked = await page.evaluate(() => {
+    const el = document.querySelector('[data-setup-workflow-landing="facilities"]');
+    if (!el) return false;
+    el.setAttribute("data-wi-render-mark", "1");
+    return true;
+  });
+  if (!marked) fail(`[${step}] the Facilities landing is not painted, so there `
+    + `is no destination to re-enter`);
+  const nav = await page.$('.tab[data-setup-workflow-nav="facilities"]');
+  if (!nav) fail(`[${step}] the real Facilities navigation control is not `
+    + `present, so the render cannot be triggered the way an operator does`);
+  await nav.click();
+  await page.waitForFunction(() => {
+    const el = document.querySelector('[data-setup-workflow-landing="facilities"]');
+    return !!el && !el.hasAttribute("data-wi-render-mark");
+  }, null, { timeout: 20000 })
+    .catch(() => fail(`[${step}] the same-tuple render never repainted the `
+      + `Facilities landing`));
+  // The paint is the last thing render() does before its wiring; give anything
+  // it kicked off (a per-card repaint, a focus poll) a beat to land, so the
+  // assertions below read a quiesced page rather than a mid-flight one.
+  await page.waitForTimeout(600);
+}
+
+// Try to start a SECOND reopen for this card, by pointer and by keyboard, the
+// way an operator would if the control were back. Deliberately tolerant: in a
+// correct build there is nothing to press and every attempt is a no-op, while
+// in a build that restored the control this drives the duplicate write all the
+// way through its confirmation to the POST. The caller asserts on the
+// interceptor's request count afterwards, so this function never fails — it
+// only tries.
+async function attemptSecondWrite(page) {
+  // ---- POINTER: whatever the landing now offers, followed through. ----
+  const primary = await page.$('[data-setup-landing-actions="facilities"] .act.primary');
+  if (primary) {
+    await primary.click({ timeout: 3000 }).catch(() => {});
+    const field = await page
+      .waitForSelector('[data-setup-card-confirm-reason="facilities"]', { timeout: 3000 })
+      .catch(() => null);
+    if (field) {
+      await field.fill("second write attempt").catch(() => {});
+      const yes = await page.$("[data-setup-card-confirm-yes]");
+      if (yes) await yes.click({ timeout: 3000 }).catch(() => {});
+    }
+  }
+  // A real mouse press at the place the control occupies, so "nothing to hit"
+  // is tested as a pointer fact and not only as a missing selector.
+  for (const sel of ['[data-setup-card-slot="facilities"]',
+                     '[data-setup-landing-actions="facilities"]']) {
+    const box = await page.locator(sel).boundingBox().catch(() => null);
+    if (box && box.width > 0 && box.height > 0) {
+      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2)
+        .catch(() => {});
+    }
+  }
+  // ---- KEYBOARD: every control reachable inside either surface. ----
+  const keyTargets = await page.$$('[data-setup-card-slot="facilities"] button, '
+    + '[data-setup-landing-actions="facilities"] button');
+  for (const el of keyTargets) {
+    await el.focus().catch(() => {});
+    await page.keyboard.press("Enter").catch(() => {});
+    await page.keyboard.press(" ").catch(() => {});
+  }
+  // ...and on the pending line itself, which IS focusable by design and is
+  // where a keyboard operator is standing while the write runs.
+  const pend = await page.$('[data-setup-card-pending="facilities"]');
+  if (pend) {
+    await pend.focus().catch(() => {});
+    await page.keyboard.press("Enter").catch(() => {});
+    await page.keyboard.press(" ").catch(() => {});
+  }
+  // ---- CODE-LEVEL FLOOR, beyond what any input device can reach. ----
+  // The two assertions above test that no CONTROL exists. This tests that the
+  // card's own write entry points refuse even when called directly, so the
+  // guarantee is "at most one unresolved write per card", not "at most one
+  // button". Not a substitute for the pointer/keyboard attempts — an addition
+  // under them.
+  await page.evaluate(() => {
+    try { askSetupCardConfirm("facilities", "primary:0"); } catch (e) {}
+    try { resolveSetupCardConfirm("facilities", true); } catch (e) {}
+    try { retrySetupWorkflowCard("facilities"); } catch (e) {}
+  });
+  await page.waitForTimeout(600);
+}
+
 // One archived Season, with a Venue, a Rink and an ACTIVE venue-access grant,
 // under the given Program. Non-vacuous by construction: the counts are
 // non-zero and the grant is live, so `season_active` is the ONLY unmet floor
@@ -504,6 +645,11 @@ async function checkViewport(browser, viewport) {
     const s2 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A2");
     const s3 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A3");
     const s4 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A4");
+    // Leg 5's two sub-legs each reopen (or try to reopen) their own Season for
+    // the same reason legs 1-4 do: a reused Season would silently make the
+    // next sub-leg's "still archived" precondition false.
+    const s5 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A5");
+    const s6 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A6");
 
     // =================== (1) HELD POST, THEN 503 =======================
     await apiPost(page, "/api/context", { program_id: shared.pa, season_id: s1.season });
@@ -883,6 +1029,323 @@ async function checkViewport(browser, viewport) {
       }
     }
 
+    // ====== (5) SAME-TUPLE RENDER WHILE THE WRITE IS UNRESOLVED ========
+    // The round-5 blocker. Everything above races a MOVED tuple; this races an
+    // ordinary render under the tuple that has NOT moved, which is the case
+    // the post-await identity guard cannot cover — by the time that guard
+    // runs, a render-driven commit has already superseded the write's identity
+    // and handed the operator back a control that fires a second one.
+    const facilitiesGeneration = () =>
+      page.evaluate(() => cardGenerations["setup/facilities"]);
+    const facilitiesModel = () =>
+      page.evaluate(() => JSON.stringify(cardStates["setup/facilities"]));
+
+    // ---------------- (5a) held before the server, then 503 ---------------
+    await apiPost(page, "/api/context", { program_id: shared.pa, season_id: s5.season });
+    await reenter(page, base);
+    await openFacilities(page, `${L}/5a`);
+    await armAnnouncements(page);
+    const before5 = await readCard(page);
+    if (before5.effective !== "Reopen this season") {
+      fail(`[${L}/5a] the fixture does not offer the reopen path (effective `
+        + `${JSON.stringify(before5.effective)}, state "${before5.state}")`);
+    }
+    const rollup5Before = await snapshot(page);
+    await openConfirmWithReason(page, `${L}/5a`, "render race, held write");
+    await resetAnnouncements(page);
+
+    // Held BEFORE the server sees it, and counted HERE — at the interceptor.
+    // The harm the reviewer measured is two writes ISSUED for one Season, so
+    // the count has to be taken where the client hands the request over, not
+    // in page code and not from responses the server chose to accept.
+    let reopen5Requests = 0;
+    let releaseFive = () => {};
+    let markFiveHeld = () => {};
+    const fiveHeld = new Promise((resolve) => { markFiveHeld = resolve; });
+    const fiveGate = new Promise((resolve) => { releaseFive = resolve; });
+    const holdBeforeServer = async (route) => {
+      reopen5Requests += 1;
+      markFiveHeld();
+      await fiveGate;
+      resourceAllowance += 1;
+      await route.fulfill({ status: 503, contentType: "application/json",
+        body: JSON.stringify({ error: { code: "server_unavailable",
+          message: "The server is temporarily unavailable (503). Please try "
+            + "again in a moment." } }) });
+    };
+    await page.route(REOPEN_RE, holdBeforeServer);
+    await page.click("[data-setup-card-confirm-yes]");
+    await fiveHeld;
+    await page.waitForTimeout(400);
+
+    const held5 = await readCard(page);
+    if (held5.state !== "pending") {
+      fail(`[${L}/5a] the card reads "${held5.state}" with its own reopen POST `
+        + `held before the server`);
+    }
+    // The EXACT number, kept for the comparison below. "state === pending"
+    // after the render would also be true of a build that superseded the write
+    // and merely painted the pending body back — and that build discards the
+    // write's own response. Only the unchanged generation rules that out.
+    const pendingGeneration = await facilitiesGeneration();
+    if (pendingGeneration !== held5.generation) {
+      fail(`[${L}/5a] the card's committed identity is generation `
+        + `${held5.generation} but the counter is at ${pendingGeneration}, so `
+        + `the pending model is already superseded before any render ran`);
+    }
+    const pendingModel = await facilitiesModel();
+    const otherGensBefore5 = JSON.parse((await others()).gens);
+
+    // The render, through the REAL Facilities navigation control, under the
+    // UNCHANGED Program/Season.
+    await sameTupleRenderThroughNav(page, `${L}/5a`);
+    const tupleAfterRender = await page.evaluate(() =>
+      JSON.stringify((contextOptions && contextOptions.selected) || null));
+    if (tupleAfterRender !== rollup5Before.selected) {
+      fail(`[${L}/5a] the context tuple changed across the re-entry `
+        + `(${rollup5Before.selected} -> ${tupleAfterRender}), so this leg `
+        + `raced a tuple move rather than a same-tuple render`);
+    }
+
+    // Attempt the second write BEFORE asserting, so a build that restored the
+    // control is measured by the duplicate POST it actually issues rather than
+    // stopped one assertion earlier.
+    await attemptSecondWrite(page);
+
+    if (reopen5Requests !== 1) {
+      fail(`[${L}/5a] ${reopen5Requests} reopen requests were issued for one `
+        + `Season while the first was still unresolved. The same-tuple render `
+        + `superseded the PENDING write's identity and handed back an `
+        + `actionable control, so the UI issued a second lifecycle mutation `
+        + `while it could not know the outcome of the first — and the first `
+        + `response is now discarded even though the server may commit it.`);
+    }
+
+    const after5 = await readCard(page);
+    const generationAfter = await facilitiesGeneration();
+    if (generationAfter !== pendingGeneration) {
+      fail(`[${L}/5a] the same-tuple render advanced this card's generation `
+        + `${pendingGeneration} -> ${generationAfter} while its own write was `
+        + `unresolved. The write's response can no longer be recognised as `
+        + `current, so it will be discarded even if the server commits it — `
+        + `preserving PENDING means never issuing the generation, not painting `
+        + `the pending body back afterwards.`);
+    }
+    if (after5.generation !== pendingGeneration || after5.state !== "pending") {
+      fail(`[${L}/5a] the card is "${after5.state}" at generation `
+        + `${after5.generation} after the render, expected "pending" at `
+        + `${pendingGeneration}`);
+    }
+    if (after5.seasonId !== before5.seasonId || after5.programId !== before5.programId) {
+      fail(`[${L}/5a] the pending identity's tuple changed across the render`);
+    }
+    const modelAfter = await facilitiesModel();
+    if (modelAfter !== pendingModel) {
+      fail(`[${L}/5a] the render replaced the PENDING card's committed model.\n`
+        + `  before: ${pendingModel.slice(0, 900)}\n  after:  ${modelAfter.slice(0, 900)}`);
+    }
+    if (after5.busy !== "true") {
+      fail(`[${L}/5a] aria-busy is "${after5.busy}" after the render, with the `
+        + `write still unresolved`);
+    }
+    if (after5.pendingText !== BUSY_TEXT) {
+      fail(`[${L}/5a] the pending copy is ${JSON.stringify(after5.pendingText)} `
+        + `after the render, expected ${JSON.stringify(BUSY_TEXT)}`);
+    }
+    if (!after5.focusPending) {
+      fail(`[${L}/5a] keyboard focus is on <${after5.focusTag}> after the `
+        + `render — the repaint destroyed the pending line the operator was `
+        + `standing on and left them nowhere, with a write still outstanding`);
+    }
+    if ((after5.slotButtons || []).length !== 0
+        || (after5.actionButtons || []).length !== 0) {
+      fail(`[${L}/5a] the render made the card actionable again (card `
+        + `${JSON.stringify(after5.slotButtons)}, landing `
+        + `${JSON.stringify(after5.actionButtons)}) with its first write still `
+        + `unresolved — the reported "Reopen this season is actionable again"`);
+    }
+    const snap5 = await snapshot(page);
+    if (snap5.rollup !== rollup5Before.rollup
+        || snap5.rollupHtml !== rollup5Before.rollupHtml) {
+      fail(`[${L}/5a] the completion count / next-task recommendation moved `
+        + `across the render while the write was unresolved.\n  before: `
+        + `${rollup5Before.rollup}\n  after:  ${snap5.rollup}`);
+    }
+    const held5Spoken = await spoken(page);
+    if (held5Spoken.some((a) => a.text === DONE_TEXT || a.text === REFRESH_TEXT)) {
+      fail(`[${L}/5a] a success sentence was spoken across the render, before `
+        + `the response: ${JSON.stringify(held5Spoken)}`);
+    }
+    // NON-VACUITY. The refusal has to be a refusal of THIS card only. If the
+    // render had not really run — or had been skipped wholesale — every
+    // assertion above would pass for the wrong reason.
+    const otherGensAfter5 = JSON.parse((await others()).gens);
+    const advanced = Object.keys(otherGensAfter5).filter((k) =>
+      k !== "setup/facilities" && otherGensAfter5[k] !== otherGensBefore5[k]);
+    if (!advanced.length) {
+      fail(`[${L}/5a] the re-entry advanced NO other card's generation, so no `
+        + `render-driven commit actually ran and this leg proves nothing: `
+        + `${JSON.stringify(otherGensBefore5)} -> ${JSON.stringify(otherGensAfter5)}`);
+    }
+    if (await seasonActiveFloorMet(page) !== false) {
+      fail(`[${L}/5a] the server reports the Season active while its reopen is `
+        + `still held before the server`);
+    }
+
+    // The held request, released as a failure: the round-4 recovery must be
+    // exactly as it was — the render in between changed nothing about the
+    // operation's identity, so its own response still moves it.
+    releaseFive();
+    await page.waitForFunction(() =>
+      readCardState("setup/facilities").state === "confirm", null, { timeout: 15000 })
+      .catch(() => fail(`[${L}/5a] the failed reopen never restored an `
+        + `actionable confirmation after the same-tuple render — the render `
+        + `superseded the write, so its own response was discarded`));
+    await page.unroute(REOPEN_RE, holdBeforeServer);
+    const recovered5 = await readCard(page);
+    if (recovered5.reasonValue !== "render race, held write") {
+      fail(`[${L}/5a] the restored confirmation lost the operator's reason: `
+        + `${JSON.stringify(recovered5.reasonValue)}`);
+    }
+    if (!recovered5.confirmError || !/503|unavailable/i.test(recovered5.confirmError)) {
+      fail(`[${L}/5a] the restored confirmation does not carry the server's own `
+        + `message: ${JSON.stringify(recovered5.confirmError)}`);
+    }
+    if (!recovered5.focusReason) {
+      fail(`[${L}/5a] focus landed on <${recovered5.focusTag}>, not the reason `
+        + `field the operator has to correct`);
+    }
+    if (reopen5Requests !== 1) {
+      fail(`[${L}/5a] ${reopen5Requests} reopen requests in total for one Season`);
+    }
+    if (await seasonActiveFloorMet(page) !== false) {
+      fail(`[${L}/5a] the Season is active after a 503 that never reached the `
+        + `server`);
+    }
+
+    // -------- (5b) the same race, released as a COMMITTED success --------
+    await apiPost(page, "/api/context", { program_id: shared.pa, season_id: s6.season });
+    await reenter(page, base);
+    await openFacilities(page, `${L}/5b`);
+    await armAnnouncements(page);
+    const rollup6Before = await snapshot(page);
+    await openConfirmWithReason(page, `${L}/5b`, "render race, committed write");
+    await resetAnnouncements(page);
+
+    // Held before the server here too (so the duplicate-write count stays
+    // honest during the render), and only executed against the server on
+    // RELEASE — so the single response this card finally receives is a
+    // genuinely committed reopen, not a fabricated one.
+    let reopen6Requests = 0;
+    let releaseSix = () => {};
+    let markSixHeld = () => {};
+    const sixHeld = new Promise((resolve) => { markSixHeld = resolve; });
+    const sixGate = new Promise((resolve) => { releaseSix = resolve; });
+    let committedStatus = null;
+    let committedBody = null;
+    const holdThenCommit = async (route) => {
+      reopen6Requests += 1;
+      markSixHeld();
+      await sixGate;
+      const response = await route.fetch();      // the server takes it HERE
+      committedStatus = response.status();
+      try { committedBody = await response.json(); } catch (e) { committedBody = null; }
+      await route.fulfill({ response });
+    };
+    await page.route(REOPEN_RE, holdThenCommit);
+    await page.click("[data-setup-card-confirm-yes]");
+    await sixHeld;
+    await page.waitForTimeout(400);
+
+    const held6 = await readCard(page);
+    if (held6.state !== "pending") {
+      fail(`[${L}/5b] the card reads "${held6.state}" with its reopen held`);
+    }
+    const pendingGeneration6 = await facilitiesGeneration();
+    const pendingModel6 = await facilitiesModel();
+
+    await sameTupleRenderThroughNav(page, `${L}/5b`);
+    await attemptSecondWrite(page);
+    if (reopen6Requests !== 1) {
+      fail(`[${L}/5b] ${reopen6Requests} reopen requests were issued for one `
+        + `Season across a same-tuple render`);
+    }
+    if (await facilitiesGeneration() !== pendingGeneration6) {
+      fail(`[${L}/5b] the same-tuple render advanced this card's generation `
+        + `while its write was unresolved`);
+    }
+    if (await facilitiesModel() !== pendingModel6) {
+      fail(`[${L}/5b] the same-tuple render replaced the PENDING model`);
+    }
+    const after6 = await readCard(page);
+    if ((after6.slotButtons || []).length !== 0
+        || (after6.actionButtons || []).length !== 0) {
+      fail(`[${L}/5b] the card is actionable again after the render (card `
+        + `${JSON.stringify(after6.slotButtons)}, landing `
+        + `${JSON.stringify(after6.actionButtons)})`);
+    }
+    if (after6.busy !== "true" || !after6.focusPending
+        || after6.pendingText !== BUSY_TEXT) {
+      fail(`[${L}/5b] the pending presentation did not survive the render `
+        + `(aria-busy ${after6.busy}, focusPending ${after6.focusPending}, copy `
+        + `${JSON.stringify(after6.pendingText)})`);
+    }
+    if ((await snapshot(page)).rollup !== rollup6Before.rollup) {
+      fail(`[${L}/5b] the completion / next-task derivation moved across the `
+        + `render while the write was unresolved`);
+    }
+
+    // "The one terminal response advances only this card": the comparison is
+    // taken across the RELEASE, so the render's own (legitimate) commits to
+    // the other five cards are already in the baseline.
+    const others6Before = await others();
+    releaseSix();
+    await settled(page, `${L}/5b/done`, s6.season);
+    await page.waitForTimeout(500);
+    await page.unroute(REOPEN_RE, holdThenCommit);
+    if (committedStatus !== 200 || !committedBody || committedBody.error) {
+      fail(`[${L}/5b] the released response was not a committed success `
+        + `(status ${committedStatus}, body ${JSON.stringify(committedBody)})`);
+    }
+    if (reopen6Requests !== 1) {
+      fail(`[${L}/5b] ${reopen6Requests} reopen requests in total for one Season`);
+    }
+    const done6 = await readCard(page);
+    if (done6.blockedBecause !== null || done6.effective !== "Add Ice") {
+      fail(`[${L}/5b] the card did not advance on its own terminal response `
+        + `after a same-tuple render (blockedBecause `
+        + `${JSON.stringify(done6.blockedBecause)}, effective `
+        + `${JSON.stringify(done6.effective)}) — the render superseded the `
+        + `write's identity, so its committed success was discarded`);
+    }
+    if (done6.generation <= pendingGeneration6) {
+      fail(`[${L}/5b] the terminal response did not advance this card's `
+        + `generation (${pendingGeneration6} -> ${done6.generation})`);
+    }
+    const done6Spoken = await spoken(page);
+    const successes6 = done6Spoken.filter((a) => a.text === DONE_TEXT);
+    if (successes6.length !== 1) {
+      fail(`[${L}/5b] expected EXACTLY ONE success announcement, got `
+        + `${successes6.length} in ${JSON.stringify(done6Spoken)}`);
+    }
+    if (done6Spoken.some((a) => a.text === REFRESH_TEXT)) {
+      fail(`[${L}/5b] the refresh's generic sentence was announced as well: `
+        + `${JSON.stringify(done6Spoken)}`);
+    }
+    const others6After = await others();
+    const gens6Before = JSON.parse(others6Before.gens);
+    const gens6After = JSON.parse(others6After.gens);
+    for (const key of Object.keys(others6Before.models)) {
+      if (gens6Before[key] !== gens6After[key]) {
+        fail(`[${L}/5b] the terminal response moved "${key}"'s generation `
+          + `(${gens6Before[key]} -> ${gens6After[key]}) — it may advance only `
+          + `its own card`);
+      }
+      if (others6Before.models[key] !== others6After.models[key]) {
+        fail(`[${L}/5b] the terminal response mutated adjacent card "${key}"`);
+      }
+    }
+
     if (errors.length) fail(`[${L}] browser errors:\n${errors.join("\n")}`);
     console.log(`[${L}] OK — a held reopen POST leaves the Facilities card `
       + `PENDING and aria-busy with NO control on either surface, keyboard focus `
@@ -898,7 +1361,17 @@ async function checkViewport(browser, viewport) {
       + `discarded response really was a committed success. A delayed FAILURE `
       + `after the same switch is equally inert. A normal success refreshes only `
       + `this card, with no reload, no adjacent generation or model touched, and `
-      + `exactly ONE success announcement, said last and after the response.`);
+      + `exactly ONE success announcement, said last and after the response. `
+      + `With the request held BEFORE the server and the Facilities destination `
+      + `re-entered through its own navigation control under the UNCHANGED `
+      + `Program/Season, the card keeps the EXACT generation it entered PENDING `
+      + `with, its committed model byte-for-byte, aria-busy, its pending copy `
+      + `and focus, an unchanged completion/next roll-up and zero actions on `
+      + `both surfaces — while the same render advances the other workflow `
+      + `cards normally — and pointer, keyboard and direct code-level attempts `
+      + `to start a second write leave the interceptor's reopen count at exactly `
+      + `one; the held 503 then still restores the reason/error/focus recovery, `
+      + `and a held-then-committed success advances this card and only this card.`);
   } catch (e) {
     if (serverOutput.trim()) {
       console.error("--- demo server output ---\n" + serverOutput.trim());
