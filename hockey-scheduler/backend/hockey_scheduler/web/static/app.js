@@ -1020,6 +1020,36 @@ function beginCardRequest(cardId, opts) {
 // operator's delayed response passes every remaining test and mutates the
 // arriving operator's card — model, DOM, focus, live region, completion and
 // next task — with the departing operator's own typed text.
+//
+// WHICH PATHS ACTUALLY DEPEND ON IT — named, because a guard credited with a
+// protection nothing exercises is the same defect as a missing one (#365 round
+// 10). This line is LOAD-BEARING for the card's READS, which ask no principal
+// question of their own anywhere:
+//
+//   retrySetupWorkflowCard()  — the per-card Retry/Refresh. Its four post-await
+//     mutation points (the model commit, repaintSetupWorkflowCard,
+//     announceCardStatus, focusCardTarget) are gated on this function alone.
+//   loadSetupProgressCard()   — the Home/Tasks card. Same shape: the model
+//     commit, the combined DOM+announcement gate and the focus move.
+//   restorePendingCardWriteFocus() — passes the LEDGER entry's identity to
+//     focusCardTarget, and that entry deliberately survives a principal change.
+//
+// It is NOT what protects the card's WRITE. reopenSelectedSeasonFromCard() asks
+// cardIdentitySamePrincipal() DIRECTLY on its own post-await line, before this
+// gate is consulted, and routes a foreign-principal response into the silent
+// reconcile — so on that path this test is reached only for an identity that
+// has already passed the same question. Say so plainly rather than let leg 7's
+// coverage read as coverage of this line: deleting it left the whole write
+// journey green, which is why the regression for it races a READ instead.
+// e2e/setup-card-write-identity.js leg 9 holds the per-card refresh's own
+// /api/v2/setup/overview across an in-app principal change and releases it
+// inside the post-auth/pre-render window — where no render of the arriving
+// principal's has run, so the generation counter has not moved and generation
+// equality still says "current". Removing this one line makes that leg fail on
+// all four points: the departing operator's "Venues, rinks and ice updated."
+// is spoken into the arriving principal's live region, their model is
+// committed, their card body is repainted, and focus is pulled onto the
+// landing heading.
 function cardIdentityCurrent(identity) {
   if (!identity) return false;
   if (!cardIdentitySamePrincipal(identity)) return false;  // #365 identity gate — principal/session epoch

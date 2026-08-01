@@ -294,6 +294,46 @@
 //      (8e) the HOME/TASKS card and its "Continue setup" CTA, across the real
 //           sign-out/sign-in path.
 //
+//   (9) A CARD READ IN FLIGHT AT THE IDENTITY BOUNDARY (round 10). Legs 1-8
+//       all race the card's WRITE, and a mutation run established that none of
+//       them is a test of the principal/session-epoch line inside
+//       cardIdentityCurrent(): deleting ONLY that line left every one of them
+//       green. reopenSelectedSeasonFromCard() asks cardIdentitySamePrincipal()
+//       itself, one line earlier, and routes a foreign-principal response into
+//       the silent reconcile, so the shared gate's own epoch test is never what
+//       refuses on the write path.
+//
+//       Where it IS the only thing that refuses is the card's READS.
+//       retrySetupWorkflowCard() — the per-card Retry/Refresh — gates its four
+//       post-await mutation points on cardIdentityCurrent() and on nothing
+//       else, and asks no principal question of its own; so do
+//       loadSetupProgressCard() and restorePendingCardWriteFocus(). A read
+//       registers no write, so an ordinary render under the arriving principal
+//       WOULD advance the generation counter and make the departing identity
+//       stale without any epoch at all — which is why this leg releases inside
+//       leg 8's post-auth/pre-render window, where no render of theirs has run,
+//       the counter is exactly where the departing operator's own refresh left
+//       it, and generation equality still says "current".
+//
+//       So the refresh's own /api/v2/setup/overview is held, the principal is
+//       changed while it is in flight, and it is RELEASED and sampled at the
+//       instant the departing principal's response resolves — with the window
+//       re-asserted after the sample, so a render of theirs slipping in cannot
+//       silently turn the assertions into observations of it. Nothing may be
+//       announced, committed, painted or focused under the arriving principal;
+//       then their own render still arrives and rebuilds the card from their
+//       own read, so the refusal is a window and not a dead surface.
+//
+//      (9a) a second League Admin — same role, same authority, different
+//           person, so the leak cannot be excused as a permissions difference.
+//      (9b) a LOWER-PRIVILEGE Arena Manager: the held response carries
+//           League-Admin-scoped counts and a MANAGE_SETUP effective action.
+//
+//       Each sub-leg first runs the IDENTICAL refresh with NO identity change
+//       and observes all four mutation points HAPPENING, so their absence
+//       afterwards is the gate refusing rather than a code path that never
+//       runs.
+//
 // TECHNIQUE
 // ---------
 //   * Delayed responses use this repo's established idiom: capture the REAL
@@ -328,6 +368,11 @@ const VIEWPORTS = [
 ];
 
 const REOPEN_RE = /\/api\/v2\/setup\/seasons\/[^/]+\/reopen$/;
+// The per-card REFRESH's own read (#365 round 10). Leg 9 holds this one open
+// instead of a write: it is the fetch retrySetupWorkflowCard() awaits, and the
+// only one of the card's reads whose response reaches all four gated mutation
+// points (model commit, repaint, announcement, focus).
+const OVERVIEW_RE = /\/api\/v2\/setup\/overview(\?|$)/;
 // The card's own declared copy (app.js SETUP_SEASON_REOPEN_ACTION). Asserted
 // as exact strings: "exactly one success announcement" is a claim about a
 // specific sentence, and a regex would let the refresh's generic sentence slip
@@ -448,6 +493,235 @@ async function loginAs(page, username, password) {
 }
 
 function fail(msg) { throw new Error(msg); }
+
+// ====== THE PAGE IS QUIET BEFORE ITS OWN GROUND MOVES (#365 round 9) ======
+// This is the ROOT CAUSE of the intermittent 404 the review reports, and the
+// reason it is a HARNESS defect rather than an application one.
+//
+// The journey moves the CURRENT session's persisted active context by raw
+// POST /api/context, on a page that is still running the app. Production never
+// does that: a real switch goes through setActiveContext(), which bumps
+// `contextRevision`, and every await in render() re-checks it and bails. A raw
+// POST tells the page nothing, so a render() that is mid-flight keeps going
+// with the `selectedSeasonId` it captured BEFORE the POST — and then issues
+//
+//     GET /api/v2/setup/seasons/<the season we just left>/venue-access
+//
+// which list_season_venue_access() correctly refuses with a generic 404,
+// because #369 ceilings that read to the caller's persisted active Season.
+// Reproduced deterministically by holding /api/v2/setup/hierarchy open (the
+// await immediately before the per-Season reads), moving the context while the
+// render sat on it, and releasing: the 404 lands every time, on the season the
+// page had just left, together with its /venue-candidates sibling.
+//
+// So the fix is to stop racing, not to forgive the 404: nothing may move the
+// server state a live render is reading until that render has finished. Idle
+// is measured on BOTH axes, because either alone is a false negative:
+//   * zero requests in flight — a render sitting on a fetch is not idle; and
+//   * no NEW request started for a whole quiet window — a render chains its
+//     reads back to back, so a zero sampled between two of them says nothing.
+const QUIET_WINDOW_MS = 300;
+const QUIESCE_TIMEOUT_MS = 20000;
+async function quiesce(page, step) {
+  const deadline = Date.now() + QUIESCE_TIMEOUT_MS;
+  for (;;) {
+    if (page.__wiInFlight() > 0) {
+      await Promise.race([page.__wiOnIdle(),
+                          new Promise((r) => setTimeout(r, 500))]);
+    }
+    if (page.__wiInFlight() === 0) {
+      const seq = page.__wiRequestSeq();
+      await page.waitForTimeout(QUIET_WINDOW_MS);
+      if (page.__wiInFlight() === 0 && page.__wiRequestSeq() === seq) return;
+    }
+    if (Date.now() > deadline) {
+      fail(`[${step}] the page never went quiet before its persisted context `
+        + `was moved (${page.__wiInFlight()} request(s) still in flight) — `
+        + `moving it under a live render is what produces the stale `
+        + `venue-access read`);
+    }
+  }
+}
+
+// Move the CURRENT session's persisted active context on a LIVE page, without
+// leaving a read in flight that is scoped to the tuple being left.
+//
+// Both halves are needed and they close the window from opposite sides:
+//   * quiesce() rules out a render that captured the OLD season id before the
+//     POST and is still running; and
+//   * re-pointing the page's own `contextOptions.selected` at the new tuple
+//     rules out a render that STARTS between the POST and the reload that
+//     follows it — the same assignment production's sendContextSwitch() makes
+//     immediately after its own /api/context POST, so the client's idea of the
+//     selection is never behind the server's.
+async function moveOwnContext(page, programId, seasonId, step) {
+  await quiesce(page, step);
+  const res = await apiPost(page, "/api/context",
+    { program_id: programId, season_id: seasonId });
+  if (!res || res.error) {
+    fail(`[${step}] could not persist the active context on `
+      + `${programId}/${seasonId}: ${JSON.stringify(res)}`);
+  }
+  await page.evaluate(([p, s]) => {
+    if (contextOptions && contextOptions.selected) {
+      contextOptions.selected.program_id = p;
+      contextOptions.selected.season_id = s;
+    }
+  }, [programId, seasonId]);
+  return res;
+}
+
+// ======== THE DELIVERY RECONCILER, AS A PURE FUNCTION (#365 round 9) =======
+// Everything the page's four network/console recorders collected, turned into
+// the list of lines that must fail the run. A pure function of its four inputs
+// on purpose: it is what makes the non-fungibility of an allowance testable
+// without a browser, which selfTestDeliveryReconciler() below does on every
+// invocation of this journey.
+//
+// THE RULES, in order:
+//   1. A 3xx is not a failure. Redirects and 304s are ordinary HTTP; they are
+//      still RECORDED (the review asks for every non-2xx to be recorded), they
+//      are simply not errors.
+//   2. A >=400 response is matched against an UNMATCHED injected allowance with
+//      the IDENTICAL method, the IDENTICAL absolute URL and the IDENTICAL
+//      status. Nothing else can satisfy it. An unrelated 404 therefore cannot
+//      consume an expected 503 — not because of ordering, but because 404 !== 503
+//      and because the URL of an unrelated request is not the URL of the
+//      reopen POST that was injected.
+//   3. Any unmatched >=400 response fails the run, NAMED: method, URL, status.
+//   4. Any allowance that was declared and never delivered fails the run too.
+//      A journey that injects a 503 the page never receives has stopped
+//      testing what it says it tests.
+//   5. Chromium's "Failed to load resource" console lines are matched by the
+//      URL in m.location() against the URLs that step 2 accepted, one line per
+//      accepted failure. A console line for any other URL fails the run and is
+//      reported WITH that URL, which m.text() alone never carried.
+//   6. A request that never got a response at all is always a failure.
+function reconcileDeliveries(nonOk, injected, consoleErrors, failedReqs) {
+  const out = [];
+  const accepted = new Map();  // url -> how many console lines it may explain
+  for (const rec of nonOk) {
+    if (rec.status < 400) continue;                                    // (1)
+    const slot = injected.find((i) => !i.matched                       // (2)
+      && i.method === rec.method && i.url === rec.url
+      && i.status === rec.status);
+    if (slot) {
+      slot.matched = true;
+      accepted.set(rec.url, (accepted.get(rec.url) || 0) + 1);
+      continue;
+    }
+    out.push(`[response] ${rec.method} ${rec.url} -> ${rec.status} — no `      // (3)
+      + `deliberate failure was injected for this request, so this is a real `
+      + `failed request, not one of this journey's own 503s`);
+  }
+  for (const i of injected) {                                          // (4)
+    if (i.matched) continue;
+    out.push(`[injected] a ${i.status} was injected for ${i.method} ${i.url} `
+      + `but no such response was ever delivered to the page, so the leg that `
+      + `injected it proved nothing`);
+  }
+  for (const c of consoleErrors) {                                     // (5)
+    const left = accepted.get(c.url) || 0;
+    if (left > 0) { accepted.set(c.url, left - 1); continue; }
+    out.push(`[console] ${c.text} @ ${c.url || "<no location reported>"}`);
+  }
+  for (const f of failedReqs) {                                        // (6)
+    out.push(`[requestfailed] ${f.method} ${f.url} -> ${f.failure}`);
+  }
+  return out;
+}
+
+// THE ALLOWANCE IS NOT FUNGIBLE, proven before the browser is even launched.
+// The review's exact scenario: a leg injects a 503 on its own reopen POST and,
+// during that same leg, an unrelated 404 occurs. The 404 must be reported with
+// its exact URL and must NOT be absorbed; the 503 must still be accepted, and
+// only for its own request.
+function selfTestDeliveryReconciler() {
+  const REOPEN = "http://127.0.0.1:8395/api/v2/setup/seasons/season_9/reopen";
+  const STRAY = "http://127.0.0.1:8395/api/v2/setup/seasons/season_9/unrelated";
+  const check = (what, got, want) => {
+    if (JSON.stringify(got) !== JSON.stringify(want)) {
+      fail(`delivery-reconciler self-test (${what}) — expected `
+        + `${JSON.stringify(want)}, got ${JSON.stringify(got)}`);
+    }
+  };
+
+  // (i) the injected 503 alone: accepted, and its console line with it.
+  let out = reconcileDeliveries(
+    [{ method: "POST", url: REOPEN, status: 503 }],
+    [{ method: "POST", url: REOPEN, status: 503, matched: false }],
+    [{ text: "Failed to load resource: the server responded with a status of "
+        + "503 (Service Unavailable)", url: REOPEN }],
+    []);
+  check("an injected 503 is accepted for its own request", out, []);
+
+  // (ii) the same 503 PLUS an unrelated 404 in the same leg. The 404 is
+  //      reported with its exact URL; the 503 is still accepted.
+  out = reconcileDeliveries(
+    [{ method: "POST", url: REOPEN, status: 503 },
+     { method: "GET", url: STRAY, status: 404 }],
+    [{ method: "POST", url: REOPEN, status: 503, matched: false }],
+    [{ text: "Failed to load resource: the server responded with a status of "
+        + "503 (Service Unavailable)", url: REOPEN },
+     { text: "Failed to load resource: the server responded with a status of "
+        + "404 (Not Found)", url: STRAY }],
+    []);
+  //      Both the delivery and its console line are reported, and NEITHER
+  //      mentions the reopen POST: the 503 was accepted silently, for itself.
+  if (out.length !== 2 || !out.every((l) => l.indexOf(STRAY) !== -1
+        && l.indexOf("404") !== -1 && l.indexOf(REOPEN) === -1)) {
+    fail(`delivery-reconciler self-test — an unrelated 404 alongside an `
+      + `injected 503 must fail the run naming ${STRAY} and nothing else, got `
+      + `${JSON.stringify(out)}`);
+  }
+
+  // (iii) the 404 ALONE against an outstanding 503 allowance: the allowance
+  //       must not be spent on it, so BOTH the stray 404 and the undelivered
+  //       injection are reported. This is the fungibility the review names,
+  //       inverted into an assertion.
+  out = reconcileDeliveries(
+    [{ method: "GET", url: STRAY, status: 404 }],
+    [{ method: "POST", url: REOPEN, status: 503, matched: false }],
+    [{ text: "Failed to load resource: the server responded with a status of "
+        + "404 (Not Found)", url: STRAY }],
+    []);
+  if (out.length !== 3
+      || !out.some((l) => l.indexOf("[response]") === 0 && l.indexOf(STRAY) !== -1)
+      || !out.some((l) => l.indexOf("[injected]") === 0 && l.indexOf(REOPEN) !== -1)
+      || !out.some((l) => l.indexOf("[console]") === 0 && l.indexOf(STRAY) !== -1)) {
+    fail(`delivery-reconciler self-test — a 503 allowance must never be spent `
+      + `on an unrelated 404, got ${JSON.stringify(out)}`);
+  }
+
+  // (iv) SAME status, DIFFERENT request: still not fungible. Two legs each
+  //      inject one 503; a third season's 503 that nobody injected is reported.
+  const OTHER = "http://127.0.0.1:8395/api/v2/setup/seasons/season_7/reopen";
+  out = reconcileDeliveries(
+    [{ method: "POST", url: REOPEN, status: 503 },
+     { method: "POST", url: OTHER, status: 503 }],
+    [{ method: "POST", url: REOPEN, status: 503, matched: false }],
+    [], []);
+  if (out.length !== 1 || out[0].indexOf(OTHER) === -1) {
+    fail(`delivery-reconciler self-test — an allowance bound to one reopen URL `
+      + `must not cover another, got ${JSON.stringify(out)}`);
+  }
+
+  // (v) SAME request, TWICE: one allowance covers one delivery, not both.
+  out = reconcileDeliveries(
+    [{ method: "POST", url: REOPEN, status: 503 },
+     { method: "POST", url: REOPEN, status: 503 }],
+    [{ method: "POST", url: REOPEN, status: 503, matched: false }],
+    [], []);
+  if (out.length !== 1 || out[0].indexOf(REOPEN) === -1) {
+    fail(`delivery-reconciler self-test — one allowance must be consumed at `
+      + `most once, got ${JSON.stringify(out)}`);
+  }
+
+  // (vi) a redirect is not a failure.
+  check("a 3xx is not a failure",
+    reconcileDeliveries([{ method: "GET", url: STRAY, status: 304 }], [], [], []),
+    []);
+}
 
 // A fresh page load in the given context. contextOptions is seeded once per
 // page load, so a raw /api/context POST needs this to take effect — and the
@@ -886,6 +1160,10 @@ async function readLedger(page) {
 // variable genuinely the PERSON: card, tuple, target Season and generation are
 // all identical on both sides of the switch.
 async function persistContextFor(page, arrive, programId, seasonId, step) {
+  // BEFORE the session is swapped out from under it, let alone the persisted
+  // tuple moved: this changes the answer to reads a render may still be
+  // waiting on. See quiesce() for the 404 this eliminates.
+  await quiesce(page, step);
   await loginAs(page, arrive.username, arrive.password);
   const theirs = await apiPost(page, "/api/context",
     { program_id: programId, season_id: seasonId });
@@ -900,6 +1178,14 @@ async function persistContextFor(page, arrive, programId, seasonId, step) {
     fail(`[${step}] could not persist admin's context on the target tuple: `
       + `${JSON.stringify(mine)}`);
   }
+  // ...and the page's own idea of the selection follows the server's, for the
+  // same reason moveOwnContext() does it — see there.
+  await page.evaluate(([p, s]) => {
+    if (contextOptions && contextOptions.selected) {
+      contextOptions.selected.program_id = p;
+      contextOptions.selected.season_id = s;
+    }
+  }, [programId, seasonId]);
 }
 
 // PATH (a): the in-app, NO-RELOAD principal change. signIn() is the exact
@@ -971,9 +1257,42 @@ async function arrivePrincipal(page, arrive, step) {
 // the page at the one instant that matters — when `currentUser` has become the
 // arriving principal and not one line of rendering has run for them.
 
+// ===== THE ARRIVING PRINCIPAL'S OWN RENDER, COUNTED (#365 round 9) ========
+// `window.__wiSignInDone` works only on PATH (a). Verbatim from the review:
+//
+//   "startSignOutThenIn() sets `window.__wiSignInDone = false`, but the
+//   production form handler calls `signIn(...)` and discards its promise, so
+//   that marker can never become true on this path."
+//
+// It is true, and it is why this counter exists: a signal that works on BOTH
+// paths, belongs to the APP rather than to a promise the test happened to be
+// handed, and cannot be produced by the test.
+//
+// render() finishes by REPLACING #content's own children. Observed with
+// `subtree: false` for exactly the reason switchContext() gives: the retain-
+// the-cards pass at the top of render(), repaintContextScopedCardsAsStale()
+// and blankContextScopedCardSurfaces() all rewrite DESCENDANTS of #content
+// while the arriving principal still has nothing of their own to show, and a
+// subtree observer would count those and call the recovery proven before it
+// happened. Only the final `c.innerHTML = …` replaces #content's own children,
+// and by then the arriving principal's reads have landed.
+//
+// Armed immediately before the sign-in is triggered, so "no render of their
+// own has run yet" is a measurement inside the window and not an assumption.
+async function armOwnRenderCounter(page) {
+  await page.evaluate(() => {
+    if (window.__wiOwnObs) window.__wiOwnObs.disconnect();
+    window.__wiOwnRenders = 0;
+    const c = document.getElementById("content");
+    window.__wiOwnObs = new MutationObserver(() => { window.__wiOwnRenders += 1; });
+    if (c) window.__wiOwnObs.observe(c, { childList: true, subtree: false });
+  });
+}
+
 // PATH (a), NOT AWAITED. The signIn() promise is parked on `window` so its
 // completion can be waited for later, after the window has been sampled.
 async function startSignInInApp(page, username, password) {
+  await armOwnRenderCounter(page);
   await page.evaluate(([u, p]) => {
     window.__wiSignInDone = false;
     window.__wiSignIn = Promise.resolve(signIn(u, p))
@@ -1001,7 +1320,12 @@ async function startSignOutThenIn(page, username, password, step) {
     .catch(() => fail(`[${step}] the sign-in screen never appeared`));
   await page.fill("#login-user", username);
   await page.fill("#login-pass", password);
+  // Kept only so the window assertion reads the same field on both paths, and
+  // deliberately NOT relied on here: the form's own handler discards the
+  // signIn() promise, so on this path it can never become true. The signal
+  // that carries this path is armOwnRenderCounter()'s render count.
   await page.evaluate(() => { window.__wiSignInDone = false; });
+  await armOwnRenderCounter(page);
   await page.click("#login-form button[type=submit]");
 }
 
@@ -1025,6 +1349,12 @@ async function startArrival(page, arrive, step) {
 // and they are already clean; this round's defect is that a clean model was
 // standing behind a stale PAINTED card, and the painted card is what the
 // operator sees.
+// The exact set of containers app.js's blankContextScopedCardSurfaces() empties
+// at the identity boundary — one constant, because the recovery assertion marks
+// precisely the containers the boundary blanked and nothing else.
+const SCOPED_SURFACE_SELECTOR =
+  "#sp-card-slot,[data-setup-card-slot],[data-setup-landing-actions],"
+  + "[data-setup-hub-progress-slot],[data-setup-workflow-card]";
 async function paintedContextScopedSurface(page) {
   return page.evaluate(() => {
     const text = (el) => ((el && el.textContent) || "").replace(/\s+/g, " ").trim();
@@ -1170,6 +1500,14 @@ async function openScopedSurface(page, surface, step) {
 //                             the server's own message and an error toast
 //              "pending"    — an unresolved write: busy copy, aria-busy, focus
 //                             on the pending line, the busy sentence spoken
+//   lands    what the ARRIVING principal's OWN post-options render must put on
+//            screen, with no navigation, click or render from this test:
+//              "surface"    — the same context-scoped surface, rebuilt and
+//                             settled (the in-app signIn() path, where nothing
+//                             touches `view`)
+//              "onboarding" — the Initial Setup destination the app's own
+//                             routing sends a fresh League Admin session to
+//                             after a REAL sign-out (see the recovery block)
 async function preRenderIdentityWindow(ctx) {
   const { page, base, L, sub, arrive, shape } = ctx;
   const surface = ctx.surface || "landing";
@@ -1215,7 +1553,7 @@ async function preRenderIdentityWindow(ctx) {
   }
   if (shape === "failed") {
     heldHandler = async (route) => {
-      ctx.allowResourceError();
+      ctx.allowResourceError(route);
       await route.fulfill({ status: 503, contentType: "application/json",
         body: JSON.stringify({ error: { code: "server_unavailable",
           message: SERVER_503_MESSAGE } }) });
@@ -1238,7 +1576,7 @@ async function preRenderIdentityWindow(ctx) {
     heldHandler = async (route) => {
       markHeld();
       await gate;
-      ctx.allowResourceError();
+      ctx.allowResourceError(route);
       await route.fulfill({ status: 503, contentType: "application/json",
         body: JSON.stringify({ error: { code: "server_unavailable",
           message: SERVER_503_MESSAGE } }) });
@@ -1320,6 +1658,7 @@ async function preRenderIdentityWindow(ctx) {
   // window stops being a race and becomes a state the leg can stand inside.
   const releaseOptions = holdContextOptions();
   let released = false;
+  let marked = 0;
   try {
     await startArrival(page, arrive, step);
     // ...and this is the ONE instant the review names: `currentUser` is the
@@ -1336,16 +1675,27 @@ async function preRenderIdentityWindow(ctx) {
     }
     const stillHeld = optionsHeldNow;
     const signInDone = await page.evaluate(() => window.__wiSignInDone === true);
+    const ownRenders = await page.evaluate(() => window.__wiOwnRenders);
 
     // THE WINDOW IS REAL. If the options load had already returned, the render
     // that closes the window could have run, and everything below would be
     // measuring the ordinary post-render state — the exact blindness the review
     // reports. Asserted, not assumed.
-    if (stillHeld < 1 || signInDone) {
+    //
+    // THREE conjuncts, and the third is why this is sound on BOTH paths. The
+    // review is right that `__wiSignInDone` is dead weight on the login-form
+    // path — the form handler discards the promise — so it is kept only for
+    // the in-app path and is never load-bearing here. `ownRenders === 0` is the
+    // signal that carries both: render() has not once replaced #content's own
+    // children since the sign-in was triggered, so no render of the arriving
+    // principal's has run, whichever way they arrived.
+    if (stillHeld < 1 || signInDone || ownRenders !== 0) {
       fail(`[${step}/window] the arriving principal's context-options load is `
-        + `no longer outstanding (held=${stillHeld}, signIn resolved=${signInDone}), `
-        + `so this sample is AFTER the render rather than inside the `
-        + `post-auth/pre-render window and proves nothing about it`);
+        + `no longer outstanding, or a render of their own has already run `
+        + `(held=${stillHeld}, signIn resolved=${signInDone}, `
+        + `renders=${ownRenders}), so this sample is AFTER the render rather `
+        + `than inside the post-auth/pre-render window and proves nothing `
+        + `about it`);
     }
     // ...and the surfaces are still THERE, so every emptiness below is a
     // withdrawal rather than a page that lost its Setup DOM.
@@ -1395,15 +1745,184 @@ async function preRenderIdentityWindow(ctx) {
         + `${JSON.stringify(spokenInWindow)}`);
     }
 
+    // ---- MARK THE BLANKED CONTAINERS, before anything is released --------
+    // A sentinel attribute on every container the boundary just blanked. The
+    // arriving principal's own render() cannot preserve it: its final
+    // `c.innerHTML = …` replaces #content's children outright, so every marked
+    // node is discarded and rebuilt. Nothing the test does afterwards removes
+    // them — that is the point. If the marks are still there, no render
+    // happened; if they are gone, one did, and it was not the test's.
+    marked = await page.evaluate((sel) => {
+      const els = Array.from(document.querySelectorAll(sel));
+      els.forEach((el, i) => el.setAttribute("data-wi-blank-mark", String(i)));
+      return els.length;
+    }, SCOPED_SURFACE_SELECTOR);
+    if (!marked) {
+      fail(`[${step}/window] there is no blanked container to mark, so the `
+        + `repaint assertion below would have nothing to observe`);
+    }
+
     releaseOptions();
     released = true;
   } finally {
     if (!released) releaseOptions();
   }
 
-  // ---- let the arriving principal's own render finish, and quiesce ----
-  await page.waitForFunction((u) => !!currentUser && currentUser.username === u,
-    arrive.username, { timeout: 20000 });
+  // ====== THE ARRIVING PRINCIPAL'S OWN RENDER, OBSERVED (#365 round 9) =====
+  // The review's second blocker, and the reason it matters is a PRODUCT one:
+  //
+  //   "Why this matters: synchronous blanking is safe only if the identity
+  //   transition itself reliably repaints from the arriving principal's reads;
+  //   otherwise the privacy fix can leave a blank page until the operator
+  //   navigates."
+  //
+  // The old shape could not tell the two apart. It waited only for
+  // `currentUser === arrive.username` — already true before the release —
+  // slept 400ms, and then called openScopedSurface(), whose navigation renders.
+  // A post-options render that never happened would have been repaired by the
+  // test's own click before the "restored" assertion ran. And on the login-form
+  // path `window.__wiSignInDone` can never become true at all, because the
+  // form's own handler discards the signIn() promise — so there was no signal
+  // there to wait on even in principle.
+  //
+  // NOTHING BELOW INITIATES ANYTHING. No navigation, no click, no page.evaluate
+  // that calls into the app. Between releaseOptions() above and the assertion
+  // here the test only WAITS and READS; waitForFunction polls in the page and
+  // runs no application code. What it waits for is the app's own work:
+  //
+  //   * `__wiOwnRenders > 0` — render() has replaced #content's own children at
+  //     least once since the sign-in was triggered (subtree:false, so the
+  //     card-slot rewrites that run from held models while the withdrawal is
+  //     still in force cannot satisfy it);
+  //   * no MARKED container is still EMPTY — every container the boundary
+  //     blanked has either been rebuilt or refilled. The marks were placed
+  //     before the release and nothing in the test removes them;
+  //   * and the DESTINATION the arriving principal's own render actually
+  //     produces is complete and settled — see `lands` below.
+  //
+  // WHERE THAT RENDER LANDS THEM IS NOT THE SAME ON BOTH PATHS, and the
+  // difference is pre-existing product behaviour that has nothing to do with
+  // this slice, so it is asserted explicitly per sub-leg rather than glossed:
+  //
+  //   in-app signIn()  — no sign-out happens, `view` is untouched, so the
+  //                      render repaints the very surface the boundary blanked.
+  //                      `lands: "surface"`.
+  //   sign-out + login form — setUser(null) demotes `view` off "setup"
+  //                      (#233 B2a r2: a signed-out visitor holds no
+  //                      manage_setup) and then off "dashboard" to "standings"
+  //                      (no ops console). On the way back in,
+  //                      onboarding-bootstrap.js restores "dashboard" for a
+  //                      fresh League Admin session and onboarding.js routes an
+  //                      installation that is not ready_to_schedule to the
+  //                      Initial Setup wizard (#174). So the arriving
+  //                      principal's own surface IS the Initial Setup shell —
+  //                      a complete page of their own, painted with no help
+  //                      from this test. `lands: "onboarding"`.
+  //
+  // Either way the claim being proven is the same one, and it is the one the
+  // review asks for: the blanking is a WINDOW. The identity transition itself
+  // repaints, so the arriving operator is never left on the blanked husk
+  // waiting for a navigation they have to think of themselves.
+  const lands = ctx.lands;
+  if (lands !== "surface" && lands !== "onboarding") {
+    fail(`[${step}/recovery] this sub-leg does not declare what the arriving `
+      + `principal's own render must land on (lands=${JSON.stringify(lands)})`);
+  }
+  const SURFACE_CODE = { landing: 0, hub: 1, home: 2 };
+  await page.waitForFunction(([which, wantOnboarding]) => {
+    if (!(window.__wiOwnRenders > 0)) return false;
+    // A marked container that is still empty is the husk itself, left standing.
+    const stillBlank = Array.from(
+      document.querySelectorAll("[data-wi-blank-mark]"))
+      .some((el) => !el.children.length
+        && !((el.textContent || "").trim().length));
+    if (stillBlank) return false;
+    const content = document.getElementById("content");
+    if (!content || !((content.textContent || "").trim().length)) return false;
+    if (content.querySelector(".skeleton")) return false;   // still mid-render
+    if (wantOnboarding) {
+      return view === "onboarding" && !!content.querySelector(".onboarding-shell");
+    }
+    const has = (s) => !!document.querySelector(s);
+    if (which === 0 && !(has('[data-setup-workflow-landing="facilities"]')
+        && has("[data-setup-card-slot]")
+        && has("[data-setup-landing-actions]"))) return false;
+    if (which === 1 && !(has("[data-setup-card-slot]")
+        && has("[data-setup-hub-progress-slot]"))) return false;
+    if (which === 2 && !has("#sp-card-slot")) return false;
+    const key = which === 2 ? "home/setup-progress" : "setup/facilities";
+    const e = readCardState(key);
+    return e.state !== "loading" && e.state !== "stale";
+  }, [SURFACE_CODE[surface], lands === "onboarding"], { timeout: 25000 })
+    .catch(async () => {
+      const why = await page.evaluate(() => ({
+        renders: window.__wiOwnRenders,
+        marksLeft: document.querySelectorAll("[data-wi-blank-mark]").length,
+        marksStillBlank: Array.from(
+          document.querySelectorAll("[data-wi-blank-mark]"))
+          .filter((el) => !el.children.length
+            && !((el.textContent || "").trim().length)).length,
+        user: currentUser && currentUser.username,
+        view: view, setupView: setupView, setupWorkflow: setupWorkflow,
+        landing: !!document.querySelector('[data-setup-workflow-landing="facilities"]'),
+        slots: document.querySelectorAll("[data-setup-card-slot]").length,
+        actions: document.querySelectorAll("[data-setup-landing-actions]").length,
+        progressSlots: document.querySelectorAll("[data-setup-hub-progress-slot]").length,
+        homeSlot: !!document.getElementById("sp-card-slot"),
+        onboardingShell: !!document.querySelector(".onboarding-shell"),
+        facilities: readCardState("setup/facilities").state,
+        homeCard: readCardState("home/setup-progress").state,
+        skeletons: document.querySelectorAll("#content .skeleton").length,
+        contentHead: ((document.getElementById("content") || {}).innerHTML || "").slice(0, 200),
+      })).catch(() => null);
+      fail(`[${step}/recovery] releasing /api/context/options never produced a `
+        + `render of the arriving principal's own that finished on `
+        + `${lands === "onboarding" ? "their Initial Setup destination" : `the ${surface} surface`}. `
+        + `The identity boundary blanks the painted card surfaces SYNCHRONOUSLY, `
+        + `so without this render ${arrive.username} is left looking at an empty `
+        + `page until they navigate — the privacy fix would have traded a `
+        + `disclosure for a dead page. Nothing in this leg navigated, clicked or `
+        + `rendered after the release: ${JSON.stringify(why)}`);
+    });
+
+  // ...and the same record every other moment in this leg is read with, so
+  // "restored" is measured on the same axes "withdrawn" was. Asserted BEFORE
+  // the test takes any action at all.
+  const recovered = await paintedContextScopedSurface(page);
+  if (lands === "surface") {
+    assertSurfaceStructure(recovered, surface, L, sub, "recovery");
+    if (!recovered.cardText.length) {
+      fail(`[${step}/recovery] the sign-in's own render rebuilt the containers `
+        + `but painted no card body for ${arrive.username}: `
+        + `${JSON.stringify(recovered)}`);
+    }
+    if (surface !== "home" && !recovered.counts.length) {
+      fail(`[${step}/recovery] ${arrive.username}'s own render restored no `
+        + `counts of their own, so "the blanking was a window" is only half `
+        + `true: ${JSON.stringify(recovered)}`);
+    }
+  } else {
+    // The Initial Setup destination is a real, complete page — asserted
+    // positively, so "landed somewhere else" can never pass by being empty.
+    const shell = await page.evaluate(() => {
+      const c = document.getElementById("content");
+      const el = c && c.querySelector(".onboarding-shell");
+      return { present: !!el, heading: !!(c && c.querySelector("h2")),
+               text: ((el && el.textContent) || "").replace(/\s+/g, " ").trim().length };
+    });
+    if (!shell.present || !shell.heading || shell.text < 40) {
+      fail(`[${step}/recovery] the arriving principal's own render landed on `
+        + `their Initial Setup destination but painted no real page there: `
+        + `${JSON.stringify(shell)}`);
+    }
+  }
+
+  // ---- ONLY NOW may this leg touch the page again --------------------
+  // Everything above is the assertion; everything below is teardown, so the
+  // held write is drained and the route removed for whatever runs next. Both
+  // were previously done BEFORE the recovery was asserted, which is part of
+  // why a missing post-options render could not be seen: the drain repaints
+  // the card on its own.
   if (shape === "pending") {
     // The held write is released only now, AFTER the window has been sampled:
     // its settlement across an identity change is leg 7's subject, and this leg
@@ -1417,22 +1936,10 @@ async function preRenderIdentityWindow(ctx) {
       .catch(() => fail(`[${step}] the held write never drained after the window`));
   }
   if (heldHandler) await page.unroute(REOPEN_RE, heldHandler);
+  await page.evaluate(() => {
+    if (window.__wiOwnObs) { window.__wiOwnObs.disconnect(); window.__wiOwnObs = null; }
+  });
   await page.waitForTimeout(400);
-  // The blanking is a WINDOW, not a permanent withdrawal: the arriving
-  // principal's own render has to repaint their own surface from their own
-  // reads, or "blank it at the boundary" would have traded a disclosure for a
-  // dead page. Deliberately only that — WHAT the reconciled card then says
-  // under the arriving principal's own permissions is leg 7's subject, asserted
-  // there for all five of its sub-legs, and re-asserting it here would make one
-  // mutation fail two different cases.
-  await openScopedSurface(page, surface, `${step}/after`);
-  const after = await paintedContextScopedSurface(page);
-  assertSurfaceStructure(after, surface, L, sub, "after");
-  if (!after.cardText.length) {
-    fail(`[${step}/after] ${arrive.username}'s own render never repainted the `
-      + `surface the boundary blanked — it is still empty after the context `
-      + `options load completed: ${JSON.stringify(after)}`);
-  }
 }
 
 // EVERY rendered surface AND every store behind it, searched for a LITERAL
@@ -1560,7 +2067,7 @@ function heldReopen(opts) {
     }
     h.markHeld();
     await h.gate;
-    opts.allowResourceError();
+    opts.allowResourceError(route);
     return route.fulfill({ status: 503, contentType: "application/json",
       body: JSON.stringify({ error: { code: "server_unavailable",
         message: SERVER_503_MESSAGE } }) });
@@ -1875,6 +2382,409 @@ async function crossPrincipalRelease(ctx) {
   }
 }
 
+// ============ LEG 9 HELPERS: A CARD READ IN FLIGHT (#365 round 10) =========
+//
+// Legs 7 and 8 are both about the card's own WRITE. That is not where the
+// principal/session epoch inside cardIdentityCurrent() actually does its work,
+// and a mutation run proved it: deleting ONLY that one line left legs 1-8
+// green. The reason is that reopenSelectedSeasonFromCard() asks
+// cardIdentitySamePrincipal() DIRECTLY on its own post-await line and routes a
+// foreign-principal response into the silent reconcile before any gated helper
+// is reached — so on the write path the epoch test inside the shared gate is
+// never the thing that refuses.
+//
+// The paths where it IS the only thing that refuses are the card's READS.
+// retrySetupWorkflowCard() — the per-card Retry/Refresh, and the same function
+// wireSetupWorkflowCards() binds to [data-setup-card-retry] — gates its four
+// post-await mutation points on cardIdentityCurrent() ALONE:
+//
+//   app.js:5367  commitCardState(identity, model)          (4)/(5) model
+//   app.js:5368  repaintSetupWorkflowCard(key, identity)    (1) DOM
+//   app.js:5374  announceCardStatus(identity, …)            (3) live region
+//   app.js:5380  focusCardTarget(identity, …)               (2) focus
+//
+// It asks no principal question of its own anywhere. Neither does
+// loadSetupProgressCard() (app.js:1606/1618/1636) or restorePendingCardWriteFocus()
+// (app.js:5242, through focusCardTarget).
+//
+// WHY THE GENERATION DOES NOT SAVE IT. For a read, the card registers no write,
+// so an ordinary Setup render under the arriving principal WOULD advance the
+// counter and make the departing identity stale on generation alone. The window
+// where it cannot is the post-auth/pre-render one leg 8 established: `currentUser`
+// is already the arriving principal and not one line of their own rendering has
+// run, so the counter is exactly where the departing operator's own refresh left
+// it. Generation equality therefore still says "current", the tuple is unchanged
+// (both operators are persisted on it), and the epoch is the ONLY remaining
+// difference between the two identities — which is precisely the property the
+// single-line mutation removes.
+//
+// So this leg holds the REFRESH's own read across the identity boundary and
+// samples at the instant the DEPARTING principal's response resolves, still
+// inside the window. It never awaits the function that closes it.
+
+// The card refresh's own read, held. Only the FIRST matching request is held —
+// everything afterwards (the arriving principal's own render, the recovery
+// navigation) passes straight through, so holding this route can never deadlock
+// a later fetch that the assertions depend on.
+//
+// route.fetch() runs BEFORE the hold, so the server answers while the
+// INITIATING principal is still the authenticated one: this is genuinely their
+// own read of their own card, and only its DELIVERY crosses the boundary.
+function heldCardRead() {
+  const h = { requests: 0, status: null, taken: false };
+  h.held = new Promise((resolve) => { h.markHeld = resolve; });
+  h.gate = new Promise((resolve) => { h.release = resolve; });
+  h.handler = async (route) => {
+    if (h.taken) {
+      try { return await route.continue(); } catch (e) { return; }
+    }
+    h.taken = true;
+    h.requests += 1;
+    const response = await route.fetch();
+    h.status = response.status();
+    h.markHeld();
+    await h.gate;
+    try { await route.fulfill({ response }); } catch (e) { /* page closed */ }
+  };
+  return h;
+}
+
+// Start the per-card refresh WITHOUT awaiting it. page.evaluate() awaits a
+// returned promise, so returning retrySetupWorkflowCard()'s would block on the
+// very read this leg holds; parked on `window` instead, exactly as leg 8 parks
+// signIn()'s. This is the expression wireSetupWorkflowCards() binds to the
+// card's own Retry/Refresh control (app.js:5759) — the control itself is
+// painted only in ERROR and STALE, and forcing either would mean injecting a
+// failure this leg is not about, so the handler is driven directly. The same
+// code-level idiom setup-prerequisite-floors.js and facilities-venue-access.js
+// already use for a per-card refresh.
+async function startCardRefresh(page, step) {
+  await page.evaluate(() => {
+    window.__wiRefresh = Promise.resolve(retrySetupWorkflowCard("facilities"));
+  });
+  const started = await page.waitForFunction(() =>
+    readCardState("setup/facilities").state === "loading", null, { timeout: 15000 })
+    .then(() => true).catch(() => false);
+  if (!started) {
+    fail(`[${step}] the per-card refresh never entered LOADING, so no read of `
+      + `this card's is in flight and there is nothing to race`);
+  }
+}
+
+// Everything the departing principal's response could reach, read at one
+// instant: the committed models (with WHOSE identity each carries), the live
+// region, keyboard focus, and the painted card surfaces.
+async function cardReadSample(page) {
+  const painted = await paintedContextScopedSurface(page);
+  const stores = await page.evaluate(() => {
+    const entry = cardStates["setup/facilities"];
+    return {
+      committedCards: Object.keys(cardStates),
+      committed: entry ? {
+        state: entry.state,
+        principal: entry.identity ? entry.identity.principal : null,
+        epoch: entry.identity ? entry.identity.epoch : null,
+        generation: entry.identity ? entry.identity.generation : null,
+      } : null,
+      counter: cardGenerations["setup/facilities"],
+      epochNow: uiIdentityEpoch,
+      who: (currentUser && currentUser.username) || null,
+    };
+  });
+  return { painted: painted, stores: stores,
+           focus: await focusNow(page), spoken: await spoken(page) };
+}
+
+// ONE sub-leg of leg 9. Same parameterisation discipline as legs 7 and 8.
+//
+// `ctx`:
+//   sub      the label used in every failure message ("9a" …)
+//   season   the archived-Season fixture this sub-leg owns
+//   arrive   { username, password, via } — the ARRIVING principal
+async function crossPrincipalCardRead(ctx) {
+  const { page, base, L, sub, arrive } = ctx;
+  const step = `${L}/${sub}`;
+
+  await persistContextFor(page, arrive, ctx.program, ctx.season.season, step);
+  await reenter(page, base);
+  await openFacilities(page, step);
+  await armAnnouncements(page);
+
+  const opening = await readCard(page);
+  if (opening.effective !== "Reopen this season") {
+    fail(`[${step}] the fixture does not put the Facilities card in its usual `
+      + `settled shape (effective ${JSON.stringify(opening.effective)}, state `
+      + `"${opening.state}") — the refresh below would then be refreshing `
+      + `something this leg has not established`);
+  }
+
+  // ============ (i) THE CONTROL: the same read, NO identity change =========
+  // The four mutation points have to be REACHABLE on this path, or their
+  // absence after the boundary would prove nothing at all. So the identical
+  // refresh is held and released under the UNCHANGED principal first, and each
+  // of the four is observed happening.
+  await quiesce(page, `${step}/control`);
+  await parkFocusOutsideCard(page, `${step}/control`);
+  const focusBeforeControl = await focusNow(page);
+  await resetAnnouncements(page);
+  const control = heldCardRead();
+  await page.route(OVERVIEW_RE, control.handler);
+  await startCardRefresh(page, `${step}/control`);
+  await control.held;
+  const controlDeliveriesBefore = ctx.overviewDeliveries();
+  control.release();
+  const controlDeadline = Date.now() + 10000;
+  while (ctx.overviewDeliveries() === controlDeliveriesBefore
+         && Date.now() < controlDeadline) {
+    await page.waitForTimeout(100);
+  }
+  await page.waitForFunction(() =>
+    readCardState("setup/facilities").state !== "loading", null, { timeout: 15000 })
+    .catch(() => fail(`[${step}/control] the refresh never settled`));
+  await page.waitForTimeout(500);
+  await page.unroute(OVERVIEW_RE, control.handler);
+
+  const settledControl = await cardReadSample(page);
+  if (!settledControl.spoken.some((a) => a.text === REFRESH_TEXT)) {
+    fail(`[${step}/control] the per-card refresh announced `
+      + `${JSON.stringify(settledControl.spoken)}, not `
+      + `${JSON.stringify(REFRESH_TEXT)}. This path must be shown to REACH the `
+      + `announcement gate under an unchanged principal, or the silence `
+      + `asserted after the identity change below would be the silence of a `
+      + `code path that never runs.`);
+  }
+  if (settledControl.focus === focusBeforeControl) {
+    fail(`[${step}/control] the per-card refresh left keyboard focus on `
+      + `${focusBeforeControl} — it must reach the focus gate under an `
+      + `unchanged principal, or "focus did not move" after the identity `
+      + `change proves nothing`);
+  }
+  if (!settledControl.stores.committed
+      || settledControl.stores.committed.principal !== "admin") {
+    fail(`[${step}/control] the per-card refresh committed `
+      + `${JSON.stringify(settledControl.stores.committed)} — it must reach the `
+      + `model-commit gate under an unchanged principal`);
+  }
+  if (!settledControl.painted.cardText.length) {
+    fail(`[${step}/control] the per-card refresh painted nothing into the card `
+      + `slot, so "nothing was repainted" after the identity change would be `
+      + `vacuous`);
+  }
+
+  // ====== (ii) THE SAME READ, HELD ACROSS THE IDENTITY BOUNDARY ======
+  await quiesce(page, step);
+  await parkFocusOutsideCard(page, step);
+  await resetAnnouncements(page);
+  const h = heldCardRead();
+  await page.route(OVERVIEW_RE, h.handler);
+  await startCardRefresh(page, step);
+  await h.held;
+  await page.waitForTimeout(300);
+
+  // The DEPARTING principal's own outstanding identity, captured while it is
+  // still readable: once the boundary destroys cardStates it lives only inside
+  // the closure of the in-flight refresh.
+  const outstanding = await page.evaluate(() => {
+    const e = cardStates["setup/facilities"];
+    return { state: e && e.state,
+             principal: e && e.identity && e.identity.principal,
+             epoch: e && e.identity && e.identity.epoch,
+             generation: e && e.identity && e.identity.generation,
+             counter: cardGenerations["setup/facilities"],
+             epochNow: uiIdentityEpoch };
+  });
+  if (outstanding.state !== "loading" || outstanding.principal !== "admin") {
+    fail(`[${step}] the held read is not the departing principal's own `
+      + `outstanding request: ${JSON.stringify(outstanding)}`);
+  }
+  if (h.status !== 200) {
+    fail(`[${step}] the departing principal's read was answered ${h.status}, `
+      + `not 200 — a failed read would carry a different sentence and this `
+      + `sub-leg would be measuring the wrong response`);
+  }
+
+  const releaseOptions = holdContextOptions();
+  let released = false;
+  try {
+    await startArrival(page, arrive, step);
+    await page.waitForFunction((u) => !!currentUser && currentUser.username === u,
+      arrive.username, { timeout: 20000 })
+      .catch(() => fail(`[${step}/window] the app never adopted ${arrive.username}`));
+
+    const boundary = await cardReadSample(page);
+    const heldNow = optionsHeldNow;
+    const ownRenders = await page.evaluate(() => window.__wiOwnRenders);
+    if (heldNow < 1 || ownRenders !== 0) {
+      fail(`[${step}/window] the arriving principal's context-options load is `
+        + `no longer outstanding, or a render of their own has already run `
+        + `(held=${heldNow}, renders=${ownRenders}) — outside the window the `
+        + `counter would have advanced and generation alone would refuse, so `
+        + `nothing below would be testing the principal/session epoch`);
+    }
+    // ---- NON-VACUITY: generation equality still says "current" ----
+    // This is the whole reason the epoch has to exist. If the counter had
+    // moved, cardIdentityCurrent() would refuse on generation and the epoch
+    // line would be untestable here.
+    if (boundary.stores.counter !== outstanding.counter) {
+      fail(`[${step}/window] the card's generation counter moved `
+        + `${outstanding.counter} -> ${boundary.stores.counter} across the `
+        + `identity change, so the departing read is already stale on `
+        + `GENERATION and this sub-leg no longer isolates the principal/session `
+        + `epoch`);
+    }
+    if (outstanding.generation !== boundary.stores.counter) {
+      fail(`[${step}/window] the outstanding read's generation `
+        + `${outstanding.generation} is not the counter's current value `
+        + `${boundary.stores.counter} — generation equality must still say `
+        + `"current" for the epoch to be the only thing left to judge by`);
+    }
+    if (!(boundary.stores.epochNow > outstanding.epoch)
+        || boundary.stores.who !== arrive.username) {
+      fail(`[${step}/window] the session epoch did not advance past the `
+        + `outstanding read's (${outstanding.epoch} -> `
+        + `${boundary.stores.epochNow}) or the signed-in principal is `
+        + `${JSON.stringify(boundary.stores.who)} rather than `
+        + `${JSON.stringify(arrive.username)} — there is nothing for the `
+        + `identity gate to compare`);
+    }
+    if (boundary.stores.committedCards.length) {
+      fail(`[${step}/window] the identity boundary left committed card models `
+        + `behind: ${JSON.stringify(boundary.stores.committedCards)}`);
+    }
+    // ...and the surfaces are still THERE, so every emptiness below is a
+    // withdrawal rather than a page that lost its Setup DOM.
+    assertSurfaceStructure(boundary.painted, "landing", L, sub, "window");
+    const focusAtBoundary = boundary.focus;
+
+    // ============ THE RELEASE, INSIDE THE WINDOW ============
+    const deliveriesBefore = ctx.overviewDeliveries();
+    h.release();
+    const deadline = Date.now() + 15000;
+    while (ctx.overviewDeliveries() === deliveriesBefore && Date.now() < deadline) {
+      await page.waitForTimeout(100);
+    }
+    if (ctx.overviewDeliveries() === deliveriesBefore) {
+      fail(`[${step}/resolve] the departing principal's read never reached the `
+        + `page, so nothing was actually resolved`);
+    }
+    // Long enough for retrySetupWorkflowCard()'s whole post-await body — the
+    // commit, the repaint, the announcement and the focus move — to have run.
+    await page.waitForTimeout(1500);
+
+    const resolved = await cardReadSample(page);
+    const stillHeld = optionsHeldNow;
+    const rendersAtSample = await page.evaluate(() => window.__wiOwnRenders);
+    // THE SAMPLE IS AT THE DEPARTING RESPONSE'S OWN RESOLUTION. Asserted after
+    // the fact as well as before it: a render of the arriving principal's own
+    // that slipped in between would have rebuilt every surface below and turned
+    // the four assertions into observations of THEIR render.
+    if (stillHeld < 1 || rendersAtSample !== 0) {
+      fail(`[${step}/resolve] the arriving principal's own render ran before `
+        + `this sample (held=${stillHeld}, renders=${rendersAtSample}), so the `
+        + `four assertions below are reading their render rather than the `
+        + `departing principal's resolved read`);
+    }
+
+    // ---- (1) NOTHING SAID ----
+    if (resolved.spoken.length) {
+      fail(`[${step}/resolve] the departing principal's card read spoke into `
+        + `${arrive.username}'s live region: ${JSON.stringify(resolved.spoken)}. `
+        + `${arrive.username} pressed no Refresh; a sentence here is somebody `
+        + `else's request announcing itself in their session.`);
+    }
+    // ---- (2) NOTHING COMMITTED ----
+    if (resolved.stores.committedCards.length) {
+      fail(`[${step}/resolve] the departing principal's read became a COMMITTED `
+        + `model in ${arrive.username}'s session: `
+        + `${JSON.stringify(resolved.stores.committed)} (cards `
+        + `${JSON.stringify(resolved.stores.committedCards)}). Those counts and `
+        + `that effective action were read under the DEPARTING principal's `
+        + `permissions, and the hub roll-up, the completion line and the next-task `
+        + `recommendation are all derived from exactly this model.`);
+    }
+    // ---- (3) NOTHING PAINTED ----
+    assertSurfaceStructure(resolved.painted, "landing", L, sub, "resolve");
+    for (const [what, value] of [
+        ["card copy", resolved.painted.cardText],
+        ["landing action copy", resolved.painted.actionsText],
+        ["controls", resolved.painted.controls],
+        ["counts", resolved.painted.counts],
+        ["status chips", resolved.painted.chips],
+        ["roll-up / next-task line", resolved.painted.rollup],
+        ["field values", resolved.painted.fieldValues]]) {
+      if (value.length) {
+        fail(`[${step}/resolve] the departing principal's read repainted `
+          + `${what} into ${arrive.username}'s blanked card surface before any `
+          + `render of their own: ${JSON.stringify(value)}`);
+      }
+    }
+    if (resolved.painted.liveRegion || resolved.painted.liveRegionHtml) {
+      fail(`[${step}/resolve] the live region holds `
+        + `${JSON.stringify(resolved.painted.liveRegion
+          || resolved.painted.liveRegionHtml)} after the departing principal's `
+        + `read resolved`);
+    }
+    // ---- (4) NO FOCUS MOVE ----
+    if (resolved.focus !== focusAtBoundary) {
+      fail(`[${step}/resolve] the departing principal's read moved keyboard `
+        + `focus in ${arrive.username}'s session (${focusAtBoundary} -> `
+        + `${resolved.focus})`);
+    }
+    if (resolved.painted.focusInScoped) {
+      fail(`[${step}/resolve] keyboard focus is standing inside a card surface `
+        + `(${resolved.painted.focusDesc}) that the arriving principal has not `
+        + `read yet`);
+    }
+    // ...and none of the departing principal's own card copy anywhere.
+    for (const literal of [REFRESH_TEXT, BUSY_TEXT, DONE_TEXT]) {
+      const sightings = await privateTextSightings(page, literal, true);
+      if (sightings.length) {
+        fail(`[${step}/resolve] ${JSON.stringify(literal)} reached `
+          + `${arrive.username} in: ${JSON.stringify(sightings)}`);
+      }
+    }
+
+    releaseOptions();
+    released = true;
+  } finally {
+    if (!released) releaseOptions();
+  }
+
+  // ---- RECOVERY: the arriving principal's OWN render still lands ----
+  // The gate refuses a foreign response; it must not leave the card dead. The
+  // arriving principal's own render rebuilds it from their own read, under
+  // their own identity.
+  await page.waitForFunction(() => window.__wiOwnRenders > 0, null,
+    { timeout: 20000 })
+    .catch(() => fail(`[${step}/recovery] the arriving principal's own render `
+      + `never replaced #content, so the refusal above left them on a blank `
+      + `card`));
+  await settled(page, `${step}/recovery`, ctx.season.season);
+  const recovered = await cardReadSample(page);
+  if (!recovered.stores.committed
+      || recovered.stores.committed.principal !== arrive.username
+      || recovered.stores.committed.epoch !== recovered.stores.epochNow) {
+    fail(`[${step}/recovery] the card's committed model is `
+      + `${JSON.stringify(recovered.stores.committed)}, not one issued to `
+      + `${arrive.username} in the current session epoch`);
+  }
+  if (!recovered.painted.cardText.length) {
+    fail(`[${step}/recovery] the arriving principal's own render painted no `
+      + `card body, so the identity gate left the surface dead rather than `
+      + `merely refusing somebody else's response`);
+  }
+  if (recovered.spoken.length) {
+    fail(`[${step}/recovery] ${arrive.username} was told `
+      + `${JSON.stringify(recovered.spoken)} — their own render answers no `
+      + `press of theirs and must announce nothing`);
+  }
+  await page.unroute(OVERVIEW_RE, h.handler);
+  await page.evaluate(() => {
+    if (window.__wiOwnObs) { window.__wiOwnObs.disconnect(); window.__wiOwnObs = null; }
+  });
+  await page.waitForTimeout(300);
+}
+
 // Re-enter the Facilities destination through the REAL sidebar navigation
 // entry. Used after a context switch, where the previously painted landing
 // may or may not have survived: every "zero controls on both surfaces"
@@ -2013,25 +2923,110 @@ async function checkViewport(browser, viewport) {
   const page = await context.newPage();
   const errors = [];
   page.on("pageerror", (e) => errors.push(`[pageerror] ${e.message}`));
-  // Chromium logs a "Failed to load resource" console error for every non-2xx
-  // fetch, and this journey injects 503s on purpose. Absorbed on a BUDGET
-  // rather than by blanket-ignoring the pattern (the role-authorization-matrix
-  // idiom): exactly one line is forgiven per 503 this file actually injected,
-  // so an unrelated failed request is still a hard failure.
-  let resourceAllowance = 0;
-  page.on("console", (m) => {
-    if (m.type() !== "error") return;
-    if (/Failed to load resource/.test(m.text()) && resourceAllowance > 0) {
-      resourceAllowance -= 1;
+  // ========== EVERY FAILED DELIVERY, NAMED (#365 review round 9) ===========
+  // The previous shape recorded only `m.text()` and forgave the next generic
+  // "Failed to load resource" console line whenever an injected 503 bumped a
+  // counter. Verbatim from the review:
+  //
+  //   "The harness records only `m.text()`, so it loses the failed URL/status
+  //   source; its `resourceAllowance` also forgives the next generic 'Failed to
+  //   load resource' console line whenever an injected 503 increments a
+  //   counter, without binding that allowance to the expected reopen endpoint
+  //   or status. An unrelated 404 can therefore be either exposed or consumed
+  //   depending on timing. That means the exact same head can be red locally
+  //   and green in CI without enough evidence to determine which request
+  //   failed."
+  //
+  // So nothing is counted any more. FOUR independent records are kept, and the
+  // matching between them happens ONCE, at the end of the viewport:
+  //
+  //   nonOk          every response the page received with a non-2xx status,
+  //                  as { method, url, status } — the record that makes a
+  //                  failure diagnosable at all.
+  //   failedReqs     requests that were never delivered (page.on("requestfailed")),
+  //                  which produce no response event and so appear nowhere above.
+  //   consoleErrors  Chromium's own console lines, each carrying m.location().url —
+  //                  the failing request's URL, which m.text() does not contain.
+  //   injected       one entry per failure THIS FILE injects, stamped with the
+  //                  exact method + URL + status of the very request being
+  //                  fulfilled. Not a counter: an allowance for a 503 on
+  //                  /api/v2/setup/seasons/<id>/reopen can only ever be
+  //                  satisfied by that method, that URL and that status, and
+  //                  only once.
+  //
+  // Reconciled at the END rather than inside the handlers because Chromium's
+  // console line and Playwright's response event are NOT ordered against each
+  // other. Consuming an allowance live would make the outcome depend on which
+  // of the two arrived first — precisely the timing dependence the review
+  // reports as "red locally, green in CI on the same SHA".
+  const nonOk = [];         // { method, url, status }
+  const failedReqs = [];    // { method, url, failure }
+  const consoleErrors = []; // { text, url }
+  const injected = [];      // { method, url, status, matched }
+  const L = viewport.label;
+  // Declare that the request THIS ROUTE HANDLER is about to fulfil will be
+  // answered with `status` on purpose. Called from inside the handler, with the
+  // route itself, so the allowance carries the concrete season URL rather than
+  // a category — an unrelated failure can never satisfy it.
+  const allowInjected = (route, status) => {
+    const req = route.request();
+    const url = req.url();
+    if (!REOPEN_RE.test(new URL(url).pathname)) {
+      // Pushed rather than thrown: a throw inside a route handler is swallowed
+      // by Playwright and would silently disarm this guard.
+      errors.push(`[injected] a deliberate ${status} was declared for `
+        + `${req.method()} ${url}, which is not this journey's reopen endpoint`);
       return;
     }
-    errors.push(`[console] ${m.text()}`);
+    injected.push({ method: req.method(), url, status, matched: false });
+  };
+  page.on("console", (m) => {
+    if (m.type() !== "error") return;
+    const loc = m.location() || {};
+    if (/Failed to load resource/.test(m.text())) {
+      consoleErrors.push({ text: m.text(), url: loc.url || "" });
+      return;
+    }
+    errors.push(`[console] ${m.text()}${loc.url ? ` @ ${loc.url}` : ""}`);
   });
   // Deliveries the PAGE actually received, so "the response was released" is
   // observed rather than assumed before any "after" snapshot is taken.
   let reopenDeliveries = 0;
-  page.on("response", (r) => { if (REOPEN_RE.test(new URL(r.url()).pathname)) reopenDeliveries++; });
-  const L = viewport.label;
+  // The same, for the per-card refresh's own READ (leg 9): "the departing
+  // principal's response reached the page" has to be observed at the network,
+  // not inferred from a timeout, because on a correct build the response
+  // changes nothing the page can be polled for.
+  let overviewDeliveries = 0;
+  page.on("response", (r) => {
+    if (REOPEN_RE.test(new URL(r.url()).pathname)) reopenDeliveries++;
+    if (OVERVIEW_RE.test(new URL(r.url()).pathname)) overviewDeliveries++;
+    const s = r.status();
+    if (s < 200 || s > 299) {
+      nonOk.push({ method: r.request().method(), url: r.url(), status: s });
+    }
+  });
+  page.on("requestfailed", (req) => {
+    const f = req.failure();
+    failedReqs.push({ method: req.method(), url: req.url(),
+                      failure: (f && f.errorText) || "unknown" });
+  });
+  // ---- IN-FLIGHT REQUESTS, so nothing this journey does to the server can
+  // land underneath a render that is still reading. See quiesce().
+  let inFlight = 0;
+  let requestSeq = 0;
+  const idleWaiters = [];
+  const settleOne = () => {
+    inFlight = Math.max(0, inFlight - 1);
+    if (inFlight === 0) idleWaiters.splice(0).forEach((r) => r());
+  };
+  page.on("request", () => { inFlight += 1; requestSeq += 1; });
+  page.on("requestfinished", settleOne);
+  page.on("requestfailed", settleOne);
+  page.__wiInFlight = () => inFlight;
+  page.__wiRequestSeq = () => requestSeq;
+  page.__wiOnIdle = () => (inFlight === 0
+    ? Promise.resolve()
+    : new Promise((r) => idleWaiters.push(r)));
   // Per-page, and reset per viewport: the two knobs are module-level because
   // only one viewport's page is ever live at a time (checkViewport is awaited
   // in sequence), but leaving one armed across viewports would silently change
@@ -2046,10 +3041,16 @@ async function checkViewport(browser, viewport) {
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 15000 });
     await loginAs(page, "admin", "demo");
+    // The BODY is read, not just the status (#365 round 9). A fetch whose
+    // response stream is never consumed stays open until the next navigation
+    // cancels it, and Chromium reports that cancellation as
+    // `net::ERR_ABORTED` on the request — a failed request this journey
+    // caused itself, and one the new requestfailed recorder correctly refuses
+    // to ignore.
     const loadStatus = await page.evaluate(() => fetch("/api/demo/load", {
       method: "POST", credentials: "same-origin",
       headers: { "Content-Type": "application/json" }, body: "{}",
-    }).then((r) => r.status));
+    }).then(async (r) => { await r.text(); return r.status; }));
     if (loadStatus !== 200) fail(`[${L}] demo load failed (status ${loadStatus})`);
 
     // ---------------------------- fixtures -----------------------------
@@ -2121,6 +3122,12 @@ async function checkViewport(browser, viewport) {
     const s17 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A17");
     const s18 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A18");
     const s19 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A19");
+    // Leg 9's two sub-legs. Neither writes anything at all — the request they
+    // race is a READ — but they get their own Season each for the same reason:
+    // the settled card shape each one asserts before it starts must be the
+    // fixture's, not whatever the previous sub-leg left.
+    const s20 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A20");
+    const s21 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A21");
 
     // THE SECOND OPERATOR (#365 round 7). A real, separate account with the
     // SAME role as the first: the leak the review reports is not a permissions
@@ -2137,7 +3144,7 @@ async function checkViewport(browser, viewport) {
     }
 
     // =================== (1) HELD POST, THEN 503 =======================
-    await apiPost(page, "/api/context", { program_id: shared.pa, season_id: s1.season });
+    await moveOwnContext(page, shared.pa, s1.season, `${L}`);
     await reenter(page, base);
     await openFacilities(page, `${L}/1`);
     await armAnnouncements(page);
@@ -2166,7 +3173,7 @@ async function checkViewport(browser, viewport) {
     const holdAndFail = async (route) => {
       markOneHeld();
       await oneGate;
-      resourceAllowance += 1;
+      allowInjected(route, 503);
       await route.fulfill({ status: 503, contentType: "application/json",
         body: JSON.stringify({ error: { code: "server_unavailable",
           message: "The server is temporarily unavailable (503). Please try "
@@ -2281,7 +3288,7 @@ async function checkViewport(browser, viewport) {
     }
 
     // ============= (2) STALE SUCCESS, RELEASED ONTO TUPLE B =============
-    await apiPost(page, "/api/context", { program_id: shared.pa, season_id: s2.season });
+    await moveOwnContext(page, shared.pa, s2.season, `${L}`);
     await reenter(page, base);
     await openFacilities(page, `${L}/2`);
     await armAnnouncements(page);
@@ -2374,7 +3381,7 @@ async function checkViewport(browser, viewport) {
     }
 
     // ============== (3) STALE ERROR, RELEASED ONTO TUPLE B ==============
-    await apiPost(page, "/api/context", { program_id: shared.pa, season_id: s3.season });
+    await moveOwnContext(page, shared.pa, s3.season, `${L}`);
     await reenter(page, base);
     await openFacilities(page, `${L}/3`);
     await armAnnouncements(page);
@@ -2387,7 +3394,7 @@ async function checkViewport(browser, viewport) {
     const holdError = async (route) => {
       markThreeHeld();
       await threeGate;
-      resourceAllowance += 1;
+      allowInjected(route, 503);
       await route.fulfill({ status: 503, contentType: "application/json",
         body: JSON.stringify({ error: { code: "server_unavailable",
           message: "The server is temporarily unavailable (503). Please try "
@@ -2431,7 +3438,7 @@ async function checkViewport(browser, viewport) {
     }
 
     // ==================== (4) NORMAL SUCCESS ============================
-    await apiPost(page, "/api/context", { program_id: shared.pa, season_id: s4.season });
+    await moveOwnContext(page, shared.pa, s4.season, `${L}`);
     await reenter(page, base);
     await openFacilities(page, `${L}/4`);
     await armAnnouncements(page);
@@ -2526,7 +3533,7 @@ async function checkViewport(browser, viewport) {
       page.evaluate(() => JSON.stringify(cardStates["setup/facilities"]));
 
     // ---------------- (5a) held before the server, then 503 ---------------
-    await apiPost(page, "/api/context", { program_id: shared.pa, season_id: s5.season });
+    await moveOwnContext(page, shared.pa, s5.season, `${L}`);
     await reenter(page, base);
     await openFacilities(page, `${L}/5a`);
     await armAnnouncements(page);
@@ -2552,7 +3559,7 @@ async function checkViewport(browser, viewport) {
       reopen5Requests += 1;
       markFiveHeld();
       await fiveGate;
-      resourceAllowance += 1;
+      allowInjected(route, 503);
       await route.fulfill({ status: 503, contentType: "application/json",
         body: JSON.stringify({ error: { code: "server_unavailable",
           message: "The server is temporarily unavailable (503). Please try "
@@ -2709,7 +3716,7 @@ async function checkViewport(browser, viewport) {
     }
 
     // -------- (5b) the same race, released as a COMMITTED success --------
-    await apiPost(page, "/api/context", { program_id: shared.pa, season_id: s6.season });
+    await moveOwnContext(page, shared.pa, s6.season, `${L}`);
     await reenter(page, base);
     await openFacilities(page, `${L}/5b`);
     await armAnnouncements(page);
@@ -2851,7 +3858,7 @@ async function checkViewport(browser, viewport) {
     });
 
     // ------------- (6a) round trip, then released as a 503 --------------
-    await apiPost(page, "/api/context", { program_id: shared.pa, season_id: s7.season });
+    await moveOwnContext(page, shared.pa, s7.season, `${L}`);
     await reenter(page, base);
     await openFacilities(page, `${L}/6a`);
     await armAnnouncements(page);
@@ -2876,7 +3883,7 @@ async function checkViewport(browser, viewport) {
       reopen7Requests += 1;
       markSevenHeld();
       await sevenGate;
-      resourceAllowance += 1;
+      allowInjected(route, 503);
       await route.fulfill({ status: 503, contentType: "application/json",
         body: JSON.stringify({ error: { code: "server_unavailable",
           message: "The server is temporarily unavailable (503). Please try "
@@ -3089,7 +4096,7 @@ async function checkViewport(browser, viewport) {
     }
 
     // ------- (6b) the same round trip, released as a COMMITTED success -------
-    await apiPost(page, "/api/context", { program_id: shared.pa, season_id: s8.season });
+    await moveOwnContext(page, shared.pa, s8.season, `${L}`);
     await reenter(page, base);
     await openFacilities(page, `${L}/6b`);
     await armAnnouncements(page);
@@ -3203,7 +4210,7 @@ async function checkViewport(browser, viewport) {
     // the tuple that is current, and it returns. If the registration is
     // released only where the initiating identity survived, the target tuple
     // is blocked the next time the operator looks at it — forever.
-    await apiPost(page, "/api/context", { program_id: shared.pa, season_id: s9.season });
+    await moveOwnContext(page, shared.pa, s9.season, `${L}`);
     await reenter(page, base);
     await openFacilities(page, `${L}/6c`);
     await armAnnouncements(page);
@@ -3219,7 +4226,7 @@ async function checkViewport(browser, viewport) {
       reopen9Requests += 1;
       markNineHeld();
       await nineGate;
-      resourceAllowance += 1;
+      allowInjected(route, 503);
       await route.fulfill({ status: 503, contentType: "application/json",
         body: JSON.stringify({ error: { code: "server_unavailable",
           message: "The server is temporarily unavailable (503). Please try "
@@ -3313,7 +4320,7 @@ async function checkViewport(browser, viewport) {
     // one reason. See the file header for the full statement of the defect.
     const legSeven = {
       page: page, base: base, L: L, program: shared.pa,
-      allowResourceError: () => { resourceAllowance += 1; },
+      allowResourceError: (route) => allowInjected(route, 503),
       deliveries: () => reopenDeliveries,
       progress: () => progressReads,
     };
@@ -3395,7 +4402,7 @@ async function checkViewport(browser, viewport) {
     // region, focus target.
     const legEight = {
       page: page, base: base, L: L, program: shared.pa,
-      allowResourceError: () => { resourceAllowance += 1; },
+      allowResourceError: (route) => allowInjected(route, 503),
     };
 
     // (8a) the richest LANDING surface: a 503'd confirmation still carrying the
@@ -3404,6 +4411,9 @@ async function checkViewport(browser, viewport) {
     await preRenderIdentityWindow(Object.assign({}, legEight, {
       sub: "8a", season: s15, surface: "landing", shape: "failed",
       reason: "typed just before the switch", arrive: ADMIN_B,
+      // In-app signIn(): no sign-out, so `view` is untouched and their own
+      // render repaints the very surface the boundary blanked.
+      lands: "surface",
     }));
 
     // (8b) an UNRESOLVED write across a REAL sign-out/sign-in: the busy copy,
@@ -3413,6 +4423,11 @@ async function checkViewport(browser, viewport) {
     await preRenderIdentityWindow(Object.assign({}, legEight, {
       sub: "8b", season: s16, surface: "landing", shape: "pending",
       reason: "unresolved across the sign-out", arrive: ADMIN_B_FORM,
+      // Sign-out + login form: setUser(null) demotes `view` off "setup" and on
+      // to "standings", and the fresh League Admin session is routed to the
+      // Initial Setup wizard on the way back in. Their own surface is that
+      // page — painted by the form-triggered sign-in, with no test navigation.
+      lands: "onboarding",
     }));
 
     // (8c) a LOWER-PRIVILEGE arriving role. The counts on screen were read
@@ -3422,6 +4437,7 @@ async function checkViewport(browser, viewport) {
     await preRenderIdentityWindow(Object.assign({}, legEight, {
       sub: "8c", season: s17, surface: "landing", shape: "actionable",
       reason: "unused", arrive: ARENA_B,
+      lands: "surface",
     }));
 
     // (8d) the SETUP HUB rather than a landing: six cards' counts, their
@@ -3431,6 +4447,7 @@ async function checkViewport(browser, viewport) {
     await preRenderIdentityWindow(Object.assign({}, legEight, {
       sub: "8d", season: s18, surface: "hub", shape: "actionable",
       reason: "unused", arrive: ADMIN_B,
+      lands: "surface",
     }));
 
     // (8e) the HOME/TASKS card and its "Continue setup" CTA, across the real
@@ -3440,8 +4457,44 @@ async function checkViewport(browser, viewport) {
     await preRenderIdentityWindow(Object.assign({}, legEight, {
       sub: "8e", season: s19, surface: "home", shape: "actionable",
       reason: "unused", arrive: ADMIN_B_FORM,
+      lands: "onboarding",
     }));
 
+    // ===== (9) A CARD READ IN FLIGHT AT THE IDENTITY BOUNDARY (round 10) ====
+    // Legs 7 and 8 both race the card's WRITE, and on that path the shared
+    // identity gate's principal/session-epoch test is never the thing that
+    // refuses: reopenSelectedSeasonFromCard() asks cardIdentitySamePrincipal()
+    // itself, one line earlier, and routes a foreign-principal response into
+    // the silent reconcile. This leg races the card's READ instead — the
+    // per-card Retry/Refresh, whose four post-await mutation points
+    // (app.js:5367/5368/5374/5380) are gated on cardIdentityCurrent() and on
+    // nothing else — held across the boundary and released INSIDE leg 8's
+    // pre-render window, where the serialization rule is not what freezes the
+    // generation counter: no render of the arriving principal's has run, so the
+    // counter has not moved and generation equality still says "current". See
+    // the leg-9 helpers for the full statement.
+    const legNine = {
+      page: page, base: base, L: L, program: shared.pa,
+      overviewDeliveries: () => overviewDeliveries,
+    };
+
+    // (9a) a second League Admin — same role, same authority, different
+    // person, so the leak cannot be excused as a permissions difference.
+    await crossPrincipalCardRead(Object.assign({}, legNine, {
+      sub: "9a", season: s20, arrive: ADMIN_B,
+    }));
+
+    // (9b) a LOWER-PRIVILEGE arriving role on the same authorized tuple. The
+    // counts in the held response were read under a League Admin's
+    // permissions, and the effective action it carries is MANAGE_SETUP — an
+    // Arena Manager must inherit neither.
+    await crossPrincipalCardRead(Object.assign({}, legNine, {
+      sub: "9b", season: s21, arrive: ARENA_B,
+    }));
+
+    // Every failed delivery this viewport saw, matched against every failure
+    // this file deliberately injected, ONCE — see reconcileDeliveries().
+    errors.push(...reconcileDeliveries(nonOk, injected, consoleErrors, failedReqs));
     if (errors.length) fail(`[${L}] browser errors:\n${errors.join("\n")}`);
     console.log(`[${L}] OK — a held reopen POST leaves the Facilities card `
       + `PENDING and aria-busy with NO control on either surface, keyboard focus `
@@ -3518,8 +4571,33 @@ async function checkViewport(browser, viewport) {
       + `the card rather than left standing inside it — on the Setup landing, `
       + `on the hub, and on the Home/Tasks card, through the in-app signIn() `
       + `and through the real sign-out/login-form path, with a lower-privilege `
-      + `arriving role included; the containers survive in place and the `
-      + `arriving principal's own render refills them.`);
+      + `arriving role included. And the blanking is a WINDOW rather than a `
+      + `dead page: with the containers MARKED before /api/context/options is `
+      + `released and NOTHING navigated, clicked or rendered by this journey `
+      + `afterwards, the transition's OWN render arrives — #content's children `
+      + `replaced, no marked container left blank, no skeleton standing — and `
+      + `finishes on the arriving principal's real destination: the same `
+      + `landing, hub or Home/Tasks surface with its own settled card and its `
+      + `own counts where `+"`view`"+` survives the transition, and the Initial Setup `
+      + `page where a real sign-out demotes it. And with the card's own `
+      + `per-card REFRESH held mid-read — the path whose four mutation points `
+      + `are gated on cardIdentityCurrent() and on nothing else — released `
+      + `INSIDE that same window, where no render of the arriving principal's `
+      + `has run so the generation counter still says "current" and the `
+      + `session epoch is the only difference left: the departing principal's `
+      + `resolved read says NOTHING into the arriving principal's live region, `
+      + `commits no model, repaints no card body, action group, count, chip or `
+      + `roll-up line, and moves no focus off a control parked outside the `
+      + `card — with the window re-asserted AFTER the sample, and with the `
+      + `IDENTICAL refresh shown first, under an unchanged principal, to reach `
+      + `all four of those points — for a second League Admin and for a `
+      + `lower-privilege Arena Manager, after which their OWN render still `
+      + `arrives and rebuilds the card under their own identity and epoch. `
+      + `Every failed delivery in the `
+      + `run is reconciled by exact method, URL and status against the `
+      + `deliberate 503s this file injected, so an unrelated failure is `
+      + `reported with the URL that failed instead of being absorbed by a `
+      + `counter.`);
   } catch (e) {
     if (serverOutput.trim()) {
       console.error("--- demo server output ---\n" + serverOutput.trim());
@@ -3532,6 +4610,10 @@ async function checkViewport(browser, viewport) {
 }
 
 (async () => {
+  // Before anything else: the allowance is not a counter and cannot be spent
+  // on somebody else's failure. Deterministic, browser-free, and it runs on
+  // every invocation — see selfTestDeliveryReconciler().
+  selfTestDeliveryReconciler();
   const browser = await chromium.launch();
   try {
     for (const viewport of VIEWPORTS) await checkViewport(browser, viewport);
