@@ -1713,6 +1713,35 @@ class ApiService:
         # attempt in this Season is a guaranteed rejection.
         season_league_ids = {ls.league_id for ls in season_league_seasons}
 
+        # ---- the server's OWN hard-prerequisite inputs (#365 review) -------
+        # Hoisted ABOVE the workflow list so ONE computation feeds three
+        # consumers that must never disagree: facilities' own done/todo count
+        # below, the per-workflow ASSERTED `prerequisites` each card reads, and
+        # `_workflow_prerequisite_gap`'s refusal reason for `next_blocked`.
+        # Previously `team_league_eligible` was computed AFTER the workflows
+        # were built (so participation's card could not publish it at all) and
+        # `schedulable_rink_ids` was computed inside step 5 -- which is exactly
+        # how the client ended up holding ONE of the server's floors
+        # (venue_access) and none of the others.
+        #
+        # Season-bound under the same `in_scope_season_ids` ceiling as the
+        # workflows that read them: a Program-only context grants no venue
+        # access and binds no LeagueSeason, so both go empty rather than
+        # widening to every Season the Program has.
+        venue_access_venue_ids = {
+            a.venue_id for a in self.store.all_season_venue_access()
+            if a.active and a.season_id in in_scope_season_ids}
+        schedulable_rink_ids = {
+            r.id for r in self.store.all_rinks()
+            if r.venue_id in venue_access_venue_ids}
+        # Mirrors register_team_for_season's own rule 7 (#331 review round 5
+        # finding 2): a Team with a permanent League can only register into a
+        # LeagueSeason of that same League, so a Program whose Teams all sit
+        # outside this Season's League(s) has no possible registration.
+        team_league_eligible = any(
+            t.league_id is None or t.league_id in season_league_ids
+            for t in teams)
+
         workflows = []
 
         def add(key, label, done, detail, primary_action, *, attention=None,
@@ -1734,8 +1763,10 @@ class ApiService:
             # #365 review (Facilities fail-open): the per-workflow, ASSERTED
             # prerequisite facts for THIS resolved tuple -- additive and
             # independent of `status`/`attention` exactly as those are of
-            # each other. See _venue_access_prerequisite below for why this
-            # cannot be left to `next_blocked`.
+            # each other. The COMPLETE ordered set for the workflow, built by
+            # _workflow_prerequisite_rows below -- see _workflow_prerequisites
+            # for why this cannot be left to `next_blocked`, and the audit on
+            # _WORKFLOW_HARD_PREREQUISITES for which workflows have floors.
             if prerequisites:
                 entry["prerequisites"] = prerequisites
             workflows.append(entry)
@@ -1836,6 +1867,16 @@ class ApiService:
             (f"{schedulable} schedulable registration(s)" if schedulable
              else "No team registered to play yet."),
             "Register Team",
+            # The COMPLETE ordered hard-prerequisite set for this workflow
+            # (#365 review round 3): selected Season present, that Season
+            # active, and at least one Team eligible for its League(s) --
+            # every reason `_workflow_prerequisite_gap` can refuse
+            # "participation" with, in the order it tests them. Publishing
+            # only some of them is what let an archived Season reach a card
+            # that still offered "Register Team"/"Add division".
+            prerequisites=self._workflow_prerequisites(
+                "participation", season, schedulable_rink_ids,
+                team_league_eligible),
             attention=(
                 {"reason": "invalid_registrations", "count": needs_attention,
                  "affected_registration_ids": attention_ids,
@@ -1871,12 +1912,10 @@ class ApiService:
         # reach a Season only through SeasonVenueAccess and carry no
         # competition-League field at all (see "Venues have no League axis",
         # docs/architecture/active-context-scoping.md).
-        venue_access_venue_ids = {
-            a.venue_id for a in self.store.all_season_venue_access()
-            if a.active and a.season_id in in_scope_season_ids}
-        schedulable_rink_ids = {
-            r.id for r in self.store.all_rinks()
-            if r.venue_id in venue_access_venue_ids}
+        # `venue_access_venue_ids`/`schedulable_rink_ids` are computed ONCE,
+        # above, and read here -- so this card's done/todo count, its published
+        # prerequisites and the Ice Builder's own `venue_access_missing`
+        # refusal are all answers from the same set.
         available_game_slots = [
             s for s in self.store.all_ice_slots()
             if s.rink_id in schedulable_rink_ids
@@ -1886,8 +1925,17 @@ class ApiService:
             (f"{len(available_game_slots)} available game slot(s)"
              if available_game_slots else "No available game ice slot yet."),
             "Add Ice",
-            prerequisites=[self._venue_access_prerequisite(
-                season, schedulable_rink_ids)])
+            # The COMPLETE ordered hard-prerequisite set (#365 review round
+            # 3): selected Season present, that Season ACTIVE, and only then
+            # the venue-access capability. Round 2 published the third fact
+            # alone, so an ARCHIVED selected Season with a live grant settled
+            # READY with `prerequisites: [{venue_access, met: true}]`,
+            # `blockedBecause: null` and a dead-end "Add Ice" -- while
+            # `_workflow_prerequisite_gap` was independently refusing the same
+            # workflow with `season_archived`.
+            prerequisites=self._workflow_prerequisites(
+                "facilities", season, schedulable_rink_ids,
+                team_league_eligible))
 
         # 6. Imports and onboarding — see docstring: "optional", not
         # done/todo, since there is no real Program-scoped completion signal
@@ -1913,15 +1961,11 @@ class ApiService:
         # before (round 1) -- only the FIRST permitted one is ever
         # considered, whether that turns out safe or blocked.
         # Prerequisite context for _workflow_prerequisite_gap (#331 review
-        # round 5 findings 1/2), computed once here rather than re-derived
-        # inside a static method: `schedulable_rink_ids` is exactly the set
-        # already computed for facilities' own done/todo check above (a Rink
-        # is a candidate ice-generation target only via that same active
-        # SeasonVenueAccess), and `team_league_eligible` mirrors
-        # register_team_for_season's own rule 7.
-        team_league_eligible = any(
-            t.league_id is None or t.league_id in season_league_ids
-            for t in teams)
+        # round 5 findings 1/2) is `schedulable_rink_ids`/
+        # `team_league_eligible`, both computed ONCE near the top of this
+        # method (#365 review round 3) and shared with the per-workflow
+        # `prerequisites` each card publishes -- so the roll-up's refusal and
+        # the card's own assertions are literally the same facts.
         next_incomplete = None
         next_blocked = None
         for w in workflows:
@@ -1974,11 +2018,187 @@ class ApiService:
             "complete": complete if role_sees_every_workflow else None,
         }
 
-    @staticmethod
-    def _venue_access_prerequisite(season, schedulable_rink_ids):
-        """The "facilities" workflow's own asserted prerequisite row: is at
-        least ONE Rink reachable through ACTIVE ``SeasonVenueAccess`` for
-        THIS exact resolved Season (#365 review, Facilities fail-open).
+    # The COMPLETE, ORDERED hard-prerequisite set each workflow's primary
+    # action needs, by workflow key (#365 review round 3). This mapping is
+    # documentation of the audit, not a second authority: the rows themselves
+    # are built by ``_workflow_prerequisite_rows`` below, which is the ONE
+    # computation both the published ``workflows[].prerequisites`` and
+    # ``_workflow_prerequisite_gap`` are projections of.
+    #
+    # THE AUDIT (#365 review round 3, verbatim requirement: "if
+    # ``_workflow_prerequisite_gap`` can refuse a workflow for a reason, that
+    # reason must be an asserted prerequisite"). Every one of the six
+    # workflows was re-checked against the real write behind its primary
+    # action:
+    #
+    # * "facilities"  -> ``SetupService.commit_ice_availability``: "Requires
+    #   an active Season (#159)" (season_missing / season_archived), and every
+    #   candidate rink must be reachable through active ``SeasonVenueAccess``
+    #   (venue_access_missing). THREE floors.
+    # * "participation" -> ``register_team_for_season``: takes
+    #   ``_require_active_season`` (season_missing / season_archived) and
+    #   enforces rule 7 (team_league_mismatch). THREE floors. Its own
+    #   "Add Division" resolution step is ``create_division``, which takes the
+    #   SAME ``_require_active_season`` guard -- which is why the Season floors
+    #   have to precede it on the client chain too, not merely precede
+    #   "Register Team".
+    # * "league_season" -> ``create_season``: needs only the Program, and
+    #   ``get_setup_progress`` returns the empty no-Program shape before any
+    #   workflow exists. No Season guard anywhere on the path. NO floors.
+    # * "teams" -> ``create_team``: a Team is permanent and carries no Season
+    #   field at all (#283); the method takes no Season guard. NO floors.
+    # * "roster" -> ``create_player``: a Player hangs off a Team, never a
+    #   Season; no Season guard. NO floors.
+    # * "import" -> the import commits are standing entry points with no
+    #   Season prerequisite (and the workflow is "optional", so it is never a
+    #   `next` candidate). NO floors.
+    #
+    # A workflow with no floors publishes no ``prerequisites`` key at all,
+    # which is a positive statement backed by
+    # ``test_only_the_two_audited_workflows_publish_prerequisites``.
+    _WORKFLOW_HARD_PREREQUISITES = {
+        "facilities": ("season_selected", "season_active", "venue_access"),
+        "participation": ("season_selected", "season_active",
+                          "team_league_eligible"),
+    }
+
+    @classmethod
+    def _workflow_prerequisite_rows(cls, key, season, schedulable_rink_ids,
+                                    team_league_eligible):
+        """THE one ordered computation of `key`'s hard prerequisites (#365
+        review round 3). Returns a list of rows, in the order the real writes
+        fail, each ``{"key", "met", "reason", "detail", "guidance"}``.
+
+        Round 2 had TWO computations: ``_venue_access_prerequisite`` published
+        ONE fact to the Facilities card, while ``_workflow_prerequisite_gap``
+        independently knew three. That is precisely how an ARCHIVED selected
+        Season with a live grant reached a card reporting
+        ``prerequisites: [{key: "venue_access", met: true}]`` and a primary
+        "Add Ice" the Ice Builder would refuse with ``season_archived``. One
+        asserted capability fact was being treated as the WHOLE workflow
+        capability. Both consumers are now projections of THIS list:
+
+        * ``_workflow_prerequisites`` publishes every row (minus ``guidance``)
+          as the card's ASSERTED, ordered set, so a client that consumes them
+          fail-closed cannot be missing a floor the server enforces.
+        * ``_workflow_prerequisite_gap`` returns the FIRST unmet row's
+          ``(reason, guidance)``, which is byte-identical to the round-2
+          behaviour it replaces.
+
+        ``detail`` and ``guidance`` are two audiences for the SAME row, not
+        two authorities: ``detail`` is the sentence a workflow CARD renders
+        beside its own counts ("what is true about this workflow"), while
+        ``guidance`` is the roll-up's ``next_blocked`` instruction ("what to
+        resolve first"). They can never disagree about WHICH prerequisite is
+        unmet -- that is decided once, here -- and the split keeps #331's
+        settled ``next_blocked`` copy verbatim while letting the card say
+        something scoped to itself.
+
+        Why the ORDER is load-bearing and not merely tidy: the client walks
+        the chain and the FIRST unmet step chooses the one action the landing
+        offers. "Season present" before "Season active" before the workflow's
+        own capability floor is the order the real writes fail in
+        (``season_guard.require_active_season`` runs before any body check),
+        so the action offered is always the one that unblocks the NEXT
+        failure rather than a later one that would still be refused.
+
+        Read-only, like the guards it mirrors: never mutates and never
+        row-locks."""
+        if key not in cls._WORKFLOW_HARD_PREREQUISITES:
+            return []
+        action = "adding ice" if key == "facilities" else "registering teams"
+        rows = []
+
+        def row(prereq_key, met, reason=None, detail=None, guidance=None):
+            entry = {"key": prereq_key, "met": bool(met)}
+            if not met:
+                entry["reason"] = reason
+                entry["detail"] = detail
+                entry["guidance"] = guidance
+            rows.append(entry)
+
+        # 1. A Season must be RESOLVED at all. Both real writes route through
+        # season_guard.require_active_season, which needs a Season id; with a
+        # Program-only context there is nothing to write into. The card cannot
+        # resolve this itself -- picking a Season is a context-bar action, not
+        # a create -- so the detail says so rather than naming a control.
+        no_season_guidance = f"Create or select a Season before {action}."
+        if season is None:
+            row("season_selected", False, "season_missing",
+                "No season is selected, so this workflow has nothing to work "
+                "on yet — pick a season in the context bar to set one up.",
+                no_season_guidance)
+            # Ordered set, not a truncated one: an unresolved Season also
+            # means there is no ACTIVE Season, and a fail-closed client must
+            # receive that row rather than infer its absence as "met".
+            row("season_active", False, "season_missing",
+                "No season is selected, so there is no active season to work "
+                "in yet — pick a season in the context bar to set one up.",
+                no_season_guidance)
+        else:
+            row("season_selected", True)
+            # 2. ...and it must be ACTIVE. An archived Season is read-only
+            # (#159): every write this workflow owns fails `season_archived`
+            # at the shared guard, so a card that offers ANY of them is a
+            # guaranteed dead end no matter how much visible inventory it has.
+            row("season_active", season.status != SeasonStatus.ARCHIVED,
+                "season_archived",
+                f"Season '{season.name}' is archived and read-only, so "
+                f"nothing in it can be changed — it has to be reopened "
+                f"before {action}.",
+                f"Season '{season.name}' is archived and read-only — "
+                f"reopen it or select an active Season before {action}.")
+
+        where = f"Season '{season.name}'" if season is not None else "this season"
+        if key == "facilities":
+            # 3. The capability floor round 2 already published, unchanged in
+            # both wording and meaning. `schedulable_rink_ids` is the SAME set
+            # facilities' own done/todo check reads, so the card, the roll-up
+            # and the Ice Builder's `venue_access_missing` refusal can never
+            # disagree.
+            #
+            # Deliberately ROLE-INVARIANT, like every other row here: this is
+            # a statement about the selected Season's data, and both roles
+            # that can see the workflow (League Admin and Arena Manager both
+            # hold MANAGE_ARENA) must receive byte-identical rows for it. WHO
+            # may resolve a gap is a permission question the caller's own
+            # permission set already answers; restating it here would create a
+            # second authority on permissions that could drift from the first.
+            row("venue_access", bool(schedulable_rink_ids),
+                "venue_access_missing",
+                f"No rink is reachable through active venue access for "
+                f"{where} yet, so ice can't be added to it — a League Admin "
+                f"must allow a venue with a rink for this season.",
+                f"No rink has venue access granted for Season "
+                f"'{season.name}' yet — a League Admin must grant "
+                f"access to at least one rink before ice can be added."
+                if season is not None else no_season_guidance)
+        else:
+            # 3. participation's own capability floor (#331 review round 5
+            # finding 2), published for the first time here: a Team with a
+            # permanent League can only register into a LeagueSeason of that
+            # same League (register_team_for_season rule 7), so with no
+            # eligible Team every registration attempt is a guaranteed
+            # `team_league_mismatch` rejection regardless of which team the
+            # operator picks.
+            row("team_league_eligible", bool(team_league_eligible),
+                "team_league_mismatch",
+                f"No permanent team is eligible to register in {where} yet, "
+                f"so registering one can't succeed — a team needs a league "
+                f"that this season actually runs.",
+                f"No permanent team is eligible to register in Season "
+                f"'{season.name}' yet — add a team under a matching "
+                f"league, or add a league to this season that matches "
+                f"an existing team, before registering teams."
+                if season is not None else no_season_guidance)
+        return rows
+
+    @classmethod
+    def _workflow_prerequisites(cls, key, season, schedulable_rink_ids,
+                                team_league_eligible):
+        """The per-workflow ASSERTED prerequisite rows published on
+        ``workflows[].prerequisites`` -- the COMPLETE ordered set above, with
+        the roll-up-only ``guidance`` sentence dropped.
 
         Why this has to exist as a per-workflow field rather than being left
         to ``next_blocked`` or inferred by the caller:
@@ -1988,123 +2208,55 @@ class ApiService:
           "facilities" is the fifth of six, so an earlier TODO workflow --
           participation, roster, anything -- consumes that one slot and the
           facilities gap is simply never reported. A card that reads its own
-          prerequisite off `next_blocked` therefore fails OPEN for the exact
-          role that CAN resolve it.
+          prerequisites off `next_blocked` therefore fails OPEN for the exact
+          role that CAN resolve them.
         * The Setup overview's Venue/Rink lists deliberately include
           revoked-grant history and creator-owned pending rows
-          (``get_setup_overview_v2``: a revoked grant to the ACTIVE Season
-          keeps the Venue in scope so the cleanup section can name it; a
-          just-created Venue has no grant yet and arrives via
-          ``pending_link_venues``). That is a correct READ contract and is
-          not narrowed. But it means "a Venue/Rink is VISIBLE" and "a Rink is
-          SCHEDULABLE this Season" are different claims, and only this
+          (``get_setup_overview_v2``), and its Season/League lists are equally
+          a READ contract rather than a capability one. So "a row is VISIBLE"
+          and "this workflow can write" are different claims, and only this
           computation answers the second one. A client that asked the first
-          question offered a dead-end "Add Ice" against a revoked grant.
+          question offered a dead-end "Add Ice" against a revoked grant
+          (round 2) and then against an archived Season (round 3).
 
-        ``schedulable_rink_ids`` is the SAME set the facilities done/todo
-        check and ``_workflow_prerequisite_gap`` already read -- passed in,
-        never recomputed here, so the card, the roll-up and the Ice Builder's
-        own ``venue_access_missing`` refusal can never disagree.
+        Emitted for EVERY role that can see the workflow at all, because the
+        facts are exactly as load-bearing for the role that cannot fix them:
+        an Arena Manager handed "Add Ice" reaches a builder that can only
+        refuse."""
+        return [{k: v for k, v in row.items() if k != "guidance"}
+                for row in cls._workflow_prerequisite_rows(
+                    key, season, schedulable_rink_ids, team_league_eligible)]
 
-        Emitted for EVERY role that can see the workflow at all (both League
-        Admin and Arena Manager hold MANAGE_ARENA), because the fact is
-        exactly as load-bearing for the role that cannot fix it: an Arena
-        Manager who is handed "Add Ice" here reaches a builder that can only
-        generate zero slots.
-
-        Deliberately ROLE-INVARIANT, which is why no "can you fix it" flag
-        lives here. This is a statement about the selected Season's data, and
-        the two roles that can see the workflow must receive byte-identical
-        rows for it (test_league_filtered_setup_progress asserts exactly that
-        for the whole facilities row). WHO may resolve the gap is a
-        permission question -- granting ``SeasonVenueAccess`` requires
-        MANAGE_SETUP, which an Arena Manager does not hold -- and it is
-        already answered by the caller's own permission set, which the client
-        reads through the same ``hasPerm`` every other control is gated on.
-        Restating it in the payload would create a second authority on
-        permissions that could drift from the first.
-        """
-        met = bool(schedulable_rink_ids)
-        row = {"key": "venue_access", "met": met}
-        if met:
-            return row
-        where = f"Season '{season.name}'" if season is not None else "this season"
-        row["reason"] = "venue_access_missing"
-        row["detail"] = (
-            f"No rink is reachable through active venue access for {where} "
-            f"yet, so ice can't be added to it — a League Admin must allow a "
-            f"venue with a rink for this season.")
-        return row
-
-    @staticmethod
-    def _workflow_prerequisite_gap(key, season, schedulable_rink_ids,
+    @classmethod
+    def _workflow_prerequisite_gap(cls, key, season, schedulable_rink_ids,
                                    team_league_eligible):
         """None if `key`'s primary action is safe to execute given the
         resolved Season context; otherwise (reason, detail) describing what
-        must change first (#331 review rounds 3-5). Mirrors the exact
-        conditions the real writes enforce, read-only -- never mutates or
-        row-locks, unlike the guards it mirrors.
+        must change first (#331 review rounds 3-5). Now a projection of
+        ``_workflow_prerequisite_rows`` -- the FIRST unmet row's reason and
+        roll-up guidance -- so the server cannot refuse a workflow for a
+        reason the same workflow's card never received (#365 review round 3).
 
         Both "facilities" (``SetupService.commit_ice_availability``, behind
         the Ice Availability Builder) and "participation"
         (``register_team_for_season``) route through
         ``season_guard.require_active_season``, so both fail identically at
-        the Season level: ``season_missing`` with no Season resolved
-        (nothing to generate ice into / no season to register a team for --
-        also true for "participation" specifically because its own real
-        destination, ``focusParticipationRegisterControl()``, needs an exact
-        selected Season to deep-link/focus a specific Register control; with
-        none resolved it can only fall back to a generic, unbound landing on
-        the Setup tree, not the precise binding #330's round-2 review
-        already required), and ``season_archived`` if the resolved one is
-        archived (read-only until an authorized reopen).
-
-        Beyond the Season itself, each has one more hard floor that makes
-        its CTA a guaranteed dead end even with an active Season resolved
-        (#331 review round 5 findings 1/2) -- both are existence checks the
-        real write also has no way around, not heuristics:
-
-        - "facilities": ``schedulable_rink_ids`` (the Rinks reachable via
-          active ``SeasonVenueAccess`` for the resolved Season -- the exact
-          set ``get_setup_progress`` already computes for facilities' own
-          done/todo check) must be non-empty. With none, every rink the
-          builder could offer lands in ``venue_access_missing``, so a
-          preview provably generates zero slots no matter what the operator
-          picks -- and an Arena Manager, who holds MANAGE_ARENA but not
-          MANAGE_SETUP, cannot grant that access themselves, making this a
-          true dead end rather than a gap the same role could close.
-        - "participation": ``team_league_eligible`` (whether any of this
-          Program's Teams has no permanent League yet, or a permanent
-          League that matches one of the resolved Season's own
-          LeagueSeasons) must be true. A Team WITH a permanent League can
-          only ever register into a LeagueSeason of that same League (rule
-          7); if none of the Program's Teams qualify, every possible
-          registration in this Season is a guaranteed
-          ``team_league_mismatch`` rejection, regardless of which team the
-          operator picks in the control.
-
-        Every other workflow's primary action (Add Season, Add Team, Add
-        Player, Import data) has no Season prerequisite of its own."""
-        if key not in ("facilities", "participation"):
-            return None
-        action = "adding ice" if key == "facilities" else "registering teams"
-        if season is None:
-            return ("season_missing", f"Create or select a Season before {action}.")
-        if season.status == SeasonStatus.ARCHIVED:
-            return ("season_archived",
-                    f"Season '{season.name}' is archived and read-only — "
-                    f"reopen it or select an active Season before {action}.")
-        if key == "facilities" and not schedulable_rink_ids:
-            return ("venue_access_missing",
-                    f"No rink has venue access granted for Season "
-                    f"'{season.name}' yet — a League Admin must grant "
-                    f"access to at least one rink before ice can be added.")
-        if key == "participation" and not team_league_eligible:
-            return ("team_league_mismatch",
-                    f"No permanent team is eligible to register in Season "
-                    f"'{season.name}' yet — add a team under a matching "
-                    f"league, or add a league to this season that matches "
-                    f"an existing team, before registering teams.")
+        the Season level: ``season_missing`` with no Season resolved (nothing
+        to generate ice into / no season to register a team for -- also true
+        for "participation" specifically because its own real destination,
+        ``focusParticipationRegisterControl()``, needs an exact selected
+        Season to deep-link/focus a specific Register control), and
+        ``season_archived`` if the resolved one is archived (read-only until
+        an authorized reopen). Beyond the Season itself each has one more hard
+        floor -- ``venue_access_missing`` and ``team_league_mismatch`` -- both
+        existence checks the real write also has no way around. Every other
+        workflow's primary action (Add Season, Add Team, Add Player, Import
+        data) has no Season prerequisite of its own; see the audit recorded on
+        ``_WORKFLOW_HARD_PREREQUISITES``."""
+        for row in cls._workflow_prerequisite_rows(
+                key, season, schedulable_rink_ids, team_league_eligible):
+            if not row["met"]:
+                return (row["reason"], row["guidance"])
         return None
 
     # -- competition-hierarchy resolution (#283) ---------------------------

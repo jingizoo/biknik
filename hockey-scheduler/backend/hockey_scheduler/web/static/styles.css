@@ -1306,6 +1306,14 @@ details.tn > .tn-sum:hover { background: #f6f7fb; }
 .swf-confirm { border: 1px solid var(--sep); border-radius: 10px; padding: 10px;
   display: flex; flex-direction: column; gap: 8px; }
 .swf-confirm-prompt { margin: 0; font-size: 13px; line-height: 1.45; }
+/* A confirmation that requires a REASON (#365 review round 3): reopening an
+   archived Season is a reasoned lifecycle write (#159), so the card collects
+   the reason instead of sending one on the operator's behalf. The 16px input
+   font is the same iOS zoom-avoidance the rest of this sheet's fields use. */
+.swf-confirm-reason { font-size: 12px; font-weight: 600; color: var(--muted); }
+.swf-confirm-reason-input { width: 100%; box-sizing: border-box; font-size: 16px;
+  padding: 8px 10px; border: 1px solid var(--sep); border-radius: 8px;
+  background: var(--card); color: inherit; }
 /* Done/To-do chips share the .swf-optional pill SHAPE but deliberately not
    its class: ".swf-optional" means Decision 9's optional workflow and nothing
    else, on every surface and in every check that looks for it. */

@@ -3688,13 +3688,18 @@ function leagueScopedTeams(sv) {
 // "Add Ice" (which needs a rink, which needs a venue) is a dead end: it says
 // what is missing and hands over an action that cannot create it.
 //
-// Each step is `{ met, action, why }`:
+// A step is one of two kinds. `{ assert: "<key>" }` is a SERVER-asserted hard
+// prerequisite, resolved against get_setup_progress's own ordered
+// `workflows[].prerequisites` by setupResolvedPrereqChain (fail-closed: an
+// unasserted or unreadable claim is never "met"). Everything else is a
+// locally-derived step over visible row counts, declared inline as
+// `{ met, action, why }`:
 //   met(facts)  whether this prerequisite is satisfied, read from the LIVE
 //               payload the card's own summary came from (setupPrereqFacts)
 //               -- never from a declared default. Usually a COUNT of visible
-//               rows; for a step about a CAPABILITY rather than an inventory
-//               (facilities/venue_access) it is an ASSERTED backend fact read
-//               through setupAssertedPrereq, because no count can answer it.
+//               rows. A step about a CAPABILITY rather than an inventory
+//               declares `assert` instead and never writes its own `met`,
+//               because no count can answer it.
 //   action      the ONE control offered while it is not. `act`/`go` are the
 //               ordinary landing action kinds; `open` is the third kind this
 //               ruling needs -- the missing record belongs to ANOTHER
@@ -3714,6 +3719,12 @@ function leagueScopedTeams(sv) {
 //               A function of the facts where the sentence is itself an
 //               asserted, scoped claim (naming the exact Season), so the copy
 //               is the backend's own statement rather than a paraphrase.
+//   advice      what to add to `why` when the action is WITHDRAWN (this role
+//               cannot resolve this step). Defaults to "Ask a league admin to
+//               set that up." -- true for a grant or a reopen, and wrong for
+//               a step nobody can resolve with a control at all (picking a
+//               Season is a context-bar action), which is why it is per-step
+//               rather than baked into the renderer.
 //
 // The chain is walked in order and the FIRST unmet step wins; all met means
 // the declared primary is genuinely the resolving action. Only the EMPTY
@@ -3759,17 +3770,45 @@ const SETUP_WORKFLOWS = [
     // a registration needs a permanent Team to register -- so the full chain
     // is league -> division -> team -> register, and the EMPTY state (zero
     // divisions) always stops at one of the first two.
+    //
+    // ...interleaved with the SERVER's own hard floors (#365 review round 3).
+    // `register_team_for_season` takes `_require_active_season` and enforces
+    // rule 7, so `get_setup_progress` publishes THREE ordered assertions for
+    // this workflow -- season_selected, season_active, team_league_eligible --
+    // and none of them can be recovered from a row count. Their positions
+    // here are not cosmetic:
+    //
+    //   * the Season floors sit BEFORE `divisions`, not merely before the
+    //     declared "Register Team". That step's own action is "Add division",
+    //     and `create_division` takes the SAME `_require_active_season`
+    //     guard -- so under an archived Season the round-2 chain answered a
+    //     dead "Register Team" with an equally dead "Add division".
+    //   * `leagues` stays first because its action is pure NAVIGATION to the
+    //     league_season landing (which derives its own effective action), and
+    //     navigation is never refused by a Season guard. Demoting a safe,
+    //     genuinely useful action behind a floor it does not violate would
+    //     withdraw help for no reason.
+    //   * team_league_eligible sits last, after `teams`: "there is no team at
+    //     all" and "no team's league matches this season" are different
+    //     states with different resolutions, and the count answers the first.
+    //
+    // Relative order among the three ASSERTED steps is exactly the server's
+    // own (season_selected -> season_active -> team_league_eligible), which
+    // is the order `_workflow_prerequisite_gap` tests them in.
     prereq: [
       { met: (f) => f.leagues > 0,
         action: { label: "Add a league first", open: "league_season" },
         why: "Divisions live inside a league, and this program's active season"
           + " has none yet." },
+      { assert: "season_selected" },
+      { assert: "season_active" },
       { met: (f) => f.divisions > 0,
         action: { label: "Add division", act: "division" },
         why: "Teams are registered into a division, and there is none yet." },
       { met: (f) => f.teams > 0,
         action: { label: "Add a team first", open: "teams" },
-        why: "There is no permanent team to register yet." }],
+        why: "There is no permanent team to register yet." },
+      { assert: "team_league_eligible" }],
     summary: (sv) => [
       { label: "Divisions", n: (sv.divisions || []).length }] },
   { key: "roster", title: "Clubs, players and staff", icon: "🧑",
@@ -3820,21 +3859,34 @@ const SETUP_WORKFLOWS = [
     // fail-open. The first two steps ask whether a Venue/Rink is VISIBLE, and
     // the scoped overview's lists deliberately include revoked-grant history
     // and creator-owned pending rows -- both correct reads, neither of which
-    // makes a Rink schedulable. So the chain has a THIRD step, and it is not
-    // a count: "is any Rink reachable through ACTIVE SeasonVenueAccess for
-    // THIS exact selected Season", asserted by the backend
-    // (get_setup_progress's `prerequisites`, computed from the same
-    // `schedulable_rink_ids` set the Ice Builder's own `venue_access_missing`
-    // refusal uses) and read here through the fail-closed accessor. Without
-    // it, a Venue+Rink whose grant was revoked settled READY with no blocker
-    // and offered "Add Ice" into a builder that can only generate zero slots.
+    // makes a Rink schedulable. So the chain continues with steps that are
+    // not counts at all: the SERVER's own ordered hard floors for this
+    // workflow, asserted on get_setup_progress's `prerequisites` and consumed
+    // fail-closed here (setupResolvedPrereqChain).
     //
-    // The resolution needs MANAGE_SETUP -- granting venue access is a League
-    // Admin action -- so the step's action declares it and
-    // setupEffectiveAction withdraws the control entirely for an Arena
-    // Manager, who would otherwise be handed a second dead end. The `why`
-    // sentence is the BACKEND's own, so it names the exact Season the claim
-    // is scoped to instead of a client-side paraphrase.
+    // Round 2 declared only the LAST of those floors, venue_access. Round 3's
+    // review reproduced the same fail-open one layer up: an ARCHIVED selected
+    // Season with a LIVE grant asserts `venue_access: met` quite correctly --
+    // a rink really is reachable -- while `commit_ice_availability` refuses
+    // the whole workflow with `season_archived`. One capability fact was
+    // standing in for the whole capability. So the Season floors are declared
+    // too, and BEFORE venue_access, which is the order the real writes fail
+    // in: season_guard.require_active_season runs before anything looks at a
+    // rink.
+    //
+    // They sit AFTER venues/rinks rather than at the head of the chain, and
+    // that placement is asserted rather than incidental: `create_venue` and
+    // `create_rink` take NO Season guard (a Venue is organization-owned; a
+    // Rink hangs off a Venue), so "Add venue"/"Add rink" are never refused by
+    // an archived or unselected Season. A chain that demoted them would
+    // withdraw a working action and offer nothing in its place.
+    //
+    // Both resolutions need MANAGE_SETUP -- granting venue access and
+    // reopening a Season are League Admin actions -- so each step's action
+    // declares it and setupEffectiveAction withdraws the control entirely for
+    // an Arena Manager, who would otherwise be handed a second dead end. The
+    // `why` sentences are the BACKEND's own, so they name the exact Season
+    // the claim is scoped to instead of a client-side paraphrase.
     prereq: [
       { met: (f) => f.venues > 0,
         action: { label: "Add venue", act: "venue" },
@@ -3842,12 +3894,9 @@ const SETUP_WORKFLOWS = [
       { met: (f) => f.rinks > 0,
         action: { label: "Add rink", act: "rink" },
         why: "Ice is booked on a rink, and this venue has none yet." },
-      { met: (f) => setupAssertedPrereq(f, "facilities", "venue_access").met,
-        action: { label: "Allow a venue for this season", go: "venue_access",
-                  perm: "manage_setup" },
-        why: (f) => setupAssertedPrereq(f, "facilities", "venue_access").detail
-          || "No rink is reachable through active venue access for the"
-            + " selected season yet, so ice can't be added to it." }],
+      { assert: "season_selected" },
+      { assert: "season_active" },
+      { assert: "venue_access" }],
     summary: (sv) => [
       { label: "Venues", n: withPendingLink(sv, "venues").length },
       { label: "Rinks", n: withPendingLink(sv, "rinks").length }] },
@@ -4046,23 +4095,34 @@ async function openSetupWorkflowDrawer(kind) {
 // let Facilities settle READY with `blockedBecause: null` and a dead-end "Add
 // Ice" primary.
 //
-// A claim like that cannot be recovered from row counts at all, so it is not
-// inferred here: it arrives ASSERTED, from the same /api/v2/setup/progress
-// read the card's status comes from, computed server-side from the exact
-// active SeasonVenueAccess set the real write enforces. `asserted` is that
-// dictionary, keyed "<workflow>/<prerequisite>" — and it is read from
-// `src.progress` (a setupProgressRead record, never a payload-or-null), so a
-// failed or unauthorized read yields NO assertions rather than a manufactured
-// "met". See setupAssertedPrereq below for the fail-closed accessor.
+// ...and the same is true one layer up, which is round 3's finding: an
+// ARCHIVED selected Season is equally invisible to every count on this card.
+// Venues and Rinks are still there, the grant is still live, and NOTHING in
+// the Season can be written. No arithmetic over visible rows answers that
+// either.
+//
+// Claims like those cannot be recovered from row counts at all, so they are
+// not inferred here: they arrive ASSERTED, from the same
+// /api/v2/setup/progress read the card's status comes from, computed
+// server-side from the exact state the real writes enforce.
+// `assertedRows[workflowKey]` is the COMPLETE ORDERED set for that workflow
+// — read from `src.progress` (a setupProgressRead record, never a
+// payload-or-null), so a failed or unauthorized read yields NO assertions
+// rather than a manufactured "met". See setupResolvedPrereqChain below for
+// the fail-closed consumption.
 function setupPrereqFacts(src) {
   const sv = (src && src.sv) || {};
   const read = (src && src.progress && src.progress.outcome)
     ? src.progress : setupProgressRead(CARD_READ.FAILED, null);
-  const asserted = {};
+  // Kept as an ORDERED LIST, never flattened to a dictionary (#365 review
+  // round 3): the backend publishes its floors in the order its own writes
+  // fail them, and a client that dropped that order could not tell "the
+  // Season is archived" from "no rink is reachable" when both are unmet --
+  // nor notice a floor it never declared.
+  const assertedRows = {};
   Object.keys(read.byKey).forEach((key) => {
-    ((read.byKey[key] || {}).prerequisites || []).forEach((p) => {
-      if (p && p.key) asserted[key + "/" + p.key] = p;
-    });
+    assertedRows[key] = ((read.byKey[key] || {}).prerequisites || [])
+      .filter((p) => p && p.key);
   });
   return {
     programs: (sv.programs || []).length,
@@ -4073,21 +4133,167 @@ function setupPrereqFacts(src) {
     venues: withPendingLink(sv, "venues").length,
     rinks: withPendingLink(sv, "rinks").length,
     players: ((src && src.players) || []).length,
-    asserted: asserted,
+    assertedRows: assertedRows,
   };
 }
 
-// An asserted prerequisite row, or a fail-CLOSED stand-in. "The backend did
-// not assert this" is never evidence that the prerequisite is satisfied — it
-// means the claim is unavailable, and a capability claim that cannot be
-// verified must not be acted on. Structurally unreachable today for
-// facilities/venue_access (a role that can see the Facilities card holds
-// MANAGE_ARENA, which is exactly what the progress route requires, and a
-// FAILED read makes a required card ERROR before any derivation runs), so
-// this is the discipline rather than a live branch.
-function setupAssertedPrereq(facts, workflowKey, prereqKey) {
-  return (facts && facts.asserted && facts.asserted[workflowKey + "/" + prereqKey])
-    || { key: prereqKey, met: false, detail: null };
+// The REAL reopen-Season path for an archived selected Season (#365 review
+// round 3), offered ONLY to a role authorized to perform it.
+//
+// `perm: "manage_setup"` is not a guess: /api/v2/setup/seasons/<id>/reopen
+// maps to MANAGE_SETUP in web/authz.py, so an Arena Manager pressing this
+// would receive a 403. setupEffectiveAction withdraws the control for them
+// entirely and the card shows guidance instead — the requirement is
+// explicitly "expose the real reopen path only to an authorized role;
+// otherwise show guidance and NO unusable mutation".
+//
+// It is a `reopen` action rather than a `go`/`act`/`open` one because there
+// is no Setup workflow, landing or drawer that owns Season lifecycle: the
+// reopen is a single reasoned write, and #159 requires a NON-EMPTY reason
+// that is recorded in the audit trail. So it routes through the card's own
+// CONFIRM state (#365) with a required reason field — the first derived
+// action to carry a `confirm`, which is why setupCardActionFor now resolves
+// "primary:0" through the committed model instead of the declared primary.
+//
+// Which Season: the SELECTED one, always. #367 established that reopening an
+// archived Season requires that Season to be the active context, and this
+// action is only ever reachable from a card whose committed identity carries
+// exactly that Season in its tuple — resolveSetupCardConfirm re-checks the
+// tuple before it fires, so a context switch withdraws the confirmation
+// rather than reopening a Season the operator has left.
+const SETUP_SEASON_REOPEN_ACTION = {
+  label: "Reopen this season", reopen: true, perm: "manage_setup",
+  confirm: {
+    prompt: "Reopen this archived season so it can be changed again? It stays"
+      + " selected, and its existing records are untouched.",
+    reason: "Why is this season being reopened?",
+    yes: "Reopen season", no: "Keep it archived",
+    done: "Season reopened.", cancelled: "The season stays archived." },
+};
+
+// The RESOLUTION each asserted prerequisite has, keyed "<workflow>/<key>".
+// Deliberately a lookup rather than a field on the payload: the backend's
+// prerequisite rows are ROLE-INVARIANT statements about the selected Season's
+// data (both roles that can see a workflow receive byte-identical rows), so
+// "who may fix this, and through which control" is a client-side permission
+// question answered by the same `hasPerm` every other control is gated on.
+// Putting it in the payload would create a second authority on permissions.
+//
+// A prerequisite with NO entry here resolves to guidance and no mutation
+// control at all. That is the fail-closed default and it is what makes a
+// NEWLY-published server floor safe: the chain still blocks on it, the card
+// still explains it in the backend's own words, and no control is offered
+// that this client has no verified path for.
+const SETUP_ASSERTED_PREREQ_ACTIONS = {
+  // Granting SeasonVenueAccess is a League Admin action and lives on the
+  // selected Season's own "Allowed venues" section (#369), not in any create
+  // drawer — runSetupWorkflowGo("venue_access") is the deep link.
+  "facilities/venue_access": {
+    label: "Allow a venue for this season", go: "venue_access",
+    perm: "manage_setup" },
+  // An archived selected Season is read-only until an authorized reopen
+  // (#159). Reopening is MANAGE_SETUP — the same permission
+  // /api/v2/setup/seasons/<id>/reopen requires (web/authz.py:
+  // "Season lifecycle archive/reopen (#159) are setup actions") — so an Arena
+  // Manager, who holds MANAGE_ARENA only, gets the guidance and NO control.
+  // #367's established rule is that reopening an archived Season requires it
+  // to be the SELECTED context, which it is by construction here: this step
+  // is only ever reached from a card whose committed identity carries that
+  // Season as its own tuple.
+  "facilities/season_active": SETUP_SEASON_REOPEN_ACTION,
+  "participation/season_active": SETUP_SEASON_REOPEN_ACTION,
+  // Rule 7 (register_team_for_season): a Team with a permanent League can
+  // only register into a LeagueSeason of that same League. Both repairs — a
+  // new Team under a league this Season runs, or moving an existing Team's
+  // permanent League — live on the Permanent teams workflow, so the one
+  // action opens that landing rather than smuggling its create drawer here.
+  "participation/team_league_eligible": {
+    label: "Set up a team in this season's league", open: "teams" },
+  // "season_selected" has NO action on purpose: choosing a Season is a
+  // context-bar selection, not a mutation any card owns, and inventing a
+  // control for it would be inventing a second context switcher. It gets
+  // guidance with its own `advice` below instead.
+};
+
+// What to append to the blocker sentence when a step's action is withdrawn.
+// The default ("Ask a league admin to set that up.") is the right sentence
+// for a grant or a reopen an Arena Manager cannot perform, and the WRONG one
+// for a Season nobody can select from a card.
+const SETUP_ASSERTED_PREREQ_ADVICE = {
+  season_selected: "Pick a season in the context bar to work in one.",
+  season_active: "Ask a league admin to reopen it.",
+};
+
+// The client's own last-resort sentence for a floor the backend did not
+// assert (a failed or unauthorized progress read, or a prerequisite key this
+// build predates). Never "it's fine": an unverifiable claim blocks.
+const SETUP_ASSERTED_PREREQ_FALLBACK = {
+  season_selected: "No season is selected for this program yet.",
+  season_active: "The selected season is archived and read-only, so nothing"
+    + " in it can be changed.",
+  venue_access: "No rink is reachable through active venue access for the"
+    + " selected season yet, so ice can't be added to it.",
+  team_league_eligible: "No permanent team is eligible to register in the"
+    + " selected season yet.",
+};
+
+// ONE asserted prerequisite, as a chain step. `met` is true ONLY for an
+// explicit `met === true` on a row the backend really published under this
+// exact key — every other shape (absent row, absent payload, a truthy-looking
+// value that is not `true`) is unmet. That is the fail-closed rule, stated
+// once here so no call site can restate it more leniently.
+function setupAssertedStep(workflowKey, prereqKey, row) {
+  const asserted = row && row.key === prereqKey ? row : null;
+  const met = !!asserted && asserted.met === true;
+  const action = SETUP_ASSERTED_PREREQ_ACTIONS[workflowKey + "/" + prereqKey] || null;
+  return {
+    assert: prereqKey,
+    met: () => met,
+    action: action,
+    // The BACKEND's own sentence when there is one, so the copy names the
+    // exact Season the claim is scoped to; the declared fallback only when
+    // the claim itself could not be read.
+    why: (asserted && asserted.detail)
+      || SETUP_ASSERTED_PREREQ_FALLBACK[prereqKey]
+      || "This step can't be taken yet, and the reason couldn't be read.",
+    advice: SETUP_ASSERTED_PREREQ_ADVICE[prereqKey] || null,
+  };
+}
+
+// THE chain, with every `{ assert }` placeholder resolved against the rows
+// get_setup_progress actually published for this workflow (#365 review round
+// 3). Two guarantees, and the second is the one this round exists for:
+//
+//  1. A DECLARED assertion the backend did not publish still appears, as a
+//     fail-closed unmet step. A failed or unauthorized progress read
+//     therefore blocks the workflow instead of silently shortening its chain
+//     to the counts — which is what "an unasserted claim is never met" has to
+//     mean once the chain is assembled dynamically.
+//  2. A PUBLISHED floor this client never declared is APPENDED rather than
+//     dropped. The whole defect of round 2 was a client holding a strict
+//     SUBSET of the server's floors; a chain built only from what the client
+//     happens to know would reproduce it the next time the server learns a
+//     new one. An undeclared floor has no registered action, so it resolves
+//     to the backend's own sentence and no mutation control — the safe
+//     answer for a claim this build cannot route.
+//
+// Declared steps keep their declared positions (see each workflow's `prereq`
+// for why those positions are what they are), and the appended ones follow in
+// the server's own published order.
+function setupResolvedPrereqChain(w, facts) {
+  const published = (facts && facts.assertedRows && facts.assertedRows[w.key]) || [];
+  const byKey = {};
+  published.forEach((p) => { if (p && p.key) byKey[p.key] = p; });
+  const declared = {};
+  const steps = (w.prereq || []).map((step) => {
+    if (!step.assert) return step;
+    declared[step.assert] = true;
+    return setupAssertedStep(w.key, step.assert, byKey[step.assert]);
+  });
+  published.forEach((p) => {
+    if (!declared[p.key]) steps.push(setupAssertedStep(w.key, p.key, p));
+  });
+  return steps;
 }
 
 // THE effective action: the single control a landing offers while a
@@ -4141,16 +4347,27 @@ function setupAssertedPrereq(facts, workflowKey, prereqKey) {
 // ASSERTED backend sentence (naming the exact Season the claim is about)
 // renders that sentence rather than a client-side paraphrase of it.
 function setupEffectiveAction(w, facts) {
-  const step = (w.prereq || []).find((s) => !s.met(facts));
-  if (!step) return { action: w.primary, why: null };
+  // The RESOLVED chain, not the declared one: `{ assert }` placeholders are
+  // replaced by the backend's published rows and any floor the backend
+  // publishes that this client never declared is appended, both fail-closed
+  // (setupResolvedPrereqChain).
+  const step = setupResolvedPrereqChain(w, facts).find((s) => !s.met(facts));
+  if (!step) return { action: w.primary, why: null, advice: null };
   const why = typeof step.why === "function" ? step.why(facts) : step.why;
+  // Guidance to append when the control is withdrawn below. Carried on the
+  // withdrawal paths only -- an offered action needs no apology.
+  const advice = step.advice || null;
+  // A step with no action at all: the blocker is real and this client has no
+  // control that resolves it (a Season selection, or a floor published by a
+  // newer backend than this build declares). Guidance is the whole truth.
+  if (!step.action) return { action: null, why: why, advice: advice };
   if (step.action.open && !setupWorkflowsFor().some((x) => x.key === step.action.open)) {
-    return { action: null, why: why };
+    return { action: null, why: why, advice: advice };
   }
   if (step.action.perm && !hasPerm(step.action.perm)) {
-    return { action: null, why: why };
+    return { action: null, why: why, advice: advice };
   }
-  return { action: step.action, why: why };
+  return { action: step.action, why: why, advice: null };
 }
 
 function buildSetupWorkflowCardModel(w, src) {
@@ -4191,7 +4408,12 @@ function buildSetupWorkflowCardModel(w, src) {
   // says only the summary is missing, exactly as before.
   const derived = () => {
     const eff = setupEffectiveAction(w, setupPrereqFacts(src));
-    return { effective: eff.action, blockedBecause: eff.why };
+    // `blockedAdvice` travels with the other two so the sentence a WITHDRAWN
+    // card shows is committed under the same identity as the withdrawal
+    // itself -- a renderer that chose it at paint time could tell an operator
+    // to ask a league admin about a blocker whose real fix is the context bar.
+    return { effective: eff.action, blockedBecause: eff.why,
+             blockedAdvice: eff.advice || null };
   };
   // A workflow with no inventory of its own (Workflow 6) has no data
   // dependency, so it is never loading, empty or errored -- it is simply
@@ -4380,9 +4602,16 @@ function setupCardBodyHtml(w, landing) {
   // declared primary. Same committed field the withdrawal above reads, so the
   // explanation and the control can never describe different problems, and no
   // sentence at all when nothing is blocked.
+  // The withdrawn-action sentence comes from the MODEL when the blocking step
+  // declared one (#365 review round 3), falling back to the league-admin
+  // wording that is correct for a grant or a reopen this role cannot perform.
+  // "No season is selected" needs a different sentence -- no league admin can
+  // pick a season for someone -- and the step is what knows that.
+  const withdrawnAdvice = () => ` ${entry.blockedAdvice
+    || "Ask a league admin to set that up."}`;
   const blockedNote = () => !entry.blockedBecause ? "" : `<p class="swf-card-blocked">
     ${esc(entry.blockedBecause)}${entry.effective === null
-      ? " Ask a league admin to set that up."
+      ? esc(withdrawnAdvice())
       : " Start with the action below — this workflow's usual next step can't"
         + " be taken until then."}</p>`;
   if (entry.state === CARD_STATE.LOADING) {
@@ -4408,9 +4637,26 @@ function setupCardBodyHtml(w, landing) {
   }
   if (entry.state === CARD_STATE.CONFIRM) {
     const c = entry.confirm || {};
+    // A confirmation may REQUIRE a reason (#365 review round 3): reopening an
+    // archived Season is a reasoned lifecycle write (#159 -- the route rejects
+    // a blank one and records what it is given in the audit trail), so the
+    // card collects it here rather than sending a canned string on the
+    // operator's behalf. A real <label>+<input> in document order, so it is
+    // reachable and named for a screen reader like any other field.
+    const reason = c.reason ? `
+        <label class="swf-confirm-reason" for="swf-confirm-reason-${esc(w.key)}"
+          >${esc(c.reason)}</label>
+        <input class="swf-confirm-reason-input" type="text" required
+          id="swf-confirm-reason-${esc(w.key)}"
+          data-setup-card-confirm-reason="${esc(w.key)}"
+          value="${esc(entry.confirmReason || "")}">
+        ${entry.confirmError
+          ? `<p class="swf-card-error" role="alert">${esc(entry.confirmError)}</p>`
+          : ""}` : "";
     return `${stats(entry.stats)}
       <div class="swf-confirm" role="group" aria-label="${esc(c.yes || "Confirm")}">
         <p class="swf-confirm-prompt">${esc(c.prompt || "Are you sure?")}</p>
+        ${reason}
         <div class="swf-card-actions">
           <button class="act ghost" data-setup-card-confirm-yes="${esc(w.key)}"
             >${esc(c.yes || "Confirm")}</button>
@@ -4434,7 +4680,7 @@ function setupCardBodyHtml(w, landing) {
       ? ` ${esc(entry.blockedBecause)}`
       : "";
     const lead = entry.effective === null && entry.blockedBecause
-      ? " Ask a league admin to set that up."
+      ? esc(withdrawnAdvice())
       : " Start with the action below.";
     return `${stats(entry.stats)}
       <p class="swf-card-empty">Nothing here yet — no ${esc(missing || "records")} for
@@ -4570,8 +4816,19 @@ async function retrySetupWorkflowCard(key) {
 // repaint can never resurrect an action from an earlier definition.
 function setupCardActionFor(w, ref) {
   const parts = String(ref || "").split(":");
-  const list = parts[0] === "primary" ? [w.primary]
-    : parts[0] === "tertiary" ? (w.tertiary || []) : (w.secondary || []);
+  // "primary" resolves through the COMMITTED model, not the declared
+  // `w.primary` (#365 review round 3). The landing's primary slot renders the
+  // card's EFFECTIVE action, and once a derived action can carry a `confirm`
+  // -- the reopen path -- looking the reference back up in the declared list
+  // would confirm one action and execute a different one. `undefined` means
+  // this card never carried a derivation (ERROR, or a model committed before
+  // one was computed), which falls back to the declared primary exactly as
+  // setupLandingActionsHtml does.
+  if (parts[0] === "primary") {
+    const entry = readCardState(setupWorkflowCardId(w.key));
+    return entry.effective === undefined ? (w.primary || null) : entry.effective;
+  }
+  const list = parts[0] === "tertiary" ? (w.tertiary || []) : (w.secondary || []);
   return list[Number(parts[1]) || 0] || null;
 }
 
@@ -4595,7 +4852,10 @@ function askSetupCardConfirm(key, ref) {
   if (!repaintSetupWorkflowCard(key, identity)) return;
   announceCardStatus(identity, action.confirm.prompt);
   const slot = document.querySelector(`[data-setup-card-slot="${key}"]`);
-  focusCardTarget(identity, slot && slot.querySelector("[data-setup-card-confirm-yes]"));
+  // A confirmation that REQUIRES a reason lands focus on the field the
+  // operator has to fill, not on the button that would reject it.
+  focusCardTarget(identity, slot && (slot.querySelector("[data-setup-card-confirm-reason]")
+    || slot.querySelector("[data-setup-card-confirm-yes]")));
 }
 
 function resolveSetupCardConfirm(key, yes) {
@@ -4605,9 +4865,26 @@ function resolveSetupCardConfirm(key, yes) {
   if (!cardTupleCurrent(held.identity)) return;
   const action = setupCardActionFor(w, held.pending);
   const c = (action && action.confirm) || {};
+  // Read the reason BEFORE anything repaints the slot the field lives in.
+  const field = document.querySelector(`[data-setup-card-confirm-reason="${key}"]`);
+  const reason = field ? String(field.value || "").trim() : "";
+  // A required reason that is blank keeps the confirmation OPEN with an
+  // error, rather than firing a write the route will reject (#159 requires a
+  // non-empty reason) or -- worse -- inventing one on the operator's behalf.
+  if (yes && c.reason && !reason) {
+    const stay = beginCardRequest(setupWorkflowCardId(key), { userInitiated: true });
+    if (!commitCardState(stay, Object.assign({}, held, {
+      confirmReason: "", confirmError: "Add a reason before reopening." }))) return;
+    if (!repaintSetupWorkflowCard(key, stay)) return;
+    announceCardStatus(stay, "Add a reason before reopening.", true);
+    const slot = document.querySelector(`[data-setup-card-slot="${key}"]`);
+    focusCardTarget(stay, slot && slot.querySelector("[data-setup-card-confirm-reason]"));
+    return;
+  }
   const identity = beginCardRequest(setupWorkflowCardId(key), { userInitiated: true });
   commitCardState(identity, Object.assign({}, held, {
-    state: held.resumeState || CARD_STATE.READY, confirm: null, pending: null }));
+    state: held.resumeState || CARD_STATE.READY, confirm: null, pending: null,
+    confirmReason: null, confirmError: null }));
   repaintSetupWorkflowCard(key, identity);
   // Success and cancellation both announce exactly once, through the one
   // sitewide live region -- the card's own visible copy is not itself a live
@@ -4618,8 +4895,53 @@ function resolveSetupCardConfirm(key, yes) {
     focusCardTarget(identity, document.querySelector(`[data-setup-card-ask="${key}"]`));
     return;
   }
+  if (action.reopen) return reopenSelectedSeasonFromCard(key, reason);
   if (action.go) return runSetupWorkflowGo(action.go);
   if (action.act) return openSetupWorkflowDrawer(action.act);
+  if (action.open) return openSetupWorkflowLanding(action.open);
+}
+
+// The REAL reopen-Season write, fired from a card whose blocking prerequisite
+// is `season_active` (#365 review round 3). The FOURTH action kind, and the
+// only one that mutates from the card itself rather than navigating to a
+// surface that does -- Season lifecycle has no workflow, landing or drawer of
+// its own, and #159 makes the reopen a single reasoned write.
+//
+// Deliberately card-scoped, all the way through:
+//
+//  * The target is the SELECTED Season, re-read from the live context at fire
+//    time and cross-checked against the identity the card committed under.
+//    #367's rule is that reopening requires the Season to be the selected
+//    context; asserting it here means a switch that slipped between the
+//    confirmation and the click reopens NOTHING rather than the wrong Season.
+//  * Recovery is this card's OWN refresh, not render(). A full render
+//    re-commits every Setup card and would bump every neighbouring
+//    generation -- the exact "adjacent-card mutation" the per-card discipline
+//    forbids. retrySetupWorkflowCard re-reads the overview and the progress
+//    payload for this card alone, so `season_active` flips to met and the
+//    chain settles on whatever the NEXT unmet floor is (or the declared
+//    primary), under a fresh generation of this card and no other.
+//  * No page reload anywhere: the tuple is unchanged (same Season id), so the
+//    committed identity stays valid across the whole sequence.
+async function reopenSelectedSeasonFromCard(key, reason) {
+  const held = cardStates[setupWorkflowCardId(key)];
+  const seasonId = contextOptions && contextOptions.selected
+    && contextOptions.selected.season_id;
+  if (!seasonId || !held || !cardTupleCurrent(held.identity)
+      || held.identity.season_id !== seasonId) {
+    toast = "That season is no longer the one you're working in — nothing was"
+      + " reopened.";
+    toastIsError = true;
+    return updateToast();
+  }
+  const r = await post(`/api/v2/setup/seasons/${seasonId}/reopen`,
+                       { reason: reason });
+  // post() already published the server's own error message into the toast.
+  if (!r || r.error) return updateToast();
+  toast = `Season reopened — it can be changed again.`;
+  toastIsError = false;
+  updateToast();
+  return retrySetupWorkflowCard(key);
 }
 
 function wireSetupWorkflowCards(root) {
@@ -4799,8 +5121,11 @@ function setupLandingActionsHtml(w) {
   // `open` is the third action kind (#365 owner ruling on EMPTY dead ends):
   // the missing prerequisite belongs to another workflow, so the control
   // opens THAT landing through the same permission-aware transition the hub's
-  // own "Open …" buttons use. No derived action ever carries `confirm`, so
-  // the confirmation branch is unreachable for one by construction.
+  // own "Open …" buttons use. `reopen` is the fourth kind (#365 review round
+  // 3) and it is the first DERIVED action that carries a `confirm`, so it
+  // takes the confirmation branch below like any declared one -- which is
+  // exactly why setupCardActionFor resolves "primary:0" through the committed
+  // model rather than the declared `w.primary`.
   const attr = (a, i, group) => a.confirm
     ? `data-setup-card-ask="${esc(w.key)}" data-setup-card-action="${esc(group)}:${i}"`
     : a.open
