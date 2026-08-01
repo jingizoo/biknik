@@ -1184,6 +1184,41 @@ function announceCardStatus(identity, message, isError) {
   return true;
 }
 
+// (3b) THE SAME ANNOUNCEMENT, WHEN THE THING BEING ANNOUNCED NAVIGATES.
+//
+// #365 requires confirmation and success announcements to reach the live
+// region "without duplicate speech". Workflow 6's confirmation completes by
+// LEAVING this surface (it opens the guided Initial Setup wizard), and every
+// navigation goes through switchTab(), which sets `toast = ""` and calls
+// render() -> updateToast(). Announcing first and navigating second therefore
+// wrote the completion sentence into the region and withdrew it again inside
+// ONE synchronous task -- before the browser painted, and before any
+// accessibility update could be delivered. The region was populated and empty
+// again in the same frame: not duplicate speech, no speech at all.
+//
+// Announcing on BOTH sides of the transition would be the duplicate the very
+// same clause forbids. So the sentence is written exactly ONCE, AFTER the
+// destination has rendered: `navigate` runs first and the announcement lands
+// when it settles -- past switchTab()'s own render() and past any awaited
+// destination load -- so nothing left in that transition clears it again, and
+// it is still standing a task and a paint later.
+//
+// THE IDENTITY IS CHECKED BEFORE THE NAVIGATION, deliberately. It answers "is
+// this still the operator's own current, unsuperseded confirmation", which is
+// a question about the moment they confirmed. The destination's own render
+// legitimately issues fresh requests for these cards and supersedes this
+// generation on the way -- reading that as "a stale response tried to
+// announce" would silently drop the very sentence this exists to deliver.
+function announceCardStatusAfter(identity, message, navigate) {
+  if (!cardIdentityCurrent(identity)) return Promise.resolve(false);  // #365 identity gate
+  return Promise.resolve(navigate()).then(() => {
+    toast = message;
+    toastIsError = false;
+    updateToast();
+    return true;
+  });
+}
+
 // (2) focus. Moves keyboard focus onto `el`, using the same tabindex="-1"
 // convention focusContentHeading() uses for a non-focusable destination
 // heading — but never stamping tabindex on a control that is already
@@ -1282,10 +1317,11 @@ function nextRequiredWorkflow(part) {
 // permitted but blocked on the Season (no Season resolved, or the resolved
 // one archived) surfaces as actionable guidance instead — `next_blocked` —
 // never a CTA that would just fail. Renders the required success state
-// once the WHOLE Program's setup is done (`complete`); renders nothing if
-// there's simply nothing left for THIS role to act on AND nothing blocked
-// to explain either, while other, not-this-role's workflows remain (three
-// different claims — see get_setup_progress's docstring).
+// once the WHOLE Program's setup is done (`complete`); renders the named
+// EMPTY state — its own heading, status sentence and explanation, and no
+// control — when there's simply nothing left for THIS role to act on AND
+// nothing blocked to explain either, while other, not-this-role's workflows
+// remain (three different claims — see get_setup_progress's docstring).
 //
 // #365: the payload is turned into an explicit discriminated model FIRST
 // (buildTasksCardModel below) and the renderer only ever switches on
@@ -1298,14 +1334,15 @@ function buildTasksCardModel(payload) {
              error: (payload && payload.error && payload.error.message) || null };
   }
   // Two DIFFERENT empty answers, discriminated by `reason` rather than left
-  // to a `!progress.program_id` test at the render site. Both deliberately
-  // render nothing (see renderSetupProgressCard): bootstrapping the very
-  // first Program is the onboarding wizard's job, not this card's, and the
-  // "nothing left for THIS role" case must not claim anything about
-  // workflows this role cannot see (#331 review round 3 finding 1 / round 5
-  // finding 3). Naming them as states anyway is the point — an empty answer
-  // is now something the model asserts, not something the renderer infers
-  // from a missing field.
+  // to a `!progress.program_id` test at the render site. Naming them as
+  // states is what lets renderSetupProgressCard give each its OWN heading,
+  // status sentence and explanation (#365): "no_program" means no Program
+  // exists or resolves for this operator at all, "nothing_actionable" means a
+  // Program IS resolved and this role's visible slice of it has nothing left
+  // to do — a claim that deliberately says nothing about workflows this role
+  // cannot see (#331 review round 3 finding 1 / round 5 finding 3). An empty
+  // answer is something the model asserts, not something the renderer infers
+  // from a missing field, and neither reason is silent any more.
   if (!payload.program_id) {
     return { state: CARD_STATE.EMPTY, reason: "no_program", status: CARD_STATUS.UNKNOWN };
   }
@@ -1385,6 +1422,21 @@ function tasksWorkflowRowsHtml(model) {
   }).join("");
 }
 
+// The exact markup last written into #sp-card-slot (#365, no duplicate
+// speech). Every write to that live region goes through paintHomeCard(), so a
+// later render can tell whether painting again would be a byte-identical
+// repaint of a polite region — which is the same sentence announced twice.
+//
+// Compared against the STRING that was written, never against
+// `slot.innerHTML`: reading innerHTML back re-serializes the live DOM (a
+// valueless attribute like `data-setup-progress-retry` comes back as
+// `data-setup-progress-retry=""`), so a source-vs-serialized comparison never
+// matches even when the paint is genuinely identical.
+let homeCardPaintedHtml = null;
+function paintHomeCard(slot, html) {
+  slot.innerHTML = html;
+  homeCardPaintedHtml = html;
+}
 function renderSetupProgressCard(model) {
   const state = (model && model.state) || CARD_STATE.LOADING;
   // The Home/Tasks half of the context-switch withdrawal (#365 owner
@@ -1442,10 +1494,14 @@ function renderSetupProgressCard(model) {
     // only control, a ghost button, so the one-primary-action-per-screen rule
     // holds here too.
     //
-    // Nothing was on screen under the earlier tuple either when the held
-    // state was EMPTY (both EMPTY reasons render nothing, by design), so
-    // there is nothing to retain and nothing to label — announcing an
-    // "earlier selection" that never showed anything would be new noise.
+    // A held EMPTY carries no retained READ — no rows, no counts, nothing
+    // this state exists to keep on screen. What EMPTY renders (see below) is
+    // a CLAIM about the tuple the operator has just left: "no program yet",
+    // or "nothing for your role to do HERE". Re-showing either under a
+    // "showing earlier data" banner would be labelling a claim as data, and
+    // the claim itself is about a context that is no longer the one selected.
+    // So this state stands down and the fresh load for the new tuple paints
+    // whatever is actually true there.
     if (model.staleFrom === CARD_STATE.EMPTY) return "";
     const rows = tasksWorkflowRowsHtml(model);
     // The PROGRAM the retained data belongs to, named exactly. Falls back to
@@ -1483,16 +1539,71 @@ function renderSetupProgressCard(model) {
       </div>
     </div>`;
   }
-  // Both EMPTY reasons (#365 buildTasksCardModel) deliberately render
-  // nothing, and for two different documented reasons rather than one
-  // accidental early return: "no_program" because bootstrapping the very
-  // first Program belongs to the onboarding wizard, and
-  // "nothing_actionable" because a role whose visible slice is narrower than
-  // the whole Program can neither be recommended anything nor be told
-  // anything verifiable about it (#331 review round 3 finding 1 / round 5
-  // finding 3). Naming them in the model is what stops a future change from
-  // conflating them.
-  if (state === CARD_STATE.EMPTY) return "";
+  // EMPTY, as a RENDERED state with its own heading and status text — one
+  // body per named reason (#365 owner correction, superseding the earlier
+  // #331 comments that documented silence here).
+  //
+  // Both reasons used to return the empty string. That left a no-Program
+  // operator and a role with nothing actionable with no explanation at all,
+  // and it left a keyboard operator whose Retry resolved into this state with
+  // nowhere to land: the fallback focused #sp-card-slot, a zero-height
+  // wrapper carrying no text and no accessible name, so focus was technically
+  // off <body> and perceptually nowhere. #365 requires every applicable state
+  // to render a stable semantic heading and status text, and requires an
+  // empty state to explain what is missing.
+  //
+  // The two reasons are DIFFERENT claims and get different copy, which is the
+  // whole point of having named them in the model:
+  //
+  //   "no_program"          no Program exists or resolves for this operator
+  //                         at all, so there is no setup to have progress on.
+  //   "nothing_actionable"  a Program is resolved and this ROLE's visible
+  //                         slice of it has nothing left to do — which is
+  //                         explicitly NOT a claim that the whole Program is
+  //                         finished (get_setup_progress: a partial view can
+  //                         never truthfully verify a whole-Program claim).
+  //
+  // ACTIONS FOLLOW THE SAME RULE THE REST OF THIS SLICE FOLLOWS: expose a
+  // primary path only where one is genuinely authorized AND can actually
+  // resolve the state; otherwise render guidance and NO control.
+  //   * "no_program" is resolved by creating the first Program, which is the
+  //     guided Initial Setup wizard's job — and onboarding.js gates that
+  //     whole view on MANAGE_SETUP (a role without it is shown a "League
+  //     Admin only" banner there). So the button is rendered only for
+  //     MANAGE_SETUP; every other role gets the sentence that names who does
+  //     it instead of a control that would dead-end.
+  //   * "nothing_actionable" has, by construction, nothing for this role to
+  //     act on — so it carries no control at all. "Go to Schedule" belongs to
+  //     SUCCESS, where the server has actually verified completion; offering
+  //     it here would imply a whole-Program claim this state cannot make.
+  // Navigation-only, exactly like SUCCESS's own "Go to Schedule": not a
+  // context-scoped mutation entry point, so it is not part of the
+  // context-switch withdrawal (`ctaWithdrawn`) either.
+  if (state === CARD_STATE.EMPTY) {
+    const canBootstrap = hasPerm("manage_setup");
+    if (model.reason === "nothing_actionable") {
+      return `<div class="dash-card sp-card" style="margin-bottom:16px">
+        <div class="dash-card-head"><h3>Setup progress — nothing for your role to do</h3></div>
+        <p class="muted sp-empty-status">There is nothing left for your role to do
+          in this program's setup right now.</p>
+        <p class="muted">Setup workflows your role doesn't manage aren't shown on this
+          card, so this isn't a claim that the whole program is finished.</p>
+      </div>`;
+    }
+    return `<div class="dash-card sp-card" style="margin-bottom:16px">
+      <div class="dash-card-head"><h3>Setup progress — no program yet</h3></div>
+      <p class="muted sp-empty-status">No program has been set up yet, so there is
+        no setup progress to show.</p>
+      ${canBootstrap
+        ? `<p class="muted">The guided Initial Setup wizard creates the first one —
+             this card fills in as each setup workflow is done.</p>
+           <div class="actions">
+             <button class="act primary" data-goto="onboarding">Start Initial Setup</button>
+           </div>`
+        : `<p class="muted">A League Admin creates the first program. There is nothing
+             here for your role to do until one exists.</p>`}
+    </div>`;
+  }
   if (state === CARD_STATE.SUCCESS) {
     // "Imports and onboarding" stays reachable even once every REQUIRED
     // workflow is done (#331 review round 2 finding 2) -- it's an
@@ -1576,10 +1687,10 @@ function renderSetupProgressCard(model) {
   // workflow this caller COULD act on except for an unmet Season
   // prerequisite (guidance to surface, not a CTA that would just fail), vs.
   // truly nothing left for this role while other, not-this-role's workflows
-  // remain (renders nothing -- see get_setup_progress's docstring). #365
-  // moved that second case into the model as EMPTY/"nothing_actionable",
-  // handled above, so reaching here always means there IS a blocked workflow
-  // to explain.
+  // remain (see get_setup_progress's docstring). #365 moved that second case
+  // into the model as EMPTY/"nothing_actionable", which is rendered above
+  // with its own heading and explanation, so reaching here always means there
+  // IS a blocked workflow to explain.
   const blocked = model.nextBlocked;
   if (!blocked) return "";
   return `<div class="dash-card sp-card" style="margin-bottom:16px">
@@ -1646,7 +1757,7 @@ async function loadSetupProgressCard(opts) {
   // settling it is also what speaks. Deliberately NOT also toasted: that
   // would be the same sentence announced twice.
   if (!cardIdentityCurrent(identity)) return;   // #365 identity gate — DOM + announcement
-  slot.innerHTML = renderSetupProgressCard(readCardState(HOME_TASKS_CARD));
+  paintHomeCard(slot, renderSetupProgressCard(readCardState(HOME_TASKS_CARD)));
   slot.setAttribute("aria-busy", "false");
   const spAction = slot.querySelector("[data-setup-progress-action]");
   if (spAction) spAction.onclick = () =>
@@ -1663,21 +1774,28 @@ async function loadSetupProgressCard(opts) {
   // response can never yank focus back into a card the operator has moved on
   // from.
   //
-  // #365: the fallback to the SLOT is not cosmetic, it closes a focus loss.
-  // `.dash-card h3` exists in five of this card's six states, but EMPTY
-  // renders the empty string on purpose (both of its reasons -- see
-  // renderSetupProgressCard), so there is no heading to land on. An operator
-  // who pressed Retry was standing on a button inside this slot; the
-  // innerHTML write above has just destroyed it, and with a null target
-  // focusCardTarget() refused and left keyboard focus on <body> -- Tab
-  // restarting from the top of the document after an action the operator
-  // deliberately took. Reproduced as an Arena Manager whose only visible
-  // workflow is already done: ERROR -> keyboard Retry -> EMPTY, focus on
-  // BODY. #sp-card-slot is the right landing place and needs no invented
-  // copy: it is render()'s own wrapper, it survives every replacement here,
-  // and it IS this card's live region, so focus stays exactly where the card
-  // the operator asked to reload lives. focusCardTarget() stamps the same
-  // tabindex="-1" it uses for any other non-focusable destination.
+  // THE TARGET IS THE SETTLED STATE'S OWN HEADING, in all SIX states.
+  //
+  // This used to be true of five of them: EMPTY rendered the empty string, so
+  // `.dash-card h3` found nothing, focusCardTarget() refused a null target and
+  // keyboard focus was left on <body> -- Tab restarting from the top of the
+  // document after an action the operator deliberately took. Reproduced as an
+  // Arena Manager whose only visible workflow is already done: ERROR ->
+  // keyboard Retry -> EMPTY, focus on BODY.
+  //
+  // The first fix for that landed focus on #sp-card-slot itself, which was
+  // only half a fix and the #365 review said so: the wrapper carries no text,
+  // no heading and no accessible name, and in the EMPTY state it had no box
+  // either, so focus was off <body> and still nowhere a person could perceive.
+  // EMPTY now renders a real heading and status text per reason (see
+  // renderSetupProgressCard), so the SAME selector below lands on a visible,
+  // named destination in every state this card can settle into.
+  //
+  // The slot is kept as the last-resort fallback rather than deleted: it is
+  // render()'s own wrapper, it survives every replacement here, and a future
+  // state that somehow painted no heading must still not drop focus on
+  // <body>. focusCardTarget() stamps the same tabindex="-1" it uses for any
+  // other non-focusable destination.
   if (opts && opts.userInitiated && hadFocusInCard) {
     focusCardTarget(identity, slot.querySelector(".dash-card h3") || slot);
   }
@@ -4508,7 +4626,10 @@ function runSetupWorkflowGo(key) {
     focusVenueAccessControl();
     return;
   }
-  goToSetupWorkflow(key);
+  // Returned, not fire-and-forget (#365): goToSetupWorkflow() is async for the
+  // drawer destinations, and announceCardStatusAfter() needs the navigation's
+  // own settle to know when the destination has finished rendering.
+  return goToSetupWorkflow(key);
 }
 async function openSetupWorkflowDrawer(kind) {
   const mySeq = ++drawerSeedFetchSeq;
@@ -5538,15 +5659,31 @@ function resolveSetupCardConfirm(key, yes) {
   // Success and cancellation both announce exactly once, through the one
   // sitewide live region -- the card's own visible copy is not itself a live
   // region, so neither is spoken twice.
-  announceCardStatus(identity, yes ? (c.done || "Continuing.")
-    : (c.cancelled || "Cancelled."));
+  //
+  // CANCELLATION stays on this surface: nothing navigates, nothing clears the
+  // region afterwards, so it is announced here and now.
   if (!yes) {
+    announceCardStatus(identity, c.cancelled || "Cancelled.");
     focusCardTarget(identity, document.querySelector(`[data-setup-card-ask="${key}"]`));
     return;
   }
-  if (action.go) return runSetupWorkflowGo(action.go);
-  if (action.act) return openSetupWorkflowDrawer(action.act);
-  if (action.open) return openSetupWorkflowLanding(action.open);
+  // COMPLETION, for the three action kinds that hand off to a destination
+  // owning its own write. Each of them navigates, and a navigation withdraws
+  // the region in the same task -- so the sentence is announced AFTER the
+  // destination render instead of before it. See announceCardStatusAfter().
+  const done = c.done || "Continuing.";
+  if (action.go) {
+    return announceCardStatusAfter(identity, done, () => runSetupWorkflowGo(action.go));
+  }
+  if (action.act) {
+    return announceCardStatusAfter(identity, done, () => openSetupWorkflowDrawer(action.act));
+  }
+  if (action.open) {
+    return announceCardStatusAfter(identity, done, () => openSetupWorkflowLanding(action.open));
+  }
+  // No destination at all: nothing is going to clear the region, so this is
+  // the ordinary in-place announcement.
+  announceCardStatus(identity, done);
 }
 
 // The REAL reopen-Season write, fired from a card whose blocking prerequisite
@@ -9410,6 +9547,12 @@ async function render() {
   // rather than flashing another Program/Season/League's data.
   const myRenderContext = contextRevision;
   let ov, sv, hv, board, lineups, standings, inbox, playerHome;
+  // #365 (no duplicate speech): the Home/Tasks live region carried THROUGH
+  // this render rather than rebuilt by it. Decided before the blank below
+  // (which would otherwise destroy the node) and re-checked at the paint --
+  // see both sites.
+  let spSlotNode = null;
+  let carrySpSlot = false;
   // Per-ENDPOINT outcomes for the Setup view's own reads (#365) — see the
   // Setup branch below for why the payloads alone cannot carry this.
   let svOk = false, playersOk = false;
@@ -9438,6 +9581,33 @@ async function render() {
     // loads -- that would be a stale destination, not retained data. Every
     // other view, and a first arrival on Setup, keeps the immediate skeleton
     // it had.
+    // #365 (no duplicate speech). #sp-card-slot is `role="status"
+    // aria-live="polite"`, and the comment on its own markup further down has
+    // always claimed the wrapper "persists across every re-render" -- but it
+    // did not: the blank below and the paint at the end of this function each
+    // re-serialized it. On a context switch that meant the SAME stale card was
+    // written into the SAME polite region twice in a row: once by
+    // repaintContextScopedCardsAsStale(), synchronously and before the awaited
+    // reads, and once by this render, from the same still-stale model. Two
+    // byte-identical writes to one polite region is duplicate speech.
+    //
+    // The SECOND one is the redundant half. The first is the synchronous stale
+    // withdrawal -- it must keep running before any await, which is the whole
+    // reason it exists -- so it is this render that stands down: the existing
+    // node is CARRIED, never detached, never re-serialized, never touched.
+    //
+    // Conditioned on BYTE-IDENTICAL content, so carrying can never leave a
+    // card standing that says something other than what this render would have
+    // painted. Every other case rebuilds exactly as before -- including the
+    // LOADING skeleton an ordinary re-render still paints over settled data.
+    spSlotNode = view === "dashboard"
+      && (hasPerm("manage_setup") || hasPerm("manage_arena"))
+      ? document.getElementById("sp-card-slot") : null;
+    if (spSlotNode && spSlotNode.parentNode === c) {
+      const held = readCardState(HOME_TASKS_CARD);
+      carrySpSlot = homeCardPaintedHtml === renderSetupProgressCard(
+        held.state === CARD_STATE.STALE ? held : { state: CARD_STATE.LOADING });
+    }
     const paintedLanding = c.querySelector("[data-setup-workflow-landing]");
     const retainSetupCards = view === "setup" && setupView === "hub"
       && (setupWorkflow
@@ -9459,6 +9629,13 @@ async function render() {
         c.querySelectorAll(".modal-scrim, .modal").forEach((el) => el.remove());
       }
       setupWorkflowsFor().forEach((w) => repaintSetupWorkflowCard(w.key, null));
+    } else if (carrySpSlot) {
+      // Same blank as below, around the carried live region instead of over
+      // it: the slot node is left exactly where it is, with exactly the
+      // content it already had.
+      Array.from(c.children).forEach((el) => { if (el !== spSlotNode) el.remove(); });
+      spSlotNode.insertAdjacentHTML("afterend",
+        `<div class="skeleton"></div><div class="skeleton"></div>`);
     } else {
       c.innerHTML = `<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>`;
     }
@@ -9975,11 +10152,21 @@ async function render() {
   // loading state exactly as before, so an ordinary reload never shows one
   // context's numbers under another's heading.
   const spInitial = readCardState(HOME_TASKS_CARD);
-  c.innerHTML =
-    view === "dashboard" ? (showSetupCard
-        ? `<div id="sp-card-slot" role="status" aria-live="polite" aria-busy="true">${
-             renderSetupProgressCard(spInitial.state === CARD_STATE.STALE
-               ? spInitial : { state: CARD_STATE.LOADING })}</div>` : "")
+  // Re-checked here, not trusted from the pre-fetch decision alone: an early
+  // return, the identity boundary's own DOM pass or a per-card repaint could
+  // have taken the node out of #content in between, and emitting no slot
+  // markup for a node that is no longer there would leave the card unpainted.
+  carrySpSlot = carrySpSlot && !!spSlotNode && spSlotNode.parentNode === c;
+  // `null` when this render paints no slot of its own — either because it is
+  // carrying the live one, or because this view/role has no card at all.
+  const spHtml = (view === "dashboard" && showSetupCard && !carrySpSlot)
+    ? renderSetupProgressCard(spInitial.state === CARD_STATE.STALE
+        ? spInitial : { state: CARD_STATE.LOADING })
+    : null;
+  const viewHtml =
+    view === "dashboard" ? (spHtml !== null
+        ? `<div id="sp-card-slot" role="status" aria-live="polite" aria-busy="true"
+             >${spHtml}</div>` : "")
       + renderDashboard(ov, standings)
     : view === "setup" ? renderSetup(sv, hv, ov)
     : view === "import" ? renderImport(ov)
@@ -9998,10 +10185,33 @@ async function render() {
     : view === "standings" ? renderStandings(ov, standings)
     : view === "activity" ? renderActivity(board, ov)
     : renderPublic(ov);
+  if (carrySpSlot) {
+    // Everything except the carried live region is replaced around it. The
+    // node itself is never detached and never re-serialized, so this render
+    // writes nothing at all into #sp-card-slot -- the synchronous stale paint
+    // that already ran stands, and the card's own load is what replaces it.
+    Array.from(c.children).forEach((el) => { if (el !== spSlotNode) el.remove(); });
+    spSlotNode.insertAdjacentHTML("afterend", viewHtml);
+  } else {
+    c.innerHTML = viewHtml;
+  }
+  // Keep the "what is currently painted into the live region" record honest,
+  // since this is the one write to it that does not go through paintHomeCard():
+  // the slot is created as part of #content's own markup here.
+  if (spHtml !== null) homeCardPaintedHtml = spHtml;
+  else if (!carrySpSlot) homeCardPaintedHtml = null;   // no slot on this surface
   // The themed confirm/blocked modal (#215) overlays whatever view is showing
   // (it can be opened from the header's Reset demo action too), so append it
   // after the view content on every render and wire it below.
-  c.innerHTML += renderModal();
+  //
+  // APPENDED, never `c.innerHTML += ...` (#365): the += form reads #content's
+  // whole serialized markup and re-parses it, which destroyed and rebuilt
+  // #sp-card-slot -- a polite live region -- with byte-identical content
+  // immediately after the paint above, on EVERY render. That is the same
+  // sentence written to the same region twice in a row, which is exactly the
+  // duplicate speech #365 forbids; it was invisible only because it was the
+  // very next mutation. insertAdjacentHTML leaves every existing node alone.
+  c.insertAdjacentHTML("beforeend", renderModal());
 
   wireModal(c);
   c.querySelectorAll("[data-goto]").forEach((b) => b.onclick = () => switchTab(b.dataset.goto));
@@ -12203,7 +12413,7 @@ function repaintContextScopedCardsAsStale() {
     // aria-busy stays true: a load for the NEW tuple is coming, and the card
     // on screen is not the answer to it.
     slot.setAttribute("aria-busy", "true");
-    slot.innerHTML = renderSetupProgressCard(readCardState(HOME_TASKS_CARD));
+    paintHomeCard(slot, renderSetupProgressCard(readCardState(HOME_TASKS_CARD)));
     const refresh = slot.querySelector("[data-setup-progress-retry]");
     if (refresh) refresh.onclick = () => loadSetupProgressCard({ userInitiated: true });
   }
@@ -12284,7 +12494,7 @@ function blankContextScopedCardSurfaces() {
   const homeSlot = document.getElementById("sp-card-slot");
   if (homeSlot) {
     homeSlot.setAttribute("aria-busy", "true");
-    homeSlot.innerHTML = "";
+    paintHomeCard(homeSlot, "");
   }
   document.querySelectorAll("[data-setup-card-slot]").forEach((slot) => {
     slot.setAttribute("aria-busy", "true");

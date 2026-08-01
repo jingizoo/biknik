@@ -27,8 +27,11 @@
 //   READY     <h3>Continue setup</h3>, the next workflow, the full workflow
 //             list with per-row Done/To do/Optional status text, the
 //             completion line, and AT MOST ONE primary action.    (legs 1b/2a)
-//   EMPTY     renders the empty string, for two separately-named reasons
-//             ("no_program", "nothing_actionable").              (legs 1h/2b')
+//   EMPTY     its OWN heading, status sentence and reason-specific
+//             explanation, one body per separately-named reason
+//             ("no_program" — with the single genuinely authorized path that
+//             resolves it; "nothing_actionable" — guidance and NO control).
+//                                                               (legs 1h/2b')
 //   STALE     <h3>Setup progress — showing earlier data</h3>, the retained
 //             rows and counts, and the obsolete primary action WITHDRAWN in
 //             favour of a ghost "Refresh setup progress".              (leg 1f)
@@ -65,7 +68,11 @@
 //   * every Home/Tasks transition must produce at least one write to
 //     #sp-card-slot (the card really does speak), and
 //   * ZERO writes to #toast-root (it must not speak twice), and
-//   * no two consecutive writes to the same region carrying the same text, and
+//   * no two consecutive CONTENT writes to the region carrying byte-identical
+//     text — retained raw, never deduplicated by the recorder, and FAILED
+//     rather than reported (#365 review: the recorder used to collapse
+//     consecutive identical entries, so a duplicated repaint was counted once
+//     by construction), and
 //   * the status sentence of the settled state must appear EXACTLY ONCE in the
 //     whole document, and
 //   * nested live regions inside the slot (the STALE banner's role="status",
@@ -174,6 +181,25 @@ const H_READY = "Continue setup";
 const H_ERROR = "Setup progress unavailable";
 const H_STALE = "Setup progress — showing earlier data";
 const H_SUCCESS = "✓ All setup steps complete";
+// EMPTY renders a body per NAMED REASON (#365 review: both reasons used to
+// return the empty string, which left a no-Program operator and a role with
+// nothing actionable with no explanation at all, and left a keyboard operator
+// whose Retry resolved here with no perceivable place to land). The two
+// reasons are DIFFERENT claims and are asserted as different copy, so a build
+// that collapsed them back into one sentence fails.
+const H_EMPTY_NO_PROGRAM = "Setup progress — no program yet";
+const H_EMPTY_NOTHING = "Setup progress — nothing for your role to do";
+const EMPTY_NO_PROGRAM_STATUS =
+  "No program has been set up yet, so there is no setup progress to show.";
+const EMPTY_NO_PROGRAM_PATH =
+  "The guided Initial Setup wizard creates the first one — this card fills in "
+  + "as each setup workflow is done.";
+const EMPTY_NOTHING_STATUS =
+  "There is nothing left for your role to do in this program's setup right now.";
+const EMPTY_NOTHING_EXPLAIN =
+  "Setup workflows your role doesn't manage aren't shown on this card, so this "
+  + "isn't a claim that the whole program is finished.";
+const CTA_START_ONBOARDING = "Start Initial Setup";
 const ERROR_SENTENCE = "Could not load your setup progress.";
 const LOADING_SR = "Loading setup progress…";
 const CTA_ADD_SEASON = "Add Season";
@@ -500,6 +526,26 @@ function holdContextOptions() {
 // That is what makes "the card spoke, and the sitewide region did not" a
 // measurement rather than an assumption, and what would catch a nested region
 // repeating its parent's sentence.
+//
+// NOTHING IS DEDUPLICATED HERE, and that is the point (#365 review). This
+// recorder used to drop an entry whose {region, text, hidden} matched the one
+// before it — so a region written twice in a row with byte-identical content
+// was collapsed to one write BY CONSTRUCTION, and "the settled sentence was
+// said exactly once" could not fail for a build that said it twice. Every raw
+// write is now retained, in order, and the duplicate is judged below.
+//
+// Each entry carries its `kind`, because the two kinds of mutation are not the
+// same event and conflating them would manufacture false duplicates rather
+// than find real ones:
+//   "content"    a childList/characterData change — the region's content was
+//                actually rewritten. This is a write, and two consecutive
+//                identical ones are duplicate speech.
+//   "attribute"  aria-busy/hidden/aria-live/role changed while the content did
+//                not. Production correctly writes the settled card and THEN
+//                clears aria-busy on the same element (the ARIA convention),
+//                which is one announcement, not two — but it carries the same
+//                text, so counting it as a write would fail every settle.
+// Both are recorded, in order; only content writes are judged.
 async function armLiveRegions(page) {
   await page.evaluate(() => {
     window.__live = [];
@@ -511,27 +557,23 @@ async function armLiveRegions(page) {
       while (el) { if (isRegion(el)) return el; el = el.parentElement; }
       return null;
     };
-    const record = (node) => {
+    const record = (node, kind) => {
       const reg = regionOf(node);
       if (!reg) return;
       const id = reg.id || `${reg.tagName.toLowerCase()}[${reg.getAttribute("role")
         || reg.getAttribute("aria-live")}]`;
       const text = (reg.textContent || "").replace(/\s+/g, " ").trim();
-      const entry = { region: id, role: reg.getAttribute("role"),
-                      live: reg.getAttribute("aria-live"),
-                      hidden: !!reg.hidden, text: text.slice(0, 400) };
-      const last = window.__live[window.__live.length - 1];
-      if (last && last.region === entry.region && last.text === entry.text
-          && last.hidden === entry.hidden) return;
-      window.__live.push(entry);
+      window.__live.push({ region: id, kind: kind, role: reg.getAttribute("role"),
+                           live: reg.getAttribute("aria-live"),
+                           hidden: !!reg.hidden, text: text.slice(0, 400) });
     };
     if (window.__liveObs) window.__liveObs.disconnect();
     window.__liveObs = new MutationObserver((records) => {
       for (const r of records) {
         if (r.type === "childList" && r.addedNodes.length) {
-          r.addedNodes.forEach(record);
+          r.addedNodes.forEach((n) => record(n, "content"));
         } else {
-          record(r.target);
+          record(r.target, r.type === "attributes" ? "attribute" : "content");
         }
       }
     });
@@ -543,6 +585,12 @@ async function armLiveRegions(page) {
 }
 async function liveWrites(page) {
   return page.evaluate(() => (window.__live || []).slice());
+}
+// The writes a person would actually hear: content rewrites carrying text,
+// in the order they happened, with nothing merged away.
+function spokenWrites(writes, region) {
+  return writes.filter((w) => w.kind === "content" && w.text
+    && (!region || w.region === region));
 }
 
 // The one Home/Tasks announcement assertion, applied identically everywhere.
@@ -561,19 +609,19 @@ async function liveWrites(page) {
 //       ("without duplicate speech") measured on the sentence that is actually
 //       being announced, rather than on every transient paint in between.
 //
-// WHAT IS RECORDED AND NOT JUDGED. A context switch paints the card's STALE
-// content TWICE with byte-identical text — once by
-// repaintContextScopedCardsAsStale(), which is deliberately synchronous and
-// runs before the awaited options/progress reads, and once by render()'s own
-// `#content.innerHTML = ...`, which rebuilds the slot from the same still-stale
-// model. Both paints are intentional and both are correct about WHAT they
-// paint. Whether a polite region whose content is replaced with identical
-// content is announced once or twice is an assistive-technology behaviour this
-// journey cannot observe, so encoding either answer as a pass/fail would be
-// this file asserting something it did not measure. Every such pair is
-// collected and reported instead.
-function assertCardSpokeOnce(writes, expectText, L, step, notes) {
-  const toast = writes.filter((w) => w.region === "toast-root" && w.text);
+//   (4) NO TWO CONSECUTIVE CONTENT WRITES to the card's region may carry
+//       byte-identical text. This was previously OBSERVED AND NOT JUDGED, and
+//       the #365 review was explicit that this is not an open question: a
+//       context switch really did paint the card's STALE content twice — once
+//       by repaintContextScopedCardsAsStale(), which is deliberately
+//       synchronous and must keep running before the awaited reads, and once
+//       by render() rebuilding the slot from the same still-stale model — and
+//       `#content.innerHTML += renderModal()` re-serialized the whole region a
+//       second time on EVERY render. Both are now eliminated in production
+//       (the live region is carried through the render instead of rebuilt),
+//       and reinstating either one fails here.
+function assertCardSpokeOnce(writes, expectText, L, step) {
+  const toast = spokenWrites(writes, "toast-root");
   if (toast.length) {
     fail(`[${L}/${step}] the Home/Tasks card spoke through the SITEWIDE live `
       + `region as well as its own — that is the same sentence announced `
@@ -581,32 +629,39 @@ function assertCardSpokeOnce(writes, expectText, L, step, notes) {
       + `${JSON.stringify(toast)}`);
   }
   const mine = writes.filter((w) => w.region === "sp-card-slot");
+  const said = spokenWrites(writes, "sp-card-slot");
   if (!mine.length) {
     fail(`[${L}/${step}] nothing at all was written to #sp-card-slot, so the `
       + `card never announced its new state through the one live region it `
       + `owns; recorded writes: ${JSON.stringify(writes)}`);
   }
-  const last = mine[mine.length - 1];
+  if (!said.length) {
+    fail(`[${L}/${step}] #sp-card-slot was touched but never had CONTENT `
+      + `written into it, so nothing was announced: ${JSON.stringify(mine)}`);
+  }
+  const last = said[said.length - 1];
   if (expectText && last.text.indexOf(expectText) === -1) {
     fail(`[${L}/${step}] the last thing #sp-card-slot said does not contain `
       + `"${expectText}": ${JSON.stringify(last)}`);
   }
   if (expectText) {
-    const said = mine.filter((w) => w.text.indexOf(expectText) !== -1);
-    if (said.length !== 1) {
+    const carried = said.filter((w) => w.text.indexOf(expectText) !== -1);
+    if (carried.length !== 1) {
       fail(`[${L}/${step}] the settled state's own sentence "${expectText}" was `
-        + `written to #sp-card-slot ${said.length} times; a polite live region `
-        + `is handed it once. Writes: ${JSON.stringify(mine.map((w) => w.text.slice(0, 90)))}`);
+        + `written to #sp-card-slot ${carried.length} times; a polite live region `
+        + `is handed it once. Writes: ${JSON.stringify(said.map((w) => w.text.slice(0, 90)))}`);
     }
   }
-  for (let i = 1; i < mine.length; i++) {
-    if (mine[i].text && mine[i].text === mine[i - 1].text) {
-      (notes || []).push(`[${L}/${step}] #sp-card-slot received two `
-        + `back-to-back writes with byte-identical text: `
-        + `"${mine[i].text.slice(0, 120)}…"`);
+  for (let i = 1; i < said.length; i++) {
+    if (said[i].text === said[i - 1].text) {
+      fail(`[${L}/${step}] #sp-card-slot received two back-to-back CONTENT `
+        + `writes carrying byte-identical text, which is the same sentence `
+        + `handed to a polite live region twice: `
+        + `"${said[i].text.slice(0, 160)}…"\n  full ordered ledger: `
+        + `${JSON.stringify(said.map((w) => w.text.slice(0, 70)))}`);
     }
   }
-  return mine;
+  return said;
 }
 
 // The nested-region half of "no duplicate speech": a role="status"/"alert"
@@ -679,10 +734,10 @@ async function reachDashboard(page, L, step) {
 }
 
 // "#content has children" rather than waitForSelector("#content > *"), which
-// asks for the first child to be VISIBLE. This card's own EMPTY state is a
-// zero-height #sp-card-slot that is legitimately the first child, so the
-// visibility wait times out on exactly the state this journey exists to
-// assert.
+// asks for the first child to be VISIBLE. #sp-card-slot is legitimately the
+// first child in every state, including the ones this journey deliberately
+// creates before the card has painted anything into it, so the visibility wait
+// times out on states this journey exists to assert.
 async function contentPainted(page) {
   await page.waitForFunction(() => {
     const c = document.getElementById("content");
@@ -765,6 +820,12 @@ async function homeCard(page) {
       progressLine: slot && slot.querySelector(".sp-progress-line")
         ? slot.querySelector(".sp-progress-line").textContent.replace(/\s+/g, " ").trim()
         : null,
+      // The EMPTY state's own status sentence, read from its own hook so its
+      // presence and its exact wording are measured rather than inferred from
+      // the slot's whole text.
+      emptyStatus: slot && slot.querySelector(".sp-empty-status")
+        ? slot.querySelector(".sp-empty-status").textContent.replace(/\s+/g, " ").trim()
+        : null,
       skeleton: !!(slot && slot.querySelector(".skeleton")),
       // The card's own model, beside the DOM painted from it.
       state: entry.state,
@@ -787,6 +848,16 @@ async function homeCard(page) {
         + "[data-setup-card-confirm-reason],[data-setup-card-pending],"
         + "[data-setup-card-ask]").length : null,
       focus: describe(a),
+      // "focus landed somewhere" is not the requirement. The target has to be
+      // something a person can PERCEIVE (a real box) and something that NAMES
+      // where they are (its own text) — the zero-height, text-less
+      // #sp-card-slot satisfied neither, which is why focusing it was only
+      // half a fix.
+      focusName: a ? (a.textContent || "").replace(/\s+/g, " ").trim() : "",
+      focusBox: a && a.getBoundingClientRect ? (() => {
+        const r = a.getBoundingClientRect();
+        return { w: Math.round(r.width), h: Math.round(r.height) };
+      })() : null,
       focusIsBody: a === document.body,
       focusInSlot: !!(slot && a && slot.contains(a)),
       focusIsSlot: !!(slot && a === slot),
@@ -1029,8 +1100,6 @@ async function checkViewport(browser, viewport) {
   });
   const page = await context.newPage();
   const errors = [];
-  // Observations that are reported, never judged — see assertCardSpokeOnce.
-  const notes = [];
   page.on("pageerror", (e) => errors.push(`[pageerror] ${e.message}`));
 
   // ---- the four independent records the reconciler is handed at the end.
@@ -1138,16 +1207,52 @@ async function checkViewport(browser, viewport) {
       fail(`[${L}/1h] the empty state is settled but still reports `
         + `aria-busy=${empty.busy}`);
     }
-    if (empty.slotHtml !== "") {
-      fail(`[${L}/1h] EMPTY/"no_program" is documented in app.js as rendering `
-        + `the empty string; it rendered ${empty.slotHtml.length} characters. `
-        + `If this state has grown copy, this journey must assert that copy `
-        + `instead of the absence: ${empty.slotHtml.slice(0, 400)}`);
+    // EMPTY IS A RENDERED STATE (#365 owner correction). It used to return the
+    // empty string for both reasons; a no-Program operator received no
+    // explanation of what was missing and no path to it.
+    if (!empty.slotHtml) {
+      fail(`[${L}/1h] EMPTY/"no_program" rendered NOTHING at all, so an `
+        + `operator with no Program is told nothing about what is missing`);
     }
-    if (empty.buttons.length || empty.headings.length) {
-      fail(`[${L}/1h] the EMPTY state exposed controls/headings it does not `
-        + `declare: ${JSON.stringify(empty)}`);
+    if (JSON.stringify(empty.headings) !== JSON.stringify([H_EMPTY_NO_PROGRAM])) {
+      fail(`[${L}/1h] EMPTY/"no_program" must carry its own stable semantic `
+        + `heading "${H_EMPTY_NO_PROGRAM}": ${JSON.stringify(empty.headings)}`);
     }
+    if (empty.emptyStatus !== EMPTY_NO_PROGRAM_STATUS) {
+      fail(`[${L}/1h] EMPTY/"no_program" must carry its own status text `
+        + `"${EMPTY_NO_PROGRAM_STATUS}"; it carried `
+        + `${JSON.stringify(empty.emptyStatus)}`);
+    }
+    // REASON-SPECIFIC: the explanation names the missing PROGRAM and the path
+    // to it, and is not the other reason's sentence.
+    if (empty.slotText.indexOf(EMPTY_NO_PROGRAM_PATH) === -1) {
+      fail(`[${L}/1h] EMPTY/"no_program" does not explain how the missing `
+        + `program comes into being: ${empty.slotText}`);
+    }
+    if (empty.slotText.indexOf(EMPTY_NOTHING_STATUS) !== -1) {
+      fail(`[${L}/1h] EMPTY/"no_program" is rendering EMPTY/"nothing_actionable"`
+        + `'s copy, so the two named reasons have been collapsed into one: `
+        + `${empty.slotText}`);
+    }
+    // ROLE-CORRECT USABLE ACTION COUNT. This operator is a League Admin, the
+    // one role MANAGE_SETUP-gated onboarding.js will actually let create the
+    // first Program — so exactly ONE enabled primary path is exposed, and it
+    // is the wizard that genuinely resolves this state.
+    if (empty.buttons.length !== 1 || empty.buttons[0].disabled
+        || empty.buttons[0].text !== CTA_START_ONBOARDING
+        || empty.buttons[0].goto !== "onboarding") {
+      fail(`[${L}/1h] EMPTY/"no_program" must expose exactly one ENABLED, `
+        + `genuinely authorized primary path ("${CTA_START_ONBOARDING}" → the `
+        + `Initial Setup wizard): ${JSON.stringify(empty.buttons)}`);
+    }
+    if (JSON.stringify(empty.primaries) !== JSON.stringify([CTA_START_ONBOARDING])) {
+      fail(`[${L}/1h] the one-primary-action-per-screen rule: `
+        + `${JSON.stringify(empty.primaries)}`);
+    }
+    await assertSentenceAppearsOnce(page, H_EMPTY_NO_PROGRAM, L, "1h");
+    await assertSentenceAppearsOnce(page, EMPTY_NO_PROGRAM_STATUS, L, "1h");
+    await assertNoNestedEcho(page, L, "1h");
+    assertCardSpokeOnce(await liveWrites(page), H_EMPTY_NO_PROGRAM, L, "1h");
     // The rest of the Dashboard is painted — this is a PER-CARD empty, not a
     // blank page that would satisfy the assertions above for the wrong reason.
     const emptyOutside = await dashboardOutsideCard(page);
@@ -1214,7 +1319,7 @@ async function checkViewport(browser, viewport) {
     await settled(page, `${L}/1a-arrive`);
     await armLiveRegions(page);
     const loadHold = holdNextProgress();
-    await renderDashboardAgain(page, L, "1a", notes);
+    await renderDashboardAgain(page, L, "1a");
     await page.waitForFunction(() => {
       const s = document.getElementById("sp-card-slot");
       return !!s && s.getAttribute("aria-busy") === "true"
@@ -1265,7 +1370,7 @@ async function checkViewport(browser, viewport) {
       fail(`[${L}/1a] the demo Program's card must settle COMPLETE, got `
         + `${afterLoad.state}`);
     }
-    assertCardSpokeOnce(await liveWrites(page), H_SUCCESS, L, "1a", notes);
+    assertCardSpokeOnce(await liveWrites(page), H_SUCCESS, L, "1a");
 
     // ============ LEG 1g — SUCCESS / COMPLETE, in full ====================
     if (JSON.stringify(afterLoad.headings) !== JSON.stringify([H_SUCCESS])) {
@@ -1321,7 +1426,7 @@ async function checkViewport(browser, viewport) {
       fail(`[${L}/1b] the authorized primary action must be the card's only `
         + `control and must be ENABLED: ${JSON.stringify(ready.buttons)}`);
     }
-    assertCardSpokeOnce(await liveWrites(page), H_READY, L, "1b", notes);
+    assertCardSpokeOnce(await liveWrites(page), H_READY, L, "1b");
     await assertSentenceAppearsOnce(page, H_READY, L, "1b");
     await assertNoNestedEcho(page, L, "1b");
     // Kept for the role comparison in leg 2b: the SAME tuple, a different role.
@@ -1370,7 +1475,7 @@ async function checkViewport(browser, viewport) {
         + `  errored: ${JSON.stringify(erroredOutside.headings)} rows `
         + `${JSON.stringify(erroredOutside.rowCounts)}`);
     }
-    assertCardSpokeOnce(await liveWrites(page), ERROR_SENTENCE, L, "1c", notes);
+    assertCardSpokeOnce(await liveWrites(page), ERROR_SENTENCE, L, "1c");
     await assertSentenceAppearsOnce(page, ERROR_SENTENCE, L, "1c");
     await assertNoNestedEcho(page, L, "1c");
 
@@ -1419,7 +1524,7 @@ async function checkViewport(browser, viewport) {
       fail(`[${L}/1e] Retry repainted something outside this card, so it is not `
         + `scoped to it`);
     }
-    assertCardSpokeOnce(await liveWrites(page), H_READY, L, "1d", notes);
+    assertCardSpokeOnce(await liveWrites(page), H_READY, L, "1d");
 
     // (1d') A RETRY THAT FAILS AGAIN lands on the ERROR heading, not nowhere.
     await armLiveRegions(page);
@@ -1517,7 +1622,7 @@ async function checkViewport(browser, viewport) {
     await assertSentenceAppearsOnce(page, H_STALE, L, "1f");
     await waitForContextReconciled(page, demo.program, demo.season, L, "1f-reconcile");
     await settled(page, `${L}/1f-settled`);
-    assertCardSpokeOnce(await liveWrites(page), H_SUCCESS, L, "1f", notes);
+    assertCardSpokeOnce(await liveWrites(page), H_SUCCESS, L, "1f");
 
     // EXACT FOCUS AFTER COMPLETION, driven by keyboard: from the settled
     // COMPLETE state, a user-initiated Refresh re-reads the card and must land
@@ -1536,7 +1641,7 @@ async function checkViewport(browser, viewport) {
         + `focus must be on "${H_SUCCESS}": state=${completed.state} `
         + `focus=${completed.focus}`);
     }
-    assertCardSpokeOnce(await liveWrites(page), H_SUCCESS, L, "1g-focus", notes);
+    assertCardSpokeOnce(await liveWrites(page), H_SUCCESS, L, "1g-focus");
 
     // ============ LEG 3 — STALE RESPONSES CANNOT WIN =====================
     // (3a) a delayed SUCCESS released after a NEWER FAILURE settled.
@@ -1582,7 +1687,7 @@ async function checkViewport(browser, viewport) {
       fail(`[${L}/3a] releasing the superseded success RESTORED the obsolete `
         + `primary action "${CTA_ADD_SEASON}" over the newer failure`);
     }
-    const spoke3a = (await liveWrites(page)).filter((w) => w.text);
+    const spoke3a = spokenWrites(await liveWrites(page));
     if (spoke3a.length) {
       fail(`[${L}/3a] a superseded response ANNOUNCED: ${JSON.stringify(spoke3a)}`);
     }
@@ -1627,7 +1732,7 @@ async function checkViewport(browser, viewport) {
       fail(`[${L}/3b] an older context's response restored ITS primary action `
         + `("${CTA_ADD_SEASON}") on the new context's card`);
     }
-    const spoke3b = (await liveWrites(page)).filter((w) => w.text);
+    const spoke3b = spokenWrites(await liveWrites(page));
     if (spoke3b.length) {
       fail(`[${L}/3b] a response from the context the operator LEFT announced `
         + `into the current one: ${JSON.stringify(spoke3b)}`);
@@ -1661,7 +1766,7 @@ async function checkViewport(browser, viewport) {
     }
     const afterRelease3c = await homeCard(page);
     assertSame(beforeRelease3c, afterRelease3c, L, "3c");
-    const spoke3c = (await liveWrites(page)).filter((w) => w.text);
+    const spoke3c = spokenWrites(await liveWrites(page));
     if (spoke3c.length) {
       fail(`[${L}/3c] a superseded FAILURE announced: ${JSON.stringify(spoke3c)}`);
     }
@@ -1707,8 +1812,8 @@ async function checkViewport(browser, viewport) {
     // `indexOf`, not equality: #toast-root's own markup carries the dismiss
     // control beside the sentence, so the region's textContent is
     // "Season created. ×".
-    const heardToast = controlWrites.filter((w) => w.region === "toast-root"
-      && w.text.indexOf(SEASON_CREATED_TOAST) !== -1);
+    const heardToast = spokenWrites(controlWrites, "toast-root")
+      .filter((w) => w.text.indexOf(SEASON_CREATED_TOAST) !== -1);
     if (!heardToast.length) {
       fail(`[${L}/2a] the live-region ledger did not record a real production `
         + `toast, so every "#toast-root never spoke" assertion in this file is `
@@ -1770,12 +1875,11 @@ async function checkViewport(browser, viewport) {
     }
     await assertSentenceAppearsOnce(page, ARENA_BLOCKED_DETAIL, L, "2b");
 
-    // (2b') THE OTHER EMPTY REASON, and the focus target when a user-initiated
-    //       retry resolves into a state that paints nothing. On the fully
-    //       set-up Program this role's only workflow is already done, so the
-    //       card resolves EMPTY/"nothing_actionable" and renders the empty
-    //       string — there is no heading to land on, and focus must still not
-    //       be dropped on <body>.
+    // (2b') THE OTHER EMPTY REASON, and the exact focus target after a
+    //       user-initiated retry resolves into it. On the fully set-up Program
+    //       this role's only visible workflow is already done, so the card
+    //       resolves EMPTY/"nothing_actionable" — a DIFFERENT claim from
+    //       "no_program" (leg 1h) and carrying different copy.
     await armLiveRegions(page);
     await switchContext(page, demo.program, demo.season, L, "2b'");
     await settled(page, `${L}/2b'`);
@@ -1784,12 +1888,49 @@ async function checkViewport(browser, viewport) {
       fail(`[${L}/2b'] expected the named EMPTY/"nothing_actionable" state, got `
         + `${arenaEmpty.state}/${arenaEmpty.reason}`);
     }
-    if (!arenaEmpty.hasSlot || arenaEmpty.slotHtml !== ""
-        || arenaEmpty.buttons.length) {
-      fail(`[${L}/2b'] EMPTY/"nothing_actionable" must be a structurally `
-        + `PRESENT but empty slot: ${JSON.stringify({ slot: arenaEmpty.hasSlot,
-          len: (arenaEmpty.slotHtml || "").length, btns: arenaEmpty.buttons })}`);
+    if (!arenaEmpty.hasSlot) {
+      fail(`[${L}/2b'] the Arena Manager has no Home/Tasks slot at all here, so `
+        + `every assertion about what this state renders would be vacuous`);
     }
+    if (!arenaEmpty.slotHtml) {
+      fail(`[${L}/2b'] EMPTY/"nothing_actionable" rendered NOTHING at all, so a `
+        + `role whose visible slice has nothing left to do is told nothing`);
+    }
+    if (JSON.stringify(arenaEmpty.headings) !== JSON.stringify([H_EMPTY_NOTHING])) {
+      fail(`[${L}/2b'] EMPTY/"nothing_actionable" must carry its own stable `
+        + `semantic heading "${H_EMPTY_NOTHING}": `
+        + `${JSON.stringify(arenaEmpty.headings)}`);
+    }
+    if (arenaEmpty.emptyStatus !== EMPTY_NOTHING_STATUS) {
+      fail(`[${L}/2b'] EMPTY/"nothing_actionable" must carry its own status `
+        + `text "${EMPTY_NOTHING_STATUS}"; it carried `
+        + `${JSON.stringify(arenaEmpty.emptyStatus)}`);
+    }
+    // REASON-SPECIFIC, and explicitly NOT an overclaim about the whole Program.
+    if (arenaEmpty.slotText.indexOf(EMPTY_NOTHING_EXPLAIN) === -1) {
+      fail(`[${L}/2b'] EMPTY/"nothing_actionable" does not explain that this is `
+        + `a claim about THIS ROLE's slice only: ${arenaEmpty.slotText}`);
+    }
+    if (arenaEmpty.slotText.indexOf(EMPTY_NO_PROGRAM_STATUS) !== -1) {
+      fail(`[${L}/2b'] EMPTY/"nothing_actionable" is rendering `
+        + `EMPTY/"no_program"'s copy, so the two named reasons have been `
+        + `collapsed into one: ${arenaEmpty.slotText}`);
+    }
+    // ROLE-CORRECT USABLE ACTION COUNT: by construction there is nothing this
+    // role can act on, so this state offers GUIDANCE AND NO CONTROL — never a
+    // button that cannot resolve the state it is standing in.
+    if (arenaEmpty.buttons.length !== 0) {
+      fail(`[${L}/2b'] a state whose whole claim is "nothing left for your `
+        + `role to do" offered ${arenaEmpty.buttons.length} control(s): `
+        + `${JSON.stringify(arenaEmpty.buttons)}`);
+    }
+    await assertSentenceAppearsOnce(page, H_EMPTY_NOTHING, L, "2b'");
+    await assertSentenceAppearsOnce(page, EMPTY_NOTHING_STATUS, L, "2b'");
+    await assertNoNestedEcho(page, L, "2b'");
+    assertCardSpokeOnce(await liveWrites(page), H_EMPTY_NOTHING, L, "2b'");
+
+    // ERROR -> KEYBOARD RETRY -> EMPTY, and where focus ends up.
+    await armLiveRegions(page);
     failNextProgress(503);
     await renderDashboardAgain(page, L, "2b'-fail");
     await settled(page, `${L}/2b'-fail`);
@@ -1797,19 +1938,52 @@ async function checkViewport(browser, viewport) {
     await page.keyboard.press("Enter");
     await settled(page, `${L}/2b'-retry`);
     const afterEmptyRetry = await homeCard(page);
-    if (afterEmptyRetry.state !== "empty") {
-      fail(`[${L}/2b'] the retry was supposed to resolve EMPTY, got `
-        + `${afterEmptyRetry.state}`);
+    if (afterEmptyRetry.state !== "empty"
+        || afterEmptyRetry.reason !== "nothing_actionable") {
+      fail(`[${L}/2b'] the retry was supposed to resolve EMPTY/`
+        + `"nothing_actionable", got ${afterEmptyRetry.state}/`
+        + `${afterEmptyRetry.reason}`);
     }
     if (afterEmptyRetry.focusIsBody) {
-      fail(`[${L}/2b'] a keyboard-activated Retry that resolves into a state `
-        + `painting no heading DROPPED FOCUS ON <body> — Tab restarts from the `
-        + `top of the document after an action the operator deliberately took`);
+      fail(`[${L}/2b'] a keyboard-activated Retry DROPPED FOCUS ON <body> — Tab `
+        + `restarts from the top of the document after an action the operator `
+        + `deliberately took`);
     }
-    if (!afterEmptyRetry.focusIsSlot) {
-      fail(`[${L}/2b'] focus after a retry that resolves EMPTY must land on the `
-        + `card's own slot (#sp-card-slot), the one element that survives every `
-        + `replacement; it is on ${afterEmptyRetry.focus}`);
+    // THE EXACT TARGET: the empty state's OWN heading, not the live-region
+    // wrapper. Focusing #sp-card-slot was the earlier half-fix the #365 review
+    // rejected: the wrapper carries no text, no heading and no name, so focus
+    // was off <body> and still nowhere a person could perceive.
+    if (afterEmptyRetry.focusIsSlot) {
+      fail(`[${L}/2b'] focus landed on the bare #sp-card-slot wrapper, which `
+        + `carries no heading, no status text and no accessible name — a `
+        + `keyboard operator cannot tell that Retry completed`);
+    }
+    if (!afterEmptyRetry.focusIsCardHeading
+        || afterEmptyRetry.focusName !== H_EMPTY_NOTHING) {
+      fail(`[${L}/2b'] focus after a Retry that resolves EMPTY must land on the `
+        + `empty state's own heading ("${H_EMPTY_NOTHING}"); it is on `
+        + `${afterEmptyRetry.focus}`);
+    }
+    if (afterEmptyRetry.focus.indexOf("tabindex=-1") === -1) {
+      fail(`[${L}/2b'] the empty-state heading was focused without the `
+        + `tabindex="-1" focusCardTarget() stamps on a non-focusable `
+        + `destination: ${afterEmptyRetry.focus}`);
+    }
+    // VISIBLE, with a real box. A named target that renders zero-height is the
+    // same non-destination by another route.
+    if (!afterEmptyRetry.focusBox || afterEmptyRetry.focusBox.w <= 0
+        || afterEmptyRetry.focusBox.h <= 0) {
+      fail(`[${L}/2b'] the focus target has no perceivable box: `
+        + `${JSON.stringify(afterEmptyRetry.focusBox)}`);
+    }
+    // …and it is STILL the focus target a beat after settled()'s own delayed
+    // focus check, so a later repaint cannot quietly take it back.
+    await page.waitForTimeout(1200);
+    const stillOnEmptyHeading = await homeCard(page);
+    if (!stillOnEmptyHeading.focusIsCardHeading
+        || stillOnEmptyHeading.focusName !== H_EMPTY_NOTHING) {
+      fail(`[${L}/2b'] focus did not REMAIN on the empty-state heading: it `
+        + `moved to ${stillOnEmptyHeading.focus}`);
     }
 
     // ===================== LEG 2c — THE UNAUTHORIZED ROLE =================
@@ -1927,8 +2101,7 @@ async function checkViewport(browser, viewport) {
       fail(`[${L}/2c] the Home/Tasks read must be refused for a Viewer by the `
         + `SERVER, not merely hidden by the client: ${JSON.stringify(viewerProbe)}`);
     }
-    const viewerSpoke = (await liveWrites(page)).filter(
-      (w) => w.region === "sp-card-slot");
+    const viewerSpoke = spokenWrites(await liveWrites(page), "sp-card-slot");
     if (viewerSpoke.length) {
       fail(`[${L}/2c] something wrote into a Home/Tasks live region for a role `
         + `that has no Home/Tasks card: ${JSON.stringify(viewerSpoke)}`);
@@ -1961,11 +2134,6 @@ async function checkViewport(browser, viewport) {
     errors.push(...reconcileDeliveries(nonOk, declared, consoleErrors, failedReqs));
     if (errors.length) fail(`[${L}] browser errors:\n${errors.join("\n")}`);
 
-    if (notes.length) {
-      console.log(`[${L}] OBSERVED, not judged (see assertCardSpokeOnce):\n  `
-        + notes.join("\n  "));
-    }
-
     console.log(`[${L}] OK — the Home/Tasks card renders its six applicable `
       + `states through real production entry points with forced transport `
       + `outcomes: a held read shows the LOADING skeleton under its own `
@@ -1978,8 +2146,8 @@ async function checkViewport(browser, viewport) {
       + `real focus indicator and Enter issues exactly one request — this `
       + `card's own read, nothing outside it repainted by a byte — landing `
       + `focus on the recovered card's own heading (and on the ERROR heading `
-      + `when the retry fails again, and on the slot itself when it resolves `
-      + `into a state that paints no heading), while a routine render-driven `
+      + `when the retry fails again, and on the EMPTY state's own visible, `
+      + `named heading when it resolves there), while a routine render-driven `
       + `load moves no focus at all; a context switch shows STALE with the `
       + `retained rows intact, aria-busy still true, the obsolete primary `
       + `action WITHDRAWN and only a ghost refresh left; and a keyboard-driven `
@@ -1995,7 +2163,12 @@ async function checkViewport(browser, viewport) {
       + `each release observed at the network first. On the same tuple a `
       + `League Admin has an enabled "Add Season" while an Arena Manager has `
       + `ZERO controls, a workflow list redacted to MANAGE_ARENA and explicit `
-      + `guidance naming the blocker; a Viewer gets no Home/Tasks card, no `
+      + `guidance naming the blocker, and on the fully set-up Program resolves `
+      + `EMPTY/"nothing_actionable" with its own heading, status sentence and `
+      + `role-scoped explanation and ZERO controls — while a League Admin on a `
+      + `store with no Program at all gets EMPTY/"no_program" with its own `
+      + `different heading, status sentence and the single genuinely `
+      + `authorized path that resolves it; a Viewer gets no Home/Tasks card, no `
       + `Setup tab, zero mutation controls on either surface even when both `
       + `views are forced through the app's own switchTab(), explicit guidance `
       + `on Setup, and a server-side 403 on the read itself — each negative `

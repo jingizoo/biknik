@@ -599,24 +599,34 @@ function armHold(ch) {
 // sentence was never announced at all.
 //
 // So each added `.toast-msg` node is recorded as a write in its own right.
-// Consecutive identical entries are still collapsed (the region is rewritten
-// wholesale on every render that has a message standing), which is why the
-// "no duplicate speech" assertions below are always written against two
-// DIFFERENT sentences.
+//
+// NOTHING IS DEDUPLICATED (#365 review). This recorder used to drop an entry
+// whose {text, error} matched the one before it, which meant a duplicated
+// confirmation or success write was counted ONCE BY CONSTRUCTION and the
+// "no duplicate speech" clause could not fail here however production behaved.
+// Every raw write is now retained, in order, and duplicates are FAILED below.
+//
+// Each entry carries its `kind`, because two different things are recorded and
+// only one of them is speech:
+//   "write"    a `.toast-msg` node was added — the region was genuinely handed
+//              a sentence. This is an announcement; two consecutive identical
+//              ones are duplicate speech.
+//   "settled"  the region's state read after the batch, which is how a write
+//              that is WITHDRAWN inside the same task is still seen at all
+//              (updateToast() hides the region without clearing its markup, so
+//              a settled read of a hidden region is the empty string). Kept in
+//              the ledger for ordering, never counted as a sentence — counting
+//              it would report every single announcement twice.
 async function armAnnouncements(page) {
   await page.evaluate(() => {
     const root = document.getElementById("toast-root");
     if (!root) throw new Error("no #toast-root to observe");
     window.__sm = [];
-    const push = (entry) => {
-      const last = window.__sm[window.__sm.length - 1];
-      if (!last || last.text !== entry.text || last.error !== entry.error) {
-        window.__sm.push(entry);
-      }
-    };
+    const push = (entry) => { window.__sm.push(entry); };
     const read = () => {
       const msg = root.querySelector(".toast-msg");
-      return { text: root.hidden ? "" : (msg ? msg.textContent.trim() : ""),
+      return { kind: "settled",
+               text: root.hidden ? "" : (msg ? msg.textContent.trim() : ""),
                error: root.classList.contains("error") };
     };
     const rec = (records) => {
@@ -627,7 +637,7 @@ async function armAnnouncements(page) {
           const el = n.classList && n.classList.contains("toast-msg")
             ? n : (n.querySelector ? n.querySelector(".toast-msg") : null);
           if (!el) return;
-          push({ text: (el.textContent || "").trim(),
+          push({ kind: "write", text: (el.textContent || "").trim(),
                  error: root.classList.contains("error") });
         });
       });
@@ -640,20 +650,38 @@ async function armAnnouncements(page) {
     rec(null);
   });
 }
-// Only the SPOKEN entries: updateToast()'s 4-second auto-clear writes an empty
-// region, which is a dismissal, not an announcement.
+// Only the SPOKEN entries, in the raw order they were written, with nothing
+// merged away: updateToast()'s 4-second auto-clear hides the region, which is
+// a dismissal rather than an announcement, and the settled reads that record
+// it are not sentences.
 async function spoken(page) {
   return (await page.evaluate(() => window.__sm || []))
-    .filter((a) => a.text).map((a) => ({ text: a.text, error: !!a.error }));
+    .filter((a) => a.kind === "write" && a.text)
+    .map((a) => ({ text: a.text, error: !!a.error }));
 }
 async function resetAnnouncements(page) {
   await page.evaluate(() => { window.__sm = []; });
 }
+// #365, "without duplicate speech", measured rather than assumed away: two
+// consecutive byte-identical writes to the one sitewide live region are the
+// same sentence handed to it twice.
+function assertNoRepeatedSpeech(said, L, step) {
+  for (let i = 1; i < said.length; i++) {
+    if (said[i].text === said[i - 1].text) {
+      fail(`[${L}/${step}] the live region was handed two back-to-back writes `
+        + `carrying byte-identical text — the same sentence announced twice: `
+        + `${JSON.stringify(said[i].text)}. Full ordered ledger: `
+        + `${JSON.stringify(said)}`);
+    }
+  }
+}
 // Exactly one announcement, and it is the one named. Both halves matter: a
 // missing sentence and a duplicated one are different defects and this reports
-// which it found.
+// which it found. The raw ledger is used, so a duplicate really is visible
+// here rather than collapsed on the way in.
 async function assertSaidExactly(page, want, isError, L, step) {
   const said = await spoken(page);
+  assertNoRepeatedSpeech(said, L, step);
   if (said.length !== 1 || said[0].text !== want || said[0].error !== !!isError) {
     fail(`[${L}/${step}] the live region must have carried EXACTLY the single `
       + `announcement ${JSON.stringify(want)} (error=${!!isError}); it carried `
@@ -2115,26 +2143,57 @@ async function legConfirmImport(page, L) {
     .catch(() => fail(`[${L}/${step}/confirm] confirming did not open the `
       + `Initial Setup wizard`));
   await quiesce(page, `${L}/${step}/confirm`);
-  // WHAT THIS ASSERTS, and what it deliberately does NOT.
+  // WHAT THIS ASSERTS (#365 review round 10 — this used to stop halfway).
   //
-  // It asserts that the declared completion sentence was written to the ONE
-  // sitewide live region, exactly once, with nothing else said alongside it.
+  // (1) The declared completion sentence was written to the ONE sitewide live
+  //     region, exactly once, with nothing else said alongside it and no
+  //     duplicate of it — measured on the RAW ledger, which no longer collapses
+  //     consecutive identical writes.
   //
-  // It does NOT assert that the sentence was still standing afterwards, and
-  // that silence is deliberate rather than an oversight: this confirmation's
-  // completion NAVIGATES, and switchTab() clears `toast` and re-runs
-  // updateToast() inside the SAME synchronous task as the announcement — so
-  // the region is populated and emptied before the browser paints. Whether an
-  // assistive technology announces a polite region that is written and
-  // withdrawn within one task is not something this journey can determine, and
-  // asserting either answer here would encode a conclusion it has not earned.
-  // The observed fact is reported as an open question instead; see the
-  // announcement recorder above for the mechanism.
+  // (2) It SURVIVED THE NAVIGATION it triggered. This confirmation's completion
+  //     opens the Initial Setup wizard, and switchTab() sets `toast = ""` and
+  //     re-runs updateToast(). Announcing before navigating therefore wrote the
+  //     sentence and withdrew it inside ONE synchronous task — populated and
+  //     empty again before the browser painted, so nothing could be exposed.
+  //     Production now announces AFTER the destination render
+  //     (announceCardStatusAfter), and this proves the outcome rather than the
+  //     mechanism: the region is sampled across a real task AND paint boundary
+  //     (two animation frames, then a macrotask) and must still be VISIBLE and
+  //     still carrying the sentence.
   const said = await spoken(page);
+  assertNoRepeatedSpeech(said, L, `${step}/confirm`);
   if (said.length !== 1 || said[0].text !== WIZARD_DONE) {
     fail(`[${L}/${step}/confirm] the completion announcement was `
       + `${JSON.stringify(said)}, expected exactly one ${JSON.stringify(WIZARD_DONE)} `
       + `written to the live region`);
+  }
+  const exposed = await page.evaluate(() => new Promise((resolve) => {
+    // Two frames, then a macrotask: a message removed in the same task as the
+    // announcement (or in the microtask drain after it) is gone before the
+    // first of these resolves.
+    requestAnimationFrame(() => requestAnimationFrame(() => setTimeout(() => {
+      const root = document.getElementById("toast-root");
+      const msg = root && root.querySelector(".toast-msg");
+      resolve({
+        present: !!root,
+        hidden: !!(root && root.hidden),
+        text: msg ? (msg.textContent || "").trim() : null,
+        view: document.body.dataset.view,
+      });
+    }, 0)));
+  }));
+  if (!exposed.present || exposed.hidden || exposed.text !== WIZARD_DONE) {
+    fail(`[${L}/${step}/confirm] the completion sentence did not SURVIVE the `
+      + `navigation it triggered: a task and two paints after the wizard `
+      + `opened, the live region is ${JSON.stringify(exposed)} — a message `
+      + `written and withdrawn before the browser paints cannot be exposed to `
+      + `assistive technology at all, so it was never announced`);
+  }
+  if (exposed.view !== "onboarding") {
+    fail(`[${L}/${step}/confirm] the survival check was taken somewhere other `
+      + `than the destination this confirmation navigates to (view `
+      + `${JSON.stringify(exposed.view)}), so it proves nothing about surviving `
+      + `the navigation`);
   }
   // Exact focus after completion: the destination's own first heading, which
   // is what focusContentHeading() targets.
@@ -2315,6 +2374,7 @@ async function legConfirmReopen(page, L, fx) {
   // Exactly ONE completion sentence, said AFTER the response — the progress
   // sentence is allowed before it, the generic refresh sentence is not.
   const said = await spoken(page);
+  assertNoRepeatedSpeech(said, L, `${step}/done`);
   const done = said.filter((a) => a.text === REOPEN_DONE);
   const generic = said.filter((a) => a.text === "Season participation and divisions updated.");
   if (done.length !== 1 || generic.length !== 0) {
@@ -2616,8 +2676,11 @@ async function checkViewport(browser, viewport) {
       + `identical across tuples apart from its identity. Both `
       + `confirmations are driven entirely by keyboard: Workflow 6's wizard `
       + `prompt (focus on the affirmative control, cancel returning focus to `
-      + `the control that opened it, completion announcing once and landing on `
-      + `the destination's own heading) and the derived reopen under an `
+      + `the control that opened it, completion announcing once — on a raw, `
+      + `never-deduplicated ledger, so once means once and not twice — and `
+      + `STILL STANDING in the visible live region a task and two paints after `
+      + `the navigation it triggered, with focus landing on the destination's `
+      + `own heading) and the derived reopen under an `
       + `archived Season (focus on the required-reason field, a blank reason `
       + `refused with focus back on the field, cancel restoring the control, `
       + `and one completion announcing exactly "Season reopened — it can be `
