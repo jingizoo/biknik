@@ -148,8 +148,26 @@ async function checkViewport(browser, viewport) {
   });
   const page = await context.newPage();
   const errors = [];
+  let expectingLoginFailure = false;
   page.on("pageerror", (e) => errors.push(`[pageerror] ${e.message}`));
-  page.on("console", (m) => { if (m.type() === "error") errors.push(`[console] ${m.text()}`); });
+  // This journey DELIBERATELY signs in with the wrong password to prove the
+  // failed-login surface keeps its title and exposes no skip link. The browser
+  // logs a console error for that 401 on its own account, asynchronously, so
+  // whether it lands before the run ends is a race -- which made this journey
+  // fail intermittently on a defect it was provoking on purpose.
+  //
+  // Allowed as narrowly as the fact permits: ONLY a resource-load failure
+  // naming 401, and only while the journey is standing in that step. Every
+  // other console error, including a 401 from anywhere else or at any other
+  // moment, still fails the run. A blanket ignore would have hidden exactly
+  // the unauthorized-request defects this suite exists to catch.
+  page.on("console", (m) => {
+    if (m.type() !== "error") return;
+    const text = m.text();
+    if (expectingLoginFailure && /Failed to load resource/.test(text)
+        && /\b401\b/.test(text)) return;
+    errors.push(`[console] ${text}`);
+  });
 
   try {
     await waitForServer(`${base}/`, READY_TIMEOUT_MS);
@@ -797,7 +815,10 @@ async function checkViewport(browser, viewport) {
     await expectShell("signed out", { title: "Sign in — Hockey Scheduler",
       skipVisible: false });
 
-    // A FAILED login keeps the sign-in surface and its title.
+    // A FAILED login keeps the sign-in surface and its title. The 401 this
+    // provokes is the point of the step, so its console noise is allowed for
+    // exactly the duration of the step and no longer (see the console handler).
+    expectingLoginFailure = true;
     await page.fill("#login-user", "admin");
     await page.fill("#login-pass", "definitely-not-the-password");
     await page.click(".login-submit");
@@ -807,6 +828,11 @@ async function checkViewport(browser, viewport) {
     }, null, { timeout: 10000 });
     await expectShell("failed login", { title: "Sign in — Hockey Scheduler",
       skipVisible: false });
+    // The browser emits the failed request's console error asynchronously, so
+    // settle before closing the allowance -- otherwise the message the window
+    // exists for can arrive just after it shuts, which is the race this fixes.
+    await page.waitForTimeout(500);
+    expectingLoginFailure = false;
 
     // Anonymous public portal.
     await page.click("#guest-public-link");

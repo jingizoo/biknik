@@ -187,6 +187,85 @@
 //      tracking. Reconciling and saying so is honest; "Season reopened." is a
 //      stale claim.
 //
+//  (7) AN AUTHENTICATED-USER CHANGE DURING AN UNRESOLVED WRITE — the round-7
+//      blocker, verbatim from the review:
+//
+//        "The ledger and card identity survive an authenticated-user change,
+//        so the departing user's delayed operation response can mutate the
+//        next user's UI and disclose the departing user's typed reason.
+//        resetTransientUiState() invalidates other identity-scoped UI state
+//        but does not invalidate cardWrites, cardStates, or cardGenerations;
+//        the card identity contains only card + Program/Season/League +
+//        generation, not the authenticated principal/session epoch. Because
+//        the ledger refuses the arriving user's render for the same tuple,
+//        the departing identity's generation also remains current. ... Release
+//        A's request as 503. While currentUser.username === 'second_admin',
+//        the card becomes CONFIRM and displays A's exact reason 'first write
+//        held', A's 'held failure' error, moves focus to that reason field,
+//        and writes the error into B's toast. ... With different roles it can
+//        also restore controls/state that the arriving role did not initiate
+//        and may not be authorized to exercise."
+//
+//      Legs 2/3 move the TUPLE and stay moved; leg 5 moves nothing; leg 6
+//      moves the tuple and comes back. This leg moves the PERSON, which none
+//      of them do: the tuple is identical throughout — both operators are
+//      persisted on the very same Program/archived Season — and the card,
+//      the target and the generation are identical too. The ONLY thing that
+//      changes is who is signed in, so this leg fails for exactly one reason.
+//
+//      NON-VACUITY IS BUILT IN AND ASSERTED: while the arriving principal is
+//      standing on the target, this file reads the card's generation COUNTER
+//      and requires it to be UNCHANGED from the value the write entered
+//      PENDING with. That is the review's own observation — the serialization
+//      rule refuses the arriving principal's render for the same tuple, so
+//      the counter cannot move — and it means generation equality alone still
+//      says "current". Nothing but the principal/session epoch stands between
+//      the departing operator's response and the arriving operator's card.
+//
+//      Each sub-leg holds A's reopen, switches to the arriving principal, and
+//      asserts on BOTH sides of the release:
+//
+//        WHILE UNRESOLVED — the arriving principal's card is NON-ACTIONABLE
+//        (otherwise the round-6 duplicate write returns), the reopen-request
+//        count stays at exactly one under pointer, keyboard and direct
+//        code-level attempts, the ledger entry still stands and is visibly
+//        FOREIGN (its identity's epoch is behind the current one and its
+//        principal is the departing operator) — and NOTHING the departing
+//        operator entered is anywhere on the rendered surface. The reason is
+//        searched for as a LITERAL across body innerText, body innerHTML,
+//        every input/textarea value, the live region, the recorded
+//        announcement log, the committed card models and the ledger's held
+//        models: a leak into a toast, a heading or a live region is the same
+//        leak as one into the reason field. The write's own busy copy
+//        ("Reopening this season…") is searched for the same way, because
+//        telling the arriving principal WHAT is happening discloses that the
+//        departing one did something.
+//
+//        AFTER THE RELEASE — no toast and no announcement AT ALL (not merely
+//        no success one), no focus movement (focus is parked on a stable
+//        control outside the card first, and must still be there), no reason,
+//        no error text, the ledger DRAINED, and the card RECONCILED from a
+//        fresh /api/v2/setup/progress read that is observed leaving the
+//        browser after the settlement — under the ARRIVING principal's own
+//        permissions and the server's current truth.
+//
+//      (7a) in-app persona switch (signIn(), no reload), released as a 503:
+//           the Season is still archived, so League Admin B's reconciled card
+//           lands on the REAL recovery action.
+//      (7b) the same switch, released as a genuinely COMMITTED success: B's
+//           card advances to "Add Ice" — a state no held value could have
+//           produced, since everything A was carrying was blocked by
+//           season_active.
+//      (7c) a REAL sign-out (the header control) followed by a sign-in
+//           through the login form, released as a 503.
+//      (7d) the same real sign-out/sign-in, released as a committed success.
+//      (7e) a LOWER-PRIVILEGE arriving role (Arena Manager) on the same
+//           authorized tuple, released as a 503. Reopening a Season is
+//           MANAGE_SETUP and an Arena Manager holds MANAGE_ARENA only, so the
+//           reconciled card must offer NO action at all — the reported "can
+//           also restore controls/state that the arriving role ... may not be
+//           authorized to exercise" is what this sub-leg forbids.
+//
 // TECHNIQUE
 // ---------
 //   * Delayed responses use this repo's established idiom: capture the REAL
@@ -230,6 +309,27 @@ const DONE_TEXT = "Season reopened — it can be changed again.";
 // The sentence the reported defect emitted SECOND, describing the refresh
 // rather than what the operator did. It must never be heard for a reopen.
 const REFRESH_TEXT = "Venues, rinks and ice updated.";
+// The 503 body every held-then-failed release in this file answers with, as
+// one constant so leg 7 can search the rendered surface for the EXACT text an
+// arriving principal must never be shown (app.js publishes the server's own
+// message verbatim into the restored confirmation and the toast).
+const SERVER_503_MESSAGE = "The server is temporarily unavailable (503). "
+  + "Please try again in a moment.";
+// The card's own NEUTRAL copy for a write that belongs to a DEPARTED
+// principal (app.js FOREIGN_CARD_WRITE_NOTE). Asserted as an exact string: it
+// is the whole of what the arriving principal is allowed to learn, and it
+// names neither the operation, nor the operator, nor the reason.
+const NEUTRAL_PENDING_TEXT = "This card is waiting on the server. It can't"
+  + " be changed until that finishes.";
+// The ARRIVING principals of leg 7. `second_admin` is the reviewer's own
+// second League Admin — same role, same authority, different person, so the
+// leak cannot be excused as a permissions difference. `arena` is the demo
+// Arena Manager /api/demo/load seeds: authorized on the same tuple, and NOT
+// authorized to reopen a Season (that is MANAGE_SETUP).
+const SECOND_ADMIN = "second_admin";
+const SECOND_ADMIN_PW = "second-admin-pw";
+const ARENA_USER = "arena";
+const ARENA_PW = "demo";
 
 function waitForServer(url, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
@@ -287,6 +387,16 @@ async function reenter(page, base) {
 // SETTLE. LOADING and PENDING both withdraw every action by design, so
 // sampling mid-flight would read zero controls and blame the wrong thing.
 async function openFacilities(page, step) {
+  await openFacilitiesNoSettle(page, step);
+  await settled(page, step);
+}
+
+// The same transition WITHOUT the settle wait. Leg 7's arriving principal
+// lands on a card that is deliberately PENDING — the ledger keeps it
+// non-actionable while the departing principal's write is unresolved — and
+// settled() excludes PENDING on purpose, so waiting for it there would hang
+// on the very state the leg exists to observe.
+async function openFacilitiesNoSettle(page, step) {
   await page.click('.tab[data-tab="setup"]:not([data-setup-workflow-nav])');
   await page.waitForSelector('[data-setup-workflow="facilities"]', { timeout: 15000 })
     .catch(() => fail(`[${step}] the Setup hub never offered "facilities"`));
@@ -294,7 +404,6 @@ async function openFacilities(page, step) {
   await page.waitForSelector('[data-setup-workflow-landing="facilities"]',
     { timeout: 15000 })
     .catch(() => fail(`[${step}] the facilities landing never rendered`));
-  await settled(page, step);
 }
 
 // Settled == not mid-read (LOADING) and not mid-write (PENDING). PENDING is a
@@ -568,8 +677,538 @@ async function readLedger(page) {
       cards: Object.keys(cardWrites).sort(),
       entries: per ? Object.keys(per).length : 0,
       targets: per ? Object.keys(per).map((k) => per[k].target).sort() : [],
+      // #365 round 7. WHO each surviving entry belongs to, beside who is
+      // signed in now. A record that outlives an authenticated-user change has
+      // to be visibly FOREIGN, or "the private payload was quarantined" could
+      // not be told apart from "there was nothing to quarantine". These four
+      // fields are what make the epoch's work observable rather than inferred.
+      epochs: per ? Object.keys(per).map((k) => per[k].identity.epoch) : [],
+      principals: per ? Object.keys(per).map((k) => per[k].identity.principal) : [],
+      currentEpoch: uiIdentityEpoch,
+      currentPrincipal: currentUser ? currentUser.username : null,
     };
   });
+}
+
+// ===================== LEG 7 HELPERS (#365 round 7) =======================
+
+// Persist BOTH operators' own active context on the SAME Program/Season, and
+// leave the page's session as `admin` (the departing principal).
+//
+// Both halves matter. The active context is per-user server state, so the
+// arriving principal has to be persisted on the target INDEPENDENTLY — that is
+// what makes them LAND on the write's target with no switching of their own,
+// which is the only way the "arriving principal is on the target tuple at
+// settlement" path is exercised at all. And it is what makes the leg's one
+// variable genuinely the PERSON: card, tuple, target Season and generation are
+// all identical on both sides of the switch.
+async function persistContextFor(page, arrive, programId, seasonId, step) {
+  await loginAs(page, arrive.username, arrive.password);
+  const theirs = await apiPost(page, "/api/context",
+    { program_id: programId, season_id: seasonId });
+  if (!theirs || theirs.error) {
+    fail(`[${step}] could not persist ${arrive.username}'s own context on the `
+      + `target tuple: ${JSON.stringify(theirs)}`);
+  }
+  await loginAs(page, "admin", "demo");
+  const mine = await apiPost(page, "/api/context",
+    { program_id: programId, season_id: seasonId });
+  if (!mine || mine.error) {
+    fail(`[${step}] could not persist admin's context on the target tuple: `
+      + `${JSON.stringify(mine)}`);
+  }
+}
+
+// PATH (a): the in-app, NO-RELOAD principal change. signIn() is the exact
+// function the login form and the demo role-switcher (#role-switch) call, and
+// it is what drives setUser() -> resetTransientUiState(). Deliberately never a
+// page.goto(): a reload starts a fresh document with an empty ledger and an
+// empty card store, which would prove nothing about state surviving a switch.
+async function signInInApp(page, username, password, step) {
+  const ok = await page.evaluate(([u, p]) => signIn(u, p), [username, password]);
+  if (ok !== true) {
+    fail(`[${step}] the app's own signIn("${username}") returned `
+      + `${JSON.stringify(ok)} — the in-app persona path never completed`);
+  }
+  await page.waitForFunction((u) => !!currentUser && currentUser.username === u,
+    username, { timeout: 15000 })
+    .catch(() => fail(`[${step}] the app never adopted ${username}`));
+}
+
+// PATH (b): a REAL sign-out through the header control, then a REAL sign-in
+// through the login form. A different transition from (a) — it passes through
+// setUser(null) first, so resetTransientUiState() fires TWICE and the session
+// is genuinely ended server-side in between — and the review requires both.
+//
+// The sign-out control is activated through its own element (el.click()) so
+// the assertion does not depend on where a 390x844 layout happens to put the
+// header: it is the real control and the real handler either way.
+async function signOutThenIn(page, username, password, step) {
+  const pressed = await page.evaluate(() => {
+    const btn = document.getElementById("signout-btn");
+    if (!btn) return false;
+    btn.click();
+    return true;
+  });
+  if (!pressed) fail(`[${step}] there is no real sign-out control to press`);
+  await page.waitForFunction(() => !currentUser, null, { timeout: 15000 })
+    .catch(() => fail(`[${step}] the real sign-out never cleared the session`));
+  await page.waitForSelector("#login-screen:not([hidden])", { timeout: 15000 })
+    .catch(() => fail(`[${step}] the sign-in screen never appeared`));
+  await page.fill("#login-user", username);
+  await page.fill("#login-pass", password);
+  await page.click("#login-form button[type=submit]");
+  await page.waitForFunction((u) => !!currentUser && currentUser.username === u,
+    username, { timeout: 15000 })
+    .catch(() => fail(`[${step}] signing in as ${username} through the login `
+      + `form never took effect`));
+}
+
+async function arrivePrincipal(page, arrive, step) {
+  if (arrive.via === "sign-out") {
+    return signOutThenIn(page, arrive.username, arrive.password, step);
+  }
+  return signInInApp(page, arrive.username, arrive.password, step);
+}
+
+// EVERY rendered surface AND every store behind it, searched for a LITERAL
+// string the departing operator entered. Returns the list of places it was
+// found, so a failure names the leak's route.
+//
+// The review is explicit that the reason input's value is not the only place
+// that counts: "Assert the ABSENCE of A's reason text by searching the whole
+// rendered surface for the literal string, not just the reason input's value —
+// a leak into a toast, a live region or a heading is the same leak." So this
+// reads innerText AND innerHTML (an <input value="…"> attribute appears only
+// in the latter), every field's live value (which appears in neither), the
+// sitewide live region, the recorded announcement history (a sentence spoken
+// and auto-dismissed four seconds later is still a sentence that was spoken),
+// and — when `includeStores` — the client stores themselves: the committed
+// card models and the ledger's held models, so "quarantined" means the text is
+// GONE rather than merely unpainted.
+//
+// `includeStores` is FALSE for the card's own DECLARED copy (the busy,
+// success and refresh sentences). Those strings are constants belonging to the
+// reopen action's declaration, so a card that legitimately OFFERS that action
+// carries them in its committed model by construction — for the arriving
+// principal exactly as for anyone else. Finding them there proves nothing; the
+// question for declared copy is only ever whether it was PAINTED or SPOKEN,
+// which is what the remaining sources measure. An operator's typed reason and
+// a server's error message are the reverse: they can never be declared copy,
+// so for those the stores are searched too.
+async function privateTextSightings(page, literal, includeStores) {
+  return page.evaluate(([s, stores]) => {
+    const hits = [];
+    const look = (where, text) => {
+      if (text && String(text).indexOf(s) !== -1) hits.push(where);
+    };
+    look("document.body innerText", document.body && document.body.innerText);
+    look("document.body innerHTML", document.body && document.body.innerHTML);
+    document.querySelectorAll("input, textarea").forEach((el, i) =>
+      look(`field[${i}] ${el.id || el.className || el.tagName}`, el.value));
+    const root = document.getElementById("toast-root");
+    look("#toast-root", root && root.textContent);
+    look("announcement history", JSON.stringify(window.__ann || []));
+    if (!stores) return hits;
+    look("readCardState(setup/facilities)",
+      JSON.stringify(readCardState("setup/facilities")));
+    look("cardStates", JSON.stringify(cardStates));
+    look("cardWrites held models", JSON.stringify(Object.keys(cardWrites)
+      .map((c) => Object.keys(cardWrites[c]).map((k) => cardWrites[c][k].model))));
+    return hits;
+  }, [literal, !!includeStores]);
+}
+
+// Where keyboard focus is, as one comparable string.
+async function focusNow(page) {
+  return page.evaluate(() => {
+    const el = document.activeElement;
+    if (!el) return "null";
+    return `${el.tagName}[${el.className || ""}]`
+      + `[tab=${el.getAttribute && el.getAttribute("data-tab") || ""}]`
+      + `{${(el.textContent || "").replace(/\s+/g, " ").trim().slice(0, 60)}}`;
+  });
+}
+
+// Park focus on a real control OUTSIDE the card before the release, so "no
+// focus movement from A's response" is a positive assertion rather than the
+// vacuous observation that focus was on <body> before and after. The Setup
+// navigation tab is outside #content, so the card's own repaint cannot destroy
+// it — only a deliberate focus move could take it away.
+async function parkFocusOutsideCard(page, step) {
+  const ok = await page.evaluate(() => {
+    const el = document.querySelector('.tab[data-tab="setup"]:not([data-setup-workflow-nav])');
+    if (!el) return false;
+    el.focus();
+    return document.activeElement === el;
+  });
+  if (!ok) {
+    fail(`[${step}] could not park keyboard focus on a stable control outside `
+      + `the card, so "focus did not move" would be asserted against <body> `
+      + `and would prove nothing`);
+  }
+}
+
+// Wait until the ARRIVING principal's card is showing the NEUTRAL pending
+// presentation: PENDING (so every control is withdrawn on both surfaces), the
+// generic copy, and NO identity at all — the model is reconstructed for this
+// principal rather than handed over from the departing one's ledger entry.
+async function foreignPendingPresentation(page, step) {
+  await page.waitForFunction((note) => {
+    if (contextSwitchIntentPending) return false;
+    const e = readCardState("setup/facilities");
+    return e.state === "pending" && e.pendingNote === note && !e.identity;
+  }, NEUTRAL_PENDING_TEXT, { timeout: 15000 })
+    .catch(() => fail(`[${step}] the arriving principal's card is not showing `
+      + `the neutral pending presentation. Either the departing principal's `
+      + `own held model was handed straight over (their reason, their counts, `
+      + `their confirmation), or the ledger entry was dropped on the identity `
+      + `change and the card became actionable with a lifecycle write still in `
+      + `flight.`));
+  await page.waitForTimeout(600);
+}
+
+// A held reopen in the two shapes leg 7 needs, counted AT THE INTERCEPTOR
+// because the harm is a write ISSUED for one Season, not one the server chose
+// to accept.
+//
+//   commit: true  — the SERVER takes the write immediately (route.fetch() runs
+//                   while the INITIATING principal is still authenticated;
+//                   afterwards their session is gone and the same request
+//                   would be answered as somebody else, or as nobody), and
+//                   only the DELIVERY is held across the identity change.
+//   commit: false — answered 503 without route.fetch(), so the server
+//                   genuinely never takes the write and the Season stays
+//                   archived throughout.
+function heldReopen(opts) {
+  const h = { requests: 0, status: null, body: null };
+  h.held = new Promise((resolve) => { h.markHeld = resolve; });
+  h.gate = new Promise((resolve) => { h.release = resolve; });
+  h.handler = async (route) => {
+    h.requests += 1;
+    if (opts.commit) {
+      const response = await route.fetch();
+      h.status = response.status();
+      try { h.body = await response.json(); } catch (e) { h.body = null; }
+      h.markHeld();
+      await h.gate;
+      return route.fulfill({ response });
+    }
+    h.markHeld();
+    await h.gate;
+    opts.allowResourceError();
+    return route.fulfill({ status: 503, contentType: "application/json",
+      body: JSON.stringify({ error: { code: "server_unavailable",
+        message: SERVER_503_MESSAGE } }) });
+  };
+  return h;
+}
+
+// ONE sub-leg of leg 7, start to finish. Parameterised rather than copied five
+// times so the five sub-legs cannot silently drift apart: everything that
+// differs between them — which Season, who arrives, how they arrive, and what
+// fresh server truth under THEIR permissions must produce — is an explicit
+// argument, and everything that must be identical is written once.
+//
+// `ctx`:
+//   sub        the label used in every failure message ("7a" …)
+//   season     the archived-Season fixture this sub-leg owns
+//   reason     the LITERAL the departing operator types, searched for later
+//   arrive     { username, password, via: "in-app" | "sign-out", label }
+//   commit     release as a genuinely committed success (true) or a 503
+//   expect     { effective, blocked, offersReopen } — what FRESH SERVER TRUTH
+//              under the ARRIVING principal's permissions must produce
+async function crossPrincipalRelease(ctx) {
+  const { page, base, L, sub, arrive } = ctx;
+  const step = `${L}/${sub}`;
+
+  // ---- both operators persisted on the SAME Program/archived Season ----
+  await persistContextFor(page, arrive, ctx.program, ctx.season.season, step);
+  await reenter(page, base);
+  await openFacilities(page, step);
+  await armAnnouncements(page);
+
+  const before = await readCard(page);
+  if (before.effective !== "Reopen this season") {
+    fail(`[${step}] the fixture does not offer the reopen path (effective `
+      + `${JSON.stringify(before.effective)}, state "${before.state}") — there `
+      + `is no card write to race`);
+  }
+  if (await seasonActiveFloorMet(page) !== false) {
+    fail(`[${step}] the fixture's season_active floor is not unmet, so the `
+      + `Season is not archived and this sub-leg proves nothing`);
+  }
+  await openConfirmWithReason(page, step, ctx.reason);
+  await resetAnnouncements(page);
+
+  const h = heldReopen({ commit: ctx.commit,
+                         allowResourceError: ctx.allowResourceError });
+  await page.route(REOPEN_RE, h.handler);
+  await page.click("[data-setup-card-confirm-yes]");
+  await h.held;
+  await page.waitForTimeout(400);
+
+  // ---- the DEPARTING principal's own view, for contrast ----
+  const held = await readCard(page);
+  if (held.state !== "pending") {
+    fail(`[${step}] the card reads "${held.state}" with its own reopen POST `
+      + `held`);
+  }
+  if (held.pendingText !== BUSY_TEXT) {
+    fail(`[${step}] the initiating operator's own pending line reads `
+      + `${JSON.stringify(held.pendingText)}, expected ${JSON.stringify(BUSY_TEXT)} `
+      + `— without this the neutral copy asserted after the switch would not be `
+      + `a substitution, it would be the only copy there ever was`);
+  }
+  const pendingGeneration = held.generation;
+  const ledgerBefore = await readLedger(page);
+  if (ledgerBefore.entries !== 1 || ledgerBefore.targets[0] !== ctx.season.season) {
+    fail(`[${step}] the unresolved operation was not registered against the `
+      + `target Season: ${JSON.stringify(ledgerBefore)}`);
+  }
+
+  // ================= THE AUTHENTICATED-USER CHANGE ==================
+  await arrivePrincipal(page, arrive, step);
+  await openFacilitiesNoSettle(page, `${step}/arrived`);
+  await foreignPendingPresentation(page, `${step}/arrived`);
+  // The announcement history is reset HERE, at the identity boundary, so every
+  // sentence it holds from now on is one the ARRIVING principal was given.
+  // Everything before this point was said to the departing operator in their
+  // own session and is not a leak — the leak is a sentence crossing the
+  // boundary, which is what the searches below measure.
+  await resetAnnouncements(page);
+
+  const who = await page.evaluate(() => (currentUser && currentUser.username) || null);
+  if (who !== arrive.username) {
+    fail(`[${step}/arrived] the signed-in principal is ${JSON.stringify(who)}, `
+      + `not ${JSON.stringify(arrive.username)}`);
+  }
+  // THE REGISTRATION SURVIVED — half (1) of the split. Deleting it here is the
+  // other way to get this round wrong: it would make the arriving principal's
+  // card actionable and re-open the round-6 duplicate write while A's request
+  // is still live.
+  const ledgerOnB = await readLedger(page);
+  if (ledgerOnB.entries !== 1 || ledgerOnB.targets[0] !== ctx.season.season) {
+    fail(`[${step}/arrived] the unresolved operation against Season `
+      + `${ctx.season.season} was forgotten on the identity change (ledger `
+      + `${JSON.stringify(ledgerOnB)}). Signing out cancelled neither the HTTP `
+      + `request nor the transaction behind it, so dropping the record hands `
+      + `the arriving principal a control that fires a SECOND lifecycle write `
+      + `against the same Season.`);
+  }
+  // ...and it is visibly FOREIGN.
+  if (!(ledgerOnB.epochs[0] < ledgerOnB.currentEpoch)
+      || ledgerOnB.principals[0] !== "admin"
+      || ledgerOnB.currentPrincipal !== arrive.username) {
+    fail(`[${step}/arrived] the surviving operation does not read as the `
+      + `DEPARTING principal's: ${JSON.stringify(ledgerOnB)}. Without an epoch `
+      + `that advanced and a principal that differs there is nothing for the `
+      + `identity gate to compare, and the quarantine below is untestable.`);
+  }
+  // NON-VACUITY, and the review's own observation: the serialization rule
+  // refuses the ARRIVING principal's render for this card+tuple, so the
+  // generation counter cannot move. Generation equality therefore still says
+  // "current", and the principal/session epoch is the ONLY thing standing
+  // between the departing operator's response and this card.
+  const counterOnB = await page.evaluate(() => cardGenerations["setup/facilities"]);
+  if (counterOnB !== pendingGeneration) {
+    fail(`[${step}/arrived] the card's generation counter moved `
+      + `${pendingGeneration} -> ${counterOnB} under the arriving principal. `
+      + `The reported defect depends on it NOT moving ("because the ledger `
+      + `refuses the arriving user's render for the same tuple, the departing `
+      + `identity's generation also remains current"), so this sub-leg is no `
+      + `longer exercising the case it exists for.`);
+  }
+
+  // ---- NON-ACTIONABLE, and carrying NOTHING the departing operator entered ----
+  const arrived = await readCard(page);
+  if (!arrived.hasLanding || !arrived.hasActionsBox) {
+    fail(`[${step}/arrived] the Facilities landing did not paint (landing `
+      + `${arrived.hasLanding}, action container ${arrived.hasActionsBox}), so `
+      + `"zero controls" would be true for the wrong reason`);
+  }
+  if (arrived.intentPending) {
+    fail(`[${step}/arrived] a context switch has not reconciled, so any "no `
+      + `controls" reading here would be the switch-intent withdrawal rather `
+      + `than the unresolved write`);
+  }
+  if ((arrived.slotButtons || []).length !== 0
+      || (arrived.actionButtons || []).length !== 0) {
+    fail(`[${step}/arrived] the arriving principal's card is actionable (card `
+      + `${JSON.stringify(arrived.slotButtons)}, landing `
+      + `${JSON.stringify(arrived.actionButtons)}) while a lifecycle write `
+      + `started by somebody else is still unresolved`);
+  }
+  if (arrived.busy !== "true") {
+    fail(`[${step}/arrived] aria-busy is "${arrived.busy}" while an unresolved `
+      + `write still owns this card`);
+  }
+  if (arrived.pendingText !== NEUTRAL_PENDING_TEXT) {
+    fail(`[${step}/arrived] the arriving principal's pending line reads `
+      + `${JSON.stringify(arrived.pendingText)}, expected the neutral `
+      + `${JSON.stringify(NEUTRAL_PENDING_TEXT)}`);
+  }
+  if (arrived.reasonValue !== null || arrived.confirmError !== null) {
+    fail(`[${step}/arrived] the departing operator's confirmation is standing `
+      + `on the arriving principal's card (reason `
+      + `${JSON.stringify(arrived.reasonValue)}, error `
+      + `${JSON.stringify(arrived.confirmError)})`);
+  }
+  const leakedWhileHeld = await privateTextSightings(page, ctx.reason, true);
+  if (leakedWhileHeld.length) {
+    fail(`[${step}/arrived] the departing operator's typed reason `
+      + `${JSON.stringify(ctx.reason)} is visible to ${arrive.username} in: `
+      + `${JSON.stringify(leakedWhileHeld)}`);
+  }
+  // The stores ARE searched here: while the write is unresolved the arriving
+  // principal's card offers no action at all, so the reopen action's declared
+  // copy has no legitimate reason to be in any model this client holds.
+  const leakedOperation = await privateTextSightings(page, BUSY_TEXT, true);
+  if (leakedOperation.length) {
+    fail(`[${step}/arrived] the departing operator's own operation copy `
+      + `${JSON.stringify(BUSY_TEXT)} is visible to ${arrive.username} in: `
+      + `${JSON.stringify(leakedOperation)} — the arriving principal must not `
+      + `learn what the previous one was doing, only that this card is busy`);
+  }
+
+  // ---- every mutation entry point still blocked ----
+  await attemptSecondWrite(page);
+  if (h.requests !== 1) {
+    fail(`[${step}/arrived] ${h.requests} reopen requests were issued for one `
+      + `Season across an authenticated-user change while the first was still `
+      + `unresolved`);
+  }
+  if ((await readLedger(page)).entries !== 1) {
+    fail(`[${step}/arrived] the attempts to start a second write disturbed the `
+      + `first operation's registration`);
+  }
+  // ...and nothing has been SAID to the arriving principal either, across the
+  // switch, the navigation and every blocked mutation attempt.
+  const spokenWhileHeld = await spoken(page);
+  if (spokenWhileHeld.length) {
+    fail(`[${step}/arrived] ${arrive.username} was told `
+      + `${JSON.stringify(spokenWhileHeld)} while somebody else's write was `
+      + `unresolved — they pressed nothing that could be answered`);
+  }
+
+  // ======================= THE RELEASE =========================
+  await parkFocusOutsideCard(page, `${step}/arrived`);
+  const focusBefore = await focusNow(page);
+  await resetAnnouncements(page);
+  const deliveriesBefore = ctx.deliveries();
+  const progressBefore = ctx.progress();
+
+  h.release();
+  const deadline = Date.now() + 10000;
+  while (ctx.deliveries() === deliveriesBefore && Date.now() < deadline) {
+    await page.waitForTimeout(100);
+  }
+  if (ctx.deliveries() === deliveriesBefore) {
+    fail(`[${step}] the released response never reached the page, so nothing `
+      + `was actually settled`);
+  }
+  await page.waitForFunction(() => {
+    const e = readCardState("setup/facilities");
+    return e.state !== "pending" && e.state !== "loading";
+  }, null, { timeout: 20000 })
+    .catch(() => fail(`[${step}/settle] the card is STILL pending after the `
+      + `departing principal's own request settled — settlement must drain the `
+      + `ledger unconditionally, including across an identity change, or the `
+      + `target tuple is blocked forever for everybody`));
+  await page.waitForTimeout(900);
+  await page.unroute(REOPEN_RE, h.handler);
+
+  if (ctx.commit && (h.status !== 200 || !h.body || h.body.error)) {
+    fail(`[${step}] the released response was not a committed success (status `
+      + `${h.status}, body ${JSON.stringify(h.body)}) — a no-op would change `
+      + `nothing whatever the client did`);
+  }
+  if (h.requests !== 1) {
+    fail(`[${step}] ${h.requests} reopen requests in total for one Season`);
+  }
+  const ledgerAfter = await readLedger(page);
+  if (ledgerAfter.entries !== 0 || ledgerAfter.cards.length !== 0) {
+    fail(`[${step}/settle] the ledger did not drain across the identity `
+      + `change: ${JSON.stringify(ledgerAfter)}`);
+  }
+
+  // ---- SILENT: nothing said, nothing focused ----
+  const spokenAfter = await spoken(page);
+  if (spokenAfter.length) {
+    fail(`[${step}/settle] the settlement spoke into ${arrive.username}'s live `
+      + `region: ${JSON.stringify(spokenAfter)}. The arriving principal `
+      + `pressed nothing; a sentence here is the departing principal's `
+      + `operation announcing itself in somebody else's session.`);
+  }
+  const focusAfter = await focusNow(page);
+  if (focusAfter !== focusBefore) {
+    fail(`[${step}/settle] focus moved on the departing principal's response `
+      + `(${focusBefore} -> ${focusAfter})`);
+  }
+  // The reason and the server's message are searched everywhere, INCLUDING the
+  // stores; the three declared sentences only where they could have been shown
+  // or spoken — see privateTextSightings for why a card offering the reopen
+  // action legitimately carries that action's own copy in its model.
+  for (const [what, literal, stores] of [
+      ["typed reason", ctx.reason, true],
+      ["server error text", SERVER_503_MESSAGE, true],
+      ["success sentence", DONE_TEXT, false],
+      ["refresh sentence", REFRESH_TEXT, false],
+      ["operation copy", BUSY_TEXT, false]]) {
+    const sightings = await privateTextSightings(page, literal, stores);
+    if (sightings.length) {
+      fail(`[${step}/settle] the departing principal's ${what} `
+        + `${JSON.stringify(literal)} reached ${arrive.username} in: `
+        + `${JSON.stringify(sightings)}`);
+    }
+  }
+
+  // ---- RECONCILED from a FRESH read, under the ARRIVING principal ----
+  if (ctx.progress() <= progressBefore) {
+    fail(`[${step}/settle] not one /api/v2/setup/progress read left the browser `
+      + `after the settlement (${progressBefore} -> ${ctx.progress()}), so the `
+      + `card was restored from state the client was HOLDING rather than `
+      + `reconciled from what the server now says under this principal`);
+  }
+  const settledCard = await readCard(page);
+  if (settledCard.state === "confirm") {
+    fail(`[${step}/settle] the settlement restored a CONFIRM on the arriving `
+      + `principal's card — the departing principal's held confirmation, `
+      + `handed to somebody who never opened it`);
+  }
+  if (settledCard.effective !== ctx.expect.effective) {
+    fail(`[${step}/settle] the reconciled card offers `
+      + `${JSON.stringify(settledCard.effective)}, but fresh server truth under `
+      + `${arrive.username}'s permissions is `
+      + `${JSON.stringify(ctx.expect.effective)}`);
+  }
+  if (!!settledCard.blockedBecause !== ctx.expect.blocked) {
+    fail(`[${step}/settle] blockedBecause is `
+      + `${JSON.stringify(settledCard.blockedBecause)}, expected `
+      + `${ctx.expect.blocked ? "a blocker" : "none"}`);
+  }
+  const offersReopen = (settledCard.actionButtons || [])
+    .concat(settledCard.slotButtons || [])
+    .some((b) => /reopen/i.test(b));
+  if (offersReopen !== ctx.expect.offersReopen) {
+    fail(`[${step}/settle] the reconciled card ${offersReopen ? "offers" : "does "
+      + "not offer"} a reopen control (card `
+      + `${JSON.stringify(settledCard.slotButtons)}, landing `
+      + `${JSON.stringify(settledCard.actionButtons)}), expected `
+      + `${ctx.expect.offersReopen ? "one" : "none"} for ${arrive.username}. A `
+      + `control this role may not exercise is exactly the "restore controls `
+      + `the arriving role did not initiate and may not be authorized to `
+      + `exercise" the review forbids.`);
+  }
+  // The server's own answer, last: a 503 that never reached it leaves the
+  // Season archived, and a committed success really did reopen it. Either way
+  // the reconciled card above had to agree with THIS, not with held state.
+  const floorMet = await seasonActiveFloorMet(page);
+  if (floorMet !== ctx.commit) {
+    fail(`[${step}/settle] the server reports season_active met=${floorMet}, `
+      + `expected ${ctx.commit} — the release did not do what this sub-leg `
+      + `arranged, so the reconcile assertions above measured the wrong truth`);
+  }
 }
 
 // Re-enter the Facilities destination through the REAL sidebar navigation
@@ -791,6 +1430,28 @@ async function checkViewport(browser, viewport) {
     const s7 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A7");
     const s8 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A8");
     const s9 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A9");
+    // Leg 7's five sub-legs, one Season each for the same reason as above: two
+    // of them really are reopened, and a reused Season would silently make the
+    // next sub-leg's "still archived" precondition false.
+    const s10 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A10");
+    const s11 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A11");
+    const s12 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A12");
+    const s13 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A13");
+    const s14 = await archivedSeasonFixture(page, shared.pa, shared.org, shared.venue, "WI Season A14");
+
+    // THE SECOND OPERATOR (#365 round 7). A real, separate account with the
+    // SAME role as the first: the leak the review reports is not a permissions
+    // failure and must not be excusable as one, so the arriving principal in
+    // 7a-7d differs from the departing one in exactly one respect — who they
+    // are. Sub-leg 7e then adds the lower-privilege case on top, using the
+    // demo Arena Manager /api/demo/load already seeded.
+    const madeAdminB = await apiPost(page, "/api/accounts",
+      { username: SECOND_ADMIN, password: SECOND_ADMIN_PW,
+        role: "league_admin", scope: {} });
+    if (!madeAdminB || madeAdminB.error) {
+      fail(`[${L}] could not create the second League Admin: `
+        + `${JSON.stringify(madeAdminB)}`);
+    }
 
     // =================== (1) HELD POST, THEN 503 =======================
     await apiPost(page, "/api/context", { program_id: shared.pa, season_id: s1.season });
@@ -1961,6 +2622,73 @@ async function checkViewport(browser, viewport) {
         + `server`);
     }
 
+    // ==== (7) AN AUTHENTICATED-USER CHANGE WHILE THE WRITE IS UNRESOLVED ====
+    // Legs 2/3/5/6 move the tuple, or refuse to. This leg moves the PERSON and
+    // nothing else: card, target Season, tuple and generation are identical on
+    // both sides of every switch below, and both operators are persisted on
+    // that same Program/archived Season, so each sub-leg can fail for exactly
+    // one reason. See the file header for the full statement of the defect.
+    const legSeven = {
+      page: page, base: base, L: L, program: shared.pa,
+      allowResourceError: () => { resourceAllowance += 1; },
+      deliveries: () => reopenDeliveries,
+      progress: () => progressReads,
+    };
+    const ADMIN_B = { username: SECOND_ADMIN, password: SECOND_ADMIN_PW,
+                      via: "in-app" };
+    const ADMIN_B_FORM = { username: SECOND_ADMIN, password: SECOND_ADMIN_PW,
+                           via: "sign-out" };
+    const ARENA_B = { username: ARENA_USER, password: ARENA_PW, via: "in-app" };
+
+    // (7a) in-app persona switch, released as a 503. The reviewer's exact
+    // reproduction, down to the reason string.
+    await crossPrincipalRelease(Object.assign({}, legSeven, {
+      sub: "7a", season: s10, reason: "first write held", arrive: ADMIN_B,
+      commit: false,
+      // The 503 never reached the server, so the Season is still archived and
+      // fresh truth under another League Admin is the REAL recovery action.
+      expect: { effective: "Reopen this season", blocked: true,
+                offersReopen: true },
+    }));
+
+    // (7b) the same switch, released as a genuinely COMMITTED success. "Add
+    // Ice" is a state no held value could have produced: everything the
+    // departing operator was carrying was blocked by season_active.
+    await crossPrincipalRelease(Object.assign({}, legSeven, {
+      sub: "7b", season: s11, reason: "committed under the first admin",
+      arrive: ADMIN_B, commit: true,
+      expect: { effective: "Add Ice", blocked: false, offersReopen: false },
+    }));
+
+    // (7c) a REAL sign-out through the header control, then a REAL sign-in
+    // through the login form — a different transition from (a): it passes
+    // through setUser(null) first, ends the session server-side, and fires
+    // resetTransientUiState() twice.
+    await crossPrincipalRelease(Object.assign({}, legSeven, {
+      sub: "7c", season: s12, reason: "held across a real sign-out",
+      arrive: ADMIN_B_FORM, commit: false,
+      expect: { effective: "Reopen this season", blocked: true,
+                offersReopen: true },
+    }));
+
+    // (7d) the same real sign-out/sign-in, released as a committed success.
+    await crossPrincipalRelease(Object.assign({}, legSeven, {
+      sub: "7d", season: s13, reason: "committed across a real sign-out",
+      arrive: ADMIN_B_FORM, commit: true,
+      expect: { effective: "Add Ice", blocked: false, offersReopen: false },
+    }));
+
+    // (7e) a LOWER-PRIVILEGE arriving role on the same authorized tuple.
+    // Reopening a Season is MANAGE_SETUP and an Arena Manager holds
+    // MANAGE_ARENA only, so the reconciled card must offer NO action at all —
+    // restoring the departing League Admin's confirmation here would hand this
+    // role a control that is a 403 in waiting, on a Season they never touched.
+    await crossPrincipalRelease(Object.assign({}, legSeven, {
+      sub: "7e", season: s14, reason: "held for the arena manager",
+      arrive: ARENA_B, commit: false,
+      expect: { effective: null, blocked: true, offersReopen: false },
+    }));
+
     if (errors.length) fail(`[${L}] browser errors:\n${errors.join("\n")}`);
     console.log(`[${L}] OK — a held reopen POST leaves the Facilities card `
       + `PENDING and aria-busy with NO control on either surface, keyboard focus `
@@ -2003,7 +2731,28 @@ async function checkViewport(browser, viewport) {
       + `response's own text. Released while the operator is still on B, B stays `
       + `snapshot-identical and silent, the ledger drains all the same, and a `
       + `later return to the target reads current server truth instead of `
-      + `sitting blocked behind a registration nothing would retire.`);
+      + `sitting blocked behind a registration nothing would retire. And with `
+      + `the write held while the AUTHENTICATED USER changes — through the `
+      + `app's own signIn() with no reload, and through a real sign-out `
+      + `followed by a sign-in through the login form — a second League Admin `
+      + `persisted on the very same Program/archived Season inherits a card `
+      + `that is non-actionable and NEUTRAL: the generic "waiting on the `
+      + `server" line, no reason, no error, no counts, and neither the typed `
+      + `reason nor the reopen's own busy copy anywhere in the body text, the `
+      + `markup, any field value, the live region, the announcement history, `
+      + `the committed models or the ledger's held models — while the `
+      + `registration survives, reads as the DEPARTING principal's (an older `
+      + `epoch, their username), the generation counter stays exactly where `
+      + `the write left it, and pointer, keyboard and direct code-level `
+      + `attempts leave the reopen count at one. Releasing as a 503 and as a `
+      + `genuinely committed success both drain the ledger, say NOTHING at `
+      + `all, move no focus off a control parked outside the card, and `
+      + `reconcile from a fresh progress read observed leaving the browser — `
+      + `landing on the real recovery action when the Season is still archived `
+      + `and on "Add Ice" when the server really did reopen it. An Arena `
+      + `Manager arriving on the same authorized tuple is reconciled the same `
+      + `way and is offered NO action at all, so no control the arriving role `
+      + `may not exercise is ever restored.`);
   } catch (e) {
     if (serverOutput.trim()) {
       console.error("--- demo server output ---\n" + serverOutput.trim());

@@ -650,6 +650,106 @@ function setupWorkflowCardId(key) { return `setup/${key}`; }
 const cardGenerations = {};
 const cardStates = {};
 
+// ========== THE AUTHENTICATED-PRINCIPAL / SESSION EPOCH (#365 round 7) ======
+// The three axes above -- card, context tuple, generation -- describe WHAT is
+// on screen. None of them describes WHO IS LOOKING AT IT, and that omission is
+// this round's defect, verbatim from the review:
+//
+//   "The ledger and card identity survive an authenticated-user change, so the
+//   departing user's delayed operation response can mutate the next user's UI
+//   and disclose the departing user's typed reason. resetTransientUiState()
+//   invalidates other identity-scoped UI state but does not invalidate
+//   cardWrites, cardStates, or cardGenerations; the card identity contains
+//   only card + Program/Season/League + generation, not the authenticated
+//   principal/session epoch. Because the ledger refuses the arriving user's
+//   render for the same tuple, the departing identity's generation also
+//   remains current."
+//
+// That last sentence is the sting. The round-6 serialization rule is what
+// KEEPS the departing identity current: beginCardRequest() refuses every
+// request for a card with an unresolved write and leaves cardGenerations
+// untouched, so the arriving principal's own renders cannot advance the
+// counter past the departing principal's operation. Generation equality --
+// the one thing cardIdentityCurrent() had left to judge by -- therefore says
+// "still current" precisely when the person in front of the browser has
+// changed. Reproduced through the app's own no-reload signIn()/setUser() path:
+// A holds a reopen with the reason "first write held", the operator switches
+// in-app to Admin B on the SAME persisted Program/archived Season, and A's 503
+// lands while currentUser.username === "second_admin" -- turning B's card into
+// CONFIRM carrying A's exact reason, A's error text, A's focus move and A's
+// toast. With a lower-privileged arriving role it also restores a control that
+// role is not authorized to exercise.
+//
+// WHY THE FIX IS NOT "DELETE THE LEDGER ON AN IDENTITY CHANGE". The ledger
+// entry conflates two facts that have DIFFERENT OWNERS AND DIFFERENT LIFETIMES,
+// and they have to be split:
+//
+//   (1) SERIALIZATION BOOKKEEPING -- "a write is in flight against this card
+//       and this target tuple". This is a fact about the SERVER, not about the
+//       view or the viewer. It must survive a principal change untouched, or
+//       the round-6 A -> B -> A duplicate-write hole reopens while A's request
+//       is still live and its transaction may still commit. It is
+//       epoch-INDEPENDENT: ANY principal, the arriving one included, is
+//       blocked from starting a second write for that card+tuple.
+//       currentCardWrite() and therefore beginCardRequest() deliberately ask
+//       no question whatsoever about who is signed in.
+//
+//   (2) THE PRIVATE PAYLOAD -- the held PENDING model, the operator's typed
+//       reason, the server's error text, the focus target. This belongs to THE
+//       PRINCIPAL WHO TYPED IT. It is epoch-SCOPED and must never be visible
+//       to, restorable by, or consumed as the UI outcome of another principal.
+//
+// So on a principal change the record KEEPS (1) and DROPS (2). The arriving
+// principal sees a card that is non-actionable -- otherwise the duplicate
+// write returns -- carrying NO text the departing principal entered: no
+// reason, no error, no focus move, no toast, and no hint that anything was
+// typed at all. foreignCardWriteModel() below is that neutral presentation,
+// and resetTransientUiState() destroys the real payload rather than merely
+// hiding it.
+//
+// THE EPOCH IS CLIENT-SIDE and needs no server field or new endpoint.
+// setUser() already fires resetTransientUiState() on exactly the transition
+// that matters (its `prevId !== nextId` guard), and that one transition covers
+// both no-reload paths the regression requires: the demo role-switcher / login
+// form calling signIn(), and a real sign-out followed by a sign-in. A page
+// reload starts a fresh document with an empty ledger and empty card state, so
+// it needs no epoch at all.
+let uiIdentityEpoch = 1;
+
+// WHO a card identity belongs to.
+//
+// Two halves, and the epoch is the authoritative one: it separates two
+// consecutive SESSIONS of the same username -- a real sign-out followed by the
+// same person signing back in -- which a username comparison alone cannot see.
+// The principal is compared as well so that any future path which swapped
+// `currentUser` WITHOUT going through resetTransientUiState() would still be
+// caught, rather than silently inheriting the previous operator's live
+// operations.
+function cardPrincipalId() { return currentUser ? currentUser.username : null; }
+function cardIdentitySamePrincipal(identity) {
+  if (!identity) return false;
+  return identity.epoch === uiIdentityEpoch
+    && identity.principal === cardPrincipalId();
+}
+
+// What the ARRIVING principal is shown for a card whose unresolved write
+// belongs to a DEPARTED one. Non-actionable (PENDING withdraws every control
+// on both surfaces -- setupCardBodyHtml and setupLandingActions -- and sets
+// aria-busy), `status: UNKNOWN` so the hub roll-up counts nothing it cannot
+// see, and no `stats`, because even the counts were read under the departing
+// principal's permissions.
+//
+// The copy describes only THIS CARD'S OWN AVAILABILITY. It deliberately does
+// not name the operation, the operator or the reason: "this season is being
+// reopened" would itself disclose what the previous operator did, and the
+// requirement is that B not learn even that A typed anything.
+const FOREIGN_CARD_WRITE_NOTE = "This card is waiting on the server. It can't"
+  + " be changed until that finishes.";
+function foreignCardWriteModel() {
+  return { state: CARD_STATE.PENDING, status: CARD_STATUS.UNKNOWN,
+           pendingNote: FOREIGN_CARD_WRITE_NOTE };
+}
+
 // card id -> target tuple -> an UNRESOLVED WRITE this card started, and the
 // enforcement behind the PENDING declaration above. That declaration says a
 // pending card is "terminal in one direction only: the write's own response —
@@ -772,6 +872,16 @@ function cardTupleKey(t) {
 // for the switched-to tuple, but paid for that answer by forgetting the
 // operation, so coming back found nothing to be blocked by. Answering by
 // LOOKUP gives the same freedom to B without costing A its record.
+//
+// IT ALSO ASKS NOTHING ABOUT WHO IS SIGNED IN, and that is deliberate (#365
+// round 7). This is half (1) of the split above -- SERIALIZATION BOOKKEEPING,
+// a fact about the server. Adding an epoch condition here would answer "no
+// unresolved write" to the arriving principal and hand them back an actionable
+// control against a Season whose first write is still in flight: exactly the
+// duplicate-write hole round 6 closed, re-opened through a different door. The
+// epoch governs half (2), the PRIVATE PAYLOAD, and it is applied at the
+// readers (readCardState) and at the identity gate (cardIdentityCurrent) --
+// never here.
 function currentCardWrite(cardId) {
   const ledger = cardWrites[cardId];
   if (!ledger) return null;
@@ -795,6 +905,16 @@ function registerCardWrite(identity, model) {
     // trip repaints from readCardState(), and by then cardStates holds the
     // OTHER tuple's model — so the pending presentation has to come from here
     // or it does not come at all.
+    //
+    // THIS FIELD IS THE PRIVATE PAYLOAD — half (2) of the split (#365 round
+    // 7). It carries the operator's typed reason (`confirmReason`), this
+    // card's counts read under their permissions, and the confirmation they
+    // would be handed back. It belongs to `identity.principal` in
+    // `identity.epoch` and to nobody else: readCardState() substitutes
+    // foreignCardWriteModel() for any other principal, and
+    // resetTransientUiState() overwrites it outright so the text stops
+    // existing rather than merely stops being rendered. Everything ELSE in
+    // this entry is half (1) and survives a principal change untouched.
     model: model,
   };
 }
@@ -863,12 +983,22 @@ function currentCardTuple() {
 // paths that remember to carry it, and the path this round is about — the
 // response landing while the initiating identity is stale — is exactly the
 // one that would not have carried it.
+//
+// The record carries the AUTHENTICATED PRINCIPAL AND SESSION EPOCH too (#365
+// round 7). Card + tuple + generation describes what is on screen; it says
+// nothing about who is looking at it, and under the serialization rule the
+// generation cannot even move while a write is unresolved — so without the
+// epoch a departing operator's response arrives looking perfectly current to
+// the arriving one. The refusal above is still epoch-INDEPENDENT: any
+// principal is blocked from starting a second write for a card+tuple that has
+// one outstanding.
 function beginCardRequest(cardId, opts) {
   const t = currentCardTuple();
   if (currentCardWrite(cardId)) return null;
   cardGenerations[cardId] = (cardGenerations[cardId] || 0) + 1;
   return { card: cardId, program_id: t.program_id, season_id: t.season_id,
            league_id: t.league_id, generation: cardGenerations[cardId],
+           epoch: uiIdentityEpoch, principal: cardPrincipalId(),
            // Whether a person asked for this load (a Retry/Refresh press), as
            // opposed to a routine render-driven one. Only an operator-
            // initiated load is allowed to move focus or announce — a routine
@@ -876,12 +1006,23 @@ function beginCardRequest(cardId, opts) {
            userInitiated: !!(opts && opts.userInitiated) };
 }
 
-// THE gate. True only when `identity` is still the newest request for its own
-// card AND the context tuple it was issued under is still the active one.
-// Everything that a response could change — DOM, focus, announcement,
-// completion, next-task selection — asks this first.
+// THE gate. True only when `identity` was issued to THE PRINCIPAL AND SESSION
+// THAT IS SIGNED IN NOW, is still the newest request for its own card, AND the
+// context tuple it was issued under is still the active one. Everything that a
+// response could change — DOM, focus, announcement, completion, next-task
+// selection — asks this first.
+//
+// The principal check is FIRST and is not a formality (#365 round 7). It is
+// the only one of the three that can fail on an authenticated-user change: the
+// tuple is per-user persisted and two operators can legitimately be on the
+// same Program/Season, and the generation cannot advance at all while the
+// serialization rule is refusing this card's requests. Drop it and a departing
+// operator's delayed response passes every remaining test and mutates the
+// arriving operator's card — model, DOM, focus, live region, completion and
+// next task — with the departing operator's own typed text.
 function cardIdentityCurrent(identity) {
   if (!identity) return false;
+  if (!cardIdentitySamePrincipal(identity)) return false;  // #365 identity gate — principal/session epoch
   if (cardGenerations[identity.card] !== identity.generation) return false;
   const t = currentCardTuple();
   return identity.program_id === t.program_id
@@ -895,6 +1036,24 @@ function cardIdentityCurrent(identity) {
 // because a refresh for the same context happens to be in flight; answering
 // the second question with the first would flash every card to "stale" on
 // every ordinary reload.
+//
+// IT IS ALSO DELIBERATELY PRINCIPAL-FREE (#365 round 7), and this is the one
+// place where folding the epoch in would be actively WRONG. The post-await
+// branch in reopenSelectedSeasonFromCard() uses this predicate to ask "is the
+// operator standing on the tuple this write targets" — and the correction for
+// this round requires that when the ARRIVING principal is on that tuple, the
+// card is reconciled from fresh server truth rather than left alone. If this
+// predicate answered "no" merely because the principal changed, that branch
+// would return early and the arriving principal would be left looking at the
+// neutral pending presentation with nothing to replace it. The epoch decides
+// WHOSE UI STATE MAY BE USED (cardIdentityCurrent, readCardState); the tuple
+// decides WHICH SEASON IS ON SCREEN. They are different questions.
+//
+// Every caller that passes a HELD model's identity here is nonetheless safe,
+// because it obtains that model through readCardState(), which substitutes a
+// principal-neutral model (carrying no identity at all) for a foreign entry —
+// so `cardTupleCurrent(held.identity)` is false for the arriving principal by
+// way of the reader, not by way of this predicate.
 function cardTupleCurrent(identity) {
   if (!identity) return false;
   const t = currentCardTuple();
@@ -942,11 +1101,38 @@ function commitCardState(identity, next) {
 // through this one function, so the card body, the landing's action groups,
 // aria-busy and the hub roll-up all agree with the operation rather than with
 // whatever the last render left behind.
+//
+// AND IT IS WHERE THE PRIVATE PAYLOAD IS WITHHELD (#365 round 7). Every
+// surface that paints a card — the body, the landing's action groups, the
+// status chip, aria-busy, the hub roll-up, the confirmation opener and its
+// resolver — reads through this one function, so a single substitution here
+// covers all of them and no call site has to remember. The two epoch-scoped
+// sources are both handled:
+//
+//   * THE LEDGER'S HELD MODEL. The entry itself survives an authenticated-user
+//     change (it is serialization bookkeeping, half (1)), so the card stays
+//     non-actionable for the arriving principal — but the model it carries is
+//     half (2) and is replaced by the neutral one. The arriving principal
+//     learns that this card is busy with the server; nothing else.
+//   * A COMMITTED cardStates ENTRY. resetTransientUiState() already destroys
+//     these on an identity change, so this branch should be unreachable — and
+//     it is asserted anyway, because "a stale cardStates entry from the
+//     departing principal read under the arriving one is the same leak by
+//     another route" (the review names cardStates and cardGenerations
+//     alongside cardWrites). LOADING is the honest answer: this principal has
+//     not read this card yet, and the render already under way commits their
+//     own model within the same pass.
 function readCardState(cardId) {
   const outstanding = currentCardWrite(cardId);
-  if (outstanding) return outstanding.model;
+  if (outstanding) {
+    return cardIdentitySamePrincipal(outstanding.identity)
+      ? outstanding.model : foreignCardWriteModel();
+  }
   const entry = cardStates[cardId];
   if (!entry) return { state: CARD_STATE.LOADING, status: CARD_STATUS.UNKNOWN };
+  if (!cardIdentitySamePrincipal(entry.identity)) {
+    return { state: CARD_STATE.LOADING, status: CARD_STATUS.UNKNOWN };
+  }
   if (entry.state !== CARD_STATE.LOADING && !cardTupleCurrent(entry.identity)) {
     return Object.assign({}, entry, { state: CARD_STATE.STALE, staleFrom: entry.state });
   }
@@ -5046,6 +5232,13 @@ function restorePendingCardWriteFocus() {
     // its own account, which is the right answer after a round trip: the
     // operator navigated back here deliberately and their focus is on a real
     // destination, so nothing may yank it onto the pending line.
+    //
+    // It is also the right answer after an authenticated-user change (#365
+    // round 7): the entry survives, because the write does, but its identity
+    // belongs to the departing principal, so cardIdentityCurrent() refuses and
+    // the arriving principal's focus is never moved by an operation they did
+    // not start. Their card is still non-actionable — that comes from the
+    // ledger, not from focus.
     if (line) focusCardTarget(held.identity, line);
   });
 }
@@ -5118,6 +5311,17 @@ function repaintSetupWorkflowCard(key, identity) {
 // actually did. It is a SUBSTITUTION, never an addition: the announcement
 // still happens exactly once, at exactly this point, under exactly this
 // identity gate.
+//
+// `opts.silent` suppresses the announcement and the focus move — and ONLY
+// those two (#365 review round 7). It exists for exactly one caller: the
+// settlement of a write whose AUTHENTICATED PRINCIPAL has changed underneath
+// it. The arriving principal did not press anything, so there is nothing to
+// tell them and nowhere they asked to be sent; a sentence in the sitewide live
+// region or a focus jump into this card would both be the departing
+// operator's operation speaking through the arriving operator's session. The
+// fresh reads, the model commit and the repaint still happen in full, because
+// the card DOES have to stop showing the neutral pending presentation and
+// start showing what the server now says — reconciled, but silently.
 async function retrySetupWorkflowCard(key, opts) {
   const o = opts || {};
   const w = setupWorkflowsFor().find((x) => x.key === key);
@@ -5162,6 +5366,10 @@ async function retrySetupWorkflowCard(key, opts) {
   // late loser can revise neither.
   if (!commitCardState(identity, model)) return;
   if (!repaintSetupWorkflowCard(key, identity)) return;      // (1) DOM
+  // A SILENT reconcile stops here: model and DOM are updated from fresh server
+  // truth under this principal's own identity and permissions, and nothing is
+  // said or focused on behalf of an operation this principal never started.
+  if (o.silent) return;
   const failed = model.state === CARD_STATE.ERROR;
   announceCardStatus(identity, failed                        // (3) announcement
     ? (o.failed || `Still couldn't load ${w.title}.`)
@@ -5459,6 +5667,34 @@ async function reopenSelectedSeasonFromCard(key, held, c, reason) {
   // this line would become the thing that does. Do not cite it as proof of
   // anything the tuple check is not already proving.
   if (!cardTupleCurrent(identity) || identity.season_id !== seasonId) return;
+  // THE TARGET IS CURRENT, BUT THE AUTHENTICATED PRINCIPAL HAS CHANGED (#365
+  // review round 7). A DIFFERENT PERSON is signed in and is standing on the
+  // Season this write targets — an in-app persona switch through signIn(), or
+  // a real sign-out followed by a sign-in, both with no page reload.
+  //
+  // Taken BEFORE cardIdentityCurrent()'s combined test, even though that test
+  // now subsumes it, because the two cases need DIFFERENT handling and merging
+  // them would give the arriving principal the departing one's refresh
+  // sentence. Everything below this line — the held-model restore, the toast,
+  // the live-region write, the repaint, the focus move, the completion claim
+  // and the next-task mutation — belongs to `identity.principal`, and every
+  // one of them would be an operation the arriving principal never started
+  // announcing itself in their session. With a lower-privileged arriving role
+  // the held restore would additionally hand back a confirmation and a control
+  // that role is not authorized to exercise.
+  //
+  // So: reconcile from FRESH SERVER TRUTH, under a NEW identity issued to the
+  // ARRIVING principal, SILENTLY. The response itself is never consumed — not
+  // its status, not its message, not the model this operation was holding. The
+  // card stops showing the neutral pending presentation and starts showing
+  // what the server says NOW, with the actions the ARRIVING principal's own
+  // permissions allow: an Arena Manager on a Season the server still reports
+  // archived gets the withdrawn-action explanation, not League Admin's reopen
+  // control. The ledger was drained above, unconditionally, so this refresh is
+  // refused by nothing and the target is not left blocked.
+  if (!cardIdentitySamePrincipal(identity)) {
+    return retrySetupWorkflowCard(key, { silent: true });
+  }
   // THE TARGET IS CURRENT, BUT THE INITIATING IDENTITY IS NOT. The operator
   // left this tuple and came back while the request was in flight: the DOM
   // this operation painted was destroyed, cardStates was overwritten by the
@@ -12420,6 +12656,73 @@ function resetTransientUiState() {
     document.querySelectorAll(".drawer-scrim, .drawer").forEach((el) => el.remove());
     drawer = null; drawerError = ""; drawerValues = {};
   }
+  // ===== PER-CARD OPERATION/UI STATE (#365 review round 7) =================
+  // The three stores the review names — cardWrites, cardStates,
+  // cardGenerations — audited one by one, because they do NOT all deserve the
+  // same treatment and the round-6 duplicate-write fix depends on that.
+  //
+  // (a) THE EPOCH, ADVANCED FIRST. Every identity already issued was stamped
+  //     with the OLD value, so from this line on cardIdentitySamePrincipal()
+  //     is false for all of them and cardIdentityCurrent() therefore refuses
+  //     every model commit, repaint, announcement, focus move, completion and
+  //     next-task mutation they could still attempt. This is the guard, and
+  //     the four call-sites downstream re-check it after their own await.
+  uiIdentityEpoch += 1;
+  // (b) cardStates — DESTROYED. A committed card model is this operator's
+  //     read: counts fetched under their permissions, and on a card mid-
+  //     confirmation their typed `confirmReason` and the server's error text.
+  //     readCardState() would already withhold it from the next identity, but
+  //     private text that is merely unread is still private text that is
+  //     still there. Deleted key by key rather than rebound, so every existing
+  //     reference to the same object keeps seeing the truth.
+  Object.keys(cardStates).forEach((k) => { delete cardStates[k]; });
+  // (c) cardWrites — KEPT, PAYLOAD QUARANTINED. This is the whole tension of
+  //     the round. The ENTRY is serialization bookkeeping: a write is in
+  //     flight against that card and target tuple, navigation and sign-out
+  //     cancelled neither the HTTP request nor the transaction behind it, and
+  //     dropping the record here would let the arriving principal fire a
+  //     SECOND lifecycle write against the same Season while the first is
+  //     unresolved — the round-6 hole, reopened. So the entry stays and the
+  //     card stays non-actionable for whoever arrives. What does NOT stay is
+  //     the held model: the reason, the error, the counts and the
+  //     confirmation are overwritten with the neutral presentation, so the
+  //     departing operator's words stop existing rather than stop being
+  //     painted.
+  Object.keys(cardWrites).forEach((cardId) => {
+    const ledger = cardWrites[cardId];
+    Object.keys(ledger).forEach((key) => {
+      ledger[key].model = foreignCardWriteModel();
+    });
+  });
+  // (c2) THE ONE SITEWIDE LIVE REGION. #toast-root is where announceCardStatus
+  //     and every other operation sentence lands, and updateToast() only HIDES
+  //     it when there is nothing left to say — the previous sentence stays in
+  //     the markup. So the departing operator's last announcement
+  //     ("Reopening this season…", a server error message, anything they were
+  //     told) is still sitting in the document the arriving principal is
+  //     handed. Hidden is not gone: it is in the DOM, and a live region is
+  //     exactly the surface this round's correction names alongside the held
+  //     model and the focus target. Emptied outright here, at the identity
+  //     boundary, rather than merely hidden.
+  toast = ""; toastIsError = false;
+  const identityToastRoot = document.getElementById("toast-root");
+  if (identityToastRoot) {
+    identityToastRoot.innerHTML = "";
+    identityToastRoot.classList.remove("error");
+  }
+  updateToast();
+  // (d) cardGenerations — DELIBERATELY KEPT, and the reasoning is the reason
+  //     the epoch had to exist at all. The counters hold no operator text:
+  //     they are monotone integers, so there is nothing here to disclose.
+  //     Resetting them would be worse than useless — it would hand the
+  //     arriving principal's first request for a card the SAME generation
+  //     number a departing principal's outstanding identity is already
+  //     holding, manufacturing collisions that only the epoch could then tell
+  //     apart. Keeping them monotone means a generation number is never
+  //     reused, and the epoch is what makes a departed identity stale
+  //     regardless of what the counter says — which is exactly the property
+  //     the review found missing, since under the serialization rule the
+  //     counter cannot move for a card with an unresolved write.
   contextRevision += 1;
   // A context switch this identity initiated but had not yet gotten a POST
   // out for (queued behind one already in flight, see setActiveContext()'s
