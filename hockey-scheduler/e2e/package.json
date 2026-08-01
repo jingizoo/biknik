@@ -33,6 +33,8 @@
     "facilities-venue-access": "node facilities-venue-access.js",
     "setup-prerequisite-floors": "node setup-prerequisite-floors.js",
     "setup-card-write-identity": "node setup-card-write-identity.js",
+    "setup-state-matrix": "node setup-state-matrix.js",
+    "home-tasks-state-matrix": "node home-tasks-state-matrix.js",
     "allowed-venues": "node allowed-venues.js",
     "venue-access-cleanup": "node venue-access-cleanup.js",
     "venue-sharing": "node venue-sharing.js",

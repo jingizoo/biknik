@@ -1662,8 +1662,24 @@ async function loadSetupProgressCard(opts) {
   // through focusCardTarget(), which re-checks the identity, so a superseded
   // response can never yank focus back into a card the operator has moved on
   // from.
+  //
+  // #365: the fallback to the SLOT is not cosmetic, it closes a focus loss.
+  // `.dash-card h3` exists in five of this card's six states, but EMPTY
+  // renders the empty string on purpose (both of its reasons -- see
+  // renderSetupProgressCard), so there is no heading to land on. An operator
+  // who pressed Retry was standing on a button inside this slot; the
+  // innerHTML write above has just destroyed it, and with a null target
+  // focusCardTarget() refused and left keyboard focus on <body> -- Tab
+  // restarting from the top of the document after an action the operator
+  // deliberately took. Reproduced as an Arena Manager whose only visible
+  // workflow is already done: ERROR -> keyboard Retry -> EMPTY, focus on
+  // BODY. #sp-card-slot is the right landing place and needs no invented
+  // copy: it is render()'s own wrapper, it survives every replacement here,
+  // and it IS this card's live region, so focus stays exactly where the card
+  // the operator asked to reload lives. focusCardTarget() stamps the same
+  // tabindex="-1" it uses for any other non-focusable destination.
   if (opts && opts.userInitiated && hadFocusInCard) {
-    focusCardTarget(identity, slot.querySelector(".dash-card h3"));
+    focusCardTarget(identity, slot.querySelector(".dash-card h3") || slot);
   }
   // The complete state's "Go to Schedule" button uses the generic
   // data-goto convention (c.querySelectorAll("[data-goto]") in render()),
