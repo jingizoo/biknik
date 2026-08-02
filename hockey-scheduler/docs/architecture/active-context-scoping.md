@@ -610,8 +610,21 @@ scenario's exact tuple, still creating, reading, listing and committing — and
 the HTTP matrix asserts the control again on the far side of the refusal, so
 switching back restores exactly the authority switching away removed.
 
-Mutation-proven, one falsifying mutation per independent clause; see the PR
-description for the verbatim failures.
+Mutation-proven, one falsifying mutation per independent clause, each with the
+fixture that isolates it:
+
+| mutation | verbatim failure |
+| --- | --- |
+| drop the CREATE tuple check | *"a league_admin active in Program B CREATED a Program A scenario"*, *"a arena_manager active in Program B CREATED a Program A scenario"*, *"a scenario was created in the different League, same Season corner while another tuple was selected"*, *"a scenario was created in the different Season, same Program corner while another tuple was selected"*, *"caller-supplied foreign season_id + league_id were accepted while another tuple was selected"* |
+| drop the LIST filter | *"league_admin active in A1a saw more than its own tuple"* (and A1b / A2a / B1a, for both roles) |
+| filter the list AFTER building DTOs | *"a DTO was assembled for a scenario outside the active tuple — the list must be filtered on stored rows BEFORE any payload is built"* |
+| drop the GET tuple check | the whole scenario payload where the generic not-found belongs: `'{"created_at": …}' != '{"error": {"code": "not_found", …}}'`, and `200 != 404` over HTTP |
+| drop the COMMIT re-authorization | *"a scenario generated in Program A was COMMITTED after the operator switched to Program B"*, *"a League Aa scenario was COMMITTED with sibling League Ab selected — the same Program and Season is not the same tuple"*, plus `Lists differ: [Game(id='game_1', …)] != []` |
+| split the refusal into "forbidden" vs "missing" | `'schedule_scenario_forbidden' != 'schedule_scenario_missing'`, and the masked-bytes comparison failing on every backend and over HTTP |
+| stop passing the principal from the route | `Lists differ: ['schedule_scenario_1', …, 'schedule_scenario_5'] != ['schedule_scenario_5']` |
+| commit with `meetings_per_opponent=None` | `'error' unexpectedly found in {'error': {'code': 'concurrency_conflict', 'message': 'This preview is out of date …` on Memory / SQLite / PostgreSQL |
+| store the raw request format instead of the generator's | `None != 1` — an omitted format must be recorded as the 1 it ran under |
+| drop the stored-vs-generated format check | `'schedule_scenario_stale' != 'schedule_scenario_integrity_error'` |
 
 ## The grant-only facility contract (venue sharing)
 
