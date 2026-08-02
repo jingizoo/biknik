@@ -136,6 +136,21 @@
 //      life), and the crossing is armed in the microtask checkpoint of the
 //      navigation's own first paint so no tick can have run before it.
 //
+//  (G2) ...AND THE SAME WHEN THE SWITCH ONLY QUEUES (#365 review round 14).
+//      (G) issues one switch while nothing is in flight, so it never takes
+//      setActiveContext()'s `if (contextSwitchInFlight) ... return` early
+//      return and cannot see where the abandonment sits relative to it. This
+//      leg reverses the order: the operator picks the SECOND Season and its
+//      POST is held, THEN the Facilities navigation starts the generic poll
+//      inside that in-flight window, THEN the operator picks the THIRD Season
+//      -- armed in the same first-paint microtask -- so that call queues and
+//      returns having sent nothing. The queue is read from the page
+//      (contextSwitchQueued names the third Season, contextSwitchInFlight is
+//      set, the canonical tuple is still the departing one, and the route has
+//      intercepted exactly one POST), and across the whole window from that
+//      second change event nothing is focused and focus does not move at all.
+//      Both switches are then released and the silence must continue.
+//
 //  (H) ...AND MUST NOT CROSS AN IDENTITY BOUNDARY — the same shape, crossed
 //      through the app's own no-reload signIn() to a different principal.
 //      That boundary is synchronous, so it is watched from the confirmed
@@ -435,14 +450,18 @@ async function holdContextSwitchPost(page) {
   };
 }
 
+// EVERY change is recorded, not just the first: leg (G2) makes two real
+// selections in one window and opens its observation at the SECOND one, so it
+// needs the whole ordered list (and needs to be able to say there were exactly
+// two). `__vagCtxChange` stays the FIRST record, which is what (G) reads.
 async function watchContextChangeEvent(page) {
   await page.evaluate(() => {
     window.__vagCtxChange = null;
+    window.__vagCtxChanges = [];
     window.__vagCtxChangeListener = (e) => {
-      if (window.__vagCtxChange) return;
       if (!e.target || e.target.id !== "ctx-select") return;
       const el = document.activeElement;
-      window.__vagCtxChange = {
+      const rec = {
         t: Date.now() - window.__vagFocus.t0,
         value: e.target.value,
         active: { id: (el && el.id) || null, tag: (el && el.tagName) || null },
@@ -456,6 +475,8 @@ async function watchContextChangeEvent(page) {
         principal: currentUser ? currentUser.username : null,
         events: window.__vagFocus.events.slice(),
       };
+      window.__vagCtxChanges.push(rec);
+      if (!window.__vagCtxChange) window.__vagCtxChange = rec;
     };
     document.addEventListener("change", window.__vagCtxChangeListener, true);
   });
@@ -484,18 +505,14 @@ async function crossingOutcome(page) {
   });
 }
 
-// The two exits focusContentHeading() can ever take: its #content landing
-// (early or at the 2s floor) and its heading landing. A boundary crossing
-// must produce NEITHER.
-const pollExits = (events) => events.filter(
-  (e) => e.id === "content" || /^H[1-3]$/.test(e.tag || ""));
-
-// The same two exits as a PREDICATE, and closed over the third shape the
-// heading landing can take: focusContentHeading() picks "h1, h2, h3,
-// .section-title", so an element carrying that class is a poll landing even
-// though its tag is not H1-H3. Leg (G) watches a window the older legs never
-// saw, so it rules out all of them rather than the two that happened to be
-// reachable there.
+// EVERY exit focusContentHeading() can ever take, as one predicate: its
+// #content landing (early or at the 2s floor) and its heading landing in all
+// three shapes the selector "h1, h2, h3, .section-title" admits -- an element
+// carrying that CLASS is a landing even though its tag is not H1-H3, which is
+// why startFocusTrace() records className at all. A boundary crossing must
+// produce NONE of them, so every boundary leg ((G), (G2) and (H)) uses this
+// one predicate rather than a narrower per-leg copy: a transient
+// .section-title landing must not be able to pass unobserved anywhere.
 const isPollLanding = (f) => f.id === "content"
   || /^H[1-3]$/.test(f.tag || "")
   || /(^|\s)section-title(\s|$)/.test(f.cls || "");
@@ -1054,13 +1071,20 @@ async function checkViewport(browser, viewport) {
         { program_id: program.id, name: "VAG Late Season One" });
       const s2 = await post("/api/v2/setup/season",
         { program_id: program.id, name: "VAG Late Season Two" });
+      // A THIRD selectable Season, for leg (G2): a switch that queues behind
+      // an in-flight one needs a target that is neither the departing Season
+      // nor the one the in-flight switch is already heading for, or "the
+      // queued call named a different destination" would not be observable.
+      const s3 = await post("/api/v2/setup/season",
+        { program_id: program.id, name: "VAG Late Season Three" });
       const venue = await post("/api/v2/setup/venue", { name: "VAG Late Venue" });
       const rink = await post("/api/v2/setup/rink",
         { venue_id: venue.id, name: "VAG Late Rink" });
       return { program: program.id, s1: s1.id, s1Name: s1.name,
-               s2: s2.id, s2Name: s2.name, venue: venue.id, rink: rink.id };
+               s2: s2.id, s2Name: s2.name, s3: s3.id, s3Name: s3.name,
+               venue: venue.id, rink: rink.id };
     });
-    for (const k of ["program", "s1", "s2", "venue", "rink"]) {
+    for (const k of ["program", "s1", "s2", "s3", "venue", "rink"]) {
       if (!d[k]) fail(`[${L}] fixture (D) failed to create ${k}: ${JSON.stringify(d)}`);
     }
     const dFx = { program: d.program, season: d.s1, seasonName: d.s1Name };
@@ -1492,7 +1516,7 @@ async function checkViewport(browser, viewport) {
           + `already elapsed — it cannot still have been pending, so this leg would `
           + `prove nothing about cancelling it`);
       }
-      const before = pollExits(cross.events);
+      const before = cross.events.filter(isPollLanding);
       if (before.length) {
         fail(`[${L}/${step}] the generic poll had already landed before the boundary `
           + `was crossed (${JSON.stringify(before)}), so it was no longer pending`);
@@ -1532,11 +1556,18 @@ async function checkViewport(browser, viewport) {
           + `the boundary must not get to answer for the surface on the other side `
           + `of it\nfocus timeline: ${JSON.stringify(traceRuns(trace))}`);
       }
-      const onHeading = pollExits(after.events);
+      // The OTHER exit of the same stale chain, in every shape the selector
+      // "h1, h2, h3, .section-title" admits (isPollLanding), and over the
+      // periodic samples as well as the focusin events -- so a .section-title
+      // landing, or one that lasted less than a sample interval, is caught
+      // here too rather than only the H1-H3 transitions the older, narrower
+      // predicate could see.
+      const onHeading = traceHits(after, (f) => f.id !== "content" && isPollLanding(f));
       if (onHeading.length) {
         fail(`[${L}/${step}] the generic poll took its HEADING landing after the `
-          + `boundary was crossed (${JSON.stringify(onHeading)}) — the other exit of `
-          + `the same stale chain, and equally not this surface's to take`);
+          + `boundary was crossed (${JSON.stringify(onHeading.slice(0, 6))}) — the `
+          + `other exit of the same stale chain, and equally not this surface's to `
+          + `take`);
       }
       const out = await crossingOutcome(page);
       if (out.active.id === "content") {
@@ -1726,6 +1757,268 @@ async function checkViewport(browser, viewport) {
     await page.unroute(HIERARCHY_READS);
     noPreviewsSince("G");
 
+    // ---- (G2) A SWITCH QUEUED BEHIND ONE ALREADY IN FLIGHT ---------------
+    // (#365 review round 14.) Leg (G) above issues ONE switch while nothing is
+    // in flight, so it only ever walks setActiveContext()'s ordinary path: the
+    // abandonment runs, the early return is NOT taken, and the POST goes out.
+    // That makes (G) blind to WHERE the abandonment sits. Moving
+    // abandonFocusWorkForContextSwitch() below the
+    // `if (contextSwitchInFlight) { contextSwitchQueued = ...; return; }`
+    // leaves (G) green, because on (G)'s path both placements run the same
+    // code in the same order.
+    //
+    // The queued path is the independent reason the attempt-time boundary is
+    // load-bearing, and it is the one the placement guarantee exists for. A
+    // second selection made while an earlier switch's POST is still
+    // unanswered SENDS NOTHING and returns immediately. If the abandonment is
+    // below that return, that selection cancels nothing at all -- and any
+    // focus work started after the first switch stays live and free to land
+    // for as long as the first response takes to arrive, which is unbounded.
+    //
+    // So the order here is deliberately the reverse of (G)'s:
+    //   1. the operator picks the SECOND Season on the real #ctx-select, and
+    //      its POST /api/context is HELD before forwarding -- the switch stays
+    //      in flight for exactly as long as this leg wants;
+    //   2. THEN the Facilities navigation runs, starting the generic poll
+    //      INSIDE that in-flight window, on a fresh ticket the first switch
+    //      cannot have bumped (it bumped before this poll existed);
+    //   3. THEN the operator picks the THIRD Season, armed in the microtask
+    //      checkpoint of that navigation's own first paint so no 50ms tick can
+    //      have run first. That call finds contextSwitchInFlight set, queues,
+    //      and returns -- and cancelling the poll from (2) is something only a
+    //      cancellation ABOVE the return can do.
+    // The early return really being taken is read from the page rather than
+    // assumed: contextSwitchQueued names the THIRD Season, contextSwitchInFlight
+    // is still true, contextOptions.selected still names the DEPARTING one, and
+    // the route has intercepted exactly ONE POST -- the queued call sent none.
+    //
+    // QUIET FIRST, for the same reason (H) does it below: (G) ends with a
+    // released switch still reconciling.
+    await reenter(page, base);
+    await page.waitForLoadState("networkidle").catch(() => {});
+    await apiPost(page, "/api/context", { program_id: d.program, season_id: d.s1 });
+    await reenter(page, base);
+    icePreviews = [];
+    // Same reason (G) does this: renderContextSwitcher() runs late in render(),
+    // so a freshly re-entered page has #ctx-select still empty. Reach a
+    // completed render through the real landing entry point, then leave Setup
+    // through a real nav control so the navigation this leg measures still
+    // starts from outside Setup with nothing painted.
+    await openFacilitiesLanding(page, `${L}/G2/switcher`);
+    await page.click('.side-nav [data-tab="dashboard"]');
+    const switcherOption3 = `${d.program}|${d.s3}`;
+    await page.waitForFunction((want) => {
+      const sel = document.getElementById("ctx-select");
+      if (!sel) return false;
+      const have = Array.from(sel.options).map((o) => o.value);
+      return want.every((v) => have.indexOf(v) !== -1);
+    }, [switcherOption, switcherOption3], { timeout: 15000 })
+      .catch(async () => fail(`[${L}/G2] the second and third Seasons are not both `
+        + `options in the real context switcher, so this leg cannot queue one real `
+        + `switch behind another the way an operator would; the switcher offers `
+        + `${JSON.stringify(await page.evaluate(() => {
+            const sel = document.getElementById("ctx-select");
+            return sel ? Array.from(sel.options).map((o) => o.value) : null;
+          }))}`));
+    // Those navigations started generic polls of their own; drain them, so the
+    // only pending poll in the window below is the one this leg starts.
+    await quiesceFocus(page);
+    await delayHierarchyReads(page);
+    const g2Hold = await holdContextSwitchPost(page);
+    await startFocusTrace(page);
+    await watchContextChangeEvent(page);
+
+    // -- (1) THE FIRST SWITCH, held before it can reach the server ---------
+    // A real operator selection on the real control (Playwright's own select
+    // action -- the same one leg (E) uses; no focus call). It happens BEFORE
+    // the poll under test exists on purpose: THIS switch's abandonment runs
+    // here, so it cannot be what cancels that poll.
+    await page.selectOption("#ctx-select", switcherOption);
+    const g2HeldBy = Date.now() + 10000;
+    while (!g2Hold.state.heldAt && Date.now() < g2HeldBy) await page.waitForTimeout(50);
+    if (!g2Hold.state.heldAt) {
+      fail(`[${L}/G2] the first context switch never issued POST /api/context, so `
+        + `there is nothing for a second switch to queue behind`);
+    }
+    const g2Flight = await page.evaluate(() => ({
+      inFlight: contextSwitchInFlight,
+      queued: contextSwitchQueued && contextSwitchQueued.seasonId,
+      season: ((contextOptions && contextOptions.selected) || {}).season_id || null,
+    }));
+    if (!g2Flight.inFlight || g2Flight.queued || g2Flight.season !== d.s1) {
+      fail(`[${L}/G2] the first switch is not cleanly in flight `
+        + `(${JSON.stringify(g2Flight)}) — the second selection below would not be `
+        + `taking setActiveContext()'s queued path at all`);
+    }
+
+    // -- (2) THE POLL, started INSIDE that in-flight window -----------------
+    await armCrossingAtFirstPaint(page, "context", switcherOption3);
+    const g2NavT = Date.now();
+    await page.click('[data-setup-workflow-nav="facilities"]');
+    await page.waitForFunction(() => !!window.__vagCrossArm, null, { timeout: 20000 })
+      .catch(() => fail(`[${L}/G2] the Facilities navigation never painted, so the `
+        + `queued switch was never armed inside the poll's window`));
+    const g2Arm = await page.evaluate(() => window.__vagCrossArm);
+    if (!g2Arm.kind) fail(`[${L}/G2] the crossing was never armed`);
+    if (g2Arm.landing) {
+      fail(`[${L}/G2] the Facilities landing had ALREADY painted when the queued `
+        + `switch was armed, so the navigation's poll would have exited on its own `
+        + `account and there is no stale poll to cancel`);
+    }
+    if (g2Arm.season !== d.s1) {
+      fail(`[${L}/G2] at the navigation the canonical tuple already read `
+        + `${JSON.stringify(g2Arm.season)} rather than the departing Season — the `
+        + `first switch had already been answered, so nothing can queue behind it`);
+    }
+
+    // -- (3) THE WINDOW OPENS: the SECOND real change on #ctx-select --------
+    await page.waitForFunction(() => (window.__vagCtxChanges || []).length >= 2,
+      null, { timeout: 20000 })
+      .catch(() => fail(`[${L}/G2] the armed switch never produced a SECOND real `
+        + `change event on #ctx-select, so there is no queued selection to observe `
+        + `from`));
+    const g2Changes = await page.evaluate(() => window.__vagCtxChanges);
+    if (g2Changes.length !== 2
+        || g2Changes[0].value !== switcherOption
+        || g2Changes[1].value !== switcherOption3) {
+      fail(`[${L}/G2] #ctx-select saw `
+        + `${JSON.stringify(g2Changes.map((c) => c.value))} rather than exactly the `
+        + `second Season followed by the third — this leg's whole subject is the `
+        + `SECOND of two real selections`);
+    }
+    const g2Change = g2Changes[1];
+    // -- ...and it really is the PRE-response window ------------------------
+    if (g2Change.season !== d.s1) {
+      fail(`[${L}/G2] at the queued change event contextOptions.selected already read `
+        + `${JSON.stringify(g2Change.season)} rather than the departing Season — the `
+        + `first switch had been answered, so this is not the queued path`);
+    }
+    // -- the poll was PROVABLY still pending at that instant ----------------
+    if (!(g2Change.t - g2Arm.t < POLL_LIFE_MS)) {
+      fail(`[${L}/G2] the queued change fired ${g2Change.t - g2Arm.t}ms after the `
+        + `navigation's first paint, i.e. after the generic poll's entire 40 x 50ms `
+        + `life had already elapsed — it cannot still have been pending`);
+    }
+    const g2Before = g2Change.events.filter((e) => e.t >= g2Arm.t).filter(isPollLanding);
+    if (g2Before.length) {
+      fail(`[${L}/G2] the generic poll had already landed before the operator made `
+        + `the queued selection (${JSON.stringify(g2Before)}), so it was no longer `
+        + `pending`);
+    }
+    if (g2Change.active.tag !== "BUTTON" || g2Change.active.id) {
+      fail(`[${L}/G2] at the queued change focus was on `
+        + `${JSON.stringify(g2Change.active)} rather than still on the nav control — `
+        + `the navigation's generic poll had already landed, so there was no pending `
+        + `poll left to cancel`);
+    }
+    if (!g2Change.skeleton || g2Change.landing) {
+      fail(`[${L}/G2] the destination had already painted at the queued change `
+        + `(skeleton ${g2Change.skeleton}, landing ${g2Change.landing}) — the poll `
+        + `would have exited on the painted content rather than still be polling`);
+    }
+
+    // -- (4) THE EARLY RETURN WAS TAKEN, read from the page itself ----------
+    const g2Queued = await page.evaluate(() => ({
+      queuedSeason: contextSwitchQueued && contextSwitchQueued.seasonId,
+      queuedProgram: contextSwitchQueued && contextSwitchQueued.programId,
+      inFlight: contextSwitchInFlight,
+      season: ((contextOptions && contextOptions.selected) || {}).season_id || null,
+    }));
+    if (g2Queued.queuedSeason !== d.s3 || g2Queued.queuedProgram !== d.program
+        || !g2Queued.inFlight || g2Queued.season !== d.s1) {
+      fail(`[${L}/G2] the second selection did not take setActiveContext()'s queued `
+        + `early return: ${JSON.stringify(g2Queued)} — expected contextSwitchQueued `
+        + `to name the THIRD Season ${JSON.stringify(d.s3)}, contextSwitchInFlight to `
+        + `still be true, and contextOptions.selected to still be the departing `
+        + `Season ${JSON.stringify(d.s1)}`);
+    }
+    if (g2Hold.state.seen !== 1) {
+      fail(`[${L}/G2] ${g2Hold.state.seen} POST /api/context request(s) were issued, `
+        + `not the one the held first switch sent — the queued selection is supposed `
+        + `to send NOTHING and return, which is the whole path this leg exercises`);
+    }
+
+    // -- (5) THE WHOLE PRE-RESPONSE WINDOW, past the poll's entire life -----
+    const G2_HOLD_MS = 3400;
+    const g2HoldUntil = Math.max(g2Hold.state.heldAt + G2_HOLD_MS,
+      g2NavT + POLL_LIFE_MS + 700);
+    const g2Wait = g2HoldUntil - Date.now();
+    if (g2Wait > 0) await page.waitForTimeout(g2Wait);
+    const g2Pending = await page.evaluate(() => ({
+      season: ((contextOptions && contextOptions.selected) || {}).season_id || null,
+      inFlight: contextSwitchInFlight,
+      queuedSeason: contextSwitchQueued && contextSwitchQueued.seasonId,
+      skeleton: !!document.querySelector("#content .skeleton"),
+    }));
+    if (g2Pending.season !== d.s1 || !g2Pending.inFlight
+        || g2Pending.queuedSeason !== d.s3 || g2Hold.state.releasedAt) {
+      fail(`[${L}/G2] the first POST did not stay held across the window `
+        + `(${JSON.stringify(g2Pending)}, released ${g2Hold.state.releasedAt}) — the `
+        + `pre-response window this leg observes never existed`);
+    }
+    const g2SincePoll = Date.now() - g2NavT;
+    if (!(g2SincePoll > POLL_LIFE_MS) || !(Date.now() - g2Hold.state.heldAt > POLL_LIFE_MS)) {
+      fail(`[${L}/G2] the window ran only ${g2SincePoll}ms from the navigation that `
+        + `started the poll, inside its own ${POLL_LIFE_MS}ms life — the poll could `
+        + `have been pending throughout without ever reaching its floor`);
+    }
+    const g2PreTrace = await readFocusTrace(page);
+    const g2Pre = { samples: g2PreTrace.samples.filter((s) => s.t >= g2Change.t),
+                    events: g2PreTrace.events.filter((e) => e.t >= g2Change.t) };
+    assertNoStaleFocus("G2",
+      `across the whole ${g2SincePoll}ms from the queued selection at ${g2Change.t}ms, `
+        + `while the FIRST switch's POST was still held and the queued one had sent `
+        + `nothing`,
+      g2Pre, [d.s1, d.s2, d.s3], 50);
+    // ...and not merely "no landing this leg names": no focus move AT ALL.
+    // Focus was on the nav control the operator was standing on when they made
+    // the queued selection, and cancelled focus work is SILENT, so it must
+    // still be there and nothing may have taken it in between.
+    const g2Moved = g2Pre.events
+      .concat(g2Pre.samples)
+      .filter((f) => (f.id || null) !== g2Change.active.id
+        || (f.tag || null) !== g2Change.active.tag);
+    if (g2Moved.length) {
+      fail(`[${L}/G2] focus moved off ${JSON.stringify(g2Change.active)} — the `
+        + `control that legitimately held it at the queued selection — to `
+        + `${JSON.stringify(g2Moved.slice(0, 6))} while the first switch was still `
+        + `unanswered\nfocus timeline: ${JSON.stringify(traceRuns(g2PreTrace))}`);
+    }
+
+    // -- (6) RELEASE BOTH, and the silence must CONTINUE --------------------
+    // Releasing the first POST lets sendContextSwitch() dequeue straight into
+    // the queued switch, so the tuple finally moves to the THIRD Season.
+    const g2ReleaseT = await page.evaluate(() => Date.now() - window.__vagFocus.t0);
+    g2Hold.release();
+    const g2Cross = await waitForCrossing(page, "context", d.s3)
+      .catch(() => fail(`[${L}/G2] the queued switch never reached the server after `
+        + `the first POST was released — contextOptions.selected never moved to the `
+        + `third Season, so the queue was dropped rather than merely deferred`));
+    if (g2Cross.season !== d.s3) {
+      fail(`[${L}/G2] the switch confirmed on ${JSON.stringify(g2Cross.season)} `
+        + `rather than the queued third Season`);
+    }
+    await page.waitForTimeout(POLL_LIFE_MS + 700);
+    await stopFocusTrace(page);
+    const g2Trace = await readFocusTrace(page);
+    assertNoStaleFocus("G2",
+      `after both switches were released and the QUEUED one confirmed at `
+        + `${g2Cross.t}ms`,
+      { samples: g2Trace.samples.filter((s) => s.t >= g2ReleaseT),
+        events: g2Trace.events.filter((e) => e.t >= g2ReleaseT) },
+      [d.s1, d.s2, d.s3], 50);
+    const g2Out = await crossingOutcome(page);
+    if (!g2Out.atArm && !g2Out.armGone) {
+      fail(`[${L}/G2] focus was taken off the control that legitimately held it and `
+        + `moved to ${JSON.stringify(g2Out.active)} — cancelling stale focus work `
+        + `must focus NOTHING, not redirect it`
+        + `\nfocus timeline: ${JSON.stringify(traceRuns(g2Trace))}`);
+    }
+    await stopContextChangeWatch(page);
+    await g2Hold.stop();
+    await page.unroute(HIERARCHY_READS);
+    noPreviewsSince("G2");
+
     // ---- (H) the IDENTITY boundary ----------------------------------------
     // A real in-app sign-in to a DIFFERENT principal, through the app's own
     // signIn() -- the function the login form's submit handler and every demo
@@ -1735,7 +2028,7 @@ async function checkViewport(browser, viewport) {
     // is standing on survives the switch and can still legitimately hold
     // focus -- which is what makes "focus was not yanked" assertable at all.
     //
-    // QUIET FIRST. (G) deliberately ends with the page mid-reconciliation: it
+    // QUIET FIRST. (G2) deliberately ends with the page mid-reconciliation: it
     // released a held context switch, and the reload/repaint that switch
     // triggers is still fetching. Signing that session out from under those
     // in-flight reads produces 401s that belong to this file's own sequencing
@@ -1807,7 +2100,16 @@ async function checkViewport(browser, viewport) {
       + `neither #content, nor a heading, nor the departing Season's Allow picker, `
       + `nor the arriving Season's -- with the switch proven still unanswered `
       + `throughout it, and that silence continues once the request is released and `
-      + `the switch confirms. The same holds across an in-app change of principal.`);
+      + `the switch confirms. The same holds when the operator's selection only `
+      + `QUEUES: with the first switch's POST held and the navigation's poll started `
+      + `inside that in-flight window, choosing a THIRD Season on the real switcher `
+      + `takes setActiveContext's early return -- proven from the page, which shows `
+      + `the queued switch naming the third Season, the switch still in flight, the `
+      + `canonical tuple still the departing Season, and exactly one POST ever `
+      + `issued -- and still cancels that poll: nothing is focused and focus does `
+      + `not move at all across the whole window, and the silence continues once `
+      + `both switches are released and the queued one confirms. The same holds `
+      + `across an in-app change of principal.`);
   } catch (e) {
     if (serverOutput.trim()) {
       console.error("--- demo server output ---\n" + serverOutput.trim());
