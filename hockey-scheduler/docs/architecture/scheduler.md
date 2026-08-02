@@ -115,8 +115,8 @@ matchups that are genuinely still missing.**
 `_existing_pairing_games(store, division_scope)` scans every Game already
 in `division_scope` — an iterable of `(league_season_id, division_id)`
 tuples, never bare division ids — and indexes `(league_season_id,
-division_id, frozenset({home_team_id, away_team_id})) -> existing_game_id`,
-with two deliberate exemptions:
+division_id, frozenset({home_team_id, away_team_id})) -> [existing_game_id,
+…]`, with two deliberate exemptions:
 
 * a **cancelled** Game does not count — a cancelled fixture is not "on the
   calendar" and its pairing is eligible for regeneration;
@@ -157,6 +157,97 @@ id, `existing_game_id`) — visible to the operator, never silently dropped,
 and never re-proposed alongside the genuinely missing pairings. Both
 `draft_schedule` and `draft_schedule_for_league` return this key with
 identical shape.
+
+## Meetings per opponent (#375)
+
+A regular season is not always a single round robin. `constraints.
+meetings_per_opponent` (integer ≥ 1, default 1) sets how many times each
+team plays every other team; 6 teams × 3 meetings is 45 games, 15 per team.
+It is request-scoped like every other scheduler knob (`min_rest_hours`,
+`max_games_per_team_per_day`, blackouts) — validated once in
+`_normalize_constraints`, no new table and no migration — and it is
+threaded through **both** the preview and the commit, including the
+commit's own locked regeneration. Passing it to only one of those yields a
+different `draft_fingerprint` and a terminal `preview_stale`.
+
+### Deterministic home/away
+
+`round_robin_pairings(team_ids, meetings=N)` emits the base single round
+robin N times, **cycle-grouped** (ABC ABC ABC, never AABBCC — `_assign_ice`
+is greedy earliest-first, so pairing-grouped output would stack a pair's
+repeat meetings into adjacent slots), mirroring every odd-indexed cycle so
+the pair swaps ends. Orientation depends only on `sorted(team_ids)` and the
+cycle index: no clock, no randomness, no store read.
+
+* **Even N** — every pair splits exactly N/2 each way, and per-team home
+  totals come out equal.
+* **Odd N** — a pair cannot split evenly, so the extra home game goes to
+  whichever team the *base* round robin already designates as home for that
+  pair: ceil(N/2) to it, floor(N/2) to the other. For N=3 that is 2–1,
+  never 3–0.
+
+Balance is guaranteed **per pair**, not per team. Per-team home totals
+inherit whatever imbalance the single round robin already has — for 6 teams
+the base gives one team 4 home out of 5, and over odd N that carries
+through rather than cancelling (measured: 8/7/9/7/7/7 at N=3). Equalizing
+it would mean changing the N=1 output, which is pinned by existing tests
+and out of scope for #375.
+
+### Which existing games count
+
+Exactly the predicate above, unchanged — non-cancelled, in scope, and
+`game_type == "regular"`. Only the *aggregation* changed: the index value
+is now a **sorted list** of game ids rather than a single id, because once
+a pairing can legitimately be required N times, "does this pairing have a
+game" is the wrong question and "how many does it have" is the right one.
+
+The sort is load-bearing, not cosmetic. `store.all_games()` iteration order
+is not guaranteed and genuinely differs between `InMemoryStore` and
+`SqlStore` on SQLite vs PostgreSQL, and these ids reach `already_scheduled[]`,
+which is bound into `draft_fingerprint` — unsorted, identical data would
+hash differently per backend.
+
+### Fill only what is missing, idempotently
+
+`_split_already_scheduled` matches by **occurrence**: the pairing list
+already contains a pairing exactly N times, so the k-th occurrence consumes
+the k-th existing game for it. A pairing needed 3 times with 1 played game
+yields 1 `already_scheduled` row and 2 proposals. Idempotence falls out
+arithmetically — once all N exist, every occurrence is accounted, nothing
+is proposed, and a second commit creates nothing. A pairing with *more*
+games than the format requires (the operator lowered N, or games were
+hand-created) reports the first N and leaves the surplus strictly alone;
+this is a fill-only-missing feature and has no mandate to delete anything.
+
+### The commit guard counts, it does not test membership
+
+`pairing_already_scheduled` used to fire on `pairing_key in _existing_now`.
+That is wrong once repeat meetings are legal: meeting 2 of a pair is
+proposed while meeting 1 legitimately exists, so a membership test would
+refuse every valid repeat commit. All three commit-side guards are now
+count-based, via `pairing_accounted_counts()` and
+`unaccounted_pairing_row()` shared by both facades (`api/service.py` and
+`api/league_scoped_service.py` carry independent copies of the commit body,
+and the league-scoped one is what HTTP reaches — the shared helpers are
+what stop them drifting):
+
+* the per-row terminal guard refuses only when a pairing holds **more**
+  games than the reviewed proposal accounted for, still checked before the
+  physical gate so the round-4 ordering contract is preserved;
+* the locked-regeneration carve-out uses the same arithmetic, so an
+  ordinary `preview_stale` is no longer misreported as a pairing race;
+* `already_scheduled` revalidation compares an ordered **prefix** per
+  pairing — a cancellation shortens or reorders it, and a newly added game
+  sorting below a reviewed one shifts it; either is genuine staleness.
+
+At N=1 all three reduce exactly to the previous behaviour.
+
+`draft_fingerprint` also binds `meetings_per_opponent` directly. In the
+ordinary case a different N already changes the row multiset, so this is
+belt-and-braces — but it closes the degenerate scope (fewer than two teams)
+where every bucket is empty for every N, following rounds 10/12/15 in
+binding the reviewed *input* dimension rather than trusting the output to
+differ.
 
 ## Draft-then-commit workflow
 

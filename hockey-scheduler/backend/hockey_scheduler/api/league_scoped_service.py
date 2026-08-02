@@ -9,7 +9,11 @@ from datetime import datetime
 
 from ..domain import Game, IceSlotStatus
 from ..domain.errors import ConcurrencyConflictError, DomainError, ValidationError
-from ..services.scheduler import _existing_pairing_games
+from ..services.scheduler import (
+    _existing_pairing_games,
+    pairing_accounted_counts,
+    unaccounted_pairing_row,
+)
 from ..services.league_scoped_scheduler import season_candidate_rink_ids
 from ..services.league_scope import (
     require_game_league_id,
@@ -303,16 +307,17 @@ class ApiService(_BaseApiService):
                 # `preview_stale`, matching round 2/3/4's accepted contract
                 # for this scenario exactly rather than silently downgrading
                 # it just because this general recheck now runs first.
-                _raced_row = next(
-                    (row for row in proposal["draft_games"]
-                     if (draft_ls_id, row.get("division_id"),
-                         frozenset((row["home_team_id"], row["away_team_id"])))
-                     in _existing_now), None)
-                if _raced_row is not None:
-                    _raced_key = (draft_ls_id, _raced_row.get("division_id"),
-                                  frozenset((_raced_row["home_team_id"],
-                                             _raced_row["away_team_id"])))
-                    _raced_gid = _existing_now[_raced_key]
+                #
+                # #375 -- count, not membership (see the identical guard in
+                # api/service.py). Meeting 2 of a pair is proposed while
+                # meeting 1 legitimately exists, so a membership test would
+                # misreport every ordinary `preview_stale` here as a pairing
+                # race. Shared helper so the two facades cannot drift.
+                _raced = unaccounted_pairing_row(
+                    proposal["draft_games"], proposal["already_scheduled"],
+                    draft_ls_id, _existing_now)
+                if _raced is not None:
+                    _raced_row, _raced_gid = _raced
                     raise ConcurrencyConflictError(
                         f"{_raced_row['home_team_name']} vs "
                         f"{_raced_row['away_team_name']} is already "
@@ -391,16 +396,27 @@ class ApiService(_BaseApiService):
             # reviewed premise "this pairing already has Game G" no longer
             # holds, so refuse before any write exactly like any other form
             # of staleness.
+            #
+            # #375 -- ordered PREFIX per pairing, not one id per pairing (see
+            # the identical guard in api/service.py).
+            _expected_existing = {}
             for a in proposal["already_scheduled"]:
                 _as_key = (draft_ls_id, a.get("division_id"),
                            frozenset((a["home_team_id"], a["away_team_id"])))
-                if _existing_now.get(_as_key) != a["existing_game_id"]:
+                _expected_existing.setdefault(_as_key, []).append(
+                    a["existing_game_id"])
+            for _as_key, _reviewed_ids in _expected_existing.items():
+                _now_ids = list(_existing_now.get(_as_key) or ())
+                if _now_ids[:len(_reviewed_ids)] != _reviewed_ids:
                     raise ConcurrencyConflictError(
                         "This preview is out of date — a game may have "
                         "been added, cancelled, or otherwise changed since "
                         "you generated it. Generate a fresh preview and "
                         "review it before committing.",
                         {"reason": "preview_stale"})
+            # #375 -- per-pairing meetings the reviewed proposal accounted for.
+            _accounted = pairing_accounted_counts(
+                proposal["already_scheduled"], draft_ls_id)
             for row in proposal["draft_games"]:
                 # #328 review round 4 -- checked BEFORE the physical gate
                 # below, not after: a row whose pairing already has a real
@@ -415,16 +431,23 @@ class ApiService(_BaseApiService):
                 # unrelated slot collision) is not in `_existing_now` for
                 # THIS row's key and so still falls through to the
                 # unchanged physical check below.
+                #
+                # #375 -- count, not membership (see api/service.py). At N=1
+                # `_accounted` is 0 for any drafted pairing, making this
+                # literally the old `key in _existing_now`.
                 _pairing_key = (draft_ls_id, row.get("division_id"),
                                 frozenset((row["home_team_id"], row["away_team_id"])))
-                if _pairing_key in _existing_now:
+                _consumed = _accounted.get(_pairing_key, 0)
+                _accounted[_pairing_key] = _consumed + 1
+                _existing_ids = _existing_now.get(_pairing_key) or ()
+                if _consumed < len(_existing_ids):
                     # #328 review round 3 -- the message itself (not just
                     # details) must be actionable: post()'s generic toast in
                     # app.js surfaces error.message alone, never
                     # error.details, so a vague message here would leave the
                     # operator with no idea which pairing/Game raced. The
                     # proposal row already carries both team names.
-                    _existing_gid = _existing_now[_pairing_key]
+                    _existing_gid = _existing_ids[_consumed]
                     raise ConcurrencyConflictError(
                         f"{row['home_team_name']} vs {row['away_team_name']} "
                         f"is already scheduled as Game {_existing_gid} — "
