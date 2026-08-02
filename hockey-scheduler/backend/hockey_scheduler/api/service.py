@@ -62,7 +62,11 @@ from ..services import (
     parse_csv_text,
     validate_import,
 )
-from ..services.scheduler import _existing_pairing_games
+from ..services.scheduler import (
+    _existing_pairing_games,
+    raced_pairing_game_id,
+    reviewed_existing_counts,
+)
 from ..services.league_scoped_scheduler import season_candidate_rink_ids
 from ..services.league_scope import (
     require_slots_belong_to_locked_season,
@@ -4784,7 +4788,8 @@ class ApiService:
     @catch
     def draft_season_schedule(self, division_id: str = None,
                               season_id: str = None, league_id: str = None,
-                              slot_ids=None, constraints=None) -> dict:
+                              slot_ids=None, constraints=None,
+                              meetings_per_opponent=None) -> dict:
         """Generate a draft round-robin schedule for a Division, or for a
         whole League within a Season optionally narrowed to one Division
         (#84/#85, extended #233 Slice G).
@@ -4797,18 +4802,27 @@ class ApiService:
         League-wide entry point instead of ``division_id`` alone;
         ``division_id`` then optionally narrows that League-wide draft to one
         Division rather than switching to the Division-only entry point.
+
+        ``meetings_per_opponent`` (#375) is the configurable regular-season
+        format: how many times each team plays every other. Omitted (or
+        ``None``) keeps the historical single round-robin. Existing
+        non-cancelled REGULAR Games count toward the requirement — cancelled
+        and exhibition games do not — so regenerating after a partial
+        schedule proposes only the meetings still missing.
         """
         if season_id and league_id:
             return draft_schedule_for_league(
                 self.store, season_id, league_id, division_id=division_id,
-                slot_ids=slot_ids, constraints=constraints)
+                slot_ids=slot_ids, constraints=constraints,
+                meetings_per_opponent=meetings_per_opponent)
         if not division_id:
             raise ValidationError(
                 "A division_id, or a season_id and league_id, is required.")
         if self.store.get_division(division_id) is None:
             raise NotFoundError("Division not found.")
         return draft_schedule(self.store, division_id, slot_ids=slot_ids,
-                              constraints=constraints)
+                              constraints=constraints,
+                              meetings_per_opponent=meetings_per_opponent)
 
     def _team_name(self, team_id) -> Optional[str]:
         """Shared by every game DTO builder (public/draft review) so a
@@ -4927,6 +4941,7 @@ class ApiService:
                               season_id: str = None, league_id: str = None,
                               slot_ids=None, constraints=None,
                               draft_fingerprint: str = None,
+                              meetings_per_opponent=None,
                               actor_id=None) -> dict:
         """Retry shell (#318): ``placement_raced`` marks the batch's
         pre-lock scope locator invalidated by a concurrent commit; each
@@ -4936,6 +4951,11 @@ class ApiService:
         The whole body lives in ``_commit_draft_schedule_attempt``; the
         league-scoped facade overrides the attempt and inherits this
         shell.
+
+        ``meetings_per_opponent`` (#375) must be the SAME format the
+        reviewed preview was generated with — it is bound into
+        ``draft_fingerprint``, so a mismatch is refused as ``preview_stale``
+        rather than silently committing a different-sized schedule.
 
         ``draft_fingerprint`` (#328 review round 5) must be the
         ``draft_fingerprint`` returned by the ``draft_season_schedule`` call
@@ -4949,7 +4969,9 @@ class ApiService:
                     division_id=division_id, season_id=season_id,
                     league_id=league_id, slot_ids=slot_ids,
                     constraints=constraints,
-                    draft_fingerprint=draft_fingerprint, actor_id=actor_id)
+                    draft_fingerprint=draft_fingerprint,
+                    meetings_per_opponent=meetings_per_opponent,
+                    actor_id=actor_id)
             except ConcurrencyConflictError as exc:
                 if ((exc.details or {}).get("reason") != "placement_raced"
                         or _attempt == 2):
@@ -4960,6 +4982,7 @@ class ApiService:
                                        league_id: str = None,
                                        slot_ids=None, constraints=None,
                                        draft_fingerprint: str = None,
+                                       meetings_per_opponent=None,
                                        actor_id=None) -> dict:
         """Persist a generated draft as draft games (is_draft=True, unpublished),
         so they can be reviewed and then published (#86). Regenerates the
@@ -5002,7 +5025,8 @@ class ApiService:
         """
         proposal = self.draft_season_schedule(
             division_id=division_id, season_id=season_id, league_id=league_id,
-            slot_ids=slot_ids, constraints=constraints)
+            slot_ids=slot_ids, constraints=constraints,
+            meetings_per_opponent=meetings_per_opponent)
         if isinstance(proposal, dict) and proposal.get("error"):
             return proposal
         if draft_fingerprint is None:
@@ -5185,6 +5209,18 @@ class ApiService:
                  for d in proposal["draft_games"]}
                 | {(draft_ls_id, a.get("division_id"))
                    for a in proposal["already_scheduled"]})
+            # #375 — the race checks below ask "does this pairing have MORE
+            # existing Games than the reviewed proposal accounted for?",
+            # not the pre-#375 "does it have any?". With a configurable
+            # format a pairing can legitimately have K existing Games AND
+            # still be in this batch for its remaining N - K, so the bare
+            # existence test would refuse every N > 1 commit against a
+            # partially-scheduled Division. At N = 1 the reviewed count for
+            # any pairing with a draft_games row is 0 and this reduces
+            # exactly to the old predicate.
+            _reviewed_counts = reviewed_existing_counts(
+                proposal["already_scheduled"], draft_ls_id)
+            _meetings = proposal.get("meetings_per_opponent") or 1
             # #328 review round 11 finding 2 -- the checks immediately below
             # only revalidate draft_games/already_scheduled row identity and
             # participation; a team's ELIGIBILITY changing in the narrow gap
@@ -5208,7 +5244,8 @@ class ApiService:
             _locked_proposal = self.draft_season_schedule(
                 division_id=division_id, season_id=season_id,
                 league_id=league_id, slot_ids=slot_ids,
-                constraints=constraints)
+                constraints=constraints,
+                meetings_per_opponent=meetings_per_opponent)
             if _locked_proposal.get("draft_fingerprint") != draft_fingerprint:
                 # #328 review round 12 finding 1 -- a mismatch here can be
                 # fully explained by a winning exact-pairing race: one of
@@ -5221,16 +5258,19 @@ class ApiService:
                 # `preview_stale`, matching round 2/3/4's accepted contract
                 # for this scenario exactly rather than silently downgrading
                 # it just because this general recheck now runs first.
-                _raced_row = next(
-                    (d for d in proposal["draft_games"]
-                     if (draft_ls_id, d.get("division_id"),
-                         frozenset((d["home_team_id"], d["away_team_id"])))
-                     in _existing_now), None)
+                # #375 — "raced" is now a COUNT comparison, not a presence
+                # test: the pairing gained a Game beyond the ones the
+                # reviewed proposal already reported as already-scheduled.
+                _raced_gid, _raced_row = None, None
+                for d in proposal["draft_games"]:
+                    _gid = raced_pairing_game_id(
+                        _existing_now, _reviewed_counts,
+                        (draft_ls_id, d.get("division_id"),
+                         frozenset((d["home_team_id"], d["away_team_id"]))))
+                    if _gid is not None:
+                        _raced_gid, _raced_row = _gid, d
+                        break
                 if _raced_row is not None:
-                    _raced_key = (draft_ls_id, _raced_row.get("division_id"),
-                                  frozenset((_raced_row["home_team_id"],
-                                             _raced_row["away_team_id"])))
-                    _raced_gid = _existing_now[_raced_key]
                     raise ConcurrencyConflictError(
                         f"{_raced_row['home_team_name']} vs "
                         f"{_raced_row['away_team_name']} is already "
@@ -5310,10 +5350,21 @@ class ApiService:
             # reviewed premise "this pairing already has Game G" no longer
             # holds, so refuse before any write exactly like any other form
             # of staleness.
+            # #375 — two conditions, because the reviewed premise for an
+            # already-scheduled row has two halves once a pairing can hold
+            # several Games. The Game this row named must still be a live
+            # Regular fixture for this pairing (membership, replacing the
+            # pre-#375 equality against the single id a pairing could
+            # have); AND the pairing must not have gained a Game beyond the
+            # format's own requirement, which a pairing with no draft_games
+            # row of its own would otherwise have nothing checking it. At
+            # N = 1 the pair of conditions is exactly the old equality.
             for a in proposal["already_scheduled"]:
                 _as_key = (draft_ls_id, a.get("division_id"),
                            frozenset((a["home_team_id"], a["away_team_id"])))
-                if _existing_now.get(_as_key) != a["existing_game_id"]:
+                _as_now = _existing_now.get(_as_key, ())
+                if (a["existing_game_id"] not in _as_now
+                        or len(_as_now) > _meetings):
                     raise ConcurrencyConflictError(
                         "This preview is out of date — a game may have "
                         "been added, cancelled, or otherwise changed since "
@@ -5335,16 +5386,21 @@ class ApiService:
                 # unrelated slot collision) is not in `_existing_now` for
                 # THIS row's key and so still falls through to the
                 # unchanged physical check below.
+                # #375 — count comparison, not presence: this row is one of
+                # the pairing's N meetings, and the reviewed proposal
+                # already told us how many of them existing Games covered.
+                # Only a Game beyond that is a race.
                 _pairing_key = (draft_ls_id, d.get("division_id"),
                                 frozenset((d["home_team_id"], d["away_team_id"])))
-                if _pairing_key in _existing_now:
+                _existing_gid = raced_pairing_game_id(
+                    _existing_now, _reviewed_counts, _pairing_key)
+                if _existing_gid is not None:
                     # #328 review round 3 -- the message itself (not just
                     # details) must be actionable: post()'s generic toast in
                     # app.js surfaces error.message alone, never
                     # error.details, so a vague message here would leave the
                     # operator with no idea which pairing/Game raced. The
                     # proposal row already carries both team names.
-                    _existing_gid = _existing_now[_pairing_key]
                     raise ConcurrencyConflictError(
                         f"{d['home_team_name']} vs {d['away_team_name']} is "
                         f"already scheduled as Game {_existing_gid} — "

@@ -2506,12 +2506,16 @@ class Handler(BaseHTTPRequestHandler):
         # round-robin proposal for a Division, or for a whole League within a
         # Season optionally narrowed to one Division. Returns a preview only —
         # nothing is created or published.
+        # #375 — meetings_per_opponent is the configurable regular-season
+        # format (how many times each team plays every other). Omitted keeps
+        # the historical single round-robin; the facade validates it.
         if path == "/api/scheduler/draft":
             return self._send_api(api.draft_season_schedule(
                 division_id=body.get("division_id"),
                 season_id=body.get("season_id"), league_id=body.get("league_id"),
                 slot_ids=body.get("slot_ids"),
-                constraints=body.get("constraints")))
+                constraints=body.get("constraints"),
+                meetings_per_opponent=body.get("meetings_per_opponent")))
         # Draft review + publish (#86): commit a proposal to draft games, then
         # publish or discard them. All operator-only (MANAGE_SCHEDULE gate).
         # Attribute draft commit/publish/discard to the signed-in user resolved
@@ -2523,6 +2527,11 @@ class Handler(BaseHTTPRequestHandler):
                 slot_ids=body.get("slot_ids"),
                 constraints=body.get("constraints"),
                 draft_fingerprint=body.get("draft_fingerprint"),
+                # #375 — must match the format the reviewed preview used;
+                # it is bound into draft_fingerprint, so a mismatch is
+                # refused as preview_stale rather than silently committing
+                # a differently-sized schedule.
+                meetings_per_opponent=body.get("meetings_per_opponent"),
                 actor_id=user_id))
         if path == "/api/scheduler/drafts/publish":
             return self._send_api(api.publish_draft_games(
