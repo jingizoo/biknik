@@ -1873,6 +1873,10 @@ def _already_scheduled_cancel_race_proposal(store):
         "home_team_name": store.get_team("t4").name,
         "away_team_name": store.get_team("t5").name,
         "division_id": "d1", "existing_game_id": "blocking_game",
+        # The pairing held exactly this one Game when the proposal was
+        # built — the baseline the commit gate compares the fresh count
+        # against, mirroring what _split_already_scheduled emits.
+        "existing_game_count": 1,
     }]
     return {
         "division_id": "d1", "season_id": "se1", "league_id": "lg",

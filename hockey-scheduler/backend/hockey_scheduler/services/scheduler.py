@@ -747,7 +747,18 @@ def _split_already_scheduled(store, pairings, existing, league_season_id):
 
     A pair with MORE existing Games than the format requests (an
     over-scheduled pairing) simply has no remaining meetings — the surplus
-    is left unreported, never used to manufacture negative work."""
+    is left unreported, never used to manufacture negative work.
+
+    Each row also carries ``existing_game_count``: how many qualifying
+    Games the pairing held WHEN THE PROPOSAL WAS BUILT — the whole count,
+    not the capped number of rows. The commit gate's race check needs that
+    number and nothing else can supply it: the rows are capped at the
+    requested meetings, so counting them tells you ``min(K, N)`` and an
+    over-scheduled pairing is indistinguishable from a raced one. Carrying
+    it also puts the true count inside ``draft_fingerprint``, so a Game
+    gained on an over-scheduled pairing — which changes no row's
+    ``existing_game_id``, since the gained Game sorts after the ones the
+    rows already name — stops being invisible to the wide gate too."""
     remaining, already = [], []
     consumed = {}
     for home, away, division_id in pairings:
@@ -762,6 +773,7 @@ def _split_already_scheduled(store, pairings, existing, league_season_id):
                 "away_team_name": _team_name(store, away),
                 "division_id": division_id,
                 "existing_game_id": existing_ids[taken],
+                "existing_game_count": len(existing_ids),
             })
         else:
             remaining.append((home, away, division_id))

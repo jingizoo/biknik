@@ -204,11 +204,26 @@ against that index *before* `_assign_ice` ever runs. Each pair's existing
 Games are consumed one per requested meeting, in meeting order: the first
 K requested meetings (K = qualifying Games, capped at the number requested)
 become `already_scheduled[]` rows naming one existing Game each
-(home/away id + name, division id, `existing_game_id`), and only the
-surplus stays for ice assignment — visible to the operator, never silently
-dropped, and never re-proposed alongside the genuinely missing meetings.
+(home/away id + name, division id, `existing_game_id`, and
+`existing_game_count`), and only the surplus stays for ice assignment —
+visible to the operator, never silently dropped, and never re-proposed
+alongside the genuinely missing meetings.
 Both `draft_schedule` and `draft_schedule_for_league` return this key with
 identical shape.
+
+`existing_game_count` is the pairing's WHOLE qualifying-Game count at the
+moment the proposal was built, not the number of rows emitted for it. The
+distinction is load-bearing for the commit gate: rows are capped at the
+requested meetings, so counting them yields `min(K, N)` and an
+over-scheduled pairing (`K > N`) is indistinguishable from one that gained
+a Game in a race. Comparing the live count against `N` instead — which
+#382 did — refuses every commit against a Division holding a pairing with
+more Games than the format asks for (a pre-existing longer series,
+imported history, or a format later reduced), with nothing having raced at
+all. Carrying the true count also places it inside `draft_fingerprint`, so
+a Game gained on an over-scheduled pairing — which changes no row's
+`existing_game_id`, because the gained Game sorts after the ones already
+named — is no longer invisible to the wide staleness gate either.
 
 Consumption is by meeting order rather than by matching each existing
 Game's actual home/away orientation: meeting order is a total order fixed
