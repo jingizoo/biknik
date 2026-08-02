@@ -1264,8 +1264,70 @@ details.tn > .tn-sum:hover { background: #f6f7fb; }
 .swf-back { align-self: flex-start; }
 /* One primary action per screen: the demoted controls sit beside it as ghost
    buttons, and the tertiary row below as plain links. */
+/* The stable container a per-card repaint rewrites the landing's action
+   groups through (#365). Layout-transparent on purpose: .swf-landing is a
+   flex column with its own gap, and this wrapper exists for the DOM write,
+   not for layout -- `display: contents` keeps .swf-actions/.swf-tertiary as
+   direct flex children exactly as before, so nothing about the landing's
+   spacing changes. A plain <div> with no implicit role, so it carries no
+   accessibility semantics that `display: contents` could drop. */
+.swf-landing-actions { display: contents; }
 .swf-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .swf-tertiary { display: flex; flex-wrap: wrap; gap: 12px; font-size: 13px; }
 .swf-detail { border-top: 1px solid var(--sep); padding-top: 12px;
   display: flex; flex-wrap: wrap; gap: 12px; align-items: baseline; }
 .swf-detail .section-title { margin: 0; }
+
+/* Per-card state model (#365). Each workflow card's body is its own slot: a
+   retry/refresh replaces only this element, so a failed card recovering never
+   repaints (or blanks) the five beside it. The state copy below reuses the
+   already-verified color pairs from the .sp-card block at the top of this
+   file rather than introducing new, unmeasured combinations:
+   #167029-on-#e3f9e8 and #57575c-on-#ececf1 are the badge pairs that block
+   already established, and #c0271b (used there as a background under white
+   text) measures 5.9:1 as TEXT on #fff and 5.5:1 on the landing's #f4f5f8 —
+   both clear of WCAG AA for body text. */
+.swf-card-body { display: flex; flex-direction: column; gap: 8px; }
+.swf-card-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.swf-card-error { margin: 0; font-size: 13px; line-height: 1.45; color: #c0271b; }
+.swf-card-stale { margin: 0; font-size: 13px; line-height: 1.45; color: #57575c; }
+/* A write this card started is in flight (#365 review round 4). Reuses the
+   stale sentence's measured #57575c-on-#fff / #f4f5f8 pair rather than
+   introducing an unmeasured colour. It carries tabindex="-1" because focus is
+   moved onto it when the confirmation it replaced is removed, so it keeps a
+   visible focus ring — a programmatic focus destination the operator cannot
+   see is the same defect as no destination at all. */
+.swf-card-pending { margin: 0; font-size: 13px; line-height: 1.45; color: #57575c; }
+.swf-card-pending:focus-visible { outline: 2px solid var(--accent, #2563eb);
+  outline-offset: 2px; border-radius: 4px; }
+/* `.swf-card-blocked` is the PARTIAL-state counterpart of `.swf-card-empty`
+   (#365 owner ruling round 2): a card with real counts whose declared primary
+   still cannot create the next record. Deliberately shares the empty state's
+   exact declaration rather than introducing a new colour — it is the same kind
+   of explanatory sentence on the same surfaces, and the contrast pairs above
+   are the measured ones. */
+.swf-card-empty, .swf-card-done, .swf-card-blocked { margin: 0; font-size: 13px;
+  line-height: 1.45; color: var(--muted); }
+.swf-progress { margin: 0 0 12px; font-size: 13px; line-height: 1.45; }
+.sp-progress-line { margin: 8px 0 0; font-size: 13px; line-height: 1.45; }
+/* The confirmation state: the card's own prompt, in the card, rather than a
+   page-level modal — the decision belongs to this one workflow. */
+.swf-confirm { border: 1px solid var(--sep); border-radius: 10px; padding: 10px;
+  display: flex; flex-direction: column; gap: 8px; }
+.swf-confirm-prompt { margin: 0; font-size: 13px; line-height: 1.45; }
+/* A confirmation that requires a REASON (#365 review round 3): reopening an
+   archived Season is a reasoned lifecycle write (#159), so the card collects
+   the reason instead of sending one on the operator's behalf. The 16px input
+   font is the same iOS zoom-avoidance the rest of this sheet's fields use. */
+.swf-confirm-reason { font-size: 12px; font-weight: 600; color: var(--muted); }
+.swf-confirm-reason-input { width: 100%; box-sizing: border-box; font-size: 16px;
+  padding: 8px 10px; border: 1px solid var(--sep); border-radius: 8px;
+  background: var(--card); color: inherit; }
+/* Done/To-do chips share the .swf-optional pill SHAPE but deliberately not
+   its class: ".swf-optional" means Decision 9's optional workflow and nothing
+   else, on every surface and in every check that looks for it. */
+.swf-status { margin-left: auto; font-size: 11px; font-weight: 700; letter-spacing: .02em;
+  text-transform: uppercase; border: 1px solid transparent;
+  border-radius: 999px; padding: 2px 8px; }
+.swf-status.swf-done { color: #167029; background: #e3f9e8; }
+.swf-status.swf-todo { color: #57575c; background: #ececf1; }

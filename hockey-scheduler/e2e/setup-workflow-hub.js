@@ -28,6 +28,26 @@
 //    empty grid.
 //
 // Runs at desktop and canonical 390x844. Fails on any console/page error.
+//
+// ---------------------------------------------------------------------------
+// #365 COVERAGE RULING (owner), recorded here for the per-card state MATRIX
+// pass that follows this one, so it inherits the boundary rather than
+// relitigating it:
+//
+//   * `league_season` EMPTY is genuinely reachable -- a pristine install with
+//     zero Programs, which is what (3)'s "empty" phase runs on. KEEP desktop
+//     AND 390px coverage of it; it is not a synthetic state.
+//   * Workflow 6 ("Imports and onboarding") has no inventory, so its
+//     data-dependent states (LOADING/EMPTY/ERROR/STALE) are INAPPLICABLE
+//     rather than untested. What the matrix must assert about it is that it
+//     stays VISIBLE, reads OPTIONAL, is NEVER the hub's recommended next
+//     workflow, and NEVER blocks the complete state.
+//   * The unauthorized cross-workflow `open` branch (setupEffectiveAction
+//     returning no action at all) is UNREACHABLE by design -- every `open`
+//     step targets a workflow carrying the same `perm` as its source. Keep it
+//     fail-closed and assert the permission invariant at MODEL/UNIT level; do
+//     NOT build an artificial browser journey to reach it.
+// ---------------------------------------------------------------------------
 
 const { chromium } = require("playwright");
 const { spawn } = require("child_process");
@@ -45,19 +65,48 @@ const VIEWPORTS = [
 // The six workflows, their designated primary action, and where that action
 // must actually land. Kept as data so a missing/renamed workflow fails loudly
 // instead of silently reducing coverage.
+//
+// #365 owner ruling on EMPTY dead ends: "primary" is the single action that
+// resolves the state the landing is ACTUALLY in, so the designated action is
+// state-dependent and the table now carries BOTH answers.
+//
+//   emptyPrimary  what an EMPTY landing must offer on a PRISTINE install
+//                 (nothing created at all), derived from each workflow's own
+//                 prerequisite chain against live counts. This is the leg the
+//                 ruling exists for: an EMPTY landing that names what is
+//                 missing and then offers an action which cannot create it is
+//                 a dead end, and the old table asserted exactly that shape.
+//   primary       the DECLARED action, which must still be the one offered
+//                 once every prerequisite is genuinely satisfied. Asserted
+//                 unchanged, against a fully provisioned Program (see
+//                 seedFullPrerequisiteChain below) rather than against an
+//                 empty install where it was never reachable in the first
+//                 place.
+//
+// `open` in `lands` means the single action opens ANOTHER workflow's landing
+// (the missing record belongs to that workflow), which is checked by the
+// landing that is then on screen, not by a drawer or a view change.
 const WORKFLOWS = [
   { key: "league_season", title: "League profile and seasons", primary: "Add Season",
-    lands: { drawer: "season" } },
+    lands: { drawer: "season" },
+    emptyPrimary: "Add program", emptyLands: { drawer: "league" } },
   { key: "teams", title: "Permanent teams", primary: "Add Team",
-    lands: { drawer: "team" } },
+    lands: { drawer: "team" },
+    emptyPrimary: "Add a league first", emptyLands: { open: "league_season" } },
   { key: "participation", title: "Season participation and divisions",
-    primary: "Register Team", lands: { view: "setup" } },
+    primary: "Register Team", lands: { view: "setup" },
+    emptyPrimary: "Add a league first", emptyLands: { open: "league_season" } },
   { key: "roster", title: "Clubs, players and staff", primary: "Add Player",
-    lands: { drawer: "player" } },
+    lands: { drawer: "player" },
+    emptyPrimary: "Add a team first", emptyLands: { open: "teams" } },
   { key: "facilities", title: "Venues, rinks and ice", primary: "Add Ice",
-    lands: { view: "calendar" } },
+    lands: { view: "calendar" },
+    emptyPrimary: "Add venue", emptyLands: { drawer: "venue" } },
+  // Workflow 6 has no inventory of its own, so it has no EMPTY state to
+  // resolve and its declared primary is always the effective one.
   { key: "import", title: "Imports and onboarding", primary: "Import data",
-    optional: true, lands: { view: "import" } },
+    optional: true, lands: { view: "import" },
+    emptyPrimary: "Import data", emptyLands: { view: "import" } },
 ];
 
 function waitForServer(url, timeoutMs) {
@@ -110,6 +159,406 @@ async function openSetupHub(page, step) {
   await page.click('[data-setup-view="hub"]');
   await page.waitForSelector(".swf-grid", { timeout: 10000 }).catch(() => fail(
     `[${step}] the workflow index never rendered after selecting Workflows`));
+}
+
+// One pass over all six landings: summary first, EXACTLY ONE primary action,
+// that action carrying the label `expect` designates, and that action actually
+// arriving where it says. `phase` names which state the pass is asserting, so a
+// failure says whether the EMPTY answer or the provisioned one is wrong.
+async function checkLandings(page, L, phase, expect) {
+  for (const w of WORKFLOWS) {
+    const want = expect(w);
+    await openSetupHub(page, `${L}/${phase}/${w.key}`);
+    await page.waitForSelector(`[data-setup-workflow="${w.key}"]`, { timeout: 10000 });
+    await page.click(`[data-setup-workflow="${w.key}"]`);
+    await page.waitForSelector(".swf-landing", { timeout: 10000 });
+    // The card must have SETTLED before its actions mean anything: LOADING
+    // withdraws every action group by design, so sampling mid-flight would
+    // read zero primaries and blame the wrong thing.
+    await page.waitForFunction((k) =>
+      readCardState("setup/" + k).state !== "loading", w.key, { timeout: 10000 });
+
+    const landing = await page.evaluate(() => {
+      const root = document.querySelector(".swf-landing");
+      const primaries = Array.from(root.querySelectorAll(".act.primary"));
+      const stats = root.querySelector(".swf-stats");
+      const actions = root.querySelector(".swf-actions");
+      // "Summary first" is positional, not merely present: the summary must
+      // appear BEFORE the action row in document order.
+      const summaryFirst = !stats || !actions
+        ? null
+        : !!(stats.compareDocumentPosition(actions) & Node.DOCUMENT_POSITION_FOLLOWING);
+      const entry = readCardState("setup/" + root.dataset.setupWorkflowLanding);
+      return {
+        title: (root.querySelector(".swf-landing-title") || {}).textContent || "",
+        state: entry.state,
+        // The unmet prerequisite the effective action was derived from, or
+        // nothing when the declared primary IS the resolving action.
+        blockedBecause: entry.blockedBecause || null,
+        primaryCount: primaries.length,
+        primaryLabel: primaries.length ? primaries[0].textContent.trim() : null,
+        summaryFirst,
+        hasBack: !!root.querySelector("[data-setup-workflow='']"),
+        // A form on the landing would violate "one landing summary (not a
+        // form)" — the create UI belongs in the drawer the action opens.
+        hasForm: !!root.querySelector("input, select, textarea"),
+      };
+    });
+
+    // The phase must actually be the state it claims to be testing, or the
+    // assertion below is vacuous — a "provisioned" pass that silently ran
+    // against an EMPTY card would assert nothing about the declared primary.
+    if (phase === "empty" && w.key !== "import") {
+      if (landing.state !== "empty") {
+        fail(`[${L}/${phase}] "${w.title}" was expected to be EMPTY on a pristine `
+          + `install but reads "${landing.state}" — this pass is the one that `
+          + `proves an EMPTY landing offers an action that can resolve it`);
+      }
+      if (!landing.blockedBecause) {
+        fail(`[${L}/${phase}] "${w.title}" is EMPTY on a pristine install but names `
+          + `no unmet prerequisite, so the single action it offers was NOT derived `
+          + `from the chain — the dead-end this pass exists to catch`);
+      }
+    }
+    // The provisioned pass asserts the DECLARED primary, which is only the
+    // effective one when every prerequisite is genuinely satisfied. Keyed on
+    // the chain, not on the card state: "Clubs, players and staff" is
+    // legitimately still EMPTY with a Team but no Player yet, and its declared
+    // "Add Player" is exactly right there.
+    if (phase === "provisioned" && landing.blockedBecause) {
+      fail(`[${L}/${phase}] "${w.title}" still reports an unmet prerequisite `
+        + `("${landing.blockedBecause}") after seeding its whole chain, so the `
+        + `declared primary was never asserted`);
+    }
+    if (landing.primaryCount !== 1) {
+      fail(`[${L}/${phase}] "${w.title}" landing must have exactly ONE primary action, `
+        + `found ${landing.primaryCount} — the primary-action audit requires a `
+        + `single .act.primary per screen`);
+    }
+    if (landing.primaryLabel !== want.primary) {
+      fail(`[${L}/${phase}] "${w.title}" primary action is "${landing.primaryLabel}", `
+        + `the audit designates "${want.primary}" in this state`);
+    }
+    if (landing.hasForm) {
+      fail(`[${L}/${phase}] "${w.title}" landing renders a form; the landing must be a `
+        + `summary, with entry happening in the drawer its action opens`);
+    }
+    if (landing.summaryFirst === false) {
+      fail(`[${L}/${phase}] "${w.title}" renders its action row before its summary; `
+        + `the requirement is summary first, detail progressively`);
+    }
+    if (!landing.hasBack) {
+      fail(`[${L}/${phase}] "${w.title}" landing has no way back to the workflow index`);
+    }
+
+    // The designated primary action must actually arrive somewhere.
+    await page.click(".swf-landing .act.primary");
+    if (want.lands.drawer) {
+      await page.waitForSelector(".drawer[role=dialog]", { timeout: 10000 })
+        .catch(() => fail(`[${L}/${phase}] "${want.primary}" did not open the `
+          + `${want.lands.drawer} drawer`));
+      const kind = await page.evaluate(() =>
+        !!document.querySelector("[data-drawer-submit]")
+        && document.querySelector("[data-drawer-submit]").dataset.drawerSubmit);
+      if (kind !== want.lands.drawer) {
+        fail(`[${L}/${phase}] "${want.primary}" opened the "${kind}" drawer, expected `
+          + `"${want.lands.drawer}"`);
+      }
+      await page.keyboard.press("Escape");
+      await page.waitForFunction(() => !document.querySelector(".drawer"),
+        null, { timeout: 10000 }).catch(() => fail(
+          `[${L}/${phase}/${w.key}] the ${want.lands.drawer} drawer never closed on Escape`));
+    } else if (want.lands.open) {
+      // A cross-workflow effective action: the missing record belongs to
+      // another workflow, so the single action must land on THAT workflow's
+      // landing -- where the chain continues -- not merely do nothing.
+      await page.waitForFunction((k) => document.body.dataset.view === "setup"
+        && !!document.querySelector(`[data-setup-workflow-landing="${k}"]`),
+        want.lands.open, { timeout: 10000 })
+        .catch(() => fail(`[${L}/${phase}] "${want.primary}" did not open the `
+          + `"${want.lands.open}" workflow landing`));
+    } else {
+      await page.waitForFunction((v) => document.body.dataset.view === v,
+        want.lands.view, { timeout: 10000 })
+        .catch(() => fail(`[${L}/${phase}] "${want.primary}" did not reach the `
+          + `"${want.lands.view}" view`));
+    }
+  }
+}
+
+// Create ONE Program whose every workflow prerequisite is genuinely satisfied,
+// and make it the active context -- so the "provisioned" pass above asserts the
+// DECLARED primary against real records rather than against an install where
+// that primary could not have worked anyway. Named to sort AFTER the "AAA …"
+// Programs section (4b) creates, so 4b's own "Program A sorts first globally"
+// trap is untouched.
+async function seedFullPrerequisiteChain(page, L) {
+  const ids = await page.evaluate(async () => {
+    const post = async (path, body) => (await fetch(path, {
+      method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    })).json();
+    const prog = await post("/api/v2/setup/program", { name: "MMM Provisioned", country: "US" });
+    const season = await post("/api/v2/setup/season",
+      { program_id: prog.id, name: "MMM Provisioned Season" });
+    const league = await post("/api/v2/setup/league",
+      { season_id: season.id, name: "MMM Provisioned League" });
+    const team = await post("/api/v2/setup/team",
+      { league_id: league.id, name: "MMM Provisioned Team" });
+    await post("/api/v2/setup/division",
+      { league_id: league.id, season_id: season.id, name: "MMM Provisioned Division" });
+    const org = await post("/api/v2/setup/organization", { name: "MMM Provisioned Org" });
+    const venue = await post("/api/v2/setup/venue",
+      { name: "MMM Provisioned Venue", organization_id: org.id });
+    await post("/api/v2/setup/rink", { venue_id: venue.id, name: "MMM Provisioned Rink" });
+    await post(`/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
+    await post("/api/context", { program_id: prog.id, season_id: season.id });
+    return { prog: prog.id, season: season.id, league: league.id, team: team.id,
+             venue: venue.id };
+  });
+  for (const [k, v] of Object.entries(ids)) {
+    if (!v) fail(`[${L}] provisioning fixture failed to create ${k}`);
+  }
+  await page.reload();
+  await page.waitForSelector("#content", { timeout: 15000 });
+  return ids;
+}
+
+// ---------------------------------------------------------------------------
+// PARTIAL states (#365 owner ruling, round 2). EMPTY was never the whole
+// defect: a workflow with SOME records is READY, not EMPTY, and went on
+// offering its declared primary even when that action could not create the
+// next record -- "Venues, rinks and ice" with one venue and no rinks offered
+// "Add Ice", which needs a rink, with a "Rinks" link sitting beside it. A
+// nearby link does not make a dead primary action acceptable, so the effective
+// action is derived for every SETTLED card and, while a prerequisite is
+// missing, the landing exposes EXACTLY that action plus the sentence naming
+// the blocker.
+//
+// Two fixtures, because the interesting partials are mutually exclusive: a
+// Program with NO league cannot also have a division, and the Program that has
+// one cannot demonstrate the leagueless chain. Between them every one of the
+// six workflows is asserted in a partial state, blocked and unblocked.
+//
+// The records that make a workflow PARTIAL rather than EMPTY are ordinary
+// creator-owned rows the app itself creates from Records' own "+ New" (the
+// `pending_link_*` half of the setup overview -- a Club with no team yet, an
+// Official with no assignment yet, a Venue with no rink yet). They are exactly
+// how an operator reaches these states in practice: create the first record of
+// one kind before the record it hangs off exists.
+const PARTIAL_FIXTURES = [
+  // (a) A Program with a Season but NO league, holding a Club and an Official.
+  { key: "leagueless",
+    label: "a program with no league, holding a club and an official",
+    seed: async (page) => page.evaluate(async () => {
+      const post = async (path, body) => (await fetch(path, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      })).json();
+      const prog = await post("/api/v2/setup/program",
+        { name: "PPA Partial Leagueless", country: "US" });
+      const season = await post("/api/v2/setup/season",
+        { program_id: prog.id, name: "PPA Partial Season" });
+      // Everything after this is created from INSIDE the new Program's own
+      // context: the v2 setup writes are judged against the caller's ACTIVE
+      // Program (#367), and a season belonging to another Program is refused
+      // with the same not-found a nonexistent one gets.
+      await post("/api/context", { program_id: prog.id, season_id: season.id });
+      await post("/api/v2/setup/club", { name: "PPA Partial Club" });
+      await post("/api/v2/setup/official", { name: "PPA Partial Official" });
+      return { prog: prog.id, season: season.id };
+    }),
+    expect: {
+      // Programs=1 Seasons=1 Leagues=0 -- partial, and its declared primary
+      // genuinely IS the resolving action: a Season needs only a Program.
+      league_season: { blocked: false, primary: "Add Season", lands: { drawer: "season" } },
+      // Teams=0 Clubs=1 -- has a record, so not EMPTY, and "Add Team" opens a
+      // drawer whose required League select has nothing in it.
+      teams: { blocked: true, primary: "Add a league first",
+        lands: { open: "league_season" } },
+      // Players=0 Officials=1 -- the owner's named Roster case, in its PARTIAL
+      // form: an official exists, so the card is not empty, and there is still
+      // no team to add a player to.
+      roster: { blocked: true, primary: "Add a team first", lands: { open: "teams" } },
+      // No inventory at all, so never empty, never blocked, always its primary.
+      import: { blocked: false, primary: "Import data", lands: { view: "import" } },
+    } },
+  // (b) A Program with a league and a division but NO team, plus a venue with
+  // no rink.
+  { key: "teamless",
+    label: "a program with a division but no team, and a venue with no rink",
+    seed: async (page) => page.evaluate(async () => {
+      const post = async (path, body) => (await fetch(path, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      })).json();
+      const prog = await post("/api/v2/setup/program",
+        { name: "PPB Partial Teamless", country: "US" });
+      const season = await post("/api/v2/setup/season",
+        { program_id: prog.id, name: "PPB Partial Season" });
+      await post("/api/context", { program_id: prog.id, season_id: season.id });
+      const league = await post("/api/v2/setup/league",
+        { season_id: season.id, name: "PPB Partial League" });
+      await post("/api/v2/setup/division",
+        { league_id: league.id, season_id: season.id, name: "PPB Partial Division" });
+      const org = await post("/api/v2/setup/organization", { name: "PPB Partial Org" });
+      const venue = await post("/api/v2/setup/venue",
+        { name: "PPB Partial Venue", organization_id: org.id });
+      await post(`/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
+      return { prog: prog.id, season: season.id, league: league.id, venue: venue.id };
+    }),
+    expect: {
+      // Teams=0 Clubs=1 (the club from (a) is still the creator's own pending
+      // link) -- partial, and NOT blocked: this Program has a league, so "Add
+      // Team" can genuinely create one. The counterpart to the blocked Teams
+      // row above, and what keeps that row from being a blanket withdrawal.
+      teams: { blocked: false, primary: "Add Team", lands: { drawer: "team" } },
+      // Divisions=1 -- the owner's named Participation case: divisions exist,
+      // so the card is not empty, and there is no permanent team to register.
+      participation: { blocked: true, primary: "Add a team first",
+        lands: { open: "teams" } },
+      roster: { blocked: true, primary: "Add a team first", lands: { open: "teams" } },
+      // Venues=1 Rinks=0 -- THE case the ruling names verbatim.
+      facilities: { blocked: true, primary: "Add rink", lands: { drawer: "rink" } },
+    } },
+];
+
+async function checkPartials(page, L) {
+  const seen = new Set();
+  for (const fx of PARTIAL_FIXTURES) {
+    const ids = await fx.seed(page);
+    for (const [k, v] of Object.entries(ids)) {
+      if (!v) fail(`[${L}/partial/${fx.key}] fixture failed to create ${k}`);
+    }
+    // Clear the hash BEFORE the reload: boot's restoreContextDeepLink() treats
+    // a leftover "#ctx=" as an intentional deep link and would re-apply the
+    // PREVIOUS fixture's Program over the one the seed just persisted -- the
+    // same trap (3b) already documents where it hands (4b) its starting
+    // conditions.
+    await page.evaluate(() =>
+      history.replaceState(null, "", location.pathname + location.search));
+    await page.reload();
+    await page.waitForSelector("#content", { timeout: 15000 });
+
+    for (const [key, want] of Object.entries(fx.expect)) {
+      seen.add(key);
+      const w = WORKFLOWS.find((x) => x.key === key);
+      await openSetupHub(page, `${L}/partial/${fx.key}/${key}`);
+      await page.click(`[data-setup-workflow="${key}"]`);
+      await page.waitForSelector(".swf-landing", { timeout: 10000 });
+      await page.waitForFunction((k) =>
+        readCardState("setup/" + k).state !== "loading", key, { timeout: 10000 });
+
+      const got = await page.evaluate((k) => {
+        const root = document.querySelector(".swf-landing");
+        const entry = readCardState("setup/" + k);
+        const box = root.querySelector("[data-setup-landing-actions]");
+        const note = root.querySelector(".swf-card-blocked");
+        return {
+          state: entry.state,
+          stats: (entry.stats || []).map((s) => ({ label: s.label, n: s.n })),
+          blockedBecause: entry.blockedBecause || null,
+          // EVERY control the landing offers, not just the primaries: "expose
+          // exactly that action" is a claim about the whole action area, and a
+          // demoted "Rinks" link left standing beside a substituted primary is
+          // precisely what the ruling rejects.
+          buttons: box ? Array.from(box.querySelectorAll("button"))
+            .map((b) => b.textContent.trim()) : [],
+          note: note ? note.textContent.replace(/\s+/g, " ").trim() : null,
+        };
+      }, key);
+
+      // The state must actually BE partial, or every assertion below is a
+      // statement about some other state. READY with at least one non-zero
+      // count is what "partial" means: real records, and still an unfinished
+      // workflow. (Workflow 6 has no inventory at all and is exempt -- it is
+      // READY with no stats by construction.)
+      if (got.state !== "ready") {
+        fail(`[${L}/partial/${fx.key}] "${w.title}" reads "${got.state}" on `
+          + `${fx.label}, expected READY -- this pass exists to assert the `
+          + `PARTIAL state, and against any other state it asserts nothing`);
+      }
+      if (key !== "import" && !got.stats.some((s) => s.n > 0)) {
+        fail(`[${L}/partial/${fx.key}] "${w.title}" has no non-zero count `
+          + `(${JSON.stringify(got.stats)}), so it is not the PARTIAL state this `
+          + `fixture is supposed to create`);
+      }
+      if (!!got.blockedBecause !== want.blocked) {
+        fail(`[${L}/partial/${fx.key}] "${w.title}" blockedBecause is `
+          + `${JSON.stringify(got.blockedBecause)}, expected `
+          + `${want.blocked ? "an unmet prerequisite" : "none"} `
+          + `(counts ${JSON.stringify(got.stats)})`);
+      }
+      if (got.buttons[0] !== want.primary) {
+        fail(`[${L}/partial/${fx.key}] "${w.title}" offers "${got.buttons[0]}" first, `
+          + `the audit designates "${want.primary}" in this partial state`);
+      }
+      if (want.blocked) {
+        // EXACTLY that action: the demoted groups are withdrawn while a
+        // prerequisite is missing, so a dead primary can never be excused by a
+        // link beside it.
+        if (got.buttons.length !== 1) {
+          fail(`[${L}/partial/${fx.key}] "${w.title}" is blocked on `
+            + `"${got.blockedBecause}" but offers ${got.buttons.length} controls `
+            + `(${JSON.stringify(got.buttons)}) -- while a prerequisite is missing `
+            + `the landing must expose exactly the one action that resolves it`);
+        }
+        // ...together with the explanation. Asserted as CONTAINMENT of the
+        // model's own sentence, so the copy and the control can never describe
+        // different problems.
+        if (!got.note || got.note.indexOf(got.blockedBecause) === -1) {
+          fail(`[${L}/partial/${fx.key}] "${w.title}" substitutes an action but its `
+            + `card body does not carry the blocker sentence `
+            + `("${got.blockedBecause}"); read "${got.note}"`);
+        }
+      } else if (got.buttons.length < 2) {
+        // The converse, so the withdrawal above cannot pass by withdrawing
+        // everything everywhere: an UNBLOCKED partial keeps its demoted
+        // actions. Every workflow named in an `expect` block with
+        // `blocked: false` declares at least one demoted action in app.js.
+        fail(`[${L}/partial/${fx.key}] "${w.title}" is not blocked but offers only `
+          + `${JSON.stringify(got.buttons)} -- an unblocked landing keeps its `
+          + `demoted actions`);
+      }
+
+      // ...and the one action actually arrives where it says.
+      await page.click(".swf-landing .act.primary");
+      if (want.lands.drawer) {
+        await page.waitForSelector(".drawer[role=dialog]", { timeout: 10000 })
+          .catch(() => fail(`[${L}/partial/${fx.key}] "${want.primary}" did not open `
+            + `the ${want.lands.drawer} drawer`));
+        const kind = await page.evaluate(() =>
+          !!document.querySelector("[data-drawer-submit]")
+          && document.querySelector("[data-drawer-submit]").dataset.drawerSubmit);
+        if (kind !== want.lands.drawer) {
+          fail(`[${L}/partial/${fx.key}] "${want.primary}" opened the "${kind}" drawer, `
+            + `expected "${want.lands.drawer}"`);
+        }
+        await page.keyboard.press("Escape");
+        await page.waitForFunction(() => !document.querySelector(".drawer"),
+          null, { timeout: 10000 });
+      } else if (want.lands.open) {
+        await page.waitForFunction((k) => document.body.dataset.view === "setup"
+          && !!document.querySelector(`[data-setup-workflow-landing="${k}"]`),
+          want.lands.open, { timeout: 10000 })
+          .catch(() => fail(`[${L}/partial/${fx.key}] "${want.primary}" did not open `
+            + `the "${want.lands.open}" workflow landing`));
+      } else {
+        await page.waitForFunction((v) => document.body.dataset.view === v,
+          want.lands.view, { timeout: 10000 })
+          .catch(() => fail(`[${L}/partial/${fx.key}] "${want.primary}" did not reach `
+            + `the "${want.lands.view}" view`));
+      }
+    }
+  }
+  // Every workflow is covered by one fixture or the other -- so a workflow
+  // quietly dropped from both tables fails here instead of reducing coverage.
+  for (const w of WORKFLOWS) {
+    if (!seen.has(w.key)) {
+      fail(`[${L}/partial] workflow "${w.key}" is in no partial-state fixture; `
+        + `the ruling covers all six`);
+    }
+  }
 }
 
 async function checkViewport(browser, viewport) {
@@ -180,78 +629,35 @@ async function checkViewport(browser, viewport) {
     }
 
     // ---- (3)+(4) each landing: summary first, ONE primary, real destination
-    for (const w of WORKFLOWS) {
-      await openSetupHub(page, `${L}/${w.key}`);
-      await page.waitForSelector(`[data-setup-workflow="${w.key}"]`, { timeout: 10000 });
-      await page.click(`[data-setup-workflow="${w.key}"]`);
-      await page.waitForSelector(".swf-landing", { timeout: 10000 });
+    // Run TWICE (#365): once on the pristine install every landing is EMPTY
+    // on, where the designated action is the one that resolves THAT emptiness,
+    // and once against a fully provisioned Program, where it is the declared
+    // primary. Same assertions both times; only the expected action differs,
+    // which is exactly the property the ruling adds.
+    await checkLandings(page, L, "empty", (w) => ({
+      primary: w.emptyPrimary, lands: w.emptyLands }));
 
-      const landing = await page.evaluate(() => {
-        const root = document.querySelector(".swf-landing");
-        const primaries = Array.from(root.querySelectorAll(".act.primary"));
-        const stats = root.querySelector(".swf-stats");
-        const actions = root.querySelector(".swf-actions");
-        // "Summary first" is positional, not merely present: the summary must
-        // appear BEFORE the action row in document order.
-        const summaryFirst = !stats || !actions
-          ? null
-          : !!(stats.compareDocumentPosition(actions) & Node.DOCUMENT_POSITION_FOLLOWING);
-        return {
-          title: (root.querySelector(".swf-landing-title") || {}).textContent || "",
-          primaryCount: primaries.length,
-          primaryLabel: primaries.length ? primaries[0].textContent.trim() : null,
-          summaryFirst,
-          hasBack: !!root.querySelector("[data-setup-workflow='']"),
-          // A form on the landing would violate "one landing summary (not a
-          // form)" — the create UI belongs in the drawer the action opens.
-          hasForm: !!root.querySelector("input, select, textarea"),
-        };
-      });
+    // ---- (3b) the declared primary, once its prerequisites really exist ---
+    await seedFullPrerequisiteChain(page, L);
+    await checkLandings(page, L, "provisioned", (w) => ({
+      primary: w.primary, lands: w.lands }));
 
-      if (landing.primaryCount !== 1) {
-        fail(`[${L}] "${w.title}" landing must have exactly ONE primary action, `
-          + `found ${landing.primaryCount} — the primary-action audit requires a `
-          + `single .act.primary per screen`);
-      }
-      if (landing.primaryLabel !== w.primary) {
-        fail(`[${L}] "${w.title}" primary action is "${landing.primaryLabel}", `
-          + `the audit designates "${w.primary}"`);
-      }
-      if (landing.hasForm) {
-        fail(`[${L}] "${w.title}" landing renders a form; the landing must be a `
-          + `summary, with entry happening in the drawer its action opens`);
-      }
-      if (landing.summaryFirst === false) {
-        fail(`[${L}] "${w.title}" renders its action row before its summary; `
-          + `the requirement is summary first, detail progressively`);
-      }
-      if (!landing.hasBack) {
-        fail(`[${L}] "${w.title}" landing has no way back to the workflow index`);
-      }
+    // ---- (3c) the PARTIAL states between those two (#365 round 2) --------
+    // Neither pass above can see this: (3) runs on an install with nothing at
+    // all, (3b) on one where every prerequisite is satisfied. The states an
+    // operator actually spends setup in are in between -- some records, some
+    // missing -- and that is where a declared primary can be dead while the
+    // card is READY rather than EMPTY.
+    await checkPartials(page, L);
 
-      // The designated primary action must actually arrive somewhere.
-      await page.click(".swf-landing .act.primary");
-      if (w.lands.drawer) {
-        await page.waitForSelector(".drawer[role=dialog]", { timeout: 10000 })
-          .catch(() => fail(`[${L}] "${w.primary}" did not open the ${w.lands.drawer} drawer`));
-        const kind = await page.evaluate(() =>
-          !!document.querySelector("[data-drawer-submit]")
-          && document.querySelector("[data-drawer-submit]").dataset.drawerSubmit);
-        if (kind !== w.lands.drawer) {
-          fail(`[${L}] "${w.primary}" opened the "${kind}" drawer, expected `
-            + `"${w.lands.drawer}"`);
-        }
-        await page.keyboard.press("Escape");
-        await page.waitForFunction(() => !document.querySelector(".drawer"),
-          null, { timeout: 10000 }).catch(() => fail(
-            `[${L}/${w.key}] the ${w.lands.drawer} drawer never closed on Escape`));
-      } else {
-        await page.waitForFunction((v) => document.body.dataset.view === v,
-          w.lands.view, { timeout: 10000 })
-          .catch(() => fail(`[${L}] "${w.primary}" did not reach the `
-            + `"${w.lands.view}" view`));
-      }
-    }
+    // Hand (4b) the same starting conditions it had before this leg existed:
+    // no context deep link in the URL. (4b) establishes its context with a raw
+    // /api/context POST followed by a reload, which is only equivalent to an
+    // operator's own switch while the hash is empty -- boot's
+    // restoreContextDeepLink() treats a leftover hash as an intentional deep
+    // link and re-applies THIS leg's Program over the one (4b) just persisted.
+    await page.evaluate(() =>
+      history.replaceState(null, "", location.pathname + location.search));
 
     // ---- (4b) PERSISTED two-Program / two-Season context binding ---------
     // The defect this exists for: these secondary create actions have a parent
@@ -281,6 +687,18 @@ async function checkViewport(browser, viewport) {
       // genuinely has no Season, since /api/context auto-selects one whenever
       // the chosen Program has any.
       const pC = await post("/api/v2/setup/program", { name: "ZZZ Ctx Program C", country: "US" });
+      // One EXISTING division under the active season's own league. #365
+      // makes a landing's demoted actions state-dependent -- an EMPTY card
+      // (the "Season participation and divisions" card counts divisions, so
+      // zero of them IS empty) offers only its one authorized primary action,
+      // so the "Divisions" secondary this leg drives is not on an empty
+      // landing. Seeding one division does NOT weaken what follows: the
+      // assertion is about where the NEXT division the drawer commits is
+      // PERSISTED, and the trap (drawerField()'s first-global-row fallback,
+      // which points at Program A's league) is untouched by an existing row
+      // in Program B.
+      await post("/api/v2/setup/division",
+        { league_id: l2.id, season_id: s2.id, name: "ZZZ Existing Division S2" });
       return { pA: pA.id, sA: sA.id, lA: lA.id, pB: pB.id, pC: pC.id,
                s1: s1.id, s2: s2.id, l1: l1.id, l2: l2.id };
     });
@@ -293,6 +711,30 @@ async function checkViewport(browser, viewport) {
         body: JSON.stringify({ program_id, season_id }),
       });
     }, [fx.pB, fx.s2]);
+    // One permanent Team under the ACTIVE season's league, created from INSIDE
+    // Program B's own context -- #367 requires a Team's League to belong to the
+    // CALLER'S ACTIVE Program, so this cannot be seeded above alongside the
+    // Programs themselves.
+    //
+    // Why it is needed at all (#365 round 2): the state-dependence of a
+    // landing's demoted actions now extends from EMPTY to any settled card with
+    // an UNMET PREREQUISITE, and "Season participation and divisions" holding a
+    // division with no team to register is exactly that -- it offers only the
+    // one action that resolves it ("Add a team first") and withdraws the
+    // "Divisions" secondary this leg drives. Satisfying the chain for real is
+    // what puts that control back. It does NOT weaken what follows: the trap is
+    // drawerField()'s first-GLOBAL-row fallback pointing at Program A's league,
+    // and a Team in Program B leaves both the fallback and the assertion (where
+    // the NEXT division is PERSISTED) untouched.
+    const teamB = await page.evaluate(async (league_id) => (await fetch(
+      "/api/v2/setup/team", {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ league_id, name: "ZZZ Ctx Team S2" }),
+      })).json(), fx.l2);
+    if (!teamB || teamB.error || !teamB.id) {
+      fail(`[${L}] could not seed Program B's permanent team: ${JSON.stringify(teamB)}`);
+    }
     await page.reload();
     await page.waitForSelector("#content", { timeout: 15000 });
 
@@ -453,6 +895,35 @@ async function checkViewport(browser, viewport) {
     }, [fx.pB, fx.s2]);
     await page.reload();
     await page.waitForSelector("#content", { timeout: 15000 });
+    // One venue + rink, granted into the ACTIVE season, before opening the
+    // landing. #365 makes a landing's demoted actions state-dependent, and
+    // this workflow's card counts venues and rinks -- with none of either the
+    // card is EMPTY and offers only its one authorized primary action, so the
+    // Rink/Ice-slot controls this leg is about are not on the landing to
+    // click. What the leg asserts is unchanged and still exactly as strong:
+    // an OFFERED control must open a real drawer rather than being
+    // permanently-failing decoration. Uses the same public endpoints
+    // dashboard-season-ceiling.js already seeds venues through.
+    const facilitiesSeed = await page.evaluate(async ([season_id]) => {
+      const post = async (path, body) => (await fetch(path, {
+        method: "POST", credentials: "same-origin",
+        headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      })).json();
+      const org = await post("/api/v2/setup/organization", { name: "ZZZ Facilities Org" });
+      const venue = await post("/api/v2/setup/venue",
+        { name: "ZZZ Facilities Venue", organization_id: org.id });
+      if (venue.error) return { error: `venue create failed: ${JSON.stringify(venue.error)}` };
+      const granted = await post(`/api/v2/setup/seasons/${season_id}/venue-access`,
+        { venue_id: venue.id });
+      if (!granted || granted.error) {
+        return { error: `venue-access grant failed: ${JSON.stringify(granted)}` };
+      }
+      const rink = await post("/api/v2/setup/rink",
+        { venue_id: venue.id, name: "ZZZ Facilities Rink" });
+      if (rink.error) return { error: `rink create failed: ${JSON.stringify(rink.error)}` };
+      return { venue: venue.id, rink: rink.id };
+    }, [fx.s2]);
+    if (facilitiesSeed.error) fail(`[${L}] ${facilitiesSeed.error}`);
     await openSetupHub(page, `${L}/facilities-live`);
     await page.click('[data-setup-workflow="facilities"]');
     await page.waitForSelector(".swf-landing", { timeout: 10000 });
@@ -519,9 +990,20 @@ async function checkViewport(browser, viewport) {
       + `records mega-page; all six workflows are present with only "Imports and `
       + `onboarding" marked optional; every landing is summary-first, form-free, `
       + `has a way back, and carries exactly one primary action matching the `
-      + `primary-action audit; each of those six actions reaches its designated `
-      + `drawer or view; and the Hierarchy and Records sub-views remain reachable `
-      + `with Records still opening real create drawers.`);
+      + `primary-action audit -- twice over: on a pristine install every landing `
+      + `is EMPTY and its one action is the one that can actually resolve that `
+      + `emptiness (naming the unmet prerequisite, jumping to the workflow that `
+      + `owns it where that is another one), and against a fully provisioned `
+      + `Program it is the declared primary; three times over counting the `
+      + `PARTIAL pass, where every one of the six is READY with real records and `
+      + `the four that can be blocked there (teams/participation/roster/`
+      + `facilities) offer EXACTLY the action that resolves the missing `
+      + `prerequisite, with the sentence naming it and their demoted controls `
+      + `withdrawn, while the unblocked partials keep theirs; each of those `
+      + `actions reaches its `
+      + `designated drawer, view or workflow landing; and the Hierarchy and `
+      + `Records sub-views remain reachable with Records still opening real `
+      + `create drawers.`);
   } catch (e) {
     if (serverOutput.trim()) {
       console.error("--- demo server output ---\n" + serverOutput.trim());

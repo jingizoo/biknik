@@ -149,17 +149,14 @@ let gCheckout = null;        // {jid, game_id} while a junior's "Can't Play" con
 let gOpp = null;             // {jid, game_id} of the junior's opportunity detail open
 let gOppDetail = null;       // fetched detail payload for gOpp
 let activityExpandedBatches = new Set();  // import_batch_ids expanded in Activity (#102)
-let setupProgress = null;  // fetched /api/v2/setup/progress payload, Home/Tasks hub (#330)
-let setupProgressError = false;  // the fetch above failed (distinct from "no data")
-// Discards a stale /api/v2/setup/progress response (#330 review round 1
-// finding 4): a NEWER render() call — e.g. after a context switch — may
-// already have committed its own result while an OLDER call's fetch is
-// still in flight. No existing generation-counter/AbortController
-// convention exists elsewhere in this file to reuse (the closest precedent,
-// the CSV import flow's snapshot-before/compare-after style, depends on
-// re-derivable DOM form state that doesn't fit a server-resolved context
-// fetch), so a minimal monotonic sequence number is used directly instead.
-let setupProgressFetchSeq = 0;
+// Home/Tasks and Setup card state lives in the per-card store (#365 —
+// cardStates/cardGenerations, further down). It replaced the three
+// page-wide values that used to sit here: `setupProgress`,
+// `setupProgressError` and the single `setupProgressFetchSeq` counter that
+// guarded the whole setup-progress fetch. One counter for a whole surface
+// cannot express "this ONE card's retry superseded this ONE card's earlier
+// request", and one payload + one error boolean cannot express "this card
+// failed while its neighbours are fine" — both of which #365 requires.
 let setupView = "hub";  // "hub" | "hierarchy" | "records" — Setup sub-view
 // (#165; "hub" added by #345 batch 2). The workflow hub is the DEFAULT route
 // into Setup: the undifferentiated mega-page must not be the only way in.
@@ -401,6 +398,28 @@ async function post(p, b) {
   if (d && d.error) { toast = d.error.message; toastIsError = true; }
   return d;
 }
+// The same transport as post(), minus its GLOBAL toast writes — for a write
+// whose outcome belongs to ONE card rather than to the page (#365).
+//
+// post() publishes the server's error message into the sitewide toast the
+// instant its own await resolves, which is a mutation of the CURRENT tuple
+// performed by a response that may already be superseded: the operator can
+// have switched Program/Season while the POST was in flight, and an older
+// tuple's failure would then speak over the new one. A card-scoped write has
+// to be able to decide, AFTER re-checking its identity, whether that message
+// is allowed to be said at all — so this hands the outcome back and says
+// nothing itself. Callers announce through announceCardStatus(), which is
+// identity-gated like every other mutation point.
+async function postScoped(p, b) {
+  try {
+    return await readApiResponse(await fetch(p, { method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(b || {}) }));
+  } catch (_) {
+    return networkErrorResult();
+  }
+}
 
 // Shared write-order logic for moving a season registration to a new
 // League/Division (#233 B2b review) — used by BOTH Season participation's
@@ -548,6 +567,743 @@ function nextUpcomingGame(games) {
     .slice().sort((a, b) => new Date(a.start_time) - new Date(b.start_time))[0] || null;
 }
 
+/* ---------- Per-card state model (#365) ---------- */
+// Home/Tasks and each of the six Setup workflow cards/landings own their
+// state SEPARATELY, per context tuple — not as the one page-wide pair
+// (`setupProgress` + `setupProgressError`, behind the single page-wide
+// `setupProgressFetchSeq`) that this replaces. #365, verbatim: "Model state
+// per workflow/card and per context tuple, not as one page-wide boolean. A
+// retry should replace only the failed card generation. A response for an
+// older Program/Season/League tuple or older retry generation must be
+// discarded before it mutates DOM, focus, announcements, completion, or
+// next-task selection."
+//
+// TWO orthogonal, explicitly discriminated axes — deliberately not collapsed
+// into one enum:
+//
+//   CARD_STATE   the card's own data lifecycle. Every value is a decision the
+//                code MADE, never something inferred from a missing payload
+//                field: EMPTY means "resolved, and there is nothing here yet"
+//                (and carries its own `reason`), ERROR means "this card's own
+//                fetch failed", STALE means "held data whose context tuple is
+//                no longer the active one".
+//   CARD_STATUS  the workflow's own done/todo/OPTIONAL axis, which the
+//                BACKEND owns — get_setup_progress emits `status: "optional"`
+//                for Workflow 6 (api/service.py). Folding it into CARD_STATE
+//                would make "this card's fetch failed" and "this step is
+//                optional" mutually exclusive, which they are not: Workflow 6
+//                is optional whether its card is loading, ready, stale or
+//                errored.
+const CARD_STATE = Object.freeze({
+  LOADING: "loading",   // a request for this card is in flight
+  READY: "ready",       // resolved, with data to show
+  EMPTY: "empty",       // resolved, and there is genuinely nothing here yet
+  STALE: "stale",       // held data bound to a context tuple that is no longer active
+  ERROR: "error",       // this card's own fetch failed; retry is scoped to it
+  CONFIRM: "confirm",   // an in-card confirmation is awaiting the operator
+  // A WRITE this card itself started is in flight. Distinct from LOADING,
+  // which is a READ: a read can be superseded and forgotten, whereas an
+  // unresolved write has already left the browser and its outcome is not yet
+  // known. The card therefore keeps its counts, offers NO control (a second
+  // press would fire a second write), and holds keyboard focus itself rather
+  // than letting the replaced confirmation drop focus to <body>. Terminal in
+  // one direction only: the write's own response — verified still current —
+  // is what moves it, never a render that happens to run.
+  PENDING: "pending",
+  SUCCESS: "success",   // resolved, and this card's work is complete
+});
+const CARD_STATUS = Object.freeze({
+  DONE: "done", TODO: "todo", OPTIONAL: "optional",
+  UNKNOWN: "unknown",   // no progress payload for this card (yet, or by role)
+});
+
+// The outcome of a READ a card model depends on — the third axis, and the one
+// #365 review round 2 finding 3 says was missing: "Carry an explicit progress
+// outcome into the model." A transport that turns its own failure into `null`
+// FAILS OPEN, because every later reader is then free to read that `null` as
+// "nothing to report, carry on" — which is exactly how a failed
+// /api/v2/setup/progress could still produce a READY card, an UNKNOWN status
+// and a retry that announced "updated". `null` cannot be told apart from
+// "this role may not read it" or "the backend had nothing to say"; an
+// asserted outcome can. #365 verbatim: "Use explicit discriminated states
+// rather than inferring state from missing payload fields."
+const CARD_READ = Object.freeze({
+  OK: "ok",                       // the read happened; its payload is authoritative
+  FAILED: "failed",               // the read was attempted and it failed
+  UNAUTHORIZED: "unauthorized",   // not attempted: this role may not read it
+});
+
+// Card ids — the first component of the identity record below. Setup's six
+// reuse the SAME keys `SETUP_WORKFLOWS` declares and the backend's
+// get_setup_progress reports, so a card can never be identified one way in
+// the model and another way anywhere else.
+const HOME_TASKS_CARD = "home/setup-progress";
+function setupWorkflowCardId(key) { return `setup/${key}`; }
+
+// card id -> newest generation issued for THAT card, and card id -> its
+// committed model. One counter per card (not one per surface, which is
+// exactly what `setupProgressFetchSeq` was) is what lets a retry supersede
+// only its own card's earlier request. Same snapshot-before-the-await /
+// re-check-after idiom as contextRevision, contextSwitchSeq, iceOperationSeq
+// and importOperationSeq elsewhere in this file, narrowed from "the page" to
+// "this card".
+const cardGenerations = {};
+const cardStates = {};
+
+// ========== THE AUTHENTICATED-PRINCIPAL / SESSION EPOCH (#365 round 7) ======
+// The three axes above -- card, context tuple, generation -- describe WHAT is
+// on screen. None of them describes WHO IS LOOKING AT IT, and that omission is
+// this round's defect, verbatim from the review:
+//
+//   "The ledger and card identity survive an authenticated-user change, so the
+//   departing user's delayed operation response can mutate the next user's UI
+//   and disclose the departing user's typed reason. resetTransientUiState()
+//   invalidates other identity-scoped UI state but does not invalidate
+//   cardWrites, cardStates, or cardGenerations; the card identity contains
+//   only card + Program/Season/League + generation, not the authenticated
+//   principal/session epoch. Because the ledger refuses the arriving user's
+//   render for the same tuple, the departing identity's generation also
+//   remains current."
+//
+// That last sentence is the sting. The round-6 serialization rule is what
+// KEEPS the departing identity current: beginCardRequest() refuses every
+// request for a card with an unresolved write and leaves cardGenerations
+// untouched, so the arriving principal's own renders cannot advance the
+// counter past the departing principal's operation. Generation equality --
+// the one thing cardIdentityCurrent() had left to judge by -- therefore says
+// "still current" precisely when the person in front of the browser has
+// changed. Reproduced through the app's own no-reload signIn()/setUser() path:
+// A holds a reopen with the reason "first write held", the operator switches
+// in-app to Admin B on the SAME persisted Program/archived Season, and A's 503
+// lands while currentUser.username === "second_admin" -- turning B's card into
+// CONFIRM carrying A's exact reason, A's error text, A's focus move and A's
+// toast. With a lower-privileged arriving role it also restores a control that
+// role is not authorized to exercise.
+//
+// WHY THE FIX IS NOT "DELETE THE LEDGER ON AN IDENTITY CHANGE". The ledger
+// entry conflates two facts that have DIFFERENT OWNERS AND DIFFERENT LIFETIMES,
+// and they have to be split:
+//
+//   (1) SERIALIZATION BOOKKEEPING -- "a write is in flight against this card
+//       and this target tuple". This is a fact about the SERVER, not about the
+//       view or the viewer. It must survive a principal change untouched, or
+//       the round-6 A -> B -> A duplicate-write hole reopens while A's request
+//       is still live and its transaction may still commit. It is
+//       epoch-INDEPENDENT: ANY principal, the arriving one included, is
+//       blocked from starting a second write for that card+tuple.
+//       currentCardWrite() and therefore beginCardRequest() deliberately ask
+//       no question whatsoever about who is signed in.
+//
+//   (2) THE PRIVATE PAYLOAD -- the held PENDING model, the operator's typed
+//       reason, the server's error text, the focus target. This belongs to THE
+//       PRINCIPAL WHO TYPED IT. It is epoch-SCOPED and must never be visible
+//       to, restorable by, or consumed as the UI outcome of another principal.
+//
+// So on a principal change the record KEEPS (1) and DROPS (2). The arriving
+// principal sees a card that is non-actionable -- otherwise the duplicate
+// write returns -- carrying NO text the departing principal entered: no
+// reason, no error, no focus move, no toast, and no hint that anything was
+// typed at all. foreignCardWriteModel() below is that neutral presentation,
+// and resetTransientUiState() destroys the real payload rather than merely
+// hiding it.
+//
+// THE EPOCH IS CLIENT-SIDE and needs no server field or new endpoint.
+// setUser() already fires resetTransientUiState() on exactly the transition
+// that matters (its `prevId !== nextId` guard), and that one transition covers
+// both no-reload paths the regression requires: the demo role-switcher / login
+// form calling signIn(), and a real sign-out followed by a sign-in. A page
+// reload starts a fresh document with an empty ledger and empty card state, so
+// it needs no epoch at all.
+let uiIdentityEpoch = 1;
+
+// WHO a card identity belongs to.
+//
+// Two halves, and the epoch is the authoritative one: it separates two
+// consecutive SESSIONS of the same username -- a real sign-out followed by the
+// same person signing back in -- which a username comparison alone cannot see.
+// The principal is compared as well so that any future path which swapped
+// `currentUser` WITHOUT going through resetTransientUiState() would still be
+// caught, rather than silently inheriting the previous operator's live
+// operations.
+function cardPrincipalId() { return currentUser ? currentUser.username : null; }
+function cardIdentitySamePrincipal(identity) {
+  if (!identity) return false;
+  return identity.epoch === uiIdentityEpoch
+    && identity.principal === cardPrincipalId();
+}
+
+// What the ARRIVING principal is shown for a card whose unresolved write
+// belongs to a DEPARTED one. Non-actionable (PENDING withdraws every control
+// on both surfaces -- setupCardBodyHtml and setupLandingActions -- and sets
+// aria-busy), `status: UNKNOWN` so the hub roll-up counts nothing it cannot
+// see, and no `stats`, because even the counts were read under the departing
+// principal's permissions.
+//
+// The copy describes only THIS CARD'S OWN AVAILABILITY. It deliberately does
+// not name the operation, the operator or the reason: "this season is being
+// reopened" would itself disclose what the previous operator did, and the
+// requirement is that B not learn even that A typed anything.
+const FOREIGN_CARD_WRITE_NOTE = "This card is waiting on the server. It can't"
+  + " be changed until that finishes.";
+function foreignCardWriteModel() {
+  return { state: CARD_STATE.PENDING, status: CARD_STATUS.UNKNOWN,
+           pendingNote: FOREIGN_CARD_WRITE_NOTE };
+}
+
+// card id -> target tuple -> an UNRESOLVED WRITE this card started, and the
+// enforcement behind the PENDING declaration above. That declaration says a
+// pending card is "terminal in one direction only: the write's own response —
+// verified still current — is what moves it, never a render that happens to
+// run." Nothing enforced it: commitSetupWorkflowCards() issued a fresh
+// generation and committed a newly fetched model for EVERY workflow on an
+// ordinary Setup render, so re-entering the Facilities destination under the
+// unchanged Program/Season superseded a live write's identity, restored
+// "Reopen this season", and let the operator fire a SECOND reopen POST for the
+// same Season while the first was still unresolved. A declared invariant
+// standing in for an enforced one is not an invariant.
+//
+// ============================ THE SERIALIZATION RULE ======================
+// An unresolved card write is an OPERATION-level state. While the ledger holds
+// an entry for this card AGAINST THE TUPLE THAT IS CURRENT NOW:
+//
+//  (1) REFUSED, not repainted. Every request for that card is refused
+//      OUTRIGHT by beginCardRequest(), which returns null WITHOUT touching
+//      cardGenerations. The generation never advances, so the pending
+//      identity stays current, its committed model, aria-busy and focus
+//      target stay exactly as the write left them, and its eventual response
+//      still passes cardIdentityCurrent(). Repainting the pending body back
+//      afterwards would NOT be equivalent: the generation would already have
+//      moved, and the write's own response would then be discarded as stale
+//      even though the server may well have committed it.
+//
+//  (2) ONLY ITS OWN SETTLEMENT ENDS IT. Nothing gets past the gate in (1) —
+//      there is no exempting token — because the registration is released by
+//      settleCardWrite() at the single point after the operation's own await,
+//      and only then does its terminal handling run. Settlement is
+//      unconditional and comes before every return on that path, so an
+//      operation cannot end without its record ending with it.
+//
+//  (3) NO SECOND USER-INITIATED WRITE. Every other operation entry point —
+//      the confirmation opener, its resolver, the per-card retry — is refused
+//      by the same gate. That is defence in depth behind the surfaces
+//      themselves: the CARD BODY paints no control in PENDING
+//      (setupCardBodyHtml) and the LANDING withdraws all three action groups
+//      (setupLandingActions), so there is nothing for a pointer to hit and
+//      nothing for the keyboard to reach in the first place.
+//
+//  (4) A DIFFERENT TUPLE RENDERS NORMALLY. currentCardWrite() looks the
+//      registration up UNDER THE TUPLE THAT IS CURRENT NOW, so a switched-to
+//      Program/Season finds none of its own and paints its card with its own
+//      generations exactly as it always did — while the registration made
+//      against the tuple the operator left goes on existing.
+//
+// ================ WHAT LEAVING THE TUPLE DOES *NOT* DO ====================
+// It does not end the operation, and the previous round of this comment said
+// it did. It called such a write "ABANDONED", dropped its registration, and
+// argued that discarding the eventual response "is the right outcome and not
+// a gap". That conflated two different facts, and only the first of them was
+// true:
+//
+//   * TRUE: the RESPONSE must be discarded when it arrives into a tuple the
+//     operator has moved on from. Applying it would paint one Season's
+//     outcome under another Season's heading — the race legs 2 and 3 of
+//     setup-card-write-identity.js exist for.
+//
+//   * FALSE: that this makes leaving harmless. Navigation cancelled NOTHING.
+//     The HTTP request is still in flight and the server transaction behind
+//     it may still commit. Discarding the response protects the UI; it does
+//     nothing whatever about the live write.
+//
+// So dropping the registration on tuple mismatch destroyed the only record
+// that the operation existed, and a short round trip — A, to B, back to A,
+// all before the first response settles — restored the mutation: the card
+// re-rendered READY with "Reopen this season" actionable, and confirming
+// again issued a SECOND concurrent lifecycle write against the same Season
+// while the outcome of the first was still unknown. Duplicated lifecycle and
+// audit effects, and a UI reasoning from neither write.
+//
+// ================== THE LEDGER: KEYED BY CARD *AND TARGET* =================
+// `cardWrites` is therefore an UNRESOLVED-OPERATION LEDGER, two levels deep:
+//
+//     cardWrites[cardId][cardTupleKey(target tuple)] -> entry
+//
+// and the second level is the whole correction. An operation belongs to a
+// CARD AND THE TUPLE/SEASON IT TARGETS, and ITS LIFETIME IS THE REQUEST'S,
+// NOT THE VIEW'S. Nothing about which tuple happens to be on screen creates
+// or destroys an entry:
+//
+//   * REGISTERED when the PENDING model commits (commitCardState), against
+//     the identity's own tuple, carrying the exact PENDING model so the
+//     presentation can be REBUILT after a round trip has destroyed the DOM
+//     and overwritten cardStates with the other tuple's model.
+//   * READ BY CURRENT TUPLE (currentCardWrite) — so B is free and A is
+//     blocked, at the same time, from the same ledger. A refusal that were
+//     global-by-card would freeze B, which is not the rule.
+//   * RELEASED ONLY BY SETTLEMENT (settleCardWrite), at the one point after
+//     the request's own await, on EVERY path — including the path where the
+//     initiating UI identity has gone stale, which is precisely the path a
+//     happy-path-only drain leaves blocked forever.
+//
+// A card with an entry for the CURRENT tuple reads as PENDING through
+// readCardState() whatever cardStates holds, so returning to the target of an
+// unresolved write repaints the non-actionable pending presentation rather
+// than a settled card with a live control on it.
+const cardWrites = {};
+
+// The three #345 axes as one comparable key. The Season axis is IN it, so
+// "card + target tuple" and "card + target Season" are the same lookup for
+// every write this file performs — each names the SELECTED Season as its
+// target. The entry carries `target` as well, mirroring the id the write
+// actually put in its URL, so a future card that reopened some OTHER Season
+// would have the explicit target to key on instead of inheriting it.
+// NUL-joined because ids are opaque strings and any printable separator could
+// in principle occur inside one.
+function cardTupleKey(t) {
+  return `${(t && t.program_id) || ""}\u0000${(t && t.season_id) || ""}`
+    + `\u0000${(t && t.league_id) || ""}`;
+}
+
+// The unresolved write registered for `cardId` AGAINST THE TUPLE THAT IS
+// CURRENT NOW, or null.
+//
+// It deliberately does NOT delete anything. The line that used to live here —
+// `if (!cardTupleCurrent(held)) { delete cardWrites[cardId]; return null; }` —
+// is the round-6 defect itself: it answered "no unresolved write" correctly
+// for the switched-to tuple, but paid for that answer by forgetting the
+// operation, so coming back found nothing to be blocked by. Answering by
+// LOOKUP gives the same freedom to B without costing A its record.
+//
+// IT ALSO ASKS NOTHING ABOUT WHO IS SIGNED IN, and that is deliberate (#365
+// round 7). This is half (1) of the split above -- SERIALIZATION BOOKKEEPING,
+// a fact about the server. Adding an epoch condition here would answer "no
+// unresolved write" to the arriving principal and hand them back an actionable
+// control against a Season whose first write is still in flight: exactly the
+// duplicate-write hole round 6 closed, re-opened through a different door. The
+// epoch governs half (2), the PRIVATE PAYLOAD, and it is applied at the
+// readers (readCardState) and at the identity gate (cardIdentityCurrent) --
+// never here.
+function currentCardWrite(cardId) {
+  const ledger = cardWrites[cardId];
+  if (!ledger) return null;
+  return ledger[cardTupleKey(currentCardTuple())] || null;
+}
+
+// Open the ledger entry for `identity`'s operation, holding the PENDING model
+// it committed. Called from commitCardState alone, so "the card is PENDING"
+// and "an operation is registered" are the same event and cannot disagree.
+function registerCardWrite(identity, model) {
+  const ledger = cardWrites[identity.card] || (cardWrites[identity.card] = {});
+  ledger[cardTupleKey(identity)] = {
+    card: identity.card, identity: identity,
+    // The tuple this operation TARGETS — the key, spelled out — and the
+    // Season its URL names. Both are the identity's, captured before the
+    // await, never re-read from live context afterwards.
+    tuple: { program_id: identity.program_id, season_id: identity.season_id,
+             league_id: identity.league_id },
+    target: identity.season_id,
+    // What the card must be rebuilt as while this stays unresolved. The round
+    // trip repaints from readCardState(), and by then cardStates holds the
+    // OTHER tuple's model — so the pending presentation has to come from here
+    // or it does not come at all.
+    //
+    // THIS FIELD IS THE PRIVATE PAYLOAD — half (2) of the split (#365 round
+    // 7). It carries the operator's typed reason (`confirmReason`), this
+    // card's counts read under their permissions, and the confirmation they
+    // would be handed back. It belongs to `identity.principal` in
+    // `identity.epoch` and to nobody else: readCardState() substitutes
+    // foreignCardWriteModel() for any other principal, and
+    // resetTransientUiState() overwrites it outright so the text stops
+    // existing rather than merely stops being rendered. Everything ELSE in
+    // this entry is half (1) and survives a principal change untouched.
+    model: model,
+  };
+}
+
+// SETTLEMENT — the one and only place a registration is released, and the
+// reason the ledger cannot leak. Keyed by the identity's OWN tuple, not by
+// the current one, so it drains identically whether the operator is standing
+// on the target or three switches away from it. Returns the entry (so the
+// caller can tell a real settlement from a double one) or null.
+function settleCardWrite(identity) {
+  const ledger = identity && cardWrites[identity.card];
+  if (!ledger) return null;
+  const key = cardTupleKey(identity);
+  const entry = ledger[key];
+  // Identity equality, not just key equality: only THIS operation's own
+  // response may retire THIS operation's registration.
+  if (!entry || entry.identity !== identity) return null;
+  delete ledger[key];
+  if (!Object.keys(ledger).length) delete cardWrites[identity.card];
+  return entry;
+}
+
+// The active context tuple (#345's three axes). Read from
+// contextOptions.selected — the CONFIRMED selection, not a switch merely
+// attempted: setActiveContext() bumps contextRevision the instant a switch
+// starts but only updates `selected` once its POST succeeds, so a response
+// that resolves during that window is still answering for the tuple that is
+// genuinely on screen, and discarding it there would throw away good data.
+// A failed switch leaves the tuple untouched and nothing goes stale; a
+// successful one updates it before its own re-render, so the next commit
+// binds to the new tuple and everything held under the old one reads stale.
+function currentCardTuple() {
+  const sel = (contextOptions && contextOptions.selected) || {};
+  return { program_id: sel.program_id || null,
+           season_id: sel.season_id || null,
+           league_id: sel.league_id || null };
+}
+
+// Issue the identity a request must still match to be allowed to change
+// anything. Owner-specified shape: workflow/card id + the exact context tuple
+// (program_id, season_id, league_id) + the request generation. Captured
+// BEFORE the vulnerable `await` and re-checked after it at EVERY mutation
+// point — a stale response that skips the DOM write but still moves focus or
+// re-announces is the same defect.
+//
+// Returns null when the serialization rule above REFUSES the request: the
+// LEDGER holds an unresolved operation for THIS CARD AGAINST THE TUPLE THAT
+// IS CURRENT RIGHT NOW. That pairing is the rule, and both halves of it
+// matter: keyed on the card alone the refusal would freeze the switched-to
+// Program/Season as well, which is not the guarantee; keyed on "the write
+// whose tuple still happens to be active" — the old currentCardWrite() — the
+// registration was destroyed by merely looking from somewhere else, so a
+// round trip back to the target found nothing left to refuse.
+//
+// The refusal is taken BEFORE the counter moves, so a refused caller leaves
+// no trace at all — that is what makes the pending identity survive an
+// ordinary render rather than merely be painted back over a generation that
+// has already advanced past the write. Every call site treats null as "do
+// nothing"; commitCardState, repaintSetupWorkflowCard, announceCardStatus and
+// focusCardTarget all refuse a null identity on their own account too.
+//
+// There is no "resolving" token any more, and there must not be one: the
+// registration is released by SETTLEMENT (settleCardWrite, at the single
+// point after the operation's own await) rather than handed forward to the
+// one caller allowed past a still-standing gate. A token only works on the
+// paths that remember to carry it, and the path this round is about — the
+// response landing while the initiating identity is stale — is exactly the
+// one that would not have carried it.
+//
+// The record carries the AUTHENTICATED PRINCIPAL AND SESSION EPOCH too (#365
+// round 7). Card + tuple + generation describes what is on screen; it says
+// nothing about who is looking at it, and under the serialization rule the
+// generation cannot even move while a write is unresolved — so without the
+// epoch a departing operator's response arrives looking perfectly current to
+// the arriving one. The refusal above is still epoch-INDEPENDENT: any
+// principal is blocked from starting a second write for a card+tuple that has
+// one outstanding.
+function beginCardRequest(cardId, opts) {
+  const t = currentCardTuple();
+  if (currentCardWrite(cardId)) return null;
+  cardGenerations[cardId] = (cardGenerations[cardId] || 0) + 1;
+  return { card: cardId, program_id: t.program_id, season_id: t.season_id,
+           league_id: t.league_id, generation: cardGenerations[cardId],
+           epoch: uiIdentityEpoch, principal: cardPrincipalId(),
+           // Whether a person asked for this load (a Retry/Refresh press), as
+           // opposed to a routine render-driven one. Only an operator-
+           // initiated load is allowed to move focus or announce — a routine
+           // refresh that did either would be a spurious repeat, not news.
+           userInitiated: !!(opts && opts.userInitiated) };
+}
+
+// THE gate. True only when `identity` was issued to THE PRINCIPAL AND SESSION
+// THAT IS SIGNED IN NOW, is still the newest request for its own card, AND the
+// context tuple it was issued under is still the active one. Everything that a
+// response could change — DOM, focus, announcement, completion, next-task
+// selection — asks this first.
+//
+// The principal check is FIRST and is not a formality (#365 round 7). It is
+// the only one of the three that can fail on an authenticated-user change: the
+// tuple is per-user persisted and two operators can legitimately be on the
+// same Program/Season, and the generation cannot advance at all while the
+// serialization rule is refusing this card's requests. Drop it and a departing
+// operator's delayed response passes every remaining test and mutates the
+// arriving operator's card — model, DOM, focus, live region, completion and
+// next task — with the departing operator's own typed text.
+//
+// WHICH PATHS ACTUALLY DEPEND ON IT — named, because a guard credited with a
+// protection nothing exercises is the same defect as a missing one (#365 round
+// 10). This line is LOAD-BEARING for the card's READS, which ask no principal
+// question of their own anywhere:
+//
+//   retrySetupWorkflowCard()  — the per-card Retry/Refresh. Its four post-await
+//     mutation points (the model commit, repaintSetupWorkflowCard,
+//     announceCardStatus, focusCardTarget) are gated on this function alone.
+//   loadSetupProgressCard()   — the Home/Tasks card. Same shape: the model
+//     commit, the combined DOM+announcement gate and the focus move.
+//   restorePendingCardWriteFocus() — passes the LEDGER entry's identity to
+//     focusCardTarget, and that entry deliberately survives a principal change.
+//
+// It is NOT what protects the card's WRITE. reopenSelectedSeasonFromCard() asks
+// cardIdentitySamePrincipal() DIRECTLY on its own post-await line, before this
+// gate is consulted, and routes a foreign-principal response into the silent
+// reconcile — so on that path this test is reached only for an identity that
+// has already passed the same question. Say so plainly rather than let leg 7's
+// coverage read as coverage of this line: deleting it left the whole write
+// journey green, which is why the regression for it races a READ instead.
+// e2e/setup-card-write-identity.js leg 9 holds the per-card refresh's own
+// /api/v2/setup/overview across an in-app principal change and releases it
+// inside the post-auth/pre-render window — where no render of the arriving
+// principal's has run, so the generation counter has not moved and generation
+// equality still says "current". Removing this one line makes that leg fail on
+// all four points: the departing operator's "Venues, rinks and ice updated."
+// is spoken into the arriving principal's live region, their model is
+// committed, their card body is repainted, and focus is pulled onto the
+// landing heading.
+function cardIdentityCurrent(identity) {
+  if (!identity) return false;
+  if (!cardIdentitySamePrincipal(identity)) return false;  // #365 identity gate — principal/session epoch
+  if (cardGenerations[identity.card] !== identity.generation) return false;
+  const t = currentCardTuple();
+  return identity.program_id === t.program_id
+    && identity.season_id === t.season_id
+    && identity.league_id === t.league_id;
+}
+
+// Staleness is a TUPLE question, not a generation one — deliberately a
+// different predicate from cardIdentityCurrent() above. Held data goes stale
+// when the operator moves to another Program/Season/League, NOT merely
+// because a refresh for the same context happens to be in flight; answering
+// the second question with the first would flash every card to "stale" on
+// every ordinary reload.
+//
+// IT IS ALSO DELIBERATELY PRINCIPAL-FREE (#365 round 7), and this is the one
+// place where folding the epoch in would be actively WRONG. The post-await
+// branch in reopenSelectedSeasonFromCard() uses this predicate to ask "is the
+// operator standing on the tuple this write targets" — and the correction for
+// this round requires that when the ARRIVING principal is on that tuple, the
+// card is reconciled from fresh server truth rather than left alone. If this
+// predicate answered "no" merely because the principal changed, that branch
+// would return early and the arriving principal would be left looking at the
+// neutral pending presentation with nothing to replace it. The epoch decides
+// WHOSE UI STATE MAY BE USED (cardIdentityCurrent, readCardState); the tuple
+// decides WHICH SEASON IS ON SCREEN. They are different questions.
+//
+// Every caller that passes a HELD model's identity here is nonetheless safe,
+// because it obtains that model through readCardState(), which substitutes a
+// principal-neutral model (carrying no identity at all) for a foreign entry —
+// so `cardTupleCurrent(held.identity)` is false for the arriving principal by
+// way of the reader, not by way of this predicate.
+function cardTupleCurrent(identity) {
+  if (!identity) return false;
+  const t = currentCardTuple();
+  return identity.program_id === t.program_id
+    && identity.season_id === t.season_id
+    && identity.league_id === t.league_id;
+}
+
+// The ONE writer. Refuses outright when the response's identity is no longer
+// current, so a late loser never becomes the card's stored model in the first
+// place. Every downstream mutation point re-checks as well — this is only
+// where the corruption would otherwise begin, not the whole guard.
+function commitCardState(identity, next) {
+  if (!cardIdentityCurrent(identity)) return false;   // #365 identity gate — model commit
+  // `identity` last, so a `next` cloned from a previous entry can never carry
+  // that entry's older identity through into the new commit.
+  cardStates[identity.card] = Object.assign({}, next, { identity: identity });
+  // Committing PENDING is what REGISTERS the unresolved operation, here rather
+  // than at the writer, so the operation-level state and the card-level state
+  // can never disagree about whether a write is outstanding: a card is
+  // PENDING exactly when there is a registered operation for it, by
+  // construction. The model just stored travels into the ledger, because it is
+  // what the card has to be REBUILT as if the operator leaves this tuple and
+  // comes back — by then cardStates holds the other tuple's model instead.
+  if (next && next.state === CARD_STATE.PENDING) {
+    registerCardWrite(identity, cardStates[identity.card]);
+  }
+  return true;
+}
+
+// What a renderer paints. Downgrades any held model whose tuple is no longer
+// active to STALE — #365's "keep the last successful data visible only when
+// the stale contract calls for it, clearly labelled stale with an actionable
+// refresh path" — rather than silently painting one Program's numbers under
+// another Program's heading. A LOADING entry is left alone: it has no data to
+// mislabel, and a fresher commit is already on its way.
+//
+// AN UNRESOLVED OPERATION AGAINST THE CURRENT TUPLE OUTRANKS cardStates
+// ENTIRELY. Returning to the target of a write that has not settled has to
+// repaint the non-actionable pending presentation, and by then there is
+// nothing left to repaint it FROM: the round trip destroyed the DOM, and the
+// renders that ran under the other tuple overwrote cardStates with that
+// tuple's model. So the pending model is reconstructed from the LEDGER, which
+// is the only thing that survived — and every reader of a card's state goes
+// through this one function, so the card body, the landing's action groups,
+// aria-busy and the hub roll-up all agree with the operation rather than with
+// whatever the last render left behind.
+//
+// AND IT IS WHERE THE PRIVATE PAYLOAD IS WITHHELD (#365 round 7). Every
+// surface that paints a card — the body, the landing's action groups, the
+// status chip, aria-busy, the hub roll-up, the confirmation opener and its
+// resolver — reads through this one function, so a single substitution here
+// covers all of them and no call site has to remember. The two epoch-scoped
+// sources are both handled:
+//
+//   * THE LEDGER'S HELD MODEL. The entry itself survives an authenticated-user
+//     change (it is serialization bookkeeping, half (1)), so the card stays
+//     non-actionable for the arriving principal — but the model it carries is
+//     half (2) and is replaced by the neutral one. The arriving principal
+//     learns that this card is busy with the server; nothing else.
+//   * A COMMITTED cardStates ENTRY. resetTransientUiState() already destroys
+//     these on an identity change, so this branch should be unreachable — and
+//     it is asserted anyway, because "a stale cardStates entry from the
+//     departing principal read under the arriving one is the same leak by
+//     another route" (the review names cardStates and cardGenerations
+//     alongside cardWrites). LOADING is the honest answer: this principal has
+//     not read this card yet, and the render already under way commits their
+//     own model within the same pass.
+function readCardState(cardId) {
+  const outstanding = currentCardWrite(cardId);
+  if (outstanding) {
+    return cardIdentitySamePrincipal(outstanding.identity)
+      ? outstanding.model : foreignCardWriteModel();
+  }
+  const entry = cardStates[cardId];
+  if (!entry) return { state: CARD_STATE.LOADING, status: CARD_STATUS.UNKNOWN };
+  if (!cardIdentitySamePrincipal(entry.identity)) {
+    return { state: CARD_STATE.LOADING, status: CARD_STATUS.UNKNOWN };
+  }
+  if (entry.state !== CARD_STATE.LOADING && !cardTupleCurrent(entry.identity)) {
+    return Object.assign({}, entry, { state: CARD_STATE.STALE, staleFrom: entry.state });
+  }
+  return entry;
+}
+
+// (3) live-region announcement, for the surfaces that have no live region of
+// their own. Routes through the ONE existing sitewide region — #toast-root,
+// `role="status" aria-live="polite"` in index.html, driven by updateToast() —
+// rather than minting a second one per card, so a confirmation or a success
+// is spoken exactly once. The Home/Tasks card deliberately does NOT use this:
+// #sp-card-slot is already its own polite live region, so settling it is what
+// speaks there, and adding a toast would be the same sentence twice.
+function announceCardStatus(identity, message, isError) {
+  if (!cardIdentityCurrent(identity)) return false;   // #365 identity gate — announcement
+  toast = message;
+  toastIsError = !!isError;
+  updateToast();
+  return true;
+}
+
+// (3b) THE SAME ANNOUNCEMENT, WHEN THE THING BEING ANNOUNCED NAVIGATES.
+//
+// #365 requires confirmation and success announcements to reach the live
+// region "without duplicate speech". Workflow 6's confirmation completes by
+// LEAVING this surface (it opens the guided Initial Setup wizard), and every
+// navigation goes through switchTab(), which sets `toast = ""` and calls
+// render() -> updateToast(). Announcing first and navigating second therefore
+// wrote the completion sentence into the region and withdrew it again inside
+// ONE synchronous task -- before the browser painted, and before any
+// accessibility update could be delivered. The region was populated and empty
+// again in the same frame: not duplicate speech, no speech at all.
+//
+// Announcing on BOTH sides of the transition would be the duplicate the very
+// same clause forbids. So the sentence is written exactly ONCE, AFTER the
+// destination has rendered: `navigate` runs first and the announcement lands
+// when it settles -- past switchTab()'s own render() and past any awaited
+// destination load -- so nothing left in that transition clears it again, and
+// it is still standing a task and a paint later.
+//
+// THE IDENTITY IS CHECKED BEFORE THE NAVIGATION, deliberately. It answers "is
+// this still the operator's own current, unsuperseded confirmation", which is
+// a question about the moment they confirmed. The destination's own render
+// legitimately issues fresh requests for these cards and supersedes this
+// generation on the way -- reading that as "a stale response tried to
+// announce" would silently drop the very sentence this exists to deliver.
+function announceCardStatusAfter(identity, message, navigate) {
+  if (!cardIdentityCurrent(identity)) return Promise.resolve(false);  // #365 identity gate
+  return Promise.resolve(navigate()).then(() => {
+    toast = message;
+    toastIsError = false;
+    updateToast();
+    return true;
+  });
+}
+
+// (2) focus. Moves keyboard focus onto `el`, using the same tabindex="-1"
+// convention focusContentHeading() uses for a non-focusable destination
+// heading — but never stamping tabindex on a control that is already
+// focusable, which would pull it out of the sequential tab order. Refuses for
+// a superseded identity: a late loser that skipped the DOM write but still
+// yanked focus out of whatever the operator moved on to is the same defect
+// the DOM guard exists to prevent.
+function focusCardTarget(identity, el) {
+  if (!cardIdentityCurrent(identity)) return false;   // #365 identity gate — focus
+  if (!el) return false;
+  if (!el.hasAttribute("tabindex")
+      && !/^(BUTTON|A|INPUT|SELECT|TEXTAREA)$/.test(el.tagName)) {
+    el.setAttribute("tabindex", "-1");
+  }
+  el.focus();
+  return true;
+}
+
+// Structural optionality for Workflow 6 (Decision 9 / #365). `optional` is a
+// PARTITION of the workflow list, not a flag each call site is trusted to
+// remember: `required` is the ONLY list the completion and next-task
+// derivations are ever handed, so generic logic cannot count the optional
+// workflow even by accident. Derived from the BACKEND's own `status`
+// ("optional" — api/service.py get_setup_progress), never from a title, key
+// or list position.
+function partitionSetupWorkflows(rows) {
+  const workflows = (rows || []).map((w) => Object.assign({}, w, {
+    status: w.status === CARD_STATUS.DONE ? CARD_STATUS.DONE
+      : w.status === CARD_STATUS.OPTIONAL ? CARD_STATUS.OPTIONAL
+      : CARD_STATUS.TODO,
+    optional: w.status === CARD_STATUS.OPTIONAL,
+  }));
+  return {
+    workflows: workflows,
+    required: workflows.filter((w) => !w.optional),
+    optional: workflows.filter((w) => w.optional),
+  };
+}
+
+// The Setup progress read, as ONE asserted record instead of a payload that
+// may or may not be there (#365 review round 2 finding 3). Every consumer is
+// handed this — never a bare payload and never `null` — so "the status read
+// failed" is a value the model can switch on rather than an absence a reader
+// has to guess about. Frozen, and it carries its own partition, so no caller
+// can re-partition the same rows a second, differently.
+//
+// `byKey` is deliberately EMPTY for anything but OK: a failed or unattempted
+// read has no rows, and manufacturing one from a previous read is precisely
+// the "retain old completion/next" the correction forbids.
+function setupProgressRead(outcome, payload) {
+  const part = partitionSetupWorkflows(
+    outcome === CARD_READ.OK ? (payload && payload.workflows) : null);
+  const byKey = {};
+  part.workflows.forEach((row) => { byKey[row.key] = row; });
+  return Object.freeze({ outcome: outcome, part: part, byKey: byKey });
+}
+// A COMPLETED /api/v2/setup/progress fetch, classified once. getJSON()
+// resolves to `{error}` for a transport or HTTP failure (readApiResponse /
+// networkErrorResult), so this is the single place that turns that into an
+// asserted outcome — instead of the two call sites that each independently
+// wrote `pr && !pr.error ? pr : null` and lost the distinction.
+function setupProgressReadOf(payload) {
+  return setupProgressRead(
+    payload && !payload.error ? CARD_READ.OK : CARD_READ.FAILED, payload);
+}
+
+// (4) completion and (5) next-task, over a partition. Both read `required`
+// only — the optional partition is not in that list at all, which is what
+// makes "Workflow 6 never blocks completion and is never the next
+// recommendation" structural rather than a special case someone could forget.
+// `remaining` is deliberately a count of REQUIRED work, so the copy the card
+// renders says something an operator can act on.
+function setupWorkflowCompletion(part) {
+  const done = part.required.filter((w) => w.status === CARD_STATUS.DONE);
+  return { total: part.required.length, done: done.length,
+           remaining: part.required.length - done.length,
+           allDone: part.required.length > 0 && done.length === part.required.length };
+}
+// The next recommendation, in the fixed #204 workflow order. Only ever drawn
+// from `required`; an optional workflow cannot be returned because it is not
+// in the list being searched.
+function nextRequiredWorkflow(part) {
+  return part.required.find((w) => w.status !== CARD_STATUS.DONE) || null;
+}
+
 /* ---------- Home/Tasks hub setup-progress card (#204/#330) ---------- */
 // The hub's single primary action (§4 of the operator-UX requirements): a
 // dynamic "Continue setup" naming the actual next incomplete Setup workflow
@@ -561,11 +1317,138 @@ function nextUpcomingGame(games) {
 // permitted but blocked on the Season (no Season resolved, or the resolved
 // one archived) surfaces as actionable guidance instead — `next_blocked` —
 // never a CTA that would just fail. Renders the required success state
-// once the WHOLE Program's setup is done (`complete`); renders nothing if
-// there's simply nothing left for THIS role to act on AND nothing blocked
-// to explain either, while other, not-this-role's workflows remain (three
-// different claims — see get_setup_progress's docstring).
-function renderSetupProgressCard(progress, hadError, loading) {
+// once the WHOLE Program's setup is done (`complete`); renders the named
+// EMPTY state — its own heading, status sentence and explanation, and no
+// control — when there's simply nothing left for THIS role to act on AND
+// nothing blocked to explain either, while other, not-this-role's workflows
+// remain (three different claims — see get_setup_progress's docstring).
+//
+// #365: the payload is turned into an explicit discriminated model FIRST
+// (buildTasksCardModel below) and the renderer only ever switches on
+// `model.state`. Nothing downstream re-reads the raw response or infers a
+// state from an absent field, which is what let "no data" and "the fetch
+// failed" look alike before.
+function buildTasksCardModel(payload) {
+  if (!payload || payload.error) {
+    return { state: CARD_STATE.ERROR, status: CARD_STATUS.UNKNOWN,
+             error: (payload && payload.error && payload.error.message) || null };
+  }
+  // Two DIFFERENT empty answers, discriminated by `reason` rather than left
+  // to a `!progress.program_id` test at the render site. Naming them as
+  // states is what lets renderSetupProgressCard give each its OWN heading,
+  // status sentence and explanation (#365): "no_program" means no Program
+  // exists or resolves for this operator at all, "nothing_actionable" means a
+  // Program IS resolved and this role's visible slice of it has nothing left
+  // to do — a claim that deliberately says nothing about workflows this role
+  // cannot see (#331 review round 3 finding 1 / round 5 finding 3). An empty
+  // answer is something the model asserts, not something the renderer infers
+  // from a missing field, and neither reason is silent any more.
+  if (!payload.program_id) {
+    return { state: CARD_STATE.EMPTY, reason: "no_program", status: CARD_STATUS.UNKNOWN };
+  }
+  const part = partitionSetupWorkflows(payload.workflows);
+  // (5) next-task selection. The backend's recommendation is authoritative
+  // about which workflow is next (it alone knows role permissions and Season
+  // prerequisites), but it is ADMITTED here only if it is not optional —
+  // resolved through the same partition, so "Workflow 6 is never the next
+  // recommendation" holds on the client too, structurally, without a key or
+  // title check. An unrecognized key stays admitted: a workflow the payload
+  // named as `next` but did not include in `workflows` is not evidence that
+  // it is optional.
+  const nextRow = payload.next
+    ? (part.workflows.find((w) => w.key === payload.next.key) || null) : null;
+  const next = payload.next && !(nextRow && nextRow.optional) ? payload.next : null;
+  // (4) completion. `complete` stays the SERVER's claim — it is computed
+  // there over the FULL, unfiltered workflow list and is deliberately `null`
+  // for a role whose visible slice is narrower (get_setup_progress: a partial
+  // view can never truthfully verify a whole-Program claim). Re-deriving it
+  // from the visible rows here would manufacture exactly the overclaim that
+  // `null` exists to prevent. The client's OWN completion arithmetic is
+  // `progress` below, which is explicitly scoped to the workflows this role
+  // can see and reads the `required` partition only.
+  const model = { part: part, progress: setupWorkflowCompletion(part),
+                  program: payload.program, next: next,
+                  nextBlocked: payload.next_blocked || null,
+                  status: CARD_STATUS.UNKNOWN };
+  if (payload.complete === true) return Object.assign(model, { state: CARD_STATE.SUCCESS });
+  if (next || model.nextBlocked) return Object.assign(model, { state: CARD_STATE.READY });
+  return Object.assign(model, { state: CARD_STATE.EMPTY, reason: "nothing_actionable" });
+}
+
+// Client-side completion copy for this card (#365), derived from the
+// `required` partition only. Rendered under the workflow list so an operator
+// can see how much REQUIRED work is left without having to work out for
+// themselves that the optional row does not count towards it.
+function tasksProgressLine(model) {
+  const p = model.progress;
+  if (!p || !p.total || !model.part) return "";
+  const optionalNote = model.part.optional.length
+    ? ` ${esc(model.part.optional.map((w) => w.label).join(", "))} is optional and never blocks completion.`
+    : "";
+  return `<p class="muted sp-progress-line">${p.done} of ${p.total} required
+    setup workflow${p.total === 1 ? "" : "s"} done.${optionalNote}</p>`;
+}
+
+// The workflow rows this card shows — extracted (#365 review round 2 finding
+// 4) so the STALE state can render the SAME retained rows it says it is
+// preserving, rather than a banner claiming data that isn't on screen. Rows
+// are read-only markup by construction (no button, no data-* action hook), so
+// reusing them in STALE cannot smuggle a CTA back into a withdrawn state.
+function tasksWorkflowRowsHtml(model) {
+  if (!model.part) return "";
+  return model.part.workflows.map((w) => {
+    // "optional" (Imports and onboarding, #331 review round 1 finding 5) is
+    // a standing alternative entry point, not a required step -- its badge
+    // must read as neither "Done" nor a to-do nag. #365: `w.optional` is the
+    // partition flag partitionSetupWorkflows() derived from the backend's own
+    // `status`, so the badge and the completion arithmetic can never disagree
+    // about which workflow is the optional one.
+    const cls = w.status === CARD_STATUS.DONE ? "green"
+      : w.optional ? "blue" : "gray";
+    const text = w.status === CARD_STATUS.DONE ? "Done"
+      : w.optional ? "Optional" : "To do";
+    // #331 review round 21 finding 2: surfaces `attention` here too --
+    // reusing the existing `.li-sub.conflict` convention (draft scheduler)
+    // -- so a workflow reading "To do" because its only registration(s)
+    // are ambiguous shows THAT reason, not just the generic done/todo
+    // detail text alone.
+    const attentionLine = w.attention
+      ? `<div class="li-sub conflict">⚠️ ${esc(w.attention.detail)}</div>` : "";
+    return `<div class="li">
+      <span class="badge ${cls}">${text}</span>
+      <div class="li-main"><div class="li-title">${esc(w.label)}</div>
+        <div class="li-sub">${esc(w.detail)}</div>${attentionLine}</div>
+    </div>`;
+  }).join("");
+}
+
+// The exact markup last written into #sp-card-slot (#365, no duplicate
+// speech). Every write to that live region goes through paintHomeCard(), so a
+// later render can tell whether painting again would be a byte-identical
+// repaint of a polite region — which is the same sentence announced twice.
+//
+// Compared against the STRING that was written, never against
+// `slot.innerHTML`: reading innerHTML back re-serializes the live DOM (a
+// valueless attribute like `data-setup-progress-retry` comes back as
+// `data-setup-progress-retry=""`), so a source-vs-serialized comparison never
+// matches even when the paint is genuinely identical.
+let homeCardPaintedHtml = null;
+function paintHomeCard(slot, html) {
+  slot.innerHTML = html;
+  homeCardPaintedHtml = html;
+}
+function renderSetupProgressCard(model) {
+  const state = (model && model.state) || CARD_STATE.LOADING;
+  // The Home/Tasks half of the context-switch withdrawal (#365 owner
+  // correction). The card's own CTA is a context-scoped mutation entry point
+  // -- goToSetupWorkflow() opens a seeded create drawer or a Setup
+  // destination -- so from the instant a switch is intended until it is
+  // reconciled it must not be painted, whatever state the model is in. Same
+  // flag, same window, same clearing points as the Setup landings'
+  // (setupLandingActions). Applied by suppressing the button rather than by
+  // an early return, so the retained rows/counts the operator was reading
+  // stay on screen; only the action goes.
+  const ctaWithdrawn = contextSwitchIntentPending;
   // Per-card loading boundary (#331 review round 2 finding 3): the caller
   // paints this skeleton immediately, before the real fetch even starts, so
   // a slow setup-progress request only delays this one card, never the rest
@@ -580,13 +1463,66 @@ function renderSetupProgressCard(progress, hadError, loading) {
   // itself (render()'s own wrapper, persisting across every re-render of
   // this function's output) carries the actual aria-busy/aria-live
   // semantics, so this is just the content that live region announces.
-  if (loading) {
+  if (state === CARD_STATE.LOADING) {
     return `<div class="dash-card sp-card" style="margin-bottom:16px">
       <div class="dash-card-head"><h3>Setup progress</h3></div>
       <div class="skeleton"><span class="sr-only">Loading setup progress…</span></div>
     </div>`;
   }
-  if (hadError) {
+  // #365: held data whose Program/Season/League tuple is no longer the active
+  // one. The numbers stay visible (they are the last thing that was true) but
+  // are labelled as belonging to an earlier context and carry a refresh path;
+  // the obsolete primary action is WITHDRAWN rather than left standing, so a
+  // stale model can never hand the operator a CTA bound to a context they
+  // have already left. Refresh is a ghost button, never .act.primary, so the
+  // one-primary-action-per-screen rule holds in this state too.
+  if (state === CARD_STATE.STALE) {
+    // #365 review round 2 finding 4. Two defects, both of them the renderer
+    // not consulting the model it was handed:
+    //
+    // (a) it dropped the retained rows and counts entirely, so a card whose
+    //     whole justification is "the last successful read stays visible,
+    //     clearly labelled" showed a label and NO retained read.
+    // (b) it preferred `model.next.label` — a WORKFLOW name — for copy
+    //     reading "setup progress for …", producing "setup progress for
+    //     Permanent teams" instead of naming the Program the data is from.
+    //     `next` is what to do next, never whose data this is; the two are
+    //     different fields and only one of them can answer this sentence.
+    //
+    // What is retained is read-only by construction (rows and the completion
+    // line carry no action hooks) and the CTA is withdrawn: Refresh is the
+    // only control, a ghost button, so the one-primary-action-per-screen rule
+    // holds here too.
+    //
+    // A held EMPTY carries no retained READ — no rows, no counts, nothing
+    // this state exists to keep on screen. What EMPTY renders (see below) is
+    // a CLAIM about the tuple the operator has just left: "no program yet",
+    // or "nothing for your role to do HERE". Re-showing either under a
+    // "showing earlier data" banner would be labelling a claim as data, and
+    // the claim itself is about a context that is no longer the one selected.
+    // So this state stands down and the fresh load for the new tuple paints
+    // whatever is actually true there.
+    if (model.staleFrom === CARD_STATE.EMPTY) return "";
+    const rows = tasksWorkflowRowsHtml(model);
+    // The PROGRAM the retained data belongs to, named exactly. Falls back to
+    // naming the tuple generically rather than to any other field: a wrong
+    // name is worse than no name.
+    const from = model.program && model.program.name
+      ? `<strong>${esc(model.program.name)}</strong>, the program you had
+         selected earlier`
+      : "the program, season and league you had selected earlier";
+    return `<div class="dash-card sp-card" style="margin-bottom:16px">
+      <div class="dash-card-head"><h3>Setup progress — showing earlier data</h3></div>
+      <div class="banner neutral" role="status"><p>This is the setup progress for
+        ${from} — not the program, season and league you have selected now.</p></div>
+      ${rows ? `<div class="section-title">Setup workflows</div>${rows}` : ""}
+      ${tasksProgressLine(model)}
+      <div class="actions">
+        <button class="act ghost" data-setup-progress-retry>Refresh setup progress</button>
+      </div>
+    </div>`;
+  }
+  if (state === CARD_STATE.ERROR) {
     // sp-card scopes the color overrides below (#331 review round 3
     // finding 4): .banner.alert's own white-on-red is a sitewide convention
     // used well below WCAG AA (~3.3:1) -- fixed here without touching the
@@ -603,8 +1539,72 @@ function renderSetupProgressCard(progress, hadError, loading) {
       </div>
     </div>`;
   }
-  if (!progress || !progress.program_id) return "";
-  if (progress.complete) {
+  // EMPTY, as a RENDERED state with its own heading and status text — one
+  // body per named reason (#365 owner correction, superseding the earlier
+  // #331 comments that documented silence here).
+  //
+  // Both reasons used to return the empty string. That left a no-Program
+  // operator and a role with nothing actionable with no explanation at all,
+  // and it left a keyboard operator whose Retry resolved into this state with
+  // nowhere to land: the fallback focused #sp-card-slot, a zero-height
+  // wrapper carrying no text and no accessible name, so focus was technically
+  // off <body> and perceptually nowhere. #365 requires every applicable state
+  // to render a stable semantic heading and status text, and requires an
+  // empty state to explain what is missing.
+  //
+  // The two reasons are DIFFERENT claims and get different copy, which is the
+  // whole point of having named them in the model:
+  //
+  //   "no_program"          no Program exists or resolves for this operator
+  //                         at all, so there is no setup to have progress on.
+  //   "nothing_actionable"  a Program is resolved and this ROLE's visible
+  //                         slice of it has nothing left to do — which is
+  //                         explicitly NOT a claim that the whole Program is
+  //                         finished (get_setup_progress: a partial view can
+  //                         never truthfully verify a whole-Program claim).
+  //
+  // ACTIONS FOLLOW THE SAME RULE THE REST OF THIS SLICE FOLLOWS: expose a
+  // primary path only where one is genuinely authorized AND can actually
+  // resolve the state; otherwise render guidance and NO control.
+  //   * "no_program" is resolved by creating the first Program, which is the
+  //     guided Initial Setup wizard's job — and onboarding.js gates that
+  //     whole view on MANAGE_SETUP (a role without it is shown a "League
+  //     Admin only" banner there). So the button is rendered only for
+  //     MANAGE_SETUP; every other role gets the sentence that names who does
+  //     it instead of a control that would dead-end.
+  //   * "nothing_actionable" has, by construction, nothing for this role to
+  //     act on — so it carries no control at all. "Go to Schedule" belongs to
+  //     SUCCESS, where the server has actually verified completion; offering
+  //     it here would imply a whole-Program claim this state cannot make.
+  // Navigation-only, exactly like SUCCESS's own "Go to Schedule": not a
+  // context-scoped mutation entry point, so it is not part of the
+  // context-switch withdrawal (`ctaWithdrawn`) either.
+  if (state === CARD_STATE.EMPTY) {
+    const canBootstrap = hasPerm("manage_setup");
+    if (model.reason === "nothing_actionable") {
+      return `<div class="dash-card sp-card" style="margin-bottom:16px">
+        <div class="dash-card-head"><h3>Setup progress — nothing for your role to do</h3></div>
+        <p class="muted sp-empty-status">There is nothing left for your role to do
+          in this program's setup right now.</p>
+        <p class="muted">Setup workflows your role doesn't manage aren't shown on this
+          card, so this isn't a claim that the whole program is finished.</p>
+      </div>`;
+    }
+    return `<div class="dash-card sp-card" style="margin-bottom:16px">
+      <div class="dash-card-head"><h3>Setup progress — no program yet</h3></div>
+      <p class="muted sp-empty-status">No program has been set up yet, so there is
+        no setup progress to show.</p>
+      ${canBootstrap
+        ? `<p class="muted">The guided Initial Setup wizard creates the first one —
+             this card fills in as each setup workflow is done.</p>
+           <div class="actions">
+             <button class="act primary" data-goto="onboarding">Start Initial Setup</button>
+           </div>`
+        : `<p class="muted">A League Admin creates the first program. There is nothing
+             here for your role to do until one exists.</p>`}
+    </div>`;
+  }
+  if (state === CARD_STATE.SUCCESS) {
     // "Imports and onboarding" stays reachable even once every REQUIRED
     // workflow is done (#331 review round 2 finding 2) -- it's an
     // always-available alternative entry point (decision 9), not something
@@ -616,7 +1616,11 @@ function renderSetupProgressCard(progress, hadError, loading) {
     // League Admin only), so rendering the button only when found redacts
     // it for Arena Manager instead of routing them to a surface they cannot
     // use, rather than falling back to a generic always-shown label.
-    const importWf = progress.workflows.find((w) => w.key === "import");
+    // Read off the OPTIONAL partition, not by key: "the always-available
+    // alternative entry point" IS the optional partition (#365), so this
+    // button follows the backend's own `status: "optional"` rather than a
+    // hardcoded "import" string that a renamed workflow would silently break.
+    const importWf = model.part.optional[0] || null;
     // #331 review round 21 finding 2: `complete` and a workflow's own
     // `attention` are independent by design (round 19's docstring) -- a
     // Team can be genuinely, validly participating (this workflow reads
@@ -627,7 +1631,7 @@ function renderSetupProgressCard(progress, hadError, loading) {
     // Reuses the exact na-row/amber markup `next_blocked` below already
     // renders in this same card, rather than introducing an unreviewed
     // color combination.
-    const attentionRows = progress.workflows.filter((w) => w.attention).map((w) => `
+    const attentionRows = model.part.workflows.filter((w) => w.attention).map((w) => `
       <div class="na-row">
         <div class="na-ico amber">⚠️</div>
         <div class="na-body"><div class="na-title">${esc(w.label)}</div>
@@ -635,37 +1639,18 @@ function renderSetupProgressCard(progress, hadError, loading) {
       </div>`).join("");
     return `<div class="dash-card sp-card" style="margin-bottom:16px">
       <div class="dash-card-head"><h3>✓ All setup steps complete</h3></div>
-      <p class="muted">Every Setup workflow is done for ${esc(progress.program.name)}.</p>
+      <p class="muted">Every Setup workflow is done for ${esc(model.program.name)}.</p>
+      ${tasksProgressLine(model)}
       ${attentionRows}
       <div class="actions">
         <button class="act primary" data-goto="calendar">Go to Schedule</button>
-        ${importWf ? `<button class="act ghost" data-setup-progress-action="import"
+        ${importWf && !ctaWithdrawn ? `<button class="act ghost" data-setup-progress-action="${esc(importWf.key)}"
           >${esc(importWf.primary_action)}</button>` : ""}
       </div>
     </div>`;
   }
-  const rows = progress.workflows.map((w) => {
-    // "optional" (Imports and onboarding, #331 review round 1 finding 5) is
-    // a standing alternative entry point, not a required step -- its badge
-    // must read as neither "Done" nor a to-do nag.
-    const cls = w.status === "done" ? "green"
-      : w.status === "optional" ? "blue" : "gray";
-    const text = w.status === "done" ? "Done"
-      : w.status === "optional" ? "Optional" : "To do";
-    // #331 review round 21 finding 2: surfaces `attention` here too --
-    // reusing the existing `.li-sub.conflict` convention (draft scheduler)
-    // -- so a workflow reading "To do" because its only registration(s)
-    // are ambiguous shows THAT reason, not just the generic done/todo
-    // detail text alone.
-    const attentionLine = w.attention
-      ? `<div class="li-sub conflict">⚠️ ${esc(w.attention.detail)}</div>` : "";
-    return `<div class="li">
-      <span class="badge ${cls}">${text}</span>
-      <div class="li-main"><div class="li-title">${esc(w.label)}</div>
-        <div class="li-sub">${esc(w.detail)}</div>${attentionLine}</div>
-    </div>`;
-  }).join("");
-  const next = progress.next;
+  const rows = tasksWorkflowRowsHtml(model);
+  const next = model.next;
   if (next) {
     // #331 review round 21 finding 2: `next` is the same workflow object
     // `rows` renders below, carrying its own `attention` when present (e.g.
@@ -687,12 +1672,13 @@ function renderSetupProgressCard(progress, hadError, loading) {
           <div class="na-sub">${esc(next.detail)}</div></div>
       </div>
       ${nextAttention}
-      <div class="actions">
+      ${ctaWithdrawn ? "" : `<div class="actions">
         <button class="act primary" data-setup-progress-action="${esc(next.key)}"
           >${esc(next.primary_action)}</button>
-      </div>
+      </div>`}
       <div class="section-title">Setup workflows</div>
       ${rows}
+      ${tasksProgressLine(model)}
     </div>`;
   }
   // Nothing is both permitted AND safe to execute right now (#331 review
@@ -701,8 +1687,11 @@ function renderSetupProgressCard(progress, hadError, loading) {
   // workflow this caller COULD act on except for an unmet Season
   // prerequisite (guidance to surface, not a CTA that would just fail), vs.
   // truly nothing left for this role while other, not-this-role's workflows
-  // remain (renders nothing -- see get_setup_progress's docstring).
-  const blocked = progress.next_blocked;
+  // remain (see get_setup_progress's docstring). #365 moved that second case
+  // into the model as EMPTY/"nothing_actionable", which is rendered above
+  // with its own heading and explanation, so reaching here always means there
+  // IS a blocked workflow to explain.
+  const blocked = model.nextBlocked;
   if (!blocked) return "";
   return `<div class="dash-card sp-card" style="margin-bottom:16px">
     <div class="dash-card-head"><span class="dch-dot"></span><h3>Continue setup</h3></div>
@@ -722,8 +1711,25 @@ function renderSetupProgressCard(progress, hadError, loading) {
 // only delays this one card's own content, never the Dashboard's first
 // paint. Also the card's own Retry action, so retrying only re-fetches
 // this one thing instead of the whole Dashboard (overview/standings too).
-async function loadSetupProgressCard() {
-  const mySeq = ++setupProgressFetchSeq;
+//
+// #365 replaced the single page-wide setupProgressFetchSeq with this card's
+// OWN generation inside a full identity record (card id + context tuple +
+// generation). The five mutation points a superseded response must not reach
+// are each gated separately below, and labelled — the issue names all five,
+// and a stale response that skips the DOM write but still moves focus or
+// re-announces is the same defect.
+async function loadSetupProgressCard(opts) {
+  const identity = beginCardRequest(HOME_TASKS_CARD, opts);
+  // Refused by the serialization rule (see cardWrites). Unreachable TODAY —
+  // the Home/Tasks card is a pure READ and starts no write, so it never
+  // registers one — and asserted rather than assumed, so this card cannot
+  // become the one render-driven commit that still clobbers a PENDING write
+  // if it ever grows an action of its own.
+  if (!identity) return;
+  // Hold the card in LOADING under the NEW identity right away, so any full
+  // render() that happens while this request is in flight paints this card's
+  // loading state rather than the previous context's settled numbers.
+  commitCardState(identity, { state: CARD_STATE.LOADING, status: CARD_STATUS.UNKNOWN });
   // aria-busy (#331 review round 5 finding 5): re-asserted here, not just
   // left over from render()'s initial paint, so a RETRY (the slot's own
   // aria-busy already flipped back to "false" after the failed fetch that
@@ -731,18 +1737,68 @@ async function loadSetupProgressCard() {
   const busySlot = document.getElementById("sp-card-slot");
   if (busySlot) busySlot.setAttribute("aria-busy", "true");
   const sp = await getJSON("/api/v2/setup/progress");
-  if (mySeq !== setupProgressFetchSeq) return;  // a newer load already won
-  if (sp && !sp.error) { setupProgress = sp; setupProgressError = false; }
-  else { setupProgress = null; setupProgressError = true; }
+  // (4) completion update and (5) next-task selection. Both are computed by
+  // buildTasksCardModel and stored by commitCardState, which refuses a
+  // superseded identity -- so a late loser cannot revise which workflow is
+  // "next" or whether the Program reads complete, even if every DOM write
+  // below were somehow skipped. This is the FIRST of the five gates, not the
+  // only one, deliberately: the model is where a stale answer would do the
+  // most invisible damage.
+  if (!commitCardState(identity, buildTasksCardModel(sp))) return;
   const slot = document.getElementById("sp-card-slot");
   if (!slot) return;  // navigated away from Dashboard before this resolved
-  slot.innerHTML = renderSetupProgressCard(setupProgress, setupProgressError, false);
+  // Where focus is BEFORE the replacement below destroys it: an operator who
+  // pressed Retry is standing on a button inside this slot, and innerHTML
+  // would drop them on <body> for good.
+  const hadFocusInCard = !!(document.activeElement && slot.contains(document.activeElement));
+  // (1) DOM mutation and (3) live-region announcement, in one write: this
+  // slot IS the card's live region (role="status" aria-live="polite" --
+  // render()'s own wrapper, which persists across every replacement here), so
+  // settling it is also what speaks. Deliberately NOT also toasted: that
+  // would be the same sentence announced twice.
+  if (!cardIdentityCurrent(identity)) return;   // #365 identity gate — DOM + announcement
+  paintHomeCard(slot, renderSetupProgressCard(readCardState(HOME_TASKS_CARD)));
   slot.setAttribute("aria-busy", "false");
   const spAction = slot.querySelector("[data-setup-progress-action]");
   if (spAction) spAction.onclick = () =>
     goToSetupWorkflow(spAction.dataset.setupProgressAction);
   const spRetry = slot.querySelector("[data-setup-progress-retry]");
-  if (spRetry) spRetry.onclick = () => loadSetupProgressCard();
+  // Retry/Refresh is scoped to THIS card and issues its own generation, so it
+  // replaces only this card's failed generation -- nothing else on the
+  // Dashboard is refetched or repainted. Flagged userInitiated so the settle
+  // is allowed to move focus (below); a routine render-driven load is not.
+  if (spRetry) spRetry.onclick = () => loadSetupProgressCard({ userInitiated: true });
+  // (2) focus change. Only for a load a person actually asked for, and only
+  // when they were standing inside this card when it was replaced -- and only
+  // through focusCardTarget(), which re-checks the identity, so a superseded
+  // response can never yank focus back into a card the operator has moved on
+  // from.
+  //
+  // THE TARGET IS THE SETTLED STATE'S OWN HEADING, in all SIX states.
+  //
+  // This used to be true of five of them: EMPTY rendered the empty string, so
+  // `.dash-card h3` found nothing, focusCardTarget() refused a null target and
+  // keyboard focus was left on <body> -- Tab restarting from the top of the
+  // document after an action the operator deliberately took. Reproduced as an
+  // Arena Manager whose only visible workflow is already done: ERROR ->
+  // keyboard Retry -> EMPTY, focus on BODY.
+  //
+  // The first fix for that landed focus on #sp-card-slot itself, which was
+  // only half a fix and the #365 review said so: the wrapper carries no text,
+  // no heading and no accessible name, and in the EMPTY state it had no box
+  // either, so focus was off <body> and still nowhere a person could perceive.
+  // EMPTY now renders a real heading and status text per reason (see
+  // renderSetupProgressCard), so the SAME selector below lands on a visible,
+  // named destination in every state this card can settle into.
+  //
+  // The slot is kept as the last-resort fallback rather than deleted: it is
+  // render()'s own wrapper, it survives every replacement here, and a future
+  // state that somehow painted no heading must still not drop focus on
+  // <body>. focusCardTarget() stamps the same tabindex="-1" it uses for any
+  // other non-focusable destination.
+  if (opts && opts.userInitiated && hadFocusInCard) {
+    focusCardTarget(identity, slot.querySelector(".dash-card h3") || slot);
+  }
   // The complete state's "Go to Schedule" button uses the generic
   // data-goto convention (c.querySelectorAll("[data-goto]") in render()),
   // which only wires elements present at render()'s OWN paint -- this slot
@@ -988,6 +2044,81 @@ async function contextSeededDrawerValues(kind) {
   // the real axis to bind to and is not wired into the context bar yet.
   return { ok: true, values: {} };
 }
+// WHICH focus request is the CURRENT one (#365 review round 12).
+//
+// focusContentHeading() below is a POLL -- a chain of setTimeout(..., 50) up
+// to 40 attempts that ends in an unconditional #content landing -- and until
+// this counter existed, that chain belonged to nobody. It kept running after
+// the navigation that started it had been replaced, and then landed focus on
+// behalf of an operator who had already asked to go somewhere else. Recorded
+// as a real browser-journey failure at 390px ("the resolution path did not
+// focus the Allow picker; focus is on {id: content}"), and traced there
+// verbatim -- the nav click's poll firing 32ms AFTER the deep link it was
+// racing had already kept its promise:
+//
+//     19ms  focusContentHeading {attempt: 0, exit: "poll"}   <- nav to the
+//                                  Facilities landing; #content is skeletons
+//     38ms  render:end (setup/hub)                           <- landing paints
+//     60ms  focusin BUTTON                                   <- the operator
+//                                  activates "Allow a venue for this season"
+//     61ms  requestDestinationFocus setupHierarchy           <- NEWER request
+//     70ms  focusContentHeading {attempt: 1, exit: "poll"}   <- still running
+//     89ms  focusin va-add-season_2/SELECT                   <- promise KEPT
+//    121ms  focusContentHeading {attempt: 2, exit: "content-early"}
+//    121ms  focusin content/DIV                              <- and STOLEN
+//
+// The theft is silent and permanent: the intent is already spent, so nothing
+// puts focus back, and a keyboard/screen-reader operator who asked to be
+// taken to the grant control is left at the top of the page instead. Note the
+// exit it takes -- "content-early", not the 2s floor. The Setup hierarchy
+// tree has no heading of its own (its `headings` count inside #content is
+// literally 0), which is exactly the case the fallback below was written for;
+// so the older poll does not even have to run out of budget to land on
+// #content, it only has to tick once after the newer destination has painted.
+//
+// SO EVERY FOCUS REQUEST TAKES A TICKET, and a poll that no longer holds the
+// current one stops where it stands. Two kinds of request take one:
+// focusContentHeading() itself (a second navigation supersedes the first --
+// the operator asked for the newer destination) and requestDestinationFocus()
+// (a deep link is a focus request too, and a more specific one). This is the
+// same supersession discipline the rest of #365 applies to every other async
+// mutation -- cardGenerations for card writes, contextRevision for renders,
+// drawerSeedFetchSeq for drawer seeds -- and it is here for the same reason:
+// an older async operation must never get to answer for a newer one.
+//
+// WHAT IT DELIBERATELY DOES NOT DO is weaken the fallback for the caller that
+// is genuinely current. A poll holding the current ticket behaves EXACTLY as
+// before, floor included; only a superseded one is dropped, and it is dropped
+// silently because the newer request is what owns focus now.
+//
+// Nor does the ticket run the other way, cancelling a standing destination
+// intent when a newer focusContentHeading() lands: an intent already carries
+// a far stronger binding than a ticket (principal + session epoch + context
+// tuple + view + sub-view + "no dialog is open", all re-checked at
+// settlement), so it cannot fire onto a surface the operator has left. The
+// generic poll has no binding of any kind -- it focuses whatever #content
+// happens to hold whenever it happens to tick -- which is precisely why it,
+// and only it, needs one.
+//
+// AND THE BOUNDARIES BUMP IT TOO (#365 round 13). Round 12 read the sentence
+// above too narrowly: it gave the poll a binding to newer REQUESTS and
+// stopped there, which closed the reported race and left the identical stale
+// work alive across the two boundaries the rest of this slice already
+// defends. A poll started under principal A / tuple X survived both a
+// principal or session-epoch change (resetTransientUiState) and a confirmed
+// context switch (sendContextSwitch's success path, where
+// contextOptions.selected moves), and could still fire afterwards -- landing
+// #content on a surface belonging to an identity or a tuple that never asked
+// for it. The intent above is dropped at exactly those two points for exactly
+// that reason; the ticket is now bumped at the same two points, and since a
+// newer ticket is all the poll can be told, that bump IS its cancellation.
+// Deliberately silent: the crossing focuses nothing on the arriving surface
+// on the departing one's behalf. And deliberately cheap for the arriving
+// identity -- a focusContentHeading() called after the bump holds the current
+// ticket and behaves exactly as before, floor included.
+let focusRequestSeq = 0;
+function newFocusRequest() { return ++focusRequestSeq; }
+
 // Best-effort focus landing for a plain view switch (no drawer of its own to
 // auto-focus) — the first heading-ish element in the freshly rendered view,
 // falling back to the #content region itself for a destination with no
@@ -998,7 +2129,22 @@ async function contextSeededDrawerValues(kind) {
 // next tick. Poll briefly instead of a single setTimeout(0), which raced
 // that fetch and could fire before the real content painted (#331 review
 // round 1 finding 4).
-function focusContentHeading(attempt) {
+//
+// Takes a fresh ticket per CALL, not per attempt: the whole chain of attempts
+// is one request, and it is the request that gets superseded, never an
+// individual tick.
+function focusContentHeading() {
+  focusContentHeadingAttempt(0, newFocusRequest());
+}
+
+function focusContentHeadingAttempt(attempt, request) {
+  // SUPERSEDED (#365 round 12): a newer focus request exists, so this chain
+  // is answering for a navigation the operator has already left behind.
+  // Returns without focusing ANYTHING -- including without taking the floor
+  // below, which is the entire point: the floor is a promise that focus will
+  // not be left nowhere, and when a newer request is live focus is not
+  // nowhere, it is wherever that request has put it or is about to.
+  if (request !== focusRequestSeq) return;
   const content = document.getElementById("content");
   const heading = content && content.querySelector(
     "h1, h2, h3, .section-title");
@@ -1010,8 +2156,8 @@ function focusContentHeading(attempt) {
     content.focus();
     return;
   }
-  if ((attempt || 0) < 40) {
-    setTimeout(() => focusContentHeading((attempt || 0) + 1), 50);
+  if (attempt < 40) {
+    setTimeout(() => focusContentHeadingAttempt(attempt + 1, request), 50);
     return;
   }
   // Poll exhausted (40 x 50ms = 2s). It used to simply return here, which
@@ -1029,6 +2175,15 @@ function focusContentHeading(attempt) {
   // from there, and a screen reader announces the region rather than
   // nothing. Deliberately unconditional -- a slow render must never end with
   // focus nowhere.
+  //
+  // Still unconditional after the supersession check above (#365 round 12),
+  // and reaching this line is exactly what proves the request is the current
+  // one: nothing newer has been asked for, so "focus is nowhere" is a real
+  // possibility and this is the answer to it. The only case that no longer
+  // gets here is the one where focus is demonstrably NOT nowhere, because a
+  // newer request owns it. e2e/facilities-venue-access.js asserts both halves
+  // -- (F) that a superseded poll never fires, (F2) that a current one still
+  // takes this floor when its destination is still loading.
   if (content) {
     content.setAttribute("tabindex", "-1");
     content.setAttribute("aria-label", "Page content");
@@ -1036,31 +2191,239 @@ function focusContentHeading(attempt) {
   }
 }
 
+// ===== DESTINATION FOCUS INTENTS (#365 review round 11) ==================
+//
+// A Setup DEEP LINK promises to land the operator ON one specific control --
+// the selected Season's "Register" add row (participation), or its "Allow a
+// venue" picker (the control that actually creates the missing
+// SeasonVenueAccess) -- and that control does not exist at click time.
+// switchTab() kicks off an ASYNC render() whose Setup reads (setup overview,
+// players, the canonical hierarchy, per-Season registrations, the selected
+// Season's venue-access and grant candidates, setup progress) all have to
+// land before the tree paints once.
+//
+// WHAT THIS REPLACES, AND WHY A BIGGER BUDGET WAS NEVER THE ANSWER. Both deep
+// links used to POLL: every 50ms, up to 200 attempts (10s) while a skeleton
+// was still up, then hand off to focusContentHeading(), whose own 40x50ms
+// (2s) poll ends in an UNCONDITIONAL #content landing -- a combined ~12s
+// budget, after which the promise silently degraded to "somewhere in the page
+// region". A budget is a GUESS about how long a render takes, and every guess
+// is wrong under enough load: the recorded 390px failure ("the resolution
+// path did not focus the Allow picker; focus is on {id: content}") is that
+// guess losing, with a keyboard/screen-reader operator told they were being
+// taken to the control that grants venue access and stranded at the top of
+// the page instead -- silently, because taking the floor looks exactly like
+// arriving. Widening the budget only moves the boundary; it cannot remove it.
+//
+// SO THE INTENT IS RESOLVED BY AN EVENT, NOT BY ELAPSED TIME. render() calls
+// settleDestinationFocus() at each point where a pass has CONCLUDED what the
+// destination shows, and the intent resolves there in exactly one of three
+// ways:
+//
+//   (1) SUPERSEDED -- the authenticated principal/session epoch or the active
+//       context tuple has moved since the intent was registered. CANCELLED,
+//       focusing NOTHING. The intent was "take THIS operator to THIS Season's
+//       grant control"; under another principal or another tuple there is no
+//       such promise left to keep, and keeping it would yank the arriving
+//       operator's focus onto a control they never asked for. Same identity
+//       discipline as every other #365 gate -- see cardIdentitySamePrincipal()
+//       and currentCardTuple() -- and deliberately the same two halves.
+//   (2) THE CONTROL EXISTS -- focus it. The promise kept, however long the
+//       destination took.
+//   (3) THE SETTLED DESTINATION PROVES IT CANNOT EXIST -- fall back. This is
+//       a CONCLUSION, not a guess: `proof` says the pass that just painted is
+//       the one that performed this destination's own reads, so what it
+//       painted is what this Season HAS. renderSeasonParticipation() renders
+//       explanatory copy instead of a picker for a Season with no grantable
+//       venue left ("Every venue is already allowed", "Create a venue on the
+//       Facility tree first"), for an archived read-only selection, and
+//       nothing at all for a role without MANAGE_SETUP -- in every one of
+//       those the control genuinely cannot appear later, so the generic
+//       content-region landing is the right answer rather than a surrender.
+//
+// ...and until one of those three holds, the intent simply STAYS ALIVE for
+// the next settlement. There is no tick count, no deadline and no timer
+// anywhere on this path: "not yet" can never convert itself into "give up".
+// The one call into focusContentHeading() is made only at (3) -- at a
+// destination that has already settled, where its first attempt finds either
+// a heading or painted content and it therefore never reaches its own poll.
+let destinationFocusIntent = null;
+
+// WHOSE intent this is, and for WHICH context. Identical in shape and
+// intention to cardIdentitySamePrincipal() + cardIdentityCurrent()'s tuple
+// half; generation has no meaning here (a focus intent belongs to a
+// navigation, not to a card request), so it is deliberately absent rather
+// than faked.
+function destinationFocusIntentCurrent(intent) {
+  if (!intent) return false;
+  if (intent.epoch !== uiIdentityEpoch) return false;
+  if (intent.principal !== cardPrincipalId()) return false;
+  const t = currentCardTuple();
+  return intent.program_id === t.program_id
+    && intent.season_id === t.season_id
+    && intent.league_id === t.league_id;
+}
+
+// Registered by the deep link, stamped with the identity that asked for it.
+// Deliberately NOT resolved here: every caller has just called switchTab(),
+// so a render for the destination is already in flight and the control on
+// screen right now (if any) belongs to the surface being left behind.
+function requestDestinationFocus(spec) {
+  // A deep link IS a focus request, and the newest one (#365 round 12): the
+  // operator has just activated a control that promises to take them to ONE
+  // named destination. Taking the ticket here is what stops the navigation
+  // that got them to this screen from finishing its own generic landing on
+  // top of that promise a fraction of a second later -- the recorded
+  // "focus is on {id: content}" failure, traced at newFocusRequest() above.
+  //
+  // Taken BEFORE the intent is stored rather than after, so there is no
+  // instant at which an intent exists while an older poll still holds the
+  // current ticket.
+  newFocusRequest();
+  const t = currentCardTuple();
+  destinationFocusIntent = {
+    view: spec.view, setupView: spec.setupView || null,
+    provenBy: spec.provenBy, find: spec.find,
+    epoch: uiIdentityEpoch, principal: cardPrincipalId(),
+    program_id: t.program_id, season_id: t.season_id, league_id: t.league_id,
+  };
+}
+
+// The identity boundary's own half of (1). The settlement check below is the
+// authoritative one -- nothing can be focused without passing it -- but an
+// intent whose principal or tuple has already moved is dead the moment that
+// happens, and leaving it in place until some later render happens to settle
+// would be holding a promise on behalf of an operator who is gone. Called
+// from resetTransientUiState() (principal/session epoch) and from the
+// confirmed context switch (tuple).
+function cancelSupersededDestinationFocus() {
+  if (destinationFocusIntent
+      && !destinationFocusIntentCurrent(destinationFocusIntent)) {
+    destinationFocusIntent = null;
+  }
+}
+
+// The ATTEMPTED-switch boundary, which is earlier than the confirmed one and
+// is the one that matters (#365 owner correction, round 13).
+//
+// cancelSupersededDestinationFocus() is deliberately NOT what runs here, and
+// could not be: it asks whether the intent still matches the canonical tuple,
+// and at the moment a switch is ATTEMPTED that tuple has not moved yet --
+// contextOptions.selected is only updated once /api/context answers. The old
+// intent therefore still looks perfectly current, so a "cancel if superseded"
+// test cancels nothing. Meanwhile the operator has already made the new
+// selection in the native control and is looking at it.
+//
+// So this is unconditional. Anything focus-related that was asked for under
+// the tuple being left is void the instant the operator asks for another one,
+// whether or not the server has caught up, and whether or not this particular
+// call goes on to be queued behind an in-flight switch. The generic poll gets
+// the same treatment through the ticket -- its next attempt sees a newer
+// request and returns without focusing anything.
+//
+// Cancelled means SILENT, never redirected: nothing here focuses anything on
+// the arriving surface. The arriving tuple's own render decides that.
+function abandonFocusWorkForContextSwitch() {
+  newFocusRequest();
+  destinationFocusIntent = null;
+}
+
+// THE settlement. `proof` names what the concluding render pass actually
+// established -- see render()'s own call sites.
+function settleDestinationFocus(proof) {
+  const intent = destinationFocusIntent;
+  if (!intent) return;
+  // (1) identity. #365 identity gate — principal/session epoch + context tuple.
+  if (!destinationFocusIntentCurrent(intent)) { destinationFocusIntent = null; return; }
+  // The operator LEFT the destination (a nav click, a sub-view toggle) while
+  // it was still loading. Nothing to keep: focus belongs to wherever they
+  // went, and this intent must not follow them there.
+  if (view !== intent.view
+      || (intent.setupView && setupView !== intent.setupView)) {
+    destinationFocusIntent = null;
+    return;
+  }
+  // An open dialog OWNS focus (see syncOverlayFocus's lifecycle). A deep-link
+  // promise cannot outrank a focus trap the operator is inside, and pulling
+  // focus out of one would be a worse defect than the one this fixes.
+  if (openOverlayElement()) { destinationFocusIntent = null; return; }
+  // (2) the control exists.
+  const el = intent.find();
+  if (el) {
+    destinationFocusIntent = null;
+    // Same tabindex="-1" convention focusCardTarget()/focusContentHeading()
+    // use, and the same refusal to stamp it on something already focusable.
+    if (!el.hasAttribute("tabindex")
+        && !/^(BUTTON|A|INPUT|SELECT|TEXTAREA)$/.test(el.tagName)) {
+      el.setAttribute("tabindex", "-1");
+    }
+    el.focus();
+    return;
+  }
+  // (3) settled, and it is not there -- so it cannot be.
+  if (proof && proof[intent.provenBy]) {
+    destinationFocusIntent = null;
+    focusContentHeading();
+    return;
+  }
+  // NOT YET: this pass settled something else (or nothing this intent's
+  // destination depends on). Keep waiting. No counter is touched here,
+  // because there is no counter.
+}
+
 // Destination focus for "participation" (#331 review round 2 finding 4):
 // landing generically on the Setup hierarchy tree isn't enough -- focus
 // must reach the ACTUAL registration control for the currently-selected
 // Season (contextOptions.selected.season_id, #159), the same "Register" add
 // row renderSetupHierarchy's league sections render per (season, league)
-// (data-reg-add/data-reg-add-season). Same poll-while-loading shape as
-// focusContentHeading() (switchTab()'s render() is async, so neither
-// target necessarily exists yet on the next tick), but once loading has
-// genuinely finished with no matching control -- no league yet, or every
-// permanent team is already registered for this Season -- falls back to
-// focusContentHeading()'s generic content-region landing rather than
-// polling forever for something that will never appear.
-function focusParticipationRegisterControl(attempt) {
-  const seasonId = contextOptions && contextOptions.selected
-    && contextOptions.selected.season_id;
-  const btn = seasonId && document.querySelector(
-    `[data-reg-add][data-reg-add-season="${CSS.escape(seasonId)}"]`);
-  if (btn) { btn.focus(); return; }
-  const content = document.getElementById("content");
-  const stillLoading = !content || content.querySelector(".skeleton");
-  if (stillLoading && (attempt || 0) < 40) {
-    setTimeout(() => focusParticipationRegisterControl((attempt || 0) + 1), 50);
-    return;
-  }
-  focusContentHeading();
+// (data-reg-add/data-reg-add-season).
+//
+// Settlement-bound for the same reason the venue-access deep link below is,
+// and it had the identical time-based give-up shape (the review's audit of
+// the other deep-link focus helpers found exactly this one, and nothing
+// else): the same 200 x 50ms poll into the same focusContentHeading() floor,
+// on the same slowest-loading Setup surface. It is the same defect, so it
+// gets the same fix rather than a second one.
+function focusParticipationRegisterControl() {
+  requestDestinationFocus({
+    view: "setup", setupView: "hierarchy", provenBy: "setupHierarchy",
+    find: () => {
+      const seasonId = contextOptions && contextOptions.selected
+        && contextOptions.selected.season_id;
+      return (seasonId && document.querySelector(
+        `[data-reg-add][data-reg-add-season="${CSS.escape(seasonId)}"]`)) || null;
+    },
+  });
+}
+
+// The same deep-link, for the selected Season's "Allow a venue" picker (#365
+// review, Facilities fail-open). This is the control that actually creates
+// the missing SeasonVenueAccess, so an operator sent here from the Facilities
+// card lands ON it rather than at the top of the hierarchy tree.
+//
+// Prefers the <select> (the field that must be filled before the Allow button
+// can do anything) and falls back to the Allow button itself.
+//
+// THE SEASON IS READ LIVE, from contextOptions.selected, and that is safe for
+// exactly one reason: the identity gate in settleDestinationFocus() has
+// already refused every tuple except the one this intent was registered
+// under, so "the live selected Season" and "this intent's own Season" are the
+// same value by the time this runs. Delete that gate and they are not: the
+// intent would reach across a context switch and focus a picker belonging to
+// a Season the operator moved to but never asked to be sent to -- which is
+// what e2e/facilities-venue-access.js's superseded-context leg proves.
+function focusVenueAccessControl() {
+  requestDestinationFocus({
+    view: "setup", setupView: "hierarchy", provenBy: "setupHierarchy",
+    find: () => {
+      const seasonId = contextOptions && contextOptions.selected
+        && contextOptions.selected.season_id;
+      if (!seasonId) return null;
+      // getElementById, not a selector: the id embeds a raw Season id.
+      return document.getElementById(`va-add-${seasonId}`)
+        || document.querySelector(`[data-va-add="${CSS.escape(seasonId)}"]`);
+    },
+  });
 }
 
 function renderDashboard(ov, standings) {
@@ -3180,12 +4543,67 @@ function leagueScopedTeams(sv) {
   return lid ? teams.filter((t) => t.league_id === lid) : teams;
 }
 
+// `prereq` (#365 owner ruling on EMPTY dead ends): the ordered chain of
+// records this workflow's DECLARED primary action needs before it can create
+// anything. "Primary" means the single action that resolves the state the
+// card is actually in, not necessarily the static `primary` above -- an EMPTY
+// Facilities landing that names the missing venues and rinks and then offers
+// "Add Ice" (which needs a rink, which needs a venue) is a dead end: it says
+// what is missing and hands over an action that cannot create it.
+//
+// A step is one of two kinds. `{ assert: "<key>" }` is a SERVER-asserted hard
+// prerequisite, resolved against get_setup_progress's own ordered
+// `workflows[].prerequisites` by setupResolvedPrereqChain (fail-closed: an
+// unasserted or unreadable claim is never "met"). Everything else is a
+// locally-derived step over visible row counts, declared inline as
+// `{ met, action, why }`:
+//   met(facts)  whether this prerequisite is satisfied, read from the LIVE
+//               payload the card's own summary came from (setupPrereqFacts)
+//               -- never from a declared default. Usually a COUNT of visible
+//               rows. A step about a CAPABILITY rather than an inventory
+//               declares `assert` instead and never writes its own `met`,
+//               because no count can answer it.
+//   action      the ONE control offered while it is not. `act`/`go` are the
+//               ordinary landing action kinds; `open` is the third kind this
+//               ruling needs -- the missing record belongs to ANOTHER
+//               workflow, so the single action opens THAT workflow's landing
+//               (which derives its own effective action the same way, so the
+//               chain resolves recursively) rather than smuggling a foreign
+//               create drawer onto this card. A create committed here would
+//               be committed under THIS card's identity while changing a
+//               DIFFERENT card's data, which is precisely the per-card
+//               binding #365 exists to hold.
+//               An action may also declare `perm`: the permission its
+//               destination genuinely requires. A role that lacks it gets NO
+//               action rather than a control it cannot execute -- see
+//               setupEffectiveAction.
+//   why         the sentence the card body uses to name the blocker, so the
+//               copy and the action can never describe different problems.
+//               A function of the facts where the sentence is itself an
+//               asserted, scoped claim (naming the exact Season), so the copy
+//               is the backend's own statement rather than a paraphrase.
+//   advice      what to add to `why` when the action is WITHDRAWN (this role
+//               cannot resolve this step). Defaults to "Ask a league admin to
+//               set that up." -- true for a grant or a reopen, and wrong for
+//               a step nobody can resolve with a control at all (picking a
+//               Season is a context-bar action), which is why it is per-step
+//               rather than baked into the renderer.
+//
+// The chain is walked in order and the FIRST unmet step wins; all met means
+// the declared primary is genuinely the resolving action. Only the EMPTY
+// state renders a single action, so this is what that one action is; every
+// other state renders its declared groups exactly as before.
 const SETUP_WORKFLOWS = [
   { key: "league_season", title: "League profile and seasons", icon: "🗓️",
     purpose: "The program's identity, and the seasons that give it schedulable time.",
     perm: "manage_setup",
     primary: { label: "Add Season", go: "league_season" },
     secondary: [{ label: "Programs", act: "league" }, { label: "Leagues", act: "level" }],
+    // A Season hangs off a Program, so with no Program at all "Add Season"
+    // opens a drawer whose only required parent select has nothing in it.
+    prereq: [{ met: (f) => f.programs > 0,
+      action: { label: "Add program", act: "league" },
+      why: "A season belongs to a program, and there is no program yet." }],
     summary: (sv) => [
       { label: "Programs", n: (sv.programs || []).length },
       { label: "Seasons", n: (sv.seasons || []).length },
@@ -3195,6 +4613,13 @@ const SETUP_WORKFLOWS = [
     perm: "manage_setup",
     primary: { label: "Add Team", go: "teams" },
     secondary: [{ label: "Clubs", act: "club" }],
+    // A permanent Team hangs off a League (its `league_id`); a Club does NOT
+    // (team-club-optional.js / test_optional_club.py), so the Club is not a
+    // prerequisite for anything and never appears in this chain.
+    prereq: [{ met: (f) => f.leagues > 0,
+      action: { label: "Add a league first", open: "league_season" },
+      why: "A permanent team belongs to a league, and this program's active"
+        + " season has none yet." }],
     summary: (sv) => [
       { label: "Teams", n: leagueScopedTeams(sv).length },
       { label: "Clubs", n: withPendingLink(sv, "clubs").length }] },
@@ -3203,6 +4628,50 @@ const SETUP_WORKFLOWS = [
     perm: "manage_setup",
     primary: { label: "Register Team", go: "participation" },
     secondary: [{ label: "Divisions", act: "division" }],
+    // Owner ruling, verbatim: "Participation: Add Division before Register
+    // Team." A Division hangs off a League paired with the active Season, and
+    // a registration needs a permanent Team to register -- so the full chain
+    // is league -> division -> team -> register, and the EMPTY state (zero
+    // divisions) always stops at one of the first two.
+    //
+    // ...interleaved with the SERVER's own hard floors (#365 review round 3).
+    // `register_team_for_season` takes `_require_active_season` and enforces
+    // rule 7, so `get_setup_progress` publishes THREE ordered assertions for
+    // this workflow -- season_selected, season_active, team_league_eligible --
+    // and none of them can be recovered from a row count. Their positions
+    // here are not cosmetic:
+    //
+    //   * the Season floors sit BEFORE `divisions`, not merely before the
+    //     declared "Register Team". That step's own action is "Add division",
+    //     and `create_division` takes the SAME `_require_active_season`
+    //     guard -- so under an archived Season the round-2 chain answered a
+    //     dead "Register Team" with an equally dead "Add division".
+    //   * `leagues` stays first because its action is pure NAVIGATION to the
+    //     league_season landing (which derives its own effective action), and
+    //     navigation is never refused by a Season guard. Demoting a safe,
+    //     genuinely useful action behind a floor it does not violate would
+    //     withdraw help for no reason.
+    //   * team_league_eligible sits last, after `teams`: "there is no team at
+    //     all" and "no team's league matches this season" are different
+    //     states with different resolutions, and the count answers the first.
+    //
+    // Relative order among the three ASSERTED steps is exactly the server's
+    // own (season_selected -> season_active -> team_league_eligible), which
+    // is the order `_workflow_prerequisite_gap` tests them in.
+    prereq: [
+      { met: (f) => f.leagues > 0,
+        action: { label: "Add a league first", open: "league_season" },
+        why: "Divisions live inside a league, and this program's active season"
+          + " has none yet." },
+      { assert: "season_selected" },
+      { assert: "season_active" },
+      { met: (f) => f.divisions > 0,
+        action: { label: "Add division", act: "division" },
+        why: "Teams are registered into a division, and there is none yet." },
+      { met: (f) => f.teams > 0,
+        action: { label: "Add a team first", open: "teams" },
+        why: "There is no permanent team to register yet." },
+      { assert: "team_league_eligible" }],
     summary: (sv) => [
       { label: "Divisions", n: (sv.divisions || []).length }] },
   { key: "roster", title: "Clubs, players and staff", icon: "🧑",
@@ -3210,10 +4679,24 @@ const SETUP_WORKFLOWS = [
     perm: "manage_setup",
     primary: { label: "Add Player", go: "roster" },
     secondary: [{ label: "Officials", act: "official" }],
-    summary: (sv) => {
+    // The case the owner called out by name: "especially Roster when no Team
+    // exists." A Player hangs off a Team, so with no Team the declared
+    // primary opens a drawer whose required Team select is empty, and
+    // goToSetupWorkflow("roster") seeds it from a team list that is itself
+    // empty. The permanent Team belongs to the "teams" workflow, so the one
+    // action goes there.
+    prereq: [{ met: (f) => f.teams > 0,
+      action: { label: "Add a team first", open: "teams" },
+      why: "Players are added to a team, and this program, season and league"
+        + " has none yet." }],
+    // Takes the player list as an ARGUMENT rather than reading the
+    // module-level `playersList` (#365): a per-card retry re-fetches
+    // /api/players for THIS card alone and must be able to compute its own
+    // summary from that response without writing the shared list other Setup
+    // surfaces (Records, the hierarchy tree) render from.
+    summary: (sv, ov, players) => {
       const lid = contextOptions && contextOptions.selected
         && contextOptions.selected.league_id;
-      let players = playersList || [];
       if (lid) {
         const teamIds = new Set(leagueScopedTeams(sv).map((t) => t.id));
         players = players.filter((p) => teamIds.has(p.team_id));
@@ -3231,17 +4714,96 @@ const SETUP_WORKFLOWS = [
     primary: { label: "Add Ice", go: "facilities" },
     secondary: [{ label: "Venues", act: "venue" }, { label: "Rinks", act: "rink" }],
     tertiary: [{ label: "Add one ice slot", act: "ice-slot" }],
+    // Owner ruling, verbatim: "Facilities: Add Venue -> Add Rink -> Add Ice."
+    // Ice is generated onto a Rink, and a Rink hangs off a Venue, so the
+    // highest-leverage action is also the LAST one that becomes possible.
+    //
+    // ...and a Rink is not enough, which is the #365 review's Facilities
+    // fail-open. The first two steps ask whether a Venue/Rink is VISIBLE, and
+    // the scoped overview's lists deliberately include revoked-grant history
+    // and creator-owned pending rows -- both correct reads, neither of which
+    // makes a Rink schedulable. So the chain continues with steps that are
+    // not counts at all: the SERVER's own ordered hard floors for this
+    // workflow, asserted on get_setup_progress's `prerequisites` and consumed
+    // fail-closed here (setupResolvedPrereqChain).
+    //
+    // Round 2 declared only the LAST of those floors, venue_access. Round 3's
+    // review reproduced the same fail-open one layer up: an ARCHIVED selected
+    // Season with a LIVE grant asserts `venue_access: met` quite correctly --
+    // a rink really is reachable -- while `commit_ice_availability` refuses
+    // the whole workflow with `season_archived`. One capability fact was
+    // standing in for the whole capability. So the Season floors are declared
+    // too, and BEFORE venue_access, which is the order the real writes fail
+    // in: season_guard.require_active_season runs before anything looks at a
+    // rink.
+    //
+    // They sit AFTER venues/rinks rather than at the head of the chain, and
+    // that placement is asserted rather than incidental: `create_venue` and
+    // `create_rink` take NO Season guard (a Venue is organization-owned; a
+    // Rink hangs off a Venue), so "Add venue"/"Add rink" are never refused by
+    // an archived or unselected Season. A chain that demoted them would
+    // withdraw a working action and offer nothing in its place.
+    //
+    // Both resolutions need MANAGE_SETUP -- granting venue access and
+    // reopening a Season are League Admin actions -- so each step's action
+    // declares it and setupEffectiveAction withdraws the control entirely for
+    // an Arena Manager, who would otherwise be handed a second dead end. The
+    // `why` sentences are the BACKEND's own, so they name the exact Season
+    // the claim is scoped to instead of a client-side paraphrase.
+    prereq: [
+      { met: (f) => f.venues > 0,
+        action: { label: "Add venue", act: "venue" },
+        why: "Ice is booked on a rink inside a venue, and there is no venue yet." },
+      { met: (f) => f.rinks > 0,
+        action: { label: "Add rink", act: "rink" },
+        why: "Ice is booked on a rink, and this venue has none yet." },
+      { assert: "season_selected" },
+      { assert: "season_active" },
+      { assert: "venue_access" }],
     summary: (sv) => [
       { label: "Venues", n: withPendingLink(sv, "venues").length },
       { label: "Rinks", n: withPendingLink(sv, "rinks").length }] },
   // Workflow 6 is OPTIONAL (Decision 9): always visible and always reachable,
   // never the hub's `next` recommendation, and never blocking the complete
   // state. It carries its own status wording rather than done/todo.
+  //
+  // #365: `optional: true` here is the DECLARED contract, used only as the
+  // fallback for a caller that has no progress payload to read (no Program
+  // resolved yet, or a role the progress route refuses). The LIVE model takes
+  // optionality from the backend's own `status: "optional"` instead
+  // (partitionSetupWorkflows), so client and server can never disagree about
+  // which workflow is the optional one. Nothing anywhere derives it from a
+  // title or a list position.
+  //
+  // No `summary`: this workflow has no Program-scoped inventory of its own to
+  // count (the same absence of a completion signal that makes it optional
+  // server-side), so its card has no data dependency and therefore no
+  // loading/empty/error of its own to reach.
+  //
+  // Consequently no `prereq` either, and that is an ASSERTION rather than an
+  // omission: with no EMPTY state to reach there is no emptiness for an
+  // effective action to resolve, and "Import data" needs no record to exist
+  // first -- importing is precisely how an operator with nothing gets
+  // started. buildSetupWorkflowCardModel derives an effective action for
+  // every workflow regardless, so an empty chain here resolves to the
+  // declared primary rather than to nothing.
   { key: "import", title: "Imports and onboarding", icon: "📥", optional: true,
     purpose: "Bring an existing league in from spreadsheets instead of typing it in.",
     perm: "manage_arena",
     primary: { label: "Import data", go: "import" },
-    secondary: [{ label: "Initial Setup wizard", go: "onboarding" }] },
+    // Re-entering the guided Initial Setup wizard replaces the whole working
+    // surface with a linear, start-from-the-top flow for the active Program.
+    // It is the only action on any of the six landings that is neither a
+    // create drawer nor a jump to an inventory screen, so it is the one that
+    // carries a card-scoped confirmation (#365's `confirmation` state). The
+    // MODEL supports `confirm` on any action; only this one declares it.
+    secondary: [{ label: "Initial Setup wizard", go: "onboarding",
+      confirm: {
+        prompt: "Restart the guided Initial Setup wizard? Your existing data "
+          + "isn't changed — you'll be taken through setup from the top.",
+        yes: "Start the wizard", no: "Stay here",
+        done: "Opening the Initial Setup wizard.",
+        cancelled: "Stayed on Imports and onboarding." } }] },
 ];
 
 // Which workflow landing is open, or null for the hub index.
@@ -3272,6 +4834,18 @@ function openSetupWorkflowLanding(key) {
     ? setupWorkflowsFor().find((w) => w.key === key) : null;
   if (key && !workflow) return false;
   view = "setup";
+  // The landing (and the hub index it belongs to) renders ONLY inside the
+  // "hub" sub-view -- renderSetup branches on `setupView` before it ever looks
+  // at `setupWorkflow`. Establishing only `view` + `setupWorkflow` therefore
+  // left this composite destination half-applied whenever the operator was on
+  // Hierarchy or Records: the Facilities nav entry, a hub card's "Open …" and
+  // the landing's own "← All setup workflows" all silently rendered the tree
+  // instead. Latent before (only a manual sub-view toggle could set it up),
+  // but #365's venue-access resolution path deep-links THROUGH the Hierarchy
+  // tree on purpose, so returning to the card was the very next step of the
+  // flow this fix creates. Set here, with the other halves, so no transition
+  // can establish one without the others.
+  setupView = "hub";
   setupWorkflow = key || null;
   toast = "";
   // The SAME per-destination reset switchTab() applies. Bypassing switchTab is
@@ -3289,15 +4863,1351 @@ function openSetupWorkflowLanding(key) {
   return true;
 }
 
-function setupSummaryHtml(w, sv, ov) {
-  // Guard the payload, not each accessor: renderSetup can be reached before
-  // (or without) a successful overview load -- an early return, a failed
-  // fetch, a role whose payload is redacted -- and a summary card must
-  // degrade to "no counts yet" rather than throwing and blanking the view.
-  if (!w.summary || !sv) return "";
-  const parts = w.summary(sv, ov).map((s) =>
-    `<span class="swf-stat"><strong>${s.n}</strong> ${esc(s.label)}</span>`).join("");
-  return `<div class="swf-stats">${parts}</div>`;
+// The two ways a Setup landing action leaves the landing, extracted (#365) so
+// a plain click and a confirmed one execute the SAME code -- a confirmation
+// that took a different route to the destination would be a second
+// implementation of the action, free to drift from the first.
+function runSetupWorkflowGo(key) {
+  // "onboarding" is the guided Initial Setup wizard, a top-level view rather
+  // than one of goToSetupWorkflow's six workflow destinations.
+  if (key === "onboarding") { switchTab("onboarding"); focusContentHeading(); return; }
+  // The REAL venue-access resolution path (#365 review, Facilities
+  // fail-open). SeasonVenueAccess is not one of the six workflows and has no
+  // create drawer: it is granted from the selected Season's own "Allowed
+  // venues" section on the Setup hierarchy tree, which is exactly where the
+  // #369 contract put the picker (and which renderSeasonParticipation gates
+  // on MANAGE_SETUP -- the same permission the step's action declares, so
+  // this destination is only ever offered to a role that finds a live control
+  // when it arrives). Same deep-link idiom as "participation" above: set the
+  // sub-view, switch, then focus the real control rather than dropping the
+  // operator at the top of a long tree to hunt for it.
+  if (key === "venue_access") {
+    setupView = "hierarchy";
+    switchTab("setup");
+    focusVenueAccessControl();
+    return;
+  }
+  // Returned, not fire-and-forget (#365): goToSetupWorkflow() is async for the
+  // drawer destinations, and announceCardStatusAfter() needs the navigation's
+  // own settle to know when the destination has finished rendering.
+  return goToSetupWorkflow(key);
+}
+async function openSetupWorkflowDrawer(kind) {
+  const mySeq = ++drawerSeedFetchSeq;
+  const seeded = await contextSeededDrawerValues(kind);
+  if (mySeq !== drawerSeedFetchSeq) return;  // a newer open already won
+  if (!seeded.ok) {
+    toast = seeded.needsContext
+      ? "Pick a program in the context bar first, so this is created in the right one."
+      : seeded.needsSeason
+        ? "Pick a season in the context bar first — this is created inside one."
+        : seeded.noLeagueInSeason
+          ? "That season has no leagues yet — add one before adding divisions."
+          : seeded.leagueNotInSeason
+            ? "Your active League isn't in this season — switch the context bar's League or clear it before adding divisions."
+            : "Couldn't load what's needed to open that — try again.";
+    toastIsError = true;
+    return render();
+  }
+  drawer = { kind }; drawerError = ""; drawerValues = seeded.values;
+  toast = "";
+  render();
+}
+
+/* ---------- Setup workflow card state (#365) ---------- */
+// Each of the six workflows is its own card in the per-card store, bound to
+// its own identity (card id + context tuple + generation). What matters here
+// that a single page-wide flag could not express: the six do NOT all share
+// one data source. "Clubs, players and staff" is the only one that needs
+// /api/players; the four with inventory counts need /api/v2/setup/overview;
+// Workflow 6 needs neither. So a /api/players outage is genuinely one card's
+// failure, and its Retry re-fetches only that endpoint and repaints only that
+// card -- the other five keep their own settled numbers on screen.
+//
+// `src` is what render() already fetched for the Setup view, plus an explicit
+// per-ENDPOINT outcome for each. The outcome flags are the point: `sv`
+// degrades to an empty shape on failure, so "the overview call failed" and
+// "this Program genuinely has nothing yet" are indistinguishable from the
+// payload alone -- exactly the "state inferred from missing payload fields"
+// #365 forbids.
+//
+// The STATUS read is the same kind of claim and now arrives the same way:
+// `src.progress` is a setupProgressRead() record, never a payload-or-null.
+// The row is looked up HERE, from that record, rather than being resolved by
+// each caller and passed in — a `statusRow` argument could arrive `null`
+// because the read failed, because this role may not read it, or because the
+// backend genuinely had no row, and this function could not tell which.
+// The facts a `prereq` chain is evaluated against, derived ONCE from the SAME
+// `src` the card's own stats come from — never re-read from a module-level
+// cache at render time. That matters for the identity discipline as much as
+// for correctness: an effective action computed here is committed into the
+// card's model under the card's own identity, so a landing can never offer an
+// action derived from one context's inventory while displaying another's.
+//
+// Scoped exactly as the summaries are (leagueScopedTeams / withPendingLink),
+// so "this workflow says it has no teams" and "the chain says a team is
+// missing" are the same claim about the same rows.
+//
+// COUNTS ARE NOT CAPABILITIES (#365 review, Facilities fail-open). Every
+// field above is a count of rows the scoped overview VISIBLY reports, and
+// that read contract deliberately includes revoked-grant history and
+// creator-owned pending rows (get_setup_overview_v2). So `venues`/`rinks`
+// answer "is there a Venue/Rink on this operator's screen", which is exactly
+// the right question for "is this card EMPTY" and exactly the WRONG question
+// for "can ice be generated here". A Rink at a Venue whose grant to the
+// selected Season was revoked is visible, correctly, and is not schedulable:
+// the Ice Builder refuses it with `venue_access_missing` and a preview
+// provably generates zero slots. Asking only the visibility question is what
+// let Facilities settle READY with `blockedBecause: null` and a dead-end "Add
+// Ice" primary.
+//
+// ...and the same is true one layer up, which is round 3's finding: an
+// ARCHIVED selected Season is equally invisible to every count on this card.
+// Venues and Rinks are still there, the grant is still live, and NOTHING in
+// the Season can be written. No arithmetic over visible rows answers that
+// either.
+//
+// Claims like those cannot be recovered from row counts at all, so they are
+// not inferred here: they arrive ASSERTED, from the same
+// /api/v2/setup/progress read the card's status comes from, computed
+// server-side from the exact state the real writes enforce.
+// `assertedRows[workflowKey]` is the COMPLETE ORDERED set for that workflow
+// — read from `src.progress` (a setupProgressRead record, never a
+// payload-or-null), so a failed or unauthorized read yields NO assertions
+// rather than a manufactured "met". See setupResolvedPrereqChain below for
+// the fail-closed consumption.
+function setupPrereqFacts(src) {
+  const sv = (src && src.sv) || {};
+  const read = (src && src.progress && src.progress.outcome)
+    ? src.progress : setupProgressRead(CARD_READ.FAILED, null);
+  // Kept as an ORDERED LIST, never flattened to a dictionary (#365 review
+  // round 3): the backend publishes its floors in the order its own writes
+  // fail them, and a client that dropped that order could not tell "the
+  // Season is archived" from "no rink is reachable" when both are unmet --
+  // nor notice a floor it never declared.
+  const assertedRows = {};
+  Object.keys(read.byKey).forEach((key) => {
+    assertedRows[key] = ((read.byKey[key] || {}).prerequisites || [])
+      .filter((p) => p && p.key);
+  });
+  return {
+    programs: (sv.programs || []).length,
+    seasons: (sv.seasons || []).length,
+    leagues: (sv.leagues || []).length,
+    teams: leagueScopedTeams(sv).length,
+    divisions: (sv.divisions || []).length,
+    venues: withPendingLink(sv, "venues").length,
+    rinks: withPendingLink(sv, "rinks").length,
+    players: ((src && src.players) || []).length,
+    assertedRows: assertedRows,
+  };
+}
+
+// The REAL reopen-Season path for an archived selected Season (#365 review
+// round 3), offered ONLY to a role authorized to perform it.
+//
+// `perm: "manage_setup"` is not a guess: /api/v2/setup/seasons/<id>/reopen
+// maps to MANAGE_SETUP in web/authz.py, so an Arena Manager pressing this
+// would receive a 403. setupEffectiveAction withdraws the control for them
+// entirely and the card shows guidance instead — the requirement is
+// explicitly "expose the real reopen path only to an authorized role;
+// otherwise show guidance and NO unusable mutation".
+//
+// It is a `reopen` action rather than a `go`/`act`/`open` one because there
+// is no Setup workflow, landing or drawer that owns Season lifecycle: the
+// reopen is a single reasoned write, and #159 requires a NON-EMPTY reason
+// that is recorded in the audit trail. So it routes through the card's own
+// CONFIRM state (#365) with a required reason field — the first derived
+// action to carry a `confirm`, which is why setupCardActionFor now resolves
+// "primary:0" through the committed model instead of the declared primary.
+//
+// Which Season: the SELECTED one, always. #367 established that reopening an
+// archived Season requires that Season to be the active context, and this
+// action is only ever reachable from a card whose committed identity carries
+// exactly that Season in its tuple — resolveSetupCardConfirm re-checks the
+// tuple before it fires, so a context switch withdraws the confirmation
+// rather than reopening a Season the operator has left.
+const SETUP_SEASON_REOPEN_ACTION = {
+  label: "Reopen this season", reopen: true, perm: "manage_setup",
+  confirm: {
+    prompt: "Reopen this archived season so it can be changed again? It stays"
+      + " selected, and its existing records are untouched.",
+    reason: "Why is this season being reopened?",
+    yes: "Reopen season", no: "Keep it archived",
+    // `busy` is what the card says WHILE the write is in flight, and `done`
+    // is said ONLY after the server has confirmed it (#365 review round 4).
+    // Keeping both in the declaration is what makes it impossible for the
+    // writer to reuse the completion sentence as a progress one.
+    busy: "Reopening this season…",
+    done: "Season reopened — it can be changed again.",
+    // Said when the reopen SUCCEEDED but this card's own follow-up refresh
+    // did not: the operator must not be told only about the refresh, because
+    // the Season really did reopen and the audit trail really did record it.
+    doneNoRefresh: "Season reopened, but this card's summary couldn't be"
+      + " reloaded. Retry below.",
+    cancelled: "The season stays archived." },
+};
+
+// The RESOLUTION each asserted prerequisite has, keyed "<workflow>/<key>".
+// Deliberately a lookup rather than a field on the payload: the backend's
+// prerequisite rows are ROLE-INVARIANT statements about the selected Season's
+// data (both roles that can see a workflow receive byte-identical rows), so
+// "who may fix this, and through which control" is a client-side permission
+// question answered by the same `hasPerm` every other control is gated on.
+// Putting it in the payload would create a second authority on permissions.
+//
+// A prerequisite with NO entry here resolves to guidance and no mutation
+// control at all. That is the fail-closed default and it is what makes a
+// NEWLY-published server floor safe: the chain still blocks on it, the card
+// still explains it in the backend's own words, and no control is offered
+// that this client has no verified path for.
+const SETUP_ASSERTED_PREREQ_ACTIONS = {
+  // Granting SeasonVenueAccess is a League Admin action and lives on the
+  // selected Season's own "Allowed venues" section (#369), not in any create
+  // drawer — runSetupWorkflowGo("venue_access") is the deep link.
+  "facilities/venue_access": {
+    label: "Allow a venue for this season", go: "venue_access",
+    perm: "manage_setup" },
+  // An archived selected Season is read-only until an authorized reopen
+  // (#159). Reopening is MANAGE_SETUP — the same permission
+  // /api/v2/setup/seasons/<id>/reopen requires (web/authz.py:
+  // "Season lifecycle archive/reopen (#159) are setup actions") — so an Arena
+  // Manager, who holds MANAGE_ARENA only, gets the guidance and NO control.
+  // #367's established rule is that reopening an archived Season requires it
+  // to be the SELECTED context, which it is by construction here: this step
+  // is only ever reached from a card whose committed identity carries that
+  // Season as its own tuple.
+  "facilities/season_active": SETUP_SEASON_REOPEN_ACTION,
+  "participation/season_active": SETUP_SEASON_REOPEN_ACTION,
+  // Rule 7 (register_team_for_season): a Team with a permanent League can
+  // only register into a LeagueSeason of that same League. Both repairs — a
+  // new Team under a league this Season runs, or moving an existing Team's
+  // permanent League — live on the Permanent teams workflow, so the one
+  // action opens that landing rather than smuggling its create drawer here.
+  "participation/team_league_eligible": {
+    label: "Set up a team in this season's league", open: "teams" },
+  // "season_selected" has NO action on purpose: choosing a Season is a
+  // context-bar selection, not a mutation any card owns, and inventing a
+  // control for it would be inventing a second context switcher. It gets
+  // guidance with its own `advice` below instead.
+};
+
+// What to append to the blocker sentence when a step's action is withdrawn.
+// The default ("Ask a league admin to set that up.") is the right sentence
+// for a grant or a reopen an Arena Manager cannot perform, and the WRONG one
+// for a Season nobody can select from a card.
+const SETUP_ASSERTED_PREREQ_ADVICE = {
+  season_selected: "Pick a season in the context bar to work in one.",
+  season_active: "Ask a league admin to reopen it.",
+};
+
+// The client's own last-resort sentence for a floor the backend did not
+// assert (a failed or unauthorized progress read, or a prerequisite key this
+// build predates). Never "it's fine": an unverifiable claim blocks.
+const SETUP_ASSERTED_PREREQ_FALLBACK = {
+  season_selected: "No season is selected for this program yet.",
+  season_active: "The selected season is archived and read-only, so nothing"
+    + " in it can be changed.",
+  venue_access: "No rink is reachable through active venue access for the"
+    + " selected season yet, so ice can't be added to it.",
+  team_league_eligible: "No permanent team is eligible to register in the"
+    + " selected season yet.",
+};
+
+// ONE asserted prerequisite, as a chain step. `met` is true ONLY for an
+// explicit `met === true` on a row the backend really published under this
+// exact key — every other shape (absent row, absent payload, a truthy-looking
+// value that is not `true`) is unmet. That is the fail-closed rule, stated
+// once here so no call site can restate it more leniently.
+function setupAssertedStep(workflowKey, prereqKey, row) {
+  const asserted = row && row.key === prereqKey ? row : null;
+  const met = !!asserted && asserted.met === true;
+  const action = SETUP_ASSERTED_PREREQ_ACTIONS[workflowKey + "/" + prereqKey] || null;
+  return {
+    assert: prereqKey,
+    met: () => met,
+    action: action,
+    // The BACKEND's own sentence when there is one, so the copy names the
+    // exact Season the claim is scoped to; the declared fallback only when
+    // the claim itself could not be read.
+    why: (asserted && asserted.detail)
+      || SETUP_ASSERTED_PREREQ_FALLBACK[prereqKey]
+      || "This step can't be taken yet, and the reason couldn't be read.",
+    advice: SETUP_ASSERTED_PREREQ_ADVICE[prereqKey] || null,
+  };
+}
+
+// THE chain, with every `{ assert }` placeholder resolved against the rows
+// get_setup_progress actually published for this workflow (#365 review round
+// 3). Two guarantees, and the second is the one this round exists for:
+//
+//  1. A DECLARED assertion the backend did not publish still appears, as a
+//     fail-closed unmet step. A failed or unauthorized progress read
+//     therefore blocks the workflow instead of silently shortening its chain
+//     to the counts — which is what "an unasserted claim is never met" has to
+//     mean once the chain is assembled dynamically.
+//  2. A PUBLISHED floor this client never declared is APPENDED rather than
+//     dropped. The whole defect of round 2 was a client holding a strict
+//     SUBSET of the server's floors; a chain built only from what the client
+//     happens to know would reproduce it the next time the server learns a
+//     new one. An undeclared floor has no registered action, so it resolves
+//     to the backend's own sentence and no mutation control — the safe
+//     answer for a claim this build cannot route.
+//
+// Declared steps keep their declared positions (see each workflow's `prereq`
+// for why those positions are what they are), and the appended ones follow in
+// the server's own published order.
+function setupResolvedPrereqChain(w, facts) {
+  const published = (facts && facts.assertedRows && facts.assertedRows[w.key]) || [];
+  const byKey = {};
+  published.forEach((p) => { if (p && p.key) byKey[p.key] = p; });
+  const declared = {};
+  const steps = (w.prereq || []).map((step) => {
+    if (!step.assert) return step;
+    declared[step.assert] = true;
+    return setupAssertedStep(w.key, step.assert, byKey[step.assert]);
+  });
+  published.forEach((p) => {
+    if (!declared[p.key]) steps.push(setupAssertedStep(w.key, p.key, p));
+  });
+  return steps;
+}
+
+// THE effective action: the single control a landing offers while a
+// prerequisite is missing. Walks the declared chain against live facts and
+// returns the first UNMET step's action plus the sentence naming why; all met
+// (or no chain at all) resolves to the declared primary, which is then
+// genuinely the action that resolves the state.
+//
+// Derived for EVERY SETTLED card, not only for EMPTY ones (#365 owner ruling,
+// round 2). EMPTY was never the whole defect: "Venues, rinks and ice" with one
+// venue and no rinks is READY, not EMPTY -- it has records to count -- and it
+// went on offering "Add Ice", which needs a rink that does not exist. A "Rinks"
+// link sitting next to it does not make that primary action live; it just means
+// the operator has to work out for themselves which of the three controls is
+// the one that can succeed. The same shape reaches Participation (divisions
+// registered but no team to register), "Clubs, players and staff" (officials
+// but, under the active League, no team to add a player to) and "Permanent
+// teams" (a club, but no league to hang a team off). The chain answers all of
+// them with the same question -- which record does the declared primary need
+// that is not there -- so it is asked for every card whose data has settled.
+//
+// Scope, deliberately: the SETUP cards only. The Home/Tasks card's "Continue
+// setup" CTA is not derived here and does not need to be -- it points at the
+// roll-up's `next`, which walks the ORDERED REQUIRED PREFIX and therefore
+// cannot recommend a workflow whose predecessor is unfinished (setupHubRollup).
+// It also has no `sv` of its own to derive from: its model comes from the
+// backend progress payload, and reading the setup overview on Home to answer a
+// question the ordering already answers would be a new data dependency, not a
+// fix.
+//
+// Fails CLOSED on an `open` step whose target workflow this role may not
+// open: openSetupWorkflowLanding() refuses an unauthorized key, so offering
+// the button would be offering a dead control. Returning no action at all
+// leaves the EMPTY body's `why` sentence as the only thing on screen, which
+// is the true statement — this role cannot resolve this emptiness itself.
+// (Unreachable today: every cross-workflow step targets a workflow carrying
+// the same `perm` as its source, so a role that can see one can see both.)
+//
+// ...and fails closed the SAME way on a step whose resolution needs a
+// permission this role does not hold (#365 review, Facilities fail-open).
+// That case is REACHABLE and is the whole point: an Arena Manager can see and
+// run Facilities (MANAGE_ARENA) but cannot grant SeasonVenueAccess
+// (MANAGE_SETUP), so substituting "Allow a venue for this season" for a dead
+// "Add Ice" would only trade one dead end for another. They get no mutation
+// control at all plus the sentence — which the card body completes with "Ask
+// a league admin to set that up" — while a League Admin gets the real
+// resolution path. Declared as `perm` ON THE STEP'S ACTION rather than tested
+// at a call site, so a future step cannot forget to ask.
+//
+// `why` may be a function of the facts, so a step whose explanation is an
+// ASSERTED backend sentence (naming the exact Season the claim is about)
+// renders that sentence rather than a client-side paraphrase of it.
+function setupEffectiveAction(w, facts) {
+  // The RESOLVED chain, not the declared one: `{ assert }` placeholders are
+  // replaced by the backend's published rows and any floor the backend
+  // publishes that this client never declared is appended, both fail-closed
+  // (setupResolvedPrereqChain).
+  const step = setupResolvedPrereqChain(w, facts).find((s) => !s.met(facts));
+  if (!step) return { action: w.primary, why: null, advice: null };
+  const why = typeof step.why === "function" ? step.why(facts) : step.why;
+  // Guidance to append when the control is withdrawn below. Carried on the
+  // withdrawal paths only -- an offered action needs no apology.
+  const advice = step.advice || null;
+  // A step with no action at all: the blocker is real and this client has no
+  // control that resolves it (a Season selection, or a floor published by a
+  // newer backend than this build declares). Guidance is the whole truth.
+  if (!step.action) return { action: null, why: why, advice: advice };
+  if (step.action.open && !setupWorkflowsFor().some((x) => x.key === step.action.open)) {
+    return { action: null, why: why, advice: advice };
+  }
+  if (step.action.perm && !hasPerm(step.action.perm)) {
+    return { action: null, why: why, advice: advice };
+  }
+  return { action: step.action, why: why, advice: null };
+}
+
+function buildSetupWorkflowCardModel(w, src) {
+  // Fail CLOSED on a caller that supplies no outcome at all: an unasserted
+  // read is treated as a failed one, never as a silent success.
+  const read = (src && src.progress && src.progress.outcome)
+    ? src.progress : setupProgressRead(CARD_READ.FAILED, null);
+  const statusRow = read.byKey[w.key] || null;
+  // Optionality: the backend's own `status` when there is a progress payload
+  // for this card, the declared contract otherwise. Never a title or index.
+  const optional = statusRow ? !!statusRow.optional : !!w.optional;
+  const status = statusRow ? statusRow.status : CARD_STATUS.UNKNOWN;
+  const base = { status: status, optional: optional, statusRead: read.outcome,
+                 attention: (statusRow && statusRow.attention) || null };
+  // #365 review round 2 finding 3: a REQUIRED workflow whose done/todo status
+  // could not be read is an explicit card ERROR — not a card that quietly
+  // reads READY/EMPTY with an UNKNOWN status while the roll-up keeps last
+  // read's completion and a retry announces "updated". The failure matters
+  // exactly where the status is load-bearing: an OPTIONAL workflow's status
+  // never reaches the completion arithmetic or the recommendation, so a
+  // failed read cannot corrupt anything through it. UNAUTHORIZED is NOT a
+  // failure — a role that may not read the route has no status, which is a
+  // true statement about it, and its cards are not in the roll-up's `known`.
+  if (!optional && read.outcome === CARD_READ.FAILED) {
+    return Object.assign(base, { state: CARD_STATE.ERROR, stats: null,
+      failed: "this workflow's setup status" });
+  }
+  // THE derivation, for every settled state below (#365 owner ruling round 2).
+  // Computed from the SAME `src` the stats are, at the same moment, and
+  // committed into the model under the card's own identity -- so the action a
+  // landing offers and the counts beside it can never be answers about
+  // different context tuples, and nothing is re-derived at paint time.
+  //
+  // Deliberately NOT reached from the ERROR branches above: an ERROR card has
+  // no asserted payload to derive from (`sv` degrades to an empty shape on a
+  // failed read, which would fake every count to zero and manufacture a
+  // prerequisite that may well exist). ERROR keeps its declared actions and
+  // says only the summary is missing, exactly as before.
+  const derived = () => {
+    const eff = setupEffectiveAction(w, setupPrereqFacts(src));
+    // `blockedAdvice` travels with the other two so the sentence a WITHDRAWN
+    // card shows is committed under the same identity as the withdrawal
+    // itself -- a renderer that chose it at paint time could tell an operator
+    // to ask a league admin about a blocker whose real fix is the context bar.
+    return { effective: eff.action, blockedBecause: eff.why,
+             blockedAdvice: eff.advice || null };
+  };
+  // A workflow with no inventory of its own (Workflow 6) has no data
+  // dependency, so it is never loading, empty or errored -- it is simply
+  // there, always reachable, which is what "optional" means here. It still
+  // carries a derivation: an empty chain resolves to the declared primary, so
+  // "every settled card has an effective action" holds without an exception.
+  if (!w.summary) {
+    return Object.assign(base, { state: CARD_STATE.READY, stats: null }, derived());
+  }
+  if (!src.svOk) {
+    return Object.assign(base, { state: CARD_STATE.ERROR, stats: null,
+      failed: "the setup overview" });
+  }
+  if (w.key === "roster" && !src.playersOk) {
+    return Object.assign(base, { state: CARD_STATE.ERROR, stats: null,
+      failed: "the player list" });
+  }
+  const stats = w.summary(src.sv, src.ov, src.players || []);
+  // EMPTY is asserted, not inferred: every count this workflow tracks is
+  // zero, so there is nothing here yet and the card says what is missing.
+  //
+  // ...and, since #365's owner ruling on dead ends, what to DO about it: the
+  // effective action and the sentence naming the blocker are resolved HERE,
+  // from the same payload these counts came from, and committed with the
+  // model. The renderer reads them; it does not re-derive them, so the action
+  // an EMPTY landing offers is always bound to the same identity as the
+  // counts beside it.
+  if (stats.every((s) => !s.n)) {
+    return Object.assign(base, { state: CARD_STATE.EMPTY, stats: stats,
+      reason: "no_records" }, derived());
+  }
+  // SUCCESS/complete for a landing is the workflow's own backend status
+  // reading "done" -- the same signal the Home/Tasks card badges, so the two
+  // surfaces can never disagree about whether a workflow is finished.
+  //
+  // Derived here too rather than assumed: "done" is the BACKEND's judgement
+  // about this workflow, and the chain's question is a different one (can the
+  // declared primary create anything RIGHT NOW, under this tuple). A League
+  // selection that narrows teams to zero makes "Add Player" dead on a roster
+  // the backend still calls done, and a done card that offers a dead action is
+  // the same dead end as an empty one.
+  if (status === CARD_STATUS.DONE) {
+    return Object.assign(base, { state: CARD_STATE.SUCCESS, stats: stats }, derived());
+  }
+  // PARTIAL -- the state the ruling's second round is about. Some of this
+  // workflow's counts are non-zero, so it is not EMPTY and the card has real
+  // records to show; that says nothing about whether the DECLARED primary can
+  // still create the next one.
+  return Object.assign(base, { state: CARD_STATE.READY, stats: stats }, derived());
+}
+
+// Bind every visible workflow card to a fresh identity and commit its model.
+// Called from render()'s Setup branch, inside the same contextRevision-guarded
+// stretch as the fetches it consumes.
+//
+// THE render-driven commit, and the one the serialization rule (see cardWrites)
+// exists for. A card with a current unresolved write is SKIPPED here: this
+// render fetched archived data while that write was in flight, and committing
+// it would supersede the write's identity, restore its withdrawn controls and
+// invite a second lifecycle mutation whose first outcome cannot be known.
+// beginCardRequest() returns null for exactly that card and leaves its
+// generation untouched; every OTHER workflow (and every workflow under a
+// different tuple) commits normally on the same pass, so one card's live
+// operation never freezes its neighbours.
+function commitSetupWorkflowCards(src) {
+  setupWorkflowsFor().forEach((w) => {
+    const identity = beginCardRequest(setupWorkflowCardId(w.key));
+    if (!identity) return;   // #365: refused — a write for this card is unresolved
+    commitCardState(identity, buildSetupWorkflowCardModel(w, src));
+  });
+}
+
+// (4) completion and (5) next-task for the Setup hub — the client's OWN
+// arithmetic, over the cards this role can actually see, and explicitly
+// labelled as such so it never reads as a claim about workflows it cannot see
+// (the same boundary get_setup_progress holds by returning `complete: null`
+// to a partial view).
+//
+// Every card is read through readCardState(), so a card whose tuple has moved
+// contributes STALE rather than its old status: the roll-up can never be
+// computed from data bound to a context tuple that is no longer active.
+// `required` is a partition, not a filtered-at-each-use list, so an optional
+// workflow cannot reach the completion arithmetic or the recommendation.
+function setupHubRollup() {
+  const rows = setupWorkflowsFor().map((w) => {
+    const entry = readCardState(setupWorkflowCardId(w.key));
+    // CONFIRM and PENDING count as settled for the SAME reason: neither has
+    // changed anything yet. A confirmation is a question, and a pending write
+    // is a request the server has not answered — the card is still holding
+    // exactly the status it settled with, so the completion count and the
+    // next-task recommendation must read exactly as they did before the
+    // operator pressed anything. Treating PENDING as unknown would move the
+    // roll-up on the strength of a write that has not happened, which is the
+    // same premature-completion claim #365 review round 4 forbids at every
+    // other mutation point.
+    const settled = entry.state === CARD_STATE.READY || entry.state === CARD_STATE.EMPTY
+      || entry.state === CARD_STATE.SUCCESS || entry.state === CARD_STATE.CONFIRM
+      || entry.state === CARD_STATE.PENDING;
+    return { key: w.key, label: w.title,
+             optional: entry.optional === undefined ? !!w.optional : !!entry.optional,
+             status: settled ? (entry.status || CARD_STATUS.UNKNOWN) : CARD_STATUS.UNKNOWN };
+  });
+  const required = rows.filter((r) => !r.optional);
+  const known = required.filter((r) => r.status !== CARD_STATUS.UNKNOWN);
+  const done = known.filter((r) => r.status === CARD_STATUS.DONE);
+  // (5) next-task, over the ORDERED REQUIRED PREFIX (#365 review round 2
+  // finding 2). Walking the whole list for the first TODO SKIPS a card whose
+  // status is not known — because its own read failed, because it is still in
+  // flight, or because it holds another context's data — and recommends a
+  // LATER workflow instead, silently reordering setup for the operator. The
+  // #204 order is a prerequisite chain, so an unknown card BLOCKS every
+  // recommendation behind it: the walk stops at the first card that is not a
+  // known DONE, and only a TODO there is a recommendation. `blockedBy` is
+  // what stopped it, so the copy can say so instead of just going quiet.
+  let next = null;
+  let blockedBy = null;
+  for (let i = 0; i < required.length; i++) {
+    const r = required[i];
+    if (r.status === CARD_STATUS.UNKNOWN) { blockedBy = r; break; }
+    if (r.status !== CARD_STATUS.DONE) { next = r; break; }
+  }
+  return {
+    required: required, optional: rows.filter((r) => r.optional),
+    total: required.length, known: known.length, done: done.length,
+    allDone: known.length === required.length && required.length > 0
+      && done.length === required.length,
+    // The recommendation is drawn from `required` alone. An optional workflow
+    // is not in the list being searched, so it can never be returned.
+    next: next, blockedBy: blockedBy,
+  };
+}
+
+// The hub's progress/next line. Text only, deliberately: a CTA here would be
+// a second primary action competing with each card's own (#204's
+// one-primary-action-per-screen rule).
+//
+// Returns "" when there is nothing true to say. That empty string is NOT a
+// no-op for the caller: see setupHubProgressSlotHtml() below — the roll-up is
+// written into a container that always exists, so "nothing to say" REMOVES
+// the previous sentence rather than leaving it standing.
+function setupHubProgressHtml() {
+  const roll = setupHubRollup();
+  if (!roll.total || !roll.known) return "";
+  const optionalNote = roll.optional.length
+    ? ` ${esc(roll.optional.map((r) => r.label).join(", "))} is optional and never blocks completion.`
+    : "";
+  const nextNote = roll.next
+    ? ` Next: <strong>${esc(roll.next.label)}</strong>.`
+    // Deliberately not silent: a blocked prefix is why there is no "Next",
+    // and saying so is what stops the absence from reading as "nothing left".
+    : roll.blockedBy
+    ? ` No next step until <strong>${esc(roll.blockedBy.label)}</strong> is up to date.`
+    : roll.allDone ? " Every required workflow you manage is done." : "";
+  return `<p class="muted swf-progress" data-setup-hub-progress>${roll.done} of
+    ${roll.total} required setup workflow${roll.total === 1 ? "" : "s"} you manage
+    ${roll.done === 1 ? "is" : "are"} done.${nextNote}${optionalNote}</p>`;
+}
+
+// The STABLE container the roll-up is always written through (#365 review
+// round 2 finding 2). The defect it removes: repaint used to replace the
+// roll-up element only when the NEW html was non-empty, so a card going
+// unknown — an Arena Manager retrying or failing Facilities, the sole
+// required card they manage — left the previous "1 of 1 … done" sentence on
+// screen beside counts that no longer supported it. "Empty html" meant "keep
+// what's there" purely because there was nothing to swap in.
+//
+// With a container that outlives its contents, the write is unconditional and
+// the empty case is a REMOVAL, not a skip. There is no longer a code path
+// that can preserve a superseded roll-up, so no call site has to remember not
+// to.
+function setupHubProgressSlotHtml() {
+  return `<div class="swf-progress-slot" data-setup-hub-progress-slot
+    >${setupHubProgressHtml()}</div>`;
+}
+
+// A card's status chip. Reads the model's `optional` partition flag, not a
+// key, so the Decision 9 wording follows the backend's own status.
+//
+// The optional chip keeps class `swf-optional` and the done/todo chips
+// deliberately do NOT: that class means Decision 9's optional workflow and
+// nothing else, everywhere it is looked for.
+function setupCardStatusChip(entry, w) {
+  const optional = entry.optional === undefined ? !!w.optional : !!entry.optional;
+  if (optional) return `<span class="swf-optional">Optional</span>`;
+  if (entry.status === CARD_STATUS.DONE) return `<span class="swf-status swf-done">Done</span>`;
+  if (entry.status === CARD_STATUS.TODO) return `<span class="swf-status swf-todo">To do</span>`;
+  return "";
+}
+
+// The per-card body: whichever of the discriminated states this card is in.
+// Shared by the hub card and the landing so the two surfaces can never drift
+// into showing different states for the same card. `landing` only widens the
+// copy (a landing has room to explain); it never changes which state is shown.
+function setupCardBodyHtml(w, landing) {
+  const entry = readCardState(setupWorkflowCardId(w.key));
+  const retry = (label) => `<div class="swf-card-actions">
+    <button class="act ghost" data-setup-card-retry="${esc(w.key)}"
+      >${label}</button></div>`;
+  const stats = (rows) => rows
+    ? `<div class="swf-stats">${rows.map((s) =>
+        `<span class="swf-stat"><strong>${s.n}</strong> ${esc(s.label)}</span>`).join("")}</div>`
+    : "";
+  // The blocker sentence for a card that is NOT empty (#365 owner ruling round
+  // 2). A partial card shows real counts, so the EMPTY copy ("nothing here
+  // yet") would be a false statement — but the missing prerequisite is exactly
+  // as load-bearing, because it is why the action below is not this workflow's
+  // declared primary. Same committed field the withdrawal above reads, so the
+  // explanation and the control can never describe different problems, and no
+  // sentence at all when nothing is blocked.
+  // The withdrawn-action sentence comes from the MODEL when the blocking step
+  // declared one (#365 review round 3), falling back to the league-admin
+  // wording that is correct for a grant or a reopen this role cannot perform.
+  // "No season is selected" needs a different sentence -- no league admin can
+  // pick a season for someone -- and the step is what knows that.
+  const withdrawnAdvice = () => ` ${entry.blockedAdvice
+    || "Ask a league admin to set that up."}`;
+  const blockedNote = () => !entry.blockedBecause ? "" : `<p class="swf-card-blocked">
+    ${esc(entry.blockedBecause)}${entry.effective === null
+      ? esc(withdrawnAdvice())
+      : " Start with the action below — this workflow's usual next step can't"
+        + " be taken until then."}</p>`;
+  if (entry.state === CARD_STATE.LOADING) {
+    return `<div class="skeleton"><span class="sr-only">Loading ${
+      esc(w.title.toLowerCase())}…</span></div>`;
+  }
+  if (entry.state === CARD_STATE.ERROR) {
+    // Scoped to THIS card: the neighbouring cards keep their own numbers, and
+    // Retry re-fetches only what this card needs. A real <button> in normal
+    // document order, so it is reachable by Tab like any other control.
+    return `<p class="swf-card-error" role="alert">Couldn't load ${
+      esc(entry.failed || "this workflow's summary")}.${landing
+        ? " The action below still works — only these counts are missing." : ""}</p>
+      ${retry("Retry")}`;
+  }
+  if (entry.state === CARD_STATE.STALE) {
+    // Held data from a context the operator has left. Shown, but labelled,
+    // with a refresh path -- never silently re-presented as current.
+    return `${stats(entry.stats)}
+      <p class="swf-card-stale">These counts are from the program, season or
+        league you had selected earlier.</p>
+      ${retry("Refresh")}`;
+  }
+  if (entry.state === CARD_STATE.PENDING) {
+    // A write this card started is IN FLIGHT (#365 review round 4). Three
+    // things this body has to get right, all of them the reported defect:
+    //  * The counts STAY. Blanking them would claim the write has already
+    //    changed something, which is exactly the premature-success the
+    //    pending state exists to stop.
+    //  * NO control at all. The confirmation's own buttons are gone (a second
+    //    press would fire a second reopen), and no retry is offered while the
+    //    first attempt is unresolved.
+    //  * The sentence is FOCUSABLE and is where focus is put. The controls
+    //    the operator was standing on have just been replaced; without a
+    //    destination, focus falls to <body> and a keyboard or screen-reader
+    //    operator is stranded mid-operation with no idea anything is
+    //    happening. tabindex="-1" is the same non-focusable-destination
+    //    convention focusContentHeading() uses — reachable programmatically,
+    //    never inserted into the tab order.
+    return `${stats(entry.stats)}
+      <p class="swf-card-pending" data-setup-card-pending="${esc(w.key)}"
+        tabindex="-1">${esc(entry.pendingNote || "Working…")}</p>`;
+  }
+  if (entry.state === CARD_STATE.CONFIRM) {
+    const c = entry.confirm || {};
+    // A confirmation may REQUIRE a reason (#365 review round 3): reopening an
+    // archived Season is a reasoned lifecycle write (#159 -- the route rejects
+    // a blank one and records what it is given in the audit trail), so the
+    // card collects it here rather than sending a canned string on the
+    // operator's behalf. A real <label>+<input> in document order, so it is
+    // reachable and named for a screen reader like any other field.
+    const reason = c.reason ? `
+        <label class="swf-confirm-reason" for="swf-confirm-reason-${esc(w.key)}"
+          >${esc(c.reason)}</label>
+        <input class="swf-confirm-reason-input" type="text" required
+          id="swf-confirm-reason-${esc(w.key)}"
+          data-setup-card-confirm-reason="${esc(w.key)}"
+          value="${esc(entry.confirmReason || "")}">
+        ${entry.confirmError
+          ? `<p class="swf-card-error" role="alert">${esc(entry.confirmError)}</p>`
+          : ""}` : "";
+    return `${stats(entry.stats)}
+      <div class="swf-confirm" role="group" aria-label="${esc(c.yes || "Confirm")}">
+        <p class="swf-confirm-prompt">${esc(c.prompt || "Are you sure?")}</p>
+        ${reason}
+        <div class="swf-card-actions">
+          <button class="act ghost" data-setup-card-confirm-yes="${esc(w.key)}"
+            >${esc(c.yes || "Confirm")}</button>
+          <button class="act ghost" data-setup-card-confirm-no="${esc(w.key)}"
+            >${esc(c.no || "Cancel")}</button>
+        </div>
+      </div>`;
+  }
+  if (entry.state === CARD_STATE.EMPTY) {
+    // Explains what is missing, in this workflow's own terms, instead of
+    // showing a row of zeros and leaving the operator to infer it.
+    //
+    // `blockedBecause` (the owner's EMPTY dead-end ruling) names the
+    // PREREQUISITE that is missing when the workflow's own declared primary
+    // cannot be the resolving action — the same chain step that chose the one
+    // action below, so the copy and the control can never describe different
+    // problems. Absent it, the declared primary IS the resolving action and
+    // the generic sentence is the whole truth.
+    const missing = (entry.stats || []).map((s) => s.label.toLowerCase()).join(", ");
+    const because = entry.blockedBecause
+      ? ` ${esc(entry.blockedBecause)}`
+      : "";
+    const lead = entry.effective === null && entry.blockedBecause
+      ? esc(withdrawnAdvice())
+      : " Start with the action below.";
+    return `${stats(entry.stats)}
+      <p class="swf-card-empty">Nothing here yet — no ${esc(missing || "records")} for
+        this program, season and league.${because}${lead}</p>`;
+  }
+  if (entry.state === CARD_STATE.SUCCESS) {
+    return `${stats(entry.stats)}
+      <p class="swf-card-done">✓ This workflow is set up. You can still add
+        more whenever you need to.</p>${blockedNote()}`;
+  }
+  return `${stats(entry.stats)}${blockedNote()}`;
+}
+
+// One card body per surface, wrapped in the slot a per-card retry/refresh
+// replaces. aria-busy is per card (not per page), so a card reloading on its
+// own is announced as busy without implying the rest of Setup is.
+// Deliberately NOT role="status"/aria-live: six polite live regions would all
+// speak on every context switch. Card-scoped confirmations and successes go
+// through the one existing sitewide live region instead (announceCardStatus).
+function setupCardSlotHtml(w, landing) {
+  const entry = readCardState(setupWorkflowCardId(w.key));
+  return `<div class="swf-card-body" data-setup-card-slot="${esc(w.key)}"
+    aria-busy="${cardBusy(entry) ? "true" : "false"}"
+    >${setupCardBodyHtml(w, landing)}</div>`;
+}
+
+// aria-busy is true for a card with an unresolved request of EITHER kind: a
+// read in flight (LOADING) or a write in flight (PENDING). Assistive
+// technology's question is "is this region still changing", and the answer is
+// yes in both — a pending write that reported itself idle would invite the
+// second press the state exists to prevent.
+function cardBusy(entry) {
+  return !!entry && (entry.state === CARD_STATE.LOADING
+    || entry.state === CARD_STATE.PENDING);
+}
+
+// The last thing the serialization rule (see cardWrites) has to protect: WHERE
+// FOCUS IS. Refusing the model commit keeps the card PENDING, but a render
+// still repaints the surface — `c.innerHTML = renderSetup(...)`, or this
+// file's own per-card slot replacement — and that destroys the focusable
+// pending line the operator was standing on, dropping them on <body> mid-
+// operation. The pending write OWNS its card's focus until its own response
+// arrives, exactly as it owns the card's model, so the operation re-asserts it
+// after any repaint that took it away.
+//
+// Deliberately NOT a focus grab: it acts only when focus has been left
+// NOWHERE — <body> or the #content region's own fallback — which is precisely
+// the case where a repaint destroyed it. A destination heading, a control the
+// operator tabbed to, anything real, is left alone.
+function restorePendingCardWriteFocus() {
+  const active = document.activeElement;
+  if (active && active !== document.body && active.id !== "content") return;
+  setupWorkflowsFor().forEach((w) => {
+    const held = currentCardWrite(setupWorkflowCardId(w.key));
+    if (!held) return;
+    const slot = document.querySelector(`[data-setup-card-slot="${w.key}"]`);
+    const line = slot && slot.querySelector("[data-setup-card-pending]");
+    // The LEDGER entry's identity. focusCardTarget refuses a superseded one on
+    // its own account, which is the right answer after a round trip: the
+    // operator navigated back here deliberately and their focus is on a real
+    // destination, so nothing may yank it onto the pending line.
+    //
+    // It is also the right answer after an authenticated-user change (#365
+    // round 7): the entry survives, because the write does, but its identity
+    // belongs to the departing principal, so cardIdentityCurrent() refuses and
+    // the arriving principal's focus is never moved by an operation they did
+    // not start. Their card is still non-actionable — that comes from the
+    // ledger, not from focus.
+    if (line) focusCardTarget(held.identity, line);
+  });
+}
+
+// (1) DOM mutation, scoped to ONE card: repaints this workflow's slot(s) --
+// its hub card and/or the open landing -- its status chip, and the hub
+// roll-up line that reads from it. Nothing else on the Setup screen is
+// touched, which is what "a retry replaces only the failed card generation"
+// means in practice: a failed "Clubs, players and staff" card recovering must
+// not blank the five cards beside it.
+function repaintSetupWorkflowCard(key, identity) {
+  if (identity && !cardIdentityCurrent(identity)) return false;  // #365 identity gate — DOM
+  const w = setupWorkflowsFor().find((x) => x.key === key);
+  if (!w) return false;
+  const slots = document.querySelectorAll(`[data-setup-card-slot="${key}"]`);
+  if (!slots.length) return false;  // navigated away before this resolved
+  const entry = readCardState(setupWorkflowCardId(key));
+  slots.forEach((slot) => {
+    slot.innerHTML = setupCardBodyHtml(w, !!slot.closest(".swf-landing"));
+    slot.setAttribute("aria-busy", cardBusy(entry) ? "true" : "false");
+  });
+  const head = document.querySelector(`[data-setup-workflow-card="${key}"] .swf-head`);
+  if (head) {
+    const chip = head.querySelector(".swf-optional, .swf-status");
+    if (chip) chip.remove();
+    const next = setupCardStatusChip(entry, w);
+    if (next) head.insertAdjacentHTML("beforeend", next);
+  }
+  // The hub roll-up is derived from every card's model, so this one card
+  // changing genuinely changes it. Written through the stable container
+  // (#365 review round 2 finding 2), UNCONDITIONALLY: when the new roll-up
+  // has nothing true to say, the previous sentence is REMOVED rather than
+  // left standing beside counts that no longer support it. The container
+  // itself persists, so a later repaint still finds its place.
+  const progressSlot = document.querySelector("[data-setup-hub-progress-slot]");
+  if (progressSlot) progressSlot.innerHTML = setupHubProgressHtml();
+  // The open landing's action groups are state-dependent too (#365 review
+  // round 2 finding 1), so a card that settles into EMPTY, STALE or CONFIRM
+  // must withdraw what that state forbids NOW -- not keep whatever the last
+  // full render painted until the next one. Same stable container, same
+  // unconditional write.
+  const landingActions = document.querySelector(`[data-setup-landing-actions="${key}"]`);
+  if (landingActions) {
+    landingActions.innerHTML = setupLandingActionsHtml(w);
+    wireSetupLandingActions(landingActions);
+  }
+  wireSetupWorkflowCards(document);
+  // The slot replacement above destroyed whatever was focused inside it. If
+  // this card is holding an unresolved write, its pending line is where the
+  // operator belongs — not <body>.
+  restorePendingCardWriteFocus();
+  return true;
+}
+
+// A per-card retry/refresh. Fetches ONLY what this card needs (the four cards
+// with inventory counts need the setup overview, "roster" additionally needs
+// the player list, Workflow 6 needs neither) and commits under this card's own
+// generation, so it can never disturb a neighbour's state or be overtaken by
+// an older response of its own.
+//
+// Deliberately does NOT write the module-level `playersList` the Records and
+// hierarchy views render from: this is one card's refresh, not the Setup
+// screen's.
+// `opts.done` / `opts.failed` let a CALLER THAT OWNS THE OUTCOME supply the
+// sentence instead of this function's generic one. The reopen writer is the
+// only such caller: without this, a successful reopen announced "Season
+// reopened." and was then immediately overwritten by this function's
+// "Venues, rinks and ice updated." — two announcements for one operation,
+// the second of which describes the refresh rather than what the operator
+// actually did. It is a SUBSTITUTION, never an addition: the announcement
+// still happens exactly once, at exactly this point, under exactly this
+// identity gate.
+//
+// `opts.silent` suppresses the announcement and the focus move — and ONLY
+// those two (#365 review round 7). It exists for exactly one caller: the
+// settlement of a write whose AUTHENTICATED PRINCIPAL has changed underneath
+// it. The arriving principal did not press anything, so there is nothing to
+// tell them and nowhere they asked to be sent; a sentence in the sitewide live
+// region or a focus jump into this card would both be the departing
+// operator's operation speaking through the arriving operator's session. The
+// fresh reads, the model commit and the repaint still happen in full, because
+// the card DOES have to stop showing the neutral pending presentation and
+// start showing what the server now says — reconciled, but silently.
+async function retrySetupWorkflowCard(key, opts) {
+  const o = opts || {};
+  const w = setupWorkflowsFor().find((x) => x.key === key);
+  if (!w) return;
+  const held = cardStates[setupWorkflowCardId(key)] || {};
+  // Refused while an operation for this card against the CURRENT tuple is
+  // still unresolved — the operator's Retry press above all. The reopen
+  // writer reaches this function only AFTER settling its own registration, so
+  // it needs no exemption to get past the gate; nothing else may.
+  const identity = beginCardRequest(setupWorkflowCardId(key), { userInitiated: true });
+  if (!identity) return;   // #365: refused — a write for this card is unresolved
+  commitCardState(identity, { state: CARD_STATE.LOADING, status: CARD_STATUS.UNKNOWN,
+                              optional: held.optional === undefined ? !!w.optional : held.optional });
+  repaintSetupWorkflowCard(key, identity);
+  const needsPlayers = key === "roster";
+  // Whether this caller may read the status route at all — an ASSERTED
+  // distinction (#365 review round 2 finding 3), not one recovered later from
+  // a null payload: "this role has no status" and "the status read failed"
+  // are different facts and must not arrive at the model looking alike.
+  const mayReadProgress = hasPerm("manage_arena");
+  const [svr, pl, pr] = await Promise.all([
+    w.summary ? getJSON("/api/v2/setup/overview") : Promise.resolve(null),
+    needsPlayers ? getJSON("/api/players") : Promise.resolve(null),
+    // Status comes from the same route the Home/Tasks card reads, gated on
+    // exactly the permission that route requires, so an unauthorized role
+    // simply has no status rather than a 403 that would read as a failure.
+    mayReadProgress ? getJSON("/api/v2/setup/progress") : Promise.resolve(null),
+  ]);
+  const svOk = !w.summary || !!(svr && !svr.error);
+  const playersOk = !needsPlayers || Array.isArray(pl);
+  // The failed read used to become `null` here, which buildSetupWorkflowCardModel
+  // then read as "no row for this card" — so a retry whose status read failed
+  // still produced READY/EMPTY and still announced "<workflow> updated". The
+  // outcome now travels with the read, so the model can (and does) refuse.
+  const progress = mayReadProgress
+    ? setupProgressReadOf(pr) : setupProgressRead(CARD_READ.UNAUTHORIZED, null);
+  const model = buildSetupWorkflowCardModel(w, {
+    sv: svOk ? svr : null, ov: null, players: Array.isArray(pl) ? pl : [],
+    svOk: svOk, playersOk: playersOk, progress: progress });
+  // (4) completion and (5) next-task: both are read off this model by
+  // setupHubRollup(), and commitCardState refuses a superseded identity, so a
+  // late loser can revise neither.
+  if (!commitCardState(identity, model)) return;
+  if (!repaintSetupWorkflowCard(key, identity)) return;      // (1) DOM
+  // A SILENT reconcile stops here: model and DOM are updated from fresh server
+  // truth under this principal's own identity and permissions, and nothing is
+  // said or focused on behalf of an operation this principal never started.
+  if (o.silent) return;
+  const failed = model.state === CARD_STATE.ERROR;
+  announceCardStatus(identity, failed                        // (3) announcement
+    ? (o.failed || `Still couldn't load ${w.title}.`)
+    : (o.done || `${w.title} updated.`), failed);
+  // (2) focus: the operator pressed Retry inside the slot that was just
+  // replaced, so land them on this card's own heading rather than <body>.
+  const landing = document.querySelector(`[data-setup-workflow-landing="${key}"]`);
+  focusCardTarget(identity, landing
+    ? landing.querySelector(".swf-landing-title")
+    : document.querySelector(`[data-setup-workflow-card="${key}"] .swf-title`));
+}
+
+// Resolve an action reference ("secondary:0") back to its declaration. Kept
+// as a lookup rather than stashing the action object on the DOM node so a
+// repaint can never resurrect an action from an earlier definition.
+function setupCardActionFor(w, ref) {
+  const parts = String(ref || "").split(":");
+  // "primary" resolves through the COMMITTED model, not the declared
+  // `w.primary` (#365 review round 3). The landing's primary slot renders the
+  // card's EFFECTIVE action, and once a derived action can carry a `confirm`
+  // -- the reopen path -- looking the reference back up in the declared list
+  // would confirm one action and execute a different one. `undefined` means
+  // this card never carried a derivation (ERROR, or a model committed before
+  // one was computed), which falls back to the declared primary exactly as
+  // setupLandingActionsHtml does.
+  if (parts[0] === "primary") {
+    const entry = readCardState(setupWorkflowCardId(w.key));
+    return entry.effective === undefined ? (w.primary || null) : entry.effective;
+  }
+  const list = parts[0] === "tertiary" ? (w.tertiary || []) : (w.secondary || []);
+  return list[Number(parts[1]) || 0] || null;
+}
+
+// The CONFIRM state (#365). Opens a card-scoped confirmation for an action
+// that declares one, bound to this card's identity so a context switch
+// withdraws it rather than leaving a prompt standing for a Program the
+// operator has left.
+function askSetupCardConfirm(key, ref) {
+  const w = setupWorkflowsFor().find((x) => x.key === key);
+  if (!w) return;
+  const action = setupCardActionFor(w, ref);
+  if (!action || !action.confirm) return;
+  // Through readCardState(), never the raw cardStates entry: on a card the
+  // operator has just come BACK to with a write still unresolved, the raw
+  // entry is whatever the other tuple's renders left behind, and this opener
+  // has to see the OPERATION. Reading the operation is what puts the refusal
+  // below on the serialization rule rather than on which tuple happened to
+  // commit last.
+  const held = readCardState(setupWorkflowCardId(key));
+  // A card holding data from a context the operator has left must not open a
+  // confirmation bound to it.
+  if (!held || !cardTupleCurrent(held.identity)) return;
+  const identity = beginCardRequest(setupWorkflowCardId(key), { userInitiated: true });
+  // Refused while this card's own write against this tuple is unresolved:
+  // opening a second confirmation is how a second write starts. The PENDING
+  // body and the withdrawn landing groups mean no control exists to reach
+  // this, so this is the code-level floor under those two surfaces, not a
+  // substitute for them.
+  if (!identity) return;
+  commitCardState(identity, Object.assign({}, held, {
+    state: CARD_STATE.CONFIRM, confirm: action.confirm,
+    pending: ref, resumeState: held.state }));
+  if (!repaintSetupWorkflowCard(key, identity)) return;
+  announceCardStatus(identity, action.confirm.prompt);
+  const slot = document.querySelector(`[data-setup-card-slot="${key}"]`);
+  // A confirmation that REQUIRES a reason lands focus on the field the
+  // operator has to fill, not on the button that would reject it.
+  focusCardTarget(identity, slot && (slot.querySelector("[data-setup-card-confirm-reason]")
+    || slot.querySelector("[data-setup-card-confirm-yes]")));
+}
+
+function resolveSetupCardConfirm(key, yes) {
+  const w = setupWorkflowsFor().find((x) => x.key === key);
+  // Same reason as askSetupCardConfirm: the OPERATION outranks the raw entry,
+  // so a card carrying an unresolved write reads PENDING here and this
+  // resolver declines rather than resolving a confirmation that is not the
+  // card's current state.
+  const held = readCardState(setupWorkflowCardId(key));
+  if (!w || !held || held.state !== CARD_STATE.CONFIRM) return;
+  if (!cardTupleCurrent(held.identity)) return;
+  const action = setupCardActionFor(w, held.pending);
+  const c = (action && action.confirm) || {};
+  // Read the reason BEFORE anything repaints the slot the field lives in.
+  const field = document.querySelector(`[data-setup-card-confirm-reason="${key}"]`);
+  const reason = field ? String(field.value || "").trim() : "";
+  // A required reason that is blank keeps the confirmation OPEN with an
+  // error, rather than firing a write the route will reject (#159 requires a
+  // non-empty reason) or -- worse -- inventing one on the operator's behalf.
+  if (yes && c.reason && !reason) {
+    const stay = beginCardRequest(setupWorkflowCardId(key), { userInitiated: true });
+    if (!stay) return;   // #365: refused — a write for this card is unresolved
+    if (!commitCardState(stay, Object.assign({}, held, {
+      confirmReason: "", confirmError: "Add a reason before reopening." }))) return;
+    if (!repaintSetupWorkflowCard(key, stay)) return;
+    announceCardStatus(stay, "Add a reason before reopening.", true);
+    const slot = document.querySelector(`[data-setup-card-slot="${key}"]`);
+    focusCardTarget(stay, slot && slot.querySelector("[data-setup-card-confirm-reason]"));
+    return;
+  }
+  // A confirmed action that performs its OWN write from this card is handed
+  // straight to the writer, BEFORE anything here restores a settled state or
+  // announces (#365 review round 4). This is the fix for the reported defect:
+  // the code below restores READY, drops the confirmation and the reason, and
+  // announces `c.done` — all of which used to run BEFORE the reopen POST had
+  // even left the browser. That is a success claimed in advance, a recovery
+  // path thrown away while it is still needed, and a card left actionable
+  // with a write outstanding. The other three action kinds (`go`, `act`,
+  // `open`) navigate to a surface that owns its own write, so for them
+  // "confirmed" genuinely IS the end of this card's part and the restore
+  // below is correct.
+  if (yes && action && action.reopen) {
+    return reopenSelectedSeasonFromCard(key, held, c, reason);
+  }
+  const identity = beginCardRequest(setupWorkflowCardId(key), { userInitiated: true });
+  if (!identity) return;   // #365: refused — a write for this card is unresolved
+  commitCardState(identity, Object.assign({}, held, {
+    state: held.resumeState || CARD_STATE.READY, confirm: null, pending: null,
+    confirmReason: null, confirmError: null }));
+  repaintSetupWorkflowCard(key, identity);
+  // Success and cancellation both announce exactly once, through the one
+  // sitewide live region -- the card's own visible copy is not itself a live
+  // region, so neither is spoken twice.
+  //
+  // CANCELLATION stays on this surface: nothing navigates, nothing clears the
+  // region afterwards, so it is announced here and now.
+  if (!yes) {
+    announceCardStatus(identity, c.cancelled || "Cancelled.");
+    focusCardTarget(identity, document.querySelector(`[data-setup-card-ask="${key}"]`));
+    return;
+  }
+  // COMPLETION, for the three action kinds that hand off to a destination
+  // owning its own write. Each of them navigates, and a navigation withdraws
+  // the region in the same task -- so the sentence is announced AFTER the
+  // destination render instead of before it. See announceCardStatusAfter().
+  const done = c.done || "Continuing.";
+  if (action.go) {
+    return announceCardStatusAfter(identity, done, () => runSetupWorkflowGo(action.go));
+  }
+  if (action.act) {
+    return announceCardStatusAfter(identity, done, () => openSetupWorkflowDrawer(action.act));
+  }
+  if (action.open) {
+    return announceCardStatusAfter(identity, done, () => openSetupWorkflowLanding(action.open));
+  }
+  // No destination at all: nothing is going to clear the region, so this is
+  // the ordinary in-place announcement.
+  announceCardStatus(identity, done);
+}
+
+// The REAL reopen-Season write, fired from a card whose blocking prerequisite
+// is `season_active` (#365 review round 3). The FOURTH action kind, and the
+// only one that mutates from the card itself rather than navigating to a
+// surface that does -- Season lifecycle has no workflow, landing or drawer of
+// its own, and #159 makes the reopen a single reasoned write.
+//
+// Deliberately card-scoped, all the way through:
+//
+//  * The target is the SELECTED Season, re-read from the live context at fire
+//    time and cross-checked against the identity the card committed under.
+//    #367's rule is that reopening requires the Season to be the selected
+//    context; asserting it here means a switch that slipped between the
+//    confirmation and the click reopens NOTHING rather than the wrong Season.
+//  * Recovery is this card's OWN refresh, not render(). A full render
+//    re-commits every Setup card and would bump every neighbouring
+//    generation -- the exact "adjacent-card mutation" the per-card discipline
+//    forbids. retrySetupWorkflowCard re-reads the overview and the progress
+//    payload for this card alone, so `season_active` flips to met and the
+//    chain settles on whatever the NEXT unmet floor is (or the declared
+//    primary), under a fresh generation of this card and no other.
+//  * No page reload anywhere: the tuple is unchanged (same Season id), so the
+//    committed identity stays valid across the whole sequence.
+//
+// #365 REVIEW ROUND 4 — WHAT WAS WRONG AND WHAT REPLACES IT
+// ---------------------------------------------------------
+// The first version was written as fire-and-forget optimism: the caller had
+// already restored READY, removed the reason field and announced "Season
+// reopened." before this function's `await` was even reached, and this
+// function checked the card's identity ONLY BEFORE that await. After it, both
+// the failure and the success branch wrote the sitewide toast, and the
+// success branch called retrySetupWorkflowCard() — bumping a generation,
+// re-committing a model, repainting and moving focus — without ever proving
+// the initiating card, tuple and generation were still the current ones. Held
+// open, an older Program/Season's response therefore reached in and changed
+// the NEW tuple's card: its generation, its committed model and DOM, its
+// focus, its announcement, and the completion and next-task lines derived
+// from it. That is precisely the stale-response race #365 requires every card
+// action to discard.
+//
+// The correction is not a new mechanism — it is the mechanism this slice
+// already uses everywhere else, applied here too:
+//
+//   IDENTITY IS ISSUED ONCE, UP FRONT, and carried through the WHOLE
+//   operation. `beginCardRequest` stamps card id + the exact
+//   Program/Season/League tuple + this card's generation, and every later
+//   step is gated on THAT record — not on a fresh one taken after the await,
+//   which would be trivially current and would prove nothing.
+//
+//   THE EXACT SEASON IS CARRIED TOO — as a pin, not as a second guarantee.
+//   `seasonId` is resolved once, here, and re-verified after the await. It
+//   cannot currently disagree with the identity's tuple (both read the same
+//   contextOptions.selected.season_id, synchronously, one line apart), so the
+//   protection above is entirely cardIdentityCurrent's; the pin exists because
+//   this write names its target explicitly in the URL instead of inheriting it
+//   from the tuple. See the gate itself for the full note.
+//
+//   NOTHING IS RESTORED OR ANNOUNCED BEFORE THE SERVER CONFIRMS. The card
+//   goes to PENDING, keeps its counts, offers no control at all, and holds
+//   focus on its own pending line. The only thing said out loud before the
+//   response is the progress sentence (`confirm.busy`), which claims nothing.
+//
+//   NOTHING HAPPENS AFTER THE AWAIT UNTIL THE INITIATING IDENTITY AND SEASON
+//   ARE RE-VERIFIED. Both terminal branches necessarily advance this card to
+//   its next generation — the failure branch by re-opening the confirmation,
+//   the success branch through retrySetupWorkflowCard's own refresh — so that
+//   one check, taken against the record captured BEFORE the await, is what
+//   stands between an older tuple's response and the current card's model,
+//   DOM, focus, live region, completion and next task. Everything after it is
+//   synchronous, so there is no second window; and each individual mutation
+//   still goes through the helper that enforces the same gate on its own
+//   account (commitCardState, repaintSetupWorkflowCard, announceCardStatus,
+//   focusCardTarget), exactly as every other card path in this file does.
+//   A superseded response returns having done nothing whatsoever — including
+//   nothing to the sitewide toast, which is why the transport here is
+//   postScoped() rather than post().
+async function reopenSelectedSeasonFromCard(key, held, c, reason) {
+  const cardId = setupWorkflowCardId(key);
+  // The EXACT Season this write targets, resolved ONCE. Everything after this
+  // line — the URL, the identity check before the await and the identity
+  // check after it — refers to this one value, so there is no second reading
+  // of live context that could disagree with the first.
+  const seasonId = contextOptions && contextOptions.selected
+    && contextOptions.selected.season_id;
+  if (!seasonId || !held || !cardTupleCurrent(held.identity)
+      || held.identity.season_id !== seasonId) {
+    toast = "That season is no longer the one you're working in — nothing was"
+      + " reopened.";
+    toastIsError = true;
+    return updateToast();
+  }
+  // The INITIATING identity, issued once and carried through the whole
+  // operation — the record every later step is judged against. It stops being
+  // current the moment any other request for this card is started or the
+  // operator moves to another Program/Season/League.
+  const identity = beginCardRequest(cardId, { userInitiated: true });
+  // Refused when a reopen for this card is ALREADY unresolved — the duplicate
+  // write itself, stopped at the source. Unreachable through the UI (neither
+  // surface paints a control in PENDING), and asserted anyway: this is the one
+  // line that makes "at most one unresolved write per card" true of the code
+  // rather than true of the current markup.
+  if (!identity) return;
+  // PENDING, BEFORE the request goes out. Counts stay, every control is
+  // withdrawn, and the reason travels with the state so the failure branch
+  // below can hand it straight back. Committing PENDING is also what
+  // REGISTERS this operation, so from here until its own response every
+  // render-driven commit for this card is refused outright.
+  if (!commitCardState(identity, Object.assign({}, held, {
+        state: CARD_STATE.PENDING, confirmReason: reason, confirmError: null,
+        pendingNote: c.busy || "Working…" }))) return;
+  if (!repaintSetupWorkflowCard(key, identity)) return;
+  // A progress sentence, not a completion one. The confirmation's prompt is
+  // still standing in the live region otherwise, describing a question the
+  // operator has already answered.
+  announceCardStatus(identity, c.busy || "Working…");
+  const slot = document.querySelector(`[data-setup-card-slot="${key}"]`);
+  // Focus followed the controls that were just replaced; put it on the card's
+  // own pending line rather than letting it fall to <body>.
+  focusCardTarget(identity, slot && slot.querySelector("[data-setup-card-pending]"));
+  const r = await postScoped(`/api/v2/setup/seasons/${seasonId}/reopen`,
+                             { reason: reason });
+  // ======================= AFTER THE AWAIT =======================
+  // SETTLEMENT, FIRST AND UNCONDITIONALLY. This is the instant the operation
+  // stops being unresolved, so it is the instant its ledger entry is
+  // released — before any question is asked about where the operator is, what
+  // the response says, or whether the initiating identity survived. Nothing
+  // below can return early past it, because it is above every return.
+  //
+  // "Even when the initiating UI identity is stale" is the whole point. The
+  // operator can be standing on another Program/Season when this lands; the
+  // generation this card was on can have moved three times. None of that has
+  // any bearing on whether the REQUEST settled — it did — and a ledger that
+  // drained only on the path where the identity is still current would leave
+  // the target tuple's card blocked forever the moment the operator glanced
+  // at another Season.
+  const settled = settleCardWrite(identity);
+  // Nothing to settle: this operation was never registered (its PENDING
+  // commit was refused) or has already settled once. Either way there is no
+  // outstanding write here and nothing this response may act on.
+  if (!settled) return;
+  // ---- WHICH TUPLE IS ON SCREEN decides what may happen next. ----
+  //
+  // NOT the target's: the round-4 rule, unchanged and unweakened. The response
+  // describes a Season the operator is no longer working in, so applying any
+  // part of it would paint one Season's outcome under another Season's
+  // heading. It returns having done NOTHING at all — no toast, no live region,
+  // no repaint, no refresh, no focus, no completion or next-task change, on
+  // either tuple. postScoped() is what makes "nothing" literally true: post()
+  // would already have published the server's error message into the sitewide
+  // toast before this line was ever reached. The ledger is drained all the
+  // same, so returning to the target later reads the server rather than a
+  // permanent block.
+  //
+  // The `season_id` conjunct is REDUNDANT TODAY and is not a second
+  // guarantee — say so plainly rather than let it read as one. `seasonId` is
+  // read from contextOptions.selected.season_id, and `identity.season_id` is
+  // set from currentCardTuple(), which reads that same field on the next
+  // synchronous line; the two cannot disagree, and cardTupleCurrent already
+  // compares identity.season_id against the live tuple. It is kept because
+  // this write names its target EXPLICITLY in the URL rather than inheriting
+  // it from the tuple: if a future card ever reopens a Season other than the
+  // selected one, the tuple check alone would stop covering the target and
+  // this line would become the thing that does. Do not cite it as proof of
+  // anything the tuple check is not already proving.
+  if (!cardTupleCurrent(identity) || identity.season_id !== seasonId) return;
+  // THE TARGET IS CURRENT, BUT THE AUTHENTICATED PRINCIPAL HAS CHANGED (#365
+  // review round 7). A DIFFERENT PERSON is signed in and is standing on the
+  // Season this write targets — an in-app persona switch through signIn(), or
+  // a real sign-out followed by a sign-in, both with no page reload.
+  //
+  // Taken BEFORE cardIdentityCurrent()'s combined test, even though that test
+  // now subsumes it, because the two cases need DIFFERENT handling and merging
+  // them would give the arriving principal the departing one's refresh
+  // sentence. Everything below this line — the held-model restore, the toast,
+  // the live-region write, the repaint, the focus move, the completion claim
+  // and the next-task mutation — belongs to `identity.principal`, and every
+  // one of them would be an operation the arriving principal never started
+  // announcing itself in their session. With a lower-privileged arriving role
+  // the held restore would additionally hand back a confirmation and a control
+  // that role is not authorized to exercise.
+  //
+  // So: reconcile from FRESH SERVER TRUTH, under a NEW identity issued to the
+  // ARRIVING principal, SILENTLY. The response itself is never consumed — not
+  // its status, not its message, not the model this operation was holding. The
+  // card stops showing the neutral pending presentation and starts showing
+  // what the server says NOW, with the actions the ARRIVING principal's own
+  // permissions allow: an Arena Manager on a Season the server still reports
+  // archived gets the withdrawn-action explanation, not League Admin's reopen
+  // control. The ledger was drained above, unconditionally, so this refresh is
+  // refused by nothing and the target is not left blocked.
+  if (!cardIdentitySamePrincipal(identity)) {
+    return retrySetupWorkflowCard(key, { silent: true });
+  }
+  // THE TARGET IS CURRENT, BUT THE INITIATING IDENTITY IS NOT. The operator
+  // left this tuple and came back while the request was in flight: the DOM
+  // this operation painted was destroyed, cardStates was overwritten by the
+  // other tuple's renders, and this card's generation moved on without it.
+  //
+  // The client therefore no longer knows what the server did — and, crucially,
+  // NEITHER DOES THIS RESPONSE. A 503 delivered here does not mean the write
+  // did not commit (navigation cancelled nothing, and the transaction behind
+  // it may have gone through); a 200 delivered here describes a Season the
+  // client has since stopped tracking. So NOTHING is restored from held state
+  // and no completion claim is made from the response. The card is RECONCILED
+  // FROM FRESH SERVER TRUTH instead — retrySetupWorkflowCard re-reads the
+  // overview and the progress payload for this card alone and rebuilds the
+  // model from what comes back, so the prerequisite chain decides the outcome:
+  // a Season the server still reports archived lands on the REAL recovery
+  // action, and one the server reports active advances to the next valid
+  // action. Its own generic sentence describes the reconcile and claims
+  // nothing about the write, which is the only honest thing left to say.
+  //
+  // It is refused by nothing: the registration was released above, so the gate
+  // this refresh has to pass is already open, and the LOADING model it commits
+  // synchronously keeps every action withdrawn until the fresh read lands.
+  if (!cardIdentityCurrent(identity)) return retrySetupWorkflowCard(key);
+  // ---- IN PLACE: never left, DOM intact, generation untouched. ----
+  // The round-4 terminal branches, exactly as they were: this response IS the
+  // one the card on screen is waiting for, and the client's held state is
+  // still a truthful description of the card the operator is looking at.
+  if (!r || r.error) {
+    // A CURRENT failure restores an actionable confirmation with the entered
+    // reason retained — the operator's own words are not thrown away and made
+    // them type again — plus the server's own message, and focus on the
+    // reason field so the retry is one keystroke away. `confirm`, `pending`
+    // and `resumeState` ride along in `held`, so the restored confirmation is
+    // the same one, resolvable by the same code path.
+    const next = beginCardRequest(cardId, { userInitiated: true });
+    if (!next) return;
+    const message = (r && r.error && r.error.message)
+      || "The season could not be reopened.";
+    if (!commitCardState(next, Object.assign({}, held, {   // model + (4)/(5)
+          state: CARD_STATE.CONFIRM, confirmReason: reason,
+          confirmError: message }))) return;
+    if (!repaintSetupWorkflowCard(key, next)) return;      // (1) DOM
+    announceCardStatus(next, message, true);               // (3) announcement
+    const back = document.querySelector(`[data-setup-card-slot="${key}"]`);
+    focusCardTarget(next, back                             // (2) focus
+      && (back.querySelector("[data-setup-card-confirm-reason]")
+          || back.querySelector("[data-setup-card-confirm-yes]")));
+    return;
+  }
+  // A CURRENT success refreshes ONLY this card, and says so exactly once.
+  // (4) completion and (5) next task are derived from the model that refresh
+  // commits under its own identity gate, so a late loser can revise neither.
+  // The refresh gets past the serialization gate because settlement above
+  // already released this operation's registration — not because it carries a
+  // token exempting it.
+  return retrySetupWorkflowCard(key, {
+    done: c.done || "Season reopened.",
+    failed: c.doneNoRefresh || c.done || "Season reopened." });
+}
+
+function wireSetupWorkflowCards(root) {
+  root.querySelectorAll("[data-setup-card-retry]").forEach((b) =>
+    b.onclick = () => retrySetupWorkflowCard(b.dataset.setupCardRetry));
+  root.querySelectorAll("[data-setup-card-ask]").forEach((b) =>
+    b.onclick = () => askSetupCardConfirm(b.dataset.setupCardAsk, b.dataset.setupCardAction));
+  root.querySelectorAll("[data-setup-card-confirm-yes]").forEach((b) =>
+    b.onclick = () => resolveSetupCardConfirm(b.dataset.setupCardConfirmYes, true));
+  root.querySelectorAll("[data-setup-card-confirm-no]").forEach((b) =>
+    b.onclick = () => resolveSetupCardConfirm(b.dataset.setupCardConfirmNo, false));
 }
 
 // Hub index: the six workflows as summary cards. This is what replaces the
@@ -3319,7 +6229,7 @@ function setupSummaryHtml(w, sv, ov) {
 // a fact about the domain rather than a filter someone forgot to apply.
 function setupScopeNote(sv) {
   // Guard the payload, not each accessor -- the same reason (and the same
-  // convention) as setupSummaryHtml above: renderSetup is reachable before
+  // convention) as buildSetupWorkflowCardModel above: renderSetup is reachable before
   // or without a successful overview load (an early return, a failed fetch,
   // a view that changed while render() was awaiting), and a note about
   // scope must degrade to nothing rather than throw and blank the view.
@@ -3354,49 +6264,224 @@ function renderSetupHub(sv, ov) {
       <header class="swf-head">
         <span class="swf-ico" aria-hidden="true">${w.icon}</span>
         <h3 class="swf-title">${esc(w.title)}</h3>
-        ${w.optional ? `<span class="swf-optional">Optional</span>` : ""}
+        ${setupCardStatusChip(readCardState(setupWorkflowCardId(w.key)), w)}
       </header>
       <p class="swf-purpose">${esc(w.purpose)}</p>
-      ${setupSummaryHtml(w, sv, ov)}
+      ${setupCardSlotHtml(w, false)}
       <button class="act ghost swf-open" data-setup-workflow="${esc(w.key)}">
         Open ${esc(w.title.toLowerCase())}</button>
     </section>`).join("");
   return `${pageIntro("Setup is six focused workflows. Open the one you need — "
     + "each opens on a summary, not a form.")}
     ${setupScopeNote(sv)}
+    ${setupHubProgressSlotHtml()}
     <div class="swf-grid">${cards}</div>`;
+}
+
+// WHICH action groups a landing may render, decided ONCE from the card's own
+// state (#365 review round 2 finding 1). The landing used to render primary,
+// secondary and tertiary unconditionally, so the state the card was in had no
+// bearing on what an operator could press: an EMPTY landing offered a whole
+// menu instead of the one action that starts the workflow, and a STALE one
+// kept every mutation control standing beside another context's counts.
+//
+// A record rather than three tests at three call sites: a future action group
+// gets its answer here or not at all, and no renderer can add one that forgot
+// to ask. The states are exhaustive by construction — the default is the only
+// permissive answer, and every withdrawal is named.
+//
+//   STALE    only Refresh (which lives in the card body, not here): the
+//            counts belong to a context the operator has left, so every
+//            control bound to them is withdrawn — a mutation fired from here
+//            would act on the CURRENT tuple using the OLD one's evidence.
+//   CONFIRM  only the confirmation's own Yes/No, in the card body. A
+//            confirmation that leaves the action it is confirming (and its
+//            neighbours) live is not a confirmation.
+//   LOADING  nothing is known about this card yet; the primary is held back
+//            with the rest rather than being the one control that outruns
+//            its own summary.
+//   EMPTY    only the authorized EFFECTIVE action — the single thing that
+//            resolves THIS emptiness, derived from the workflow's declared
+//            prerequisite chain against live counts (setupEffectiveAction,
+//            committed into the model as `effective`) rather than the static
+//            `w.primary`, which for Facilities is "Add Ice" and needs a rink
+//            that needs a venue. Role authorization is already handled:
+//            setupWorkflowsFor() refuses the whole workflow (and this landing
+//            with it) for a role lacking its `perm`, and an `open` step
+//            targeting a workflow this role cannot open resolves to no action
+//            at all rather than to a dead control.
+//   BLOCKED  the same withdrawal, in ANY settled state, whenever the card's
+//            model carries an unmet prerequisite (#365 owner ruling round 2).
+//            This is not a seventh CARD_STATE — it is a property of the
+//            derivation, and it is deliberately not folded into EMPTY: a
+//            PARTIAL card (venues but no rinks, divisions but no team to
+//            register) genuinely has records and must keep showing them, while
+//            still offering only the one action that can create the next one.
+//            The owner's ruling is that a neighbouring "Rinks" link does not
+//            make a dead "Add Ice" acceptable, so the demoted groups are
+//            withdrawn here exactly as they are in EMPTY: while a prerequisite
+//            is missing the landing exposes EXACTLY the effective action, and
+//            the card body carries the `blockedBecause` sentence that explains
+//            it.
+//   ERROR    keeps all three, deliberately and consistently with the copy the
+//            card body shows in this state: "The action below still works —
+//            only these counts are missing." Nothing about the actions is
+//            unsafe; only the summary is missing.
+//
+// One withdrawal is NOT a state at all and deliberately precedes them: while
+// a context switch has been ATTEMPTED but not yet reconciled
+// (contextSwitchIntentPending, set synchronously at setActiveContext()'s
+// first invalidation boundary), every landing mutation control is withdrawn
+// no matter what state the card is holding. The card's own state still
+// describes the tuple the operator has LEFT, so no value of it can answer
+// "may this control commit right now" — only the intent flag can, and it
+// clears only once a reconciliation has actually happened, on every success
+// and failure path. Same idiom as #369's contextHashIntentPending.
+//
+// `blocked` is the model's own answer (a committed `blockedBecause`), never a
+// re-derivation: the withdrawal and the sentence explaining it come from the
+// same committed field, so a landing can never withdraw its demoted actions
+// while the copy claims nothing is missing, or the reverse. It is consulted
+// AFTER the three withdrawal states above, which withdraw everything anyway --
+// a STALE card keeps whatever `blockedBecause` it settled with, and that
+// answer belongs to the tuple the operator has left.
+function setupLandingActions(state, blocked) {
+  if (contextSwitchIntentPending) {
+    return { primary: false, secondary: false, tertiary: false };
+  }
+  // PENDING joins the withdrawal list for a reason the other three do not
+  // share: a control left standing here is not merely misleading, it is a
+  // SECOND WRITE one press away, against a Season whose first write has not
+  // reported back. "While current and pending, keep the card non-actionable"
+  // (#365 review round 4) is enforced HERE, on the landing's action groups,
+  // as well as in the card body — the two surfaces render the same card and
+  // either one left actionable would be the same defect.
+  if (state === CARD_STATE.STALE || state === CARD_STATE.CONFIRM
+      || state === CARD_STATE.LOADING || state === CARD_STATE.PENDING) {
+    return { primary: false, secondary: false, tertiary: false };
+  }
+  if (state === CARD_STATE.EMPTY || blocked) {
+    return { primary: true, secondary: false, tertiary: false };
+  }
+  return { primary: true, secondary: true, tertiary: true };
+}
+
+// A landing's action groups, rendered from the card's CURRENT state. Lives
+// inside the stable `[data-setup-landing-actions]` container, and is what a
+// per-card repaint rewrites — so a card that settles into EMPTY, STALE or
+// CONFIRM withdraws the controls that state forbids RIGHT THEN, instead of
+// keeping whatever the last full render happened to paint. Same stable-
+// container discipline as the hub roll-up: the write is unconditional and
+// "no actions" is an empty container, never a skipped update.
+function setupLandingActionsHtml(w) {
+  // `go` routes through goToSetupWorkflow -- the seeded, fail-closed path
+  // (#331 review rounds 5/6) that binds a create drawer to the ACTIVE
+  // Program/Season instead of letting it fall back to a global first option.
+  // `act` opens a plain entity drawer, identical to Records' own "+ New".
+  // An action declaring `confirm` routes through the card's own CONFIRM state
+  // (#365) instead of firing straight away; everything else is unchanged.
+  // `open` is the third action kind (#365 owner ruling on EMPTY dead ends):
+  // the missing prerequisite belongs to another workflow, so the control
+  // opens THAT landing through the same permission-aware transition the hub's
+  // own "Open …" buttons use. `reopen` is the fourth kind (#365 review round
+  // 3) and it is the first DERIVED action that carries a `confirm`, so it
+  // takes the confirmation branch below like any declared one -- which is
+  // exactly why setupCardActionFor resolves "primary:0" through the committed
+  // model rather than the declared `w.primary`.
+  const attr = (a, i, group) => a.confirm
+    ? `data-setup-card-ask="${esc(w.key)}" data-setup-card-action="${esc(group)}:${i}"`
+    : a.open
+    ? `data-setup-workflow="${esc(a.open)}"`
+    : a.go
+    ? `data-setup-workflow-go="${esc(a.go)}"` : `data-setup-workflow-act="${esc(a.act)}"`;
+  const act = (a, cls, i, group) =>
+    `<button class="act ${cls}" ${attr(a, i, group)}>${esc(a.label)}</button>`;
+  const entry = readCardState(setupWorkflowCardId(w.key));
+  const allow = setupLandingActions(entry.state, !!entry.blockedBecause);
+  // THE effective action, in EVERY settled state (#365 owner ruling round 2):
+  // whatever the committed model resolved from the prerequisite chain — which
+  // may be a demoted control, a sibling workflow, or (when this role cannot
+  // resolve it) nothing at all — and the declared primary only when the chain
+  // says that is genuinely the resolving action.
+  //
+  // Read off the MODEL, never re-derived here: re-deriving would read live
+  // module state at paint time and could answer for a tuple the card is not
+  // bound to. `undefined` means this card never carried a derivation (ERROR,
+  // or a model committed before one was computed), which falls back to the
+  // declared primary rather than silently rendering no action.
+  const primaryAction = !allow.primary ? null
+    : entry.effective === undefined ? w.primary : entry.effective;
+  const secondary = allow.secondary
+    ? (w.secondary || []).map((a, i) => act(a, "ghost", i, "secondary")).join("") : "";
+  const tertiary = allow.tertiary
+    ? (w.tertiary || []).map((a, i) =>
+        `<button class="linklike" ${attr(a, i, "tertiary")}>${esc(a.label)}</button>`).join("")
+    : "";
+  return `${primaryAction || secondary ? `<div class="swf-actions">
+      ${primaryAction ? act(primaryAction, "primary", 0, "primary") : ""}
+      ${secondary}
+    </div>` : ""}
+    ${tertiary ? `<div class="swf-tertiary">${tertiary}</div>` : ""}`;
+}
+
+// The landing actions' own event wiring, shared by render()'s pass over the
+// whole content element and by a per-card repaint that just replaced them --
+// so a repainted action set is never a dead control.
+function wireSetupLandingActions(root) {
+  // Primary actions route through goToSetupWorkflow -- the seeded,
+  // fail-closed path -- rather than opening a raw drawer, so a landing's
+  // primary action carries the same active-Program binding the Home/Tasks
+  // hub's does.
+  root.querySelectorAll("[data-setup-workflow-go]").forEach((b) =>
+    b.onclick = () => runSetupWorkflowGo(b.dataset.setupWorkflowGo));
+  // Demoted actions go through the SAME seeded, fail-closed path as the
+  // primary ones. They used to open a raw drawer with drawerValues = {},
+  // mirroring Records' own "+ New" -- which is correct on Records (a flat
+  // record-management surface) and wrong here, because a workflow landing is
+  // scoped to the active Program and its parent selects are not.
+  root.querySelectorAll("[data-setup-workflow-act]").forEach((b) =>
+    b.onclick = () => openSetupWorkflowDrawer(b.dataset.setupWorkflowAct));
+  // An `open` effective action (#365 owner ruling): the missing prerequisite
+  // belongs to a sibling workflow, so this jumps to that landing through the
+  // SAME permission-aware transition render()'s own [data-setup-workflow]
+  // pass uses. Wired here too because a per-card REPAINT rewrites this
+  // container without re-running render()'s wiring — a repainted cross-
+  // workflow action would otherwise be a dead control.
+  root.querySelectorAll("[data-setup-workflow]").forEach((b) =>
+    b.onclick = () => openSetupWorkflowLanding(b.dataset.setupWorkflow || null));
 }
 
 // A single workflow's LANDING: summary first, then exactly one primary
 // action, then the demoted ones. Detail lives one level in (the Records and
 // Hierarchy views), per "show summary first; reveal detail progressively".
+//
+// The action groups themselves live in setupLandingActionsHtml() below, so
+// the ONE state-dependent decision is made in one place and a per-card
+// repaint re-makes it — an action set left over from an earlier state would
+// be the same defect one repaint later.
 function renderSetupWorkflowLanding(w, sv, ov) {
-  // `go` routes through goToSetupWorkflow -- the seeded, fail-closed path
-  // (#331 review rounds 5/6) that binds a create drawer to the ACTIVE
-  // Program/Season instead of letting it fall back to a global first option.
-  // `act` opens a plain entity drawer, identical to Records' own "+ New".
-  const attr = (a) => a.go
-    ? `data-setup-workflow-go="${esc(a.go)}"` : `data-setup-workflow-act="${esc(a.act)}"`;
-  const act = (a, cls) =>
-    `<button class="act ${cls}" ${attr(a)}>${esc(a.label)}</button>`;
-  const secondary = (w.secondary || []).map((a) => act(a, "ghost")).join("");
-  const tertiary = (w.tertiary || []).map((a) =>
-    `<button class="linklike" ${attr(a)}>${esc(a.label)}</button>`).join("");
+  // The optional note follows the LIVE model's partition flag (the backend's
+  // own `status: "optional"`), falling back to the declared contract when no
+  // progress payload is available -- same single source as the hub chip and
+  // the Home/Tasks badge, so no surface can call this step optional while
+  // another counts it as required work.
+  const landingEntry = readCardState(setupWorkflowCardId(w.key));
+  const isOptional = landingEntry.optional === undefined
+    ? !!w.optional : !!landingEntry.optional;
+  const optionalNote = isOptional
+    ? `<p class="swf-optional-note">This step is optional — you can
+        set everything up by hand instead, and skipping it never blocks the
+        rest of setup.</p>` : "";
   return `
     <div class="swf-landing" data-setup-workflow-landing="${esc(w.key)}">
       <button class="linklike swf-back" data-setup-workflow="">← All setup workflows</button>
       <h2 class="swf-landing-title">${w.icon} ${esc(w.title)}</h2>
       <p class="swf-purpose">${esc(w.purpose)}</p>
       ${setupScopeNote(sv)}
-      ${w.optional ? `<p class="swf-optional-note">This step is optional — you can
-        set everything up by hand instead, and skipping it never blocks the
-        rest of setup.</p>` : ""}
-      ${setupSummaryHtml(w, sv, ov)}
-      <div class="swf-actions">
-        ${act(w.primary, "primary")}
-        ${secondary}
-      </div>
-      ${tertiary ? `<div class="swf-tertiary">${tertiary}</div>` : ""}
+      ${optionalNote}
+      ${setupCardSlotHtml(w, true)}
+      <div class="swf-landing-actions" data-setup-landing-actions="${esc(w.key)}"
+        >${setupLandingActionsHtml(w)}</div>
       <div class="swf-detail">
         <div class="section-title">Detail</div>
         <button class="linklike" data-setup-view="records">All records</button>
@@ -6723,8 +9808,108 @@ async function render() {
   // rather than flashing another Program/Season/League's data.
   const myRenderContext = contextRevision;
   let ov, sv, hv, board, lineups, standings, inbox, playerHome;
+  // #365 (no duplicate speech): the Home/Tasks live region carried THROUGH
+  // this render rather than rebuilt by it. Decided before the blank below
+  // (which would otherwise destroy the node) and re-checked at the paint --
+  // see both sites.
+  let spSlotNode = null;
+  let carrySpSlot = false;
+  // Per-ENDPOINT outcomes for the Setup view's own reads (#365) — see the
+  // Setup branch below for why the payloads alone cannot carry this.
+  let svOk = false, playersOk = false;
+  // #365 review round 11: did THIS pass perform the Setup hierarchy
+  // destination's own reads? It is the settlement signal a deep-link focus
+  // intent resolves on (settleDestinationFocus), and it is per-PASS rather
+  // than a module flag on purpose: `view` is module-level and re-read
+  // throughout this function, so an older pass that flipped to Setup only
+  // after it had already gone past the fetches below can still reach the
+  // paint and render an EMPTY hierarchy from the default `sv`/`hv` shapes.
+  // That pass proves nothing about whether a picker can exist, so it reports
+  // nothing, and the intent waits for the pass that actually read.
+  let hierarchyReadsSettled = false;
   try {
-    c.innerHTML = `<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>`;
+    // #365 owner correction — the render LIFECYCLE, not just the card model.
+    // This line used to blank #content unconditionally, and every card was
+    // re-committed only after the awaited reads below. Between the two there
+    // was no Setup DOM at all, so a settled card could never be PAINTED while
+    // its tuple was superseded: STALE was representable in the model and
+    // unreachable on all six Setup landings, which is exactly the state #365
+    // requires them to render.
+    //
+    // So when this render is re-entering a Setup surface that is already
+    // painted, the existing card DOM is RETAINED across the fetches instead
+    // of being blanked, and every card is repainted from its HELD model
+    // first. readCardState() answers STALE for anything bound to a tuple the
+    // operator has left, and setupLandingActions() withdraws that state's
+    // action groups -- so what stands during the fetch window is last-good
+    // data, labelled as earlier, with only its Refresh. When the reads land,
+    // the ordinary full paint below replaces it exactly as before.
+    //
+    // Conditioned on the SAME Setup surface already being on screen: the same
+    // workflow landing, or the same hub index. A NAVIGATION between Setup
+    // surfaces (landing -> index, index -> Records) is not a re-entry and must
+    // not leave the surface being left behind standing while the next one
+    // loads -- that would be a stale destination, not retained data. Every
+    // other view, and a first arrival on Setup, keeps the immediate skeleton
+    // it had.
+    // #365 (no duplicate speech). #sp-card-slot is `role="status"
+    // aria-live="polite"`, and the comment on its own markup further down has
+    // always claimed the wrapper "persists across every re-render" -- but it
+    // did not: the blank below and the paint at the end of this function each
+    // re-serialized it. On a context switch that meant the SAME stale card was
+    // written into the SAME polite region twice in a row: once by
+    // repaintContextScopedCardsAsStale(), synchronously and before the awaited
+    // reads, and once by this render, from the same still-stale model. Two
+    // byte-identical writes to one polite region is duplicate speech.
+    //
+    // The SECOND one is the redundant half. The first is the synchronous stale
+    // withdrawal -- it must keep running before any await, which is the whole
+    // reason it exists -- so it is this render that stands down: the existing
+    // node is CARRIED, never detached, never re-serialized, never touched.
+    //
+    // Conditioned on BYTE-IDENTICAL content, so carrying can never leave a
+    // card standing that says something other than what this render would have
+    // painted. Every other case rebuilds exactly as before -- including the
+    // LOADING skeleton an ordinary re-render still paints over settled data.
+    spSlotNode = view === "dashboard"
+      && (hasPerm("manage_setup") || hasPerm("manage_arena"))
+      ? document.getElementById("sp-card-slot") : null;
+    if (spSlotNode && spSlotNode.parentNode === c) {
+      const held = readCardState(HOME_TASKS_CARD);
+      carrySpSlot = homeCardPaintedHtml === renderSetupProgressCard(
+        held.state === CARD_STATE.STALE ? held : { state: CARD_STATE.LOADING });
+    }
+    const paintedLanding = c.querySelector("[data-setup-workflow-landing]");
+    const retainSetupCards = view === "setup" && setupView === "hub"
+      && (setupWorkflow
+        ? !!(paintedLanding
+             && paintedLanding.dataset.setupWorkflowLanding === setupWorkflow)
+        : !!c.querySelector(".swf-grid"));
+    if (retainSetupCards) {
+      // Retaining the SURFACE must not retain an overlay that has since been
+      // CLOSED. Blanking used to remove a dismissed drawer/modal as a side
+      // effect, synchronously, before any fetch -- a modal dialog left
+      // standing (still trapping focus) until a refetch resolves would be a
+      // strictly worse regression than the skeleton flash this removes. The
+      // open cases need nothing here: the paint below rebuilds them, exactly
+      // as it did when the surface was blanked first.
+      if (!drawer) {
+        c.querySelectorAll(".drawer-scrim, .drawer").forEach((el) => el.remove());
+      }
+      if (!modal) {
+        c.querySelectorAll(".modal-scrim, .modal").forEach((el) => el.remove());
+      }
+      setupWorkflowsFor().forEach((w) => repaintSetupWorkflowCard(w.key, null));
+    } else if (carrySpSlot) {
+      // Same blank as below, around the carried live region instead of over
+      // it: the slot node is left exactly where it is, with exactly the
+      // content it already had.
+      Array.from(c.children).forEach((el) => { if (el !== spSlotNode) el.remove(); });
+      spSlotNode.insertAdjacentHTML("afterend",
+        `<div class="skeleton"></div><div class="skeleton"></div>`);
+    } else {
+      c.innerHTML = `<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>`;
+    }
     ov = await getJSON("/api/demo/overview");
     if (contextRevision !== myRenderContext) return;  // #367: superseded, a fresh render() is already coming
     if (ov && ov.error) throw new Error(ov.error.message);
@@ -6800,6 +9985,14 @@ async function render() {
     if (view === "setup") {
       sv = { programs: [], seasons: [], leagues: [], divisions: [], teams: [], clubs: [], organizations: [], venues: [], rinks: [], ice_slots: [], officials: [] };
       hv = { programs: [] };
+      // #365: the empty shape above is exactly why the per-card model needs an
+      // explicit per-ENDPOINT outcome rather than reading the payload. `sv`
+      // degrades to zeroes on failure, so "the overview call failed" and "this
+      // Program genuinely has nothing yet" are indistinguishable from `sv`
+      // alone -- the "state inferred from missing payload fields" the issue
+      // forbids. These two flags carry the distinction to the cards.
+      svOk = false;
+      playersOk = false;
     }
     // Canonical Setup structure (#233 B2a). `sv` (the flat overview) is gated
     // MANAGE_ARENA server-side — both League Admin and Arena Manager hold it
@@ -6809,7 +10002,8 @@ async function render() {
     if (view === "setup" && (hasPerm("manage_setup") || hasPerm("manage_arena"))) {
       const svr = await getJSON("/api/v2/setup/overview");
       if (contextRevision !== myRenderContext) return;  // #367: superseded, a fresh render() is already coming
-      if (svr && !svr.error) sv = svr;
+      svOk = !!(svr && !svr.error);
+      if (svOk) sv = svr;
     }
     // The Competition tree, Setup Player card, and season participation are
     // MANAGE_SETUP-only (roster-adjacent / competition-structure data an
@@ -6830,7 +10024,8 @@ async function render() {
       // guard cover module-level state too; every module-level assignment
       // below this line is inside the same guarded stretch.
       if (contextRevision !== myRenderContext) return;  // superseded
-      playersList = Array.isArray(pl) ? pl : [];
+      playersOk = Array.isArray(pl);
+      playersList = playersOk ? pl : [];
       // The canonical Program→Season→League→Division tree (#233 B2a review
       // r1): consumed as-is rather than reconstructed from flat `sv` lists,
       // so needs_assignment/teams_without_division match the canonical
@@ -6934,6 +10129,56 @@ async function render() {
           }
         }
       }
+      // #365 review round 11 — THE SETTLEMENT SIGNAL for the hierarchy
+      // destination's deep-link focus intents. Reached only after this pass
+      // has read the canonical hierarchy, every Program's teams, every
+      // Season's registrations and (for the SELECTED Season, which is the
+      // only one that can host either control) its venue-access grants and
+      // grant candidates -- i.e. after every read the "Register" add row and
+      // the "Allow a venue" picker are built from. It is below the last
+      // `contextRevision` guard in the loop, so a superseded pass returns
+      // above this line and reports nothing at all.
+      //
+      // From here on, whatever the paint below produces IS what this Season
+      // has: a picker, or renderSeasonParticipation()'s explanatory copy for
+      // a Season with no grantable venue left. That is what lets a missing
+      // control be CONCLUDED absent rather than waited out.
+      hierarchyReadsSettled = true;
+    } else if (view === "setup") {
+      // No MANAGE_SETUP: renderSeasonParticipation() returns "" outright, so
+      // this surface has no Season rows, no Register add row and no Allow
+      // picker, and none of the reads above would change that. A pass that
+      // legitimately skipped them has still settled the question -- an Arena
+      // Manager waiting forever for a control their permission set can never
+      // render would be the same silent loss, one branch over.
+      hierarchyReadsSettled = true;
+    }
+    // #365: bind each visible Setup workflow card to its OWN identity (card id
+    // + context tuple + generation) and commit its model, inside the same
+    // contextRevision-guarded stretch as the fetches it consumes — so the
+    // cards a paint renders were bound under the same context that paint was.
+    //
+    // The per-workflow done/todo/optional status comes from the SAME route the
+    // Home/Tasks card reads, so the hub chip, the landing's optional note and
+    // the Home/Tasks badge can never disagree. Gated on exactly the permission
+    // that route requires (MANAGE_ARENA — web/authz.py), so a role that cannot
+    // read it simply has no status rather than a 403 that would read as a
+    // per-card failure.
+    //
+    // #365 review round 2 finding 3: the outcome of that read is ASSERTED and
+    // carried into the model (setupProgressRead), never flattened to `null`.
+    // A `null` progress could not be told apart from "this role may not read
+    // it", so a failed read produced cards that were READY/EMPTY with an
+    // UNKNOWN status — a transport failing OPEN, presented as a settled hub.
+    if (view === "setup" && setupWorkflowsFor().length) {
+      let progress = setupProgressRead(CARD_READ.UNAUTHORIZED, null);
+      if (hasPerm("manage_arena")) {
+        const pr = await getJSON("/api/v2/setup/progress");
+        if (contextRevision !== myRenderContext) return;  // superseded
+        progress = setupProgressReadOf(pr);
+      }
+      commitSetupWorkflowCards({ sv: sv, ov: ov, players: playersList,
+        svOk: svOk, playersOk: playersOk, progress: progress });
     }
     // The game sheet also needs the officials pool for its assign control (#30).
     if (view === "sheet") {
@@ -7126,9 +10371,11 @@ async function render() {
     // "dashboard" (canSeeOpsConsole) but has nothing to do with this. The
     // fetch itself happens independently, in loadSetupProgressCard() below
     // (#331 review round 2 finding 3) — not awaited inline here, so it
-    // never blocks the rest of the Dashboard from painting.
-    setupProgress = null;
-    setupProgressError = false;
+    // never blocks the rest of the Dashboard from painting. Nothing is
+    // cleared here any more (#365): the card's own store entry is replaced by
+    // that load under its own identity, and readCardState() already labels a
+    // held model whose tuple has moved as stale, so blanking it from here
+    // would only discard data the stale contract says to keep showing.
   } catch (e) {
     setChrome(ov);
     c.innerHTML = `<div class="banner alert"><h2>Could not load data</h2>
@@ -7136,6 +10383,15 @@ async function render() {
       <div class="actions"><button class="act primary" id="retry-btn">Retry</button></div>`;
     const retry = document.getElementById("retry-btn");
     if (retry) retry.onclick = () => render();  // no inline handler (CSP)
+    // #365 review round 11: this pass CONCLUDED the destination too -- into a
+    // failure, but conclusively: the tree is gone, the banner is what stands,
+    // and no control the deep link was promising can appear without another
+    // render (the Retry above). So a standing focus intent resolves here
+    // rather than waiting for a render that is not coming, and its fallback
+    // lands on this banner's own <h2>. Reported for every intent
+    // (`setupHierarchy` included), because the failure is the destination's,
+    // not one endpoint's.
+    settleDestinationFocus({ setupHierarchy: true });
     return;
   }
 
@@ -7171,6 +10427,11 @@ async function render() {
       const h = c.querySelector(".banner.neutral h2");
       if (h) { h.setAttribute("tabindex", "-1"); h.focus(); }
     }
+    // A concluded pass, on a view no deep-link intent of ours targets. No
+    // proof is offered: the `view` check inside cancels any standing intent
+    // outright (the operator is on Roster/Sheet, not the Setup tree), which
+    // is the right answer and not the fallback one.
+    settleDestinationFocus(null);
     return;
   }
   // Per-card loading boundary (#331 review round 2 finding 3): the card's
@@ -7188,9 +10449,32 @@ async function render() {
   // announced automatically. aria-busy starts true (a fetch is about to
   // start, per the loading skeleton painted on the same line) and
   // loadSetupProgressCard() clears it once real content lands.
-  c.innerHTML =
-    view === "dashboard" ? (showSetupCard
-        ? `<div id="sp-card-slot" role="status" aria-live="polite" aria-busy="true">${renderSetupProgressCard(null, false, true)}</div>` : "")
+  //
+  // #365: the one exception to "always start from the skeleton" is a held
+  // model whose context tuple has moved (readCardState returns STALE). That
+  // is precisely the case the stale contract covers -- last-good data stays
+  // visible, labelled as belonging to an earlier selection and with its own
+  // refresh path, while the fresh load for the new tuple runs -- instead of
+  // being blanked to a skeleton that says nothing. Every other case (no held
+  // model at all, or one for the tuple that is still active) starts from the
+  // loading state exactly as before, so an ordinary reload never shows one
+  // context's numbers under another's heading.
+  const spInitial = readCardState(HOME_TASKS_CARD);
+  // Re-checked here, not trusted from the pre-fetch decision alone: an early
+  // return, the identity boundary's own DOM pass or a per-card repaint could
+  // have taken the node out of #content in between, and emitting no slot
+  // markup for a node that is no longer there would leave the card unpainted.
+  carrySpSlot = carrySpSlot && !!spSlotNode && spSlotNode.parentNode === c;
+  // `null` when this render paints no slot of its own — either because it is
+  // carrying the live one, or because this view/role has no card at all.
+  const spHtml = (view === "dashboard" && showSetupCard && !carrySpSlot)
+    ? renderSetupProgressCard(spInitial.state === CARD_STATE.STALE
+        ? spInitial : { state: CARD_STATE.LOADING })
+    : null;
+  const viewHtml =
+    view === "dashboard" ? (spHtml !== null
+        ? `<div id="sp-card-slot" role="status" aria-live="polite" aria-busy="true"
+             >${spHtml}</div>` : "")
       + renderDashboard(ov, standings)
     : view === "setup" ? renderSetup(sv, hv, ov)
     : view === "import" ? renderImport(ov)
@@ -7209,10 +10493,33 @@ async function render() {
     : view === "standings" ? renderStandings(ov, standings)
     : view === "activity" ? renderActivity(board, ov)
     : renderPublic(ov);
+  if (carrySpSlot) {
+    // Everything except the carried live region is replaced around it. The
+    // node itself is never detached and never re-serialized, so this render
+    // writes nothing at all into #sp-card-slot -- the synchronous stale paint
+    // that already ran stands, and the card's own load is what replaces it.
+    Array.from(c.children).forEach((el) => { if (el !== spSlotNode) el.remove(); });
+    spSlotNode.insertAdjacentHTML("afterend", viewHtml);
+  } else {
+    c.innerHTML = viewHtml;
+  }
+  // Keep the "what is currently painted into the live region" record honest,
+  // since this is the one write to it that does not go through paintHomeCard():
+  // the slot is created as part of #content's own markup here.
+  if (spHtml !== null) homeCardPaintedHtml = spHtml;
+  else if (!carrySpSlot) homeCardPaintedHtml = null;   // no slot on this surface
   // The themed confirm/blocked modal (#215) overlays whatever view is showing
   // (it can be opened from the header's Reset demo action too), so append it
   // after the view content on every render and wire it below.
-  c.innerHTML += renderModal();
+  //
+  // APPENDED, never `c.innerHTML += ...` (#365): the += form reads #content's
+  // whole serialized markup and re-parses it, which destroyed and rebuilt
+  // #sp-card-slot -- a polite live region -- with byte-identical content
+  // immediately after the paint above, on EVERY render. That is the same
+  // sentence written to the same region twice in a row, which is exactly the
+  // duplicate speech #365 forbids; it was invisible only because it was the
+  // very next mutation. insertAdjacentHTML leaves every existing node alone.
+  c.insertAdjacentHTML("beforeend", renderModal());
 
   wireModal(c);
   c.querySelectorAll("[data-goto]").forEach((b) => b.onclick = () => switchTab(b.dataset.goto));
@@ -7221,6 +10528,12 @@ async function render() {
   // (#331 review round 2 finding 3) -- the slot painted above is only ever
   // the loading skeleton at this point, so there's nothing of the card's
   // own to wire here yet.
+  // ...with ONE exception (#365): a stale card painted above already carries
+  // its own refresh control, which must work during the very window it is
+  // on screen, before that load settles and rewires the slot itself.
+  const spStaleRefresh = c.querySelector("[data-setup-progress-retry]");
+  if (spStaleRefresh) spStaleRefresh.onclick =
+    () => loadSetupProgressCard({ userInitiated: true });
   if (showSetupCard) loadSetupProgressCard();
   // Administration → Danger zone (#256): opens the guarded factory-reset modal.
   const frBtn = c.querySelector("[data-factory-reset]");
@@ -7570,41 +10883,17 @@ async function render() {
   c.querySelectorAll("[data-setup-workflow]").forEach((b) => b.onclick = () => {
     openSetupWorkflowLanding(b.dataset.setupWorkflow || null);
   });
-  // Primary actions route through goToSetupWorkflow -- the seeded, fail-closed
-  // path -- rather than opening a raw drawer, so a landing's primary action
-  // carries the same active-Program binding the Home/Tasks hub's does.
-  c.querySelectorAll("[data-setup-workflow-go]").forEach((b) => b.onclick = () => {
-    const key = b.dataset.setupWorkflowGo;
-    if (key === "onboarding") { switchTab("onboarding"); focusContentHeading(); return; }
-    goToSetupWorkflow(key);
-  });
-  // Demoted actions go through the SAME seeded, fail-closed path as the
-  // primary ones. They used to open a raw drawer with drawerValues = {},
-  // mirroring Records' own "+ New" -- which is correct on Records (a flat
-  // record-management surface) and wrong here, because a workflow landing is
-  // scoped to the active Program and its parent selects are not.
-  c.querySelectorAll("[data-setup-workflow-act]").forEach((b) => b.onclick = async () => {
-    const kind = b.dataset.setupWorkflowAct;
-    const mySeq = ++drawerSeedFetchSeq;
-    const seeded = await contextSeededDrawerValues(kind);
-    if (mySeq !== drawerSeedFetchSeq) return;  // a newer open already won
-    if (!seeded.ok) {
-      toast = seeded.needsContext
-        ? "Pick a program in the context bar first, so this is created in the right one."
-        : seeded.needsSeason
-          ? "Pick a season in the context bar first — this is created inside one."
-          : seeded.noLeagueInSeason
-            ? "That season has no leagues yet — add one before adding divisions."
-            : seeded.leagueNotInSeason
-              ? "Your active League isn't in this season — switch the context bar's League or clear it before adding divisions."
-              : "Couldn't load what's needed to open that — try again.";
-      toastIsError = true;
-      return render();
-    }
-    drawer = { kind }; drawerError = ""; drawerValues = seeded.values;
-    toast = "";
-    render();
-  });
+  // A landing's primary/secondary/tertiary actions -- the same wiring a
+  // per-card repaint re-applies to the action set it just re-rendered.
+  wireSetupLandingActions(c);
+  // Per-card retry/refresh and the card-scoped confirmation (#365).
+  wireSetupWorkflowCards(c);
+  // A full repaint of #content just destroyed every focused node in it. A card
+  // holding an unresolved write keeps its PENDING model through this render
+  // (the serialization rule refused the commit) and must keep its focus too,
+  // or an ordinary re-entry into the same destination strands a keyboard
+  // operator on <body> with a write still outstanding.
+  if (view === "setup") restorePendingCardWriteFocus();
   c.querySelectorAll("button[data-act]").forEach((b) => b.onclick = () => rosterAction(b.dataset.act, b.dataset.id));
   c.querySelectorAll(".seg[data-view]").forEach((b) => b.onclick = () => { gameView = b.dataset.view; toast = ""; render(); });
   c.querySelectorAll("[data-side]").forEach((b) => b.onclick = () => { rosterSide = b.dataset.side; toast = ""; render(); });
@@ -8689,6 +11978,18 @@ async function render() {
   // handles the close half: when the render that just ran removed the
   // dialog, focus returns to whatever opened it.
   syncOverlayFocus();
+  // #365 review round 11: THE settlement, and the last thing of all. After
+  // the paint and after every wiring pass, so a control this intent is
+  // waiting for is in the document AND bound before focus reaches it; after
+  // syncOverlayFocus() so the dialog lifecycle keeps its precedence (an
+  // intent that finds an overlay open cancels rather than reaching into it).
+  //
+  // `hierarchyReadsSettled` is this PASS's own answer, never a module flag --
+  // a pass that painted the Setup tree without having read for it proves
+  // nothing, reports nothing, and leaves the intent alive for the pass that
+  // did. That is the whole difference between waiting for an EVENT and
+  // waiting out a CLOCK.
+  settleDestinationFocus({ setupHierarchy: hierarchyReadsSettled });
 }
 
 // Per-view page title (#345). A single-page app never reloads, so without
@@ -9314,11 +12615,42 @@ async function restoreContextDeepLink() {
 // confirmed (setActiveContext()'s second bump, below) -- reseeding them here
 // too would only seed from the STILL-OLD selection this function runs
 // before that POST updates.
+//
+// #365 (owner): the drawer/Import/Ice-Builder trio was not the whole set. The
+// Home/Tasks "Continue setup" CTA (`[data-setup-progress-action]`) and every
+// button inside a Setup landing's `[data-setup-landing-actions]` container are
+// context-scoped mutation entry points too, and neither was withdrawn here --
+// so between the native <select> already showing Program B and the first
+// repaint (three awaits later: /api/context, /api/context/options, and the
+// next render's Setup reads), Program A's "Add Ice"/"Venues"/"Rinks" and A's
+// "Continue setup" stayed enabled and keyboard-activatable, able to open a
+// flow against a tuple changing underneath them.
+//
+// Withdrawn by REMOVAL, for the same reason the drawer's submit control is:
+// disabling can be undone by any repaint that runs before reconciliation,
+// while a removed control cannot receive pointer or keyboard activation
+// however the event was already on its way. The containers themselves
+// (`[data-setup-landing-actions]`, `#sp-card-slot`) are stable and survive,
+// so the later repaint refills them rather than having to recreate structure.
+//
+// Removal alone is not sufficient, and is not the guarantee: any render or
+// per-card repaint in the window would paint the controls straight back. The
+// standing guarantee is contextSwitchIntentPending, which setupLandingActions()
+// and renderSetupProgressCard() both consult -- this DOM pass only closes the
+// gap before the first such paint.
+function withdrawContextScopedActionControls() {
+  document.querySelectorAll(
+    "[data-setup-progress-action],"
+    + "[data-setup-landing-actions] button,"
+    + "[data-setup-card-ask],[data-setup-card-confirm-yes],[data-setup-card-confirm-no]"
+  ).forEach((el) => el.remove());
+}
 function invalidateContextScopedMutations() {
   importState.report = null;
   importState.validatedKey = null;
   importState.committed = null;
   if (iceBuilder) iceBuilder.preview = null;
+  withdrawContextScopedActionControls();
   if (drawer) {
     document.querySelectorAll(".drawer-scrim, .drawer").forEach((el) => el.remove());
     drawer = null; drawerError = ""; drawerValues = {};
@@ -9363,7 +12695,139 @@ let contextSwitchInFlight = false;
 // set from the moment intent is published until a syncContextHash() has
 // reconciled the URL with canonical truth, on EVERY success and failure path.
 let contextHashIntentPending = false;
+// #365, and structurally the SAME defect #369 fixed one layer over: "a
+// context switch has been intended but not yet reconciled". contextHashIntentPending
+// answers it for the URL; this answers it for every context-scoped ACTION
+// CONTROL -- the Home/Tasks setup CTA and the six Setup landings' mutation
+// buttons.
+//
+// Why it cannot be contextSwitchInFlight, and cannot be the cards' own state:
+// contextSwitchInFlight clears the instant the POST resolves, while the
+// repaint that rebinds those controls is still two awaits away
+// (loadContextOptions, then render()'s Setup reads); and a card's CARD_STATE
+// still describes the tuple the operator has LEFT, so no value of it can
+// answer "may this control commit right now". Set SYNCHRONOUSLY at
+// setActiveContext()'s first line -- before any await, before
+// invalidateContextScopedMutations()'s own DOM pass -- and cleared only where
+// a reconciliation has actually happened, which is every path that reaches a
+// syncContextHash() (success AND failure), never on the merely-queued path.
+let contextSwitchIntentPending = false;
 let contextSwitchQueued = null;  // {programId, seasonId, leagueId, mySeq} -- the one pending switch not yet sent, if any
+
+// Repaint the context-scoped cards from their HELD models, at the moment the
+// POST has confirmed and contextOptions.selected has moved (#365 owner
+// correction). readCardState() now answers STALE for every model still bound
+// to the tuple the operator left, so this is what turns retained data from
+// "silently presented as current, with live controls" into "explicitly
+// labelled as earlier data, with only a Refresh". Runs BEFORE the awaited
+// options/progress reads rather than after them, because that window is the
+// whole defect: three awaits during which A's numbers sat under B's heading.
+//
+// Deliberately in-place rather than through render(): render() would rebuild
+// #ctx-select from a contextOptions whose `programs` list has not been
+// refreshed yet, and its own reads are exactly what this is trying not to
+// wait for.
+function repaintContextScopedCardsAsStale() {
+  const slot = document.getElementById("sp-card-slot");
+  if (slot) {
+    // aria-busy stays true: a load for the NEW tuple is coming, and the card
+    // on screen is not the answer to it.
+    slot.setAttribute("aria-busy", "true");
+    paintHomeCard(slot, renderSetupProgressCard(readCardState(HOME_TASKS_CARD)));
+    const refresh = slot.querySelector("[data-setup-progress-retry]");
+    if (refresh) refresh.onclick = () => loadSetupProgressCard({ userInitiated: true });
+  }
+  // `null` identity: this is not a response reconciling its own request, it
+  // is the tuple itself moving, so there is no generation to check -- only
+  // the held model and the new tuple, which readCardState() already compares.
+  setupWorkflowsFor().forEach((w) => repaintSetupWorkflowCard(w.key, null));
+}
+
+// ============ THE IDENTITY BOUNDARY'S OWN DOM PASS (#365 round 8) ==========
+// The TUPLE boundary above has a synchronous repaint. The IDENTITY boundary had
+// none, and that was this round's defect. Verbatim from the review:
+//
+//   "setUser() adopts the new principal BEFORE those awaits.
+//   resetTransientUiState() destroys/quarantines the JS stores and clears the
+//   toast, but it does not synchronously repaint or blank the already-rendered
+//   card DOM. With /api/context/options delayed, the new session can remain on
+//   the departing principal's painted PENDING card and its permission-scoped
+//   counts until the later render replaces it."
+//
+// Round 7 fixed the STORES and only the stores: cardStates destroyed, the
+// ledger's held models overwritten with foreignCardWriteModel(), the live
+// region emptied. Every one of those surfaces was ALREADY PAINTED, so what the
+// arriving principal actually looked at did not change at all. A clean model
+// standing behind a stale painted card is the same disclosure by the same
+// route -- a rendered value standing in for an asserted one, inverted.
+//
+// IT CANNOT FETCH, and it cannot go through render(). It runs inside
+// resetTransientUiState(), which setUser() calls BEFORE it assigns
+// `currentUser` -- and everything after that point is an await (the options
+// load, the deep-link reconciliation, and only then a render). Anything
+// asynchronous here would sit inside the very window it exists to close.
+//
+// SO IT BLANKS RATHER THAN REPAINTS. Repainting would mean deriving a view for
+// a principal nobody has identified yet from data that belongs to the one
+// leaving -- and by the time this runs there is nothing left to derive from
+// anyway. Empty discloses nothing, and it is short-lived: the render() that
+// follows setUser() paints the arriving principal's own surfaces from their own
+// reads, under their own permissions.
+//
+// WHAT IS BLANKED, and why each one is context- or permission-scoped:
+//   * every context-scoped MUTATION CONTROL, by the same REMOVAL the tuple
+//     boundary uses (withdrawContextScopedActionControls) -- disabling can be
+//     undone by any repaint, a removed control cannot be activated however the
+//     event was already on its way.
+//   * the Home/Tasks card body (#sp-card-slot) -- workflow rows and completion
+//     counts read under the DEPARTING principal's permissions.
+//   * every Setup card slot ([data-setup-card-slot] -- the hub grid AND the
+//     open landing, which is why this is a querySelectorAll and not one lookup)
+//     -- counts, the blocker sentence, the server's error text, the departing
+//     operator's typed reason inside an open confirmation, and the busy copy of
+//     their own unresolved write.
+//   * every landing ACTION container, emptied WHOLE rather than only of its
+//     buttons: the withdrawn-action advice beside them is prose about the
+//     departing principal's blocked state.
+//   * every hub STATUS CHIP -- "Done"/"To do" is a permission-scoped assertion
+//     about this Program made by the previous reader, and it lives in the card
+//     header, outside the slot blanked above.
+//   * the hub ROLL-UP / NEXT-TASK line -- the same counts, one derivation up.
+//   * KEYBOARD FOCUS, when it is standing inside any of the above. Blanking
+//     destroys the focused node, and "wherever the removal happened to drop it"
+//     is not a place to hand a new principal: it is moved out deliberately,
+//     before the removal, so the arriving principal starts from the document
+//     rather than from inside a card that no longer exists.
+//
+// aria-busy stays TRUE on both card wrappers: this principal has not read these
+// cards yet and a load for them is what comes next, so "idle" would be a lie
+// told to assistive technology for the length of the window.
+function blankContextScopedCardSurfaces() {
+  withdrawContextScopedActionControls();
+  const scoped = "#sp-card-slot,[data-setup-card-slot],[data-setup-landing-actions],"
+    + "[data-setup-hub-progress-slot],[data-setup-workflow-card]";
+  const active = document.activeElement;
+  if (active && active !== document.body && active.closest
+      && active.closest(scoped)) {
+    active.blur();
+  }
+  const homeSlot = document.getElementById("sp-card-slot");
+  if (homeSlot) {
+    homeSlot.setAttribute("aria-busy", "true");
+    paintHomeCard(homeSlot, "");
+  }
+  document.querySelectorAll("[data-setup-card-slot]").forEach((slot) => {
+    slot.setAttribute("aria-busy", "true");
+    slot.innerHTML = "";
+  });
+  document.querySelectorAll("[data-setup-landing-actions]")
+    .forEach((box) => { box.innerHTML = ""; });
+  document.querySelectorAll("[data-setup-hub-progress-slot]")
+    .forEach((box) => { box.innerHTML = ""; });
+  document.querySelectorAll("[data-setup-workflow-card] .swf-status,"
+    + "[data-setup-workflow-card] .swf-optional")
+    .forEach((chip) => chip.remove());
+}
 
 // Persist a switcher pick, then reflect it in the hash and re-render.
 // `leagueId` is the third axis (#345/#364), additive like the backend's own
@@ -9376,6 +12840,12 @@ let contextSwitchQueued = null;  // {programId, seasonId, leagueId, mySeq} -- th
 // leaving the previous League to survive a Program/Season-only switch.
 async function setActiveContext(programId, seasonId, leagueId) {
   const mySeq = ++contextSwitchSeq;
+  // FIRST statement, before every await and before the DOM pass below (#365
+  // owner correction): from this instant no Setup landing action group and no
+  // Home/Tasks setup CTA may be painted, whatever state any card is holding
+  // and whatever repaint runs next. Cleared only once a reconciliation has
+  // actually happened -- see the flag's own comment.
+  contextSwitchIntentPending = true;
   // Invalidate SYNCHRONOUSLY, before anything below (#331 review round 8) --
   // see invalidateContextScopedMutations()'s own comment for why.
   // contextRevision bumps here too, not just after success further down:
@@ -9385,6 +12855,17 @@ async function setActiveContext(programId, seasonId, leagueId) {
   // only once it's confirmed.
   invalidateContextScopedMutations();
   contextRevision += 1;
+  // Focus work asked for under the tuple being LEFT dies here, before every
+  // await and before the early return below (#365 owner correction, round 13).
+  // Placing this after the /api/context response -- where the confirmed-switch
+  // cancellation sits -- is one boundary too late: during a slow response the
+  // old tuple still satisfies destinationFocusIntentCurrent(), so a standing
+  // intent or a still-pending generic poll can fire onto a surface the
+  // operator has already navigated away from in the native control. The early
+  // return matters just as much: a switch that queues behind an in-flight one
+  // would otherwise not reach any cancellation at all until its predecessor
+  // settled.
+  abandonFocusWorkForContextSwitch();
   if (contextSwitchInFlight) {
     contextSwitchQueued = { programId, seasonId, leagueId, mySeq };
     return;
@@ -9440,6 +12921,13 @@ async function sendContextSwitch(mySeq, programId, seasonId, leagueId) {
     // deep link, and silently POSTs the persisted context back to it.
     syncContextHash();
     contextHashIntentPending = false;
+    // #365 owner correction: "a failed switch may restore the still-current
+    // tuple only through a fresh render." The tuple never moved, so nothing
+    // went stale and nothing may be repainted as actionable in place -- the
+    // withdrawal is released here and the render() below is the ONE thing
+    // that puts the controls back, rebuilt from the tuple that is still
+    // current rather than resurrected from the DOM they were removed from.
+    contextSwitchIntentPending = false;
     render();
     return;
   }
@@ -9459,7 +12947,42 @@ async function sendContextSwitch(mySeq, programId, seasonId, leagueId) {
   // actually rebind Import/Ice Builder to it instead of finding its own
   // stamp already "current" (from the first bump) and skipping the reseed.
   contextRevision += 1;
+  // NOT the primary invalidation, and must not be read as one (#365 owner
+  // correction, round 13). Focus work is abandoned at the moment a switch is
+  // ATTEMPTED -- see abandonFocusWorkForContextSwitch() at the top of
+  // setActiveContext(). Doing it only here was one boundary too late: until
+  // /api/context answers, contextOptions.selected still holds the OLD tuple,
+  // so the old intent goes on satisfying destinationFocusIntentCurrent() and
+  // a standing intent or in-flight poll could still fire while the operator
+  // was already looking at their new selection in the native control.
+  //
+  // Kept because it is not merely a repeat: a switch QUEUED behind an
+  // in-flight one is drained straight into this function, and focus work
+  // started in the interval between queueing and draining has not passed the
+  // attempt-time call. Both are cheap; neither alone covers every path.
+  cancelSupersededDestinationFocus();
+  // ...and the SAME sentence about the generic poll (#365 round 13). The
+  // ticket below is the only binding focusContentHeading()'s chain has, and
+  // until this line it was bumped by newer focus REQUESTS only -- so a poll
+  // started under the tuple the operator has just left survived the switch
+  // and could still take its #content landing on the arriving Season's
+  // surface, which is the same stale-work-crossing-a-boundary defect the
+  // intent above is dropped here to avoid. Bumping the ticket is the whole
+  // cancellation: every in-flight chain compares against it on its next tick
+  // and returns without focusing anything. Silent, not redirected -- nothing
+  // is focused on the new surface on the old poll's behalf, and a
+  // focusContentHeading() called AFTER this line (the render below, an
+  // overlay close) takes a fresh ticket and keeps its floor in full.
+  newFocusRequest();
   syncContextHash();
+  // The tuple has now genuinely moved, so every held card model is bound to a
+  // context the operator has left. Repaint them as explicitly STALE HERE --
+  // before the awaited options reload below and the Setup reads after it --
+  // rather than leaving A's counts standing under B's heading for the length
+  // of two more round trips (#365 owner correction). The action controls stay
+  // withdrawn throughout: contextSwitchIntentPending is still set, and STALE
+  // withdraws them on its own account too.
+  repaintContextScopedCardsAsStale();
   // Then reconcile the whole option set from a fresh GET so the label/status/
   // read-only badge reflect canonical state at POST time — a Season may have
   // been archived/reopened or newly authorized since options loaded. Rendering
@@ -9471,6 +12994,12 @@ async function sendContextSwitch(mySeq, programId, seasonId, leagueId) {
   if (mySeq !== contextSwitchSeq) return;  // superseded during the refetch
   syncContextHash();
   contextHashIntentPending = false;
+  // Reconciliation has actually happened: canonical options are loaded and the
+  // hash matches them, so a control painted from here on is bound to the tuple
+  // that is genuinely current. Released immediately before the render() that
+  // repaints them, and never on a path that returns early -- a superseded or
+  // queued switch leaves it set for its successor to clear.
+  contextSwitchIntentPending = false;
   toast = "";
   render();
 }
@@ -9827,6 +13356,105 @@ function resetTransientUiState() {
     document.querySelectorAll(".drawer-scrim, .drawer").forEach((el) => el.remove());
     drawer = null; drawerError = ""; drawerValues = {};
   }
+  // ===== PER-CARD OPERATION/UI STATE (#365 review round 7) =================
+  // The three stores the review names — cardWrites, cardStates,
+  // cardGenerations — audited one by one, because they do NOT all deserve the
+  // same treatment and the round-6 duplicate-write fix depends on that.
+  //
+  // (a) THE EPOCH, ADVANCED FIRST. Every identity already issued was stamped
+  //     with the OLD value, so from this line on cardIdentitySamePrincipal()
+  //     is false for all of them and cardIdentityCurrent() therefore refuses
+  //     every model commit, repaint, announcement, focus move, completion and
+  //     next-task mutation they could still attempt. This is the guard, and
+  //     the four call-sites downstream re-check it after their own await.
+  uiIdentityEpoch += 1;
+  // (a2) THE STANDING DEEP-LINK FOCUS INTENT (#365 round 11). Same reasoning
+  //     as (a) and enforced by the same epoch: an unresolved "take me to this
+  //     Season's Allow-a-venue picker" belongs to the DEPARTING operator, and
+  //     the arriving one must not have their focus pulled onto a control the
+  //     departing one asked for. settleDestinationFocus() would refuse it on
+  //     its own account (it asks the same question at resolution time, which
+  //     is what makes the refusal airtight); this drops the record here so a
+  //     dead promise is not left standing across the boundary at all.
+  cancelSupersededDestinationFocus();
+  // (a3) THE GENERIC FOCUS POLL (#365 round 13). The intent above carries an
+  //     identity and is refused at settlement on its own account; the poll
+  //     carries NOTHING but the ticket, so the epoch bumped at (a) means
+  //     nothing to it and a chain started under the DEPARTING principal
+  //     would keep ticking and land focus on the ARRIVING one's surface --
+  //     the same boundary crossing (a) and (a2) exist to stop, in the one
+  //     piece of async focus work that had no binding to identity at all.
+  //     Bumping the ticket here IS the invalidation: the next tick of every
+  //     in-flight chain sees a newer request and returns having focused
+  //     nothing. It costs the arriving identity nothing -- any
+  //     focusContentHeading() called after this line takes a fresh ticket
+  //     and keeps its #content floor unchanged.
+  newFocusRequest();
+  // (b) cardStates — DESTROYED. A committed card model is this operator's
+  //     read: counts fetched under their permissions, and on a card mid-
+  //     confirmation their typed `confirmReason` and the server's error text.
+  //     readCardState() would already withhold it from the next identity, but
+  //     private text that is merely unread is still private text that is
+  //     still there. Deleted key by key rather than rebound, so every existing
+  //     reference to the same object keeps seeing the truth.
+  Object.keys(cardStates).forEach((k) => { delete cardStates[k]; });
+  // (c) cardWrites — KEPT, PAYLOAD QUARANTINED. This is the whole tension of
+  //     the round. The ENTRY is serialization bookkeeping: a write is in
+  //     flight against that card and target tuple, navigation and sign-out
+  //     cancelled neither the HTTP request nor the transaction behind it, and
+  //     dropping the record here would let the arriving principal fire a
+  //     SECOND lifecycle write against the same Season while the first is
+  //     unresolved — the round-6 hole, reopened. So the entry stays and the
+  //     card stays non-actionable for whoever arrives. What does NOT stay is
+  //     the held model: the reason, the error, the counts and the
+  //     confirmation are overwritten with the neutral presentation, so the
+  //     departing operator's words stop existing rather than stop being
+  //     painted.
+  Object.keys(cardWrites).forEach((cardId) => {
+    const ledger = cardWrites[cardId];
+    Object.keys(ledger).forEach((key) => {
+      ledger[key].model = foreignCardWriteModel();
+    });
+  });
+  // (c2) THE ONE SITEWIDE LIVE REGION. #toast-root is where announceCardStatus
+  //     and every other operation sentence lands, and updateToast() only HIDES
+  //     it when there is nothing left to say — the previous sentence stays in
+  //     the markup. So the departing operator's last announcement
+  //     ("Reopening this season…", a server error message, anything they were
+  //     told) is still sitting in the document the arriving principal is
+  //     handed. Hidden is not gone: it is in the DOM, and a live region is
+  //     exactly the surface this round's correction names alongside the held
+  //     model and the focus target. Emptied outright here, at the identity
+  //     boundary, rather than merely hidden.
+  toast = ""; toastIsError = false;
+  const identityToastRoot = document.getElementById("toast-root");
+  if (identityToastRoot) {
+    identityToastRoot.innerHTML = "";
+    identityToastRoot.classList.remove("error");
+  }
+  updateToast();
+  // (c3) THE ALREADY-PAINTED CARD SURFACES (#365 round 8). (b) and (c) above
+  //     destroy the STORES; the live region got its own DOM pass in (c2)
+  //     precisely because "hidden is not gone". Every OTHER context-scoped
+  //     surface was left exactly as the departing principal painted it, and a
+  //     painted card is what the operator actually sees -- the review's
+  //     "post-auth/pre-render privacy window". Blanked SYNCHRONOUSLY here,
+  //     before setUser() assigns `currentUser` and therefore before the
+  //     arriving principal is exposed at all, because everything after this
+  //     point is an await. See blankContextScopedCardSurfaces().
+  blankContextScopedCardSurfaces();
+  // (d) cardGenerations — DELIBERATELY KEPT, and the reasoning is the reason
+  //     the epoch had to exist at all. The counters hold no operator text:
+  //     they are monotone integers, so there is nothing here to disclose.
+  //     Resetting them would be worse than useless — it would hand the
+  //     arriving principal's first request for a card the SAME generation
+  //     number a departing principal's outstanding identity is already
+  //     holding, manufacturing collisions that only the epoch could then tell
+  //     apart. Keeping them monotone means a generation number is never
+  //     reused, and the epoch is what makes a departed identity stale
+  //     regardless of what the counter says — which is exactly the property
+  //     the review found missing, since under the serialization rule the
+  //     counter cannot move for a card with an unresolved write.
   contextRevision += 1;
   // A context switch this identity initiated but had not yet gotten a POST
   // out for (queued behind one already in flight, see setActiveContext()'s
@@ -9875,6 +13503,15 @@ function resetTransientUiState() {
     syncContextHash();
     contextHashIntentPending = false;
   }
+  // ...and the identical reasoning for the ACTION-CONTROL withdrawal (#365).
+  // The switch this flag was set for has just been orphaned: its POST's own
+  // completion will hit the `mySeq !== contextSwitchSeq` guard above and
+  // return without reaching either clearing point, so leaving the flag set
+  // would withdraw the NEXT identity's Setup landing actions and Home CTA
+  // permanently. Released here, where the departing identity's whole
+  // transient state is; the render() that follows setUser() is what paints
+  // the new identity's own controls.
+  contextSwitchIntentPending = false;
 }
 function setUser(user) {
   const prevId = currentUser ? currentUser.username : null;

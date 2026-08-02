@@ -406,10 +406,44 @@ async function checkViewport(browser, viewport) {
     // "worked" even without waiting for settlement, for the wrong reason).
     await waitForCardSettled(page);
 
-    // (1) No Program exists at all yet -> no card (bootstrapping the very
-    // first Program is the onboarding wizard's job, not this card's).
-    if (await cardState(page) !== null) {
-      fail("expected no setup-progress card before any Program exists");
+    // (1) No Program exists at all yet. Bootstrapping the very first Program
+    // is the onboarding wizard's job, not this card's -- but #365 (owner
+    // correction) requires the card to SAY SO rather than render nothing:
+    // the named EMPTY/"no_program" state, with its own heading, its own status
+    // sentence, and the one genuinely authorized path that resolves it. This
+    // operator is a League Admin, the role MANAGE_SETUP-gated onboarding.js
+    // will actually let create that first Program, so the path is exposed and
+    // enabled here.
+    const noProgram = await cardState(page);
+    if (!noProgram || noProgram.heading !== "Setup progress — no program yet") {
+      fail(`expected the named EMPTY/"no_program" state before any Program `
+        + `exists, got ${JSON.stringify(noProgram)}`);
+    }
+    const noProgramBody = await page.evaluate(() => {
+      const slot = document.getElementById("sp-card-slot");
+      if (!slot) return null;
+      const status = slot.querySelector(".sp-empty-status");
+      return {
+        status: status ? status.textContent.replace(/\s+/g, " ").trim() : null,
+        buttons: Array.from(slot.querySelectorAll("button")).map((b) => ({
+          text: b.textContent.trim(), goto: b.dataset.goto || null,
+          primary: b.classList.contains("primary"), disabled: !!b.disabled,
+        })),
+        rows: slot.querySelectorAll(".li").length,
+      };
+    });
+    if (!noProgramBody
+        || noProgramBody.status !== "No program has been set up yet, so there "
+          + "is no setup progress to show."
+        || noProgramBody.rows !== 0
+        || noProgramBody.buttons.length !== 1
+        || noProgramBody.buttons[0].text !== "Start Initial Setup"
+        || noProgramBody.buttons[0].goto !== "onboarding"
+        || !noProgramBody.buttons[0].primary
+        || noProgramBody.buttons[0].disabled) {
+      fail(`EMPTY/"no_program" must explain the missing Program and expose `
+        + `exactly one enabled, genuinely authorized path to it, got `
+        + `${JSON.stringify(noProgramBody)}`);
     }
 
     await page.evaluate(async () => {
@@ -1319,12 +1353,19 @@ async function checkRoleScenarios(browser, viewport) {
     // verify a whole-Program "complete" claim from their own narrower
     // view -- `complete` reads `null` for them even though the Program
     // (and their own visible facilities workflow) is genuinely, fully
-    // done, and the card renders NOTHING rather than the success banner
-    // it hands League Admin above (a claim Arena Manager cannot verify)
-    // or a stale/misleading "nothing more for you" card. The Arena
+    // done, so the card must NOT render the success banner it hands
+    // League Admin above (a claim Arena Manager cannot verify). The Arena
     // Calendar stays reachable the ordinary way, via the main nav tab --
-    // this card's own "Go to Schedule" shortcut simply has nothing left
-    // to say once there is nothing to recommend and nothing to verify.
+    // this card's own "Go to Schedule" shortcut has nothing left to say
+    // once there is nothing to recommend and nothing to verify.
+    //
+    // #365 (owner correction) changed what it renders INSTEAD. It used to
+    // render nothing at all, which left this operator with no explanation
+    // of why their Home/Tasks card was blank; it now renders the named
+    // EMPTY/"nothing_actionable" state -- its own heading, its own status
+    // sentence, an explanation that this is a claim about THIS ROLE's
+    // slice only, and NO control, since by construction there is nothing
+    // here this role could act on.
     const cArenaProgress = await apiGet(page, "/api/v2/setup/progress");
     if (cArenaProgress.complete !== null) {
       fail(`Program C, Arena Manager: expected complete: null (never a `
@@ -1338,13 +1379,39 @@ async function checkRoleScenarios(browser, viewport) {
     }
     await freshLoad();
     s = await cardState(page);
-    if (s !== null) {
-      fail(`Program C, Arena Manager: expected NO setup-progress card `
-        + `(nothing left to recommend, nothing left to verify), got `
+    if (!s || s.heading !== "Setup progress — nothing for your role to do") {
+      fail(`Program C, Arena Manager: expected the named `
+        + `EMPTY/"nothing_actionable" state with its own heading, got `
         + `${JSON.stringify(s)}`);
     }
-    if (await page.$("#sp-card-slot .dash-card")) {
-      fail("expected #sp-card-slot to render no card at all in this state");
+    if (s.primaryLabel !== null || s.hasRetry || s.rows.length) {
+      fail(`Program C, Arena Manager: the empty state must be guidance with NO `
+        + `control and no workflow rows, got ${JSON.stringify(s)}`);
+    }
+    const cEmpty = await page.evaluate(() => {
+      const slot = document.getElementById("sp-card-slot");
+      if (!slot) return null;
+      const status = slot.querySelector(".sp-empty-status");
+      return {
+        status: status ? status.textContent.replace(/\s+/g, " ").trim() : null,
+        text: (slot.textContent || "").replace(/\s+/g, " ").trim(),
+        buttons: slot.querySelectorAll("button").length,
+      };
+    });
+    if (!cEmpty || cEmpty.buttons !== 0
+        || cEmpty.status !== "There is nothing left for your role to do in this "
+          + "program's setup right now."
+        || cEmpty.text.indexOf("Setup workflows your role doesn't manage aren't "
+          + "shown on this card, so this isn't a claim that the whole program "
+          + "is finished.") === -1) {
+      fail(`Program C, Arena Manager: the empty state must explain what is `
+        + `missing without offering a control it cannot honour, got `
+        + `${JSON.stringify(cEmpty)}`);
+    }
+    // The success banner it must NOT render, asserted directly.
+    if (cEmpty.text.indexOf("All setup steps complete") !== -1) {
+      fail("Program C, Arena Manager: the card claimed whole-Program completion "
+        + "from a partial view");
     }
 
     // ---- (D) Two Programs, A created first / B active (#331 review round

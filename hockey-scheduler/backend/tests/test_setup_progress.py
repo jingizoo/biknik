@@ -925,6 +925,452 @@ class SetupProgressComputationTest(unittest.TestCase):
                          f"ahead to roster: {progress}")
         self.assertEqual(progress["next_blocked"]["reason"], "season_archived")
 
+    # -- the facilities card's OWN venue-access prerequisite (#365 review) --
+    # `next_blocked` above describes exactly ONE workflow: the first permitted
+    # TODO one. These assert the ADDITIVE per-workflow contract that exists
+    # because of that -- a Facilities card that derived its own prerequisite
+    # from `next_blocked` failed OPEN for League Admin, whose permitted list
+    # starts four workflows earlier.
+
+    def _facilities_prereq(self, progress):
+        row = next(w for w in progress["workflows"] if w["key"] == "facilities")
+        prereqs = {p["key"]: p for p in row.get("prerequisites", [])}
+        return prereqs.get("venue_access")
+
+    def _revoked_grant_fixture(self, api):
+        """A Program whose Venue+Rink are VISIBLE but not schedulable: the
+        grant to the selected Season existed and was revoked. This is the
+        reviewer's reproduction -- the scoped overview still reports the
+        Venue and Rink (revoked history is deliberately in scope), so any
+        check that asks only "is a Rink visible" answers yes."""
+        api.create_user_account("admin", "pw", "league_admin")
+        program = api.create_program("Prog", actor_id="admin")
+        # Real Season boundaries: the Ice Builder cross-check below plans
+        # against them, and every other assertion is indifferent to them.
+        season = api.create_season(program["id"], "Fall",
+                                   start_date="2026-09-01", end_date="2027-03-31",
+                                   actor_id="admin")
+        venue = api.create_venue("V", actor_id="admin")
+        rink = api.create_rink(venue["id"], "R", actor_id="admin")
+        api.set_active_context("admin", Role.LEAGUE_ADMIN, {},
+                               program["id"], season["id"])
+        access = api.grant_season_venue_access(season["id"], venue["id"],
+                                               actor_id="admin")
+        api.revoke_season_venue_access(access["id"], actor_id="admin")
+        return program, season, venue, rink
+
+    def test_facilities_prerequisite_is_unmet_for_a_revoked_grant(self):
+        """A Venue and Rink whose grant to the SELECTED Season was revoked
+        are still visible (correctly -- revoked history stays in scope so the
+        cleanup section can name it) and are NOT schedulable. BOTH roles that
+        can see the workflow receive the identical unmet fact: it is a
+        statement about the Season's data, not about the caller, and the role
+        that cannot grant access needs it just as much (it is precisely the
+        role that would otherwise be handed a dead-end Add Ice)."""
+        api = self._api()
+        program, season, venue, rink = self._revoked_grant_fixture(api)
+
+        # Non-vacuous: the rows really are visible, so this is not merely an
+        # empty Program. Same read the client's own counts come from.
+        overview = api.get_setup_overview_v2("admin", Role.LEAGUE_ADMIN, {})
+        self.assertTrue([v for v in overview["venues"] if v["id"] == venue["id"]],
+                        f"the revoked-grant Venue must stay visible: {overview['venues']}")
+        self.assertTrue([r for r in overview["rinks"] if r["id"] == rink["id"]],
+                        f"the revoked-grant Rink must stay visible: {overview['rinks']}")
+
+        rows = {}
+        for role, label in ((ADMIN, "league admin"), (ARENA, "arena manager")):
+            progress = api.get_setup_progress("admin", *role)
+            prereq = self._facilities_prereq(progress)
+            self.assertIsNotNone(prereq, f"{label} received no venue_access "
+                                         f"prerequisite at all: {progress}")
+            self.assertFalse(prereq["met"], f"{label}: {prereq}")
+            self.assertEqual(prereq["reason"], "venue_access_missing", label)
+            self.assertIn(season["name"], prereq["detail"], label)
+            rows[label] = prereq
+        self.assertEqual(rows["league admin"], rows["arena manager"],
+                         f"the fact is about the Season's data, not the caller, "
+                         f"so both roles must receive an identical row: {rows}")
+
+    def test_facilities_prerequisite_is_unmet_for_an_ungranted_venue(self):
+        """The second reproduction: a Venue+Rink that never had a grant at
+        all. Same answer as the revoked case -- what matters is ACTIVE
+        access for this Season, not the history that produced its absence."""
+        api = self._api()
+        api.create_user_account("admin", "pw", "league_admin")
+        program = api.create_program("Prog", actor_id="admin")
+        season = api.create_season(program["id"], "Fall", actor_id="admin")
+        venue = api.create_venue("V", actor_id="admin")
+        api.create_rink(venue["id"], "R", actor_id="admin")
+        api.set_active_context("admin", Role.LEAGUE_ADMIN, {},
+                               program["id"], season["id"])
+
+        for role, label in ((ADMIN, "league admin"), (ARENA, "arena manager")):
+            prereq = self._facilities_prereq(api.get_setup_progress("admin", *role))
+            self.assertFalse(prereq["met"], f"{label}: {prereq}")
+            self.assertEqual(prereq["reason"], "venue_access_missing", label)
+
+    def test_facilities_prerequisite_is_met_once_access_is_granted(self):
+        """The converse, so the assertions above cannot pass by reporting
+        every Facilities card blocked forever. Re-granting the revoked
+        Venue -- the real recovery path -- must flip the same fact."""
+        api = self._api()
+        program, season, venue, _rink = self._revoked_grant_fixture(api)
+        api.grant_season_venue_access(season["id"], venue["id"], actor_id="admin")
+
+        for role, label in ((ADMIN, "league admin"), (ARENA, "arena manager")):
+            prereq = self._facilities_prereq(api.get_setup_progress("admin", *role))
+            self.assertTrue(prereq["met"], f"{label}: {prereq}")
+            self.assertIsNone(prereq.get("reason"), f"{label}: {prereq}")
+            self.assertIsNone(prereq.get("detail"), f"{label}: {prereq}")
+
+    def test_facilities_prerequisite_is_reported_when_next_blocked_names_nothing(self):
+        """THE fail-open this contract exists for. For a League Admin the
+        first permitted TODO workflow is `league_season`/`teams`/… long
+        before facilities, so `next`/`next_blocked` say nothing about
+        facilities at all -- here `next` is a perfectly safe EARLIER
+        workflow. The facilities row must STILL carry its own unmet
+        prerequisite, or the card has no scoped fact to bind and falls back
+        to "a Rink is visible", which is exactly the dead-end Add Ice."""
+        api = self._api()
+        program, season, venue, _rink = self._revoked_grant_fixture(api)
+        # Leave `teams` genuinely todo, so `next` is an earlier, unblocked
+        # workflow and `next_blocked` is None.
+        progress = api.get_setup_progress("admin", *ADMIN)
+        self.assertIsNotNone(progress["next"], progress)
+        self.assertNotEqual(progress["next"]["key"], "facilities", progress)
+        self.assertIsNone(progress["next_blocked"], progress)
+
+        prereq = self._facilities_prereq(progress)
+        self.assertFalse(
+            prereq["met"],
+            f"facilities must assert its own venue-access gap even when "
+            f"`next`/`next_blocked` are about another workflow: {progress}")
+        self.assertEqual(prereq["reason"], "venue_access_missing")
+
+    def test_facilities_prerequisite_is_scoped_to_the_selected_season(self):
+        """Season-bound exactly as the workflow's own done/todo check is: a
+        grant held by ANOTHER Season of the same Program never satisfies the
+        selected one. Otherwise the card would advance on a neighbouring
+        tuple's inventory -- the thing per-card identity exists to prevent."""
+        api = self._api()
+        api.create_user_account("admin", "pw", "league_admin")
+        program = api.create_program("Prog", actor_id="admin")
+        granted_season = api.create_season(program["id"], "Fall", actor_id="admin")
+        other_season = api.create_season(program["id"], "Spring", actor_id="admin")
+        venue = api.create_venue("V", actor_id="admin")
+        api.create_rink(venue["id"], "R", actor_id="admin")
+        api.set_active_context("admin", Role.LEAGUE_ADMIN, {},
+                               program["id"], granted_season["id"])
+        api.grant_season_venue_access(granted_season["id"], venue["id"],
+                                      actor_id="admin")
+
+        met = self._facilities_prereq(api.get_setup_progress("admin", *ADMIN))
+        self.assertTrue(met["met"], met)
+
+        api.set_active_context("admin", Role.LEAGUE_ADMIN, {},
+                               program["id"], other_season["id"])
+        unmet = self._facilities_prereq(api.get_setup_progress("admin", *ADMIN))
+        self.assertFalse(unmet["met"], unmet)
+        self.assertIn(other_season["name"], unmet["detail"], unmet)
+
+    def test_facilities_prerequisite_matches_the_ice_builder_refusal(self):
+        """The prerequisite and the real write must never disagree. With the
+        grant revoked, the Ice Availability Builder's own preview -- the
+        exact destination "Add Ice" opens -- refuses the Rink with
+        `venue_access_missing` and generates zero slots. That is what makes
+        the withdrawn CTA a correction rather than a style choice."""
+        api = self._api()
+        program, season, _venue, rink = self._revoked_grant_fixture(api)
+        prereq = self._facilities_prereq(api.get_setup_progress("admin", *ADMIN))
+        self.assertFalse(prereq["met"], prereq)
+
+        preview = api.preview_ice_availability(
+            season_id=season["id"], rink_ids=[rink["id"]], weekdays=[1],
+            start_local="18:00", end_local="19:00",
+            start_date="2026-09-01", end_date="2026-09-07",
+            playable_minutes=60, turnover_minutes=0, actor_id="admin")
+        self.assertNotIn("error", preview, preview)
+        self.assertEqual(preview["slots"], [],
+                         f"a revoked grant must yield zero usable slots: {preview}")
+        self.assertEqual([m["rink_id"] for m in preview["venue_access_missing"]],
+                         [rink["id"]], preview)
+
+
+    # -- the COMPLETE ordered hard-prerequisite set (#365 review round 3) ----
+    # Round 2 published ONE fact (venue_access) and called it the workflow's
+    # capability. These assert the whole set, in order, and that it is the
+    # SAME computation `_workflow_prerequisite_gap` refuses with -- so the
+    # server can never refuse a workflow for a reason its own card never
+    # received.
+
+    @staticmethod
+    def _prereqs(progress, key):
+        """The ORDERED prerequisite rows for `key`, as published."""
+        row = next(w for w in progress["workflows"] if w["key"] == key)
+        return row.get("prerequisites", [])
+
+    @staticmethod
+    def _prereq_keys(progress, key):
+        return [p["key"] for p in
+                SetupProgressComputationTest._prereqs(progress, key)]
+
+    @staticmethod
+    def _prereq(progress, key, prereq_key):
+        for p in SetupProgressComputationTest._prereqs(progress, key):
+            if p["key"] == prereq_key:
+                return p
+        return None
+
+    def _archived_season_with_live_grant(self, api):
+        """THE round-3 reproduction, verbatim from the review: Program +
+        active Season + Venue + Rink, grant the Venue to that Season, then
+        ARCHIVE the selected Season.
+
+        Deliberately NON-VACUOUS in two independent ways, because both are
+        how round 2's fix could have appeared to cover this:
+        * the Venue and Rink are really VISIBLE (counts non-zero), so the
+          card is not merely empty; and
+        * the grant is really ACTIVE, so `venue_access` asserts met -- the
+          card is not already blocked by round 2's own floor.
+        What is left is exactly the new hole: a read-only Season."""
+        api.create_user_account("admin", "pw", "league_admin")
+        program = api.create_program("Prog", actor_id="admin")
+        season = api.create_season(program["id"], "Fall",
+                                   start_date="2026-09-01", end_date="2027-03-31",
+                                   actor_id="admin")
+        venue = api.create_venue("V", actor_id="admin")
+        rink = api.create_rink(venue["id"], "R", actor_id="admin")
+        api.set_active_context("admin", Role.LEAGUE_ADMIN, {},
+                               program["id"], season["id"])
+        api.grant_season_venue_access(season["id"], venue["id"], actor_id="admin")
+        api.archive_season(season["id"], reason="round 3", actor_id="admin")
+        return program, season, venue, rink
+
+    def test_facilities_publishes_every_floor_for_an_archived_season(self):
+        """THE round-3 fail-open. An archived selected Season with a LIVE
+        grant used to publish `[{venue_access, met: true}]` and nothing
+        else, so the card settled with no blocker and a dead-end "Add Ice"
+        while `commit_ice_availability` would refuse the same workflow with
+        `season_archived`. The complete ordered set has to arrive."""
+        api = self._api()
+        _program, season, venue, rink = self._archived_season_with_live_grant(api)
+        progress = api.get_setup_progress("admin", *ADMIN)
+
+        # Non-vacuity 1: the rows really are visible, so this is a card with
+        # real inventory rather than an empty one that offers nothing anyway.
+        overview = api.get_setup_overview_v2("admin", Role.LEAGUE_ADMIN, {})
+        self.assertTrue([v for v in overview["venues"] if v["id"] == venue["id"]],
+                        overview["venues"])
+        self.assertTrue([r for r in overview["rinks"] if r["id"] == rink["id"]],
+                        overview["rinks"])
+
+        self.assertEqual(
+            self._prereq_keys(progress, "facilities"),
+            ["season_selected", "season_active", "venue_access"],
+            f"facilities must publish the COMPLETE set, in the order the real "
+            f"writes fail it: {progress}")
+        self.assertTrue(self._prereq(progress, "facilities", "season_selected")["met"])
+        # Non-vacuity 2: the round-2 floor is genuinely MET here, so nothing
+        # below can be passing because of it.
+        self.assertTrue(
+            self._prereq(progress, "facilities", "venue_access")["met"],
+            f"the grant is active, so venue_access must assert met -- otherwise "
+            f"this fixture is testing round 2's hole again: {progress}")
+
+        archived = self._prereq(progress, "facilities", "season_active")
+        self.assertFalse(archived["met"], archived)
+        self.assertEqual(archived["reason"], "season_archived", archived)
+        self.assertIn(season["name"], archived["detail"], archived)
+
+        # ...and the hole this closes: `next_blocked` cannot report it,
+        # because an EARLIER workflow owns that single slot (or nothing does).
+        self.assertNotEqual((progress["next_blocked"] or {}).get("key"),
+                            "facilities", progress)
+
+    def test_participation_publishes_every_floor_for_an_archived_season(self):
+        """The same audit for participation: an archived selected Season and
+        an otherwise perfectly valid League/Division/Team. Its own capability
+        floor (team_league_eligible) is MET, so the archived Season is the
+        only thing left -- and it was absent from the published set."""
+        api = self._api()
+        api.create_user_account("admin", "pw", "league_admin")
+        program = api.create_program("Prog", actor_id="admin")
+        season = api.create_season(program["id"], "Fall", actor_id="admin")
+        league = api.create_league(season["id"], "AL", actor_id="admin")
+        club = api.create_club("C", actor_id="admin")
+        api.set_active_context("admin", Role.LEAGUE_ADMIN, {},
+                               program["id"], season["id"])
+        api.create_team(club["id"], None, "T", actor_id="admin",
+                        program_id=program["id"], league_id=league["id"])
+        api.create_division(season["id"], league["id"], "D", actor_id="admin")
+        api.archive_season(season["id"], reason="round 3", actor_id="admin")
+
+        progress = api.get_setup_progress("admin", *ADMIN)
+        self.assertEqual(
+            self._prereq_keys(progress, "participation"),
+            ["season_selected", "season_active", "team_league_eligible"],
+            progress)
+        self.assertTrue(
+            self._prereq(progress, "participation", "team_league_eligible")["met"],
+            f"the Team's permanent League really is one this Season runs, so "
+            f"the eligibility floor must assert met -- otherwise the archived "
+            f"assertion below could pass for the wrong reason: {progress}")
+        archived = self._prereq(progress, "participation", "season_active")
+        self.assertFalse(archived["met"], archived)
+        self.assertEqual(archived["reason"], "season_archived", archived)
+        self.assertIn(season["name"], archived["detail"], archived)
+
+    def test_participation_publishes_its_team_league_eligibility_floor(self):
+        """The second participation floor, published for the first time in
+        round 3: an ACTIVE Season whose only Team is permanently bound to
+        another League. Every registration here is a guaranteed rule-7
+        rejection, and the card had no way to know."""
+        api = self._api()
+        api.create_user_account("admin", "pw", "league_admin")
+        program = api.create_program("Prog", actor_id="admin")
+        season_a = api.create_season(program["id"], "Season A", actor_id="admin")
+        league_a = api.create_league(season_a["id"], "League A", actor_id="admin")
+        club = api.create_club("C", actor_id="admin")
+        api.set_active_context("admin", Role.LEAGUE_ADMIN, {},
+                               program["id"], season_a["id"])
+        api.create_team(club["id"], None, "T", actor_id="admin",
+                        program_id=program["id"], league_id=league_a["id"])
+        season_b = api.create_season(program["id"], "Season B", actor_id="admin")
+        api.create_league(season_b["id"], "League B", actor_id="admin")
+        api.set_active_context("admin", Role.LEAGUE_ADMIN, {},
+                               program["id"], season_b["id"])
+
+        progress = api.get_setup_progress("admin", *ADMIN)
+        rows = self._prereqs(progress, "participation")
+        self.assertEqual([p["key"] for p in rows],
+                         ["season_selected", "season_active",
+                          "team_league_eligible"], rows)
+        # The Season floors are MET -- it is active and selected -- so the
+        # eligibility row is the only thing this asserts.
+        self.assertTrue(rows[0]["met"], rows)
+        self.assertTrue(rows[1]["met"], rows)
+        self.assertFalse(rows[2]["met"], rows)
+        self.assertEqual(rows[2]["reason"], "team_league_mismatch", rows)
+        self.assertIn(season_b["name"], rows[2]["detail"], rows)
+
+    def test_no_selected_season_publishes_both_season_rows_unmet(self):
+        """A Program-only context. The set stays COMPLETE rather than being
+        truncated at the first failure: a fail-closed client treats a missing
+        row as unmet anyway, but it would then explain it in the client's own
+        words instead of the server's."""
+        api = self._api()
+        api.create_user_account("admin", "pw", "league_admin")
+        program = api.create_program("Prog", actor_id="admin")
+        api.create_season(program["id"], "Fall", actor_id="admin")
+        api.set_active_context("admin", Role.LEAGUE_ADMIN, {}, program["id"], None)
+
+        progress = api.get_setup_progress("admin", *ADMIN)
+        for key, last in (("facilities", "venue_access"),
+                          ("participation", "team_league_eligible")):
+            self.assertEqual(self._prereq_keys(progress, key),
+                             ["season_selected", "season_active", last], progress)
+            for prereq_key in ("season_selected", "season_active"):
+                row = self._prereq(progress, key, prereq_key)
+                self.assertFalse(row["met"], f"{key}/{prereq_key}: {row}")
+                self.assertEqual(row["reason"], "season_missing",
+                                 f"{key}/{prereq_key}: {row}")
+                self.assertTrue(row["detail"], row)
+
+    def test_published_rows_and_the_refusal_are_one_computation(self):
+        """The structural claim: `_workflow_prerequisite_gap` -- the server's
+        own authority on why a workflow is refused -- is a PROJECTION of the
+        published rows (its first unmet one), never an independent second
+        opinion. Asserted across every combination of the three inputs, so a
+        future floor added to one and not the other fails here."""
+        from hockey_scheduler.domain import SeasonStatus
+
+        class _S:
+            def __init__(self, status):
+                self.name = "Fall"
+                self.status = status
+
+        service_cls = self._api().__class__
+        seasons = [None, _S(SeasonStatus.ACTIVE), _S(SeasonStatus.ARCHIVED)]
+        for key in ("facilities", "participation"):
+            for season in seasons:
+                for rinks in (set(), {"rink_1"}):
+                    for eligible in (False, True):
+                        rows = service_cls._workflow_prerequisites(
+                            key, season, rinks, eligible)
+                        gap = service_cls._workflow_prerequisite_gap(
+                            key, season, rinks, eligible)
+                        unmet = [r for r in rows if not r["met"]]
+                        case = (f"{key} season={season and season.status} "
+                                f"rinks={bool(rinks)} eligible={eligible}")
+                        if not unmet:
+                            self.assertIsNone(gap, f"{case}: {rows} -> {gap}")
+                        else:
+                            self.assertIsNotNone(gap, f"{case}: {rows}")
+                            self.assertEqual(gap[0], unmet[0]["reason"],
+                                             f"{case}: {rows} -> {gap}")
+                            self.assertTrue(gap[1], f"{case}: {gap}")
+
+    def test_only_the_two_audited_workflows_publish_prerequisites(self):
+        """The audit itself, as an assertion. `_workflow_prerequisite_gap`
+        refuses ONLY facilities and participation, and the four other
+        workflows' real writes (create_season/create_team/create_player/the
+        import commits) take no Season guard -- so their absent
+        `prerequisites` key is a positive statement, not an omission. If a
+        floor is ever added to one of them this fails until it is published
+        too."""
+        api = self._api()
+        _program, season, _venue, _rink = self._archived_season_with_live_grant(api)
+        progress = api.get_setup_progress("admin", *ADMIN)
+        with_floors, without = [], []
+        for w in progress["workflows"]:
+            (with_floors if "prerequisites" in w else without).append(w["key"])
+        self.assertEqual(with_floors, ["participation", "facilities"], progress)
+        self.assertEqual(sorted(without),
+                         ["import", "league_season", "roster", "teams"], progress)
+
+        service_cls = api.__class__
+        for key in without:
+            self.assertIsNone(
+                service_cls._workflow_prerequisite_gap(key, season, set(), False),
+                f"{key} publishes no prerequisites, so the server must not be "
+                f"able to refuse it either")
+            self.assertEqual(
+                service_cls._workflow_prerequisites(key, season, set(), False), [])
+
+    def test_the_new_facilities_rows_are_role_invariant(self):
+        """Same discipline round 2 established for venue_access, extended to
+        the whole set: these are statements about the selected Season's data,
+        not about the caller, so both roles that can see the workflow receive
+        byte-identical rows. WHO may reopen the Season is a permission
+        question the caller's own permission set already answers."""
+        api = self._api()
+        self._archived_season_with_live_grant(api)
+        rows = {label: self._prereqs(api.get_setup_progress("admin", *role),
+                                     "facilities")
+                for role, label in ((ADMIN, "league admin"), (ARENA, "arena"))}
+        self.assertEqual(rows["league admin"], rows["arena"], rows)
+
+    def test_reopening_the_season_clears_only_the_season_floor(self):
+        """The converse, so the assertions above cannot pass by reporting
+        every archived card blocked forever: the REAL reopen -- the same
+        write /api/v2/setup/seasons/<id>/reopen performs -- flips
+        season_active and leaves the other rows exactly as they were."""
+        api = self._api()
+        _program, season, _venue, _rink = self._archived_season_with_live_grant(api)
+        before = self._prereqs(api.get_setup_progress("admin", *ADMIN), "facilities")
+        api.reopen_season(season["id"], reason="back to work", actor_id="admin")
+        after = self._prereqs(api.get_setup_progress("admin", *ADMIN), "facilities")
+
+        self.assertEqual([p["key"] for p in after],
+                         [p["key"] for p in before], after)
+        self.assertTrue(all(p["met"] for p in after),
+                        f"every facilities floor must be met once the Season is "
+                        f"reopened (the grant was never revoked): {after}")
+        progress = api.get_setup_progress("admin", *ARENA)
+        self.assertEqual(progress["next"]["key"], "facilities", progress)
+        self.assertIsNone(progress["next_blocked"], progress)
+
 
 class SetupProgressHttpTest(unittest.TestCase):
     """Route/authz contract over real HTTP — mirrors test_v2_setup_contract.
@@ -1239,6 +1685,167 @@ class SetupProgressHttpTest(unittest.TestCase):
         self.assertEqual(status, 200, advanced)
         self.assertEqual(advanced["next"]["key"], "participation", advanced)
         self.assertIsNone(advanced["next_blocked"])
+
+    @staticmethod
+    def _prereqs(progress, key):
+        row = next(w for w in progress["workflows"] if w["key"] == key)
+        return row.get("prerequisites", [])
+
+    def test_archived_season_publishes_every_facilities_floor_over_real_http(self):
+        """The round-3 reproduction over the REAL authenticated route, for
+        BOTH roles that can see the workflow. The grant stays ACTIVE and the
+        Venue/Rink stay visible, so `venue_access` asserts met and the only
+        remaining floor is the read-only Season -- which is exactly the state
+        that used to publish a single met row and a dead-end "Add Ice".
+
+        For League Admin `next_blocked` names an EARLIER workflow (or
+        nothing), which is why the per-workflow rows have to carry the fact:
+        the roll-up's one slot is already spoken for."""
+        admin = self._login("admin")
+        status, program = self._req(admin, "POST", "/api/v2/setup/program",
+                                    {"name": "R3 Archived HTTP Prog", "country": "US"})
+        self.assertEqual(status, 200, program)
+        status, season = self._req(admin, "POST", "/api/v2/setup/season",
+                                   {"program_id": program["id"], "name": "R3 Fall"})
+        self.assertEqual(status, 200, season)
+        status, venue = self._req(admin, "POST", "/api/v2/setup/venue", {"name": "R3 V"})
+        self.assertEqual(status, 200, venue)
+        status, rink = self._req(admin, "POST", "/api/v2/setup/rink",
+                                 {"venue_id": venue["id"], "name": "R3 R"})
+        self.assertEqual(status, 200, rink)
+        status, _ = self._req(admin, "POST", "/api/context",
+                              {"program_id": program["id"], "season_id": season["id"]})
+        self.assertEqual(status, 200)
+        status, grant = self._req(
+            admin, "POST", f"/api/v2/setup/seasons/{season['id']}/venue-access",
+            {"venue_id": venue["id"]})
+        self.assertEqual(status, 200, grant)
+        status, archived = self._req(
+            admin, "POST", f"/api/v2/setup/seasons/{season['id']}/archive",
+            {"reason": "round 3"})
+        self.assertEqual(status, 200, archived)
+
+        arena = self._login("arena")
+        status, _ = self._req(arena, "POST", "/api/context",
+                              {"program_id": program["id"], "season_id": season["id"]})
+        self.assertEqual(status, 200)
+
+        seen = {}
+        for opener, label in ((admin, "league admin"), (arena, "arena manager")):
+            status, progress = self._req(opener, "GET", "/api/v2/setup/progress")
+            self.assertEqual(status, 200, progress)
+            rows = self._prereqs(progress, "facilities")
+            seen[label] = rows
+            self.assertEqual([p["key"] for p in rows],
+                             ["season_selected", "season_active", "venue_access"],
+                             f"{label}: {progress}")
+            # Non-vacuity: the grant is live, so the round-2 floor is met and
+            # cannot be what is blocking here.
+            self.assertTrue(rows[2]["met"], f"{label}: {rows}")
+            self.assertFalse(rows[1]["met"], f"{label}: {rows}")
+            self.assertEqual(rows[1]["reason"], "season_archived", f"{label}: {rows}")
+            self.assertIn(season["name"], rows[1]["detail"], f"{label}: {rows}")
+        self.assertEqual(seen["league admin"], seen["arena manager"], seen)
+
+        status, progress = self._req(admin, "GET", "/api/v2/setup/progress")
+        self.assertNotEqual((progress["next_blocked"] or {}).get("key"),
+                            "facilities",
+                            f"this fixture exists because the roll-up cannot "
+                            f"carry the fact for League Admin: {progress}")
+
+        # The REAL reopen entry point, over the same route the card fires.
+        status, reopened = self._req(
+            admin, "POST", f"/api/v2/setup/seasons/{season['id']}/reopen",
+            {"reason": "back to work"})
+        self.assertEqual(status, 200, reopened)
+        status, after = self._req(arena, "GET", "/api/v2/setup/progress")
+        self.assertEqual(status, 200, after)
+        self.assertTrue(all(p["met"] for p in self._prereqs(after, "facilities")),
+                        after)
+        self.assertEqual(after["next"]["key"], "facilities", after)
+        self.assertIsNone(after["next_blocked"], after)
+
+    def test_reopen_route_is_refused_for_a_role_without_manage_setup(self):
+        """Why the card offers the reopen control to League Admin ONLY: the
+        route itself is MANAGE_SETUP, so an Arena Manager pressing it would
+        receive a 403. A control that can only fail is the same dead end this
+        whole contract exists to remove."""
+        admin = self._login("admin")
+        status, program = self._req(admin, "POST", "/api/v2/setup/program",
+                                    {"name": "R3 Reopen Authz Prog", "country": "US"})
+        self.assertEqual(status, 200, program)
+        status, season = self._req(admin, "POST", "/api/v2/setup/season",
+                                   {"program_id": program["id"], "name": "R3 Authz"})
+        self.assertEqual(status, 200, season)
+        status, _ = self._req(admin, "POST", "/api/context",
+                              {"program_id": program["id"], "season_id": season["id"]})
+        self.assertEqual(status, 200)
+        status, _ = self._req(
+            admin, "POST", f"/api/v2/setup/seasons/{season['id']}/archive",
+            {"reason": "authz check"})
+        self.assertEqual(status, 200)
+
+        arena = self._login("arena")
+        status, _ = self._req(arena, "POST", "/api/context",
+                              {"program_id": program["id"], "season_id": season["id"]})
+        self.assertEqual(status, 200)
+        status, denied = self._req(
+            arena, "POST", f"/api/v2/setup/seasons/{season['id']}/reopen",
+            {"reason": "let me in"})
+        self.assertEqual(status, 403, denied)
+
+        # ...and the Season really is still archived, so the refusal was not a
+        # 403 handed back after a partial write.
+        status, still = self._req(arena, "GET", "/api/v2/setup/progress")
+        self.assertEqual(status, 200, still)
+        rows = self._prereqs(still, "facilities")
+        self.assertFalse(rows[1]["met"], rows)
+        self.assertEqual(rows[1]["reason"], "season_archived", rows)
+
+    def test_archived_season_publishes_every_participation_floor_over_real_http(self):
+        """Participation's own audit over the real route, with an otherwise
+        valid League/Division/Team so its eligibility floor asserts met and
+        the archived Season is the only blocker left."""
+        admin = self._login("admin")
+        status, program = self._req(admin, "POST", "/api/v2/setup/program",
+                                    {"name": "R3 Part HTTP Prog", "country": "US"})
+        self.assertEqual(status, 200, program)
+        status, season = self._req(admin, "POST", "/api/v2/setup/season",
+                                   {"program_id": program["id"], "name": "R3 Part"})
+        self.assertEqual(status, 200, season)
+        status, league = self._req(admin, "POST", "/api/v2/setup/league",
+                                   {"season_id": season["id"], "name": "R3 League"})
+        self.assertEqual(status, 200, league)
+        status, club = self._req(admin, "POST", "/api/v2/setup/club",
+                                 {"name": "R3 Club"})
+        self.assertEqual(status, 200, club)
+        status, _ = self._req(admin, "POST", "/api/context",
+                              {"program_id": program["id"], "season_id": season["id"]})
+        self.assertEqual(status, 200)
+        status, team = self._req(admin, "POST", "/api/v2/setup/team",
+                                 {"club_id": club["id"], "league_id": league["id"],
+                                  "name": "R3 Team"})
+        self.assertEqual(status, 200, team)
+        status, division = self._req(admin, "POST", "/api/v2/setup/division",
+                                     {"season_id": season["id"],
+                                      "league_id": league["id"], "name": "R3 Div"})
+        self.assertEqual(status, 200, division)
+        status, _ = self._req(
+            admin, "POST", f"/api/v2/setup/seasons/{season['id']}/archive",
+            {"reason": "round 3"})
+        self.assertEqual(status, 200)
+
+        status, progress = self._req(admin, "GET", "/api/v2/setup/progress")
+        self.assertEqual(status, 200, progress)
+        rows = self._prereqs(progress, "participation")
+        self.assertEqual([p["key"] for p in rows],
+                         ["season_selected", "season_active",
+                          "team_league_eligible"], progress)
+        self.assertTrue(rows[2]["met"],
+                        f"the Team's league really is one this Season runs: {rows}")
+        self.assertFalse(rows[1]["met"], rows)
+        self.assertEqual(rows[1]["reason"], "season_archived", rows)
+        self.assertIn(season["name"], rows[1]["detail"], rows)
 
 
 if __name__ == "__main__":

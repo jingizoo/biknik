@@ -202,6 +202,50 @@ resolve it themselves (an Arena Manager blocked on a Season only a League
 Admin can create) is still told clearly rather than routed into a silent
 failure or a workflow further down the list.
 
+That ordering is also why `next_blocked` is **not** a per-workflow
+prerequisite contract, and must never be read as one (#365 review, Facilities
+fail-open). It describes exactly ONE workflow — the first permitted TODO
+one — so for a League Admin, whose permitted list starts four workflows
+earlier, a facilities gap is simply never reported there. A surface that
+derived the Facilities card's own prerequisite from `next_blocked` therefore
+failed OPEN for the very role that can resolve it.
+
+So each `workflows[]` row may additionally carry `prerequisites`: an ordered
+list of ASSERTED facts about that workflow, for this exact resolved
+Program/Season/League tuple, additive and independent of `status` exactly as
+`attention` is. Today one row exists, on "facilities":
+
+```json
+{"key": "venue_access", "met": false, "reason": "venue_access_missing",
+ "detail": "No rink is reachable through active venue access for Season 'Fall 2025' yet, …"}
+```
+
+`met` is computed from the SAME `schedulable_rink_ids` set the workflow's own
+done/todo check and `_workflow_prerequisite_gap` read — the Rinks reachable
+through ACTIVE `SeasonVenueAccess` for the selected Season — so the card, the
+roll-up and the Ice Availability Builder's own `venue_access_missing` refusal
+can never disagree. It is emitted to every role that can see the workflow
+(both League Admin and Arena Manager hold `MANAGE_ARENA`), because the fact is
+just as load-bearing for the role that cannot fix it.
+
+The row is deliberately ROLE-INVARIANT — it describes the selected Season's
+data, not the caller, and both roles receive byte-identical rows. WHO may
+resolve the gap is a separate, permission question: granting
+`SeasonVenueAccess` requires `MANAGE_SETUP`, which an Arena Manager does not
+hold. The client answers it from the caller's own permission set (the same
+`hasPerm` every other control is gated on), so a League Admin is offered the
+real venue-access resolution path while an Arena Manager is offered no
+mutation control at all plus guidance that a League Admin must grant it.
+Restating the permission in the payload would create a second authority on it,
+free to drift from the first.
+
+This is deliberately NOT derivable from the Setup overview's Venue/Rink
+lists. Those correctly include revoked-grant history and creator-owned
+pending rows (see `get_setup_overview_v2`), so "a Rink is VISIBLE" and "a
+Rink is SCHEDULABLE this Season" are different claims; the read contract is
+right and is not narrowed, and the schedulability claim gets its own asserted
+field instead.
+
 The `workflows` list itself is also filtered to what the caller's role can
 manage, not global (a reversal of the original design — an Arena Manager
 must never receive League-Admin-only completion signals or exact team/
