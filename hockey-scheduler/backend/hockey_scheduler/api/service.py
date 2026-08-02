@@ -4832,6 +4832,96 @@ class ApiService:
                               meetings_per_opponent=meetings_per_opponent)
 
     # -- immutable named schedule scenarios (#206/#378) ------------------
+    #
+    # ACTIVE-TUPLE SCOPING (#381 blocker). The four scenario entry points began
+    # life gated on the MANAGE_SCHEDULE capability alone, which is exactly the
+    # mistake #369 already ruled on for the setup surface: *one asserted
+    # capability fact is not the whole workflow capability*. A League Admin or
+    # Arena Manager is a `context_scope._GLOBAL_ROLE` — authorized for every
+    # Program in the installation — so a role gate authorized a caller working
+    # in Program B to create a Program A scenario from caller-supplied scope
+    # ids, to list every stored scenario (name, creator, constraints, the whole
+    # proposal and the generation snapshot), to fetch any of them by id, and to
+    # commit A's frozen Games into A. A cross-context disclosure and an IDOR
+    # write behind the same missing check.
+    #
+    # The rule, and it is deliberately the SAME rule the setup surface already
+    # runs, not a parallel mechanism:
+    #
+    # * the tuple is resolved SERVER-SIDE through
+    #   `ContextService.resolve_with_league(user_id, role, scope)`. A scenario
+    #   request body carries scope ids, but an id selects WHICH rows to
+    #   consider and is never evidence of entitlement to them;
+    # * a scenario's own `(program_id, season_id, league_id)` is ONE WHOLE EDGE
+    #   and is judged by `_setup_target_edge_allows` verbatim — the same
+    #   "edges, not unions" predicate #369 landed. Three independent axis
+    #   unions would authorize combinations that do not exist;
+    # * every scenario is Season- AND League-bound by construction (all three
+    #   columns are NOT NULL), so a Program-only context fails CLOSED against
+    #   every scenario, exactly as `get_standings` fails closed. An explicit
+    #   NO LEAGUE stays the first-class "approved Program + active-Season
+    #   union" selection it is everywhere else;
+    # * there is NO creator clause. `setup_target_accessible` rule 6 admits one
+    #   only for a genuinely UNLINKED record, and a scenario can never be
+    #   unlinked. Creator ownership surviving hierarchy linking was ruled a
+    #   blocker in its own right (#372): it is an unrevokable back door no
+    #   Program admin can see or remove. Once the chain exists, the chain is
+    #   the sole authority;
+    # * `role is None` (internal call sites, the demo/full seeds, the
+    #   acceptance harnesses) is ungated and completely untouched, matching
+    #   `setup_target_accessible` rule 1 and `setup_guarded_mutation`.
+    def _scenario_in_active_tuple(self, scenario, user_id, role, scope) -> bool:
+        """Is this stored scenario inside the caller's persisted exact tuple?
+
+        The one predicate create/list/get/commit all route through, so the rule
+        cannot drift between the four verbs — the same reason #369 funnels
+        every setup mutation through `setup_target_accessible`.
+        """
+        if role is None:
+            return True                      # no identity supplied → no gate
+        program, season, league = self.context.resolve_with_league(
+            user_id, role, scope)
+        if program is None:
+            return False                     # no active Program → fail closed
+        return self._setup_target_edge_allows(
+            (scenario.program_id, scenario.season_id, scenario.league_id),
+            program, season, league)
+
+    @staticmethod
+    def _scenario_not_found(scenario_id):
+        """The ONE not-found a foreign, a nonexistent and an unreadable
+        scenario id all take.
+
+        A single raise site is what makes the three response-identical rather
+        than merely similar: same code, same message, same details, and the
+        only variable is the caller's OWN echoed input. A 404-vs-403 split
+        between "exists but is not yours" and "does not exist" IS the
+        disclosure — it turns the route into an existence oracle over
+        sequential ids, the same trap `setup_target_accessible` and the
+        venue-access Season ceiling both had to close.
+        """
+        return NotFoundError(
+            "Schedule scenario not found.",
+            details={"reason": "schedule_scenario_missing",
+                     "scenario_id": scenario_id})
+
+    @staticmethod
+    def _scenario_scope_not_found(division_id, season_id, league_id):
+        """The refusal a CREATE outside the active tuple takes.
+
+        Byte-identical to what `resolve_scenario_scope` itself raises when the
+        same request SHAPE names ids that do not exist — the League-wide shape
+        refuses at its LeagueSeason link, the Division shape at its Division.
+        Neither echoes any id, so a foreign Program's Season/League/Division
+        cannot be told apart from a guessed one.
+        """
+        if season_id and league_id:
+            return NotFoundError(
+                "The selected League is not linked to the selected Season.",
+                details={"reason": "league_season_missing"})
+        return NotFoundError(
+            "Division not found.", details={"reason": "division_missing"})
+
     @staticmethod
     def _scenario_dto(scenario) -> dict:
         """A detached JSON view; callers can never mutate stored evidence."""
@@ -4866,13 +4956,35 @@ class ApiService:
     def create_schedule_scenario(self, name: str, division_id: str = None,
                                  season_id: str = None,
                                  league_id: str = None, slot_ids=None,
-                                 constraints=None, actor_id=None) -> dict:
+                                 constraints=None,
+                                 meetings_per_opponent=None, actor_id=None,
+                                 user_id=None, role=None, scope=None) -> dict:
         """Generate and persist review evidence without writing any Game.
 
         REPEATABLE READ makes proposal generation, the material-input snapshot,
         and the one scenario INSERT observe a single database snapshot.  The
         scenario remains immutable afterward; creating another generation is a
         new named record with a new id, never an update in place.
+
+        An identified caller is raised to SERIALIZABLE instead, because the
+        active-context resolution below needs that level and a nested join may
+        never RAISE the isolation of the open transaction — the same reason
+        `setup_guarded_mutation` adopts the strongest level any participant
+        needs. `role is None` keeps the pre-existing REPEATABLE READ exactly.
+
+        AUTHORIZATION runs against the RESOLVED REQUESTED HIERARCHY, inside the
+        same transaction, before a single line of the proposal is generated:
+        the caller supplies scope ids, `resolve_scenario_scope` turns them into
+        the real `(Program, Season, League)` they name, and that whole edge must
+        equal the caller's own server-resolved active tuple. Authorizing the
+        capability alone let an operator active in Program B generate and store
+        a Program A scenario from B's own session.
+
+        `meetings_per_opponent` (#375/#382) is the regular-season format this
+        generation ran under. It is read back OFF the proposal rather than off
+        the request, so the scenario records the N the generator actually
+        applied, and `commit_schedule_scenario` replays that same N — see
+        `_scenario_replay_meetings`.
         """
         if not isinstance(name, str) or not name.strip():
             raise ValidationError(
@@ -4899,28 +5011,54 @@ class ApiService:
             "slot_ids": copy.deepcopy(list(slot_ids))
             if slot_ids is not None else None,
             "constraints": copy.deepcopy(constraints),
+            # Overwritten below with the value the generator actually applied.
+            "meetings_per_opponent": None,
         }
-        with self.store.transaction(isolation="REPEATABLE READ"):
-            scope = resolve_scenario_scope(
+        isolation = "REPEATABLE READ" if role is None else "SERIALIZABLE"
+        with self.store.transaction(isolation=isolation):
+            # `hierarchy`, not `scope`: `scope` is the caller's ACCOUNT scope
+            # (the third of the `(user_id, role, scope)` principal triple this
+            # whole facade names consistently), while this is the requested
+            # Program/Season/League/Division the body's ids resolve to.
+            hierarchy = resolve_scenario_scope(
                 self.store, division_id=division_id, season_id=season_id,
                 league_id=league_id)
+            # BEFORE generation, so a foreign hierarchy never reaches the
+            # planner: no proposal is computed, nothing derived from another
+            # Program's rows is serialized, and the refusal cannot be told from
+            # the one a guessed id already produced.
+            if role is not None:
+                program, season, league = self.context.resolve_with_league(
+                    user_id, role, scope)
+                if program is None or not self._setup_target_edge_allows(
+                        (hierarchy["program_id"], hierarchy["season_id"],
+                         hierarchy["league_id"]), program, season, league):
+                    raise self._scenario_scope_not_found(
+                        division_id, season_id, league_id)
             proposal = self.draft_season_schedule(
                 division_id=division_id, season_id=season_id,
                 league_id=league_id, slot_ids=request_input["slot_ids"],
-                constraints=request_input["constraints"])
+                constraints=request_input["constraints"],
+                meetings_per_opponent=meetings_per_opponent)
             if isinstance(proposal, dict) and proposal.get("error"):
                 return proposal
+            # The N the GENERATOR resolved, never the raw request: an omitted
+            # format is recorded as the 1 it really ran under, so the commit
+            # replay has an explicit value to bind to rather than a default to
+            # re-derive.
+            request_input["meetings_per_opponent"] = proposal.get(
+                "meetings_per_opponent")
             snapshot = material_input_snapshot(
-                self.store, scope, request_input,
+                self.store, hierarchy, request_input,
                 planner_version=SCENARIO_PLANNER_VERSION)
             scenario = ScheduleScenario(
                 id=self.store.next_id("schedule_scenario"),
                 name=clean_name,
-                program_id=scope["program_id"],
-                season_id=scope["season_id"],
-                league_id=scope["league_id"],
-                league_season_id=scope["league_season_id"],
-                division_id=scope["division_id"],
+                program_id=hierarchy["program_id"],
+                season_id=hierarchy["season_id"],
+                league_id=hierarchy["league_id"],
+                league_season_id=hierarchy["league_season_id"],
+                division_id=hierarchy["division_id"],
                 planner_version=SCENARIO_PLANNER_VERSION,
                 input_fingerprint=canonical_fingerprint(snapshot),
                 # Whole opaque output, not only the v1 commit token.  Future
@@ -4947,34 +5085,102 @@ class ApiService:
         return self._scenario_dto(stored)
 
     @catch
-    def get_schedule_scenario(self, scenario_id: str) -> dict:
+    def get_schedule_scenario(self, scenario_id: str, user_id=None, role=None,
+                              scope=None) -> dict:
+        """One scenario, only from inside the caller's own active tuple.
+
+        Existence and readability collapse into ONE raise site on purpose (see
+        `_scenario_not_found`): a scenario of another Program answers with the
+        same status and the same bytes as an id that was never minted, so this
+        route is not an existence oracle for evidence the caller may not read.
+        """
         scenario = self.store.get_schedule_scenario(scenario_id)
-        if scenario is None:
-            raise NotFoundError(
-                "Schedule scenario not found.",
-                details={"reason": "schedule_scenario_missing",
-                         "scenario_id": scenario_id})
+        if scenario is None or not self._scenario_in_active_tuple(
+                scenario, user_id, role, scope):
+            raise self._scenario_not_found(scenario_id)
         return self._scenario_dto(scenario)
 
     @catch
-    def list_schedule_scenarios(self) -> dict:
-        scenarios = sorted(
-            self.store.all_schedule_scenarios(),
-            key=lambda value: (value.created_at, value.id))
+    def list_schedule_scenarios(self, user_id=None, role=None,
+                                scope=None) -> dict:
+        """Every scenario of the caller's active exact tuple, and no other.
+
+        The filter runs on the STORED ROWS, strictly BEFORE any DTO is built.
+        Filtering a list of DTOs would mean a foreign scenario's name, creator,
+        constraints, whole proposal and generation snapshot had already been
+        deep-copied and serialized once; the count, the shape and the timing of
+        that work are themselves a signal, and one `return` away from being the
+        payload. Nothing outside the tuple is ever read into a response object.
+        """
+        rows = self.store.all_schedule_scenarios()
+        if role is not None:
+            program, season, league = self.context.resolve_with_league(
+                user_id, role, scope)
+            rows = ([] if program is None else
+                    [row for row in rows
+                     if self._setup_target_edge_allows(
+                         (row.program_id, row.season_id, row.league_id),
+                         program, season, league)])
+        scenarios = sorted(rows, key=lambda value: (value.created_at, value.id))
         return {"scenarios": [self._scenario_dto(value)
                               for value in scenarios]}
 
-    def _commit_schedule_scenario_attempt(self, scenario_id, actor_id=None):
-        """One lock-linearized, all-or-nothing stale-check + draft commit."""
-        with self.store.transaction():
-            scenario = self.store.get_schedule_scenario_for_update(scenario_id)
-            if scenario is None:
-                raise NotFoundError(
-                    "Schedule scenario not found.",
-                    details={"reason": "schedule_scenario_missing",
-                             "scenario_id": scenario_id})
+    @staticmethod
+    def _scenario_replay_meetings(scenario):
+        """The regular-season format this scenario must REPLAY under (#382).
 
-            scope = {
+        Returned from the stored `request_input`, which
+        `create_schedule_scenario` fills from the generator's own answer — so
+        an omitted request format is stored as the explicit 1 it ran under and
+        a stored N replays as N. The alternative, letting the commit pass
+        `None` and having `_normalize_meetings` default it to 1, silently
+        commits a single round-robin's worth of a double round-robin scenario
+        (in practice: `preview_stale`, because the locked regeneration no
+        longer matches the reviewed `draft_fingerprint`).
+
+        Returns `(value, integrity_ok)`. `integrity_ok` is False when the
+        stored format is missing or disagrees with the format the persisted
+        PROPOSAL was generated under — two independently fingerprinted fields
+        that must agree, so a rewritten record cannot quietly change the size
+        of the schedule a reviewed scenario commits.
+        """
+        stored = scenario.request_input.get("meetings_per_opponent")
+        generated = scenario.proposal.get("meetings_per_opponent")
+        return stored, stored is not None and stored == generated
+
+    def _commit_schedule_scenario_attempt(self, scenario_id, actor_id=None,
+                                          user_id=None, role=None, scope=None):
+        """One lock-linearized, all-or-nothing stale-check + draft commit.
+
+        RE-AUTHORIZATION AT COMMIT TIME, INSIDE THE WRITE TRANSACTION. Reading
+        the scenario at generation is not authority to commit it later: the
+        operator may switch Program, Season or League in between, and the tuple
+        that decides is the one current when the Games land. So the check is
+        not a preflight — it runs after `get_schedule_scenario_for_update` has
+        ROW-LOCKED the scenario, on the post-lock snapshot, inside the SAME
+        `store.transaction()` that `_commit_draft_schedule_attempt` joins for
+        every Game INSERT, slot update, counter bump and audit row. A refusal
+        rolls the whole unit back, so a refused commit leaves zero trace; this
+        is exactly `setup_guarded_mutation`'s lock-then-decide-then-mutate
+        shape, and for the same reason (#372): a predicate that closes its own
+        transaction before the write was never one unit with it.
+
+        `ContextService._snapshot` asks for SERIALIZABLE and a nested join may
+        not raise the open transaction's isolation, so an identified caller
+        opens SERIALIZABLE here. `role is None` keeps the previous default
+        level byte-for-byte, and takes no context read at all.
+        """
+        with self.store.transaction(
+                isolation=None if role is None else "SERIALIZABLE"):
+            scenario = self.store.get_schedule_scenario_for_update(scenario_id)
+            # Locked first, then judged: a foreign scenario and a nonexistent
+            # one leave through the ONE raise site, so commit is no more of an
+            # existence oracle than get is.
+            if scenario is None or not self._scenario_in_active_tuple(
+                    scenario, user_id, role, scope):
+                raise self._scenario_not_found(scenario_id)
+
+            hierarchy = {
                 "program_id": scenario.program_id,
                 "season_id": scenario.season_id,
                 "league_id": scenario.league_id,
@@ -4988,6 +5194,10 @@ class ApiService:
             if (canonical_fingerprint(scenario.proposal)
                     != scenario.proposal_fingerprint):
                 integrity_fields.append("proposal")
+            replay_meetings, meetings_ok = self._scenario_replay_meetings(
+                scenario)
+            if not meetings_ok:
+                integrity_fields.append("meetings_per_opponent")
             if integrity_fields:
                 raise ValidationError(
                     "This schedule scenario failed its immutable-record "
@@ -5004,7 +5214,7 @@ class ApiService:
                 # a material writer either committed before these reads or is
                 # blocked until the all-or-nothing draft transaction finishes.
                 current_snapshot = material_input_snapshot(
-                    self.store, scope, scenario.request_input,
+                    self.store, hierarchy, scenario.request_input,
                     planner_version=SCENARIO_PLANNER_VERSION)
                 current_fingerprint = canonical_fingerprint(current_snapshot)
                 changed = changed_snapshot_sections(
@@ -5057,6 +5267,11 @@ class ApiService:
                 slot_ids=copy.deepcopy(request_input.get("slot_ids")),
                 constraints=copy.deepcopy(request_input.get("constraints")),
                 draft_fingerprint=scenario.proposal.get("draft_fingerprint"),
+                # #382 — replay the format this scenario was GENERATED under.
+                # The under-lock regeneration inside the commit gate takes this
+                # value; omitting it re-derives the historical single
+                # round-robin and refuses a reviewed N > 1 batch as stale.
+                meetings_per_opponent=replay_meetings,
                 actor_id=actor_id,
                 reviewed_proposal=scenario.proposal,
                 scenario_guard=_guard_material_inputs,
@@ -5073,13 +5288,19 @@ class ApiService:
             return {"scenario_id": scenario.id, **result}
 
     @catch
-    def commit_schedule_scenario(self, scenario_id: str,
-                                 actor_id=None) -> dict:
+    def commit_schedule_scenario(self, scenario_id: str, actor_id=None,
+                                 user_id=None, role=None, scope=None) -> dict:
         """Commit one stored scenario; retry only transaction-level races.
 
         Transient lock-plan races retry from a fresh transaction. A material
         input mutation that won before the scheduler locks is reported as
         ``schedule_scenario_stale`` with section-level guidance.
+
+        The principal triple is passed through unchanged on every retry, and
+        each attempt RE-RESOLVES the active tuple from its own fresh snapshot
+        (see `_commit_schedule_scenario_attempt`) — so a context switch that
+        wins a race against a retrying commit is observed by the next attempt
+        and refused, never carried over from the attempt that read it first.
         """
         transient = {
             "placement_raced", "serialization_failure",
@@ -5088,7 +5309,8 @@ class ApiService:
         for attempt in range(3):
             try:
                 return self._commit_schedule_scenario_attempt(
-                    scenario_id, actor_id=actor_id)
+                    scenario_id, actor_id=actor_id, user_id=user_id,
+                    role=role, scope=scope)
             except ConcurrencyConflictError as exc:
                 reason = (exc.details or {}).get("reason")
                 if reason not in transient or attempt == 2:

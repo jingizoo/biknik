@@ -1233,3 +1233,35 @@ transaction.
 This layer does not interpret or reshape unplaced explanations and does not add
 format knobs. Explanation fields/order/caps remain the generator's contract;
 configurable meetings and deterministic home/away remain #375's contract.
+
+### The format a scenario replays under (#382)
+
+A scenario is generated under one regular-season format and must **commit under
+that same one**. `meetings_per_opponent` is therefore persisted, not re-derived:
+
+- create passes the caller's requested value to the generator and then stores
+  **the generator's own resolved answer** (`proposal["meetings_per_opponent"]`)
+  in `request_input`, so an omitted format is recorded as the explicit `1` it
+  really ran under rather than left absent;
+- it is also part of the material snapshot's `planner_input`, because the same
+  registrations and the same ice produce a different fixture list under a
+  different N — the format is a material input, not a request detail;
+- commit passes that stored value into the draft-commit gate, where the
+  under-lock regeneration uses it. Omitting it re-derives the historical single
+  round-robin, whose `draft_fingerprint` no longer matches the reviewed one, so
+  a double round-robin would be refused as `preview_stale` instead of
+  committing its 2 × C(n,2) fixtures;
+- the stored format and the persisted proposal's format are covered by two
+  **independent** fingerprints, so their agreement is checked explicitly at
+  commit. A disagreement is `schedule_scenario_integrity_error` with
+  `fields: ["meetings_per_opponent"]` — a rewritten record cannot quietly
+  change the size of the schedule a reviewed scenario commits.
+
+### Authorization is not part of this layer's staleness contract
+
+Everything above is about whether the reviewed *world* still holds. Whether the
+caller may act on this scenario at all is a separate, earlier question, answered
+by the active-tuple rule in
+[active-context-scoping.md](active-context-scoping.md#named-schedule-scenarios-378--381)
+— including a re-authorization at commit time that runs under the scenario's
+row lock, inside this same transaction.

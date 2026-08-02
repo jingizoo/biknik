@@ -1692,16 +1692,41 @@ class Handler(BaseHTTPRequestHandler):
             if self._operator_only("/api/scheduler/commit"):
                 return
             return self._send_api(api.list_draft_games())
+        # Named schedule scenarios (#206/#378). MANAGE_SCHEDULE says the
+        # caller may operate SOME schedule; only the persisted active tuple
+        # says WHICH — so like /api/demo/overview and /api/standings these
+        # reads need a real session, not the identity-less X-Demo-Role /
+        # headerless demo fallbacks, and the facade re-resolves the tuple
+        # server-side (#381: a role-only gate handed Program A's scenarios to
+        # a Program-B-selected League Admin or Arena Manager, and BOTH those
+        # roles hold MANAGE_SCHEDULE).
         if path == "/api/scheduler/scenarios":
             if self._operator_only("/api/scheduler/commit"):
                 return
-            return self._send_api(api.list_schedule_scenarios())
+            role, scope, user_id, err = self._resolve_role()
+            if err is not None:
+                code, payload = err
+                return self._send_json(payload, code)
+            if user_id is None:
+                return self._send_json({"error": {
+                    "code": "unauthorized",
+                    "message": "A signed-in account is required."}}, 401)
+            return self._send_api(
+                api.list_schedule_scenarios(user_id, role, scope))
         scenario_get = re.match(r"^/api/scheduler/scenarios/([^/]+)$", path)
         if scenario_get:
             if self._operator_only("/api/scheduler/commit"):
                 return
-            return self._send_api(
-                api.get_schedule_scenario(scenario_get.group(1)))
+            role, scope, user_id, err = self._resolve_role()
+            if err is not None:
+                code, payload = err
+                return self._send_json(payload, code)
+            if user_id is None:
+                return self._send_json({"error": {
+                    "code": "unauthorized",
+                    "message": "A signed-in account is required."}}, 401)
+            return self._send_api(api.get_schedule_scenario(
+                scenario_get.group(1), user_id, role, scope))
         if path == "/api/auth/me":
             # Consistent with POST role resolution (#50): no cookie → signed out,
             # a valid cookie → the user, a present-but-invalid/expired cookie →
@@ -2535,22 +2560,33 @@ class Handler(BaseHTTPRequestHandler):
                 check_body(
                     body,
                     allowed={"name", "division_id", "season_id", "league_id",
-                             "slot_ids", "constraints"},
+                             "slot_ids", "constraints",
+                             "meetings_per_opponent"},
                     required=("name",),
                     types={"name": str,
                            "division_id": (str, type(None)),
                            "season_id": (str, type(None)),
                            "league_id": (str, type(None)),
                            "slot_ids": (list, type(None)),
-                           "constraints": (dict, type(None))})
+                           "constraints": (dict, type(None)),
+                           "meetings_per_opponent": (int, type(None))})
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
+            if user_id is None:
+                return self._send_json({"error": {
+                    "code": "unauthorized",
+                    "message": "A signed-in account is required."}}, 401)
+            # The body's scope ids say WHICH hierarchy to generate for; the
+            # session says whether this caller may. Both go to the facade, and
+            # only the second one is authority (#381).
             return self._send_api(api.create_schedule_scenario(
                 body.get("name"), division_id=body.get("division_id"),
                 season_id=body.get("season_id"),
                 league_id=body.get("league_id"),
                 slot_ids=body.get("slot_ids"),
-                constraints=body.get("constraints"), actor_id=user_id))
+                constraints=body.get("constraints"),
+                meetings_per_opponent=body.get("meetings_per_opponent"),
+                actor_id=user_id, user_id=user_id, role=role, scope=scope))
         scenario_commit = re.match(
             r"^/api/scheduler/scenarios/([^/]+)/commit$", path)
         if scenario_commit:
@@ -2558,8 +2594,13 @@ class Handler(BaseHTTPRequestHandler):
                 check_body(body, allowed=set())
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
+            if user_id is None:
+                return self._send_json({"error": {
+                    "code": "unauthorized",
+                    "message": "A signed-in account is required."}}, 401)
             return self._send_api(api.commit_schedule_scenario(
-                scenario_commit.group(1), actor_id=user_id))
+                scenario_commit.group(1), actor_id=user_id,
+                user_id=user_id, role=role, scope=scope))
         # Draft review + publish (#86): commit a proposal to draft games, then
         # publish or discard them. All operator-only (MANAGE_SCHEDULE gate).
         # Attribute draft commit/publish/discard to the signed-in user resolved

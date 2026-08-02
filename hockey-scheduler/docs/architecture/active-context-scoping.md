@@ -521,6 +521,98 @@ both APIs, and a table-completeness check so a relation dropped from
 assertion that previously required only that the probe creates come back with
 the name withheld.
 
+### Named schedule scenarios (#378 / #381)
+
+The same blocker, one surface later. The four scenario routes shipped gated on
+the `MANAGE_SCHEDULE` **capability** alone and on nothing else: `POST
+/api/scheduler/scenarios` took the Program/Season/League/Division ids straight
+from the request body, `GET /api/scheduler/scenarios` returned every stored
+scenario in the installation, and get/commit-by-id reached any of them.
+
+League Admin **and Arena Manager both hold `MANAGE_SCHEDULE`**, and both are
+`context_scope._GLOBAL_ROLES` — authorized for every Program. So an operator
+whose active tuple was Program B could create a Program A scenario, read A's
+name, creator, constraints, whole proposal and generation snapshot, and commit
+A's frozen Games into A. A cross-context disclosure and an IDOR write behind the
+same missing check. *One asserted capability fact is not the whole workflow
+capability* — the #369 rule, restated.
+
+The fix reuses the machinery already here rather than inventing a second one:
+
+| verb | bound how |
+| --- | --- |
+| create | the requested ids are resolved by `resolve_scenario_scope` into a real `(Program, Season, League)`, and **that** whole edge must equal the active tuple — checked before the planner runs, so no proposal is ever computed for a foreign hierarchy |
+| list | filtered on the STORED ROWS, strictly **before** any DTO is built |
+| get | one raise site shared with "does not exist" |
+| commit | **re-authorized at commit time**, under the scenario's row lock, inside the transaction that writes the Games |
+
+A scenario's `(program_id, season_id, league_id)` is judged by
+`_setup_target_edge_allows` **verbatim** — the same "edges, not unions"
+predicate #369 landed for setup targets. All three columns are NOT NULL, so:
+
+- a **Program-only** context fails closed against every scenario, exactly as
+  `get_standings` does — a scenario is Season-bound by construction and there is
+  nothing to compare a missing Season against;
+- an explicit **No League** stays the first-class "approved Program +
+  active-Season union" selection it is everywhere else, and the Season ceiling
+  above it does not relax;
+- the two near misses the owner named — same Program/different Season, and same
+  Season/different League — are both refused, which is exactly what a
+  Program-only ceiling would have waved through.
+
+**There is no creator clause.** `setup_target_accessible` rule 6 admits one only
+for a genuinely UNLINKED record, and a scenario can never be unlinked. Creator
+authority surviving hierarchy linking was ruled a blocker in its own right in
+#372 (`writable_setup_parent_ids` was too broad): it is an unrevokable back door
+no Program admin can see or remove. Once the chain exists, the chain is the sole
+authority.
+
+**Filtering the list before DTO construction is the contract, not an
+optimization.** Building DTOs and then dropping some would mean a foreign
+scenario's name, creator, constraints, whole proposal and generation snapshot
+had already been deep-copied into a response object once; the count, the shape
+and the timing of that work are a signal on their own, and it is one `return`
+away from being the payload.
+
+**Foreign and nonexistent are response-identical, in status AND bytes.** Get and
+commit share ONE raise site, so `404 not_found` /
+`{"reason": "schedule_scenario_missing", "scenario_id": <the caller's own
+input>}` is all either produces; mask that one echo and the payloads are equal.
+Create's refusal reuses the wording `resolve_scenario_scope` already emits for
+the same request SHAPE — `division_missing` for the Division form,
+`league_season_missing` for the Season+League form — so a foreign hierarchy is
+indistinguishable from a guessed one. A 404-vs-403 split here would itself be
+the disclosure: it turns a sequential id space into an existence oracle.
+
+**Commit re-authorizes; it does not trust the create.** Reading a scenario at
+generation is not authority to commit it minutes later — the operator may switch
+Program, Season or League in between, and the tuple that decides is the one
+current when the Games land. So the check is not a preflight. It runs after
+`get_schedule_scenario_for_update` has row-locked the scenario, on the post-lock
+snapshot, inside the SAME `store.transaction()` the draft-commit gate joins for
+every Game INSERT, slot allocation, counter bump and audit row — the
+lock-then-decide-then-mutate shape `setup_guarded_mutation` established, for the
+reason #372 gives: a predicate that closes its own transaction before the write
+was never one unit with it. An identified caller opens that transaction
+`SERIALIZABLE`, because `ContextService._snapshot` asks for it and a nested join
+may not RAISE the open transaction's isolation.
+
+`role is None` — internal call sites, the demo/full seeds, the acceptance
+harnesses — is ungated and completely untouched, matching
+`setup_target_accessible` rule 1.
+
+Regression: `backend/tests/test_schedule_scenario_scope.py`, across
+Memory/SQLite/PostgreSQL at the service boundary and over authenticated HTTP.
+Two Programs, with Program A carrying both near-miss corners, each corner
+independently schedulable so a refusal can never be confused with an empty one.
+Every negative is measured against the clause-5 control — the same actor, in the
+scenario's exact tuple, still creating, reading, listing and committing — and
+the HTTP matrix asserts the control again on the far side of the refusal, so
+switching back restores exactly the authority switching away removed.
+
+Mutation-proven, one falsifying mutation per independent clause; see the PR
+description for the verbatim failures.
+
 ## The grant-only facility contract (venue sharing)
 
 The ceiling governs the **competition** tree — Seasons, Leagues, Divisions,
@@ -700,6 +792,11 @@ real, reproducible mixed-grid defect, not a theoretical one — it is what
   the Setup Season ceiling driven by the persisted context, the creator-owned
   pending-link list keyed on the session's own account id, and the
   Program-only standings read.
+- `tests/test_schedule_scenario_scope.py` — the named-scenario create / list /
+  get / commit boundary (#381) across Memory / SQLite / PostgreSQL and over
+  authenticated HTTP, with the two-Program matrix, both near-miss corners, the
+  foreign-vs-nonexistent byte comparison, the switch-between-create-and-commit
+  case, and the positive control every negative is measured against.
 - `e2e/league-filtered-data.js`, `setup-v2-context-scope.js`,
   `dashboard-season-ceiling.js` — the browser layer at desktop and 390×844,
   including two delayed-response races proving the newest tuple always wins

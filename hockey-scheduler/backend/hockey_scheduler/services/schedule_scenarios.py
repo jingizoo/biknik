@@ -224,6 +224,13 @@ def material_input_snapshot(store, scope: dict, request_input: dict,
             "slot_ids": _plain(requested_slot_ids),
             # Includes the current constraint/blackout contract opaquely.
             "constraints": _plain(request_input.get("constraints")),
+            # #382 — the regular-season format (meetings per opponent) is a
+            # material planner input: the same registrations and ice produce a
+            # different fixture list under a different N.  Recorded here so the
+            # evidence names the format, and so a stored scenario replays under
+            # the N it was generated with rather than the historical default.
+            "meetings_per_opponent": request_input.get(
+                "meetings_per_opponent"),
         },
         "registrations": {
             "rows": _plain(registrations),

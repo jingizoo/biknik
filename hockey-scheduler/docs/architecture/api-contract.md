@@ -108,8 +108,11 @@ The facade supports the three required screen states:
 
 ## Named schedule scenarios (#378)
 
-All routes require server-side `MANAGE_SCHEDULE`; audit actors come from the
-authenticated session, never a request field.
+All four routes require a **signed-in session** plus server-side
+`MANAGE_SCHEDULE`, **and** are bound to that session's persisted active
+Program/Season/League tuple — see
+[active-context-scoping.md](active-context-scoping.md#named-schedule-scenarios-378--381).
+Audit actors come from the authenticated session, never a request field.
 
 ```http
 POST /api/scheduler/scenarios
@@ -127,16 +130,31 @@ Create accepts a strict body:
   "league_id": "league_1",
   "division_id": "division_1",
   "slot_ids": ["slot_1"],
-  "constraints": {}
+  "constraints": {},
+  "meetings_per_opponent": 2
 }
 ```
 
 Alternatively, the existing Division-only scope may omit `season_id` and
-`league_id`. The response includes immutable `name`, `scope`, `planner`
-fingerprints/version, `request_input`, the opaque `proposal`, and the full
-`generation_snapshot`. Commit takes an empty body. It creates unpublished draft
-Games only when the current material-input fingerprint still matches; otherwise
-it returns `409 concurrency_conflict` with
+`league_id`. `meetings_per_opponent` (#375) is the regular-season format; the
+scenario records the value the generator actually applied (an omitted format is
+stored as `1`, not left absent) and **replays that same N at commit**.
+
+The response includes immutable `name`, `scope`, `planner`
+fingerprints/version, `request_input` (carrying `meetings_per_opponent`), the
+opaque `proposal`, and the full `generation_snapshot`. Commit takes an empty
+body. It creates unpublished draft Games only when the current material-input
+fingerprint still matches; otherwise it returns `409 concurrency_conflict` with
 `details.reason = "schedule_scenario_stale"`, section-level `changed_inputs`,
 and `required_action = "generate_new_scenario"`. Publishing remains
 `POST /api/scheduler/drafts/publish`.
+
+Scope refusals are deliberately **non-oracular**:
+
+| request | answer |
+| --- | --- |
+| inside the active exact tuple | the normal response |
+| a scenario id outside it (get / commit) | `404 not_found`, `schedule_scenario_missing` — byte-identical to a scenario id that never existed once the echoed `scenario_id` is masked |
+| create naming a Division outside it | `404 not_found`, `division_missing` — the same body a nonexistent `division_id` produces |
+| create naming a Season+League outside it | `404 not_found`, `league_season_missing` — the same body an unlinked/nonexistent pair produces |
+| list | `200` containing **only** the active exact tuple's scenarios |

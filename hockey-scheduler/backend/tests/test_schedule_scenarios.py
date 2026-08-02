@@ -328,7 +328,84 @@ class _ScenarioContract:
         }
         self.assertEqual(len(pairings), 6)
         self.assertEqual(len(scenario["proposal"]["draft_games"]), 6)
-        self.assertNotIn("meetings_per_opponent", scenario["request_input"])
+        # #382 — an OMITTED format is recorded as the explicit 1 the generator
+        # actually applied, never left absent for the commit to re-derive.
+        self.assertEqual(scenario["request_input"]["meetings_per_opponent"], 1)
+        self.assertEqual(
+            scenario["generation_snapshot"]["planner_input"][
+                "meetings_per_opponent"], 1)
+
+    def test_explicit_meetings_format_is_persisted_and_replayed(self):
+        """#382 — the N a scenario was generated under is stored and replayed.
+
+        Four teams at N = 2 is 12 fixtures, twice the 6 a single round-robin
+        produces, so the count alone falsifies a commit that quietly replayed
+        the historical default: the under-lock regeneration inside the commit
+        gate would then disagree with the reviewed ``draft_fingerprint`` and
+        refuse the batch as ``preview_stale`` rather than create 12 Games.
+        """
+        # 4 teams × 2 meetings = 12 fixtures, and `_seed` lays down only 8
+        # slots — without more ice the batch would be capped by placement and
+        # the 12-vs-6 contrast under test would never appear.
+        for index in range(8, 20):
+            self.store.add_ice_slot(IceSlot(
+                id=f"slot_{index}", rink_id="rink",
+                start_time=BASE + timedelta(days=index),
+                end_time=BASE + timedelta(days=index, hours=1)))
+        single = self._scenario("Single")
+        self.assertEqual(len(single["proposal"]["draft_games"]), 6)
+
+        double = self._scenario("Double", meetings_per_opponent=2)
+        self.assertEqual(double["request_input"]["meetings_per_opponent"], 2)
+        self.assertEqual(double["proposal"]["meetings_per_opponent"], 2)
+        self.assertEqual(
+            double["generation_snapshot"]["planner_input"][
+                "meetings_per_opponent"], 2)
+        self.assertEqual(len(double["proposal"]["draft_games"]), 12)
+        # Re-read from the store, not the create response: the value must have
+        # survived persistence, which is what the commit below relies on.
+        stored = self.api.get_schedule_scenario(double["scenario_id"])
+        self.assertEqual(stored["request_input"]["meetings_per_opponent"], 2)
+
+        result = self.api.commit_schedule_scenario(
+            double["scenario_id"], actor_id="operator")
+        self.assertNotIn("error", result, result)
+        self.assertEqual(len(result["created"]), 12)
+        self.assertEqual(len(self.store.all_games()), 12)
+
+    def test_stored_replay_format_must_match_the_generated_proposal(self):
+        """A rewritten format is an integrity failure, not a silent resize.
+
+        ``request_input`` and ``proposal`` are covered by two INDEPENDENT
+        fingerprints, so neither alone proves the replay N is the generation N.
+        Committing a record whose two halves disagree would commit a different
+        format from the one the operator reviewed.
+        """
+        scenario = self._scenario("Tampered", meetings_per_opponent=2)
+        original = self.store.get_schedule_scenario_for_update
+
+        def tampered(scenario_id):
+            row = original(scenario_id)
+            if row is not None:
+                # ONLY the replay format moves. `input_fingerprint` covers the
+                # generation_snapshot and `proposal_fingerprint` the proposal,
+                # so both existing integrity checks still PASS here — this
+                # isolates the cross-field agreement and nothing else.
+                row.request_input["meetings_per_opponent"] = 1
+            return row
+
+        self.store.get_schedule_scenario_for_update = tampered
+        try:
+            result = self.api.commit_schedule_scenario(
+                scenario["scenario_id"], actor_id="operator")
+        finally:
+            self.store.get_schedule_scenario_for_update = original
+        self.assertEqual(
+            result["error"]["details"]["reason"],
+            "schedule_scenario_integrity_error", result)
+        self.assertIn("meetings_per_opponent",
+                      result["error"]["details"]["fields"])
+        self.assertEqual(self.store.all_games(), [])
 
     def test_base_facade_uses_the_same_stored_proposal_commit_contract(self):
         base = BaseApiService(self.store)
@@ -430,14 +507,21 @@ class ScheduleScenarioHttpTest(unittest.TestCase):
             target=cls.httpd.serve_forever, daemon=True)
         cls.thread.start()
         # This module's own four-team fixture, planted alongside the demo seed,
-        # rather than the seed's first Division: the seed carries a SIX-game
-        # series between one pair of teams, and #375's meeting-count contract
-        # refuses any commit whose already-scheduled pairing holds MORE Games
-        # than the format asks for — so a commit there answers `preview_stale`
-        # for a reason that has nothing to do with scenarios. `_seed` uses
-        # literal ids ("program"/"season"/…) that cannot collide with the
-        # demo seed's generated `program_1`-style ids.
+        # rather than the seed's first Division. Two reasons, both load-bearing:
+        #  * the route now resolves the caller's ACTIVE tuple (#381), and this
+        #    test SELECTS this hierarchy explicitly instead of depending on
+        #    whichever Program the context fallback happens to land on;
+        #  * the demo seed carries a SIX-game series between one pair of teams,
+        #    and #375's meeting-count contract refuses any commit whose
+        #    already-scheduled pairing holds MORE Games than the format asks
+        #    for — so a commit there answers `preview_stale` for a reason that
+        #    has nothing to do with scenarios.
+        # `_seed` uses literal ids ("program"/"season"/…) that cannot collide
+        # with the demo seed's generated `program_1`-style ids.
         _seed(srv.STATE.api.store)
+        cls.program_id = "program"
+        cls.season_id = "season"
+        cls.league_id = "league"
         cls.division_id = "division"
 
     @classmethod
@@ -481,6 +565,13 @@ class ScheduleScenarioHttpTest(unittest.TestCase):
         client = self._client()
         self._request(client, "POST", "/api/auth/login",
                       {"username": "admin", "password": "demo"})
+        # #381 -- the route is bound to the caller's persisted active tuple,
+        # so this roundtrip selects the hierarchy it is about to work in
+        # rather than relying on the context fallback.
+        status, ctx = self._request(client, "POST", "/api/context", {
+            "program_id": self.program_id, "season_id": self.season_id,
+            "league_id": self.league_id})
+        self.assertEqual(status, 200, ctx)
         status, error = self._request(
             client, "POST", "/api/scheduler/scenarios",
             {"name": "Bad", "division_id": self.division_id,
