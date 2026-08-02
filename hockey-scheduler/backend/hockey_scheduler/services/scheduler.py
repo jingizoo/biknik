@@ -52,6 +52,10 @@ from .league_scope import (
     registered_team_ids_in_division,
     registered_teams_by_division_in_league,
 )
+from .schedule_explanations import (
+    ExplanationBudget,
+    build_unplaced_explanation,
+)
 from .setup_service import SetupService as _PolicySetup
 
 
@@ -301,12 +305,103 @@ SLOT_OVERLAP_CONFLICT = "slot_overlap_conflict"
 # TEAM_OVERLAP only ever appears where the generator previously reported
 # nothing at all, which is precisely the impossible-schedule bug it closes.
 TEAM_OVERLAP = "team_overlap"
+# Explanation-only fact: the slot was valid inventory at the beginning of the
+# preview, but an earlier pairing in this same deterministic proposal selected
+# it. It is not added to legacy ``reason_codes`` (whose semantics stay intact).
+ICE_ALREADY_SELECTED = "ice_already_selected"
+
+
+def _slot_constraint_rejections(slot, home, away, con, team_slots):
+    """All request-constraint rejections for one candidate, in stable priority.
+
+    The order mirrors :func:`_slot_reason`, whose independent established path
+    still short-circuits at its FIRST cause.  This complete-list evaluator runs
+    only inside the bounded observer after a pairing is already known to be
+    unplaced, so simultaneous hard causes are visible without changing which
+    fixture wins a slot or adding work to successful placement (#379).
+    """
+    day = slot.start_time.date().isoformat()
+    rejected = []
+    if day in con["season_blackout_dates"]:
+        rejected.append({
+            "code": SEASON_BLACKOUT,
+            "message": "season blackout date",
+            "details": {"date": day},
+        })
+    if day in con["holiday_dates"]:
+        rejected.append({
+            "code": HOLIDAY,
+            "message": "holiday",
+            "details": {"date": day},
+        })
+    blackout_teams = sorted(
+        tid for tid in (home, away)
+        if day in con["team_blackouts"].get(tid, ()))
+    if blackout_teams:
+        rejected.append({
+            "code": TEAM_BLACKOUT,
+            "message": "team blackout date",
+            "details": {"date": day, "team_ids": blackout_teams},
+        })
+    if day in con["rink_blackouts"].get(slot.rink_id, ()):
+        rejected.append({
+            "code": RINK_BLACKOUT,
+            "message": "rink blackout date",
+            "details": {"date": day, "rink_id": slot.rink_id},
+        })
+    if con["max_per_day"] > 0:
+        maxed_teams = []
+        for tid in (home, away):
+            same_day = sum(1 for t in team_slots.get(tid, [])
+                           if t.date() == slot.start_time.date())
+            if same_day >= con["max_per_day"]:
+                maxed_teams.append(tid)
+        if maxed_teams:
+            rejected.append({
+                "code": MAX_PER_DAY,
+                "message": "max games per team per day reached",
+                "details": {
+                    "date": day,
+                    "team_ids": sorted(set(maxed_teams)),
+                    "limit": con["max_per_day"],
+                },
+            })
+    if con["min_rest_hours"] > 0:
+        rest = timedelta(hours=con["min_rest_hours"])
+        conflicts = []
+        hit_teams = set()
+        for tid in (home, away):
+            for start in team_slots.get(tid, []):
+                if abs(slot.start_time - start) < rest:
+                    hit_teams.add(tid)
+                    conflicts.append({
+                        "team_id": tid,
+                        "start_time": start.isoformat(),
+                    })
+        if conflicts:
+            # Two teams plus their nearest few proposal starts are enough to
+            # remediate this candidate; keep nested evidence bounded too.
+            conflicts.sort(key=_canonical_sort_key)
+            kept = conflicts[:4]
+            rejected.append({
+                "code": MIN_REST,
+                "message": "minimum rest between games not met",
+                "details": {
+                    "team_ids": sorted(hit_teams),
+                    "min_rest_hours": con["min_rest_hours"],
+                    "conflicts": kept,
+                    "omitted_conflict_count": len(conflicts) - len(kept),
+                },
+            })
+    return rejected
 
 
 def _slot_reason(slot, home, away, con, team_slots):
     """Why ``slot`` can't host ``home`` vs ``away`` under the constraints, as
     ``(code, message)``, or ``(None, None)`` if it can. ``team_slots`` maps
     team_id -> [assigned start_time]."""
+    # Keep the established decision path short-circuiting at the first cause.
+    # The all-causes helper above is explanation-only and globally capped.
     day = slot.start_time.date().isoformat()
     if day in con["season_blackout_dates"]:
         return SEASON_BLACKOUT, "season blackout date"
@@ -326,8 +421,8 @@ def _slot_reason(slot, home, away, con, team_slots):
     if con["min_rest_hours"] > 0:
         rest = timedelta(hours=con["min_rest_hours"])
         for tid in (home, away):
-            for t in team_slots.get(tid, []):
-                if abs(slot.start_time - t) < rest:
+            for start in team_slots.get(tid, []):
+                if abs(slot.start_time - start) < rest:
                     return MIN_REST, "minimum rest between games not met"
     return None, None
 
@@ -356,6 +451,11 @@ def _active_game_slot_pairs(store):
         s = store.get_ice_slot(g.ice_slot_id)
         if s is not None:
             pairs.append((g, s))
+    # Store iteration order is not a contract (especially on PostgreSQL).  The
+    # policy/team observers may stop at the first conflicting Game, so sort the
+    # shared snapshot before either can select evidence from it (#379).
+    pairs.sort(key=lambda pair: (
+        pair[1].start_time, pair[1].end_time, pair[1].id, pair[0].id))
     return pairs
 
 
@@ -443,13 +543,15 @@ def _policy_advisor(store, season_id, pairs=None):
     if pairs is None:
         pairs = _active_game_slot_pairs(store)
 
-    def check(slot, tentative_spans):
+    def check(slot, tentative_spans, include_details=False):
         violation = setup._slot_policy_violation(
             slot, season_id, extra_rink_spans=tentative_spans,
             rink_games=pairs)
         if violation is None:
-            return None, None
+            return (None, None, {}) if include_details else (None, None)
         message, details = violation
+        if include_details:
+            return details["reason"], message, dict(details)
         return details["reason"], message
 
     return check
@@ -464,8 +566,68 @@ def _resolve_division_season_id(store, division_id):
     return ls.season_id if ls is not None else None
 
 
+def _candidate_explanation_record(store, slot, home, away, *, used, con,
+                                  team_slots, policy_check, rink_spans,
+                                  occupancy):
+    """Evaluate one bounded explanation candidate without changing decisions.
+
+    The placement loop has already failed the pairing before this runs.  This
+    observer therefore reads the exact same current tentative state but never
+    mutates ``used``/``team_slots``/``rink_spans``/``occupancy``.  It may report
+    several simultaneous hard causes even though the legacy scheduler retains
+    its established first-cause short circuit.
+    """
+    rink = store.get_rink(slot.rink_id) if slot.rink_id else None
+    raw = {
+        "ice_slot_id": slot.id,
+        "rink_id": slot.rink_id,
+        "venue_id": rink.venue_id if rink is not None else None,
+        "start_time": slot.start_time.isoformat(),
+        "end_time": slot.end_time.isoformat(),
+        "rejections": [],
+    }
+    if slot.id in used:
+        raw["rejections"].append({
+            "code": ICE_ALREADY_SELECTED,
+            "details": {},
+        })
+        return raw
+
+    raw["rejections"].extend({
+        "code": item["code"],
+        "details": item.get("details") or {},
+    } for item in _slot_constraint_rejections(
+        slot, home, away, con, team_slots))
+
+    if policy_check is not None:
+        policy_code, _policy_message, policy_details = policy_check(
+            slot, rink_spans.get(slot.rink_id, ()), include_details=True)
+        if policy_code is not None:
+            policy_details["rink_id"] = slot.rink_id
+            raw["rejections"].append({
+                "code": policy_code,
+                "details": policy_details,
+            })
+
+    overlap_code, _overlap_message, conflicts = _team_overlap_reason(
+        store, slot, home, away, occupancy)
+    if overlap_code is not None:
+        raw["rejections"].append({
+            "code": overlap_code,
+            "details": {
+                "team_ids": sorted({c["team_id"] for c in conflicts}),
+                "conflicts": [{
+                    "team_id": c["team_id"],
+                    "conflict_source": c["conflict_source"],
+                    "conflict_game_id": c["conflict_game_id"],
+                } for c in conflicts],
+            },
+        })
+    return raw
+
+
 def _assign_ice(store, pairings, slots, constraints, policy_check=None,
-                team_spans=None):
+                team_spans=None, *, explain=True, explanation_context=None):
     """Greedy earliest-slot-first assignment shared by every entry point.
 
     ``pairings`` is ``[(home_team_id, away_team_id, division_id_or_None), ...]``
@@ -483,6 +645,8 @@ def _assign_ice(store, pairings, slots, constraints, policy_check=None,
     """
     con = _normalize_constraints(constraints)
     draft_games, unscheduled = [], []
+    explanation_budget = ExplanationBudget() if explain else None
+    explanation_context = dict(explanation_context or {})
     used = set()
     team_slots = {}  # team_id -> [assigned start_time]
     rink_spans = {}  # rink_id -> [(slot_id, start, end)] picked this run (#277)
@@ -539,7 +703,7 @@ def _assign_ice(store, pairings, slots, constraints, policy_check=None,
                 reason = "No slot satisfies constraints: " + \
                     ", ".join(sorted(set(messages))) + "."
                 reason_codes = sorted(set(codes))
-            unscheduled.append({
+            row = {
                 "home_team_id": home, "away_team_id": away,
                 "home_team_name": _team_name(store, home),
                 "away_team_name": _team_name(store, away),
@@ -553,7 +717,25 @@ def _assign_ice(store, pairings, slots, constraints, policy_check=None,
                 # blackouts/rest/policy, so it is a positive signal rather
                 # than a field that is always present and usually noise.
                 "team_conflicts": _dedupe_team_conflicts(team_conflicts),
-            })
+            }
+            if explanation_budget is not None:
+                allowance, preview_limited = explanation_budget.reserve(len(slots))
+                raw_candidates = [
+                    _candidate_explanation_record(
+                        store, candidate, home, away, used=used, con=con,
+                        team_slots=team_slots, policy_check=policy_check,
+                        rink_spans=rink_spans, occupancy=occupancy)
+                    for candidate in slots[:allowance]
+                ]
+                row["explanation"] = build_unplaced_explanation(
+                    pairing=row,
+                    scope=explanation_context,
+                    legacy_reason_codes=reason_codes,
+                    raw_candidates=raw_candidates,
+                    candidate_total=len(slots),
+                    preview_budget_limited=preview_limited,
+                )
+            unscheduled.append(row)
     return draft_games, unscheduled
 
 
@@ -1005,6 +1187,7 @@ def draft_schedule(store, division_id, slot_ids=None, constraints=None,
     # not division_id alone (see _existing_pairing_games).
     division = store.get_division(division_id) if division_id else None
     ls_id = division.league_season_id if division else None
+    league_season = store.get_league_season(ls_id) if ls_id else None
     scope = {(ls_id, division_id)}
     pairings, already_scheduled = _split_already_scheduled(
         store, all_pairings, _existing_pairing_games(store, scope), ls_id)
@@ -1014,7 +1197,12 @@ def draft_schedule(store, division_id, slot_ids=None, constraints=None,
         store, pairings, slots, constraints,
         policy_check=_policy_advisor(
             store, _resolve_division_season_id(store, division_id), active),
-        team_spans=_persisted_team_spans(active))
+        team_spans=_persisted_team_spans(active),
+        explanation_context={
+            "season_id": league_season.season_id if league_season else None,
+            "league_id": league_season.league_id if league_season else None,
+            "division_id": division_id,
+        })
     unschedulable_teams = _unschedulable_teams(
         store, teams, pairings, unscheduled)
     return {
@@ -1073,7 +1261,12 @@ def draft_schedule_for_league(store, season_id, league_id, division_id=None,
     draft_games, unscheduled = _assign_ice(
         store, pairings, slots, constraints,
         policy_check=_policy_advisor(store, season_id, active),
-        team_spans=_persisted_team_spans(active))
+        team_spans=_persisted_team_spans(active),
+        explanation_context={
+            "season_id": season_id,
+            "league_id": league_id,
+            "division_id": division_id,
+        })
     unschedulable_teams = _unschedulable_teams(
         store, all_teams, pairings, unscheduled)
     return {
