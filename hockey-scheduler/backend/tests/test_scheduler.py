@@ -45,7 +45,10 @@ from hockey_scheduler.services import (
     draft_schedule_for_league,
     round_robin_pairings,
 )
-from hockey_scheduler.services.scheduler import _draft_fingerprint
+from hockey_scheduler.services.scheduler import (
+    MAX_MEETINGS_PER_OPPONENT,
+    _draft_fingerprint,
+)
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.api.service import ApiService as BaseApiService
 from hockey_scheduler.web import server as srv
@@ -112,6 +115,26 @@ class DraftFingerprintTest(unittest.TestCase):
         b = self._base_args()
         b["team_ids"] = a["team_ids"] + ["t4"]
         self.assertNotEqual(_draft_fingerprint(**a), _draft_fingerprint(**b))
+
+    def test_changed_meetings_per_opponent_changes_fingerprint(self):
+        # #375 -- the requested FORMAT is bound directly, so this holds even
+        # with every row list held byte-for-byte identical. Asserted against
+        # the pure function precisely because organically producing two
+        # different N with identical buckets is not reproducible: the point
+        # is that the guarantee does not depend on the buckets differing.
+        a = self._base_args()
+        b = self._base_args()
+        b["meetings_per_opponent"] = 3
+        self.assertNotEqual(_draft_fingerprint(**a), _draft_fingerprint(**b))
+
+    def test_default_meetings_per_opponent_matches_explicit_one(self):
+        # Anti-vacuity partner of the test above: the new payload field must
+        # not make an omitted format hash differently from an explicit
+        # single round-robin, or every pre-#375 caller would look "changed".
+        a = self._base_args()
+        b = self._base_args()
+        b["meetings_per_opponent"] = 1
+        self.assertEqual(_draft_fingerprint(**a), _draft_fingerprint(**b))
 
     def test_changed_unscheduled_reason_codes_changes_fingerprint(self):
         a = self._base_args()
@@ -2146,6 +2169,300 @@ class SchedulerContract:
             self):
         self._already_scheduled_cancelled_after_regen_refused(BaseApiService)
 
+    # -- configurable regular-season format (#375) -------------------------
+    # Every test below runs against BOTH backends via MemorySchedulerTest and
+    # DurableSchedulerTest (SQLite by default, PostgreSQL when
+    # TEST_DATABASE_URL is set) — the counting genuinely crosses that
+    # boundary, because `store.all_games()` is insertion-ordered in memory
+    # and `ORDER BY id` in SQL.
+
+    def _meeting_counts(self, res):
+        """``{frozenset(pair): count}`` over a proposal's PLACED rows —
+        what the format actually asked the ice to host."""
+        counts = {}
+        for d in res["draft_games"]:
+            key = frozenset((d["home_team_id"], d["away_team_id"]))
+            counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    def _orientations(self, res):
+        """The ordered ``(home, away)`` sequence a proposal placed — the
+        home/away SPLIT itself, not just how many games each pair got."""
+        return [(d["home_team_id"], d["away_team_id"])
+                for d in res["draft_games"]]
+
+    def test_one_meeting_per_opponent_is_the_historical_single_round_robin(self):
+        # Anti-vacuity control for every N > 1 assertion below: the default
+        # and an explicit 1 must both still be the single round-robin, so a
+        # later "N meetings" assertion is proving the format changed rather
+        # than reporting a number the generator produces regardless.
+        self._division_fixture(4, 6)
+        default = draft_schedule(self.store, "div1")
+        explicit = draft_schedule(self.store, "div1", meetings_per_opponent=1)
+        self.assertEqual(default, explicit)
+        self.assertEqual(len(default["draft_games"]), 6)  # C(4,2)
+        self.assertEqual(set(self._meeting_counts(default).values()), {1})
+
+    def test_two_meetings_per_opponent_schedules_each_pair_twice(self):
+        self._division_fixture(4, 12)  # C(4,2) x 2 = 12
+        res = draft_schedule(self.store, "div1", meetings_per_opponent=2)
+        self.assertEqual(res["unscheduled"], [])
+        self.assertEqual(len(res["draft_games"]), 12)
+        counts = self._meeting_counts(res)
+        self.assertEqual(len(counts), 6)  # still exactly the 6 distinct pairs
+        self.assertEqual(set(counts.values()), {2})
+
+    def test_three_meetings_per_opponent_schedules_each_pair_three_times(self):
+        self._division_fixture(4, 18)  # C(4,2) x 3 = 18
+        res = draft_schedule(self.store, "div1", meetings_per_opponent=3)
+        self.assertEqual(res["unscheduled"], [])
+        self.assertEqual(len(res["draft_games"]), 18)
+        counts = self._meeting_counts(res)
+        self.assertEqual(len(counts), 6)
+        self.assertEqual(set(counts.values()), {3})
+
+    def test_six_teams_three_meetings_is_fifteen_games_per_team(self):
+        # The issue's own worked example, asserted the way the issue states
+        # it: not "45 rows exist" but "every team plays 15 games".
+        self._division_fixture(6, 45)  # C(6,2) x 3 = 45
+        res = draft_schedule(self.store, "div1", meetings_per_opponent=3)
+        self.assertEqual(res["unscheduled"], [])
+        self.assertEqual(len(res["draft_games"]), 45)
+        per_team = {}
+        for d in res["draft_games"]:
+            for tid in (d["home_team_id"], d["away_team_id"]):
+                per_team[tid] = per_team.get(tid, 0) + 1
+        self.assertEqual(len(per_team), 6)
+        self.assertEqual(set(per_team.values()), {15})
+        self.assertEqual(set(self._meeting_counts(res).values()), {3})
+
+    def test_home_away_split_is_balanced_within_one_game_per_pair(self):
+        # "Balanced deterministically" has a balance half as well as a
+        # determinism half. Odd N cannot split evenly, so the guarantee is
+        # "within one game" -- and at even N it must be exactly even.
+        self._division_fixture(4, 24)
+        for meetings, allowed in ((2, {(1, 1)}), (3, {(2, 1), (1, 2)})):
+            res = draft_schedule(self.store, "div1",
+                                 meetings_per_opponent=meetings)
+            oriented = {}
+            for h, a in self._orientations(res):
+                oriented[(h, a)] = oriented.get((h, a), 0) + 1
+            seen = set()
+            for (h, a) in list(oriented):
+                if (a, h) in seen or (h, a) in seen:
+                    continue
+                seen.add((h, a))
+                split = (oriented.get((h, a), 0), oriented.get((a, h), 0))
+                self.assertIn(split, allowed,
+                              f"meetings={meetings} pair={h}/{a} split={split}")
+
+    def test_home_away_split_is_reproducible_from_the_same_inputs(self):
+        # Determinism against repetition in ONE process/store.
+        self._division_fixture(4, 18)
+        first = draft_schedule(self.store, "div1", meetings_per_opponent=3)
+        second = draft_schedule(self.store, "div1", meetings_per_opponent=3)
+        self.assertEqual(self._orientations(first), self._orientations(second))
+        self.assertEqual(first, second)
+
+    def test_home_away_split_does_not_depend_on_registration_order(self):
+        # The stronger determinism claim, and the one a hidden `random` /
+        # set-iteration dependency would actually break: an INDEPENDENT
+        # store, built with the teams registered in the reverse order, must
+        # produce the byte-identical home/away split. Two separate stores
+        # also means two separate id-counter sequences and two separate
+        # dict insertion orders.
+        self._division_fixture(4, 18)
+        forward = draft_schedule(self.store, "div1", meetings_per_opponent=3)
+
+        other = self.__class__()
+        other.store = self.make_store()
+        try:
+            other._base()
+            other.store.add_league(League(
+                id="lg1", program_id="prog1", name="League"))
+            other.store.add_league_season(LeagueSeason(
+                id="ls_lg1_se1", league_id="lg1", season_id="se1"))
+            other.store.add_division(Division(
+                id="div1", league_season_id="ls_lg1_se1", name="D1"))
+            for i in reversed(range(4)):  # reverse registration order
+                other.store.add_team(Team(id=f"t{i}", name=f"Team {i}",
+                                          program_id="prog1", league_id="lg1"))
+                other.store.add_season_team_registration(
+                    SeasonTeamRegistration(
+                        id=f"streg_t{i}", league_season_id="ls_lg1_se1",
+                        team_id=f"t{i}", division_id="div1", active=True))
+            other._slots(18)
+            reversed_build = draft_schedule(
+                other.store, "div1", meetings_per_opponent=3)
+        finally:
+            conn = getattr(other.store, "conn", None)
+            if conn is not None:
+                conn.close()
+
+        self.assertEqual(self._orientations(forward),
+                         self._orientations(reversed_build))
+        self.assertEqual(forward["draft_fingerprint"],
+                         reversed_build["draft_fingerprint"])
+
+    def _seed_first_pairing_game(self, **game_kwargs):
+        """Plant ONE Game for the first round-robin pairing of the 4-team
+        fixture, tagged into the fixture's own LeagueSeason/Division so the
+        scope filter cannot reject it before the counting rule under test is
+        ever evaluated (the vacuity trap #328's review already caught here)."""
+        home, away = round_robin_pairings(["t0", "t1", "t2", "t3"])[0]
+        self.store.add_game(Game(
+            id=game_kwargs.pop("id", "seeded1"),
+            home_team_id=home, away_team_id=away,
+            start_time=BASE_TIME - timedelta(days=100),
+            end_time=BASE_TIME - timedelta(days=100) + timedelta(hours=1),
+            division_id="div1", season_id="se1", league_id="lg1",
+            league_season_id="ls_lg1_se1", **game_kwargs))
+        return frozenset((home, away))
+
+    def test_played_regular_game_satisfies_one_of_three_meetings(self):
+        # The POSITIVE control the two negatives below are measured against.
+        # Without it, "a cancelled game leaves 3 outstanding" proves nothing:
+        # 3 is also what a scheduler that ignored existing games entirely
+        # would report.
+        self._division_fixture(4, 18)
+        pair = self._seed_first_pairing_game()
+        res = draft_schedule(self.store, "div1", meetings_per_opponent=3)
+        self.assertEqual(self._meeting_counts(res)[pair], 2)
+        self.assertEqual(len(res["already_scheduled"]), 1)
+        self.assertEqual(res["already_scheduled"][0]["existing_game_id"],
+                         "seeded1")
+
+    def test_cancelled_game_does_not_satisfy_a_meeting(self):
+        self._division_fixture(4, 18)
+        pair = self._seed_first_pairing_game(cancelled=True)
+        res = draft_schedule(self.store, "div1", meetings_per_opponent=3)
+        # All three meetings still outstanding -- contrast the control
+        # above, where an identical but NON-cancelled game left two.
+        self.assertEqual(self._meeting_counts(res)[pair], 3)
+        self.assertEqual(res["already_scheduled"], [])
+
+    def test_exhibition_game_does_not_satisfy_a_meeting(self):
+        self._division_fixture(4, 18)
+        pair = self._seed_first_pairing_game(
+            game_type=GameType.EXHIBITION.value)
+        res = draft_schedule(self.store, "div1", meetings_per_opponent=3)
+        # A friendly is not a regular-season fixture, so it discharges none
+        # of the three -- again contrast the control's two.
+        self.assertEqual(self._meeting_counts(res)[pair], 3)
+        self.assertEqual(res["already_scheduled"], [])
+
+    def test_already_scheduled_game_ids_are_reported_backend_independently(self):
+        # The Memory/SQL boundary the issue calls out. Two existing Games
+        # for one pair are INSERTED in descending id order, so insertion
+        # order (what the in-memory store returns) and id order (what the
+        # SQL store returns) disagree. The proposal must report the same
+        # ids, in the same order, either way.
+        self._division_fixture(4, 18)
+        home, away = round_robin_pairings(["t0", "t1", "t2", "t3"])[0]
+        for gid in ("game_zz", "game_aa"):  # descending: insertion != sorted
+            self.store.add_game(Game(
+                id=gid, home_team_id=home, away_team_id=away,
+                start_time=BASE_TIME - timedelta(days=100),
+                end_time=BASE_TIME - timedelta(days=100) + timedelta(hours=1),
+                division_id="div1", season_id="se1", league_id="lg1",
+                league_season_id="ls_lg1_se1"))
+        res = draft_schedule(self.store, "div1", meetings_per_opponent=3)
+        pair = frozenset((home, away))
+        reported = [a["existing_game_id"] for a in res["already_scheduled"]
+                    if frozenset((a["home_team_id"], a["away_team_id"])) == pair]
+        self.assertEqual(reported, ["game_aa", "game_zz"])
+        self.assertEqual(self._meeting_counts(res)[pair], 1)  # 3 - 2 existing
+
+    def test_regeneration_after_partial_schedule_adds_exactly_the_missing(self):
+        self._division_fixture(4, 18)
+        # Commit a single round-robin first: 6 of the 18 meetings exist.
+        first = commit_fresh_draft(self.api, "div1")
+        self.assertEqual(len(first["created"]), 6)
+        before = {g.id for g in self.store.all_games()}
+        self.assertEqual(len(before), 6)
+
+        second = commit_fresh_draft(self.api, "div1", meetings_per_opponent=3)
+        self.assertEqual(len(second["created"]), 12)  # 18 - 6, and nothing more
+        after = {g.id for g in self.store.all_games()}
+        self.assertEqual(len(after), 18)
+        # The pre-existing six are untouched, not re-created or replaced.
+        self.assertTrue(before < after)
+        counts = {}
+        for g in self.store.all_games():
+            key = frozenset((g.home_team_id, g.away_team_id))
+            counts[key] = counts.get(key, 0) + 1
+        self.assertEqual(len(counts), 6)
+        self.assertEqual(set(counts.values()), {3})
+
+    def test_regeneration_twice_in_a_row_is_a_no_op(self):
+        self._division_fixture(4, 18)
+        first = commit_fresh_draft(self.api, "div1", meetings_per_opponent=3)
+        self.assertEqual(len(first["created"]), 18)
+        after_first = {g.id for g in self.store.all_games()}
+
+        # Idempotence is proved by running it AGAIN and observing that ZERO
+        # new Games appear -- not by re-asserting a total that would look
+        # identical if the second run had replaced the first run's rows.
+        second = commit_fresh_draft(self.api, "div1", meetings_per_opponent=3)
+        self.assertEqual(second["created"], [])
+        after_second = {g.id for g in self.store.all_games()}
+        self.assertEqual(after_first, after_second)
+
+        proposal = self.api.draft_season_schedule(
+            division_id="div1", meetings_per_opponent=3)
+        self.assertEqual(proposal["draft_games"], [])
+        self.assertEqual(len(proposal["already_scheduled"]), 18)
+
+    def test_committed_three_meeting_schedule_is_fifteen_games_per_team(self):
+        # The worked example carried all the way through the facade and the
+        # commit gate to persisted Games -- the end-to-end proof that the
+        # format parameter survives every layer, not just the generator.
+        self._division_fixture(6, 45)
+        res = commit_fresh_draft(self.api, "div1", meetings_per_opponent=3)
+        self.assertEqual(len(res["created"]), 45)
+        per_team = {}
+        for g in self.store.all_games():
+            for tid in (g.home_team_id, g.away_team_id):
+                per_team[tid] = per_team.get(tid, 0) + 1
+        self.assertEqual(set(per_team.values()), {15})
+
+    def test_league_wide_draft_honours_meetings_per_opponent_per_division(self):
+        self._league_two_divisions_fixture(per_division=2, n_slots=8)
+        res = draft_schedule_for_league(
+            self.store, "se1", "lg1", meetings_per_opponent=3)
+        # One pairing per Division x 3 meetings = 6, and still never a
+        # cross-Division pairing: repeating each group's round-robin must
+        # not start drawing opponents from the other group.
+        self.assertEqual(len(res["draft_games"]), 6)
+        for d in res["draft_games"]:
+            self.assertIn(
+                {d["home_team_id"], d["away_team_id"]},
+                ({"g0", "g1"}, {"s0", "s1"}),
+                "a league-wide multi-meeting draft paired across Divisions")
+        self.assertEqual(set(self._meeting_counts(res).values()), {3})
+
+    def test_commit_refuses_when_preview_used_a_different_format(self):
+        # The format is bound into draft_fingerprint, so previewing N=1 and
+        # committing N=3 must be refused rather than silently persisting a
+        # schedule three times the size of the one reviewed.
+        self._division_fixture(4, 18)
+        preview = self.api.draft_season_schedule(division_id="div1")
+        res = self.api.commit_draft_schedule(
+            division_id="div1",
+            draft_fingerprint=preview["draft_fingerprint"],
+            meetings_per_opponent=3)
+        self.assertEqual(res.get("error", {}).get("details", {}).get("reason"),
+                         "preview_stale", repr(res))
+        self.assertEqual(self.store.all_games(), [])
+
+    def test_invalid_meetings_per_opponent_is_a_structured_error(self):
+        self._division_fixture(4, 6)
+        for bad in (0, -1, True, 1.5, "3", MAX_MEETINGS_PER_OPPONENT + 1):
+            res = self.api.draft_season_schedule(
+                division_id="div1", meetings_per_opponent=bad)
+            self.assertEqual(res.get("error", {}).get("code"),
+                             "validation_error", f"{bad!r}: {res!r}")
+
 
 class MemorySchedulerTest(SchedulerContract, unittest.TestCase):
     def make_store(self):
@@ -2239,11 +2556,15 @@ class SchedulerHttpTest(unittest.TestCase):
 
     # -- draft_fingerprint IS a breaking change to the Commit request
     # contract, over real HTTP (#328 review round 9) ------------------------
-    def _build_committable_division(self, c):
-        """A small Division with two Teams and one open ice slot, built
-        entirely through real setup HTTP calls (not direct store writes) --
-        every id these routes hand back is freshly sequential, so repeated
-        calls across tests in this class never collide."""
+    def _build_committable_division(self, c, n_slots=1):
+        """A small Division with two Teams and ``n_slots`` open ice slots,
+        built entirely through real setup HTTP calls (not direct store
+        writes) -- every id these routes hand back is freshly sequential, so
+        repeated calls across tests in this class never collide.
+
+        ``n_slots`` (#375) exists because a multi-meeting format needs one
+        slot per meeting; it defaults to the single slot every pre-#375
+        caller in this class already relies on."""
         def post(path, body):
             status, resp = self._req(c, "POST", path, body)
             self.assertEqual(status, 200, repr(resp))
@@ -2283,9 +2604,14 @@ class SchedulerHttpTest(unittest.TestCase):
         post(f"/api/v2/setup/seasons/{season['id']}/venue-access",
              {"venue_id": venue["id"]})
         rink = post("/api/setup/rink", {"venue_id": venue["id"], "name": "HCC Rink"})
-        post("/api/setup/ice-slot", {
-            "rink_id": rink["id"], "start_time": "2026-09-12T08:00:00+00:00",
-            "end_time": "2026-09-12T09:00:00+00:00", "slot_type": "game"})
+        for day in range(n_slots):
+            # A distinct DAY per slot, so two meetings of the same pair can
+            # never be refused as a team double-booking (#373).
+            post("/api/setup/ice-slot", {
+                "rink_id": rink["id"],
+                "start_time": f"2026-09-{12 + day:02d}T08:00:00+00:00",
+                "end_time": f"2026-09-{12 + day:02d}T09:00:00+00:00",
+                "slot_type": "game"})
         return division["id"]
 
     def test_commit_without_fingerprint_is_preview_required_via_http(self):
@@ -2356,6 +2682,65 @@ class SchedulerHttpTest(unittest.TestCase):
             body["error"]["details"]["reason"], "preview_stale", repr(body))
         self.assertEqual(
             len(srv.STATE.api.store.all_games()), games_before, repr(body))
+
+    def test_meetings_per_opponent_round_trips_over_http(self):
+        """#375 -- the configurable format survives the REAL transport on
+        BOTH routes. The Generate route must accept it (3 rows for the one
+        pairing, not 1), and the Commit route must forward the SAME value
+        into its own server-side regeneration: if it dropped it, the
+        regenerated proposal would be a single round-robin whose
+        fingerprint could not match, and this commit would fail
+        preview_stale instead of creating three Games."""
+        c = self._client()
+        self._req(c, "POST", "/api/auth/login", {"username": "admin", "password": "demo"})
+        div = self._build_committable_division(c, n_slots=3)
+        status, preview = self._req(c, "POST", "/api/scheduler/draft", {
+            "division_id": div, "meetings_per_opponent": 3})
+        self.assertEqual(status, 200, repr(preview))
+        self.assertEqual(preview["meetings_per_opponent"], 3, repr(preview))
+        self.assertEqual(len(preview["draft_games"]), 3, repr(preview))
+        pairs = {frozenset((d["home_team_id"], d["away_team_id"]))
+                 for d in preview["draft_games"]}
+        self.assertEqual(len(pairs), 1, repr(preview))  # one pair, 3 meetings
+
+        status, body = self._req(c, "POST", "/api/scheduler/commit", {
+            "division_id": div, "meetings_per_opponent": 3,
+            "draft_fingerprint": preview["draft_fingerprint"]})
+        self.assertEqual(status, 200, repr(body))
+        self.assertEqual(len(body["created"]), 3, repr(body))
+
+    def test_commit_dropping_meetings_per_opponent_is_preview_stale_via_http(self):
+        """#375 -- the negative partner of the round-trip above, and the
+        reason the format is bound into draft_fingerprint: a Commit that
+        omits the format the preview was generated with is REFUSED, not
+        silently committed as a single round-robin a third of the size the
+        operator reviewed."""
+        c = self._client()
+        self._req(c, "POST", "/api/auth/login", {"username": "admin", "password": "demo"})
+        div = self._build_committable_division(c, n_slots=3)
+        status, preview = self._req(c, "POST", "/api/scheduler/draft", {
+            "division_id": div, "meetings_per_opponent": 3})
+        self.assertEqual(status, 200, repr(preview))
+        games_before = len(srv.STATE.api.store.all_games())
+        status, body = self._req(c, "POST", "/api/scheduler/commit", {
+            "division_id": div,  # format omitted
+            "draft_fingerprint": preview["draft_fingerprint"]})
+        self.assertEqual(status, 409, repr(body))
+        self.assertEqual(
+            body["error"]["details"]["reason"], "preview_stale", repr(body))
+        self.assertEqual(
+            len(srv.STATE.api.store.all_games()), games_before, repr(body))
+
+    def test_invalid_meetings_per_opponent_is_rejected_over_http(self):
+        c = self._client()
+        self._req(c, "POST", "/api/auth/login", {"username": "admin", "password": "demo"})
+        div = srv.STATE.api.store.all_divisions()[0].id
+        for bad in (0, -2, "many", 2.5, True):
+            status, body = self._req(c, "POST", "/api/scheduler/draft", {
+                "division_id": div, "meetings_per_opponent": bad})
+            self.assertEqual(status, 400, f"{bad!r}: {body!r}")
+            self.assertEqual(body["error"]["code"], "validation_error",
+                             f"{bad!r}: {body!r}")
 
     def test_league_wide_draft_rejects_cross_league_division_via_http(self):
         div = srv.STATE.api.store.all_divisions()[0].id
