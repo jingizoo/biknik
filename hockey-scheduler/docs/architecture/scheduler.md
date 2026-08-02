@@ -1,6 +1,6 @@
-# Draft scheduler — round-robin generation and draft-commit (#84 / #86 / #233 Slice G / #206 slice 1)
+# Draft scheduler — round-robin generation and draft-commit (#84 / #86 / #233 Slice G / #206 slice 1 / #375)
 
-A deliberately simple, deterministic fixture generator: single round-robin
+A deliberately simple, deterministic fixture generator: round-robin
 pairings, each assigned to the earliest available game ice slot. Generation
 is pure over the store (`services/scheduler.py`) and produces a *draft*
 proposal only; nothing is persisted until the separate commit step.
@@ -9,8 +9,8 @@ proposal only; nothing is persisted until the separate commit step.
 
 `round_robin_pairings` (the circle method) takes a Division's — or a
 League-wide draft's per-Division group's — registered team ids, sorted for
-determinism, and returns every unordered pair exactly once (an odd team
-count gets a bye each round). Two entry points share the same
+determinism, and returns every unordered pair `meetings_per_opponent` times
+(an odd team count gets a bye each round). Two entry points share the same
 pairing/ice-assignment core:
 
 * `draft_schedule(store, division_id, ...)` — one Division.
@@ -19,6 +19,38 @@ pairing/ice-assignment core:
   Registrations are grouped by their own Division (or "no Division") and
   each group gets its own round-robin — a league-wide draft never pairs
   teams across different Divisions of that League.
+
+## Configurable regular-season format (#375)
+
+`meetings_per_opponent` (optional on `draft_season_schedule` and
+`commit_draft_schedule`, and on both HTTP routes; `None`/omitted means 1)
+is how many times each team plays every other. 6 teams × 3 meetings is
+C(6,2) × 3 = 45 fixtures, i.e. **15 games per team**. It is validated as an
+integer in `1..MAX_MEETINGS_PER_OPPONENT` (20) — `bool` is rejected
+explicitly, since `True` would otherwise silently mean 1 — and a bad value
+raises a structured `ValidationError` rather than letting a raw `TypeError`
+cross the facade boundary. The ceiling exists because the materialized
+pairing list grows as `meetings × C(teams, 2)`.
+
+**Home/away is deterministic, not arbitrary.** Meeting *m* (0-indexed)
+reuses the base round-robin's orientation when *m* is even and reverses it
+when *m* is odd. Two properties follow:
+
+* every pair's split is balanced to within one game — exactly even for even
+  `meetings`, base-orientation-plus-one for odd;
+* the decision reads only the sorted team ids and `meetings`. No RNG, no
+  clock, no dict/set iteration order, no store state — so the same inputs
+  reproduce the same split in another process, on another store backend,
+  and regardless of the order teams were registered in.
+
+Cycles are emitted whole (all of meeting 0, then meeting 1, …), which is
+both what a real league schedule looks like and what keeps the
+`meetings=1` output byte-identical to pre-#375.
+
+`meetings_per_opponent` is bound into `draft_fingerprint` directly, not
+merely implied by the row lists it changes, so previewing one format and
+committing another is a guaranteed `preview_stale` refusal rather than one
+that happens to fall out of the buckets differing.
 
 `_assign_ice` greedily assigns each pairing (in round-robin order) the
 earliest still-free candidate slot that satisfies every constraint
@@ -115,8 +147,8 @@ matchups that are genuinely still missing.**
 `_existing_pairing_games(store, division_scope)` scans every Game already
 in `division_scope` — an iterable of `(league_season_id, division_id)`
 tuples, never bare division ids — and indexes `(league_season_id,
-division_id, frozenset({home_team_id, away_team_id})) -> existing_game_id`,
-with two deliberate exemptions:
+division_id, frozenset({home_team_id, away_team_id})) -> [existing_game_id,
+…]`, with two deliberate exemptions:
 
 * a **cancelled** Game does not count — a cancelled fixture is not "on the
   calendar" and its pairing is eligible for regeneration;
@@ -149,14 +181,58 @@ key are scoped by the full `(league_season_id, division_id)` tuple, not by
   precisely: Division A's stale Game can never satisfy a lookup keyed to
   Division B.
 
+### Counting, not presence (#375)
+
+The value is a **list** of qualifying Game ids, not one id. With a
+configurable format the question is no longer "does this pairing have a
+Game?" but "how many of its N meetings are already satisfied?", which a
+mapping holding one id per pair structurally cannot answer. The two
+exemptions above are unchanged and are exactly what the count is taken
+over: an existing Regular game counts, a cancelled one does not, an
+exhibition does not.
+
+The list is **sorted by game id**, which is load-bearing rather than
+cosmetic. `store.all_games()` is insertion-ordered on the in-memory store
+but `ORDER BY id` on the SQL store, so an unsorted list would make *which*
+existing Game a given `already_scheduled[]` row reports — and therefore the
+`draft_fingerprint` derived from it — differ between Memory, SQLite and
+PostgreSQL for identical data. Sorting here is the single point that makes
+the count and its reporting backend-independent.
+
 `_split_already_scheduled` partitions the full computed pairing list
-against that index *before* `_assign_ice` ever runs: a pairing with a real
-existing Game is removed from ice assignment entirely and reported by name
-in the response's new `already_scheduled[]` (home/away id + name, division
-id, `existing_game_id`) — visible to the operator, never silently dropped,
-and never re-proposed alongside the genuinely missing pairings. Both
-`draft_schedule` and `draft_schedule_for_league` return this key with
+against that index *before* `_assign_ice` ever runs. Each pair's existing
+Games are consumed one per requested meeting, in meeting order: the first
+K requested meetings (K = qualifying Games, capped at the number requested)
+become `already_scheduled[]` rows naming one existing Game each
+(home/away id + name, division id, `existing_game_id`), and only the
+surplus stays for ice assignment — visible to the operator, never silently
+dropped, and never re-proposed alongside the genuinely missing meetings.
+Both `draft_schedule` and `draft_schedule_for_league` return this key with
 identical shape.
+
+Consumption is by meeting order rather than by matching each existing
+Game's actual home/away orientation: meeting order is a total order fixed
+by the inputs alone, so the same facts always leave the same meetings
+outstanding, whereas orientation-matching would need a tie-break the inputs
+do not supply whenever several existing Games share an orientation. A pair
+with *more* existing Games than the format requests simply has no remaining
+meetings.
+
+**Idempotence** falls out of this directly: run generation again with
+nothing changed, every requested meeting is matched by an existing Game,
+the remaining set is empty, and the regeneration creates nothing.
+
+The commit gate's race checks became **count comparisons** to match
+(`reviewed_existing_counts` / `raced_pairing_game_id`, shared by both
+facades). "This pairing already has a Game" was the right question only
+while every pairing needed exactly one meeting; with N meetings a pairing
+can legitimately have K < N existing Games *and* be in the batch for its
+remaining N − K, so the bare presence test would have refused every N > 1
+commit against a partially-scheduled Division with
+`pairing_already_scheduled`. The question is now "does it have **more** than
+the reviewed proposal accounted for?". At N = 1 the reviewed count for any
+pairing with a `draft_games` row is 0, and the comparison reduces exactly
+to the original predicate.
 
 ## Draft-then-commit workflow
 
