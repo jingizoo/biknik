@@ -894,12 +894,16 @@ class SetupService:
                 if r.league_season_id == league_season_id]
         games = [g for g in self.store.all_games()
                  if g.league_season_id == league_season_id]
+        scenarios = [s for s in self.store.all_schedule_scenarios()
+                     if s.league_season_id == league_season_id]
         self._block_if_dependents(
             "league_season", league_season_id, "season binding", [
                 self._dep_group("division", divisions, lambda d: d.name),
                 self._dep_group("team registration", regs,
                                 lambda r: self._team_name(r.team_id)),
-                self._dep_group("game", games, self._matchup)])
+                self._dep_group("game", games, self._matchup),
+                self._dep_group("schedule scenario", scenarios,
+                                lambda s: s.name)])
         self.store.delete_league_season(league_season_id)
         self._audit("league_season_deleted", "league_season", league_season_id,
                     actor_id, {"league_id": ls.league_id,
@@ -8135,11 +8139,15 @@ class SetupService:
         teams = self.store.teams_for_program(program_id)
         venues = [v for v in self.store.all_venues()
                   if v.league_id == program_id]
+        scenarios = [s for s in self.store.all_schedule_scenarios()
+                     if s.program_id == program_id]
         return [self._dep_group("season", seasons, lambda s: s.name),
                 self._dep_group("level", leagues, lambda lg: lg.name,
                                 display="league"),
                 self._dep_group("team", teams, lambda t: t.name),
-                self._dep_group("venue", venues, lambda v: v.name)]
+                self._dep_group("venue", venues, lambda v: v.name),
+                self._dep_group("schedule scenario", scenarios,
+                                lambda s: s.name)]
 
     # Store entity_type (from DependentDeleteConflict) → (details entity_type,
     # itemised-block label, dependent-groups resolver). The details entity_type
@@ -8253,6 +8261,8 @@ class SetupService:
         # first (its owning Season, if archived, has already failed above).
         games = [g for g in self.store.all_games()
                  if g.league_season_id in ls_ids or g.league_id == league_id]
+        scenarios = [s for s in self.store.all_schedule_scenarios()
+                     if s.league_id == league_id]
         # #159 — a permanent Team references exactly one League (Team.league_id,
         # #283 rule 3). Deleting the League would orphan those Teams, so they are
         # explicit dependents (there is no FK to catch this at the DB layer).
@@ -8269,6 +8279,8 @@ class SetupService:
             self._dep_group("team registration", regs,
                             lambda r: self._team_name(r.team_id)),
             self._dep_group("game", games, self._matchup),
+            self._dep_group("schedule scenario", scenarios,
+                            lambda s: s.name),
             self._dep_group("team", teams, lambda t: t.name),
             self._dep_group("season binding", ls_rows,
                             lambda ls: self._season_name(ls.season_id))])
@@ -8335,6 +8347,8 @@ class SetupService:
         # #251's delete_season_team_registration) is the explicit cleanup an
         # operator runs on each revoked row before this delete can succeed.
         venue_access = self.store.season_venue_access_for_season(season_id)
+        scenarios = [s for s in self.store.all_schedule_scenarios()
+                     if s.season_id == season_id]
         self._block_if_dependents("season", season_id, "season", [
             self._dep_group("level", levels, lambda lv: lv.name,
                             display="league"),
@@ -8342,6 +8356,8 @@ class SetupService:
             self._dep_group("team registration", regs,
                             lambda r: self._team_name(r.team_id)),
             self._dep_group("game", games, self._matchup),
+            self._dep_group("schedule scenario", scenarios,
+                            lambda s: s.name),
             self._dep_group("venue access", venue_access,
                             lambda a: self._venue_name(a.venue_id))])
         self._cascade_scheduling_policy(
@@ -8363,6 +8379,8 @@ class SetupService:
         regs = [r for r in self.store.all_season_team_registrations()
                 if r.division_id == division_id]
         games = [g for g in self.store.all_games() if g.division_id == division_id]
+        scenarios = [s for s in self.store.all_schedule_scenarios()
+                     if s.division_id == division_id]
         # Deletion keys off real operational dependents only (#180, #233 D1
         # bundled fix): an ACTIVE registration or any Game blocks deletion. An
         # INACTIVE registration (the team was removed from the season via
@@ -8377,7 +8395,9 @@ class SetupService:
         self._block_if_dependents("division", division_id, "division", [
             self._dep_group("team registration", active_regs,
                             lambda r: self._team_name(r.team_id)),
-            self._dep_group("game", games, self._matchup)])
+            self._dep_group("game", games, self._matchup),
+            self._dep_group("schedule scenario", scenarios,
+                            lambda s: s.name)])
         # Clear the inactive registrations' division_id (never a hard delete —
         # the row, its Season/Team/League identity, and its active=False
         # status are all retained) before removing the Division itself. Each

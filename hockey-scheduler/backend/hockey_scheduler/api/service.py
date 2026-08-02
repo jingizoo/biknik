@@ -6,6 +6,7 @@ returned as the structured ``{"error": {...}}`` shape so callers (and a future
 web framework) never see Python tracebacks across the boundary.
 """
 
+import copy
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -28,6 +29,7 @@ from ..domain import (
     NotificationRecipient,
     Permission,
     Role,
+    ScheduleScenario,
     OfficialRole,
     ResultStatus,
     RosterEntryStatus,
@@ -61,6 +63,11 @@ from ..services import (
     new_feed_token,
     parse_csv_text,
     validate_import,
+    SCENARIO_PLANNER_VERSION,
+    canonical_fingerprint,
+    changed_snapshot_sections,
+    material_input_snapshot,
+    resolve_scenario_scope,
 )
 from ..services.scheduler import (
     _existing_pairing_games,
@@ -4824,6 +4831,269 @@ class ApiService:
                               constraints=constraints,
                               meetings_per_opponent=meetings_per_opponent)
 
+    # -- immutable named schedule scenarios (#206/#378) ------------------
+    @staticmethod
+    def _scenario_dto(scenario) -> dict:
+        """A detached JSON view; callers can never mutate stored evidence."""
+        return {
+            "scenario_id": scenario.id,
+            "name": scenario.name,
+            "scope": {
+                "program_id": scenario.program_id,
+                "season_id": scenario.season_id,
+                "league_id": scenario.league_id,
+                "league_season_id": scenario.league_season_id,
+                "division_id": scenario.division_id,
+            },
+            "planner": {
+                "version": scenario.planner_version,
+                "input_fingerprint": scenario.input_fingerprint,
+                "proposal_fingerprint": scenario.proposal_fingerprint,
+                "draft_fingerprint": scenario.proposal.get(
+                    "draft_fingerprint"),
+            },
+            "request_input": copy.deepcopy(scenario.request_input),
+            # Opaque by contract: scenario persistence does not interpret or
+            # reorder proposal/explanation fields owned by the generator.
+            "proposal": copy.deepcopy(scenario.proposal),
+            "generation_snapshot": copy.deepcopy(
+                scenario.generation_snapshot),
+            "created_at": scenario.created_at.isoformat(),
+            "created_by": scenario.created_by,
+        }
+
+    @catch
+    def create_schedule_scenario(self, name: str, division_id: str = None,
+                                 season_id: str = None,
+                                 league_id: str = None, slot_ids=None,
+                                 constraints=None, actor_id=None) -> dict:
+        """Generate and persist review evidence without writing any Game.
+
+        REPEATABLE READ makes proposal generation, the material-input snapshot,
+        and the one scenario INSERT observe a single database snapshot.  The
+        scenario remains immutable afterward; creating another generation is a
+        new named record with a new id, never an update in place.
+        """
+        if not isinstance(name, str) or not name.strip():
+            raise ValidationError(
+                "A scenario name is required.",
+                {"reason": "scenario_name_required"})
+        clean_name = name.strip()
+        if len(clean_name) > 120:
+            raise ValidationError(
+                "A scenario name must be 120 characters or fewer.",
+                {"reason": "scenario_name_too_long", "max_length": 120})
+        if slot_ids is not None and (
+                not isinstance(slot_ids, (list, tuple))
+                or any(not isinstance(value, str) for value in slot_ids)):
+            raise ValidationError(
+                "slot_ids must be a list of strings.",
+                {"reason": "scenario_slot_ids_invalid"})
+        if constraints is not None and not isinstance(constraints, dict):
+            raise ValidationError(
+                "constraints must be an object.",
+                {"reason": "scenario_constraints_invalid"})
+
+        request_input = {
+            "scope_mode": "league" if season_id and league_id else "division",
+            "slot_ids": copy.deepcopy(list(slot_ids))
+            if slot_ids is not None else None,
+            "constraints": copy.deepcopy(constraints),
+        }
+        with self.store.transaction(isolation="REPEATABLE READ"):
+            scope = resolve_scenario_scope(
+                self.store, division_id=division_id, season_id=season_id,
+                league_id=league_id)
+            proposal = self.draft_season_schedule(
+                division_id=division_id, season_id=season_id,
+                league_id=league_id, slot_ids=request_input["slot_ids"],
+                constraints=request_input["constraints"])
+            if isinstance(proposal, dict) and proposal.get("error"):
+                return proposal
+            snapshot = material_input_snapshot(
+                self.store, scope, request_input,
+                planner_version=SCENARIO_PLANNER_VERSION)
+            scenario = ScheduleScenario(
+                id=self.store.next_id("schedule_scenario"),
+                name=clean_name,
+                program_id=scope["program_id"],
+                season_id=scope["season_id"],
+                league_id=scope["league_id"],
+                league_season_id=scope["league_season_id"],
+                division_id=scope["division_id"],
+                planner_version=SCENARIO_PLANNER_VERSION,
+                input_fingerprint=canonical_fingerprint(snapshot),
+                # Whole opaque output, not only the v1 commit token.  Future
+                # explainability fields stay bound without this persistence
+                # layer learning or redesigning any of them.
+                proposal_fingerprint=canonical_fingerprint(proposal),
+                request_input=request_input,
+                proposal=copy.deepcopy(proposal),
+                generation_snapshot=snapshot,
+                created_at=self.setup.clock(),
+                created_by=actor_id,
+            )
+            stored = self.store.add_schedule_scenario(scenario)
+            self.setup._audit(
+                "schedule_scenario_created", "schedule_scenario",
+                scenario.id, actor_id,
+                {"scenario_name": scenario.name,
+                 "program_id": scenario.program_id,
+                 "season_id": scenario.season_id,
+                 "league_id": scenario.league_id,
+                 "division_id": scenario.division_id,
+                 "input_fingerprint": scenario.input_fingerprint,
+                 "proposal_fingerprint": scenario.proposal_fingerprint})
+        return self._scenario_dto(stored)
+
+    @catch
+    def get_schedule_scenario(self, scenario_id: str) -> dict:
+        scenario = self.store.get_schedule_scenario(scenario_id)
+        if scenario is None:
+            raise NotFoundError(
+                "Schedule scenario not found.",
+                details={"reason": "schedule_scenario_missing",
+                         "scenario_id": scenario_id})
+        return self._scenario_dto(scenario)
+
+    @catch
+    def list_schedule_scenarios(self) -> dict:
+        scenarios = sorted(
+            self.store.all_schedule_scenarios(),
+            key=lambda value: (value.created_at, value.id))
+        return {"scenarios": [self._scenario_dto(value)
+                              for value in scenarios]}
+
+    def _commit_schedule_scenario_attempt(self, scenario_id, actor_id=None):
+        """One lock-linearized, all-or-nothing stale-check + draft commit."""
+        with self.store.transaction():
+            scenario = self.store.get_schedule_scenario_for_update(scenario_id)
+            if scenario is None:
+                raise NotFoundError(
+                    "Schedule scenario not found.",
+                    details={"reason": "schedule_scenario_missing",
+                             "scenario_id": scenario_id})
+
+            scope = {
+                "program_id": scenario.program_id,
+                "season_id": scenario.season_id,
+                "league_id": scenario.league_id,
+                "league_season_id": scenario.league_season_id,
+                "division_id": scenario.division_id,
+            }
+            integrity_fields = []
+            if (canonical_fingerprint(scenario.generation_snapshot)
+                    != scenario.input_fingerprint):
+                integrity_fields.append("generation_snapshot")
+            if (canonical_fingerprint(scenario.proposal)
+                    != scenario.proposal_fingerprint):
+                integrity_fields.append("proposal")
+            if integrity_fields:
+                raise ValidationError(
+                    "This schedule scenario failed its immutable-record "
+                    "integrity check and cannot be committed. Contact an "
+                    "administrator before retrying.",
+                    {"reason": "schedule_scenario_integrity_error",
+                     "scenario_id": scenario.id,
+                     "fields": integrity_fields})
+
+            def _guard_material_inputs():
+                # This callback runs only after the existing scheduler commit
+                # gate holds its Program/Team/Rink/Season lock plan.  That
+                # gives the comparison a shared, explicit linearization point:
+                # a material writer either committed before these reads or is
+                # blocked until the all-or-nothing draft transaction finishes.
+                current_snapshot = material_input_snapshot(
+                    self.store, scope, scenario.request_input,
+                    planner_version=SCENARIO_PLANNER_VERSION)
+                current_fingerprint = canonical_fingerprint(current_snapshot)
+                changed = changed_snapshot_sections(
+                    scenario.generation_snapshot, current_snapshot)
+                if (scenario.planner_version != SCENARIO_PLANNER_VERSION
+                        or current_fingerprint != scenario.input_fingerprint):
+                    if (scenario.planner_version != SCENARIO_PLANNER_VERSION
+                            and "planner_version" not in changed):
+                        changed.insert(0, "planner_version")
+                    raise ConcurrencyConflictError(
+                        "This schedule scenario is stale because material "
+                        "inputs changed after generation. Generate a new "
+                        "named scenario, review it, and commit that new "
+                        "scenario instead.",
+                        {"reason": "schedule_scenario_stale",
+                         "scenario_id": scenario.id,
+                         "changed_inputs": changed,
+                         "required_action": "generate_new_scenario",
+                         "generated_input_fingerprint":
+                             scenario.input_fingerprint,
+                         "current_input_fingerprint": current_fingerprint})
+
+            guard_team_ids = tuple(
+                row.get("team_id")
+                for row in (scenario.generation_snapshot
+                            .get("registrations", {}).get("rows", ()))
+                if row.get("team_id"))
+            guard_venue_ids = tuple(
+                row.get("id")
+                for row in (scenario.generation_snapshot
+                            .get("venue_access", {}).get("venues", ()))
+                if row.get("id"))
+            guard_games = scenario.generation_snapshot.get("games", ())
+            guard_game_ids = tuple(
+                row.get("id") for row in guard_games if row.get("id"))
+            guard_season_ids = tuple(
+                row.get("season_id")
+                for row in guard_games if row.get("season_id"))
+
+            request_input = scenario.request_input
+            league_mode = request_input.get("scope_mode") == "league"
+            # The existing commit gate remains authoritative for per-row
+            # placement, participation, pairing, and lock-order checks.  Passing
+            # the immutable proposal prevents a fresh regeneration from silently
+            # substituting a different batch after review.
+            result = self._commit_draft_schedule_attempt(
+                division_id=scenario.division_id,
+                season_id=scenario.season_id if league_mode else None,
+                league_id=scenario.league_id if league_mode else None,
+                slot_ids=copy.deepcopy(request_input.get("slot_ids")),
+                constraints=copy.deepcopy(request_input.get("constraints")),
+                draft_fingerprint=scenario.proposal.get("draft_fingerprint"),
+                actor_id=actor_id,
+                reviewed_proposal=scenario.proposal,
+                scenario_guard=_guard_material_inputs,
+                guard_team_ids=guard_team_ids,
+                guard_venue_ids=guard_venue_ids,
+                guard_game_ids=guard_game_ids,
+                guard_season_ids=guard_season_ids)
+            self.setup._audit(
+                "schedule_scenario_committed", "schedule_scenario",
+                scenario.id, actor_id,
+                {"scenario_name": scenario.name,
+                 "input_fingerprint": scenario.input_fingerprint,
+                 "created_count": len(result.get("created") or ())})
+            return {"scenario_id": scenario.id, **result}
+
+    @catch
+    def commit_schedule_scenario(self, scenario_id: str,
+                                 actor_id=None) -> dict:
+        """Commit one stored scenario; retry only transaction-level races.
+
+        Transient lock-plan races retry from a fresh transaction. A material
+        input mutation that won before the scheduler locks is reported as
+        ``schedule_scenario_stale`` with section-level guidance.
+        """
+        transient = {
+            "placement_raced", "serialization_failure",
+            "deadlock_detected", "lock_not_available",
+        }
+        for attempt in range(3):
+            try:
+                return self._commit_schedule_scenario_attempt(
+                    scenario_id, actor_id=actor_id)
+            except ConcurrencyConflictError as exc:
+                reason = (exc.details or {}).get("reason")
+                if reason not in transient or attempt == 2:
+                    raise
+
     def _team_name(self, team_id) -> Optional[str]:
         """Shared by every game DTO builder (public/draft review) so a
         missing/unknown team resolves to None the same way everywhere."""
@@ -4983,7 +5253,13 @@ class ApiService:
                                        slot_ids=None, constraints=None,
                                        draft_fingerprint: str = None,
                                        meetings_per_opponent=None,
-                                       actor_id=None) -> dict:
+                                       actor_id=None,
+                                       reviewed_proposal=None,
+                                       scenario_guard=None,
+                                       guard_team_ids=(),
+                                       guard_venue_ids=(),
+                                       guard_game_ids=(),
+                                       guard_season_ids=()) -> dict:
         """Persist a generated draft as draft games (is_draft=True, unpublished),
         so they can be reviewed and then published (#86). Regenerates the
         proposal server-side (deterministic) and returns the created drafts +
@@ -5023,10 +5299,17 @@ class ApiService:
         THIS regeneration and taking the locks below remains
         ``_existing_now``'s job, unaffected by this check.
         """
-        proposal = self.draft_season_schedule(
-            division_id=division_id, season_id=season_id, league_id=league_id,
-            slot_ids=slot_ids, constraints=constraints,
-            meetings_per_opponent=meetings_per_opponent)
+        # Named scenarios (#378) pass their exact immutable reviewed proposal
+        # after independently revalidating the material-input snapshot in the
+        # same outer transaction.  The legacy route leaves this unset and keeps
+        # its existing regenerate-from-request behavior byte-for-byte.
+        proposal = (copy.deepcopy(reviewed_proposal)
+                    if reviewed_proposal is not None
+                    else self.draft_season_schedule(
+                        division_id=division_id, season_id=season_id,
+                        league_id=league_id, slot_ids=slot_ids,
+                        constraints=constraints,
+                        meetings_per_opponent=meetings_per_opponent))
         if isinstance(proposal, dict) and proposal.get("error"):
             return proposal
         if draft_fingerprint is None:
@@ -5091,7 +5374,19 @@ class ApiService:
                 self.store, resolved_season_id, slot_ids)
             _plan = self.setup._policy_scope_lock_plan(
                 _pre_rinks, (resolved_season_id,))
+            _plan["seasons"].update(
+                sid for sid in guard_season_ids if sid)
+            for _sid in _plan["seasons"]:
+                _season = self.store.get_season(_sid)
+                if _season is not None and _season.program_id:
+                    _plan["programs"].add(_season.program_id)
             self.setup._lock_programs(_plan["programs"])
+            # Scenario snapshots include the Venue timezone used for local
+            # policy/blackout interpretation. Existing hierarchy writes take
+            # the Venue row's UPDATE lock, so lock those exact rows before the
+            # Team/Rink/Season chain and hold them through the snapshot guard.
+            for _venue_id in sorted({v for v in guard_venue_ids if v}):
+                self.store.get_venue_for_update(_venue_id)
             # #328 review round 8/9 -- also lock every already_scheduled
             # row's Teams, not just draft_games': the revalidation below
             # (whether that row's existing_game_id is still the current
@@ -5101,8 +5396,11 @@ class ApiService:
             # forced to serialize against this transaction the same way
             # draft_games' own teams already are.
             self.setup._lock_teams(
-                t for d in proposal["draft_games"] + proposal["already_scheduled"]
-                for t in (d["home_team_id"], d["away_team_id"]))
+                set(guard_team_ids) | {
+                    t for d in (proposal["draft_games"]
+                                + proposal["already_scheduled"])
+                    for t in (d["home_team_id"], d["away_team_id"])
+                })
             # #328 review round 13 -- recomputed fresh (not reused from
             # `_pre_rinks` above) under the Team locks just acquired, exactly
             # mirroring the pre-existing draft_games-only pattern this
@@ -5139,6 +5437,15 @@ class ApiService:
                     "A scheduling-policy scope changed while processing "
                     "the request; please retry.",
                     {"reason": "placement_raced"})
+            # Existing Game mutations lock their Season before writing the
+            # Game. Locking the generated snapshot's exact rows after all
+            # Seasons matches that order and closes legacy/row-only updates;
+            # new relevant Games are already serialized by the registered
+            # Team or candidate Rink locks above.
+            for _game_id in sorted({g for g in guard_game_ids if g}):
+                self.store.get_game_for_update(_game_id)
+            if scenario_guard is not None:
+                scenario_guard()
             # Resolve the exact competition identity only after the Season lock.
             # If a concurrent unbind won first, fail closed; if it is queued
             # behind us, its dependency scan will see the Games created below.

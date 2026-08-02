@@ -5,6 +5,7 @@ persists the resolved season context and revalidates draft commit/publish so a
 stale or legacy row cannot bypass the same league-ice invariant.
 """
 
+import copy
 from datetime import datetime
 
 from ..domain import Game, IceSlotStatus
@@ -61,7 +62,13 @@ class ApiService(_BaseApiService):
                                        slot_ids=None, constraints=None,
                                        draft_fingerprint: str = None,
                                        meetings_per_opponent=None,
-                                       actor_id=None) -> dict:
+                                       actor_id=None,
+                                       reviewed_proposal=None,
+                                       scenario_guard=None,
+                                       guard_team_ids=(),
+                                       guard_venue_ids=(),
+                                       guard_game_ids=(),
+                                       guard_season_ids=()) -> dict:
         """One attempt of the base facade's ``commit_draft_schedule`` retry
         shell (#318) — the shell (with ``@catch``) is inherited; overriding
         the attempt keeps the league-scoped body inside the retry loop, and
@@ -86,10 +93,13 @@ class ApiService(_BaseApiService):
         preview-binding check. See the base facade's
         ``_commit_draft_schedule_attempt`` for the full rationale.
         """
-        proposal = self.draft_season_schedule(
-            division_id=division_id, season_id=season_id, league_id=league_id,
-            slot_ids=slot_ids, constraints=constraints,
-            meetings_per_opponent=meetings_per_opponent)
+        proposal = (copy.deepcopy(reviewed_proposal)
+                    if reviewed_proposal is not None
+                    else self.draft_season_schedule(
+                        division_id=division_id, season_id=season_id,
+                        league_id=league_id, slot_ids=slot_ids,
+                        constraints=constraints,
+                        meetings_per_opponent=meetings_per_opponent))
         if isinstance(proposal, dict) and proposal.get("error"):
             return proposal
         if draft_fingerprint is None:
@@ -154,7 +164,15 @@ class ApiService(_BaseApiService):
                 self.store, resolved_season_id, slot_ids)
             _plan = self.setup._policy_scope_lock_plan(
                 _pre_rinks, (resolved_season_id,))
+            _plan["seasons"].update(
+                sid for sid in guard_season_ids if sid)
+            for _sid in _plan["seasons"]:
+                _season = self.store.get_season(_sid)
+                if _season is not None and _season.program_id:
+                    _plan["programs"].add(_season.program_id)
             self.setup._lock_programs(_plan["programs"])
+            for _venue_id in sorted({v for v in guard_venue_ids if v}):
+                self.store.get_venue_for_update(_venue_id)
             # #328 review round 8/9 -- also lock every already_scheduled
             # row's Teams, not just draft_games': the revalidation below
             # (whether that row's existing_game_id is still the current
@@ -164,8 +182,11 @@ class ApiService(_BaseApiService):
             # forced to serialize against this transaction the same way
             # draft_games' own teams already are.
             self.setup._lock_teams(
-                t for row in proposal["draft_games"] + proposal["already_scheduled"]
-                for t in (row["home_team_id"], row["away_team_id"]))
+                set(guard_team_ids) | {
+                    t for row in (proposal["draft_games"]
+                                  + proposal["already_scheduled"])
+                    for t in (row["home_team_id"], row["away_team_id"])
+                })
             # #328 review round 13 -- recomputed fresh (not reused from
             # `_pre_rinks` above) under the Team locks just acquired, exactly
             # mirroring the pre-existing draft_games-only pattern this
@@ -202,6 +223,10 @@ class ApiService(_BaseApiService):
                     "A scheduling-policy scope changed while processing "
                     "the request; please retry.",
                     {"reason": "placement_raced"})
+            for _game_id in sorted({g for g in guard_game_ids if g}):
+                self.store.get_game_for_update(_game_id)
+            if scenario_guard is not None:
+                scenario_guard()
             # Resolve the exact LeagueSeason after the Season lock. A regular
             # draft must carry this identity so publish/move can enforce the
             # same competition scope, including league-wide rows with no

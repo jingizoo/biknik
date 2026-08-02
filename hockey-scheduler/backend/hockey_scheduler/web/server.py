@@ -256,6 +256,8 @@ _GET_ROUTES = [re.compile(p) for p in (
     r"^/api/public/standings/league-season/[^/]+/[^/]+$",
     r"^/api/public/games/[^/]+$",
     r"^/api/scheduler/drafts$",
+    r"^/api/scheduler/scenarios$",
+    r"^/api/scheduler/scenarios/[^/]+$",
     r"^/api/auth/me$",
     r"^/api/context$",
     r"^/api/context/options$",
@@ -332,6 +334,8 @@ _POST_ROUTES = [re.compile(p) for p in (
     r"^/api/import/commit/(?:teams-players|officials-availability"
     r"|rinks-ice-slots)$",
     r"^/api/scheduler/draft$",
+    r"^/api/scheduler/scenarios$",
+    r"^/api/scheduler/scenarios/[^/]+/commit$",
     r"^/api/scheduler/commit$",
     r"^/api/scheduler/drafts/(?:publish|discard)$",
     r"^/api/setup/ice-availability/(?:preview|commit)$",
@@ -1688,6 +1692,16 @@ class Handler(BaseHTTPRequestHandler):
             if self._operator_only("/api/scheduler/commit"):
                 return
             return self._send_api(api.list_draft_games())
+        if path == "/api/scheduler/scenarios":
+            if self._operator_only("/api/scheduler/commit"):
+                return
+            return self._send_api(api.list_schedule_scenarios())
+        scenario_get = re.match(r"^/api/scheduler/scenarios/([^/]+)$", path)
+        if scenario_get:
+            if self._operator_only("/api/scheduler/commit"):
+                return
+            return self._send_api(
+                api.get_schedule_scenario(scenario_get.group(1)))
         if path == "/api/auth/me":
             # Consistent with POST role resolution (#50): no cookie → signed out,
             # a valid cookie → the user, a present-but-invalid/expired cookie →
@@ -2516,6 +2530,36 @@ class Handler(BaseHTTPRequestHandler):
                 slot_ids=body.get("slot_ids"),
                 constraints=body.get("constraints"),
                 meetings_per_opponent=body.get("meetings_per_opponent")))
+        if path == "/api/scheduler/scenarios":
+            try:
+                check_body(
+                    body,
+                    allowed={"name", "division_id", "season_id", "league_id",
+                             "slot_ids", "constraints"},
+                    required=("name",),
+                    types={"name": str,
+                           "division_id": (str, type(None)),
+                           "season_id": (str, type(None)),
+                           "league_id": (str, type(None)),
+                           "slot_ids": (list, type(None)),
+                           "constraints": (dict, type(None))})
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
+            return self._send_api(api.create_schedule_scenario(
+                body.get("name"), division_id=body.get("division_id"),
+                season_id=body.get("season_id"),
+                league_id=body.get("league_id"),
+                slot_ids=body.get("slot_ids"),
+                constraints=body.get("constraints"), actor_id=user_id))
+        scenario_commit = re.match(
+            r"^/api/scheduler/scenarios/([^/]+)/commit$", path)
+        if scenario_commit:
+            try:
+                check_body(body, allowed=set())
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
+            return self._send_api(api.commit_schedule_scenario(
+                scenario_commit.group(1), actor_id=user_id))
         # Draft review + publish (#86): commit a proposal to draft games, then
         # publish or discard them. All operator-only (MANAGE_SCHEDULE gate).
         # Attribute draft commit/publish/discard to the signed-in user resolved

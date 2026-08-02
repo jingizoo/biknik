@@ -300,6 +300,14 @@ role-journey criterion plus the three moderated operator-validation
 sessions. No Schedule/Facilities, #287, or #206 work advances ahead of
 #345.
 
+Owner-directed parallel exception (2026-08-02): while #375 implements only
+configurable regular-season meeting counts and deterministic home/away balance,
+bounded #206 children may independently advance named scenario persistence and
+material-input stale commit refusal (#378), plus preview explainability. These
+exceptions do not reorder or replace #375/#345, and their contracts must not
+overlap: scenario persistence treats generated explanation payloads as opaque,
+and neither parallel slice owns meeting-count or home/away generation behavior.
+
 Done since this section was last accurate: #267 (login security, PR #286);
 #277 (turnover/curfew policy, PR #318/#319); #313/#315 (recurring ice
 templates + month view, closing #158). Release 0's #160/#271 security gate

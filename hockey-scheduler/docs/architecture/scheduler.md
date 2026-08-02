@@ -1189,3 +1189,47 @@ scope-locator staleness reason #313/#314/#318 use, which the retry shell
 DOES retry) precisely so none of them are ever retried. `placement_raced`
 is not scheduler-specific; it is shared with every other placement path
 that re-verifies a pre-lock locator under its locks.
+
+## Named immutable scenarios (#378)
+
+`POST /api/scheduler/scenarios` generates the existing deterministic proposal
+inside one repeatable-read transaction and persists it as a new named
+`ScheduleScenario`. Generation writes no Game and allocates no slot. The record
+stores the exact proposal as opaque JSON (including all proposed fixtures and
+unplaced explanation values), the permanent Program → League plus Season →
+LeagueSeason/optional Division scope, the planner version, the original slot /
+constraint input, and a canonical material-input snapshot. There is no update
+method or mutable status field; committing creates separate draft Games and
+publishing remains the existing separate operation.
+
+The material snapshot is a delimiter-safe canonical JSON document whose SHA-256
+identity covers the scoped hierarchy records, every registration in the target
+LeagueSeason and its permanent Team, SeasonVenueAccess and candidate
+Venue/Rink/ice inventory, relevant Games (including lock/cancel/publish/draft
+state), stored constraint/blackout input, and every applicable Program/Season/
+Rink scheduling-policy row. Neighbor Games on candidate Rinks contribute their
+own Season/Program policy scopes because the directional turnover rule reads
+them too. Each section also has its own fingerprint so a refusal can name what
+changed without exposing database details.
+
+`POST /api/scheduler/scenarios/{id}/commit` opens one transaction, row-locks
+the immutable scenario, expands the existing scheduler's ordered Program →
+Team → Rink → Season lock plan with the scenario's material Venue and existing
+Game rows, then re-reads that complete material input and compares it with the
+generation snapshot before any Game/audit/slot write. A
+mismatch refuses the whole operation as `schedule_scenario_stale`, with
+`changed_inputs`, `required_action = "generate_new_scenario"`, and generated /
+current input fingerprints. With identical inputs, the stored reviewed proposal
+is passed into the existing draft-commit gate; the gate still owns lock order,
+competition participation, exact-pairing, physical slot, team-overlap, and
+policy checks. The shared locks give the stale comparison an explicit
+linearization point: a material writer either committed before the comparison
+or remains blocked until the all-or-nothing draft transaction finishes. The
+outer transaction makes the snapshot check, every created draft Game, every
+slot allocation, and both audit records one all-or-nothing unit on Memory,
+SQLite, and PostgreSQL; transient lock-plan races restart from a fresh
+transaction.
+
+This layer does not interpret or reshape unplaced explanations and does not add
+format knobs. Explanation fields/order/caps remain the generator's contract;
+configurable meetings and deterministic home/away remain #375's contract.

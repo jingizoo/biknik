@@ -105,3 +105,38 @@ The facade supports the three required screen states:
   `status = "draft"` with `message = "No players selected yet."`.
 - **Error** — any structured error shape above; the screen shows the
   `error.message`.
+
+## Named schedule scenarios (#378)
+
+All routes require server-side `MANAGE_SCHEDULE`; audit actors come from the
+authenticated session, never a request field.
+
+```http
+POST /api/scheduler/scenarios
+GET  /api/scheduler/scenarios
+GET  /api/scheduler/scenarios/{scenarioId}
+POST /api/scheduler/scenarios/{scenarioId}/commit
+```
+
+Create accepts a strict body:
+
+```json
+{
+  "name": "Opening-week plan",
+  "season_id": "season_1",
+  "league_id": "league_1",
+  "division_id": "division_1",
+  "slot_ids": ["slot_1"],
+  "constraints": {}
+}
+```
+
+Alternatively, the existing Division-only scope may omit `season_id` and
+`league_id`. The response includes immutable `name`, `scope`, `planner`
+fingerprints/version, `request_input`, the opaque `proposal`, and the full
+`generation_snapshot`. Commit takes an empty body. It creates unpublished draft
+Games only when the current material-input fingerprint still matches; otherwise
+it returns `409 concurrency_conflict` with
+`details.reason = "schedule_scenario_stale"`, section-level `changed_inputs`,
+and `required_action = "generate_new_scenario"`. Publishing remains
+`POST /api/scheduler/drafts/publish`.

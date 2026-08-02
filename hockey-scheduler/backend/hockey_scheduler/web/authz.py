@@ -172,6 +172,9 @@ def required_permission(path: str):
     # Generating a draft season schedule is a scheduling action (#84).
     if path == "/api/scheduler/draft":
         return Permission.MANAGE_SCHEDULE
+    if (path == "/api/scheduler/scenarios"
+            or re.match(r"^/api/scheduler/scenarios/[^/]+/commit$", path)):
+        return Permission.MANAGE_SCHEDULE
     # Committing / publishing / discarding drafts are scheduling actions (#86).
     if path in ("/api/scheduler/commit", "/api/scheduler/drafts/publish",
                 "/api/scheduler/drafts/discard"):
