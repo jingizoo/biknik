@@ -15,20 +15,34 @@ Usage (from ``backend/tests``):
                                             # OWN database (URL_p0, URL_p1, …)
                                             # so concurrent workers never share
                                             # one Postgres DB's tables.
+    python3 run_parallel.py --fail-output-lines 40   # bound each failing
+                                            # shard's report to 40 lines TOTAL
 
 Exit code is non-zero if any shard fails; failing shards' output is printed.
 HS_PBKDF2_ITERATIONS is already lowered by tests/helpers.py at import time.
 
 Diagnosability (#382 postmortem): a failing shard's report used to be a blind
-tail slice (``err[-4000:]``) of raw output. The HTTP tests leak listening
-sockets whose ``ResourceWarning: unclosed <socket …>`` lines are emitted by the
-garbage collector at INTERPRETER SHUTDOWN — i.e. *after* unittest has printed
-``FAILED (failures=1)`` — so hundreds of them sat in the last 4000 characters
-and pushed the actual ``FAIL:``/``Traceback``/``AssertionError`` block out of
-the window. Red CI carried no assertion at all. Both halves are fixed here:
-the noise is filtered out of the captured TEXT (never suppressed in the child,
-so a genuine leak regression is still observable), and what is printed is
-anchored to the failure section rather than to a byte offset.
+tail slice (``err[-4000:]``) of raw output, and the HTTP fixtures leaked their
+listening sockets — ``ThreadingHTTPServer.shutdown()`` stops the serve loop but
+only ``server_close()`` releases the socket, and 80 of the suite's 88 fixtures
+called just the first. The garbage collector reported every one of them as
+``ResourceWarning: unclosed <socket …>`` at INTERPRETER SHUTDOWN — i.e. *after*
+unittest had printed ``FAILED (failures=1)`` — so hundreds of those lines sat in
+the last 4000 characters and pushed the actual ``FAIL:``/``Traceback``/
+``AssertionError`` block out of the window. Red CI carried no assertion at all.
+
+Three things changed, and ``tests/test_run_parallel_report.py`` pins all of
+them (the first round proved the fix with a pasted transcript, which does not
+run again):
+
+* The fixtures now call ``server_close()``, so the noise is not produced.
+* The report still filters ``unclosed <socket …>`` out of the captured TEXT as
+  defence in depth — never suppressed in the child, so a genuine leak
+  regression is still observable, and every *other* warning (unclosed files,
+  unclosed database connections) is kept because it is real signal.
+* What is printed is anchored to the failure section rather than to a byte
+  offset, and ``--fail-output-lines N`` bounds it to N lines INCLUDING the
+  omission/elision markers it adds. See :func:`_failure_excerpt`.
 """
 
 import argparse
@@ -54,6 +68,23 @@ _TRACEMALLOC_HINT = (
 _FAILURE_MARKER_RE = re.compile(r"^(?:FAIL|ERROR): \S")
 _TRACEBACK_RE = re.compile(r"^Traceback \(most recent call last\):")
 _RULE_RE = re.compile(r"^=+$")
+
+# The smallest ``--fail-output-lines N`` that can still carry an actionable
+# report. The excerpt is bounded to N lines *including its own markers*, and
+# three things have to survive for a red CI to be worth reading:
+#
+#   1. the first ``FAIL:``/``ERROR:`` banner — WHICH test failed;
+#   2. the elision marker — so the gap between head and tail is never silent;
+#   3. unittest's closing ``FAILED (…)`` summary — HOW MANY failed.
+#
+# At N=2 the marker would have to go, at N=1 one of the two endpoints as well,
+# and a report that silently drops its own middle is exactly the failure mode
+# #382 was about. So N=1 and N=2 are rejected outright rather than quietly
+# honoured by emitting more than N lines.
+MIN_FAIL_OUTPUT_LINES = 3
+
+_OMITTED_NOTE = "[… {n} line(s) before the first failure omitted …]"
+_ELIDED_NOTE = "[… {n} line(s) elided from the middle of the failure section …]"
 
 
 def _strip_socket_warnings(text):
@@ -98,40 +129,109 @@ def _summary_line(text):
     return ""
 
 
-def _failure_excerpt(text, max_lines):
-    """Return the report anchored to the FAILURE SECTION, not to a byte offset.
+def _check_fail_output_lines(n):
+    """Reject a positive budget too small to carry an actionable report.
 
-    Starts at the first ``FAIL:``/``ERROR:`` banner (including its ``===`` rule)
-    or, failing that, the first traceback, so the failing test name, its
-    file:line and its assertion are always inside the window. ``max_lines <= 0``
-    means print everything. If the failure section itself overflows the budget,
-    the HEAD (first failures, with their assertions) and the TAIL (``Ran N
-    tests`` / ``FAILED (…)``) are both kept and the middle is elided — never the
-    other way round.
+    ``0`` (and any negative, which argparse rejects earlier) means unbounded.
+    Raises :class:`ValueError` for ``1 <= n < MIN_FAIL_OUTPUT_LINES``.
     """
-    lines = text.splitlines()
-    if max_lines <= 0 or len(lines) <= max_lines:
-        return "\n".join(lines)          # nothing to bound; keep every line
-    start = 0
+    if 0 < n < MIN_FAIL_OUTPUT_LINES:
+        raise ValueError(
+            f"--fail-output-lines must be 0 (unbounded) or at least "
+            f"{MIN_FAIL_OUTPUT_LINES}, got {n}: below {MIN_FAIL_OUTPUT_LINES} "
+            f"the excerpt cannot hold the failing test's name, the elision "
+            f"marker and unittest's closing summary at the same time.")
+    return n
+
+
+def _fail_output_lines_arg(value):
+    """argparse ``type=`` for ``--fail-output-lines``: fail fast, not after the run."""
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected an integer, got {value!r}")
+    if n < 0:
+        raise argparse.ArgumentTypeError(
+            f"--fail-output-lines must not be negative, got {n} "
+            f"(use 0 for unbounded)")
+    try:
+        return _check_fail_output_lines(n)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+def _first_failure_anchor(lines):
+    """``(rule_index, banner_index)`` of the first ``FAIL:``/``ERROR:`` section.
+
+    ``rule_index`` points at the ``======`` rule unittest prints above the
+    banner when there is one, otherwise at the banner itself; ``banner_index``
+    always points at the informative line. A bare traceback (a shard that died
+    outside the test run) anchors both at the ``Traceback`` line. ``(0, 0)``
+    when there is no failure marker at all.
+    """
     for i, line in enumerate(lines):
         if _FAILURE_MARKER_RE.match(line):
-            start = i - 1 if i and _RULE_RE.match(lines[i - 1]) else i
-            break
+            return (i - 1 if i and _RULE_RE.match(lines[i - 1]) else i), i
         if _TRACEBACK_RE.match(line):
-            start = i
-            break
-    head_note = []
-    if start:
-        head_note = [f"[… {start} line(s) before the first failure omitted …]"]
+            return i, i
+    return 0, 0
+
+
+def _failure_excerpt(text, max_lines):
+    """Return AT MOST ``max_lines`` lines, anchored to the FAILURE SECTION.
+
+    ``max_lines <= 0`` means print everything. Otherwise the returned excerpt is
+    bounded to ``max_lines`` lines **including the omission and elision markers
+    it adds** — the markers are spent out of the same budget as the content, so
+    ``--fail-output-lines 10`` yields ten lines and not twelve. Anything below
+    :data:`MIN_FAIL_OUTPUT_LINES` is rejected by :func:`_check_fail_output_lines`
+    rather than honoured by overshooting.
+
+    The excerpt starts at the first ``FAIL:``/``ERROR:`` banner (with its ``===``
+    rule when it fits) or, failing that, the first traceback, so the failing test
+    name and its assertion are inside the window; a blind tail would drop the
+    FIRST failures of a multi-failure shard, which is the half a reader needs
+    most. When the failure section still overflows, the HEAD (first failures,
+    with their assertions) and the TAIL (``Ran N tests`` / ``FAILED (…)``) are
+    both kept and the middle is elided.
+
+    What gets sacrificed as N tightens, in order — lowest priority first:
+
+    1. the ``[… N line(s) before the first failure omitted …]`` note;
+    2. the ``===`` rule decorating the banner (the banner itself is kept);
+
+    so that at ``N == MIN_FAIL_OUTPUT_LINES`` the excerpt is exactly the failing
+    test's banner, the elision marker and unittest's closing summary.
+    """
+    lines = text.splitlines()
+    if max_lines <= 0:
+        return "\n".join(lines)          # unbounded; keep every line
+    _check_fail_output_lines(max_lines)
+    if len(lines) <= max_lines:
+        return "\n".join(lines)          # already within budget
+
+    rule_i, banner_i = _first_failure_anchor(lines)
+
+    # ONE budget of max_lines pays for: the pre-failure note (if any), the head
+    # slice, the elision marker, and the tail slice.
+    note_cost = 1 if rule_i else 0
+    if max_lines - note_cost - 1 < 2:    # no room left for both a head and tail
+        note_cost = 0                    # the note is sacrificed first
+    budget = max_lines - note_cost - 1   # the elision marker costs exactly one
+    head_n = max(1, (budget * 2) // 3)
+    tail_n = budget - head_n             # >= 1 for every budget >= 2
+
+    # With a single head line to spend, spend it on the FAIL:/ERROR: banner
+    # rather than on the ``===`` rule that merely decorates it.
+    start = rule_i if head_n >= 2 else banner_i
+
+    note = [_OMITTED_NOTE.format(n=start)] if (note_cost and start) else []
     body = lines[start:]
-    if max_lines > 0 and len(body) > max_lines:
-        head_n = max(1, (max_lines * 2) // 3)
-        tail_n = max(1, max_lines - head_n)
-        body = (body[:head_n]
-                + [f"[… {len(body) - head_n - tail_n} line(s) elided from the "
-                   f"middle of the failure section …]"]
-                + body[-tail_n:])
-    return "\n".join(head_note + body)
+    if len(note) + len(body) <= max_lines:
+        return "\n".join(note + body)    # fits without eliding anything
+    return "\n".join(note + body[:head_n]
+                     + [_ELIDED_NOTE.format(n=len(body) - head_n - tail_n)]
+                     + body[-tail_n:])
 
 
 def _failing_test_names(text):
@@ -183,10 +283,13 @@ def main():
     ap.add_argument("-j", "--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 1))
     ap.add_argument("--postgres", metavar="BASE_URL", default=None,
                     help="run against PostgreSQL, one DB per worker")
-    ap.add_argument("--fail-output-lines", type=int, default=0, metavar="N",
-                    help="bound each failing shard's report to N lines, keeping "
-                         "the failure section's head and tail (default 0 = "
-                         "print the whole thing)")
+    ap.add_argument("--fail-output-lines", type=_fail_output_lines_arg,
+                    default=0, metavar="N",
+                    help=f"bound each failing shard's report to N lines TOTAL, "
+                         f"markers included, keeping the failure section's head "
+                         f"and tail (default 0 = print the whole thing; the "
+                         f"smallest accepted positive N is "
+                         f"{MIN_FAIL_OUTPUT_LINES})")
     args = ap.parse_args()
 
     os.chdir(os.path.dirname(os.path.abspath(__file__)))
