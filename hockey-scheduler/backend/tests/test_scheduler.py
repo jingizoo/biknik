@@ -2374,7 +2374,14 @@ class SchedulerContract:
         self.assertEqual(self._meeting_counts(res)[pair], 1)  # 3 - 2 existing
 
     def test_regeneration_after_partial_schedule_adds_exactly_the_missing(self):
-        self._division_fixture(4, 18)
+        # SPARE ice (36 slots for 18 meetings) is deliberate and
+        # load-bearing. With exactly 18 the ice runs out at precisely the
+        # right moment to disguise a generator that re-proposes existing
+        # meetings: it would place the first 12 of its 18 re-proposed rows,
+        # report "created 12", and land on three games per pair anyway --
+        # every assertion below passing for entirely the wrong reason. With
+        # ice to spare, a re-adding generator creates 18 and is caught.
+        self._division_fixture(4, 36)
         # Commit a single round-robin first: 6 of the 18 meetings exist.
         first = commit_fresh_draft(self.api, "div1")
         self.assertEqual(len(first["created"]), 6)
@@ -2382,6 +2389,10 @@ class SchedulerContract:
         self.assertEqual(len(before), 6)
 
         second = commit_fresh_draft(self.api, "div1", meetings_per_opponent=3)
+        # Named explicitly so a generator that re-proposes existing meetings
+        # fails HERE, reporting the refusal the commit gate raised, rather
+        # than as a bare KeyError on the line below.
+        self.assertNotIn("error", second, repr(second))
         self.assertEqual(len(second["created"]), 12)  # 18 - 6, and nothing more
         after = {g.id for g in self.store.all_games()}
         self.assertEqual(len(after), 18)
@@ -2395,7 +2406,14 @@ class SchedulerContract:
         self.assertEqual(set(counts.values()), {3})
 
     def test_regeneration_twice_in_a_row_is_a_no_op(self):
-        self._division_fixture(4, 18)
+        # SPARE ice (36 slots for 18 meetings) is what makes the "zero new
+        # Games" assertion below able to fail at all. Sized exactly, the
+        # first commit consumes every slot, and a generator that re-proposed
+        # all 18 existing meetings would find no ice for any of them and
+        # create nothing -- reporting the idempotent answer for the
+        # non-idempotent reason. Half the ice left over means a re-adding
+        # generator really does create a second set of Games.
+        self._division_fixture(4, 36)
         first = commit_fresh_draft(self.api, "div1", meetings_per_opponent=3)
         self.assertEqual(len(first["created"]), 18)
         after_first = {g.id for g in self.store.all_games()}
@@ -2404,6 +2422,10 @@ class SchedulerContract:
         # new Games appear -- not by re-asserting a total that would look
         # identical if the second run had replaced the first run's rows.
         second = commit_fresh_draft(self.api, "div1", meetings_per_opponent=3)
+        # A no-op regeneration must SUCCEED with nothing to do, not be
+        # refused: asserted explicitly so a re-adding generator surfaces the
+        # gate's refusal here instead of as a bare KeyError below.
+        self.assertNotIn("error", second, repr(second))
         self.assertEqual(second["created"], [])
         after_second = {g.id for g in self.store.all_games()}
         self.assertEqual(after_first, after_second)
