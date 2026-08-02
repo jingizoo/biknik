@@ -102,6 +102,10 @@ class MigrationApplyTest(unittest.TestCase):
             cur.execute("ALTER TABLE leagues DROP COLUMN program_id")
             cur.execute("ALTER TABLE leagues ADD COLUMN season_id TEXT")
             cur.execute("DROP INDEX IF EXISTS ux_league_season")
+            # 050 is a later dependent of the 035 hierarchy being reversed.
+            # Remove it before league_seasons; deleting the migration ledger
+            # below makes the adoption replay rebuild it in canonical order.
+            cur.execute("DROP TABLE IF EXISTS schedule_scenarios")
             cur.execute("DROP TABLE IF EXISTS league_seasons")
             cur.execute("ALTER TABLE games DROP COLUMN league_id")
             cur.execute("ALTER TABLE season_team_registrations DROP COLUMN league_id")
@@ -226,6 +230,7 @@ class MigrationApplyTest(unittest.TestCase):
             adopted_tables = {r["name"] for r in adopted.conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
             self.assertIn("league_seasons", adopted_tables)
+            self.assertIn("schedule_scenarios", adopted_tables)
             self.assertIn("league_season_id", _table_columns(adopted, "divisions"))
             self.assertIn("program_id", _table_columns(adopted, "leagues"))
             self.assertIn("league_id", _table_columns(adopted, "teams"))

@@ -24,6 +24,7 @@ from hockey_scheduler.store.sql_store import migrate
 
 _VERSION = "028_competition_reset"
 _V035 = "035_competition_hierarchy_reset"
+_V050 = "050_schedule_scenarios"
 
 
 def _sql_targets():
@@ -45,9 +46,11 @@ def _downgrade_035(store):
     POST-028 schema and un-record it, so ``_downgrade_028`` can finish reversing
     to pre-028 and a re-``migrate`` re-applies 028 AND 035 over legacy-shaped
     rows. Runs on a freshly-migrated (empty) database — only the SCHEMA is
-    reversed."""
+    reversed. Later hierarchy dependents are rewound too so the forward replay
+    restores the complete current schema."""
     with store.transaction():
         cur = store.conn.cursor()
+        cur.execute("DROP TABLE IF EXISTS schedule_scenarios")
         cur.execute("DROP INDEX IF EXISTS ix_teams_league")
         cur.execute("ALTER TABLE teams DROP COLUMN league_id")
         cur.execute("DROP INDEX IF EXISTS ux_team_league_season")
@@ -66,7 +69,8 @@ def _downgrade_035(store):
         cur.execute("DROP INDEX IF EXISTS ux_league_season")
         cur.execute("DROP TABLE IF EXISTS league_seasons")
         cur.execute(store.dialect.sql(
-            "DELETE FROM schema_migrations WHERE version = ?"), (_V035,))
+            "DELETE FROM schema_migrations WHERE version IN (?, ?)"),
+            (_V035, _V050))
 
 
 def _downgrade_028(store):
@@ -150,9 +154,10 @@ class C1bUpgradedReopenTest(unittest.TestCase):
                 _downgrade_035(first)
                 _downgrade_028(first)
                 _seed_pre028(first)
-                migrate(first.conn, first.dialect)  # apply 028 AND 035
+                migrate(first.conn, first.dialect)  # apply 028, 035, and 050
                 self.assertIn(_VERSION, first.migration_status()["applied"], label)
                 self.assertIn(_V035, first.migration_status()["applied"], label)
+                self.assertIn(_V050, first.migration_status()["applied"], label)
                 first.close()
 
                 # 2. A fresh store against the same database (a restart) reads
@@ -161,6 +166,7 @@ class C1bUpgradedReopenTest(unittest.TestCase):
                 try:
                     self.assertIn(_VERSION, store.migration_status()["applied"], label)
                     self.assertIn(_V035, store.migration_status()["applied"], label)
+                    self.assertIn(_V050, store.migration_status()["applied"], label)
 
                     prog = store.get_program("prog1")
                     self.assertIsNotNone(prog, label)
