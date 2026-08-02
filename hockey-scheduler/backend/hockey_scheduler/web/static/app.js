@@ -87,6 +87,10 @@ let publicState = { schedule: null, standings: null, division: null, game: null,
 let publicTab = "schedule";        // "schedule" | "standings" (#83)
 let schedulerState = {
   division: null, preview: null, drafts: [], summary: null,
+  // #375 — the configurable regular-season format: how many times each team
+  // plays every other. 1 is the historical single round-robin, so an
+  // operator who never touches the control gets exactly the old behaviour.
+  meetings: 1,
   filters: { division: "all", rink: "all", issue: "all" },  // (#106)
   selected: new Set(),  // game_ids picked for publish/discard (#106)
 };  // (#86)
@@ -8816,6 +8820,12 @@ function renderScheduler(ov) {
       <div class="section-title" style="margin-top:0">Generate draft schedule</div>
       <div class="dq-actions">
         <select id="sched-div">${divOptions(schedulerState.division)}</select>
+        <label class="sr-only" for="sched-meetings">Games against each opponent</label>
+        <select id="sched-meetings" title="Games against each opponent">${
+          [1, 2, 3, 4].map((n) => `<option value="${n}"${
+            n === schedulerState.meetings ? " selected" : ""
+          }>${n === 1 ? "1 game" : `${n} games`} vs each opponent</option>`).join("")
+        }</select>
         <button class="act" data-sched-generate>Generate</button>
       </div></div>
     ${previewBlock}${summaryBlock}${draftBlock}`;
@@ -11246,6 +11256,16 @@ async function render() {
   // Draft scheduler (#86): generate preview, commit, publish, discard.
   const schedDiv = c.querySelector("#sched-div");
   if (schedDiv) schedDiv.onchange = () => { schedulerState.division = schedDiv.value; };
+  // #375 — the configurable format. Recorded exactly like the Division
+  // select above (no re-render): the value is read fresh by BOTH the
+  // Generate and Commit handlers below, and the backend binds it into
+  // draft_fingerprint, so changing it after a Generate makes Commit fail
+  // preview_stale — already handled by the error branch, which clears the
+  // stale preview and returns focus to Generate.
+  const schedMeetings = c.querySelector("#sched-meetings");
+  if (schedMeetings) schedMeetings.onchange = () => {
+    schedulerState.meetings = Number(schedMeetings.value) || 1;
+  };
   const schedGen = c.querySelector("[data-sched-generate]");
   // #328 review round 8 finding 4 -- consume the flag set by the PREVIOUS
   // render's Commit error branch below, now that this render's fresh
@@ -11258,7 +11278,10 @@ async function render() {
   }
   if (schedGen) schedGen.onclick = async () => {
     toast = "";
-    const res = await post("/api/scheduler/draft", { division_id: schedulerState.division });
+    const res = await post("/api/scheduler/draft", {
+      division_id: schedulerState.division,
+      meetings_per_opponent: schedulerState.meetings,
+    });
     schedulerState.preview = (res && !res.error) ? res : null;
     await render();
   };
@@ -11271,6 +11294,15 @@ async function render() {
     // this fingerprint no longer matches that fresh regeneration.
     const res = await post("/api/scheduler/commit", {
       division_id: schedulerState.division,
+      // #375 — the format the PREVIEW was generated with, read off that
+      // preview and not off the live select, exactly like the
+      // draft_fingerprint below it. What Commit writes must be what is on
+      // screen: the select is the input to the NEXT Generate, so an
+      // operator who nudges it while reading a still-valid proposal must
+      // not thereby redefine the batch they are about to commit (nor be
+      // forced to regenerate an unchanged one).
+      meetings_per_opponent: (schedulerState.preview
+        && schedulerState.preview.meetings_per_opponent) || 1,
       draft_fingerprint: schedulerState.preview && schedulerState.preview.draft_fingerprint,
     });
     if (res && !res.error) {

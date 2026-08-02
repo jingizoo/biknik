@@ -22,6 +22,18 @@ dropped (#206 slice 1) — re-running Generate against a Division that
 already has some Games fills in only the missing matchups; it never
 duplicates the ones that exist.
 
+The regular-season FORMAT is configurable (#375): ``meetings_per_opponent``
+asks for N meetings between every pair instead of one, so 6 teams x 3
+meetings is 15 games per team. The three counting rules that decide whether
+a meeting is already satisfied are stated once, in
+:func:`_existing_pairing_games`, and are the same rules the single
+round-robin always used — an existing Regular game counts, a cancelled one
+does not, an exhibition does not. Home/away for the Nth meeting is decided
+deterministically from the sorted team ids alone (see
+:func:`round_robin_pairings`), never randomly and never from iteration
+order, so the same inputs reproduce the same split in any process and on
+any store backend.
+
 A team is never proposed for two overlapping games (#373). Occupancy is
 team-wide — keyed by stable team id and actual interval, never by rink or
 display name — and covers BOTH already-persisted games and the candidates
@@ -43,13 +55,71 @@ from .league_scope import (
 from .setup_service import SetupService as _PolicySetup
 
 
-def round_robin_pairings(team_ids):
-    """Single round-robin pairings via the circle method (deterministic).
+# #375 — an operator-configurable regular-season format is still a bounded
+# one: the pairing list this engine materializes grows as
+# ``meetings × C(teams, 2)``, so an unbounded value turns one request into an
+# arbitrarily large allocation. Real formats sit in the 1–4 range (single,
+# double, triple, quadruple round-robin); the ceiling is deliberately far
+# above any of them while still being a ceiling.
+MAX_MEETINGS_PER_OPPONENT = 20
 
-    Returns a flat list of ``(home_team_id, away_team_id)`` in round order.
-    Every team plays every other exactly once. An odd number of teams yields a
-    bye each round (the byed team simply has no game that round). Home/away
-    alternates by round for basic balance.
+
+def _normalize_meetings(value, field="meetings_per_opponent"):
+    """Validate the configurable meetings-per-opponent count (#375).
+
+    Client input, so every bad shape raises a structured ``ValidationError``
+    rather than letting a raw TypeError cross the facade boundary — the same
+    contract :func:`_normalize_constraints` already holds for the scheduling
+    constraints. ``None`` means "not specified" and keeps the historical
+    single round-robin, so every existing caller is unchanged.
+
+    ``bool`` is rejected explicitly even though it is an ``int`` subclass:
+    ``True`` would otherwise silently mean "1 meeting" and ``False`` would
+    mean "0", neither of which any caller can have intended.
+    """
+    if value is None:
+        return 1
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValidationError(
+            f"'{field}' must be an integer >= 1.")
+    if value < 1:
+        raise ValidationError(f"'{field}' must be an integer >= 1.")
+    if value > MAX_MEETINGS_PER_OPPONENT:
+        raise ValidationError(
+            f"'{field}' must be at most {MAX_MEETINGS_PER_OPPONENT}.")
+    return value
+
+
+def round_robin_pairings(team_ids, meetings=1):
+    """Round-robin pairings via the circle method (deterministic).
+
+    Returns a flat list of ``(home_team_id, away_team_id)``. With the default
+    ``meetings=1`` this is a SINGLE round-robin in round order — every team
+    plays every other exactly once — byte-identical to the pre-#375 output.
+    An odd number of teams yields a bye each round (the byed team simply has
+    no game that round). Home/away alternates by round for basic balance.
+
+    ``meetings`` (#375) repeats that base round-robin N times, so every team
+    plays every other exactly N times: ``meetings × C(teams, 2)`` pairings in
+    total, i.e. ``meetings × (teams - 1)`` games per team. The worked example
+    from the issue: 6 teams × 3 meetings = 45 pairings = 15 games per team.
+
+    Home/away is decided DETERMINISTICALLY, never arbitrarily: meeting *m*
+    (0-indexed) reuses the base round-robin's own orientation when *m* is
+    even and the exact reverse when *m* is odd. Two consequences worth
+    stating, because they are the guarantee rather than an accident:
+
+    * Every pair's home/away split is balanced to within one game — for even
+      ``meetings`` it is exactly even (each side hosts ``meetings / 2``), for
+      odd ``meetings`` the base orientation hosts one extra.
+    * The decision depends only on the sorted team ids and ``meetings``. No
+      RNG, no clock, no dict/set iteration order, no store state — so the
+      same inputs reproduce the same split in a different process, on a
+      different backend, in a different order of registration.
+
+    The cycles are emitted whole (all of meeting 0, then all of meeting 1,
+    …) rather than interleaved, which is both what a real league schedule
+    looks like and what keeps the ``meetings=1`` output unchanged.
     """
     teams = sorted(team_ids)
     if len(teams) < 2:
@@ -58,16 +128,19 @@ def round_robin_pairings(team_ids):
         teams = teams + [None]  # None marks the bye
     n = len(teams)
     fixed, rot = teams[0], teams[1:]
-    pairings = []
+    base = []
     for r in range(n - 1):
         arrangement = [fixed] + rot
         for i in range(n // 2):
             a, b = arrangement[i], arrangement[n - 1 - i]
             if a is None or b is None:
                 continue  # bye
-            pairings.append((a, b) if r % 2 == 0 else (b, a))
+            base.append((a, b) if r % 2 == 0 else (b, a))
         rot = [rot[-1]] + rot[:-1]  # rotate all but the fixed team
-    return pairings
+    if meetings == 1:
+        return base
+    return [(h, a) if m % 2 == 0 else (a, h)
+            for m in range(meetings) for h, a in base]
 
 
 def _available_game_slots(store, slot_ids=None):
@@ -563,7 +636,25 @@ def _existing_pairing_games(store, division_scope):
     count (that is exactly the signal the pairing needs re-scheduling); an
     EXHIBITION game does not count either (#283: it never affects
     standings and was never the round-robin obligation) — only a Regular
-    game satisfies a Regular pairing."""
+    game satisfies a Regular pairing.
+
+    #375 — the value is a LIST of every qualifying Game's id, not a single
+    id. A configurable format asks each pair to meet N times, so "does this
+    pairing already have a Game?" is no longer the question; "how many of
+    its N meetings are already satisfied?" is, and a mapping that can only
+    hold one id per pair structurally cannot answer it. The three counting
+    rules above are unchanged and are what the count is taken OVER: an
+    existing Regular game counts, a cancelled one does not, an exhibition
+    does not.
+
+    The list is SORTED by game id, which is load-bearing rather than
+    cosmetic: ``store.all_games()`` is insertion-ordered on the in-memory
+    store but ``ORDER BY id`` on the SQL store, so an unsorted list would
+    make WHICH existing Game a given already-scheduled row reports — and
+    therefore the ``draft_fingerprint`` derived from it — differ between
+    Memory, SQLite and PostgreSQL for identical data. Sorting here is the
+    single point that makes the count and its reporting backend-independent.
+    """
     wanted = set(division_scope)
     found = {}
     for g in store.all_games():
@@ -574,8 +665,56 @@ def _existing_pairing_games(store, division_scope):
             continue
         if g.game_type != GameType.REGULAR.value:
             continue
-        found[scope + (frozenset((g.home_team_id, g.away_team_id)),)] = g.id
-    return found
+        found.setdefault(
+            scope + (frozenset((g.home_team_id, g.away_team_id)),), []).append(g.id)
+    return {key: sorted(ids) for key, ids in found.items()}
+
+
+def reviewed_existing_counts(already_scheduled, league_season_id):
+    """``{(league_season_id, division_id, pairing): count}`` — how many
+    existing Games the reviewed proposal ACCOUNTED FOR per pairing (#375).
+
+    The commit gate's race checks used to ask "does this pairing have a Game
+    at all?", which was the right question only while every pairing needed
+    exactly one meeting. With N meetings a pairing can legitimately have
+    K < N existing Games *and still be in this batch* for its remaining
+    N - K, so the question becomes "does it have MORE than the proposal
+    reviewed?". This builds the baseline that comparison is made against,
+    straight from the proposal's own ``already_scheduled`` rows.
+
+    At the historical single round-robin this returns 0 for every pairing
+    that has a ``draft_games`` row (such a pairing has no already-scheduled
+    row), so ``len(existing) > 0`` — the exact pre-#375 predicate — is what
+    the callers' comparison reduces to.
+    """
+    counts = {}
+    for a in already_scheduled:
+        key = (league_season_id, a.get("division_id"),
+               frozenset((a["home_team_id"], a["away_team_id"])))
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def raced_pairing_game_id(existing_now, reviewed_counts, key):
+    """The id of a Game that appeared for ``key`` BEYOND what the reviewed
+    proposal accounted for, or ``None`` if none did (#375).
+
+    ``existing_now`` is a fresh :func:`_existing_pairing_games` snapshot
+    taken under the commit's locks; ``reviewed_counts`` comes from
+    :func:`reviewed_existing_counts`. A pairing whose current count exceeds
+    the reviewed count had a Game created for it since the operator
+    reviewed the preview — the terminal ``pairing_already_scheduled`` fact.
+
+    The id returned is the first one the proposal did NOT account for, taken
+    from the sorted list, so the error names the same Game on every backend.
+    At the single round-robin (reviewed count 0, one existing Game) that is
+    that Game's id — identical to the pre-#375 ``existing_now[key]`` lookup.
+    """
+    ids = existing_now.get(key, ())
+    reviewed = reviewed_counts.get(key, 0)
+    if len(ids) <= reviewed:
+        return None
+    return ids[reviewed]
 
 
 def _split_already_scheduled(store, pairings, existing, league_season_id):
@@ -586,18 +725,43 @@ def _split_already_scheduled(store, pairings, existing, league_season_id):
     look identical to "not asked for") or silently re-proposed (the
     production risk this slice fixes). ``league_season_id`` is the single
     constant identity shared by every pairing in this call (#328 review
-    round 2 — the lookup key must match Division, not just pairing)."""
+    round 2 — the lookup key must match Division, not just pairing).
+
+    #375 — with a configurable format the SAME unordered pair appears
+    ``meetings`` times in ``pairings``, and ``existing`` holds a sorted LIST
+    of the Games that already satisfy it. Each pair's existing Games are
+    consumed one per requested meeting, in order: the first K requested
+    meetings (K = however many qualifying Games exist, capped at the number
+    requested) become ``already_scheduled`` rows naming one existing Game
+    each, and only the surplus stays in ``remaining``. That is precisely
+    "regeneration fills only the missing meetings" — and, run again with
+    nothing changed in between, every requested meeting is matched by an
+    existing Game, ``remaining`` is empty, and the regeneration is a no-op.
+
+    Consumption is by MEETING ORDER, not by trying to match each existing
+    Game's actual home/away orientation. That is a deliberate determinism
+    choice: meeting order is a total order fixed by the inputs alone, so the
+    same facts always leave the same meetings outstanding, whereas
+    orientation-matching would need a tie-break the inputs do not supply
+    whenever several existing Games share an orientation.
+
+    A pair with MORE existing Games than the format requests (an
+    over-scheduled pairing) simply has no remaining meetings — the surplus
+    is left unreported, never used to manufacture negative work."""
     remaining, already = [], []
+    consumed = {}
     for home, away, division_id in pairings:
-        existing_game_id = existing.get(
-            (league_season_id, division_id, frozenset((home, away))))
-        if existing_game_id is not None:
+        key = (league_season_id, division_id, frozenset((home, away)))
+        existing_ids = existing.get(key, ())
+        taken = consumed.get(key, 0)
+        if taken < len(existing_ids):
+            consumed[key] = taken + 1
             already.append({
                 "home_team_id": home, "away_team_id": away,
                 "home_team_name": _team_name(store, home),
                 "away_team_name": _team_name(store, away),
                 "division_id": division_id,
-                "existing_game_id": existing_game_id,
+                "existing_game_id": existing_ids[taken],
             })
         else:
             remaining.append((home, away, division_id))
@@ -617,7 +781,8 @@ def _canonical_sort_key(row):
 
 
 def _draft_fingerprint(league_season_id, team_ids, draft_games, unscheduled,
-                        unschedulable_teams, already_scheduled):
+                        unschedulable_teams, already_scheduled,
+                        meetings_per_opponent=1):
     """Deterministic identity of exactly what this proposal reviewed — #328
     review round 5, widened rounds 7, 10, 11, 12, 15, and 16. Bound into the response
     so the commit path can prove, right before writing, that this fact
@@ -779,13 +944,23 @@ def _draft_fingerprint(league_season_id, team_ids, draft_games, unscheduled,
         "already_scheduled": scheduled,
         "unscheduled": unresolved,
         "unschedulable_teams": blocked_teams,
+        # #375 — the requested regular-season FORMAT is part of what the
+        # operator reviewed, so it is bound directly rather than left to be
+        # inferred from the buckets above. Changing N almost always changes
+        # those buckets too, but "almost always" is not the standard the
+        # rest of this fingerprint is held to: binding the number itself
+        # makes "the preview was generated for a different format than the
+        # commit is asking for" a guaranteed mismatch instead of one that
+        # happens to fall out of the row lists.
+        "meetings_per_opponent": meetings_per_opponent,
     }
     return hashlib.sha256(json.dumps(
         payload, sort_keys=True, separators=(",", ":"), default=str
     ).encode()).hexdigest()[:16]
 
 
-def draft_schedule(store, division_id, slot_ids=None, constraints=None):
+def draft_schedule(store, division_id, slot_ids=None, constraints=None,
+                   meetings_per_opponent=None):
     """Generate a draft round-robin schedule for a division (#84/#85).
 
     Returns ``{division_id, team_count, draft_games, unscheduled,
@@ -799,14 +974,21 @@ def draft_schedule(store, division_id, slot_ids=None, constraints=None):
     :func:`_draft_fingerprint`) binds this exact missing/already-scheduled
     split AND each missing pairing's placement (slot, time) so a later
     commit can detect drift in either. Nothing is persisted.
+
+    ``meetings_per_opponent`` (#375) configures how many times each team
+    plays every other; ``None`` keeps the historical single round-robin.
+    Existing Regular Games count toward the requirement, so a regeneration
+    proposes only the meetings still missing.
     """
+    meetings = _normalize_meetings(meetings_per_opponent)
     # A division's teams are those validly registered in it this season (#180),
     # via the shared resolver — active rows whose Team exists and whose league
     # matches, so an orphaned or cross-league registration row can never enter a
     # draft (#199/#200 review). Same source of truth game creation, moves,
     # publishing, and standings use.
     teams = sorted(registered_team_ids_in_division(store, division_id))
-    all_pairings = [(h, a, division_id) for h, a in round_robin_pairings(teams)]
+    all_pairings = [(h, a, division_id)
+                    for h, a in round_robin_pairings(teams, meetings)]
     # #328 review — scope the exclusion by this Division's own LeagueSeason,
     # not division_id alone (see _existing_pairing_games).
     division = store.get_division(division_id) if division_id else None
@@ -825,17 +1007,19 @@ def draft_schedule(store, division_id, slot_ids=None, constraints=None):
         store, teams, pairings, unscheduled)
     return {
         "division_id": division_id, "team_count": len(teams),
+        "meetings_per_opponent": meetings,
         "draft_games": draft_games, "unscheduled": unscheduled,
         "already_scheduled": already_scheduled,
         "unschedulable_teams": unschedulable_teams,
         "draft_fingerprint": _draft_fingerprint(
             ls_id, teams, draft_games, unscheduled, unschedulable_teams,
-            already_scheduled),
+            already_scheduled, meetings),
     }
 
 
 def draft_schedule_for_league(store, season_id, league_id, division_id=None,
-                              slot_ids=None, constraints=None):
+                              slot_ids=None, constraints=None,
+                              meetings_per_opponent=None):
     """Generate a draft schedule for a whole League within a Season, optionally
     narrowed to one Division (#233 Slice G).
 
@@ -845,7 +1029,13 @@ def draft_schedule_for_league(store, season_id, league_id, division_id=None,
     league-wide draft never pairs a Gold team against a Silver team just
     because they share a League; each Division's teams get their own
     round-robin, all sharing the same season-scoped ice pool for assignment.
+
+    ``meetings_per_opponent`` (#375) applies to every Division group alike:
+    each group's own round-robin is repeated N times, so a team plays every
+    opponent IN ITS OWN DIVISION N times and still never meets one from
+    another Division.
     """
+    meetings = _normalize_meetings(meetings_per_opponent)
     groups = registered_teams_by_division_in_league(
         store, season_id, league_id, division_id)
     all_pairings = []
@@ -853,7 +1043,8 @@ def draft_schedule_for_league(store, season_id, league_id, division_id=None,
     for div_id, team_ids in groups.items():
         all_teams |= team_ids
         all_pairings.extend(
-            (h, a, div_id) for h, a in round_robin_pairings(sorted(team_ids)))
+            (h, a, div_id)
+            for h, a in round_robin_pairings(sorted(team_ids), meetings))
     # #328 review — scope the exclusion by THIS League+Season's own
     # LeagueSeason, not division_id alone (see _existing_pairing_games):
     # the "no Division" group's div_id is None for every League, so
@@ -876,10 +1067,11 @@ def draft_schedule_for_league(store, season_id, league_id, division_id=None,
     return {
         "season_id": season_id, "league_id": league_id,
         "division_id": division_id, "team_count": len(all_teams),
+        "meetings_per_opponent": meetings,
         "draft_games": draft_games, "unscheduled": unscheduled,
         "already_scheduled": already_scheduled,
         "unschedulable_teams": unschedulable_teams,
         "draft_fingerprint": _draft_fingerprint(
             ls_id, all_teams, draft_games, unscheduled, unschedulable_teams,
-            already_scheduled),
+            already_scheduled, meetings),
     }
