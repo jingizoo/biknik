@@ -2044,6 +2044,81 @@ async function contextSeededDrawerValues(kind) {
   // the real axis to bind to and is not wired into the context bar yet.
   return { ok: true, values: {} };
 }
+// WHICH focus request is the CURRENT one (#365 review round 12).
+//
+// focusContentHeading() below is a POLL -- a chain of setTimeout(..., 50) up
+// to 40 attempts that ends in an unconditional #content landing -- and until
+// this counter existed, that chain belonged to nobody. It kept running after
+// the navigation that started it had been replaced, and then landed focus on
+// behalf of an operator who had already asked to go somewhere else. Recorded
+// as a real browser-journey failure at 390px ("the resolution path did not
+// focus the Allow picker; focus is on {id: content}"), and traced there
+// verbatim -- the nav click's poll firing 32ms AFTER the deep link it was
+// racing had already kept its promise:
+//
+//     19ms  focusContentHeading {attempt: 0, exit: "poll"}   <- nav to the
+//                                  Facilities landing; #content is skeletons
+//     38ms  render:end (setup/hub)                           <- landing paints
+//     60ms  focusin BUTTON                                   <- the operator
+//                                  activates "Allow a venue for this season"
+//     61ms  requestDestinationFocus setupHierarchy           <- NEWER request
+//     70ms  focusContentHeading {attempt: 1, exit: "poll"}   <- still running
+//     89ms  focusin va-add-season_2/SELECT                   <- promise KEPT
+//    121ms  focusContentHeading {attempt: 2, exit: "content-early"}
+//    121ms  focusin content/DIV                              <- and STOLEN
+//
+// The theft is silent and permanent: the intent is already spent, so nothing
+// puts focus back, and a keyboard/screen-reader operator who asked to be
+// taken to the grant control is left at the top of the page instead. Note the
+// exit it takes -- "content-early", not the 2s floor. The Setup hierarchy
+// tree has no heading of its own (its `headings` count inside #content is
+// literally 0), which is exactly the case the fallback below was written for;
+// so the older poll does not even have to run out of budget to land on
+// #content, it only has to tick once after the newer destination has painted.
+//
+// SO EVERY FOCUS REQUEST TAKES A TICKET, and a poll that no longer holds the
+// current one stops where it stands. Two kinds of request take one:
+// focusContentHeading() itself (a second navigation supersedes the first --
+// the operator asked for the newer destination) and requestDestinationFocus()
+// (a deep link is a focus request too, and a more specific one). This is the
+// same supersession discipline the rest of #365 applies to every other async
+// mutation -- cardGenerations for card writes, contextRevision for renders,
+// drawerSeedFetchSeq for drawer seeds -- and it is here for the same reason:
+// an older async operation must never get to answer for a newer one.
+//
+// WHAT IT DELIBERATELY DOES NOT DO is weaken the fallback for the caller that
+// is genuinely current. A poll holding the current ticket behaves EXACTLY as
+// before, floor included; only a superseded one is dropped, and it is dropped
+// silently because the newer request is what owns focus now.
+//
+// Nor does the ticket run the other way, cancelling a standing destination
+// intent when a newer focusContentHeading() lands: an intent already carries
+// a far stronger binding than a ticket (principal + session epoch + context
+// tuple + view + sub-view + "no dialog is open", all re-checked at
+// settlement), so it cannot fire onto a surface the operator has left. The
+// generic poll has no binding of any kind -- it focuses whatever #content
+// happens to hold whenever it happens to tick -- which is precisely why it,
+// and only it, needs one.
+//
+// AND THE BOUNDARIES BUMP IT TOO (#365 round 13). Round 12 read the sentence
+// above too narrowly: it gave the poll a binding to newer REQUESTS and
+// stopped there, which closed the reported race and left the identical stale
+// work alive across the two boundaries the rest of this slice already
+// defends. A poll started under principal A / tuple X survived both a
+// principal or session-epoch change (resetTransientUiState) and a confirmed
+// context switch (sendContextSwitch's success path, where
+// contextOptions.selected moves), and could still fire afterwards -- landing
+// #content on a surface belonging to an identity or a tuple that never asked
+// for it. The intent above is dropped at exactly those two points for exactly
+// that reason; the ticket is now bumped at the same two points, and since a
+// newer ticket is all the poll can be told, that bump IS its cancellation.
+// Deliberately silent: the crossing focuses nothing on the arriving surface
+// on the departing one's behalf. And deliberately cheap for the arriving
+// identity -- a focusContentHeading() called after the bump holds the current
+// ticket and behaves exactly as before, floor included.
+let focusRequestSeq = 0;
+function newFocusRequest() { return ++focusRequestSeq; }
+
 // Best-effort focus landing for a plain view switch (no drawer of its own to
 // auto-focus) — the first heading-ish element in the freshly rendered view,
 // falling back to the #content region itself for a destination with no
@@ -2054,7 +2129,22 @@ async function contextSeededDrawerValues(kind) {
 // next tick. Poll briefly instead of a single setTimeout(0), which raced
 // that fetch and could fire before the real content painted (#331 review
 // round 1 finding 4).
-function focusContentHeading(attempt) {
+//
+// Takes a fresh ticket per CALL, not per attempt: the whole chain of attempts
+// is one request, and it is the request that gets superseded, never an
+// individual tick.
+function focusContentHeading() {
+  focusContentHeadingAttempt(0, newFocusRequest());
+}
+
+function focusContentHeadingAttempt(attempt, request) {
+  // SUPERSEDED (#365 round 12): a newer focus request exists, so this chain
+  // is answering for a navigation the operator has already left behind.
+  // Returns without focusing ANYTHING -- including without taking the floor
+  // below, which is the entire point: the floor is a promise that focus will
+  // not be left nowhere, and when a newer request is live focus is not
+  // nowhere, it is wherever that request has put it or is about to.
+  if (request !== focusRequestSeq) return;
   const content = document.getElementById("content");
   const heading = content && content.querySelector(
     "h1, h2, h3, .section-title");
@@ -2066,8 +2156,8 @@ function focusContentHeading(attempt) {
     content.focus();
     return;
   }
-  if ((attempt || 0) < 40) {
-    setTimeout(() => focusContentHeading((attempt || 0) + 1), 50);
+  if (attempt < 40) {
+    setTimeout(() => focusContentHeadingAttempt(attempt + 1, request), 50);
     return;
   }
   // Poll exhausted (40 x 50ms = 2s). It used to simply return here, which
@@ -2085,6 +2175,15 @@ function focusContentHeading(attempt) {
   // from there, and a screen reader announces the region rather than
   // nothing. Deliberately unconditional -- a slow render must never end with
   // focus nowhere.
+  //
+  // Still unconditional after the supersession check above (#365 round 12),
+  // and reaching this line is exactly what proves the request is the current
+  // one: nothing newer has been asked for, so "focus is nowhere" is a real
+  // possibility and this is the answer to it. The only case that no longer
+  // gets here is the one where focus is demonstrably NOT nowhere, because a
+  // newer request owns it. e2e/facilities-venue-access.js asserts both halves
+  // -- (F) that a superseded poll never fires, (F2) that a current one still
+  // takes this floor when its destination is still loading.
   if (content) {
     content.setAttribute("tabindex", "-1");
     content.setAttribute("aria-label", "Page content");
@@ -2092,46 +2191,209 @@ function focusContentHeading(attempt) {
   }
 }
 
+// ===== DESTINATION FOCUS INTENTS (#365 review round 11) ==================
+//
+// A Setup DEEP LINK promises to land the operator ON one specific control --
+// the selected Season's "Register" add row (participation), or its "Allow a
+// venue" picker (the control that actually creates the missing
+// SeasonVenueAccess) -- and that control does not exist at click time.
+// switchTab() kicks off an ASYNC render() whose Setup reads (setup overview,
+// players, the canonical hierarchy, per-Season registrations, the selected
+// Season's venue-access and grant candidates, setup progress) all have to
+// land before the tree paints once.
+//
+// WHAT THIS REPLACES, AND WHY A BIGGER BUDGET WAS NEVER THE ANSWER. Both deep
+// links used to POLL: every 50ms, up to 200 attempts (10s) while a skeleton
+// was still up, then hand off to focusContentHeading(), whose own 40x50ms
+// (2s) poll ends in an UNCONDITIONAL #content landing -- a combined ~12s
+// budget, after which the promise silently degraded to "somewhere in the page
+// region". A budget is a GUESS about how long a render takes, and every guess
+// is wrong under enough load: the recorded 390px failure ("the resolution
+// path did not focus the Allow picker; focus is on {id: content}") is that
+// guess losing, with a keyboard/screen-reader operator told they were being
+// taken to the control that grants venue access and stranded at the top of
+// the page instead -- silently, because taking the floor looks exactly like
+// arriving. Widening the budget only moves the boundary; it cannot remove it.
+//
+// SO THE INTENT IS RESOLVED BY AN EVENT, NOT BY ELAPSED TIME. render() calls
+// settleDestinationFocus() at each point where a pass has CONCLUDED what the
+// destination shows, and the intent resolves there in exactly one of three
+// ways:
+//
+//   (1) SUPERSEDED -- the authenticated principal/session epoch or the active
+//       context tuple has moved since the intent was registered. CANCELLED,
+//       focusing NOTHING. The intent was "take THIS operator to THIS Season's
+//       grant control"; under another principal or another tuple there is no
+//       such promise left to keep, and keeping it would yank the arriving
+//       operator's focus onto a control they never asked for. Same identity
+//       discipline as every other #365 gate -- see cardIdentitySamePrincipal()
+//       and currentCardTuple() -- and deliberately the same two halves.
+//   (2) THE CONTROL EXISTS -- focus it. The promise kept, however long the
+//       destination took.
+//   (3) THE SETTLED DESTINATION PROVES IT CANNOT EXIST -- fall back. This is
+//       a CONCLUSION, not a guess: `proof` says the pass that just painted is
+//       the one that performed this destination's own reads, so what it
+//       painted is what this Season HAS. renderSeasonParticipation() renders
+//       explanatory copy instead of a picker for a Season with no grantable
+//       venue left ("Every venue is already allowed", "Create a venue on the
+//       Facility tree first"), for an archived read-only selection, and
+//       nothing at all for a role without MANAGE_SETUP -- in every one of
+//       those the control genuinely cannot appear later, so the generic
+//       content-region landing is the right answer rather than a surrender.
+//
+// ...and until one of those three holds, the intent simply STAYS ALIVE for
+// the next settlement. There is no tick count, no deadline and no timer
+// anywhere on this path: "not yet" can never convert itself into "give up".
+// The one call into focusContentHeading() is made only at (3) -- at a
+// destination that has already settled, where its first attempt finds either
+// a heading or painted content and it therefore never reaches its own poll.
+let destinationFocusIntent = null;
+
+// WHOSE intent this is, and for WHICH context. Identical in shape and
+// intention to cardIdentitySamePrincipal() + cardIdentityCurrent()'s tuple
+// half; generation has no meaning here (a focus intent belongs to a
+// navigation, not to a card request), so it is deliberately absent rather
+// than faked.
+function destinationFocusIntentCurrent(intent) {
+  if (!intent) return false;
+  if (intent.epoch !== uiIdentityEpoch) return false;
+  if (intent.principal !== cardPrincipalId()) return false;
+  const t = currentCardTuple();
+  return intent.program_id === t.program_id
+    && intent.season_id === t.season_id
+    && intent.league_id === t.league_id;
+}
+
+// Registered by the deep link, stamped with the identity that asked for it.
+// Deliberately NOT resolved here: every caller has just called switchTab(),
+// so a render for the destination is already in flight and the control on
+// screen right now (if any) belongs to the surface being left behind.
+function requestDestinationFocus(spec) {
+  // A deep link IS a focus request, and the newest one (#365 round 12): the
+  // operator has just activated a control that promises to take them to ONE
+  // named destination. Taking the ticket here is what stops the navigation
+  // that got them to this screen from finishing its own generic landing on
+  // top of that promise a fraction of a second later -- the recorded
+  // "focus is on {id: content}" failure, traced at newFocusRequest() above.
+  //
+  // Taken BEFORE the intent is stored rather than after, so there is no
+  // instant at which an intent exists while an older poll still holds the
+  // current ticket.
+  newFocusRequest();
+  const t = currentCardTuple();
+  destinationFocusIntent = {
+    view: spec.view, setupView: spec.setupView || null,
+    provenBy: spec.provenBy, find: spec.find,
+    epoch: uiIdentityEpoch, principal: cardPrincipalId(),
+    program_id: t.program_id, season_id: t.season_id, league_id: t.league_id,
+  };
+}
+
+// The identity boundary's own half of (1). The settlement check below is the
+// authoritative one -- nothing can be focused without passing it -- but an
+// intent whose principal or tuple has already moved is dead the moment that
+// happens, and leaving it in place until some later render happens to settle
+// would be holding a promise on behalf of an operator who is gone. Called
+// from resetTransientUiState() (principal/session epoch) and from the
+// confirmed context switch (tuple).
+function cancelSupersededDestinationFocus() {
+  if (destinationFocusIntent
+      && !destinationFocusIntentCurrent(destinationFocusIntent)) {
+    destinationFocusIntent = null;
+  }
+}
+
+// The ATTEMPTED-switch boundary, which is earlier than the confirmed one and
+// is the one that matters (#365 owner correction, round 13).
+//
+// cancelSupersededDestinationFocus() is deliberately NOT what runs here, and
+// could not be: it asks whether the intent still matches the canonical tuple,
+// and at the moment a switch is ATTEMPTED that tuple has not moved yet --
+// contextOptions.selected is only updated once /api/context answers. The old
+// intent therefore still looks perfectly current, so a "cancel if superseded"
+// test cancels nothing. Meanwhile the operator has already made the new
+// selection in the native control and is looking at it.
+//
+// So this is unconditional. Anything focus-related that was asked for under
+// the tuple being left is void the instant the operator asks for another one,
+// whether or not the server has caught up, and whether or not this particular
+// call goes on to be queued behind an in-flight switch. The generic poll gets
+// the same treatment through the ticket -- its next attempt sees a newer
+// request and returns without focusing anything.
+//
+// Cancelled means SILENT, never redirected: nothing here focuses anything on
+// the arriving surface. The arriving tuple's own render decides that.
+function abandonFocusWorkForContextSwitch() {
+  newFocusRequest();
+  destinationFocusIntent = null;
+}
+
+// THE settlement. `proof` names what the concluding render pass actually
+// established -- see render()'s own call sites.
+function settleDestinationFocus(proof) {
+  const intent = destinationFocusIntent;
+  if (!intent) return;
+  // (1) identity. #365 identity gate — principal/session epoch + context tuple.
+  if (!destinationFocusIntentCurrent(intent)) { destinationFocusIntent = null; return; }
+  // The operator LEFT the destination (a nav click, a sub-view toggle) while
+  // it was still loading. Nothing to keep: focus belongs to wherever they
+  // went, and this intent must not follow them there.
+  if (view !== intent.view
+      || (intent.setupView && setupView !== intent.setupView)) {
+    destinationFocusIntent = null;
+    return;
+  }
+  // An open dialog OWNS focus (see syncOverlayFocus's lifecycle). A deep-link
+  // promise cannot outrank a focus trap the operator is inside, and pulling
+  // focus out of one would be a worse defect than the one this fixes.
+  if (openOverlayElement()) { destinationFocusIntent = null; return; }
+  // (2) the control exists.
+  const el = intent.find();
+  if (el) {
+    destinationFocusIntent = null;
+    // Same tabindex="-1" convention focusCardTarget()/focusContentHeading()
+    // use, and the same refusal to stamp it on something already focusable.
+    if (!el.hasAttribute("tabindex")
+        && !/^(BUTTON|A|INPUT|SELECT|TEXTAREA)$/.test(el.tagName)) {
+      el.setAttribute("tabindex", "-1");
+    }
+    el.focus();
+    return;
+  }
+  // (3) settled, and it is not there -- so it cannot be.
+  if (proof && proof[intent.provenBy]) {
+    destinationFocusIntent = null;
+    focusContentHeading();
+    return;
+  }
+  // NOT YET: this pass settled something else (or nothing this intent's
+  // destination depends on). Keep waiting. No counter is touched here,
+  // because there is no counter.
+}
+
 // Destination focus for "participation" (#331 review round 2 finding 4):
 // landing generically on the Setup hierarchy tree isn't enough -- focus
 // must reach the ACTUAL registration control for the currently-selected
 // Season (contextOptions.selected.season_id, #159), the same "Register" add
 // row renderSetupHierarchy's league sections render per (season, league)
-// (data-reg-add/data-reg-add-season). Same poll-while-loading shape as
-// focusContentHeading() (switchTab()'s render() is async, so neither
-// target necessarily exists yet on the next tick), but once loading has
-// genuinely finished with no matching control -- no league yet, or every
-// permanent team is already registered for this Season -- falls back to
-// focusContentHeading()'s generic content-region landing rather than
-// polling forever for something that will never appear.
+// (data-reg-add/data-reg-add-season).
 //
-// THE give-up condition is "loading finished and the control still isn't
-// there", not the tick count -- the count is only a safety net against an
-// infinite poll if a render never settles. It was 40 (2s), copied from
-// focusContentHeading(), and that is the wrong budget for a DEEP LINK: the
-// Setup hierarchy tree issues its own chain of scoped reads (setup overview,
-// hierarchy, players, the selected Season's venue-access and grant
-// candidates, setup progress) before it paints once, and on a loaded machine
-// that regularly runs past two seconds -- so the poll expired while the
-// skeleton was still up and the deep link silently degraded to the generic
-// content-region landing. focusContentHeading() can afford the short budget
-// because its fallback IS its contract; here the fallback is the loss of it.
-// (#365 review, reproduced as a real browser-journey failure: "the resolution
-// path did not focus the Allow picker; focus is on {id: content}".)
-const DEEP_LINK_FOCUS_ATTEMPTS = 200;   // x 50ms = 10s, only while still loading
-function focusParticipationRegisterControl(attempt) {
-  const seasonId = contextOptions && contextOptions.selected
-    && contextOptions.selected.season_id;
-  const btn = seasonId && document.querySelector(
-    `[data-reg-add][data-reg-add-season="${CSS.escape(seasonId)}"]`);
-  if (btn) { btn.focus(); return; }
-  const content = document.getElementById("content");
-  const stillLoading = !content || content.querySelector(".skeleton");
-  if (stillLoading && (attempt || 0) < DEEP_LINK_FOCUS_ATTEMPTS) {
-    setTimeout(() => focusParticipationRegisterControl((attempt || 0) + 1), 50);
-    return;
-  }
-  focusContentHeading();
+// Settlement-bound for the same reason the venue-access deep link below is,
+// and it had the identical time-based give-up shape (the review's audit of
+// the other deep-link focus helpers found exactly this one, and nothing
+// else): the same 200 x 50ms poll into the same focusContentHeading() floor,
+// on the same slowest-loading Setup surface. It is the same defect, so it
+// gets the same fix rather than a second one.
+function focusParticipationRegisterControl() {
+  requestDestinationFocus({
+    view: "setup", setupView: "hierarchy", provenBy: "setupHierarchy",
+    find: () => {
+      const seasonId = contextOptions && contextOptions.selected
+        && contextOptions.selected.season_id;
+      return (seasonId && document.querySelector(
+        `[data-reg-add][data-reg-add-season="${CSS.escape(seasonId)}"]`)) || null;
+    },
+  });
 }
 
 // The same deep-link, for the selected Season's "Allow a venue" picker (#365
@@ -2140,29 +2402,28 @@ function focusParticipationRegisterControl(attempt) {
 // card lands ON it rather than at the top of the hierarchy tree.
 //
 // Prefers the <select> (the field that must be filled before the Allow button
-// can do anything) and falls back to the Allow button itself. Identical
-// poll-while-loading / give-up-to-the-heading shape as
-// focusParticipationRegisterControl above, sharing its budget for exactly the
-// reason documented there: switchTab renders asynchronously, this destination
-// is the slowest-loading Setup surface there is, and a Season that has no
-// grantable venue left renders explanatory copy instead of a picker rather
-// than nothing at all.
-function focusVenueAccessControl(attempt) {
-  const seasonId = contextOptions && contextOptions.selected
-    && contextOptions.selected.season_id;
-  // getElementById, not a selector: the id embeds a raw Season id.
-  const picker = seasonId && document.getElementById(`va-add-${seasonId}`);
-  if (picker) { picker.focus(); return; }
-  const allow = seasonId && document.querySelector(
-    `[data-va-add="${CSS.escape(seasonId)}"]`);
-  if (allow) { allow.focus(); return; }
-  const content = document.getElementById("content");
-  const stillLoading = !content || content.querySelector(".skeleton");
-  if (stillLoading && (attempt || 0) < DEEP_LINK_FOCUS_ATTEMPTS) {
-    setTimeout(() => focusVenueAccessControl((attempt || 0) + 1), 50);
-    return;
-  }
-  focusContentHeading();
+// can do anything) and falls back to the Allow button itself.
+//
+// THE SEASON IS READ LIVE, from contextOptions.selected, and that is safe for
+// exactly one reason: the identity gate in settleDestinationFocus() has
+// already refused every tuple except the one this intent was registered
+// under, so "the live selected Season" and "this intent's own Season" are the
+// same value by the time this runs. Delete that gate and they are not: the
+// intent would reach across a context switch and focus a picker belonging to
+// a Season the operator moved to but never asked to be sent to -- which is
+// what e2e/facilities-venue-access.js's superseded-context leg proves.
+function focusVenueAccessControl() {
+  requestDestinationFocus({
+    view: "setup", setupView: "hierarchy", provenBy: "setupHierarchy",
+    find: () => {
+      const seasonId = contextOptions && contextOptions.selected
+        && contextOptions.selected.season_id;
+      if (!seasonId) return null;
+      // getElementById, not a selector: the id embeds a raw Season id.
+      return document.getElementById(`va-add-${seasonId}`)
+        || document.querySelector(`[data-va-add="${CSS.escape(seasonId)}"]`);
+    },
+  });
 }
 
 function renderDashboard(ov, standings) {
@@ -9556,6 +9817,16 @@ async function render() {
   // Per-ENDPOINT outcomes for the Setup view's own reads (#365) — see the
   // Setup branch below for why the payloads alone cannot carry this.
   let svOk = false, playersOk = false;
+  // #365 review round 11: did THIS pass perform the Setup hierarchy
+  // destination's own reads? It is the settlement signal a deep-link focus
+  // intent resolves on (settleDestinationFocus), and it is per-PASS rather
+  // than a module flag on purpose: `view` is module-level and re-read
+  // throughout this function, so an older pass that flipped to Setup only
+  // after it had already gone past the fetches below can still reach the
+  // paint and render an EMPTY hierarchy from the default `sv`/`hv` shapes.
+  // That pass proves nothing about whether a picker can exist, so it reports
+  // nothing, and the intent waits for the pass that actually read.
+  let hierarchyReadsSettled = false;
   try {
     // #365 owner correction — the render LIFECYCLE, not just the card model.
     // This line used to blank #content unconditionally, and every card was
@@ -9858,6 +10129,29 @@ async function render() {
           }
         }
       }
+      // #365 review round 11 — THE SETTLEMENT SIGNAL for the hierarchy
+      // destination's deep-link focus intents. Reached only after this pass
+      // has read the canonical hierarchy, every Program's teams, every
+      // Season's registrations and (for the SELECTED Season, which is the
+      // only one that can host either control) its venue-access grants and
+      // grant candidates -- i.e. after every read the "Register" add row and
+      // the "Allow a venue" picker are built from. It is below the last
+      // `contextRevision` guard in the loop, so a superseded pass returns
+      // above this line and reports nothing at all.
+      //
+      // From here on, whatever the paint below produces IS what this Season
+      // has: a picker, or renderSeasonParticipation()'s explanatory copy for
+      // a Season with no grantable venue left. That is what lets a missing
+      // control be CONCLUDED absent rather than waited out.
+      hierarchyReadsSettled = true;
+    } else if (view === "setup") {
+      // No MANAGE_SETUP: renderSeasonParticipation() returns "" outright, so
+      // this surface has no Season rows, no Register add row and no Allow
+      // picker, and none of the reads above would change that. A pass that
+      // legitimately skipped them has still settled the question -- an Arena
+      // Manager waiting forever for a control their permission set can never
+      // render would be the same silent loss, one branch over.
+      hierarchyReadsSettled = true;
     }
     // #365: bind each visible Setup workflow card to its OWN identity (card id
     // + context tuple + generation) and commit its model, inside the same
@@ -10089,6 +10383,15 @@ async function render() {
       <div class="actions"><button class="act primary" id="retry-btn">Retry</button></div>`;
     const retry = document.getElementById("retry-btn");
     if (retry) retry.onclick = () => render();  // no inline handler (CSP)
+    // #365 review round 11: this pass CONCLUDED the destination too -- into a
+    // failure, but conclusively: the tree is gone, the banner is what stands,
+    // and no control the deep link was promising can appear without another
+    // render (the Retry above). So a standing focus intent resolves here
+    // rather than waiting for a render that is not coming, and its fallback
+    // lands on this banner's own <h2>. Reported for every intent
+    // (`setupHierarchy` included), because the failure is the destination's,
+    // not one endpoint's.
+    settleDestinationFocus({ setupHierarchy: true });
     return;
   }
 
@@ -10124,6 +10427,11 @@ async function render() {
       const h = c.querySelector(".banner.neutral h2");
       if (h) { h.setAttribute("tabindex", "-1"); h.focus(); }
     }
+    // A concluded pass, on a view no deep-link intent of ours targets. No
+    // proof is offered: the `view` check inside cancels any standing intent
+    // outright (the operator is on Roster/Sheet, not the Setup tree), which
+    // is the right answer and not the fallback one.
+    settleDestinationFocus(null);
     return;
   }
   // Per-card loading boundary (#331 review round 2 finding 3): the card's
@@ -11670,6 +11978,18 @@ async function render() {
   // handles the close half: when the render that just ran removed the
   // dialog, focus returns to whatever opened it.
   syncOverlayFocus();
+  // #365 review round 11: THE settlement, and the last thing of all. After
+  // the paint and after every wiring pass, so a control this intent is
+  // waiting for is in the document AND bound before focus reaches it; after
+  // syncOverlayFocus() so the dialog lifecycle keeps its precedence (an
+  // intent that finds an overlay open cancels rather than reaching into it).
+  //
+  // `hierarchyReadsSettled` is this PASS's own answer, never a module flag --
+  // a pass that painted the Setup tree without having read for it proves
+  // nothing, reports nothing, and leaves the intent alive for the pass that
+  // did. That is the whole difference between waiting for an EVENT and
+  // waiting out a CLOCK.
+  settleDestinationFocus({ setupHierarchy: hierarchyReadsSettled });
 }
 
 // Per-view page title (#345). A single-page app never reloads, so without
@@ -12535,6 +12855,17 @@ async function setActiveContext(programId, seasonId, leagueId) {
   // only once it's confirmed.
   invalidateContextScopedMutations();
   contextRevision += 1;
+  // Focus work asked for under the tuple being LEFT dies here, before every
+  // await and before the early return below (#365 owner correction, round 13).
+  // Placing this after the /api/context response -- where the confirmed-switch
+  // cancellation sits -- is one boundary too late: during a slow response the
+  // old tuple still satisfies destinationFocusIntentCurrent(), so a standing
+  // intent or a still-pending generic poll can fire onto a surface the
+  // operator has already navigated away from in the native control. The early
+  // return matters just as much: a switch that queues behind an in-flight one
+  // would otherwise not reach any cancellation at all until its predecessor
+  // settled.
+  abandonFocusWorkForContextSwitch();
   if (contextSwitchInFlight) {
     contextSwitchQueued = { programId, seasonId, leagueId, mySeq };
     return;
@@ -12616,6 +12947,33 @@ async function sendContextSwitch(mySeq, programId, seasonId, leagueId) {
   // actually rebind Import/Ice Builder to it instead of finding its own
   // stamp already "current" (from the first bump) and skipping the reseed.
   contextRevision += 1;
+  // NOT the primary invalidation, and must not be read as one (#365 owner
+  // correction, round 13). Focus work is abandoned at the moment a switch is
+  // ATTEMPTED -- see abandonFocusWorkForContextSwitch() at the top of
+  // setActiveContext(). Doing it only here was one boundary too late: until
+  // /api/context answers, contextOptions.selected still holds the OLD tuple,
+  // so the old intent goes on satisfying destinationFocusIntentCurrent() and
+  // a standing intent or in-flight poll could still fire while the operator
+  // was already looking at their new selection in the native control.
+  //
+  // Kept because it is not merely a repeat: a switch QUEUED behind an
+  // in-flight one is drained straight into this function, and focus work
+  // started in the interval between queueing and draining has not passed the
+  // attempt-time call. Both are cheap; neither alone covers every path.
+  cancelSupersededDestinationFocus();
+  // ...and the SAME sentence about the generic poll (#365 round 13). The
+  // ticket below is the only binding focusContentHeading()'s chain has, and
+  // until this line it was bumped by newer focus REQUESTS only -- so a poll
+  // started under the tuple the operator has just left survived the switch
+  // and could still take its #content landing on the arriving Season's
+  // surface, which is the same stale-work-crossing-a-boundary defect the
+  // intent above is dropped here to avoid. Bumping the ticket is the whole
+  // cancellation: every in-flight chain compares against it on its next tick
+  // and returns without focusing anything. Silent, not redirected -- nothing
+  // is focused on the new surface on the old poll's behalf, and a
+  // focusContentHeading() called AFTER this line (the render below, an
+  // overlay close) takes a fresh ticket and keeps its floor in full.
+  newFocusRequest();
   syncContextHash();
   // The tuple has now genuinely moved, so every held card model is bound to a
   // context the operator has left. Repaint them as explicitly STALE HERE --
@@ -13010,6 +13368,28 @@ function resetTransientUiState() {
   //     next-task mutation they could still attempt. This is the guard, and
   //     the four call-sites downstream re-check it after their own await.
   uiIdentityEpoch += 1;
+  // (a2) THE STANDING DEEP-LINK FOCUS INTENT (#365 round 11). Same reasoning
+  //     as (a) and enforced by the same epoch: an unresolved "take me to this
+  //     Season's Allow-a-venue picker" belongs to the DEPARTING operator, and
+  //     the arriving one must not have their focus pulled onto a control the
+  //     departing one asked for. settleDestinationFocus() would refuse it on
+  //     its own account (it asks the same question at resolution time, which
+  //     is what makes the refusal airtight); this drops the record here so a
+  //     dead promise is not left standing across the boundary at all.
+  cancelSupersededDestinationFocus();
+  // (a3) THE GENERIC FOCUS POLL (#365 round 13). The intent above carries an
+  //     identity and is refused at settlement on its own account; the poll
+  //     carries NOTHING but the ticket, so the epoch bumped at (a) means
+  //     nothing to it and a chain started under the DEPARTING principal
+  //     would keep ticking and land focus on the ARRIVING one's surface --
+  //     the same boundary crossing (a) and (a2) exist to stop, in the one
+  //     piece of async focus work that had no binding to identity at all.
+  //     Bumping the ticket here IS the invalidation: the next tick of every
+  //     in-flight chain sees a newer request and returns having focused
+  //     nothing. It costs the arriving identity nothing -- any
+  //     focusContentHeading() called after this line takes a fresh ticket
+  //     and keeps its #content floor unchanged.
+  newFocusRequest();
   // (b) cardStates — DESTROYED. A committed card model is this operator's
   //     read: counts fetched under their permissions, and on a card mid-
   //     confirmation their typed `confirmReason` and the server's error text.
