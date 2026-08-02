@@ -1419,6 +1419,7 @@ class SetupTargetRouteMatrixTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
 
     # -- backend steering ---------------------------------------------------
     def _reset_backend(self, database_url, backend):
@@ -3277,6 +3278,7 @@ class SetupTargetAtomicityTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
 
     # -- plumbing (same shape as the route matrix above) --------------------
     def _reset_backend(self, database_url, backend):
@@ -3803,6 +3805,7 @@ class SetupTargetAxisConsistencyTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
 
     # -- plumbing (same shape as the atomicity class above) -----------------
     def _reset_backend(self, database_url, backend):
@@ -4439,6 +4442,7 @@ class SetupTargetGameParentConsistencyHttpTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
 
     # -- plumbing (the axis-consistency class's shape, verbatim) ------------
     _reset_backend = SetupTargetAxisConsistencyTest._reset_backend
@@ -5051,6 +5055,7 @@ class SetupTargetBindingEndConsistencyHttpTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
 
     # -- plumbing (the game-parent HTTP class's shape, verbatim) ------------
     _reset_backend = SetupTargetAxisConsistencyTest._reset_backend
@@ -5244,6 +5249,7 @@ class SetupTargetLockAtomicityTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
 
     # -- plumbing (same shape as the classes above) -------------------------
     def _reset_backend(self, database_url, backend):

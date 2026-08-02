@@ -249,6 +249,7 @@ class SeasonDateHttpTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
 
     def _admin(self):
         c = urllib.request.build_opener(

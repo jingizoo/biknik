@@ -106,6 +106,7 @@ class WriteSchemaHttpTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
 
     def _client(self):
         return urllib.request.build_opener(

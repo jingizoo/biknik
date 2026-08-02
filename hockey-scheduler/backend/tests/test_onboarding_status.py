@@ -300,6 +300,7 @@ class OnboardingStatusHttpTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
 
     def _get(self, role=None, cookie=None):
         req = urllib.request.Request(

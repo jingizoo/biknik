@@ -113,6 +113,7 @@ class PerUserReadReceiptHttpTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
         srv.STATE.reset()
 
     def _client(self):

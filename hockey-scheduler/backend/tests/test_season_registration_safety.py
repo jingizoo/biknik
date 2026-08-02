@@ -106,6 +106,7 @@ class RegistrationActorIntegrityHttpTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
 
     def _post(self, path, body):
         req = urllib.request.Request(

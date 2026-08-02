@@ -842,6 +842,7 @@ class StandingsAuthorizationHttpTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
 
     def setUp(self):
         # Per-test reset (not just once per class): a clean full demo seed

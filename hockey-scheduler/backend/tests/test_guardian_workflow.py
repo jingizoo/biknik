@@ -156,6 +156,7 @@ class GuardianHttpTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
 
     def _login(self, username):
         c = urllib.request.build_opener(

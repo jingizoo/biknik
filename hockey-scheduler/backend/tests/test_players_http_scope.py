@@ -88,6 +88,7 @@ class PlayersHttpScopeTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
 
     # -- harness (copied idiom from test_v2_setup_contract.py) --------------
     def _client(self):

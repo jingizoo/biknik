@@ -353,6 +353,7 @@ class LoginSecurityHttpTest(unittest.TestCase):
         srv.LOGIN_THROTTLE = cls._orig_throttle
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
 
     def setUp(self):
         # A small, real-clock throttle so a handful of requests exercises the

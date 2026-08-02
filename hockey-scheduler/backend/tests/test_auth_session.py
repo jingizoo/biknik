@@ -27,6 +27,7 @@ class AuthSessionTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
 
     def _client(self):
         # Each opener has its own cookie jar = an isolated browser session.

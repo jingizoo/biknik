@@ -55,6 +55,7 @@ class StatusEndpointTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
 
     def _get(self, path):
         with urllib.request.urlopen(f"http://127.0.0.1:{self.port}{path}") as r:
@@ -90,6 +91,7 @@ class ProductionStatusEndpointTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
         os.environ.pop("APP_MODE", None)
         srv.STATE.reset()
 
@@ -130,6 +132,7 @@ class FactoryResetFlagStatusEndpointTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
         os.environ.pop("APP_MODE", None)
         os.environ.pop("ALLOW_PRODUCTION_FACTORY_RESET", None)
         srv.STATE.reset()

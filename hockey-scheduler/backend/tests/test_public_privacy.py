@@ -67,6 +67,7 @@ class ProductionPublicPrivacyTest(_HttpBase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
         for k in ("APP_MODE", "BOOTSTRAP_ADMIN_USER", "BOOTSTRAP_ADMIN_PASSWORD"):
             os.environ.pop(k, None)
         srv.STATE.reset()
@@ -271,6 +272,7 @@ class DemoPublicPrivacyTest(_HttpBase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
 
     def test_demo_operator_reads_player_data(self):
         # Demo exposes player data (lineups/roster) to an authenticated

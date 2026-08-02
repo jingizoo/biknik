@@ -140,6 +140,7 @@ class HealthReadinessHttpTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
 
     def _get(self, path, headers=None):
         req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}",
@@ -214,6 +215,7 @@ class ProductionReadinessHttpTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
         for k, v in cls._saved.items():
             if v is None:
                 os.environ.pop(k, None)

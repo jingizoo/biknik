@@ -35,6 +35,7 @@ class AuthFallbackTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
         os.environ.pop("DEMO_HEADERLESS_ADMIN", None)
 
     def _req(self, method, path, body=None, headers=None):

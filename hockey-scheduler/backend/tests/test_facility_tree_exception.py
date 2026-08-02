@@ -782,6 +782,7 @@ class GrantCandidateHttpPermissionTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
 
     def _client(self):
         return urllib.request.build_opener(
@@ -889,6 +890,7 @@ class ScopedVenueAccessHttpTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
 
     def _client(self):
         return urllib.request.build_opener(
@@ -1104,6 +1106,7 @@ class SelectedSeasonCeilingHttpTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
 
     def _client(self):
         return urllib.request.build_opener(
@@ -1657,6 +1660,7 @@ class ArchivedSelectedSeasonCandidateHttpTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
 
     def _client(self):
         return urllib.request.build_opener(

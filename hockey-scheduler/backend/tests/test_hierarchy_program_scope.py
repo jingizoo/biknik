@@ -315,6 +315,7 @@ class HierarchyWriteScopeHttpTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
 
     def _reset_backend(self, database_url):
         """Rebuild the live ``STATE`` on the given backend for this one test.

@@ -29,6 +29,7 @@ class ProductionModeTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
         # Leave global state clean for every other test module in this run —
         # STATE and its account/session singletons are shared across files.
         os.environ.pop("APP_MODE", None)
@@ -173,6 +174,7 @@ class DemoModeIsTheDefaultTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
         srv.STATE.reset()
 
     def _get(self, path, headers=None):
