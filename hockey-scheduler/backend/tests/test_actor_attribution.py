@@ -67,20 +67,45 @@ class ActorAttributionHttpTest(unittest.TestCase):
         entries = srv.STATE.api.store.audit_for_game(game_id)
         return next(e for e in reversed(entries) if e.action == action)
 
-    _next_slot_offset_days = 30
-
     def _fresh_game(self, admin):
         """A brand-new, unrostered ice slot + game between the demo teams,
         independent of any other test's mutations (locking/cancelling/
         selecting a roster on a shared game would make tests order-dependent).
         Each call gets its own non-overlapping slot on the rink — ice slots
-        may not overlap, and same-second calls would otherwise collide.
+        may not overlap, so two calls must never land on the same window.
+
+        The slot is anchored to what the RINK ALREADY HOLDS, never to the
+        wall-clock time of day. ``datetime.now() + 31 days`` was a latent
+        time bomb: the demo seed books this same rink on FIXED calendar
+        dates (2026-09-05 … 2026-09-19, 16:00/18:00/18:30/20:30 UTC), so
+        once "now + 31 days" drifted onto a seeded date the create was
+        refused ``schedule_conflict`` — but only when the clock-time window
+        [start, start+2h) happened to hit a seeded slot. The suite's verdict
+        then depended on the hour CI started: identical tree, green at
+        12:43Z as PR #382, red at 15:08Z as the merge on main.
+
+        Deriving the anchor from the rink's own occupancy is collision-proof
+        by construction: ``create_ice_slot`` refuses on a half-open interval
+        test against slots ON THIS RINK, and a start placed on the day AFTER
+        every such slot ends cannot satisfy it. Recomputing per call also
+        makes each successive slot land a day past the one the previous call
+        just created. ``max`` with the current time keeps the slot in the
+        future once real time overtakes the seeded dates.
         """
-        type(self)._next_slot_offset_days += 1
         rink_id = srv.STATE.ids["main_rink_id"]
-        start = (datetime.now(timezone.utc).replace(microsecond=0)
-                 + timedelta(days=type(self)._next_slot_offset_days))
+        booked_until = max(
+            [s.end_time for s in srv.STATE.api.store.all_ice_slots()
+             if s.rink_id == rink_id]
+            + [datetime.now(timezone.utc)])
+        start = (booked_until + timedelta(days=1)).replace(
+            hour=12, minute=0, second=0, microsecond=0)
         end = start + timedelta(hours=2)
+        # These tests enroll substitutes into the game they get back, which is
+        # only meaningful for a game that has not happened yet. Checked rather
+        # than assumed: with the seed's dates fixed in 2026-09, dropping the
+        # ``max`` above silently starts handing out PAST slots the moment real
+        # time overtakes them, and nothing else in the suite would notice.
+        self.assertGreater(start, datetime.now(timezone.utc))
         status, slot = self._req(
             admin, "POST", "/api/setup/ice-slot",
             {"rink_id": rink_id, "start_time": start.isoformat(),
