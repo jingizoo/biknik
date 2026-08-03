@@ -70,6 +70,7 @@ import json
 import os
 import re
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -1216,6 +1217,242 @@ class DraftActiveTupleTest(unittest.TestCase):
             self.assertEqual(
                 _ok(api.discard_draft_games(all_drafts=True))["discarded"], 12)
         self._on_every_backend(body)
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "needs PostgreSQL: the race is a DATABASE lock")
+class DraftActiveTupleRaceTest(unittest.TestCase):
+    """The check/use gap, proven by BLOCKING a real second connection.
+
+    A lock can only be observed through contention, so a same-process test
+    cannot tell "authorized inside the write transaction under the
+    ActiveContext lock" from "authorized just before it" — both refuse the
+    sequential case identically. This class opens a SECOND PostgreSQL
+    connection, has it perform the context switch that would invalidate the
+    authorization, and asserts it is still BLOCKED at the moment the write
+    verb is about to mutate.
+
+    Blocked, then completing once the verb's transaction ends, is the whole
+    proof: it shows the wait was a lock and not a broken thread, and it shows
+    the two operations were serialized rather than interleaved. Modelled on
+    `test_schedule_scenarios.test_the_snapshot_venue_rows_are_locked_against_a_racing_writer`,
+    which established this shape here.
+    """
+
+    maxDiff = None
+
+    def setUp(self):
+        self.store = fresh_sql_store(os.environ["TEST_DATABASE_URL"])
+        self.api = ApiService(self.store)
+        self.fixture = build_two_programs(self.api)
+        self.pa, self.sa, self.la, self.da = corner(
+            self.fixture, "A", "1", "a")
+        self.pb, self.sb, self.lb, _db = corner(self.fixture, "B", "1", "a")
+        self._select(self.pa, self.sa, self.la)
+
+    def tearDown(self):
+        self.store.close()
+
+    def _select(self, program_id, season_id, league_id):
+        _ok(self.api.set_active_context(
+            ADMIN, Role.LEAGUE_ADMIN, {}, program_id, season_id, league_id),
+            "set_active_context")
+
+    def _commit_a_batch(self):
+        preview = _ok(self.api.draft_season_schedule(
+            division_id=self.da, user_id=ADMIN, role=Role.LEAGUE_ADMIN,
+            scope={}))
+        result = _ok(self.api.commit_draft_schedule(
+            division_id=self.da,
+            draft_fingerprint=preview["draft_fingerprint"], actor_id=ADMIN,
+            user_id=ADMIN, role=Role.LEAGUE_ADMIN, scope={}), "commit")
+        return [row["game_id"] for row in result["created"]]
+
+    def _racing_context_switch(self):
+        """A second CONNECTION switching this same operator to Program B.
+
+        Returns ``(start, race)``: ``start()`` launches it and asserts it is
+        still blocked two seconds later; ``race`` carries the thread and any
+        error for the caller to join and re-raise.
+        """
+        race = {"worker": None, "error": None, "done": False}
+
+        def switch_on_second_connection():
+            other = SqlStore(os.environ["TEST_DATABASE_URL"])
+            try:
+                other_api = ApiService(other)
+                other_api.set_active_context(
+                    ADMIN, Role.LEAGUE_ADMIN, {}, self.pb, self.sb, self.lb)
+                race["done"] = True
+            except BaseException as error:   # surfaced on the test thread
+                race["error"] = error
+            finally:
+                other.close()
+
+        def start(where):
+            worker = threading.Thread(target=switch_on_second_connection,
+                                      daemon=True)
+            race["worker"] = worker
+            worker.start()
+            worker.join(timeout=2)
+            self.assertTrue(
+                worker.is_alive(),
+                f"the operator's context switch COMPLETED at {where} while "
+                "the write verb held its transaction -- the ActiveContext row "
+                "is not locked, so the verb can mutate under a tuple that no "
+                "longer authorizes it")
+        return start, race
+
+    def _assert_the_writer_was_only_delayed(self, race):
+        race["worker"].join(timeout=10)
+        self.assertFalse(race["worker"].is_alive(),
+                         "the blocked context switch never completed")
+        if race["error"] is not None:
+            raise race["error"]
+        self.assertTrue(race["done"])
+        saved = self.store.get_active_context(ADMIN)
+        self.assertEqual(saved.program_id, self.pb,
+                         "the racing switch did not actually land")
+
+    def test_publish_holds_the_context_lock_across_its_writes(self):
+        game_ids = self._commit_a_batch()
+        start, race = self._racing_context_switch()
+        original = self.api.setup.publish_game
+        seen = {"calls": 0}
+
+        def publish_with_a_racing_switch(game_id, published, actor_id=None):
+            seen["calls"] += 1
+            if seen["calls"] == 1:
+                # Strictly AFTER the ActiveContext + Game locks and the
+                # authorization, and strictly BEFORE this batch is finished.
+                start("the first publish_game")
+            return original(game_id, published, actor_id)
+
+        self.api.setup.publish_game = publish_with_a_racing_switch
+        try:
+            published = _ok(self.api.publish_draft_games(
+                game_ids=game_ids, actor_id=ADMIN, user_id=ADMIN,
+                role=Role.LEAGUE_ADMIN, scope={}))
+        finally:
+            self.api.setup.publish_game = original
+
+        self.assertEqual(published["published"], 6)
+        self._assert_the_writer_was_only_delayed(race)
+
+    def test_discard_holds_the_context_lock_across_its_writes(self):
+        game_ids = self._commit_a_batch()
+        start, race = self._racing_context_switch()
+        original = self.store.delete_game
+        seen = {"calls": 0}
+
+        def delete_with_a_racing_switch(game_id):
+            seen["calls"] += 1
+            if seen["calls"] == 1:
+                start("the first delete_game")
+            return original(game_id)
+
+        self.store.delete_game = delete_with_a_racing_switch
+        try:
+            discarded = _ok(self.api.discard_draft_games(
+                game_ids=game_ids, actor_id=ADMIN, user_id=ADMIN,
+                role=Role.LEAGUE_ADMIN, scope={}))
+        finally:
+            self.store.delete_game = original
+
+        self.assertEqual(discarded["discarded"], 6)
+        self._assert_the_writer_was_only_delayed(race)
+
+    def test_discard_all_holds_the_context_lock_across_its_writes(self):
+        """``all_drafts`` takes the same path and must take the same lock —
+        it is the form that means "everything", so an unlocked one is the
+        worst case rather than a lesser one."""
+        self._commit_a_batch()
+        start, race = self._racing_context_switch()
+        original = self.store.delete_game
+        seen = {"calls": 0}
+
+        def delete_with_a_racing_switch(game_id):
+            seen["calls"] += 1
+            if seen["calls"] == 1:
+                start("the first delete_game of an all_drafts discard")
+            return original(game_id)
+
+        self.store.delete_game = delete_with_a_racing_switch
+        try:
+            discarded = _ok(self.api.discard_draft_games(
+                all_drafts=True, actor_id=ADMIN, user_id=ADMIN,
+                role=Role.LEAGUE_ADMIN, scope={}))
+        finally:
+            self.store.delete_game = original
+
+        self.assertEqual(discarded["discarded"], 6)
+        self._assert_the_writer_was_only_delayed(race)
+
+    def test_commit_holds_the_context_lock_across_its_game_writes(self):
+        """The commit verb, at its FIRST Game INSERT — after the
+        re-authorization and the whole lock plan, before any row lands."""
+        preview = _ok(self.api.draft_season_schedule(
+            division_id=self.da, user_id=ADMIN, role=Role.LEAGUE_ADMIN,
+            scope={}))
+        start, race = self._racing_context_switch()
+        original = self.store.add_game
+        seen = {"calls": 0}
+
+        def add_with_a_racing_switch(game):
+            seen["calls"] += 1
+            if seen["calls"] == 1:
+                start("the first Game INSERT")
+            return original(game)
+
+        self.store.add_game = add_with_a_racing_switch
+        try:
+            committed = _ok(self.api.commit_draft_schedule(
+                division_id=self.da,
+                draft_fingerprint=preview["draft_fingerprint"],
+                actor_id=ADMIN, user_id=ADMIN, role=Role.LEAGUE_ADMIN,
+                scope={}), "commit")
+        finally:
+            self.store.add_game = original
+
+        self.assertEqual(len(committed["created"]), 6)
+        self._assert_the_writer_was_only_delayed(race)
+
+    def test_the_switch_really_can_complete_when_nothing_holds_the_lock(self):
+        """The anti-vacuity control for all four races above.
+
+        Every one of them asserts a thread is STILL ALIVE after two seconds.
+        That assertion passes just as well if the second connection can never
+        complete at all — a bad URL, an exhausted pool, a thread that threw
+        before reaching the write. So: with no write verb running, the exact
+        same racing switch must finish quickly and land.
+        """
+        start_time = time.monotonic()
+        race = {"error": None, "done": False}
+
+        def switch_on_second_connection():
+            other = SqlStore(os.environ["TEST_DATABASE_URL"])
+            try:
+                ApiService(other).set_active_context(
+                    ADMIN, Role.LEAGUE_ADMIN, {}, self.pb, self.sb, self.lb)
+                race["done"] = True
+            except BaseException as error:
+                race["error"] = error
+            finally:
+                other.close()
+
+        worker = threading.Thread(target=switch_on_second_connection,
+                                  daemon=True)
+        worker.start()
+        worker.join(timeout=10)
+        if race["error"] is not None:
+            raise race["error"]
+        self.assertTrue(race["done"], "the racing switch cannot complete even "
+                                      "with nothing holding the lock")
+        self.assertLess(time.monotonic() - start_time, 2.0,
+                        "the racing switch is slow on its own, so 'still "
+                        "alive after 2s' proves nothing about locking")
+        self.assertEqual(self.store.get_active_context(ADMIN).program_id,
+                         self.pb)
 
 
 class DraftActiveTupleHttpTest(unittest.TestCase):
