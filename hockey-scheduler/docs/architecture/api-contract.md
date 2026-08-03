@@ -157,4 +157,5 @@ Scope refusals are deliberately **non-oracular**:
 | a scenario id outside it (get / commit) | `404 not_found`, `schedule_scenario_missing` — byte-identical to a scenario id that never existed once the echoed `scenario_id` is masked |
 | create naming a Division outside it | `404 not_found`, `division_missing` — the same body a nonexistent `division_id` produces |
 | create naming a Season+League outside it | `404 not_found`, `league_season_missing` — the same body an unlinked/nonexistent pair produces |
+| create naming a Season+League outside it **plus any `division_id`** | the same `league_season_missing` body, whether that Division is real, foreign, or invented. The tuple is judged the instant the LeagueSeason link resolves, so the later `division_missing` refusal is never reached from outside the tuple — otherwise the pair of answers reports whether a guessed `(season_id, league_id)` is genuinely linked |
 | list | `200` containing **only** the active exact tuple's scenarios |
