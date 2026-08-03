@@ -1649,6 +1649,73 @@ class DraftBatchVersusSingleGameLockOrderTest(unittest.TestCase):
             {g.id for g in self.store.all_games() if g.published},
             set(self.committed))
 
+    def test_a_locked_game_whose_season_left_the_plan_restarts_the_unit(self):
+        """The Season-locator comparison itself, reached directly.
+
+        The end-to-end drift test below cannot reach this raise on
+        PostgreSQL: the batch runs SERIALIZABLE, so its plan and its locked
+        re-read come from ONE snapshot and cannot disagree, and a row a
+        concurrent transaction really did change makes `SELECT ... FOR UPDATE`
+        abort with `serialization_failure` before the comparison runs at all.
+        That is why the raise shipped unfalsifiable, and why "the retry
+        happened" is not evidence that THIS guard caused it.
+
+        So the disagreement is injected where it would come from on any
+        backend or future call path whose re-read is not snapshot-isolated:
+        the locked row comes back naming a Season the plan never locked. The
+        guard must notice BEFORE authorization gets a chance to silently drop
+        the row as out-of-tuple, raise `placement_raced`, and restart the
+        whole unit -- which then completes against the real rows.
+        """
+        moved = self.committed[-1]
+        other_season = self.fixture["A"]["seasons"]["2"]["season"]
+        audit_before = len(self.store.all_setup_audit())
+        attempts = {"count": 0}
+        plain_resolve = self.api.context.resolve_with_league
+
+        def counting_resolve(*args, **kwargs):
+            attempts["count"] += 1
+            return plain_resolve(*args, **kwargs)
+
+        self.api.context.resolve_with_league = counting_resolve
+        self.addCleanup(setattr, self.api.context, "resolve_with_league",
+                        plain_resolve)
+
+        original = self.store.get_game_for_update
+
+        def drifted_on_the_first_attempt(game_id):
+            locked = original(game_id)
+            if attempts["count"] == 1 and locked is not None \
+                    and locked.id == moved:
+                drifted = copy.copy(locked)
+                drifted.season_id = other_season
+                return drifted
+            return locked
+
+        self.store.get_game_for_update = drifted_on_the_first_attempt
+        try:
+            result = self.api.discard_draft_games(
+                game_ids=list(self.committed), actor_id=ADMIN,
+                user_id=ADMIN, role=Role.LEAGUE_ADMIN, scope={})
+        finally:
+            self.store.get_game_for_update = original
+
+        self.assertEqual(
+            attempts["count"], 2,
+            "the locked Game named a Season the plan never locked and the "
+            "batch carried on regardless -- the comparison must run BEFORE "
+            "authorization, which otherwise drops the changed row silently, "
+            "and a mismatch must restart the whole unit")
+        self.assertNotIn("error", result, result)
+        # The restarted attempt saw the real rows, so nothing was lost.
+        self.assertEqual(result["discarded"], 6, result)
+        self.assertEqual(self.store.all_games(), [])
+        # The abandoned attempt rolled back completely: only the successful
+        # attempt's six discards are audited.
+        self.assertEqual(
+            len(self.store.all_setup_audit()) - audit_before, 6,
+            "the abandoned attempt left audit rows behind")
+
     def test_a_target_changing_season_between_plan_and_lock_is_retried(self):
         """The bounded re-read/retry the reordering needs.
 
@@ -1661,6 +1728,16 @@ class DraftBatchVersusSingleGameLockOrderTest(unittest.TestCase):
         moved = self.committed[-1]
         other_season = self.fixture["A"]["seasons"]["2"]["season"]
         audit_before = len(self.store.all_setup_audit())
+        attempts = {"count": 0}
+        plain_resolve = self.api.context.resolve_with_league
+
+        def counting_resolve(*args, **kwargs):
+            attempts["count"] += 1
+            return plain_resolve(*args, **kwargs)
+
+        self.api.context.resolve_with_league = counting_resolve
+        self.addCleanup(setattr, self.api.context, "resolve_with_league",
+                        plain_resolve)
         original = self.store.get_game_for_update
         seen = {"calls": 0, "moved": False}
 
@@ -1688,6 +1765,19 @@ class DraftBatchVersusSingleGameLockOrderTest(unittest.TestCase):
             self.store.get_game_for_update = original
 
         self.assertTrue(seen["moved"], "the conflict was never injected")
+        # THE assertion: a second transaction really ran. Without it the
+        # 'discarded 5, survivor 1' result below is produced entirely by the
+        # FIRST attempt -- the authorization check silently drops the changed
+        # row before the Season comparison is ever reached, so `placement_raced`
+        # is never raised and `_retry_on_plan_race` never does anything. One
+        # `resolve_with_league` runs per attempt.
+        self.assertEqual(
+            attempts["count"], 2,
+            "the batch ran ONE transaction, so the Season-drift raise and the "
+            "bounded retry were never exercised -- the changed row was "
+            "silently dropped by authorization instead")
+        # The retry planned against the winner's COMMITTED Season.
+        self.assertEqual(self.store.get_game(moved).season_id, other_season)
         self.assertNotIn("error", result, result)
         # The retry re-planned: the moved Game is no longer in the tuple, so
         # the five that remain are discarded and it is left alone.

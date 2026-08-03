@@ -6514,6 +6514,10 @@ class ApiService:
             drafts, game_ids, all_drafts)
             if self._game_in_active_tuple(g, program, season, league)]
         planned_seasons = {g.season_id for g in planned if g.season_id}
+        # Each planned Game's EXACT Season, kept per row rather than as a set:
+        # a set only answers "is this Season one we locked", which a row that
+        # moved between two Seasons the batch happens to hold would pass.
+        planned_season_of = {g.id: g.season_id for g in planned}
 
         # -- step 3: SEASONS first, sorted, matching every other path.
         self._guard_active_seasons(planned_seasons)
@@ -6527,17 +6531,22 @@ class ApiService:
             # stand under the lock, never as the pre-lock scan saw them.
             if locked is None or not locked.is_draft:
                 continue
-            if not self._game_in_active_tuple(locked, program, season,
-                                              league):
-                continue
-            if locked.season_id not in planned_seasons:
-                # The row moved to a Season this transaction never locked, so
-                # the writes below would touch unlocked ice. Restart against a
-                # fresh plan rather than proceed on a scope we do not hold.
+            # The Season comparison runs HERE -- immediately after the lock and
+            # BEFORE authorization. Authorization would otherwise drop the
+            # changed row silently: a Game whose Season moved while its other
+            # parents still name the old one has a DISAGREEING parent graph, so
+            # `_game_in_active_tuple` answers False and `continue`s, and this
+            # raise is never reached. The batch would then carry on writing to
+            # ice this transaction never locked, and the drift would look
+            # exactly like an ordinary out-of-tuple row.
+            if locked.season_id != planned_season_of[game_id]:
                 raise ConcurrencyConflictError(
                     "A draft game's season changed while processing the "
                     "request; please retry.",
                     {"reason": "placement_raced"})
+            if not self._game_in_active_tuple(locked, program, season,
+                                              league):
+                continue
             targets.append(locked)
         return targets
 
