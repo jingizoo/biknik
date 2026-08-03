@@ -6410,25 +6410,22 @@ class ApiService:
         }
         return {"draft_games": rows, "summary": summary}
 
-    def _draft_targets(self, game_ids, all_drafts, user_id=None, role=None,
-                       scope=None):
-        """The draft Games this publish/discard call may act on (#386).
+    @staticmethod
+    def _select_draft_targets(drafts, game_ids, all_drafts):
+        """Apply the caller's ``game_ids`` / ``all`` selection to an
+        ALREADY-AUTHORIZED candidate list.
 
-        The active-tuple filter runs on the candidate set FIRST, and the
-        caller's `game_ids` / `all` selection is applied to what survives. The
-        order is the contract: a caller-supplied id selects WHICH rows to
-        consider and is never evidence of entitlement to them, so a foreign id
-        simply matches nothing — arriving at the identical `{"published": 0}`
-        / `{"discarded": 0}` an id that was never minted already produced. No
-        separate refusal is introduced, so there is no status or wording for
-        an existence oracle to read. `all: true` likewise means "all of MINE",
+        Selection strictly AFTER authorization is the contract, not an
+        ordering detail: a caller-supplied id says WHICH rows to consider and
+        is never evidence of entitlement to them, so a foreign id simply
+        matches nothing — arriving at the identical ``{"published": 0}`` /
+        ``{"discarded": 0}`` an id that was never minted already produced. No
+        separate refusal exists, so there is no status or wording for an
+        existence oracle to read. ``all: true`` likewise means "all of MINE",
         never the installation.
         """
-        drafts = self._games_in_active_tuple(
-            [g for g in self.store.all_games() if g.is_draft],
-            user_id, role, scope)
         if all_drafts:
-            return drafts
+            return list(drafts)
         wanted = set(game_ids or [])
         return [g for g in drafts if g.id in wanted]
 
@@ -6463,23 +6460,26 @@ class ApiService:
         `league_season_id` was moved out of the tuple between the read and the
         lock is judged on what it is NOW.
         """
+        drafts = [g for g in self.store.all_games() if g.is_draft]
         if role is None:
-            return self._draft_targets(game_ids, all_drafts)
+            # Ungated and untouched: no context read, no lock, no re-read.
+            return self._select_draft_targets(drafts, game_ids, all_drafts)
         program, season, league = self.context.resolve_with_league(
             user_id, role, scope, lock=True)
         if program is None:
             return []
+        # Selected FIRST so only the rows this call could act on are locked —
+        # `all_drafts` still means every draft, and an explicit id list locks
+        # just those. Sorted, so two concurrent batches take the Game locks in
+        # one global order and cannot deadlock against each other.
         candidates = sorted(
-            (g.id for g in self.store.all_games() if g.is_draft),
-            )
-        if not all_drafts:
-            wanted = set(game_ids or [])
-            candidates = [gid for gid in candidates if gid in wanted]
+            g.id for g in self._select_draft_targets(
+                drafts, game_ids, all_drafts))
         targets = []
         for game_id in candidates:
             locked = self.store.get_game_for_update(game_id)
-            # Re-read under the lock: `is_draft` and every parent are judged
-            # on the row as it stands now, not as the pre-lock scan saw it.
+            # Judged on the RE-READ row: `is_draft` and every parent as they
+            # stand under the lock, never as the pre-lock scan saw them.
             if (locked is not None and locked.is_draft
                     and self._game_in_active_tuple(
                         locked, program, season, league)):
