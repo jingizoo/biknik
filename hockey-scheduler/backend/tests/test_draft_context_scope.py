@@ -245,14 +245,20 @@ def foreign_identifiers(fixture, program_tag, season_tag, league_tag):
     """Every identifier a refused caller must NOT see, for one corner.
 
     This is the #380-facing clause, generalized. #380 ("bounded schedule
-    explanations") will add richer candidate evidence to the draft response --
+    explanations") adds richer candidate evidence to the draft response --
     per-pairing rejected slots, the rink and venue each belongs to, the
-    blackout that excluded it, the times considered. That PR is not merged, so
-    its own fields cannot be exercised here. What CAN be pinned, and what will
-    still hold when they land, is the general property those fields must obey:
-    a refused response names NOTHING of the target hierarchy anywhere in its
+    blackout that excluded it, the times considered. When this was written
+    that PR was unmerged and only the general property could be pinned: a
+    refused response names NOTHING of the target hierarchy anywhere in its
     bytes -- not a team, not a slot, not the rink, not the venue, not a
     blackout date, not a candidate time.
+
+    #380 has since landed, and
+    ``test_no_candidate_evidence_is_built_for_a_refused_target`` below now
+    drives those real fields against this same identifier set. Both are kept:
+    the general property holds for every field the response may grow next,
+    and the specific one proves the fields that exist today are covered
+    rather than merely absent from a payload that had none.
     """
     program = fixture[program_tag]
     season = program["seasons"][season_tag]
@@ -629,12 +635,11 @@ class DraftActiveTupleTest(unittest.TestCase):
         """Not one identifier of the refused hierarchy appears anywhere in the
         response bytes.
 
-        #380 ("bounded schedule explanations") is not merged, so its own
-        candidate-evidence fields cannot be exercised here. This asserts the
-        general property they will have to obey, on the response shape that
-        exists today, written so it keeps holding when the richer evidence
-        lands: whatever a draft response grows, a REFUSED one still names no
-        team, slot, rink, venue, blackout or time of the target hierarchy.
+        The GENERAL property, deliberately stated over the whole response
+        rather than over #380's named fields: whatever a draft response
+        grows, a REFUSED one still names no team, slot, rink, venue,
+        blackout or time of the target hierarchy. The field-specific
+        counterpart is the next test.
         """
         def body(store, api):
             fixture = build_two_programs(api)
@@ -668,6 +673,85 @@ class DraftActiveTupleTest(unittest.TestCase):
                             f"identifiers {leaked} -- a refused response must "
                             "carry no team, slot, rink, venue, blackout or "
                             "time of the target")
+        self._on_every_backend(body)
+
+    def test_no_candidate_evidence_is_built_for_a_refused_target(self):
+        """#380's OWN fields, now that they exist.
+
+        The test above pins the general property over the whole payload. This
+        one names the fields, and -- more importantly -- proves the refusal is
+        withholding something real. A draft whose pairings all PLACE has no
+        ``unscheduled`` rows and therefore no explanation at all, so "the
+        refusal carries no candidate_windows" would be true of a request that
+        never had any. The allowed control below blacks out every one of the
+        corner's own slot dates so all six pairings go unplaced, and asserts
+        that the in-tuple response really does hand over candidate windows
+        naming that hierarchy's slots, rinks, venues and times.
+
+        The refused request is then byte-for-byte the same request.
+        """
+        def body(store, api):
+            fixture = build_two_programs(api)
+            pa, sa, la, da = corner(fixture, "A", "1", "a")
+            pb, sb, lb, _db = corner(fixture, "B", "1", "a")
+            target = fixture["A"]["seasons"]["1"]["leagues"]["a"]
+            secrets = foreign_identifiers(fixture, "A", "1", "a")
+            request = {
+                "division_id": da,
+                "slot_ids": list(target["slots"]),
+                # Every candidate date, so nothing places and every pairing
+                # carries a full explanation.
+                "constraints": {"season_blackout_dates": sorted(
+                    {when[:10] for when in target["slot_times"]})},
+            }
+
+            # -- the control: in the exact tuple, evidence really is built --
+            self._select(api, ADMIN, Role.LEAGUE_ADMIN, pa, sa, la)
+            allowed = _ok(self._draft(
+                api, ADMIN, Role.LEAGUE_ADMIN, **copy.deepcopy(request)),
+                "in-tuple draft")
+            self.assertEqual(allowed["draft_games"], [], allowed)
+            self.assertTrue(allowed["unscheduled"], allowed)
+            windows = [
+                window
+                for row in allowed["unscheduled"]
+                for window in row["explanation"]["candidate_windows"]]
+            self.assertTrue(windows, allowed)
+            # The evidence names exactly the class of identifier the refusal
+            # must withhold -- slot, rink, venue and candidate time.
+            for window in windows:
+                self.assertIn(window["ice_slot_id"], target["slots"])
+                self.assertIn(window["start_time"], target["slot_times"])
+                self.assertEqual(window["rink_id"], fixture["A"]["rink"])
+            present = leaked_identifiers(secrets, json.dumps(allowed,
+                                                             sort_keys=True))
+            self.assertGreater(
+                len(present), 15,
+                "the ALLOWED payload does not actually carry the identifiers "
+                "the refusal is asked to withhold, so the refusal below "
+                "would pass for the wrong reason")
+
+            # -- the refusal: same request, a principal in Program B --------
+            for user_id, role in GLOBAL_PRINCIPALS:
+                with self.subTest(role=role.value):
+                    self._select(api, user_id, role, pb, sb, lb)
+                    refused = self._draft(
+                        api, user_id, role, **copy.deepcopy(request))
+                    self.assertIn("error", refused, refused)
+                    raw = json.dumps(refused, sort_keys=True)
+                    for field in ("explanation", "candidate_windows",
+                                  "blocking_constraint_codes", "alternatives",
+                                  "rejections", "unscheduled"):
+                        self.assertNotIn(
+                            field, raw,
+                            f"a refused draft carried the {field!r} field -- "
+                            "no evidence may be assembled for a hierarchy "
+                            "this principal is refused")
+                    leaked = leaked_identifiers(secrets, raw)
+                    self.assertEqual(
+                        leaked, [],
+                        f"candidate evidence leaked {leaked} for a refused "
+                        "target")
         self._on_every_backend(body)
 
     # -- clause: role is None ----------------------------------------------

@@ -12,6 +12,7 @@ from .league_scope import (
     require_slot_belongs_to_season,
     slot_belongs_to_season,
 )
+from .schedule_explanations import add_scope_blocker
 from .scheduler import (
     draft_schedule as _base_draft_schedule,
     draft_schedule_for_league as _base_draft_schedule_for_league,
@@ -61,6 +62,36 @@ def season_candidate_rink_ids(store, season_id, slot_ids):
     return rinks
 
 
+def _annotate_missing_venue_access(store, result, season_id, league_id):
+    """Explain an empty candidate pool caused by zero active access grants.
+
+    The scanner intentionally never returns another Season/Program's slots.
+    This adds only the selected Season id and a concrete input-correction code;
+    it does not reveal which inaccessible venues/rinks/slots happen to exist.
+    """
+    has_active_access = any(
+        access.active
+        for access in store.season_venue_access_for_season(season_id))
+    if has_active_access:
+        return
+    scope = {
+        "season_id": season_id,
+        "league_id": league_id,
+        "division_id": result.get("division_id"),
+    }
+    for row in result.get("unscheduled", ()):
+        explanation = row.get("explanation")
+        if explanation is None:
+            continue
+        add_scope_blocker(
+            explanation,
+            code="venue_access_missing",
+            details={"season_id": season_id},
+            pairing=row,
+            scope=scope,
+        )
+
+
 def draft_schedule(store, division_id, slot_ids=None, constraints=None,
                    meetings_per_opponent=None):
     division = store.get_division(division_id) if division_id else None
@@ -87,6 +118,8 @@ def draft_schedule(store, division_id, slot_ids=None, constraints=None,
     if not scoped_slot_ids:
         for row in result["unscheduled"]:
             row["reason"] = "No available game ice is assigned to this season."
+        _annotate_missing_venue_access(
+            store, result, season_id, league_id)
 
     result["season_id"] = season_id
     result["league_id"] = league_id
@@ -126,6 +159,8 @@ def draft_schedule_for_league(store, season_id, league_id, division_id=None,
     if not scoped_slot_ids:
         for row in result["unscheduled"]:
             row["reason"] = "No available game ice is assigned to this season."
+        _annotate_missing_venue_access(
+            store, result, season_id, league_id)
 
     return result
 
