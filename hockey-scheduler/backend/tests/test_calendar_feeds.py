@@ -264,6 +264,7 @@ class CalendarHttpTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
 
     def setUp(self):
         # Every test method in this class shares one server/rate-limiter

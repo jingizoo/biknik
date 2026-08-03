@@ -42,6 +42,7 @@ class GameLeagueSeasonIdentityHttpTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
 
     def setUp(self):
         # #331 review round 23: STATE.reset() swaps STATE.api/game_id in

@@ -63,6 +63,7 @@ class PublicPagesProductionTest(_Base):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
         os.environ.pop("APP_MODE", None)
         os.environ.pop("BOOTSTRAP_ADMIN_USER", None)
         os.environ.pop("BOOTSTRAP_ADMIN_PASSWORD", None)

@@ -386,6 +386,7 @@ class ZeroProgramBootstrapScopingHttpTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
         # STATE is a module-level singleton shared with every other HTTP test
         # module; hand it back seeded, the way they expect to find it.
         cls.srv.STATE.reset()

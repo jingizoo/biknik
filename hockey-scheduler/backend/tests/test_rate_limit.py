@@ -138,6 +138,7 @@ class RateLimitHttpTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
 
     def setUp(self):
         self.srv.RATE_LIMITER.reset()

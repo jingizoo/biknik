@@ -64,6 +64,7 @@ def setUpModule():
 def tearDownModule():
     if _HTTPD:
         _HTTPD.shutdown()
+        _HTTPD.server_close()
     for k, v in _SAVED_ENV.items():
         if v is None:
             os.environ.pop(k, None)

@@ -76,6 +76,7 @@ def setUpModule():
 def tearDownModule():
     if _HTTPD:
         _HTTPD.shutdown()
+        _HTTPD.server_close()
 
 
 class WebServerTest(unittest.TestCase):

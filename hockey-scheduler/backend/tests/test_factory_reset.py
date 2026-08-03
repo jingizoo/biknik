@@ -656,6 +656,7 @@ class FactoryResetHttpTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
         for k, v in cls._env_backup.items():
             if v is None:
                 os.environ.pop(k, None)

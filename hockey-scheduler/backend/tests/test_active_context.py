@@ -1351,6 +1351,7 @@ class ActiveContextHttpTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        cls.httpd.server_close()
 
     def _req(self, method, path, body=None, opener=None, role=None):
         url = f"http://127.0.0.1:{self.port}{path}"

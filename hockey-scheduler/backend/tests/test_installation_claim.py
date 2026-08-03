@@ -201,6 +201,7 @@ class InstallationClaimHttpTest(unittest.TestCase):
     def tearDown(self):
         self.httpd.shutdown()
         self.thread.join(timeout=5)
+        self.httpd.server_close()
         try:
             srv.STATE.api.store.close()
         except Exception:
