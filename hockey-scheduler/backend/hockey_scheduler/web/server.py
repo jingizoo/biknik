@@ -1689,9 +1689,21 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(api.get_public_game(pg.group(1)))
         if path == "/api/scheduler/drafts":
             # Current draft games for the review screen (#86), operator-only.
+            # #386 — MANAGE_SCHEDULE says the caller may review SOME draft;
+            # only the persisted active tuple says WHICH. Without the principal
+            # this answered with every draft Game in the installation, both
+            # team names, Division, Rink and time included — the same payload
+            # the draft proposal discloses, one route further down. The
+            # identity-less X-Demo-Role / headerless demo fallbacks resolve a
+            # context too (`user_id=None` simply has no SAVED selection), so
+            # the facade re-resolves the tuple server-side either way.
             if self._operator_only("/api/scheduler/commit"):
                 return
-            return self._send_api(api.list_draft_games())
+            role, scope, user_id, err = self._resolve_role()
+            if err is not None:
+                code, payload = err
+                return self._send_json(payload, code)
+            return self._send_api(api.list_draft_games(user_id, role, scope))
         # Named schedule scenarios (#206/#378). MANAGE_SCHEDULE says the
         # caller may operate SOME schedule; only the persisted active tuple
         # says WHICH — so like /api/demo/overview and /api/standings these
@@ -2548,13 +2560,20 @@ class Handler(BaseHTTPRequestHandler):
         # #375 — meetings_per_opponent is the configurable regular-season
         # format (how many times each team plays every other). Omitted keeps
         # the historical single round-robin; the facade validates it.
+        # #386 — the body's scope ids say WHICH hierarchy to draft; the session
+        # says whether this caller may. Both go to the facade, and only the
+        # second one is authority. MANAGE_SCHEDULE (the gate above) is held by
+        # League Admin AND Arena Manager, both `context_scope._GLOBAL_ROLES`,
+        # so without the principal an operator working in Program B received
+        # Program A's whole proposal — pairings, team names and ice slots.
         if path == "/api/scheduler/draft":
             return self._send_api(api.draft_season_schedule(
                 division_id=body.get("division_id"),
                 season_id=body.get("season_id"), league_id=body.get("league_id"),
                 slot_ids=body.get("slot_ids"),
                 constraints=body.get("constraints"),
-                meetings_per_opponent=body.get("meetings_per_opponent")))
+                meetings_per_opponent=body.get("meetings_per_opponent"),
+                user_id=user_id, role=role, scope=scope))
         if path == "/api/scheduler/scenarios":
             try:
                 check_body(
@@ -2617,15 +2636,26 @@ class Handler(BaseHTTPRequestHandler):
                 # refused as preview_stale rather than silently committing
                 # a differently-sized schedule.
                 meetings_per_opponent=body.get("meetings_per_opponent"),
-                actor_id=user_id))
+                # #386 — the same sibling omission as /api/scheduler/draft,
+                # behind a verb that WRITES: this route takes the identical
+                # caller-supplied Division-only or Season+League target, so
+                # without the principal a Program-B-selected operator could
+                # commit Program A's regenerated proposal into A and read every
+                # created Game's teams, rink and time back out.
+                actor_id=user_id, user_id=user_id, role=role, scope=scope))
+        # #386 — `game_ids` comes straight from the request body and `all`
+        # meant the whole installation, so without the principal either verb
+        # was an IDOR write over another Program's draft schedule. The target
+        # set is now the active tuple's own drafts; a foreign id matches
+        # nothing and reads back exactly like an id that never existed.
         if path == "/api/scheduler/drafts/publish":
             return self._send_api(api.publish_draft_games(
                 game_ids=body.get("game_ids"), all_drafts=bool(body.get("all")),
-                actor_id=user_id))
+                actor_id=user_id, user_id=user_id, role=role, scope=scope))
         if path == "/api/scheduler/drafts/discard":
             return self._send_api(api.discard_draft_games(
                 game_ids=body.get("game_ids"), all_drafts=bool(body.get("all")),
-                actor_id=user_id))
+                actor_id=user_id, user_id=user_id, role=role, scope=scope))
 
         # Notification delivery worker: drain the pending queue (#58).
         if path == "/api/notifications/deliveries/process":

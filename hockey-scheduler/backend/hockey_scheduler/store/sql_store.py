@@ -1759,8 +1759,165 @@ class SqlStore:
         return cur.rowcount if cur.rowcount is not None else 0
 
     # -- per-user active Program/Season context (#159) ---------------------
+    #
+    # The lock keyspace for the per-user context mutex (#386 re-review). An
+    # arbitrary but STABLE namespace, so these advisory locks can never
+    # collide with another feature's.
+    _ACTIVE_CONTEXT_LOCK_NAMESPACE = 0x4143      # "AC"
+
+    def _lock_active_context_mutex(self, user_id):
+        """Take the per-user ActiveContext MUTEX for this transaction (#386).
+
+        ``SELECT ... FOR UPDATE`` on ``user_active_context`` is not enough on
+        its own, and the reason is exactly the owner's: **an absent-row read is
+        not a lock**. A user who has never saved a selection has no row, so the
+        authorizing transaction's ``FOR UPDATE`` locks nothing, and all it holds
+        against a concurrent FIRST ``INSERT`` is a single read->write
+        anti-dependency — which SERIALIZABLE is not obliged to abort. A brand
+        new operator could therefore authorize from fallback tuple A, make
+        their first saved selection B concurrently, and have BOTH the B
+        selection and the A Game writes commit.
+
+        A PostgreSQL transaction-scoped ADVISORY lock has the one property a
+        row lock cannot have here: it exists before the row does. It is keyed
+        on the user id, needs nothing to be present, and is released
+        automatically at commit or rollback, so no cleanup path can leak it.
+        Both sides take it — the mutating authorization and
+        ``set_active_context`` — which is what makes it a mutex rather than a
+        hint.
+
+        ``hashtext`` collisions are possible and harmless: two unrelated users
+        would merely serialize against each other. Correctness never depends on
+        the key being unique, only on it being the SAME for one user.
+
+        A falsy ``user_id`` takes nothing. Such a caller (the identity-less
+        X-Demo-Role fallback) can never own a row — ``set_active_context``
+        refuses without a user id — so there is no first insert to race.
+
+        SQLite is a documented no-op: ``transaction()`` holds the process-wide
+        lock for the whole block, which is strictly stronger.
+        """
+        if not user_id or self.backend != "postgres":
+            return
+        self._exec("SELECT pg_advisory_xact_lock(?, hashtext(?))",
+                   (self._ACTIVE_CONTEXT_LOCK_NAMESPACE, user_id))
+
+    @contextmanager
+    def active_context_mutex(self, user_id):
+        """Hold the per-user context mutex ACROSS a whole mutation unit (#386).
+
+        The transaction-scoped lock alone cannot order this, and the reason is
+        exact: PostgreSQL fixes a SERIALIZABLE transaction's view at its FIRST
+        query, and `SELECT pg_advisory_xact_lock(...)` *is* a query. A batch
+        that issues it, blocks behind a first selection, and then wins the lock
+        still holds the snapshot that statement took — taken BEFORE the
+        selection committed. Winning the lock tells it nothing it had not
+        already decided: it sees no saved context, resolves the fallback tuple
+        and mutates it after the real selection is persisted. **Blocking on a
+        lock does not refresh a view the blocking statement itself took.**
+
+        So the wait has to happen OUTSIDE the transaction that authorizes.
+        This is a SESSION-scoped advisory lock taken before ``BEGIN`` and held
+        across commit or rollback, so the mutation unit's snapshot is created
+        only after the wait is over — and any selection that lands afterwards
+        blocks until this unit is completely finished.
+
+        RELEASING IS THE DANGEROUS PART, and it is why this is a context
+        manager rather than a pair of calls. A session lock survives rollback
+        and survives the connection being reused; leaking it once leaves that
+        user permanently unable to schedule. The ``finally`` therefore always
+        runs, and if the connection is in an aborted state (the unit raised
+        mid-transaction) it is rolled back first so the unlock can execute —
+        an unlock that silently failed would be exactly the leak this guards
+        against. A failure to release is re-raised, never swallowed: a leaked
+        mutex must be loud.
+
+        MUST be entered OUTSIDE any transaction; asserted, because acquiring
+        inside one would reintroduce the very ordering bug it exists to fix.
+        SQLite is a no-op — its ``transaction()`` holds the process-wide lock,
+        which is strictly stronger and needs no cross-transaction mutex.
+        """
+        if not user_id or self.backend != "postgres":
+            yield
+            return
+        key = (self._ACTIVE_CONTEXT_LOCK_NAMESPACE, user_id)
+        # The connection lock is taken FIRST and held through the advisory
+        # unlock. Two reasons, and the second one is a bug this check itself
+        # introduced:
+        #
+        # * it makes the whole mutex context, the nested `transaction()` and
+        #   the release ONE unit on this connection — which a single
+        #   PostgreSQL connection requires anyway, since it cannot run two
+        #   statements at once;
+        # * `_txn_depth` is STORE state, not thread-local, and `transaction()`
+        #   holds this same lock for its whole block. Reading the depth
+        #   WITHOUT the lock let a request see a DIFFERENT request's open
+        #   transaction, mistake it for its own re-entry, and raise instead of
+        #   waiting — a 500 on two perfectly valid concurrent requests with no
+        #   advisory-lock contention involved at all. Holding the lock means
+        #   any depth observed here is genuinely this caller's own.
+        #
+        # `_lock` is an RLock, so the nested `transaction()` re-enters it
+        # freely; nothing here deadlocks against the code it wraps.
+        with self._lock:
+            if self._txn_depth > 0:
+                raise RuntimeError(
+                    "active_context_mutex() must be entered OUTSIDE any "
+                    "transaction: a mutex acquired inside the transaction it "
+                    "protects is taken by a statement that has already fixed "
+                    "that transaction's snapshot")
+            self._exec("SELECT pg_advisory_lock(?, hashtext(?))", key)
+            try:
+                yield
+            finally:
+                try:
+                    self._exec(
+                        "SELECT pg_advisory_unlock(?, hashtext(?))", key)
+                except Exception:
+                    # The unit failed mid-transaction and left the connection
+                    # aborted. Clear it and release anyway — never leak.
+                    self.conn.rollback()
+                    self._exec(
+                        "SELECT pg_advisory_unlock(?, hashtext(?))", key)
+
     def get_active_context(self, user_id):
         return self._get(ActiveContext, user_id)
+
+    def get_active_context_for_update(self, user_id):
+        """The caller's saved context, ROW-LOCKED until this transaction ends
+        (#386).
+
+        The lock half of the protocol that orders an active-tuple
+        AUTHORIZATION against a concurrent ``set_active_context``. A consistent
+        snapshot is not enough on its own: ``ContextService._snapshot`` gives
+        the resolve a coherent read, but nothing stops a competing
+        ``POST /api/context`` from committing between that read and the Games
+        landing. Whoever takes this lock first wins, and the loser blocks until
+        the first one commits — so a write authorized under tuple A can never
+        be performed under tuple B.
+
+        ``set_active_context`` deliberately takes NO explicit lock of its own.
+        Its ``INSERT ... ON CONFLICT (id) DO UPDATE`` acquires the row lock
+        itself when the row exists, so it already blocks behind this one — an
+        extra ``SELECT ... FOR UPDATE`` there would be redundant, and it also
+        put a second ``user_active_context`` statement in front of the INSERT,
+        which silently moved the barrier in
+        ``test_active_context.ContextConcurrencyPgTest`` off the write it was
+        instrumenting. The ordering is a property of this side of the protocol.
+
+        The row may not exist (a caller running on `_fallback`, never having
+        selected anything). ``FOR UPDATE`` then locks nothing — there is no row
+        to lock and no lock the writer could block on either. An earlier
+        revision leaned on SERIALIZABLE's read->write anti-dependency to order
+        that case and the owner's review rejected it: **an absent-row read is
+        not a lock**, and one anti-dependency does not oblige PostgreSQL to
+        abort either transaction, so a brand new operator could authorize from
+        fallback tuple A, make their first saved selection B concurrently, and
+        commit BOTH. `_lock_active_context_mutex` above is what actually orders
+        the first insert; the row lock remains for the ordinary case.
+        """
+        self._lock_active_context_mutex(user_id)
+        return self._get_for_update(ActiveContext, user_id)
 
     def set_active_context(self, ctx):
         """Persist a user's selected context (one row per user), last-write-wins.
@@ -1778,6 +1935,18 @@ class SqlStore:
         previously-saved League with NULL rather than leaving a stale one bound
         to a context it may not belong to."""
         with self.transaction():
+            # #386 — take the SAME per-user mutex the authorizing readers
+            # take, so a context switch and a write authorized against the
+            # tuple it switches away from order against each other on the
+            # database. This is the half that covers the caller's very FIRST
+            # selection, where there is no row for either side to lock: the
+            # advisory lock exists before the row does. An explicit row lock is
+            # deliberately NOT taken here — `ON CONFLICT (id) DO UPDATE`
+            # acquires it itself, and adding a second `user_active_context`
+            # statement ahead of the INSERT silently moved the barrier in
+            # `test_active_context.ContextConcurrencyPgTest` off the write it
+            # instruments.
+            self._lock_active_context_mutex(ctx.id)
             self._exec(
                 "INSERT INTO user_active_context "
                 "(id, program_id, season_id, updated_at, league_id) "

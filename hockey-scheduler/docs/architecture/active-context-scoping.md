@@ -658,6 +658,407 @@ The rest of the scenario record's own contract — immutability, staleness and t
 commit lock plan — is documented in
 [scheduler.md](scheduler.md#named-immutable-scenarios-378).
 
+### The draft surface underneath it (#386)
+
+The same blocker again, on the endpoint the scenario routes are a wrapper
+around. `draft_season_schedule` took **no principal at all** — no `user_id`, no
+`role`, no `scope` — and `POST /api/scheduler/draft` passed none, so it was
+authorized by the `MANAGE_SCHEDULE` capability and by nothing else. Both roles
+that hold that capability are `_GLOBAL_ROLES`, so a League Admin (confirmed in
+the #381 review) or an Arena Manager whose active context was Program B could
+post Program A's identifiers and receive **A's whole proposal — every pairing,
+both team names per pairing, and the ice slot each game would occupy**.
+
+That is not a latent gap, it is a live bypass of the section above: a caller
+refused a foreign *scenario* could ask the draft endpoint for the same
+Program's proposal and read the team names straight out of it. Binding the
+wrapper without binding what it wraps was never going to hold.
+
+The gate is `ApiService._authorize_schedule_target`, and it is the #381
+machinery verbatim: `resolve_with_league` → the requested ids resolved by
+`resolve_scenario_scope` into a real `(Program, Season, League)` →
+`_setup_target_edge_allows` on that **whole edge**, judged through
+`resolve_scenario_scope`'s `authorize=` callback so it runs at the earliest
+point each request shape knows its edge. Both near-miss corners refuse, a
+Program-only context fails closed against every Division of its own Program,
+and an explicit **No League** stays the Program + active-Season union it is
+everywhere else.
+
+**Two independent closures, not one restated twice.** Ordering the callback
+covers the ladder the *generator* itself climbs
+(`require_league_belongs_to_season` answers `league_missing` for a guessed
+League and `league_season_mismatch` for a real-but-unbound one, both before the
+Division lookup can answer `division_missing`). Flattening every refusal
+reached **before** the edge was known covers the rungs no callback placement
+can get in front of — a Division whose own LeagueSeason/Season/League row is
+missing, a Season and League resolving into two different Programs, a Season
+whose Program row is gone. Each of those is a fact about rows the caller may
+not see. Both are kept and both are mutation-proven, because "authorize
+earlier" and "say less" fail in different directions.
+
+**Inside the caller's own tuple nothing changed.** Once the edge has passed,
+this gate steps aside and the generator raises its own precise diagnostics
+(`Division {id} not found.`, `League belongs to a different season.`)
+unaltered. `role is None` is ungated and takes no context read at all —
+including `create_schedule_scenario`'s own nested generation, which has already
+authorized the identical edge and must not re-resolve inside its open
+`SERIALIZABLE` transaction.
+
+**One refusal helper for both entry points.** `_schedule_scope_not_found`
+(renamed from `_scenario_scope_not_found`) now serves the scenario CREATE and
+the draft generate/commit alike. Two wordings would let a caller play one route
+against the other: refused by one and refused *differently* by the other is
+itself a signal about which id was real.
+
+#### The sibling entry points
+
+The audit the blocker asked for found the same omission on every other
+scheduler-facing method, and each is bound here:
+
+| entry point | route | omission | now |
+| --- | --- | --- | --- |
+| `draft_season_schedule` | `POST /api/scheduler/draft` | no principal; caller-supplied target | active-tuple edge check before generation |
+| `commit_draft_schedule` | `POST /api/scheduler/commit` | no principal; the IDENTICAL target, behind a verb that WRITES | the same gate, twice: preflight, then re-authorized under the write locks |
+| `list_draft_games` | `GET /api/scheduler/drafts` | no principal; every draft Game in the installation, both team names, Division, Rink, time | rows filtered before any review row is built; `published_count` scoped too |
+| `publish_draft_games` | `POST /api/scheduler/drafts/publish` | no principal; `game_ids` from the body, `all` = the installation | targets narrowed to the tuple first, then the selection applied |
+| `discard_draft_games` | `POST /api/scheduler/drafts/discard` | as above, and it DELETES | as above |
+| `create/list/get/commit_schedule_scenario` | `/api/scheduler/scenarios*` | — | already bound by #381 |
+
+**The commit is checked twice, and the first check has to be first.** The
+preflight runs before `preview_required` / `preview_stale`, because the
+fingerprint gate is itself an oracle otherwise: "your preview is out of date"
+confirms the hierarchy exists where a guessed id answers not-found. The second
+check runs after the Program/Team/Rink/Season locks and before the first Game
+INSERT, in the same transaction — reading a preview is not authority to commit
+it minutes later, and a context switch landing in the gap between the preflight
+and the locks is exactly the check/use gap #372 named. An identified caller
+therefore opens that transaction `SERIALIZABLE`, since `ContextService._snapshot`
+asks for it and a nested join may not raise the open transaction's isolation.
+
+**Both copies of the commit body carry it.** `api/service.py`'s
+`_commit_draft_schedule_attempt` is SHADOWED at runtime by
+`api/league_scoped_service.py`'s override (MRO: hierarchy_import_service →
+league_scoped_service → service). Only the override actually executes, so the
+mutations below were applied there; the base copy carries the identical binding
+so the two cannot drift.
+
+#### A draft Game is judged by its WHOLE parent graph
+
+The first cut reduced a Game to `(its Season's Program, its Season, its
+`league_id`)` — **two of the four** competition parents — and the owner's
+review named that for what it is: a parallel mechanism with weaker semantics
+than the one #372 already landed for exactly this record. `season_id` and
+`league_id` can both name the active tuple while `division_id` or
+`league_season_id` points into another Program, another Season or a sibling
+League, and the reduced edge authorized the row anyway: both team names, the
+Division name, the Rink and the time of a foreign draft on the review screen,
+and its Games reachable by publish/discard.
+
+The decision is `_setup_target_edges("game", game)` **verbatim**.
+`_game_parent_constraints` resolves every non-null parent *independently* —
+`season_id`, `league_id`, **both ends** of `league_season_id` as two separate
+constraints, and `division_id` through its own binding likewise — and yields no
+edge at all when any of them fails to resolve or when two of them disagree on
+Program, Season or League. An empty edge set with `saw_link` is
+linked-but-unauthorized, which is the fail-closed answer here.
+
+A Game with **no** competition parent at all is also excluded for an identified
+caller. `setup_target_accessible` rule 6 would hand such a record to its
+creator; that clause is deliberately not adopted, for #372's own reason and
+#381's — and every Game the scheduler commits carries all four parents, so an
+unparented draft is not a state this surface has to keep workable.
+
+**The two participating Teams are folded in on top**, by the same "edges, not
+unions" rule and through the same `_team_edges` helper. This narrows and never
+widens. It lives in the review predicate rather than in
+`_game_parent_constraints` because it is a property of *this payload*: the
+review row serializes `home_team_name` and `away_team_name`, so a foreign Team
+is a direct disclosure through this surface even when all four competition
+parents agree — while #372's generic setup gate judges the four FKs only, on
+purpose (a Team transferred between Leagues after a Game was played must not
+make that historical Game unmanageable).
+
+`Game.league_id` is the canonical competition League, the axis `Team.league_id`
+names — *not* the legacy Program id `Venue.league_id` stores. `role is None`
+still sees the whole installation.
+
+#### Lock, then decide, then mutate
+
+Scoping the read was not enough on its own, and the first cut got the *timing*
+wrong in the way #372 already ruled on. `publish_draft_games` /
+`discard_draft_games` resolved their targets and authorized them in one
+transaction and then wrote in another, so a concurrent `POST /api/context`
+landing in between made the batch authorized under a tuple that no longer held.
+A predicate that closes its own transaction before the write was never one unit
+with it.
+
+So the whole unit — resolve, authorize, validate, mutate — is one
+`store.transaction()`, `SERIALIZABLE` for an identified caller (the nested
+context read asks for that level, and a nested join may never *raise* the open
+transaction's isolation). `_locked_draft_targets` takes three locks in order:
+
+1. the caller's **per-user ActiveContext mutex, then its row**
+   (`resolve_with_league(..., lock=True)` → `get_active_context_for_update`),
+   **before any other read**. `set_active_context` takes the **same** mutex
+   before writing;
+2. the **pre-lock locator**: the candidate drafts, read unlocked, selected, and
+   **authorized** — before any Season is touched, because locking the Season of
+   an unauthorized candidate would run `_require_active_season` against a
+   foreign Season and turn its `season_read_only` refusal into an existence
+   oracle;
+3. the **Season** rows named by that plan (`_guard_active_seasons`, sorted);
+4. the **Game** rows (`get_game_for_update`, sorted).
+
+**A lock taken inside the transaction cannot order the transaction's own
+snapshot.** PostgreSQL fixes a `SERIALIZABLE` transaction's view at its FIRST
+query — and `SELECT pg_advisory_xact_lock(…)` *is* a query. A batch that issued
+it, blocked behind a first context selection, and then won the lock still held
+the snapshot that very statement took, from before the selection committed:
+it saw no saved context, resolved the fallback tuple and mutated it after the
+real selection was persisted. Blocking on a lock does not refresh a view the
+blocking statement already took, and no amount of moving the *reads* later
+fixes that, because the lock statement is itself a read.
+
+So the wait happens **outside** the transaction. `store.active_context_mutex`
+is a **session-scoped** advisory lock taken before `BEGIN` and held across
+commit or rollback, so the unit's snapshot is created only once the wait is
+over, and any selection arriving afterwards blocks until the unit is finished.
+The alternative the ruling allowed — detect contention, then retry in a fresh
+transaction — was rejected because the required regression has to *observe the
+batch blocked*, and a try-lock-and-retry design never blocks.
+
+**Every identified mutation unit takes it, including the named-scenario
+commit.** `_commit_schedule_scenario_attempt` entered its own `SERIALIZABLE`
+transaction and called the draft commit deliberately identity-less, so nothing
+took the mutex at all — while a comment at the inner call claimed it was
+joining an outer protected unit that did not exist. The scenario's *row* lock
+orders nothing about `user_active_context`, and the `SERIALIZABLE` graph again
+holds only a read-context → write-context anti-dependency, which obliges
+neither side to abort. The mutex now wraps that unit from outside its
+transaction; the nested draft call stays identity-less so it *joins* rather
+than trying to reacquire a lock the session already holds.
+
+**The connection lock is held across the whole mutex context**, from the
+precondition check through the advisory unlock. `_txn_depth` is *store* state,
+not thread-local, and `transaction()` holds `_lock` for its entire block —
+so reading the depth without that lock let one request see a **different**
+request's open transaction, mistake it for its own re-entry, and raise instead
+of waiting. On the ordinary shared-`SqlStore` web shape that was a 500 on two
+perfectly valid concurrent requests, with no advisory-lock contention involved
+at all: a precondition check that introduced a worse failure than the race it
+guarded. `_lock` is an `RLock`, so the nested `transaction()` re-enters freely.
+
+**Releasing it is the dangerous part**, which is why it is a context manager
+and never a pair of calls. A session lock survives rollback and survives the
+connection being reused; leak it once and that user can never schedule again.
+The `finally` always runs, and when the unit raised mid-transaction the
+connection is rolled back first so the unlock can execute — an unlock that
+silently failed would be exactly the leak this guards against. A failure to
+release is re-raised, never swallowed. Entering inside a transaction is refused
+by the store outright, so the ordering bug cannot be reintroduced by a future
+call site.
+
+**The mutex must precede the first read, not merely the first write.** An
+earlier revision read the candidate Games and only then took the mutex. Under
+`SERIALIZABLE` the snapshot is established by the transaction's first
+data-reading statement, so a mutex acquired after it is too late *by
+construction*: a first selection slips in between, takes the still-free
+advisory lock, inserts tuple B and commits, and the batch's already-fixed
+snapshot cannot see that row — it resolves the stale fallback tuple A and
+writes A after B is persisted. The order is therefore transaction entry →
+mutex → resolve → candidate reads, so the mutex acquisition is itself the
+statement that fixes the snapshot.
+
+**An absent-row read is not a lock.** The row lock alone covered only callers
+who had already saved a selection. A brand-new operator has no row, so
+`FOR UPDATE` locks nothing, and an earlier revision leaned on `SERIALIZABLE`'s
+read→write anti-dependency to order the first `INSERT` — which PostgreSQL is
+not obliged to abort. That operator could authorize from fallback tuple A, make
+their first saved selection B concurrently, and commit **both**. The fix is a
+transaction-scoped **advisory lock** keyed on the user id
+(`_lock_active_context_mutex`), which has the one property a row lock cannot
+have here: it exists before the row does. Both sides take it, which is what
+makes it a mutex rather than a hint. `hashtext` collisions merely serialize two
+unrelated users. SQLite and the in-memory store are documented no-ops — their
+`transaction()` holds a process-wide lock, which is strictly stronger.
+
+**Season before Game, because that is the repo's order.** An earlier revision
+locked Games first and left `_guard_active_seasons` to the callers afterwards,
+reversing what every single-Game path does: `SetupService.publish_game` and
+`delete_game` lock the Season through `_guard_game_season` and only then touch
+the Game. Batch Game→Season against single Season→Game is an ABBA cycle, and
+PostgreSQL resolves those by killing one side — a 500 on a legitimate pair of
+requests. One canonical order removes the cycle instead of making it rarer.
+
+Locking Seasons from an **unlocked** plan opens a window, so the plan is
+**re-verified** on the locked rows. The order inside that loop is the contract:
+each Game's **exact planned Season** is compared *immediately after the lock and
+before authorization*. Putting the comparison after the authorization check
+made it dead code — a Game whose Season moved while its other parents still
+name the old one has a disagreeing parent graph, so `_game_in_active_tuple`
+answers False and `continue`s, and the raise is never reached. The comparison is
+per-Game rather than against the set of planned Seasons, because a set only
+answers "is this one we locked", which a row moving between two Seasons the
+batch happens to hold would pass. Drift raises `placement_raced`, rolls the
+attempt back, and restarts under a bounded retry (3 attempts).
+
+**What that raise can and cannot be reached by.** On PostgreSQL a *real*
+concurrent writer cannot reach it: the batch runs `SERIALIZABLE`, so its plan
+and its locked re-read come from one snapshot and cannot disagree, and a row
+another transaction genuinely changed makes `SELECT … FOR UPDATE` abort with
+`serialization_failure` first. That is precisely why "a retry happened" was not
+evidence this guard caused it, and why the guard shipped unfalsifiable for a
+round. It is kept as defence in depth for any backend or future call path whose
+re-read is not snapshot-isolated, and its regression injects the disagreement at
+the re-read itself rather than pretending a concurrent writer produced it. That retry also covers `serialization_failure`: it is the
+*same* race caught by the database a moment earlier, and refusing it would turn
+an ordinary concurrent edit into a user-visible 409 on a request that succeeds
+when re-run.
+
+The authorization runs on the **re-read, post-lock** Game rows, so a Game whose
+parents moved between the scan and the lock is judged on what it is now. The
+commit path's under-lock re-authorization takes the same context mutex.
+
+**The league-scoped facade no longer resolves the batch twice.** It used to
+override `publish_draft_games` entirely, resolve the targets itself, and then
+call `super()`, which resolved them again — two chances to disagree, and the
+validation itself leaks on a wider set (`require_game_league_id` raises
+`game_league_ambiguous` / `venue_access_missing` naming a *foreign* Game's id
+and league ids, the disclosure again as an error payload). It now supplies its
+league-ice invariant through `_publish_batch_extra_validation`, a hook that runs
+on the already-locked batch — and runs **first**, exactly where its own
+validation sat before, because that order is the published contract: running the
+participation check ahead of it relabels both reasons as
+`regular_game_missing_league_season`.
+
+**What is deliberately NOT narrowed.** `list_draft_games`' slot-conflict and
+team-double-booking indexes still scan every Game. A foreign Program's game
+genuinely occupying this Program's shared arena slot IS a real conflict for the
+in-scope draft, and hiding it would let the review screen certify a batch that
+cannot publish. Only a boolean escapes into the payload.
+
+Regression: `backend/tests/test_draft_context_scope.py`, across
+Memory/SQLite/PostgreSQL at the service boundary and over authenticated HTTP.
+Two Programs on the same shape #381's fixture uses, Program A carrying both
+near-miss corners, each corner independently schedulable *and separately
+asserted to be* — so a refusal can never be confused with an empty proposal.
+Byte-identity is compared on **raw HTTP response bytes and status**, never on
+parsed JSON: two payloads can parse equal and still differ in key order, in a
+field one omits, or in the status line.
+
+**The #380-facing clause.** #380 (bounded schedule explanations) is not merged,
+so its candidate-evidence fields cannot be exercised. What is pinned instead is
+the general property they will have to obey, written so it keeps holding when
+they land: a refused response names **no** team, slot, rink, venue, blackout
+date or candidate time of the target hierarchy, anywhere in its bytes. The
+search is on identifier boundaries rather than bare substrings (`team_1` would
+otherwise match `team_10`), and it deliberately still catches an id
+interpolated into a message, which an exact-scalar comparison over parsed JSON
+would miss.
+
+Mutation-proven, one falsifying mutation per independent clause, each with the
+fixture that isolates it:
+
+| mutation | verbatim failure |
+| --- | --- |
+| drop the gate call from `draft_season_schedule` | *"a admin active in Program B received Program A's proposal (division shape)"* with the whole payload — 74 failures across both roles, both shapes and every backend |
+| authorize on the PROGRAM alone (three axes collapsed to one) | *"a league_admin drafted the different League, same Season corner while another tuple was selected"*, *"…different Season, same Program…"* (both roles), *"a Program-only context drafted a Season-bound Division of its own Program"*, *"\"No League\" relaxed the SEASON ceiling"* — and the foreign-Program clause stays GREEN, which is the isolation |
+| judge the edge only on the RESOLVED hierarchy **and** let the ladder's own refusals through | *"a junk division_id alongside a FOREIGN season_id + league_id answered differently from a guessed pair — the refusal tells an unauthorized caller whether that LeagueSeason is real"*, with `'…"division_missing"…' != '…"league_season_missing"…'` and the same split over raw HTTP bytes |
+| drop only the `authorize=` callback (keep the flattening) | `'The selected League is not linked to the selected Season.' != 'Division division_2 not found.'` — the in-tuple caller loses the diagnostic it is entitled to |
+| split the refusal into "forbidden" vs "missing" | `'draft_scope_forbidden' != 'division_missing'`, `403 != 404`, and the raw-bytes comparison failing on every backend and over HTTP |
+| refuse only AFTER generating, attaching the candidates to the refusal | *"the refused draft response named foreign identifiers ['2026-09-07T18:00:00+00:00', …, 'A1a Team 0', …, 'Rink A', 'division_7', 'league_4', 'rink_4', 'season_2', 'slot_58', …, 'team_16']"* — the #380 clause, and byte-identity with it |
+| gate the identity-less path too (`role is None` no longer returns early) | *"'error' unexpectedly found in {'error': {… 'division_missing'}}"* on the internal/seed callers, plus `'details' unexpectedly found in {…}` where the legacy wording must stay bare |
+| drop the principal from the commit PREFLIGHT | *"a foreign COMMIT target answered differently from a nonexistent one (no fingerprint) — the fingerprint gate ran before the tuple gate"* (and for a real and a guessed fingerprint), `400 preview_required` vs `404` over HTTP |
+| drop the commit's under-lock RE-AUTHORIZATION | *"a draft was COMMITTED after the operator's context moved to Program B between the preflight and the write locks"*, with the six created Games in the failure message |
+| drop the `list_draft_games` filter | *"a league_admin active in Program B saw Program A's draft games"*, *"a admin active in Program B listed Program A's draft games"*, and the leaked-identifier list |
+| filter the review list AFTER building rows | *"a review row was assembled for a draft Game outside the active tuple — the list must be filtered on stored rows BEFORE any payload is built"* |
+| drop the `_draft_targets` filter | *"publish reached Program A's draft games"*, *"discard reached Program A's draft games"*, *"a foreign publish target answered differently from a nonexistent one"*, *"Program A's committed drafts were published or discarded by a Program-B-selected operator"* |
+| leave `published_count` installation-wide | `12 != 6 : the published count included another Program's games` |
+
+Added in re-review, for the two clauses the owner's exact-head review found
+were asserted by prose and by nothing else:
+
+| mutation | verbatim failure |
+| --- | --- |
+| replace the full parent-graph walk with the reduced `season_id` + `league_id` edge | 16 subtests: *"a draft Game with a parent outside the active tuple was served to the review screen — the WHOLE parent graph decides, not season_id + league_id"* |
+| drop the ActiveContext row lock from `resolve_with_league(lock=True)` | *"the operator's context switch COMPLETED at the first publish_game while the write verb held its transaction — the ActiveContext row is not locked, so the verb can mutate under a tuple that no longer authorizes it"* — 4 of the 5 race tests, the anti-vacuity control correctly still passing |
+| decide the batch OUTSIDE the write transaction | the same assertion, from the publish race |
+| drop the advisory lock from `get_active_context_for_update` | all four first-selection races: *"the caller's FIRST context selection COMPLETED at … while the write verb held its transaction — with no row to lock there is nothing serializing them, so the verb can write under tuple A while tuple B is persisted"* |
+| drop the advisory lock from `set_active_context` | the same four, with the same assertion — both sides must take it or it is not a mutex |
+| restore Game-before-Season order | all three batch-vs-single barriers: `'error' unexpectedly found in {… "reason": "deadlock_detected" …}` |
+| move the mutex/tuple resolution back after the first candidate read | *"the caller's FIRST context selection COMPLETED at the batch's first candidate read — the batch had already established its SERIALIZABLE snapshot without holding the per-user mutex, so it will resolve the stale fallback tuple A and write A after B is persisted"* |
+| delete the Season-mismatch raise | `1 != 2 : the locked Game named a Season the plan never locked and the batch carried on regardless — the comparison must run BEFORE authorization, which otherwise drops the changed row silently, and a mismatch must restart the whole unit` |
+| delete `_retry_on_plan_race` | the same, plus *"the batch ran ONE transaction, so the Season-drift raise and the bounded retry were never exercised"* |
+| take the mutex inside the SERIALIZABLE transaction instead of around it | *"the batch discarded Program A's drafts after waiting behind a first selection that committed tuple B — its snapshot was fixed by the lock query itself, so winning the lock told it nothing it had not already decided"* |
+| skip the session-mutex release on the error path | *"the per-user mutex was NOT released after the unit raised — a session-scoped lock survives rollback, so this user is now permanently unable to run any scheduling batch"* |
+| remove the outer mutex from the scenario commit | *"the scenario commit was NOT blocked behind the first selection's mutex — it entered its SERIALIZABLE transaction and resolved tuple A while tuple B was still uncommitted, so it can land Program A's reviewed Games after B is persisted"* |
+| remove the connection-lock coverage from the mutex context | *"a second concurrent request RAISED instead of waiting: it read another request's transaction depth as its own"* |
+
+**Which mechanism is actually load-bearing, stated honestly.** The session
+mutex subsumes two guards that were independently falsifiable before it
+existed: with it in place, removing the transaction-scoped advisory lock from
+`get_active_context_for_update`, or moving the tuple resolution back after the
+first candidate read, no longer fails any test — the session mutex already
+excludes the racing selection in both directions. Both are kept (they are
+correct, cheap, and remain the only protection for any future `lock=True`
+caller that does not wrap itself in the session mutex), but they are recorded
+here as **no longer independently falsifiable through this surface** rather
+than left to look like live, proven guards. The mechanism that carries the
+selection-first ordering is the session mutex, and it is falsified by removing
+it.
+
+Both of the last round's blockers were the same failure mode — the mechanism
+right, the test shaped so the window could not occur. Every test above was
+therefore written **before** its fix and observed failing against the unfixed
+code; the two verbatim red outputs are recorded in PR #388.
+
+**The first-selection cases needed their own class, and that is the point.**
+`DraftActiveTupleRaceTest` persists a tuple in `setUp`, so every one of its
+tests exercises the existing-row lock — the advisory mutex shipped for one
+round completely unfalsifiable behind it.
+`DraftFirstSelectionRaceTest` starts with **no row**, on its own user id so the
+other classes cannot create one for it, and every test **asserts the row is
+absent** before racing: a fixture change that quietly creates it fails loudly
+rather than testing nothing. It also asserts the newcomer's `_fallback` really
+resolves to the corner the batch was committed into, so a refusal can never
+come from scope instead of from the lock. Four operations — commit, publish,
+explicit `game_ids` discard, `all_drafts` discard — each observing the block,
+then the completion, then one of the two valid serial outcomes, then zero
+cross-tuple effect.
+
+`DraftBatchVersusSingleGameLockOrderTest` fires its barrier at the batch's
+**second** Game lock, so under the old order the batch provably *holds* a Game
+while it still needs the Season — the half of the cycle a deadlock requires.
+Its fourth test forces the window the reorder opens (a target moving to an
+unplanned Season between locator and lock) and asserts the abandoned attempt
+left no audit rows behind.
+
+The full-graph matrix runs **16 cases, each on its own hierarchy** so no case
+can pass or fail for another's reason: foreign / sibling-League / other-Season
+`division_id`; `league_season_id` foreign and with each **end alone** out of
+tuple (the Season end judged under "No League", so only that end can refuse —
+a sibling League's binding differs on both ends at once and would not isolate
+either); foreign `season_id` / `league_id`; foreign and sibling-League home and
+away Team; and a dangling value for every non-null parent. Each asserts the
+Game was visible *before* the corruption, that the rest of its batch stays
+visible after, that publish and discard are byte-identical to a nonexistent
+target, and that the Game is not deleted.
+
+The race class blocks a **real second PostgreSQL connection** performing the
+context switch, and asserts it is still waiting at the moment the verb is about
+to mutate — then that it completes once the verb's transaction ends, which is
+what proves the wait was a lock and not a broken thread. It covers commit (at
+its first Game INSERT), publish, discard by explicit `game_ids`, and discard
+with `all_drafts`. Its fifth test is the anti-vacuity control the other four
+need: with nothing holding the lock the identical switch must finish in under
+two seconds and land, or "still alive after 2s" would pass for a thread that
+could never complete at all.
+
+The null-Program branch has its own fixture for the reason #381 recorded: every
+other principal in the file is a GLOBAL role, which can never resolve a null
+Program, so *"a principal authorized for NO Program drafted a schedule"* is only
+reachable through an unbound scoped identity.
+
 ## The grant-only facility contract (venue sharing)
 
 The ceiling governs the **competition** tree — Seasons, Leagues, Divisions,
@@ -842,6 +1243,11 @@ real, reproducible mixed-grid defect, not a theoretical one — it is what
   authenticated HTTP, with the two-Program matrix, both near-miss corners, the
   foreign-vs-nonexistent byte comparison, the switch-between-create-and-commit
   case, and the positive control every negative is measured against.
+- `tests/test_draft_context_scope.py` — the draft generate / commit / review
+  boundary underneath it (#386), same backends and the same authenticated HTTP
+  matrix, with the raw-response-byte comparison, the ladder oracle, the
+  under-lock commit re-authorization, and the "a refusal names nothing of the
+  target hierarchy" clause #380's richer evidence will inherit.
 - `e2e/league-filtered-data.js`, `setup-v2-context-scope.js`,
   `dashboard-season-ceiling.js` — the browser layer at desktop and 390×844,
   including two delayed-response races proving the newest tuple always wins

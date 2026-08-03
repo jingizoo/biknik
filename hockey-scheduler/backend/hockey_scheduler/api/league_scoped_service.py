@@ -68,7 +68,9 @@ class ApiService(_BaseApiService):
                                        guard_team_ids=(),
                                        guard_venue_ids=(),
                                        guard_game_ids=(),
-                                       guard_season_ids=()) -> dict:
+                                       guard_season_ids=(),
+                                       user_id=None, role=None,
+                                       scope=None) -> dict:
         """One attempt of the base facade's ``commit_draft_schedule`` retry
         shell (#318) — the shell (with ``@catch``) is inherited; overriding
         the attempt keeps the league-scoped body inside the retry loop, and
@@ -92,6 +94,15 @@ class ApiService(_BaseApiService):
         independently of the base facade, so it needs the identical
         preview-binding check. See the base facade's
         ``_commit_draft_schedule_attempt`` for the full rationale.
+
+        #386 -- THIS is the copy that runs. `api/__init__` exports
+        `hierarchy_import_service.ApiService`, whose MRO is
+        hierarchy_import_service -> league_scoped_service -> service, so this
+        override SHADOWS the base facade's attempt entirely. Both copies carry
+        the active-tuple binding, but only this one is exercised by the routes
+        and by every test that drives the real facade; a fix applied to the
+        base copy alone would be dead code, and a mutation applied there alone
+        would prove nothing.
         """
         proposal = (copy.deepcopy(reviewed_proposal)
                     if reviewed_proposal is not None
@@ -99,7 +110,11 @@ class ApiService(_BaseApiService):
                         division_id=division_id, season_id=season_id,
                         league_id=league_id, slot_ids=slot_ids,
                         constraints=constraints,
-                        meetings_per_opponent=meetings_per_opponent))
+                        meetings_per_opponent=meetings_per_opponent,
+                        # #386 -- the PREFLIGHT half of the tuple binding,
+                        # before `preview_required`/`preview_stale` and before
+                        # any lock.
+                        user_id=user_id, role=role, scope=scope))
         if isinstance(proposal, dict) and proposal.get("error"):
             return proposal
         if draft_fingerprint is None:
@@ -137,7 +152,20 @@ class ApiService(_BaseApiService):
         # in one transaction, so a concurrent archive cannot slip between the
         # guard and the writes (autocommit would drop the FOR UPDATE lock at the
         # end of the check) and the batch stays all-or-nothing.
-        with self.store.transaction():
+        #
+        # #386 — an identified caller opens SERIALIZABLE, because the
+        # re-authorization below reads the context through
+        # `ContextService._snapshot`, which asks for SERIALIZABLE, and a nested
+        # join may never RAISE the open transaction's isolation. `role is None`
+        # keeps the previous default level byte-for-byte.
+        # #386 — the per-user mutex wraps this unit from OUTSIDE the
+        # transaction, so the SERIALIZABLE snapshot the re-authorization below
+        # reads is created only after any competing context selection has
+        # finished. Nested scenario commits pass `role is None` and take
+        # nothing, so they cannot deadlock against their own outer unit.
+        with self._active_context_mutex(user_id, role), \
+                self.store.transaction(
+                isolation=None if role is None else "SERIALIZABLE"):
             # #277/#313/#318 — the global Program→Team→Rink→Season lock
             # order, exactly as the base facade: Program rows (policy scopes
             # the per-row gate reads) FIRST — matching the ice-availability
@@ -330,6 +358,19 @@ class ApiService(_BaseApiService):
             # committed (and this regeneration observes it) or is blocked
             # behind this transaction (and cannot land before the writes
             # below).
+            # #386 -- RE-AUTHORIZE the target tuple HERE, after the
+            # Program/Team/Rink/Season locks and BEFORE the first Game
+            # INSERT, inside the transaction that writes them. Reading a
+            # preview is not authority to commit it minutes later: the
+            # operator may switch Program, Season or League in between, and
+            # the tuple that decides is the one current when the Games land.
+            # A refusal rolls the whole unit back, so a refused commit leaves
+            # zero trace. Raised rather than read off the regeneration's error
+            # dict, so the caller gets the byte-identical scope refusal
+            # instead of a `preview_stale` that would misdescribe it.
+            self._authorize_schedule_target(
+                division_id, season_id, league_id, user_id, role, scope,
+                lock=True)
             _locked_proposal = self.draft_season_schedule(
                 division_id=division_id, season_id=season_id,
                 league_id=league_id, slot_ids=slot_ids,
@@ -565,15 +606,26 @@ class ApiService(_BaseApiService):
             "unscheduled": proposal["unscheduled"],
         }
 
-    @catch
-    def publish_draft_games(self, game_ids=None, all_drafts=False,
-                            actor_id=None) -> dict:
-        targets = self._draft_targets(game_ids, all_drafts)
-        # Validate the whole batch before the first slot allocation or publish;
-        # one bad legacy draft must not partially publish the selection.
+    def _publish_batch_extra_validation(self, targets) -> None:
+        """The league-ice invariant, on the batch the base facade has ALREADY
+        locked and authorized (#386).
+
+        This used to be a full override of ``publish_draft_games`` that
+        resolved the targets itself and then called ``super()``, which resolved
+        them a SECOND time. Two independent resolutions of the same request are
+        two chances to disagree — a concurrent context switch or a Game moving
+        between them meant the set validated here was not provably the set the
+        base facade published, and the validation itself leaks: on a wider set,
+        ``require_game_league_id`` raises ``game_league_ambiguous`` /
+        ``venue_access_missing`` naming a FOREIGN Game's id and league ids,
+        which is the disclosure again, this time as an error payload.
+
+        As a hook there is exactly ONE resolution, taken under the
+        ActiveContext and Game row locks, and this runs on those very rows
+        inside the write transaction. Raising here rolls the whole batch back,
+        so one bad legacy draft still cannot partially publish the selection.
+        """
         for game in targets:
             require_game_league_id(self.store, game)
             require_slot_belongs_to_season(
                 self.store, game.ice_slot_id, game.season_id)
-        return super().publish_draft_games(
-            game_ids=game_ids, all_drafts=all_drafts, actor_id=actor_id)
