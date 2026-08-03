@@ -809,6 +809,34 @@ transaction's isolation). `_locked_draft_targets` takes three locks in order:
 3. the **Season** rows named by that plan (`_guard_active_seasons`, sorted);
 4. the **Game** rows (`get_game_for_update`, sorted).
 
+**A lock taken inside the transaction cannot order the transaction's own
+snapshot.** PostgreSQL fixes a `SERIALIZABLE` transaction's view at its FIRST
+query — and `SELECT pg_advisory_xact_lock(…)` *is* a query. A batch that issued
+it, blocked behind a first context selection, and then won the lock still held
+the snapshot that very statement took, from before the selection committed:
+it saw no saved context, resolved the fallback tuple and mutated it after the
+real selection was persisted. Blocking on a lock does not refresh a view the
+blocking statement already took, and no amount of moving the *reads* later
+fixes that, because the lock statement is itself a read.
+
+So the wait happens **outside** the transaction. `store.active_context_mutex`
+is a **session-scoped** advisory lock taken before `BEGIN` and held across
+commit or rollback, so the unit's snapshot is created only once the wait is
+over, and any selection arriving afterwards blocks until the unit is finished.
+The alternative the ruling allowed — detect contention, then retry in a fresh
+transaction — was rejected because the required regression has to *observe the
+batch blocked*, and a try-lock-and-retry design never blocks.
+
+**Releasing it is the dangerous part**, which is why it is a context manager
+and never a pair of calls. A session lock survives rollback and survives the
+connection being reused; leak it once and that user can never schedule again.
+The `finally` always runs, and when the unit raised mid-transaction the
+connection is rolled back first so the unlock can execute — an unlock that
+silently failed would be exactly the leak this guards against. A failure to
+release is re-raised, never swallowed. Entering inside a transaction is refused
+by the store outright, so the ordering bug cannot be reintroduced by a future
+call site.
+
 **The mutex must precede the first read, not merely the first write.** An
 earlier revision read the candidate Games and only then took the mutex. Under
 `SERIALIZABLE` the snapshot is established by the transaction's first
@@ -940,6 +968,21 @@ were asserted by prose and by nothing else:
 | move the mutex/tuple resolution back after the first candidate read | *"the caller's FIRST context selection COMPLETED at the batch's first candidate read — the batch had already established its SERIALIZABLE snapshot without holding the per-user mutex, so it will resolve the stale fallback tuple A and write A after B is persisted"* |
 | delete the Season-mismatch raise | `1 != 2 : the locked Game named a Season the plan never locked and the batch carried on regardless — the comparison must run BEFORE authorization, which otherwise drops the changed row silently, and a mismatch must restart the whole unit` |
 | delete `_retry_on_plan_race` | the same, plus *"the batch ran ONE transaction, so the Season-drift raise and the bounded retry were never exercised"* |
+| take the mutex inside the SERIALIZABLE transaction instead of around it | *"the batch discarded Program A's drafts after waiting behind a first selection that committed tuple B — its snapshot was fixed by the lock query itself, so winning the lock told it nothing it had not already decided"* |
+| skip the session-mutex release on the error path | *"the per-user mutex was NOT released after the unit raised — a session-scoped lock survives rollback, so this user is now permanently unable to run any scheduling batch"* |
+
+**Which mechanism is actually load-bearing, stated honestly.** The session
+mutex subsumes two guards that were independently falsifiable before it
+existed: with it in place, removing the transaction-scoped advisory lock from
+`get_active_context_for_update`, or moving the tuple resolution back after the
+first candidate read, no longer fails any test — the session mutex already
+excludes the racing selection in both directions. Both are kept (they are
+correct, cheap, and remain the only protection for any future `lock=True`
+caller that does not wrap itself in the session mutex), but they are recorded
+here as **no longer independently falsifiable through this surface** rather
+than left to look like live, proven guards. The mechanism that carries the
+selection-first ordering is the session mutex, and it is falsified by removing
+it.
 
 Both of the last round's blockers were the same failure mode — the mechanism
 right, the test shaped so the window could not occur. Every test above was
