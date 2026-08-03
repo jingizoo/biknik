@@ -2411,6 +2411,95 @@ class DraftFirstSelectionRaceTest(unittest.TestCase):
             self._mutex_is_free(),
             "the per-user mutex was not released after a refusing unit")
 
+    def test_a_concurrent_request_on_the_same_store_waits_and_does_not_raise(
+            self):
+        """Two ordinary concurrent requests must not 500 each other.
+
+        ``_txn_depth`` is STORE state, not thread-local. The web shape shares
+        one ``SqlStore`` across requests, so if request A is inside any
+        transaction when request B starts a scheduler mutation, B reads a
+        depth that belongs to A, mistakes it for its own re-entry, and raises
+        "must be entered OUTSIDE any transaction". That is a 500 on two
+        perfectly valid requests, with no advisory-lock contention involved at
+        all — a regression the precondition check itself introduced.
+
+        The racing user is deliberately a DIFFERENT one, so the per-user
+        advisory lock cannot be the reason B waits: what B must wait for is
+        the connection, and it must WAIT rather than raise.
+        """
+        self.assertTrue(self._mutex_is_free())
+        other_user = "user_draft_someone_else"
+        entered = threading.Event()
+        release = threading.Event()
+        holder = {"error": None}
+
+        def hold_a_transaction():
+            try:
+                with self.store.transaction():
+                    entered.set()
+                    release.wait(30)
+            except BaseException as error:
+                holder["error"] = error
+
+        holder_thread = threading.Thread(target=hold_a_transaction,
+                                         daemon=True)
+        holder_thread.start()
+        self.addCleanup(release.set)
+        self.assertTrue(entered.wait(15),
+                        "request A never entered its transaction")
+
+        second = {"result": None, "error": None}
+
+        def run_second_request():
+            try:
+                second["result"] = self.api.discard_draft_games(
+                    game_ids=list(self.committed), actor_id=other_user,
+                    user_id=other_user, role=Role.LEAGUE_ADMIN, scope={})
+            except BaseException as error:
+                second["error"] = error
+
+        second_thread = threading.Thread(target=run_second_request,
+                                         daemon=True)
+        second_thread.start()
+        second_thread.join(timeout=3)
+        self.assertIsNone(
+            second["error"],
+            "a second concurrent request RAISED instead of waiting: it read "
+            f"another request's transaction depth as its own ({second['error']!r})")
+        self.assertTrue(
+            second_thread.is_alive(),
+            "the second request neither raised nor waited -- it ran straight "
+            "through another request's open transaction on the same "
+            "connection, so this test is not exercising the shared-store "
+            "shape at all")
+
+        release.set()
+        holder_thread.join(20)
+        second_thread.join(40)
+        if holder["error"] is not None:
+            raise holder["error"]
+        if second["error"] is not None:
+            raise second["error"]
+        self.assertIsNotNone(second["result"])
+        self.assertNotIn("error", second["result"], second["result"])
+        # ...and no session lock is left behind for either user.
+        self.assertTrue(self._mutex_is_free(),
+                        "a session lock leaked for the paused user")
+        prober = SqlStore(os.environ["TEST_DATABASE_URL"])
+        try:
+            row = prober._exec(
+                "SELECT pg_try_advisory_lock(?, hashtext(?)) AS got",
+                (SqlStore._ACTIVE_CONTEXT_LOCK_NAMESPACE, other_user)
+            ).fetchone()
+            self.assertTrue(
+                bool(row["got"]),
+                "a session lock leaked for the second request's user")
+            prober._exec("SELECT pg_advisory_unlock(?, hashtext(?))",
+                         (SqlStore._ACTIVE_CONTEXT_LOCK_NAMESPACE,
+                          other_user))
+        finally:
+            prober.close()
+
     def test_the_mutex_may_not_be_taken_inside_a_transaction(self):
         """The ordering rule, enforced in the store rather than by comment.
 

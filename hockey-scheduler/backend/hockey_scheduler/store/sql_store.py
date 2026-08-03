@@ -1840,24 +1840,45 @@ class SqlStore:
         if not user_id or self.backend != "postgres":
             yield
             return
-        if self._txn_depth > 0:
-            raise RuntimeError(
-                "active_context_mutex() must be entered OUTSIDE any "
-                "transaction: a mutex acquired inside the transaction it "
-                "protects is taken by a statement that has already fixed "
-                "that transaction's snapshot")
         key = (self._ACTIVE_CONTEXT_LOCK_NAMESPACE, user_id)
-        self._exec("SELECT pg_advisory_lock(?, hashtext(?))", key)
-        try:
-            yield
-        finally:
+        # The connection lock is taken FIRST and held through the advisory
+        # unlock. Two reasons, and the second one is a bug this check itself
+        # introduced:
+        #
+        # * it makes the whole mutex context, the nested `transaction()` and
+        #   the release ONE unit on this connection — which a single
+        #   PostgreSQL connection requires anyway, since it cannot run two
+        #   statements at once;
+        # * `_txn_depth` is STORE state, not thread-local, and `transaction()`
+        #   holds this same lock for its whole block. Reading the depth
+        #   WITHOUT the lock let a request see a DIFFERENT request's open
+        #   transaction, mistake it for its own re-entry, and raise instead of
+        #   waiting — a 500 on two perfectly valid concurrent requests with no
+        #   advisory-lock contention involved at all. Holding the lock means
+        #   any depth observed here is genuinely this caller's own.
+        #
+        # `_lock` is an RLock, so the nested `transaction()` re-enters it
+        # freely; nothing here deadlocks against the code it wraps.
+        with self._lock:
+            if self._txn_depth > 0:
+                raise RuntimeError(
+                    "active_context_mutex() must be entered OUTSIDE any "
+                    "transaction: a mutex acquired inside the transaction it "
+                    "protects is taken by a statement that has already fixed "
+                    "that transaction's snapshot")
+            self._exec("SELECT pg_advisory_lock(?, hashtext(?))", key)
             try:
-                self._exec("SELECT pg_advisory_unlock(?, hashtext(?))", key)
-            except Exception:
-                # The unit failed mid-transaction and left the connection
-                # aborted. Clear it and release anyway — never leak.
-                self.conn.rollback()
-                self._exec("SELECT pg_advisory_unlock(?, hashtext(?))", key)
+                yield
+            finally:
+                try:
+                    self._exec(
+                        "SELECT pg_advisory_unlock(?, hashtext(?))", key)
+                except Exception:
+                    # The unit failed mid-transaction and left the connection
+                    # aborted. Clear it and release anyway — never leak.
+                    self.conn.rollback()
+                    self._exec(
+                        "SELECT pg_advisory_unlock(?, hashtext(?))", key)
 
     def get_active_context(self, user_id):
         return self._get(ActiveContext, user_id)
