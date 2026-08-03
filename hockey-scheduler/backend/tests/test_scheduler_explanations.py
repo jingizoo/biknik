@@ -5,6 +5,7 @@ causes, canonical ordering, per-pair/global caps, scope privacy, honest
 alternatives, and observer-only placement equivalence.
 """
 
+import copy
 import json
 import os
 import threading
@@ -305,6 +306,34 @@ class _ExplanationContract:
             {a["action_code"] for a in explanation["alternatives"]},
             {"review_rink_scheduling_policy"})
 
+    def test_ice_taken_by_an_earlier_pairing_says_so_not_no_ice_available(self):
+        """The one case where the legacy prose is actively misleading.
+
+        Three teams, one window: the first pairing takes it and the other two
+        are told ``No available ice slot for this pairing`` — which reads as
+        "this Season has no ice" when the truth is "this proposal already
+        spent the ice it has". ``ice_already_selected`` is the only reason
+        code this slice invents and it exists for exactly this row, so it is
+        pinned against the real greedy loop rather than the formatter.
+        """
+        api = _seed(self.store, team_count=3)
+        _slot(self.store, "only", "r1", BASE)
+        preview = api.draft_season_schedule("d")
+        self.assertEqual(len(preview["draft_games"]), 1)
+        taken = preview["draft_games"][0]["ice_slot_id"]
+        self.assertEqual(len(preview["unscheduled"]), 2)
+        for row in preview["unscheduled"]:
+            # The legacy field keeps its established, coarser answer.
+            self.assertEqual(row["reason_codes"], ["no_ice_available"])
+            explanation = row["explanation"]
+            self.assertEqual(
+                explanation["blocking_constraint_codes"],
+                ["no_ice_available", "ice_already_selected"])
+            self.assertEqual(
+                [(c["ice_slot_id"], [r["code"] for r in c["rejections"]])
+                 for c in explanation["candidate_windows"]],
+                [(taken, ["ice_already_selected"])])
+
     def test_cap_order_and_scope_are_stable_across_multi_venue_inventory(self):
         """Reordering, over-cap, or out-of-scope mutations fail separately."""
         api = _seed(self.store)
@@ -369,7 +398,257 @@ class PostgresExplanationTest(_ExplanationContract, unittest.TestCase):
         return store
 
 
+class ExplanationFormatterContractTest(unittest.TestCase):
+    """The formatter's own guarantees, driven directly.
+
+    ``_assign_ice`` only ever feeds this formatter candidates it has ALREADY
+    rejected, and only ever feeds it the detail shapes the two in-repo
+    producers happen to emit today. Three contract clauses are therefore
+    unreachable through the scheduler — the rejection-free-candidate guard,
+    the detail allowlist, and the canonical code rank — and every one of them
+    could be deleted with the rest of this file still green. They are the
+    clauses that decide whether a future producer can leak, so they are
+    exercised here against the public entry point instead.
+    """
+
+    PAIRING = {"home_team_id": "t0", "away_team_id": "t1"}
+    SCOPE = {"season_id": "se", "league_id": "lg"}
+
+    def _build(self, rejections, *, legacy=(), candidate_total=1,
+               slot_id="window"):
+        return build_unplaced_explanation(
+            pairing=dict(self.PAIRING),
+            scope=dict(self.SCOPE),
+            legacy_reason_codes=list(legacy),
+            raw_candidates=[{
+                "ice_slot_id": slot_id, "rink_id": "r1", "venue_id": "v1",
+                "start_time": BASE.isoformat(),
+                "end_time": (BASE + timedelta(hours=1)).isoformat(),
+                "rejections": list(rejections),
+            }],
+            candidate_total=candidate_total,
+        )
+
+    def test_a_candidate_with_no_rejection_is_never_reported_as_evidence(self):
+        """An unplaced pairing's evidence may not include a playable window."""
+        explanation = build_unplaced_explanation(
+            pairing=dict(self.PAIRING),
+            scope=dict(self.SCOPE),
+            legacy_reason_codes=["no_ice_available"],
+            raw_candidates=[
+                {
+                    "ice_slot_id": "wide_open", "rink_id": "r1",
+                    "venue_id": "v1", "start_time": BASE.isoformat(),
+                    "end_time": (BASE + timedelta(hours=1)).isoformat(),
+                    "rejections": [],
+                },
+                {
+                    "ice_slot_id": "blocked", "rink_id": "r1",
+                    "venue_id": "v1",
+                    "start_time": (BASE + timedelta(days=1)).isoformat(),
+                    "end_time": (BASE + timedelta(days=1, hours=1))
+                    .isoformat(),
+                    "rejections": [{
+                        "code": "holiday", "details": {"date": "2026-10-06"}}],
+                },
+            ],
+            candidate_total=2,
+        )
+        self.assertEqual(
+            [c["ice_slot_id"] for c in explanation["candidate_windows"]],
+            ["blocked"])
+        self.assertNotIn("wide_open", json.dumps(explanation, sort_keys=True))
+        self.assertEqual(explanation["bounds"]["candidate_window_count"], 1)
+        self.assertEqual(
+            explanation["bounds"]["candidate_window_omitted_count"], 1)
+
+    def test_candidate_details_are_an_allowlist_not_a_pass_through(self):
+        """Only the named safe fields survive, whatever the producer sends."""
+        explanation = self._build([{
+            "code": "curfew_violation",
+            "details": {
+                "rink_id": "r1",
+                "curfew_local": "19:00",
+                "slot_end_local": "19:30",
+                # None of the rest is allowlisted. ``reason`` is what the
+                # shared policy helper actually puts in every details dict;
+                # the other two stand in for the operator-entered text a
+                # future violation could start carrying.
+                "reason": "curfew_violation",
+                "rink_name": "Arena v1 Rink r1",
+                "operator_note": "call Dana about the late key",
+            },
+        }])
+        details = explanation["candidate_windows"][0]["rejections"][0][
+            "details"]
+        self.assertEqual(details, {
+            "rink_id": "r1",
+            "curfew_local": "19:00",
+            "slot_end_local": "19:30",
+        })
+        self.assertNotIn("reason", details)
+        serialized = json.dumps(explanation, sort_keys=True)
+        for leaked in ("rink_name", "Arena v1", "operator_note",
+                       "call Dana"):
+            self.assertNotIn(leaked, serialized)
+
+    def test_the_allowlist_reaches_inside_nested_evidence_rows(self):
+        """A top-level field allowlist says nothing about a list of rows.
+
+        ``team_overlap.conflicts`` rows are assembled beside a producer whose
+        own conflict records carry ``team_name``; ``min_rest.conflicts`` rows
+        sit next to the tentative proposal state. Copying a nested dict
+        verbatim would make the privacy rule "the allowlist, plus whatever
+        today's producer happens to pass".
+        """
+        explanation = self._build([
+            {
+                "code": "team_overlap",
+                "details": {
+                    "team_ids": ["t0"],
+                    "conflicts": [{
+                        "team_id": "t0",
+                        "conflict_source": "existing_game",
+                        "conflict_game_id": "g1",
+                        "team_name": "Team 0",
+                        "note": "coach asked to avoid Tuesdays",
+                    }],
+                },
+            },
+            {
+                "code": "min_rest",
+                "details": {
+                    "team_ids": ["t0"],
+                    "min_rest_hours": 24,
+                    "conflicts": [{
+                        "team_id": "t0",
+                        "start_time": BASE.isoformat(),
+                        "opponent_name": "Team 1",
+                    }],
+                    "omitted_conflict_count": 0,
+                },
+            },
+        ])
+        by_code = {r["code"]: r["details"]
+                   for r in explanation["candidate_windows"][0]["rejections"]}
+        self.assertEqual(by_code["team_overlap"]["conflicts"], [{
+            "team_id": "t0",
+            "conflict_source": "existing_game",
+            "conflict_game_id": "g1",
+        }])
+        self.assertEqual(by_code["min_rest"]["conflicts"], [{
+            "team_id": "t0",
+            "start_time": BASE.isoformat(),
+        }])
+        serialized = json.dumps(explanation, sort_keys=True)
+        for leaked in ("team_name", "Team 0", "opponent_name", "Team 1",
+                       "coach asked"):
+            self.assertNotIn(leaked, serialized)
+
+    def test_blocking_codes_use_the_canonical_rank_not_the_alphabet(self):
+        """Scope, then inventory, then the scheduler's evaluation order."""
+        codes = ["team_overlap", "holiday", "no_ice_available",
+                 "season_blackout"]
+        explanation = self._build(
+            [{"code": code, "details": {}} for code in codes])
+        self.assertEqual(
+            explanation["blocking_constraint_codes"],
+            ["no_ice_available", "season_blackout", "holiday",
+             "team_overlap"])
+        # Alphabetical would be holiday, no_ice_available, season_blackout,
+        # team_overlap — which changes WHICH three corrections an operator is
+        # shown, not merely their order.
+        self.assertEqual(
+            [a["reason_code"] for a in explanation["alternatives"]],
+            ["no_ice_available", "season_blackout", "holiday"])
+
+    def test_an_unknown_future_code_sorts_after_every_known_one(self):
+        """A new code must not need a formatter change to stay deterministic."""
+        explanation = self._build([
+            {"code": "aaa_unknown_future_code", "details": {}},
+            {"code": "team_overlap", "details": {}},
+        ])
+        self.assertEqual(
+            explanation["blocking_constraint_codes"],
+            ["team_overlap", "aaa_unknown_future_code"])
+        self.assertEqual(
+            explanation["alternatives"][-1],
+            {"action_code": "review_scheduling_input",
+             "reason_code": "aaa_unknown_future_code"})
+
+
 class ExplanationBudgetAndObserverTest(unittest.TestCase):
+    def test_active_game_snapshot_is_canonical_not_store_order(self):
+        """The shared snapshot both observers stop at the FIRST match in.
+
+        ``_slot_policy_violation`` returns the first conflicting Game it
+        meets, so an unsorted snapshot would let store insertion order — not
+        a contract on any backend — choose the ``conflict_game_id`` an
+        explanation reports.
+        """
+        store = InMemoryStore()
+        _seed(store, team_count=4)
+        # Inserted latest-first, so insertion order is the exact reverse of
+        # the canonical (start_time, end_time, slot_id, game_id) order.
+        for index in reversed(range(4)):
+            start = BASE + timedelta(days=index)
+            slot_id = _slot(store, f"snap_{index}", "r1", start)
+            store.add_game(Game(
+                id=f"game_{index}", season_id="se", division_id="d",
+                home_team_id="t0", away_team_id="t1", ice_slot_id=slot_id,
+                start_time=start, end_time=start + timedelta(minutes=60)))
+        pairs = sched._active_game_slot_pairs(store)
+        self.assertEqual(
+            [(game.id, slot.id) for game, slot in pairs],
+            [(f"game_{i}", f"snap_{i}") for i in range(4)])
+
+    def test_explanation_stays_out_of_the_commit_preview_fingerprint(self):
+        """#328's ``_draft_fingerprint`` allowlists unscheduled fields by name.
+
+        The commit gate REGENERATES the proposal and refuses on a changed
+        ``draft_fingerprint``. This observer reaches deeper into live state
+        than the bound fields do (a policy conflict's ``conflict_game_id``,
+        which candidate windows the shared budget paid for), so binding it
+        would turn an unrelated neighbouring Game into a spurious
+        ``preview_stale`` refusal of a batch whose placements, reasons, and
+        team conflicts are byte-for-byte identical. Pinned rather than
+        assumed: nothing else in the suite fails if it starts being bound.
+        """
+        store = InMemoryStore()
+        api = _seed(store)
+        _slot(store, "fp_candidate", "r1", BASE)
+        preview = api.draft_season_schedule("d", constraints={
+            "season_blackout_dates": [BASE.date().isoformat()]})
+        rows = preview["unscheduled"]
+        self.assertTrue(rows[0]["explanation"]["candidate_windows"])
+        args = ("ls", ["t0", "t1"], preview["draft_games"], rows,
+                preview["unschedulable_teams"], preview["already_scheduled"],
+                preview["meetings_per_opponent"])
+        self.assertEqual(
+            preview["draft_fingerprint"], sched._draft_fingerprint(*args))
+        rewritten = copy.deepcopy(rows)
+        rewritten[0]["explanation"] = {
+            "value_object_version": 99,
+            "blocking_constraint_codes": ["team_overlap"],
+            "candidate_windows": [],
+            "alternatives": [],
+            "bounds": {},
+        }
+        self.assertEqual(
+            sched._draft_fingerprint(
+                args[0], args[1], args[2], rewritten, args[4], args[5],
+                args[6]),
+            preview["draft_fingerprint"])
+        # Control: the fields the gate DOES bind still move it, so the
+        # equality above is a statement about `explanation`, not about a
+        # fingerprint that ignores `unscheduled` altogether.
+        rewritten[0]["reason_codes"] = ["team_overlap"]
+        self.assertNotEqual(
+            sched._draft_fingerprint(
+                args[0], args[1], args[2], rewritten, args[4], args[5],
+                args[6]),
+            preview["draft_fingerprint"])
+
     def test_rejection_and_alternative_caps_report_exact_omitted_counts(self):
         codes = [
             "season_blackout", "holiday", "team_blackout", "rink_blackout",
@@ -464,6 +743,9 @@ class SchedulerExplanationHttpTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.httpd.shutdown()
         cls.thread.join(timeout=5)
+        # #384: shutdown() only stops serve_forever; the listening socket is
+        # released by server_close(), and the suite has a structural guard.
+        cls.httpd.server_close()
         srv.STATE.reset(seed=False)
 
     def setUp(self):

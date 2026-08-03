@@ -81,6 +81,20 @@ _SAFE_DETAIL_FIELDS = {
 }
 
 
+# Two allowlisted details are lists of ROWS rather than scalars, and a
+# top-level field allowlist says nothing about what is inside them: the
+# ``team_overlap`` rows are built next to a producer whose own conflict
+# records carry ``team_name``, and ``_safe_value`` copies every key of a
+# nested dict verbatim.  Allowlisting the row shape too keeps the privacy
+# guarantee one rule rather than "the allowlist, plus whatever the current
+# producers happen to hand over".
+_SAFE_NESTED_ROW_FIELDS = {
+    ("min_rest", "conflicts"): ("team_id", "start_time"),
+    ("team_overlap", "conflicts"): (
+        "team_id", "conflict_source", "conflict_game_id"),
+}
+
+
 def ordered_reason_codes(codes):
     """Canonical unique reason-code order, including future unknown codes."""
     return sorted(
@@ -108,14 +122,28 @@ def _safe_value(value):
     return _safe_scalar(value)
 
 
+def _safe_rows(value, allowed):
+    """Allowlist each row of a nested evidence list, then order canonically."""
+    rows = value if isinstance(value, (list, tuple, set)) else ()
+    kept = []
+    for row in rows:
+        source = row if isinstance(row, dict) else {}
+        kept.append({field: _safe_value(source[field])
+                     for field in allowed if field in source})
+    return sorted(kept, key=_canonical_key)
+
+
 def _safe_details(code, details):
     allowed = _SAFE_DETAIL_FIELDS.get(code, ())
     source = details if isinstance(details, dict) else {}
-    return {
-        field: _safe_value(source[field])
-        for field in allowed
-        if field in source
-    }
+    safe = {}
+    for field in allowed:
+        if field not in source:
+            continue
+        nested = _SAFE_NESTED_ROW_FIELDS.get((code, field))
+        safe[field] = (_safe_rows(source[field], nested) if nested is not None
+                       else _safe_value(source[field]))
+    return safe
 
 
 class ExplanationBudget:
