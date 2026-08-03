@@ -142,11 +142,51 @@ sits beside `_team_overlap_reason`, whose own conflict records carry
 the concrete `review_season_venue_access` correction carrying only the selected
 Season id; inaccessible venue/rink/slot identities remain hidden.
 
+### A conflicting Game id is bound to the caller's own context
+
+`#386`/`#388` bind every draft entry point to the caller's persisted active
+tuple, and this evidence obeys the same boundary. The candidate SCANNER
+already did: it never returns another Season's ice, so `ice_slot_id`,
+`rink_id`, `venue_id` and the two timestamps are in-context by construction.
+
+The active-game SNAPSHOT is the hole, and deliberately so.
+`_active_game_slot_pairs` is unfiltered by `#373` — no Season, League,
+Division, draft/published or GameType filtering — because the preview and the
+commit gate must measure the same physical edges. Two Seasons holding active
+access to one Venue is exactly what `SeasonVenueAccess` expresses, so a
+neighbouring Season's Game routinely collides with in-context ice, and its id
+reached the payload through three codes: `slot_overlap_conflict`,
+`turnover_buffer_conflict` (via the rink) and `team_overlap` (via the team).
+
+`_in_scope_game_ids` is therefore computed once per run from that same shared
+snapshot and every conflicting Game id is checked against it. Both halves of
+the tuple must match — the two corners `#388` names, same Program/different
+Season and same Season/different League, are each refused a proposal and each
+would slip through a one-sided comparison. An unresolved Season/League scope
+withholds every id rather than defaulting open.
+
+`conflict_slot_id` is NOT withheld. The candidate's Rink is in-context ice, so
+a slot on that Rink is the caller's own inventory and the operator still
+learns which of their windows is unusable and why. Only the Game id is
+dropped, and it is dropped rather than nulled so the allowlist simply omits
+the field.
+
+Half of this was a restructuring of an existing disclosure — where the overlap
+is the FIRST cause, the legacy `reason` prose already interpolates
+`"...hosting game G on the same rink"`. The other half was new: the
+established decision path short-circuits at its first cause, so a candidate
+blocked by a blackout never reaches the policy advisory, while the all-causes
+observer does. Both shapes are covered separately.
+
 An alternative is always a correction, never a scheduling claim. Examples are
 `review_team_blackout`, `review_minimum_rest_policy`,
 `review_rink_scheduling_policy`, `reschedule_conflicting_game`, and
 `increase_available_game_ice`. No alternative contains an `ice_slot_id` saying
-that a hard-rejected window is playable.
+that a hard-rejected window is playable. When the conflicting Game id is
+withheld, `_alternative_for` degrades on its own from
+`reschedule_conflicting_game` to `provide_non_overlapping_game_ice` — an
+operator with no authority over the other Season cannot reschedule its Game,
+so naming that action would have been the dishonest answer.
 
 Team eligibility remains fail-closed before pair generation: inactive,
 unregistered, cross-Program, and cross-League Teams do not become pairings and
@@ -179,6 +219,16 @@ the suite green before its test existed.
 | Sort blocking codes alphabetically instead of by rank | `test_blocking_codes_use_the_canonical_rank_not_the_alphabet`, `test_an_unknown_future_code_sorts_after_every_known_one` |
 | Add `explanation` to the `_draft_fingerprint` allowlist | `test_explanation_stays_out_of_the_commit_preview_fingerprint` |
 | Report ice spent by an earlier pairing as `no_ice_available` | `test_ice_taken_by_an_earlier_pairing_says_so_not_no_ice_available` |
+| Remove `_in_scope_game_ids`' fail-closed branch | `test_an_unresolved_scope_withholds_every_id` |
+| Compare only the League, not the Season | `test_a_teams_other_season_game_is_named_only_inside_the_tuple`, `test_only_the_exact_season_and_league_pair_is_in_scope` |
+| Compare only the Season, not the League | `test_a_sibling_leagues_game_in_this_season_is_withheld_too`, `test_only_the_exact_season_and_league_pair_is_in_scope` |
+| Keep the policy `conflict_game_id` unconditionally | `test_a_neighbouring_seasons_game_is_never_named_in_evidence` |
+| Keep the `team_overlap` `conflict_game_id` unconditionally | `test_a_teams_other_season_game_is_named_only_inside_the_tuple` |
+| Stop seeding the scope from the Division entry point | `test_an_in_scope_conflicting_game_is_still_named` (`shape='division'`) |
+| Stop seeding the scope from the League-wide entry point | `test_an_in_scope_conflicting_game_is_still_named` (`shape='league-wide'`) |
+| Uncap `min_rest.conflicts` (`kept = conflicts`) | `test_nested_evidence_rows_are_capped_and_count_what_they_dropped` |
+| Drop the per-team `break` in `_team_overlap_reason` | `test_team_overlap_reports_at_most_one_row_per_team` |
+| Delete `_authorize_schedule_target` from `draft_season_schedule` | `test_no_candidate_evidence_is_built_for_a_refused_target` (`test_draft_context_scope`) |
 
 ## Ownership boundary
 
