@@ -10277,8 +10277,20 @@ async function render() {
     }
     // Draft scheduler review (#86/#106), operator-only.
     if (view === "scheduler" && hasPerm("manage_schedule")) {
-      if (!schedulerState.division && ov.divisions[0]) {
-        schedulerState.division = ov.divisions[0].id;
+      // #386 — re-seed when the stored selection is no longer one the ACTIVE
+      // tuple offers, not only when it is empty. `schedulerState.division` is
+      // module-level and survives a context switch, while `ov.divisions` is
+      // narrowed to the active Program/Season/League. Keeping a stale id would
+      // leave the picker rendering a valid-looking Division of the NEW context
+      // while Generate/Commit still sent the OLD one — which the backend now
+      // refuses as not-found (it is a foreign hierarchy), so the screen and the
+      // request would disagree with no way for the operator to see why. Before
+      // this endpoint was bound, that same stale id silently returned the other
+      // Program's proposal, which is the defect itself.
+      const offered = ov.divisions || [];
+      if (!offered.some((d) => d.id === schedulerState.division)) {
+        schedulerState.division = offered[0] ? offered[0].id : null;
+        schedulerState.preview = null;
       }
       const dr = await getJSON("/api/scheduler/drafts");
       const drafts = (dr && dr.draft_games) || [];
