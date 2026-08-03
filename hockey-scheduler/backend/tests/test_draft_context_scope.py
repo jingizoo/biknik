@@ -90,6 +90,10 @@ ADMIN = "user_draft_admin"
 ARENA = "user_draft_arena"
 ICE_BASE = datetime(2026, 9, 7, 18, tzinfo=timezone.utc)
 GLOBAL_PRINCIPALS = ((ADMIN, Role.LEAGUE_ADMIN), (ARENA, Role.ARENA_MANAGER))
+# An operator that has NEVER saved a context. Deliberately its own id:
+# sharing one with the classes above would let their `set_active_context`
+# calls create the very row the absent-row races exist to test without.
+NEWCOMER = "user_draft_newcomer"
 
 # A guessed id of each kind, in the same sequential namespace the counters hand
 # out. These are what "nonexistent" means throughout this file.
@@ -1452,6 +1456,326 @@ class DraftActiveTupleRaceTest(unittest.TestCase):
                         "the racing switch is slow on its own, so 'still "
                         "alive after 2s' proves nothing about locking")
         self.assertEqual(self.store.get_active_context(ADMIN).program_id,
+                         self.pb)
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "needs PostgreSQL: the race is a DATABASE lock")
+class DraftFirstSelectionRaceTest(unittest.TestCase):
+    """The caller's very FIRST context selection, with NO ActiveContext row.
+
+    `DraftActiveTupleRaceTest` above cannot reach this branch, and that is
+    exactly the hole the owner's review found: every one of its tests selects
+    a context in ``setUp``, so the row always exists and the write verb's
+    ``SELECT ... FOR UPDATE`` always has something to lock. **An absent-row
+    read is not a lock.** A brand new operator resolves its tuple from
+    ``_fallback``, has nothing to lock, and — with only a read->write
+    anti-dependency standing between them, which SERIALIZABLE is not obliged
+    to abort — could have its first saved selection B and a batch of Program A
+    Game writes both commit.
+
+    So every test here asserts, FIRST, that no row exists. If a future change
+    to the fixture quietly creates one, these tests fail loudly instead of
+    passing while testing nothing.
+
+    The valid serial outcomes are exactly two, and both are asserted:
+
+      * the verb ordered FIRST — it acted on the fallback tuple A, and the B
+        selection landed afterwards; or
+      * the selection ordered FIRST — the verb saw tuple B and wrote nothing,
+        because none of the A drafts is in B.
+
+    What must never happen is the third outcome: B persisted AND A's Games
+    mutated. A cross-tuple write is checked directly, not inferred.
+    """
+
+    maxDiff = None
+
+    def setUp(self):
+        self.store = fresh_sql_store(os.environ["TEST_DATABASE_URL"])
+        self.api = ApiService(self.store)
+        self.fixture = build_two_programs(self.api)
+        # `_fallback` picks the first authorized Program by id and, within it,
+        # the LATEST active Season -- Season A2, not A1. The fixture is bound
+        # to whichever corner it really resolves to rather than to a guess,
+        # and then ASSERTED, so a fixture change that moves the fallback fails
+        # here instead of silently testing an unauthorized corner.
+        self.pa, self.sa, self.la, self.da = corner(
+            self.fixture, "A", "2", "a")
+        self.pb, self.sb, self.lb, _db = corner(self.fixture, "B", "1", "a")
+        program, season, league = self.api.context.resolve_with_league(
+            NEWCOMER, Role.LEAGUE_ADMIN, {})
+        self.assertEqual(
+            (program.id, season.id, league), (self.pa, self.sa, None),
+            "the newcomer's FALLBACK tuple is not the corner this fixture "
+            "commits into, so the races below would refuse for scope reasons "
+            "rather than exercising the first-selection lock")
+        # Committed as an identity-less internal caller, so the batch exists
+        # WITHOUT the newcomer ever having saved a context.
+        preview = _ok(self.api.draft_season_schedule(division_id=self.da))
+        self.committed = [row["game_id"] for row in _ok(
+            self.api.commit_draft_schedule(
+                division_id=self.da,
+                draft_fingerprint=preview["draft_fingerprint"]),
+            "seed commit")["created"]]
+        self.assertEqual(len(self.committed), 6)
+
+    def tearDown(self):
+        self.store.close()
+
+    def _assert_no_saved_context(self):
+        """The anti-vacuity guard: this whole class is about the ABSENT row."""
+        self.assertIsNone(
+            self.store.get_active_context(NEWCOMER),
+            "this test is about the caller's FIRST selection, but an "
+            "ActiveContext row already exists -- it would exercise the "
+            "already-covered row-lock path and prove nothing about the "
+            "absent-row one")
+
+    def _race_first_selection(self, verb_under_test, at):
+        """Run ``verb_under_test`` while a second CONNECTION makes the very
+        first A->B selection, released at the ``at`` seam.
+
+        Returns the verb's result. Asserts both sides completed and that the
+        outcome is one of the two valid serial ones.
+        """
+        self._assert_no_saved_context()
+        race = {"worker": None, "error": None, "done": False}
+
+        def first_selection_on_second_connection():
+            other = SqlStore(os.environ["TEST_DATABASE_URL"])
+            try:
+                ApiService(other).set_active_context(
+                    NEWCOMER, Role.LEAGUE_ADMIN, {}, self.pb, self.sb,
+                    self.lb)
+                race["done"] = True
+            except BaseException as error:       # surfaced on the test thread
+                race["error"] = error
+            finally:
+                other.close()
+
+        def start():
+            worker = threading.Thread(
+                target=first_selection_on_second_connection, daemon=True)
+            race["worker"] = worker
+            worker.start()
+            worker.join(timeout=2)
+            self.assertTrue(
+                worker.is_alive(),
+                f"the caller's FIRST context selection COMPLETED at {at} "
+                "while the write verb held its transaction -- with no row to "
+                "lock there is nothing serializing them, so the verb can "
+                "write under tuple A while tuple B is persisted")
+
+        result = verb_under_test(start)
+
+        race["worker"].join(timeout=15)
+        self.assertFalse(race["worker"].is_alive(),
+                         "the blocked first selection never completed")
+        if race["error"] is not None:
+            raise race["error"]
+        self.assertTrue(race["done"])
+        self.assertEqual(self.store.get_active_context(NEWCOMER).program_id,
+                         self.pb, "the racing first selection did not land")
+        return result
+
+    def _assert_no_cross_tuple_write(self, before, target_ids):
+        """Whatever the ordering, nothing of Program B's may have changed and
+        the batch must be all-or-nothing over its own targets."""
+        before_games, _before_slots, before_audit = before
+        self.assertEqual(
+            {g.id for g in self.store.all_games() if g.season_id == self.sb},
+            set(),
+            "the batch wrote Games into the newly-selected Program B")
+        now_games = {g.id: (g.is_draft, g.published)
+                     for g in self.store.all_games()}
+        # A discard removes rows; a publish flips is_draft. Either way each
+        # TARGET either moved or did not, and they must agree with each other.
+        moved = {gid for gid in target_ids
+                 if now_games.get(gid) != before_games.get(gid)}
+        self.assertIn(
+            len(moved), (0, len(target_ids)),
+            f"only {len(moved)} of {len(target_ids)} targets moved -- a "
+            "partially-applied batch")
+        # Nothing OUTSIDE the target set may move at all.
+        for gid, state in before_games.items():
+            if gid in target_ids:
+                continue
+            self.assertEqual(now_games.get(gid), state,
+                             f"game {gid} changed but was never a target")
+        if not moved:
+            self.assertEqual(len(self.store.all_setup_audit()), before_audit,
+                             "a batch that wrote nothing still audited")
+
+    def _snapshot(self):
+        return ({g.id: (g.is_draft, g.published)
+                 for g in self.store.all_games()},
+                {s.id: s.status for s in self.store.all_ice_slots()},
+                len(self.store.all_setup_audit()))
+
+    def test_first_selection_races_publish(self):
+        before = self._snapshot()
+        original = self.api.setup.publish_game
+        seen = {"calls": 0}
+
+        def run(start):
+            def publish_with_the_first_selection(game_id, published,
+                                                 actor_id=None):
+                seen["calls"] += 1
+                if seen["calls"] == 1:
+                    start()
+                return original(game_id, published, actor_id)
+
+            self.api.setup.publish_game = publish_with_the_first_selection
+            try:
+                return _ok(self.api.publish_draft_games(
+                    game_ids=list(self.committed), actor_id=NEWCOMER,
+                    user_id=NEWCOMER, role=Role.LEAGUE_ADMIN, scope={}))
+            finally:
+                self.api.setup.publish_game = original
+
+        result = self._race_first_selection(run, "the first publish_game")
+        self.assertIn(result["published"], (0, 6), result)
+        self._assert_no_cross_tuple_write(before, set(self.committed))
+
+    def test_first_selection_races_discard(self):
+        before = self._snapshot()
+        original = self.store.delete_game
+        seen = {"calls": 0}
+
+        def run(start):
+            def delete_with_the_first_selection(game_id):
+                seen["calls"] += 1
+                if seen["calls"] == 1:
+                    start()
+                return original(game_id)
+
+            self.store.delete_game = delete_with_the_first_selection
+            try:
+                return _ok(self.api.discard_draft_games(
+                    game_ids=list(self.committed), actor_id=NEWCOMER,
+                    user_id=NEWCOMER, role=Role.LEAGUE_ADMIN, scope={}))
+            finally:
+                self.store.delete_game = original
+
+        result = self._race_first_selection(run, "the first delete_game")
+        self.assertIn(result["discarded"], (0, 6), result)
+        self._assert_no_cross_tuple_write(before, set(self.committed))
+
+    def test_first_selection_races_discard_all(self):
+        before = self._snapshot()
+        original = self.store.delete_game
+        seen = {"calls": 0}
+
+        def run(start):
+            def delete_with_the_first_selection(game_id):
+                seen["calls"] += 1
+                if seen["calls"] == 1:
+                    start()
+                return original(game_id)
+
+            self.store.delete_game = delete_with_the_first_selection
+            try:
+                return _ok(self.api.discard_draft_games(
+                    all_drafts=True, actor_id=NEWCOMER, user_id=NEWCOMER,
+                    role=Role.LEAGUE_ADMIN, scope={}))
+            finally:
+                self.store.delete_game = original
+
+        result = self._race_first_selection(
+            run, "the first delete_game of an all_drafts discard")
+        self.assertIn(result["discarded"], (0, 6), result)
+        self._assert_no_cross_tuple_write(before, set(self.committed))
+
+    def test_first_selection_races_commit(self):
+        self._assert_no_saved_context()
+        before = self._snapshot()
+        # A second Division in the SAME corner, so there is something left to
+        # commit after setUp's batch.
+        _ok(self.api.discard_draft_games(all_drafts=True), "clear")
+        before = self._snapshot()
+        preview = _ok(self.api.draft_season_schedule(
+            division_id=self.da, user_id=NEWCOMER, role=Role.LEAGUE_ADMIN,
+            scope={}))
+        original = self.store.add_game
+        seen = {"calls": 0}
+
+        def run(start):
+            def add_with_the_first_selection(game):
+                seen["calls"] += 1
+                if seen["calls"] == 1:
+                    start()
+                return original(game)
+
+            self.store.add_game = add_with_the_first_selection
+            try:
+                return self.api.commit_draft_schedule(
+                    division_id=self.da,
+                    draft_fingerprint=preview["draft_fingerprint"],
+                    actor_id=NEWCOMER, user_id=NEWCOMER,
+                    role=Role.LEAGUE_ADMIN, scope={})
+            finally:
+                self.store.add_game = original
+
+        result = self._race_first_selection(run, "the first Game INSERT")
+        # The commit CREATES rows, so the all-or-nothing check above (which
+        # tracks pre-existing targets) does not apply; the two valid serial
+        # outcomes are asserted directly instead.
+        in_a = {g.id for g in self.store.all_games() if g.season_id == self.sa}
+        in_b = {g.id for g in self.store.all_games() if g.season_id == self.sb}
+        self.assertEqual(in_b, set(),
+                         "the commit wrote Games into the newly-selected "
+                         "Program B")
+        if "error" in result:
+            # The selection ordered FIRST: refused, and nothing written.
+            self.assertEqual(result["error"]["details"]["reason"],
+                             "division_missing", result)
+            self.assertEqual(in_a, set(),
+                             "a refused commit still created Games")
+            self.assertEqual(len(self.store.all_setup_audit()), before[2],
+                             "a refused commit still audited")
+        else:
+            # The commit ordered FIRST, on the fallback tuple A it really did
+            # hold at the time.
+            self.assertEqual(len(result["created"]), 6, result)
+            self.assertEqual(len(in_a), 6)
+
+    def test_the_first_selection_completes_freely_when_nothing_holds_it(self):
+        """The anti-vacuity control for the four races above.
+
+        Each of them asserts a thread is STILL ALIVE after two seconds, which
+        would also pass for a thread that can never complete at all. With
+        nothing holding the mutex the identical first selection must finish
+        quickly and land.
+        """
+        self._assert_no_saved_context()
+        started = time.monotonic()
+        race = {"error": None, "done": False}
+
+        def first_selection():
+            other = SqlStore(os.environ["TEST_DATABASE_URL"])
+            try:
+                ApiService(other).set_active_context(
+                    NEWCOMER, Role.LEAGUE_ADMIN, {}, self.pb, self.sb,
+                    self.lb)
+                race["done"] = True
+            except BaseException as error:
+                race["error"] = error
+            finally:
+                other.close()
+
+        worker = threading.Thread(target=first_selection, daemon=True)
+        worker.start()
+        worker.join(timeout=10)
+        if race["error"] is not None:
+            raise race["error"]
+        self.assertTrue(race["done"],
+                        "the first selection cannot complete even with "
+                        "nothing holding the mutex")
+        self.assertLess(time.monotonic() - started, 2.0,
+                        "the first selection is slow on its own, so 'still "
+                        "alive after 2s' proves nothing about the mutex")
+        self.assertEqual(self.store.get_active_context(NEWCOMER).program_id,
                          self.pb)
 
 
