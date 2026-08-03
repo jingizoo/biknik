@@ -3,24 +3,41 @@
 Uses obviously-fictional names — no real PII, no production data.
 """
 
-from datetime import datetime, timezone
 from typing import Tuple
 
 from .domain import Game, Player, Position, Team
+from .full_demo import demo_day_zero
+from .services import RosterService
 from .store import InMemoryStore
 
 
-def build_seeded_store() -> Tuple[InMemoryStore, str]:
+def build_seeded_store(seed_instant=None) -> Tuple[InMemoryStore, str]:
     """Return an in-memory store seeded with one team, players, and a game.
 
     The returned game id targets 1 goalie and 15 skaters.
+
+    The game is placed RELATIVE to ``seed_instant`` on the demo's shared day
+    zero (:func:`~hockey_scheduler.full_demo.demo_day_zero`), never on a fixed
+    calendar date (#387). It used to sit at 2026-07-04, which real time had
+    already passed: ``hockey_scheduler.demo`` then walked an operator through
+    enrolling and accepting a substitute for a game that had ALREADY BEEN
+    PLAYED — a state ``accept_substitute_offer`` refuses outright ("This game
+    is no longer upcoming"), so the script demonstrated a flow the product
+    does not actually permit.
+
+    Omitted, the instant comes from the RosterService clock this seed's own
+    store is about to be driven by — the same single source of "now" the
+    engine reads, not a second one (CLAUDE.md: times are passed in
+    explicitly).
     """
     store = InMemoryStore()
 
     team = Team(id="team_lions", name="U16 Lions")
     store.add_team(team)
 
-    start = datetime(2026, 7, 4, 18, 30, tzinfo=timezone.utc)
+    if seed_instant is None:
+        seed_instant = RosterService(store).clock()
+    start = demo_day_zero(seed_instant).replace(hour=18, minute=30)
     game = Game(
         id="game_1",
         home_team_id=team.id,

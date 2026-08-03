@@ -32,8 +32,54 @@ from .domain.errors import DomainError
 from .services import RosterService, SetupService
 from .store import InMemoryStore
 
-# A fixed demo "Saturday".
-_DAY = datetime(2026, 9, 5, tzinfo=timezone.utc)
+# The demo's ice inventory is RELATIVE to the instant the demo is seeded at,
+# never pinned to the calendar (#387).
+#
+# It used to be three fixed dates — 2026-09-05 (the core scenario's "Saturday"),
+# 2026-09-12 (the unrostered "next game") and 2026-09-06 + 14 days (the
+# pilot-scale inventory). Those are a countdown, not data: once real time passes
+# them, a freshly-seeded demo is born past-dated. Every surface that reasons
+# about "now" then degrades with it — `find_next_game_for_player` returns no
+# next game, `accept_substitute_offer` refuses ("no longer upcoming"),
+# `delete_ice_slot` refuses ("past slots are history"), and a sales demo shows
+# a league whose whole season already happened. Nothing fails loudly; it just
+# quietly stops demonstrating anything.
+#
+# The same absolute dates were also a *clock-dependent* trap for anything that
+# books ice relative to now. `test_actor_attribution` booked at `now + 31..34
+# days` while inheriting the current hour, so it collided with the evening slots
+# below only between 15:00 and 21:00 UTC: identical trees passed as a PR at
+# 12:43Z and failed on main at 15:08Z on 2026-08-02. #384 fixed that fixture by
+# anchoring it to the rink's own occupancy; this fixes the data it tripped over.
+#
+# Day zero is derived, not chosen: UTC midnight on the first Saturday at least
+# a week after the seed instant. Saturday keeps the demo's weekend look; the
+# week of lead time keeps the whole two-week inventory below future-dated even
+# for a demo server left running for days. The derivation is a pure function of
+# the seed instant, so the same instant always rebuilds the same inventory
+# (CLAUDE.md: the domain never calls ``datetime.now()`` itself — the instant is
+# passed in).
+_DEMO_WEEKDAY = 5          # Saturday, with Monday == 0 (``date.weekday()``)
+_DEMO_LEAD_DAYS = 7
+
+
+def demo_day_zero(seed_instant: datetime) -> datetime:
+    """The demo's day zero for ``seed_instant``: UTC midnight on the first
+    Saturday at least ``_DEMO_LEAD_DAYS`` days after it.
+
+    ``seed_instant`` must be a timezone-aware datetime — the repo's convention
+    for every time that crosses a boundary. A naive value is rejected rather
+    than assumed to be UTC, because guessing would silently shift the whole
+    inventory by the caller's offset.
+    """
+    if not isinstance(seed_instant, datetime):
+        raise ValueError("seed_instant must be a datetime.")
+    if seed_instant.tzinfo is None or seed_instant.utcoffset() is None:
+        raise ValueError("seed_instant must be a timezone-aware datetime.")
+    day = seed_instant.astimezone(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    day += timedelta(days=_DEMO_LEAD_DAYS)
+    return day + timedelta(days=(_DEMO_WEEKDAY - day.weekday()) % 7)
 
 # Every seeded record is attributed to the demo's REAL League-Admin account,
 # by its account id — not to a synthetic label (#367 owner ruling).
@@ -73,16 +119,27 @@ _FALCONS_SKATERS = [
 ]
 
 
-def build_full_demo_store(store=None) -> Tuple[InMemoryStore, str, dict]:
+def build_full_demo_store(store=None, seed_instant=None
+                          ) -> Tuple[InMemoryStore, str, dict]:
     """Return (store, game_id, ids) for the full E2E demo scenario.
 
     A store may be injected (e.g. a SqlStore) to seed any backend; defaults to
     a fresh in-memory store.
+
+    ``seed_instant`` is the timezone-aware instant the whole ice inventory is
+    laid out relative to (see :func:`demo_day_zero`). Omitted, it comes from
+    the SetupService clock this seed already runs on — the seed path's single
+    source of "now", the same one that stamps the audit rows written below —
+    rather than a second, independently-drifting call to ``datetime.now()``.
+    A test that needs exact dates passes the instant in and derives them with
+    :func:`demo_day_zero`, which keeps the assertion exact instead of
+    approximate.
     """
     store = store if store is not None else InMemoryStore()
     setup = SetupService(store)
     roster = RosterService(store)
     admin = DEMO_ADMIN_ACCOUNT_ID
+    day = demo_day_zero(setup.clock() if seed_instant is None else seed_instant)
 
     # Facility owner that operates the league and owns its arenas (#166/#173) —
     # a rink company, distinct from a hockey Club. The league links up to it,
@@ -151,12 +208,12 @@ def build_full_demo_store(store=None) -> Tuple[InMemoryStore, str, dict]:
     main_rink = setup.create_rink(venue.id, "Main Rink", actor_id=admin)
     setup.create_rink(venue.id, "Training Rink", actor_id=admin)
 
-    setup.create_ice_slot(main_rink.id, _DAY.replace(hour=16),
-                          _DAY.replace(hour=17, minute=30), actor_id=admin)
-    slot_game = setup.create_ice_slot(main_rink.id, _DAY.replace(hour=18, minute=30),
-                                      _DAY.replace(hour=20), actor_id=admin)
-    setup.create_ice_slot(main_rink.id, _DAY.replace(hour=20, minute=30),
-                          _DAY.replace(hour=22), actor_id=admin)
+    setup.create_ice_slot(main_rink.id, day.replace(hour=16),
+                          day.replace(hour=17, minute=30), actor_id=admin)
+    slot_game = setup.create_ice_slot(main_rink.id, day.replace(hour=18, minute=30),
+                                      day.replace(hour=20), actor_id=admin)
+    setup.create_ice_slot(main_rink.id, day.replace(hour=20, minute=30),
+                          day.replace(hour=22), actor_id=admin)
 
     game = setup.create_game(season.id, d_u16.id, u16_lions.id, u16_falcons.id,
                              slot_game.id, actor_id=admin)
@@ -185,9 +242,10 @@ def build_full_demo_store(store=None) -> Tuple[InMemoryStore, str, dict]:
     # A future draft game for the same team, left UNROSTERED, so the operator
     # can demonstrate real roster selection (manual picks + copy previous
     # roster) against an empty roster instead of the already-full seeded game.
-    _NEXT = datetime(2026, 9, 12, tzinfo=timezone.utc)
-    slot_next = setup.create_ice_slot(main_rink.id, _NEXT.replace(hour=18, minute=30),
-                                      _NEXT.replace(hour=20), actor_id=admin)
+    next_day = day + timedelta(days=7)
+    slot_next = setup.create_ice_slot(main_rink.id,
+                                      next_day.replace(hour=18, minute=30),
+                                      next_day.replace(hour=20), actor_id=admin)
     game_next = setup.create_game(season.id, d_u16.id, u16_lions.id,
                                   u16_falcons.id, slot_next.id, actor_id=admin)
 
@@ -206,7 +264,7 @@ def build_full_demo_store(store=None) -> Tuple[InMemoryStore, str, dict]:
 
     # Pilot-scale data pack (#97) — purely additive, see module docstring.
     _seed_pilot_scale(setup, roster, admin, season, d_u16, d_u18, d_sen,
-                      club_falcons, main_rink, league)
+                      club_falcons, main_rink, league, day)
 
     ids = {
         "next_game_id": game_next.id,
@@ -287,11 +345,15 @@ def _round_robin_pairs(team_ids, rounds):
 
 
 def _seed_pilot_scale(setup, roster, admin, season, d_u16, d_u18, d_sen,
-                      club_falcons, main_rink, league):
+                      club_falcons, main_rink, league, day):
     """Fill the store out to pilot scale on top of the core scenario above:
     12 teams, ~184 players, 24 officials, 3 rinks across 2 venues, two weeks
     of ice inventory, and ~18 more published games (~19-20 total) with a
     couple of officiating conflicts and player non-responses mixed in.
+
+    ``day`` is the core scenario's own day zero (:func:`demo_day_zero`), so
+    this pack's inventory stays welded to it instead of carrying a second,
+    independently-drifting anchor of its own.
     """
     store = setup.store
     club_bears = next(c for c in store.all_clubs() if c.name == "Bears HC")
@@ -343,16 +405,18 @@ def _seed_pilot_scale(setup, roster, admin, season, d_u16, d_u18, d_sen,
     training_rink = next(r for r in store.all_rinks() if r.name == "Training Rink")
     rinks = [main_rink, training_rink, lakeside_rink]
 
-    # Two weeks of ice inventory across all 3 rinks: one evening GAME slot
-    # per rink per day, plus a practice slot every 4th day for variety.
+    # Two weeks of ice inventory across all 3 rinks, starting the day after
+    # day zero: one evening GAME slot per rink per day, plus a practice slot
+    # every 4th day for variety.
     # Defensive: main_rink already has core-scenario bookings on a couple of
-    # these dates (e.g. the #93-style "next game" slot on day 6), so a slot
-    # that would overlap an existing one on the same rink is simply skipped
-    # rather than allowed to crash server startup on a date collision.
-    _START = datetime(2026, 9, 6, tzinfo=timezone.utc)
+    # these days (e.g. the #93-style "next game" slot on day zero + 7, which
+    # is offset 6 here), so a slot that would overlap an existing one on the
+    # same rink is simply skipped rather than allowed to crash server startup
+    # on a collision.
+    start = day + timedelta(days=1)
     game_slots = []
-    for day in range(14):
-        d = _START + timedelta(days=day)
+    for offset in range(14):
+        d = start + timedelta(days=offset)
         for rink in rinks:
             try:
                 slot = setup.create_ice_slot(
@@ -361,7 +425,7 @@ def _seed_pilot_scale(setup, roster, admin, season, d_u16, d_u18, d_sen,
                 game_slots.append(slot)
             except DomainError:
                 pass
-            if day % 4 == 0:
+            if offset % 4 == 0:
                 try:
                     setup.create_ice_slot(
                         rink.id, d.replace(hour=16), d.replace(hour=17, minute=15),
