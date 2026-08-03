@@ -502,6 +502,75 @@ class DemoSeedInstantDefaultTest(unittest.TestCase):
         self.assertEqual(layout_only(store), expected_layout(pinned))
 
 
+class DemoSeedInstantEnvOverrideTest(unittest.TestCase):
+    """The running web server can be told which instant to seed at.
+
+    #389 review: the browser gate for all of this could only ever observe the
+    machine's real clock, so it proved the app correct on today's date — which
+    is exactly how the bug being fixed passed for years. Pinning the seed
+    instant from outside the process is what lets a browser journey run against
+    a demo seeded well past the retired September 2026 window.
+
+    The hook is an environment variable, read at the moment the demo is
+    (re)built. Unset -- production, and every ordinary dev run -- it is
+    literally ``None`` handed to the same parameter that already defaulted to
+    ``None``, so the seed path is byte-for-byte what it was.
+    """
+
+    ENV = "HOCKEY_DEMO_SEED_INSTANT"
+
+    def setUp(self):
+        from hockey_scheduler.web import server as srv
+
+        self.srv = srv
+        self.addCleanup(os.environ.pop, self.ENV, None)
+        os.environ.pop(self.ENV, None)
+
+    def test_unset_env_leaves_the_seed_on_its_own_clock(self):
+        # The inert case, asserted rather than assumed: with nothing set, the
+        # resolver contributes nothing and build_full_demo_store keeps the
+        # default it always had.
+        self.assertIsNone(self.srv.demo_seed_instant_from_env())
+
+    def test_env_instant_is_used_verbatim(self):
+        os.environ[self.ENV] = "2031-04-17T13:05:41.123456+00:00"
+        self.assertEqual(self.srv.demo_seed_instant_from_env(),
+                         datetime(2031, 4, 17, 13, 5, 41, 123456, tzinfo=UTC))
+
+    def test_a_non_utc_offset_is_preserved_as_an_instant(self):
+        os.environ[self.ENV] = "2031-04-17T18:05:41+05:00"
+        self.assertEqual(self.srv.demo_seed_instant_from_env(),
+                         datetime(2031, 4, 17, 13, 5, 41, tzinfo=UTC))
+
+    def test_a_naive_instant_is_refused_not_guessed(self):
+        # Same rule as demo_day_zero: guessing UTC would silently shift the
+        # whole inventory by the caller's offset. Refused LOUDLY, because a
+        # silently-ignored override would make the browser gate below pass
+        # against a demo seeded at the real clock -- the exact vacuity this
+        # hook exists to remove.
+        os.environ[self.ENV] = "2031-04-17T13:05:41"
+        with self.assertRaises(ValueError):
+            self.srv.demo_seed_instant_from_env()
+
+    def test_an_unparseable_instant_is_refused_not_ignored(self):
+        os.environ[self.ENV] = "next tuesday"
+        with self.assertRaises(ValueError):
+            self.srv.demo_seed_instant_from_env()
+
+    def test_the_seeded_store_really_lands_on_the_env_instant(self):
+        # End to end through the server's own rebuild, not just the resolver:
+        # a demo seeded five years past the retired window puts its ice there.
+        os.environ[self.ENV] = "2031-04-17T13:05:41.123456+00:00"
+        state = self.srv.DemoState()
+        state.reset(seed=True)
+        slots = state.api.store.all_ice_slots()
+        self.assertEqual(len(slots), 57)      # premise: a full demo was built
+        self.assertEqual(min(s.start_time for s in slots),
+                         demo_day_zero(FAR_FUTURE).replace(hour=16))
+        self.assertEqual(layout_only(state.api.store),
+                         expected_layout(FAR_FUTURE))
+
+
 class OtherSeedFixturesAreRelativeTest(unittest.TestCase):
     """The audit half of #387: the demo's ice was not the only pinned date."""
 

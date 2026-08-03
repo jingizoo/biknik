@@ -373,6 +373,48 @@ def _json_default(obj):
     return str(obj)
 
 
+#: Env var naming the instant the demo dataset is laid out relative to.
+#:
+#: The demo's ice is RELATIVE to the moment it is seeded (#387,
+#: ``full_demo.demo_day_zero``), which is normally "now". That is right for a
+#: real demo and useless for a TEST of the very behaviour #387 fixed: a browser
+#: journey run against the machine's real clock can only ever prove the app
+#: correct on today's date, which is precisely how the pinned September 2026
+#: dates passed for years before real time caught up with them. Setting this
+#: lets a journey seed a demo well past that window and drive the real UI
+#: against it (``e2e/calendar-today.js``).
+#:
+#: Unset -- production, and every ordinary dev run -- the resolver below
+#: returns ``None``, which is the value ``build_full_demo_store`` already
+#: defaulted its ``seed_instant`` parameter to. The seed path is then
+#: byte-for-byte what it was: the SetupService clock it already runs on.
+DEMO_SEED_INSTANT_ENV = "HOCKEY_DEMO_SEED_INSTANT"
+
+
+def demo_seed_instant_from_env(env=None) -> Optional[datetime]:
+    """The pinned demo seed instant, or ``None`` when unset.
+
+    A malformed or NAIVE value raises rather than being ignored. A silently
+    dropped override is worse than no override at all: the browser gate would
+    then run against a demo seeded at the real clock while believing it had
+    travelled to 2031, and pass vacuously.
+    """
+    raw = (os.environ if env is None else env).get(DEMO_SEED_INSTANT_ENV)
+    if not raw:
+        return None
+    try:
+        instant = datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{DEMO_SEED_INSTANT_ENV} must be an ISO-8601 datetime, "
+            f"got {raw!r}.") from exc
+    if instant.tzinfo is None or instant.utcoffset() is None:
+        raise ValueError(
+            f"{DEMO_SEED_INSTANT_ENV} must be timezone-aware, got {raw!r} — "
+            "guessing UTC would shift the whole inventory silently.")
+    return instant
+
+
 class DemoState:
     """Holds the demo facade; can (re)build or clear itself for the demo."""
 
@@ -436,7 +478,11 @@ class DemoState:
                 store.reset_schema()
             api = self._make_api(store)
             if seed:
-                _, game_id, ids = build_full_demo_store(store)
+                # Resolved per rebuild, not once at import: day zero is
+                # recomputed on every Load/Reset, so a test that pins the
+                # instant must have it honored by the rebuild it triggers.
+                _, game_id, ids = build_full_demo_store(
+                    store, seed_instant=demo_seed_instant_from_env())
                 self._seed_demo_accounts(api, ids)
             else:
                 game_id, ids = None, {}
