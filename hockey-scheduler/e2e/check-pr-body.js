@@ -24,7 +24,38 @@
 //                       git diff --name-only <base>...<head>
 //   ui_pointer          whether app.js still names a YYYY-MM-DD literal
 //   head / base         git rev-parse / merge-base (or the CI event payload)
-//   ci                  gh pr checks
+//
+// WHY THERE IS NO `ci` FACT (#389 review round 2).
+//
+// There used to be one, and it was the worst thing in this file. `ciStatus()`
+// returned null whenever GITHUB_ACTIONS was set — a job inside a run genuinely
+// cannot observe its own run's terminal status — and the `ci` row was then
+// printed SKIP and counted as `ok`. So in the one environment where this gate
+// is authoritative, its most volatile field was not checked at all, while the
+// body told readers it was. The gate went green on a head whose body said
+// `ci: pending` after the run had finished green. A check that skips a field
+// and reports ok is indistinguishable from one that verified it.
+//
+// The fix is not a better skip. CI status is simply NOT A PROPERTY OF THE HEAD:
+// every other fact above is a pure function of the tree and git and cannot
+// change without a commit, whereas a run's conclusion changes on re-run, on
+// infrastructure flake, on nothing at all. Recording it as a "fact about the
+// head that this gate verifies" is a category error, and no amount of
+// machinery fixes a claim that is not about the thing being claimed.
+//
+// The alternative considered was a separate `workflow_run`-triggered workflow
+// firing on the main run's completion. That is genuinely non-self-referential,
+// and it was rejected for a concrete reason: `workflow_run` workflows only ever
+// execute from the DEFAULT BRANCH, so one added on this branch would not run on
+// this PR at all. Adding it here would ship a mechanism that provably does
+// nothing while the body advertised the protection — the same defect this whole
+// gate exists to prevent, one level up.
+//
+// So `ci` is gone from the block, and the body no longer claims it is verified.
+// The protection is not merely dropped: UNKNOWN KEYS ARE NOW REJECTED, so a
+// future `ci:` line (or any other unverified claim smuggled into the
+// machine-checked block) fails loudly instead of sitting there looking checked.
+// That removes the whole class rather than tracking one instance of it.
 //
 // USAGE
 //   node check-pr-body.js                  # fetches the body with `gh`
@@ -93,6 +124,15 @@ function groundTruth() {
 
   const changed = sh("git", ["diff", "--name-only", `${base}...${head}`])
     .split("\n").filter(Boolean);
+  // Premise for the two counts below: a PR always changes something. An empty
+  // diff (wrong base, shallow clone, detached ref) would make both counts a
+  // vacuous 0, which a body stating 0 would then "agree" with — the same
+  // can't-fail shape as the retired `ci` skip, in a different field.
+  if (!changed.length) {
+    throw new Error(
+      `git diff ${base}...${head} is empty — the changed-file counts would be `
+      + `a vacuous 0. Is origin/main fetched and the base correct?`);
+  }
 
   // A literal in EXECUTABLE code only — comments explaining the retired dates
   // by name are expected, same exemption the backend's structural guard makes.
@@ -112,23 +152,12 @@ function groundTruth() {
   };
 }
 
-// `null` means "could not be determined here" — reported as SKIPPED, never
-// silently treated as agreement.
-function ciStatus() {
-  if (process.env.GITHUB_ACTIONS) return null;   // its own checks are running
-  let raw;
-  try {
-    raw = sh("gh", ["pr", "checks", PR, "--repo", REPO,
-                    "--json", "name,bucket"]);
-  } catch {
-    return null;                                  // no gh / no network / no auth
-  }
-  const checks = JSON.parse(raw);
-  if (!checks.length) return null;
-  if (checks.some((c) => c.bucket === "pending")) return "pending";
-  if (checks.every((c) => c.bucket === "pass")) return "all-green";
-  return "failing";
-}
+// Every fact this gate compares. Exhaustive on purpose: the block must carry
+// exactly these keys, no more and no fewer. Anything else is either a fact
+// nobody verifies (which is how the retired `ci` field misled readers) or a
+// misspelling of one that is silently going unchecked.
+const FACTS = ["lead_days", "weekday_snap", "backend_tests_changed",
+               "e2e_files_changed", "ui_pointer", "head", "base"];
 
 function parseFactBlock(body) {
   const m = body.match(/<!--\s*pr-facts\s*([\s\S]*?)-->/);
@@ -156,7 +185,6 @@ function main() {
 
   const truth = groundTruth();
   const facts = parseFactBlock(body);
-  const ci = ciStatus();
 
   const rows = [];
   const check = (name, expected, actual) => {
@@ -164,16 +192,14 @@ function main() {
                 ok: String(expected) === String(actual) });
   };
 
-  for (const key of ["lead_days", "weekday_snap", "backend_tests_changed",
-                     "e2e_files_changed", "ui_pointer", "head", "base"]) {
+  for (const key of FACTS) {
     check(key, truth[key], facts[key] === undefined ? "(missing)" : facts[key]);
   }
-  if (ci === null) {
-    rows.push({ name: "ci", expected: "(undeterminable here)",
-                actual: facts.ci || "(missing)", ok: true, skipped: true });
-  } else {
-    check("ci", ci, facts.ci === undefined ? "(missing)" : facts.ci);
-  }
+
+  // Unknown keys are a failure, not noise. A key nobody compares looks exactly
+  // like a verified one to a reader — that is precisely how `ci: pending` sat
+  // in a block advertised as gate-checked while the run was green.
+  const unknown = Object.keys(facts).filter((k) => !FACTS.includes(k));
 
   const stale = STALE_PROSE
     .filter((s) => s.re.test(body.replace(/<!--[\s\S]*?-->/g, "")))
@@ -182,28 +208,34 @@ function main() {
   let width = 0;
   for (const r of rows) width = Math.max(width, r.name.length);
   for (const r of rows) {
-    const mark = r.skipped ? "SKIP" : (r.ok ? "ok  " : "FAIL");
-    console.log(`  ${mark}  ${r.name.padEnd(width)}  head=${r.expected}`
-      + `  body=${r.actual}`);
+    console.log(`  ${r.ok ? "ok  " : "FAIL"}  ${r.name.padEnd(width)}`
+      + `  head=${r.expected}  body=${r.actual}`);
+  }
+  for (const k of unknown) {
+    console.log(`  FAIL  ${k}: not a fact this gate verifies — remove it, or `
+      + `add it to FACTS with ground truth derived from the head`);
   }
   for (const why of stale) console.log(`  FAIL  stale prose: ${why}`);
 
-  // Anti-vacuity: a body with a well-formed but empty fact block, or a run
-  // where nothing could be derived, must not read as agreement.
-  const ran = rows.filter((r) => !r.skipped).length;
-  if (ran < 7) {
-    console.error(`only ${ran} facts were actually compared; expected 7+`);
+  // Anti-vacuity. Every row must have been a real comparison — there is no
+  // longer any code path that records a row without comparing it, and this
+  // asserts that rather than trusting it. An exact count, not a floor, so
+  // dropping a fact from FACTS fails here instead of quietly narrowing the
+  // gate.
+  if (rows.length !== FACTS.length) {
+    console.error(`compared ${rows.length} facts, expected exactly `
+      + `${FACTS.length}`);
     process.exit(1);
   }
 
-  const bad = rows.filter((r) => !r.ok).length + stale.length;
+  const bad = rows.filter((r) => !r.ok).length + unknown.length + stale.length;
   if (bad) {
     console.error(`\nPR body disagrees with this head in ${bad} place(s). `
       + `Rewrite the body from the head, not the other way round.`);
     process.exit(1);
   }
-  console.log(`PR body consistent with ${truth.head} (${ran} facts checked`
-    + `${ci === null ? ", ci skipped" : ""}).`);
+  console.log(`PR body consistent with ${truth.head} `
+    + `(${rows.length} facts checked, none skipped).`);
 }
 
 main();
