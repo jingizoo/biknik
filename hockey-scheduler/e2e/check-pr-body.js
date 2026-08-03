@@ -29,7 +29,12 @@
 // USAGE
 //   node check-pr-body.js                  # fetches the body with `gh`
 //   node check-pr-body.js --body-file X    # offline, or to test a candidate
-//   PR_BODY=... node check-pr-body.js      # CI, from the event payload
+//
+// The body is always fetched LIVE, never taken from the CI event payload. A
+// pull_request payload snapshots the body as it was when the run started, so a
+// body corrected after the push would still be judged on its old text — the
+// gate would report a failure that no longer exists, and re-running would not
+// clear it. Fetching live means a re-run always judges what is actually there.
 //
 // Exits non-zero on any disagreement.
 const { execFileSync } = require("child_process");
@@ -70,9 +75,12 @@ function groundTruth() {
   const lead = demo.match(/^_DEMO_LEAD_DAYS\s*=\s*(\d+)/m);
   if (!lead) throw new Error("could not read _DEMO_LEAD_DAYS from full_demo.py");
 
+  // On a pull_request event the checkout is the MERGE commit, so `git rev-parse
+  // HEAD` is not the PR head — the workflow passes the real one in.
   const head = process.env.PR_HEAD_SHA || sh("git", ["rev-parse", "HEAD"]);
-  const base = process.env.PR_BASE_SHA
-    || sh("git", ["merge-base", "origin/main", "HEAD"]);
+  // Always the merge-base, never the event's `base.sha`: the body's claims are
+  // about `git diff main...HEAD`, and that is the commit it diffs from.
+  const base = sh("git", ["merge-base", "origin/main", head]);
 
   const changed = sh("git", ["diff", "--name-only", `${base}...${head}`])
     .split("\n").filter(Boolean);
@@ -132,9 +140,8 @@ function main() {
   const i = process.argv.indexOf("--body-file");
   const body = i !== -1
     ? fs.readFileSync(process.argv[i + 1], "utf8")
-    : (process.env.PR_BODY
-       || sh("gh", ["pr", "view", PR, "--repo", REPO, "--json", "body",
-                    "--jq", ".body"]));
+    : sh("gh", ["pr", "view", PR, "--repo", REPO, "--json", "body",
+                "--jq", ".body"]);
 
   const truth = groundTruth();
   const facts = parseFactBlock(body);
