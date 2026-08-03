@@ -742,12 +742,88 @@ league_scoped_service → service). Only the override actually executes, so the
 mutations below were applied there; the base copy carries the identical binding
 so the two cannot drift.
 
-**A draft Game's edge is `(its Season's Program, its Season, its `league_id`)`.**
+#### A draft Game is judged by its WHOLE parent graph
+
+The first cut reduced a Game to `(its Season's Program, its Season, its
+`league_id`)` — **two of the four** competition parents — and the owner's
+review named that for what it is: a parallel mechanism with weaker semantics
+than the one #372 already landed for exactly this record. `season_id` and
+`league_id` can both name the active tuple while `division_id` or
+`league_season_id` points into another Program, another Season or a sibling
+League, and the reduced edge authorized the row anyway: both team names, the
+Division name, the Rink and the time of a foreign draft on the review screen,
+and its Games reachable by publish/discard.
+
+The decision is `_setup_target_edges("game", game)` **verbatim**.
+`_game_parent_constraints` resolves every non-null parent *independently* —
+`season_id`, `league_id`, **both ends** of `league_season_id` as two separate
+constraints, and `division_id` through its own binding likewise — and yields no
+edge at all when any of them fails to resolve or when two of them disagree on
+Program, Season or League. An empty edge set with `saw_link` is
+linked-but-unauthorized, which is the fail-closed answer here.
+
+A Game with **no** competition parent at all is also excluded for an identified
+caller. `setup_target_accessible` rule 6 would hand such a record to its
+creator; that clause is deliberately not adopted, for #372's own reason and
+#381's — and every Game the scheduler commits carries all four parents, so an
+unparented draft is not a state this surface has to keep workable.
+
+**The two participating Teams are folded in on top**, by the same "edges, not
+unions" rule and through the same `_team_edges` helper. This narrows and never
+widens. It lives in the review predicate rather than in
+`_game_parent_constraints` because it is a property of *this payload*: the
+review row serializes `home_team_name` and `away_team_name`, so a foreign Team
+is a direct disclosure through this surface even when all four competition
+parents agree — while #372's generic setup gate judges the four FKs only, on
+purpose (a Team transferred between Leagues after a Game was played must not
+make that historical Game unmanageable).
+
 `Game.league_id` is the canonical competition League, the axis `Team.league_id`
-names — *not* the legacy Program id `Venue.league_id` stores. A Game reaches its
-Program only through its Season, so a row with no resolvable Season has no edge
-at all and is omitted for an identified caller: a dangling chain is never the
-permissive branch. `role is None` still sees the whole installation.
+names — *not* the legacy Program id `Venue.league_id` stores. `role is None`
+still sees the whole installation.
+
+#### Lock, then decide, then mutate
+
+Scoping the read was not enough on its own, and the first cut got the *timing*
+wrong in the way #372 already ruled on. `publish_draft_games` /
+`discard_draft_games` resolved their targets and authorized them in one
+transaction and then wrote in another, so a concurrent `POST /api/context`
+landing in between made the batch authorized under a tuple that no longer held.
+A predicate that closes its own transaction before the write was never one unit
+with it.
+
+So the whole unit — resolve, authorize, validate, mutate — is one
+`store.transaction()`, `SERIALIZABLE` for an identified caller (the nested
+context read asks for that level, and a nested join may never *raise* the open
+transaction's isolation). `_locked_draft_targets` takes three locks in order:
+
+1. the caller's **ActiveContext row**
+   (`resolve_with_league(..., lock=True)` → `get_active_context_for_update`).
+   `set_active_context` takes the **same** lock before writing, so a context
+   switch either orders wholly before the authorization or waits for the write
+   it authorized to commit. The row may not exist yet (a caller on
+   `_fallback`); `FOR UPDATE` then locks nothing and the `SERIALIZABLE`
+   read-write anti-dependency against the first `INSERT` carries the ordering
+   instead. Both halves are needed;
+2. every candidate draft **Game row** (`get_game_for_update`), in sorted id
+   order so two concurrent batches cannot deadlock;
+3. the **Season** rows, unchanged, still after the Game locks.
+
+The authorization then runs on the **re-read, post-lock** Game rows, so a Game
+whose parents moved between the scan and the lock is judged on what it is now.
+The commit path's under-lock re-authorization takes the same context lock.
+
+**The league-scoped facade no longer resolves the batch twice.** It used to
+override `publish_draft_games` entirely, resolve the targets itself, and then
+call `super()`, which resolved them again — two chances to disagree, and the
+validation itself leaks on a wider set (`require_game_league_id` raises
+`game_league_ambiguous` / `venue_access_missing` naming a *foreign* Game's id
+and league ids, the disclosure again as an error payload). It now supplies its
+league-ice invariant through `_publish_batch_extra_validation`, a hook that runs
+on the already-locked batch — and runs **first**, exactly where its own
+validation sat before, because that order is the published contract: running the
+participation check ahead of it relabels both reasons as
+`regular_game_missing_league_season`.
 
 **What is deliberately NOT narrowed.** `list_draft_games`' slot-conflict and
 team-double-booking indexes still scan every Game. A foreign Program's game
@@ -792,7 +868,36 @@ fixture that isolates it:
 | filter the review list AFTER building rows | *"a review row was assembled for a draft Game outside the active tuple — the list must be filtered on stored rows BEFORE any payload is built"* |
 | drop the `_draft_targets` filter | *"publish reached Program A's draft games"*, *"discard reached Program A's draft games"*, *"a foreign publish target answered differently from a nonexistent one"*, *"Program A's committed drafts were published or discarded by a Program-B-selected operator"* |
 | leave `published_count` installation-wide | `12 != 6 : the published count included another Program's games` |
-| let a Game with no resolvable Season match on its League alone | *"a draft Game whose Season does not resolve was served to an identified caller"* |
+
+Added in re-review, for the two clauses the owner's exact-head review found
+were asserted by prose and by nothing else:
+
+| mutation | verbatim failure |
+| --- | --- |
+| replace the full parent-graph walk with the reduced `season_id` + `league_id` edge | 16 subtests: *"a draft Game with a parent outside the active tuple was served to the review screen — the WHOLE parent graph decides, not season_id + league_id"* |
+| drop the ActiveContext row lock from `resolve_with_league(lock=True)` | *"the operator's context switch COMPLETED at the first publish_game while the write verb held its transaction — the ActiveContext row is not locked, so the verb can mutate under a tuple that no longer authorizes it"* — 4 of the 5 race tests, the anti-vacuity control correctly still passing |
+| decide the batch OUTSIDE the write transaction | the same assertion, from the publish race |
+
+The full-graph matrix runs **16 cases, each on its own hierarchy** so no case
+can pass or fail for another's reason: foreign / sibling-League / other-Season
+`division_id`; `league_season_id` foreign and with each **end alone** out of
+tuple (the Season end judged under "No League", so only that end can refuse —
+a sibling League's binding differs on both ends at once and would not isolate
+either); foreign `season_id` / `league_id`; foreign and sibling-League home and
+away Team; and a dangling value for every non-null parent. Each asserts the
+Game was visible *before* the corruption, that the rest of its batch stays
+visible after, that publish and discard are byte-identical to a nonexistent
+target, and that the Game is not deleted.
+
+The race class blocks a **real second PostgreSQL connection** performing the
+context switch, and asserts it is still waiting at the moment the verb is about
+to mutate — then that it completes once the verb's transaction ends, which is
+what proves the wait was a lock and not a broken thread. It covers commit (at
+its first Game INSERT), publish, discard by explicit `game_ids`, and discard
+with `all_drafts`. Its fifth test is the anti-vacuity control the other four
+need: with nothing holding the lock the identical switch must finish in under
+two seconds and land, or "still alive after 2s" would pass for a thread that
+could never complete at all.
 
 The null-Program branch has its own fixture for the reason #381 recorded: every
 other principal in the file is a GLOBAL role, which can never resolve a null
