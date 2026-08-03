@@ -285,7 +285,6 @@ class ApiService(_BaseApiService):
             # this override reimplements in full.
             _reviewed_counts = reviewed_existing_counts(
                 proposal["already_scheduled"], draft_ls_id)
-            _meetings = proposal.get("meetings_per_opponent") or 1
             # #328 review round 11 finding 2 -- the checks immediately below
             # only revalidate draft_games/already_scheduled row identity and
             # participation; a team's ELIGIBILITY changing in the narrow gap
@@ -419,16 +418,23 @@ class ApiService(_BaseApiService):
             # several Games. The Game this row named must still be a live
             # Regular fixture for this pairing (membership, replacing the
             # pre-#375 equality against the single id a pairing could
-            # have); AND the pairing must not have gained a Game beyond the
-            # format's own requirement, which a pairing with no draft_games
-            # row of its own would otherwise have nothing checking it. At
-            # N = 1 the pair of conditions is exactly the old equality.
+            # have); AND the pairing must not have GAINED a Game since the
+            # proposal was built, which a pairing with no draft_games row
+            # of its own would otherwise have nothing checking it.
+            #
+            # Same correction as the Season-scoped sibling in service.py:
+            # the baseline is the pairing's own reviewed count carried on
+            # the row, not the format N (which refuses every commit against
+            # a legitimately over-scheduled pairing) and not the number of
+            # proposal rows (which is capped at the requested meetings and
+            # so reports min(K, N) for exactly those pairings). At N = 1
+            # with one existing Game this is exactly the old equality.
             for a in proposal["already_scheduled"]:
                 _as_key = (draft_ls_id, a.get("division_id"),
                            frozenset((a["home_team_id"], a["away_team_id"])))
                 _as_now = _existing_now.get(_as_key, ())
                 if (a["existing_game_id"] not in _as_now
-                        or len(_as_now) > _meetings):
+                        or len(_as_now) > a["existing_game_count"]):
                     raise ConcurrencyConflictError(
                         "This preview is out of date — a game may have "
                         "been added, cancelled, or otherwise changed since "

@@ -2435,6 +2435,94 @@ class SchedulerContract:
         self.assertEqual(proposal["draft_games"], [])
         self.assertEqual(len(proposal["already_scheduled"]), 18)
 
+    def _seed_extra_pairing_games(self, pair_index, count, prefix):
+        """Plant ``count`` additional Regular Games on one round-robin
+        pairing, so it holds MORE Games than a single round robin asks for."""
+        home, away = round_robin_pairings(["t0", "t1", "t2", "t3"])[pair_index]
+        for i in range(count):
+            self.store.add_game(Game(
+                id=f"{prefix}{i}", home_team_id=home, away_team_id=away,
+                start_time=BASE_TIME - timedelta(days=200 + i),
+                end_time=BASE_TIME - timedelta(days=200 + i) + timedelta(hours=1),
+                division_id="div1", season_id="se1", league_id="lg1",
+                league_season_id="ls_lg1_se1"))
+        return frozenset((home, away))
+
+    def test_over_scheduled_pairing_does_not_block_committing_the_others(self):
+        # #382 regression. One pairing legitimately holds THREE Games where
+        # the format asks for one -- a pre-existing longer series, imported
+        # history, or a format later reduced. Nothing has raced. The other
+        # five pairings are still unscheduled and must commit normally.
+        #
+        # The commit gate compared the pairing's live count against the
+        # format N and refused the whole batch as `preview_stale`, which
+        # made an ordinary schedule un-committable for the entire Division.
+        # 36 slots (spare ice) so a refusal cannot be mistaken for "no ice".
+        self._division_fixture(4, 36)
+        pair = self._seed_extra_pairing_games(0, 3, "surplus")
+        proposal = self.api.draft_season_schedule(division_id="div1")
+        # The premise: the surplus pairing really is over-scheduled, and
+        # really is reported as already-scheduled rather than re-proposed.
+        self.assertEqual(len(proposal["already_scheduled"]), 1)
+        self.assertEqual(
+            proposal["already_scheduled"][0]["existing_game_count"], 3)
+        self.assertEqual(len(proposal["draft_games"]), 5)  # 6 pairs - 1 covered
+
+        res = commit_fresh_draft(self.api, "div1")
+        self.assertNotIn("error", res, repr(res))
+        self.assertEqual(len(res["created"]), 5)
+        counts = {}
+        for g in self.store.all_games():
+            key = frozenset((g.home_team_id, g.away_team_id))
+            counts[key] = counts.get(key, 0) + 1
+        # The surplus is left exactly as it was -- not topped up, not pruned.
+        self.assertEqual(counts[pair], 3)
+        self.assertEqual(sorted(counts.values()), [1, 1, 1, 1, 1, 3])
+
+    def test_division_of_only_over_scheduled_pairings_commits_as_a_no_op(self):
+        # The degenerate shape of the same #382 regression, and the one the
+        # demo seed hits: EVERY pairing is over-scheduled, so the proposal
+        # has no draft_games at all. There is nothing to write and nothing
+        # to race -- the commit must succeed with an empty batch rather
+        # than refuse. A gate that refuses here reports `preview_stale` for
+        # a Division nobody has touched.
+        self._division_fixture(4, 36)
+        for i in range(6):  # all six round-robin pairings
+            self._seed_extra_pairing_games(i, 2, f"surplus{i}_")
+        proposal = self.api.draft_season_schedule(division_id="div1")
+        self.assertEqual(proposal["draft_games"], [])
+        self.assertEqual(len(proposal["already_scheduled"]), 6)
+
+        res = commit_fresh_draft(self.api, "div1")
+        self.assertNotIn("error", res, repr(res))
+        self.assertEqual(res["created"], [])
+        self.assertEqual(len(self.store.all_games()), 12)  # untouched
+
+    def test_pairing_that_gains_a_game_after_the_preview_is_still_refused(self):
+        # The race the count check exists for, and the control that stops
+        # the two tests above from being satisfied by simply deleting the
+        # check. The operator reviewed "this pairing is covered by ONE
+        # Game"; a second one lands before the commit. That is a genuine
+        # lost race and must still be terminal.
+        #
+        # The proposal is frozen (the commit's own regeneration is stubbed
+        # to return it) so the per-row gate is what answers, not the wider
+        # fingerprint compare -- the same isolation idiom as
+        # test_placement_concurrency's already_scheduled race harness.
+        self._division_fixture(4, 36)
+        self._seed_first_pairing_game(id="reviewed1")
+        proposal = self.api.draft_season_schedule(division_id="div1")
+        self.assertEqual(
+            proposal["already_scheduled"][0]["existing_game_count"], 1)
+
+        self._seed_extra_pairing_games(0, 1, "raced")  # the lost race
+        self.api.draft_season_schedule = lambda *a, **k: proposal
+        res = self.api.commit_draft_schedule(
+            division_id="div1",
+            draft_fingerprint=proposal["draft_fingerprint"])
+        self.assertIn("error", res, repr(res))
+        self.assertEqual(res["error"]["details"]["reason"], "preview_stale")
+
     def test_committed_three_meeting_schedule_is_fifteen_games_per_team(self):
         # The worked example carried all the way through the facade and the
         # commit gate to persisted Games -- the end-to-end proof that the

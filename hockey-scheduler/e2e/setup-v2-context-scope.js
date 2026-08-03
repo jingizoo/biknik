@@ -143,11 +143,41 @@ function apiPost(page, url, body) {
 const loginAs = (page, username, password) =>
   apiPost(page, "/api/auth/login", { username, password: password || "demo" });
 
+// ============ RENDER'S OWN FETCH WINDOW, UNDER TEST CONTROL ================
+// /api/demo/overview is render()'s FIRST await. Everything between render()'s
+// synchronous blank of #content and its final paint sits behind it, and on the
+// Records surface that blank is a three-`<div class="skeleton">` rewrite with
+// no `.setup-grid` in it at all -- the window in which this journey read
+// `cards=[]`. On a loopback that window is single-digit milliseconds, which is
+// why the shipped settlement lost the race only 1 time in 40 and why a
+// falsifying mutation against it would otherwise be a coin flip rather than a
+// proof.
+//
+// So it is intercepted once per page and made WIDE for the duration of a
+// context switch. Not one response byte changes: the delay only guarantees
+// that a settlement which returns before the scoped grid is repainted is
+// caught inside the window EVERY time instead of occasionally. A build that
+// waits correctly is unaffected -- it simply waits the extra beat. The knob
+// deliberately lives in the switch helpers rather than inside the wait, so
+// that reverting the WAIT to its shipped card-content-only form leaves the
+// window exactly as wide and the resulting failure is deterministic.
+const RENDER_OVERVIEW_RE = /\/api\/demo\/overview(\?|$)/;
+const SWITCH_RENDER_DELAY_MS = 400;
+let renderWindowDelayMs = 0;
+async function installRenderWindowControl(page) {
+  await page.route(RENDER_OVERVIEW_RE, async (route) => {
+    const delay = renderWindowDelayMs;
+    if (delay > 0) await new Promise((r) => setTimeout(r, delay));
+    try { await route.continue(); } catch (e) { /* page closed mid-delay */ }
+  });
+}
+
 async function newPage(browser, viewport) {
   const context = await browser.newContext({
     viewport: { width: viewport.width, height: viewport.height },
   });
   const page = await context.newPage();
+  await installRenderWindowControl(page);
   const errors = [];
   page.on("pageerror", (e) => errors.push(`[pageerror] ${e.message}`));
   page.on("console", (m) => {
@@ -355,61 +385,250 @@ async function readRecords(page) {
   });
 }
 
-// Wait for the Records grid to settle on an expected card content. The
-// SIGNAL CARD matters: it has to be one whose expected value genuinely
-// CHANGES across the switch being made, or the wait returns immediately
-// against the pre-switch paint and proves nothing.
-//   * League switches use "Teams" (League-bound, and it changes on the
-//     Program axis too).
-//   * Program AND Season switches use "Seasons": under the #367 owner
-//     ruling that card holds exactly the active Season, so it is the one
-//     card guaranteed to differ across both of those switches -- Teams is
-//     PERMANENT Program+League structure and does NOT change when only the
-//     Season changes.
-// On timeout it reports what actually rendered, so a real narrowing
-// regression reads as a precise diff rather than an opaque hang; the same
-// expectation is then re-asserted explicitly below, so a late paint landing
-// wrong content still fails.
-async function settleCard(page, cardTitle, expectedTitles, step) {
-  await page.waitForSelector(".setup-grid", { timeout: 10000 }).catch(() => fail(
-    `[${step}] the Setup Records grid never rendered`));
+// ============ WHAT "THE SWITCH HAS SETTLED" MEANS ON THIS SURFACE =========
+// This helper used to BE the settlement condition, and that was the defect
+// behind the #385 shard-2 failure: `[phone/A+none] no "Programs" Setup
+// Records card rendered ... (saw [])`. It is now only a CONTENT ASSERTION,
+// run after the settlement below has already been reached.
+//
+// The failure reproduces on merged `main` exactly as often as on the #385
+// head -- 1/40 serial idle runs of the failing step pair at 390px on each,
+// 3/30 and 2/30 under full-CPU load -- so it was never the scheduler
+// correction. An instrumented trace recording every write to #content's own
+// children, stamped with the contextRevision that owned it, says which layer
+// is wrong, and it is NOT the application:
+//
+//   render:ENTER             rev=49 intent=false grid=12  pass=24 revAtEnter=49
+//   render:after-sync-blank  rev=49 grid=-1 kids=3   supersededAtBlank=false
+//   #content childList       rev=49 added=3 removed=6      <- LOADING SKELETON
+//   SETTLE-RETURNED (old)    rev=49 grid=-1                <- journey proceeds
+//   TEST: readRecords        rev=49 grid=-1                <- cards=[]
+//   #content childList       rev=49 added=6 removed=3 grid=12
+//   render:RESOLVED          rev=49 supersededAtExit=false
+//
+// The empty grid is the CURRENT render's own skeleton blank (app.js's
+// `c.innerHTML = <div class="skeleton">x3`), owned by the newest
+// contextRevision, superseded neither on entry nor on exit, and repainted by
+// that very same pass into the correct 12-card scoped grid. Across 140
+// instrumented iterations the surface converged on the correct, correctly
+// scoped, non-empty grid EVERY time, including every reproduction. No
+// cancelled or superseded render ever cleared a newer scoped grid: the
+// product invariant holds and app.js needs no change.
+//
+// What was wrong is that this journey settled on CARD CONTENT, and at the
+// failing step that content DOES NOT CHANGE. Step (1) selects Program A (the
+// Teams card becomes the two PROGA teams) and then selects "No League" on a
+// bar that is ALREADY on "No League" (the Teams card stays the two PROGA
+// teams). The comment this replaces named that exact trap -- the signal card
+// "has to be one whose expected value genuinely CHANGES across the switch
+// being made, or the wait returns immediately against the pre-switch paint
+// and proves nothing" -- and the instrumentation caught it firing: the
+// predicate was ALREADY TRUE before the change event was dispatched in 140 of
+// 140 iterations. The journey returned on the pre-switch paint and then read
+// the DOM inside the repaint window of the switch it had just asked for.
+//
+// A signal card cannot be repaired by picking a different card, because a
+// League switch from "No League" to "No League" legitimately changes NO card
+// at all. The settlement has to come from the switch LIFECYCLE instead -- see
+// waitForScopedRecordsPaint() below -- and once it does, this check must stop
+// being a WAIT.
+//
+// That is the second half of the same lesson, and it was worth a mutation to
+// learn: with the lifecycle wait in place but this helper still polling until
+// the content became right, deleting the settlement's own "and the paint left
+// a .setup-grid standing" clause did NOT fail the journey (3 runs, 3 passes).
+// The settlement was allowed to return on render()'s loading skeleton and this
+// poll simply sat there until the real grid arrived and rescued it. A wait
+// that recovers from an early settlement also HIDES one -- it made the
+// settlement's correctness depend on its callers instead of on itself, which
+// is the same coupling that produced the original defect.
+//
+// So the per-card expectations are now ASSERTED against the settled surface,
+// in a single read, with no polling. render() writes the whole Records grid in
+// one `c.innerHTML = renderSetup(...)`, so at the settled moment every card is
+// already final and there is nothing legitimate left to wait for; anything
+// still missing is a real narrowing regression and says so immediately.
+async function assertCardTitles(page, cardTitle, expectedTitles, step) {
   const want = [...expectedTitles].sort();
-  await page.waitForFunction(([title, expected]) => {
-    const card = Array.from(document.querySelectorAll(".setup-grid .setup-card"))
+  const got = await page.evaluate((title) => {
+    const grid = document.querySelector(".setup-grid");
+    if (!grid) return { grid: false };
+    const card = Array.from(grid.querySelectorAll(".setup-card"))
       .find((c) => (c.querySelector(".sc-title")?.textContent || "").trim() === title);
-    if (!card) return false;
-    const got = Array.from(card.querySelectorAll(".setup-card-body .li-title"))
-      .map((el) => el.textContent.trim()).sort();
-    return got.length === expected.length && got.every((v, i) => v === expected[i]);
-  }, [cardTitle, want], { timeout: 10000 }).catch(async () => {
-    const { cards } = await readRecords(page);
-    fail(`[${step}] the Records "${cardTitle}" card never settled on `
-      + `${JSON.stringify(want)} -- rendered `
-      + `${JSON.stringify((cards[cardTitle] || {}).titles)}`);
+    if (!card) {
+      return { grid: true, card: false, cards: Array.from(grid.querySelectorAll(".sc-title"))
+        .map((el) => el.textContent.trim()) };
+    }
+    return { grid: true, card: true,
+      titles: Array.from(card.querySelectorAll(".setup-card-body .li-title"))
+        .map((el) => el.textContent.trim()) };
+  }, cardTitle);
+  if (!got.grid) {
+    fail(`[${step}] the switch settled on a surface with NO Setup Records grid `
+      + `on it -- the settlement condition returned before the scoped grid was `
+      + `painted`);
+  }
+  if (!got.card) {
+    fail(`[${step}] no "${cardTitle}" card on the settled Setup Records grid -- `
+      + `saw ${JSON.stringify(got.cards)}`);
+  }
+  const sorted = [...got.titles].sort();
+  if (sorted.length !== want.length || !sorted.every((v, i) => v === want[i])) {
+    fail(`[${step}] the Records "${cardTitle}" card settled on `
+      + `${JSON.stringify(sorted)} -- expected ${JSON.stringify(want)}`);
+  }
+}
+
+const assertTeamsCard = (page, expectedTeams, step) =>
+  assertCardTitles(page, "Teams", expectedTeams, step);
+
+// What the SERVER persisted, never what the <select> is displaying. The
+// shipped League helper polled `#ctx-league-select.value`, which Playwright
+// has already assigned before the change event it triggers even fires -- so
+// that wait settled on the journey's own keystroke and observed nothing about
+// the switch.
+const confirmedTuple = (page) => page.evaluate(() => {
+  const s = (contextOptions && contextOptions.selected) || {};
+  return { programId: s.program_id || null, seasonId: s.season_id || null,
+           leagueId: s.league_id || null };
+});
+
+// THE SETTLEMENT ITSELF -- the discipline setup-card-write-identity.js
+// established for this family of bug, plus the one conjunct the Records
+// surface needs and the Setup hub does not. Three things must ALL be true,
+// and the paint must be OBSERVED rather than timed:
+//
+//   (1) THE CONFIRMED TUPLE -- program, season AND league, from
+//       contextOptions.selected. All three: a League switch moves only the
+//       third axis, so a wait that reads the first two is not waiting for it
+//       at all.
+//   (2) contextSwitchIntentPending === false -- the action-control withdrawal
+//       released, i.e. a reconciliation genuinely happened rather than a POST
+//       echo having landed.
+//   (3) A #content DIRECT-CHILDREN paint (`subtree: false`) delivered while
+//       (1) and (2) already hold, AND LEAVING A `.setup-grid` STANDING.
+//
+// The `.setup-grid` clause in (3) is what the hub journey does not need and
+// this one cannot do without. render()'s retain-the-cards pass is conditioned
+// on `setupView === "hub"`, so on Records render() takes the other branch and
+// blanks #content to skeletons -- and it does that AFTER sendContextSwitch()
+// has already confirmed the tuple and released the withdrawal. That blank is
+// itself a direct-children rewrite satisfying (1), (2) and every observer
+// shape the hub journey uses; it is precisely the paint this journey used to
+// read `cards=[]` from. Only a paint that left a `.setup-grid` behind is the
+// settled scoped surface.
+//
+// The observer is armed BEFORE the change event so a fast paint cannot land
+// between two polls of the wait.
+//
+// FALSIFIABILITY -- every clause here was proven to fail on its own, with the
+// window widener in place so each result is deterministic rather than a race
+// re-run until it obliges:
+//   * settlement replaced by the shipped card-content-only form (window
+//     unchanged): 3/3 FAIL, `[desktop/A+none] no "Programs" Setup Records card
+//     rendered ... (saw [])` -- the reported CI line, verbatim. With the
+//     widener ALSO neutralized it reverts to the intermittent original: 5 runs,
+//     2 passes and 3 failures, at `[phone/A+none]` -- the reported viewport and
+//     step, which is what ties this journey's own defect to the shard failure.
+//   * (3)'s `.setup-grid` clause deleted from observer and poll: 3/3 FAIL,
+//     "the switch settled on a surface with NO Setup Records grid on it".
+//   * (1)'s League axis inverted in the poll: 2/2 FAIL on the settle timeout
+//     with its diagnostic.
+//   * (2) inverted in the poll: 2/2 FAIL likewise.
+// Note what the last two do and do not show. They prove those conjuncts are
+// live and gating. They are inversions rather than deletions because DELETING
+// (1) or (2) does not break this journey: clause (3) already forces the wait
+// past the skeleton to the final paint, and nothing on the Records surface
+// rewrites #content's own children between the POST echo and that paint. They
+// are kept because they are what makes this wait fail LOUDLY, with the
+// confirmed tuple in the message, when a switch is rejected or coalesced
+// rather than merely slow -- and because a future step that switches twice in
+// a row would need them.
+async function armScopedPaintObserver(page, programId, seasonId, leagueId) {
+  await page.evaluate(([p, s, lg]) => {
+    if (window.__scopeObs) window.__scopeObs.disconnect();
+    window.__scopePainted = false;
+    const c = document.getElementById("content");
+    window.__scopeObs = new MutationObserver(() => {
+      if (contextSwitchIntentPending) return;
+      const cur = (contextOptions && contextOptions.selected) || {};
+      if (cur.program_id !== p) return;
+      if ((cur.season_id || null) !== s) return;
+      if ((cur.league_id || null) !== lg) return;
+      if (!c.querySelector(".setup-grid")) return;
+      window.__scopePainted = true;
+    });
+    if (c) window.__scopeObs.observe(c, { childList: true, subtree: false });
+  }, [programId, seasonId, leagueId]);
+}
+
+async function waitForScopedRecordsPaint(page, programId, seasonId, leagueId, step) {
+  await page.waitForFunction(([p, s, lg]) => {
+    if (contextSwitchIntentPending) return false;
+    const cur = (contextOptions && contextOptions.selected) || {};
+    if (cur.program_id !== p) return false;
+    if ((cur.season_id || null) !== s) return false;
+    if ((cur.league_id || null) !== lg) return false;
+    // Re-checked at poll time, not only at delivery: the grid this journey is
+    // about to read has to be standing NOW, not merely to have existed once.
+    if (!document.querySelector(".setup-grid")) return false;
+    return window.__scopePainted === true;
+  }, [programId, seasonId, leagueId], { timeout: 20000 }).catch(async () => {
+    const why = await page.evaluate(() => ({
+      intentPending: !!contextSwitchIntentPending,
+      selected: (contextOptions && contextOptions.selected) || null,
+      paintedAfterRelease: !!window.__scopePainted,
+      gridCards: document.querySelectorAll(".setup-grid .setup-card").length,
+      contentChildren: Array.from(document.getElementById("content").children)
+        .map((el) => el.className || el.tagName),
+    })).catch(() => null);
+    fail(`[${step}] the context switch to ${programId}/${seasonId}/`
+      + `${leagueId || "(No League)"} never SETTLED -- the confirmed tuple, the `
+      + `release of the action-control withdrawal, and a #content repaint after `
+      + `both that left a .setup-grid standing are all required before this `
+      + `surface may be read: ${JSON.stringify(why)}`);
+  });
+  await page.evaluate(() => {
+    if (window.__scopeObs) window.__scopeObs.disconnect();
+    window.__scopeObs = null;
   });
 }
 
-const settleRecords = (page, expectedTeams, step) =>
-  settleCard(page, "Teams", expectedTeams, step);
-
 async function selectProgram(page, programId, seasonId, seasonName, expected, step) {
-  await page.selectOption("#ctx-select", `${programId}|${seasonId}`);
-  await settleCard(page, "Seasons", [seasonName], step);
-  await settleRecords(page, expected.teams, step);
+  const cur = await confirmedTuple(page);
+  // #ctx-select's own onchange CARRIES the active League forward across a
+  // same-Program Season change and DROPS it on a Program change (app.js:
+  // `const carryLeague = p === sel.program_id ? (sel.league_id || null) : null`).
+  // Mirrored here so the tuple this waits for is the one the real control
+  // actually asks the server for, rather than an assumption about which
+  // Leagues this journey happens to have selected by now.
+  const leagueId = programId === cur.programId ? cur.leagueId : null;
+  renderWindowDelayMs = SWITCH_RENDER_DELAY_MS;
+  try {
+    await armScopedPaintObserver(page, programId, seasonId, leagueId);
+    await page.selectOption("#ctx-select", `${programId}|${seasonId}`);
+    await waitForScopedRecordsPaint(page, programId, seasonId, leagueId, step);
+  } finally {
+    renderWindowDelayMs = 0;
+  }
+  await assertCardTitles(page, "Seasons", [seasonName], step);
+  await assertTeamsCard(page, expected.teams, step);
 }
 
 async function selectLeague(page, leagueId, expected, step) {
-  await page.selectOption("#ctx-league-select", leagueId || "");
-  // The switch is fire-and-forget from the <select>'s own onchange (the #345
-  // contextRevision idiom), so poll the control's settled value rather than
-  // sleeping a guessed interval -- same discipline league-context-bar.js and
-  // league-filtered-data.js use.
-  await page.waitForFunction((v) => {
-    const el = document.getElementById("ctx-league-select");
-    return el && el.value === (v || "");
-  }, leagueId, { timeout: 10000 }).catch(() => fail(
-    `[${step}] the League select never settled on "${leagueId || "(No League)"}"`));
-  await settleRecords(page, expected.teams, step);
+  // #ctx-league-select's own onchange CARRIES the active Program and Season
+  // forward and moves only the League axis.
+  const cur = await confirmedTuple(page);
+  renderWindowDelayMs = SWITCH_RENDER_DELAY_MS;
+  try {
+    await armScopedPaintObserver(page, cur.programId, cur.seasonId, leagueId || null);
+    await page.selectOption("#ctx-league-select", leagueId || "");
+    await waitForScopedRecordsPaint(page, cur.programId, cur.seasonId,
+                                    leagueId || null, step);
+  } finally {
+    renderWindowDelayMs = 0;
+  }
+  await assertTeamsCard(page, expected.teams, step);
 }
 
 // The full Setup Records assertion for one persisted context.
