@@ -261,7 +261,8 @@ class ContextService:
             return None
         return self.store.get_league(league_id)
 
-    def resolve_with_league(self, user_id: Optional[str], role, scope):
+    def resolve_with_league(self, user_id: Optional[str], role, scope,
+                            lock=False):
         """``(program, season, league)`` — the League-aware form of
         :meth:`resolve`, with identical Program/Season semantics.
 
@@ -271,8 +272,21 @@ class ContextService:
         serializable snapshot and DETACHED before the lock releases, so a
         concurrent unbind/delete/revocation cannot make the triple internally
         contradict itself.
+
+        ``lock=True`` additionally takes the caller's ActiveContext ROW LOCK
+        (#386) and holds it for the rest of the SURROUNDING transaction, which
+        the caller must own. A snapshot alone answers "what was the tuple when
+        I read it"; the lock is what makes the answer still true when a write
+        authorized by it lands. `set_active_context` takes the same lock before
+        writing, so a concurrent context switch either orders wholly before
+        this read (and is seen) or waits until the authorized write has
+        committed. Every MUTATING active-tuple gate uses this form; a read-only
+        gate does not need it and must not take it, or ordinary reads would
+        serialize against each other for nothing.
         """
         def work():
+            if lock:
+                self.store.get_active_context_for_update(user_id)
             program, season = self._resolve_locked(user_id, role, scope)
             league = self._resolve_league_locked(
                 user_id, role, scope, program, season)
