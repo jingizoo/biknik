@@ -33,7 +33,10 @@ from hockey_scheduler.domain import (
     Team,
     Venue,
 )
-from hockey_scheduler.domain.errors import ScheduleConflictError
+from hockey_scheduler.domain.errors import (
+    ScheduleConflictError,
+    ValidationError,
+)
 from hockey_scheduler.store import InMemoryStore, SqlStore
 from hockey_scheduler.store.sql_store import _load_migrations
 from hockey_scheduler.web import server as srv
@@ -412,6 +415,61 @@ class _ScenarioContract:
             ).fetchone()
             counter_after = counter_row["value"] if counter_row else None
         self.assertEqual(counter_after, counter_before)
+
+    def test_a_failure_after_the_draft_gate_still_rolls_the_games_back(self):
+        """The OUTER transaction is one unit with the inner draft-commit gate.
+
+        Every other rollback test here fails INSIDE
+        `_commit_draft_schedule_attempt`, whose own `store.transaction()` would
+        undo the Games on its own — so replacing
+        `_commit_schedule_scenario_attempt`'s transaction with a no-op context
+        manager broke NOTHING. That is precisely the clause the design rests
+        on: the scenario's row lock, the re-authorization decided under it, the
+        staleness guard, every Game INSERT and slot allocation, and BOTH audit
+        rows have to be one all-or-nothing unit. Without the outer transaction
+        the inner gate simply commits and the lock is released the moment it is
+        taken.
+
+        The only way to see the difference is to fail AFTER the inner gate has
+        returned successfully, which is exactly where the
+        `schedule_scenario_committed` audit row is written.
+        """
+        scenario = self._scenario("Rolled back from outside")
+        original = self.api.setup._audit
+
+        def fail_on_the_scenario_audit(action, *args, **kwargs):
+            if action == "schedule_scenario_committed":
+                raise ValidationError("Forced post-commit refusal.",
+                                      {"reason": "forced_outer_refusal"})
+            return original(action, *args, **kwargs)
+
+        self.api.setup._audit = fail_on_the_scenario_audit
+        try:
+            result = self.api.commit_schedule_scenario(
+                scenario["scenario_id"], actor_id="operator")
+        finally:
+            self.api.setup._audit = original
+
+        self.assertEqual(result["error"]["details"]["reason"],
+                         "forced_outer_refusal", result)
+        self.assertEqual(
+            self.store.all_games(), [],
+            "the draft gate's Games survived a failure in the enclosing unit "
+            "-- the scenario commit is not one transaction with it")
+        self.assertTrue(all(
+            slot.status == IceSlotStatus.AVAILABLE
+            for slot in self.store.all_ice_slots()))
+        # The INNER gate's own audit row must be gone too, not just the outer
+        # one that raised: it was written before the failure, in the same unit.
+        self.assertFalse(any(
+            audit.action in ("draft_schedule_committed",
+                             "schedule_scenario_committed")
+            for audit in self.store.all_setup_audit()))
+        # The control: with the audit left alone the identical commit lands.
+        committed = self.api.commit_schedule_scenario(
+            scenario["scenario_id"], actor_id="operator")
+        self.assertNotIn("error", committed, committed)
+        self.assertEqual(len(committed["created"]), 6)
 
     def test_success_creates_unpublished_drafts_and_never_mutates_scenario(self):
         scenario = self._scenario()
