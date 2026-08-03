@@ -1759,6 +1759,49 @@ class SqlStore:
         return cur.rowcount if cur.rowcount is not None else 0
 
     # -- per-user active Program/Season context (#159) ---------------------
+    #
+    # The lock keyspace for the per-user context mutex (#386 re-review). An
+    # arbitrary but STABLE namespace, so these advisory locks can never
+    # collide with another feature's.
+    _ACTIVE_CONTEXT_LOCK_NAMESPACE = 0x4143      # "AC"
+
+    def _lock_active_context_mutex(self, user_id):
+        """Take the per-user ActiveContext MUTEX for this transaction (#386).
+
+        ``SELECT ... FOR UPDATE`` on ``user_active_context`` is not enough on
+        its own, and the reason is exactly the owner's: **an absent-row read is
+        not a lock**. A user who has never saved a selection has no row, so the
+        authorizing transaction's ``FOR UPDATE`` locks nothing, and all it holds
+        against a concurrent FIRST ``INSERT`` is a single read->write
+        anti-dependency — which SERIALIZABLE is not obliged to abort. A brand
+        new operator could therefore authorize from fallback tuple A, make
+        their first saved selection B concurrently, and have BOTH the B
+        selection and the A Game writes commit.
+
+        A PostgreSQL transaction-scoped ADVISORY lock has the one property a
+        row lock cannot have here: it exists before the row does. It is keyed
+        on the user id, needs nothing to be present, and is released
+        automatically at commit or rollback, so no cleanup path can leak it.
+        Both sides take it — the mutating authorization and
+        ``set_active_context`` — which is what makes it a mutex rather than a
+        hint.
+
+        ``hashtext`` collisions are possible and harmless: two unrelated users
+        would merely serialize against each other. Correctness never depends on
+        the key being unique, only on it being the SAME for one user.
+
+        A falsy ``user_id`` takes nothing. Such a caller (the identity-less
+        X-Demo-Role fallback) can never own a row — ``set_active_context``
+        refuses without a user id — so there is no first insert to race.
+
+        SQLite is a documented no-op: ``transaction()`` holds the process-wide
+        lock for the whole block, which is strictly stronger.
+        """
+        if not user_id or self.backend != "postgres":
+            return
+        self._exec("SELECT pg_advisory_xact_lock(?, hashtext(?))",
+                   (self._ACTIVE_CONTEXT_LOCK_NAMESPACE, user_id))
+
     def get_active_context(self, user_id):
         return self._get(ActiveContext, user_id)
 
@@ -1786,13 +1829,16 @@ class SqlStore:
 
         The row may not exist (a caller running on `_fallback`, never having
         selected anything). ``FOR UPDATE`` then locks nothing — there is no row
-        to lock and no lock the writer could block on either — and the ordering
-        comes instead from the SERIALIZABLE isolation the authorizing
-        transaction runs at: the read-write anti-dependency against a
-        concurrent first INSERT is detected and one side is retried. Both
-        halves are needed — the row lock for the ordinary case, the isolation
-        for the very first write.
+        to lock and no lock the writer could block on either. An earlier
+        revision leaned on SERIALIZABLE's read->write anti-dependency to order
+        that case and the owner's review rejected it: **an absent-row read is
+        not a lock**, and one anti-dependency does not oblige PostgreSQL to
+        abort either transaction, so a brand new operator could authorize from
+        fallback tuple A, make their first saved selection B concurrently, and
+        commit BOTH. `_lock_active_context_mutex` above is what actually orders
+        the first insert; the row lock remains for the ordinary case.
         """
+        self._lock_active_context_mutex(user_id)
         return self._get_for_update(ActiveContext, user_id)
 
     def set_active_context(self, ctx):
@@ -1811,14 +1857,18 @@ class SqlStore:
         previously-saved League with NULL rather than leaving a stale one bound
         to a context it may not belong to."""
         with self.transaction():
-            # #386 — take the SAME row lock the authorizing readers take
-            # (`get_active_context_for_update`) BEFORE writing, so the two
-            # order against each other on the database rather than merely
-            # observing individually-consistent snapshots. Without it a
-            # context switch could commit between an authorization and the
-            # write it authorized. On a first write there is no row to lock;
-            # the ON CONFLICT below and the reader's SERIALIZABLE isolation
-            # carry the ordering for that case.
+            # #386 — take the SAME per-user mutex the authorizing readers
+            # take, so a context switch and a write authorized against the
+            # tuple it switches away from order against each other on the
+            # database. This is the half that covers the caller's very FIRST
+            # selection, where there is no row for either side to lock: the
+            # advisory lock exists before the row does. An explicit row lock is
+            # deliberately NOT taken here — `ON CONFLICT (id) DO UPDATE`
+            # acquires it itself, and adding a second `user_active_context`
+            # statement ahead of the INSERT silently moved the barrier in
+            # `test_active_context.ContextConcurrencyPgTest` off the write it
+            # instruments.
+            self._lock_active_context_mutex(ctx.id)
             self._exec(
                 "INSERT INTO user_active_context "
                 "(id, program_id, season_id, updated_at, league_id) "
