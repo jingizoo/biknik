@@ -658,6 +658,147 @@ The rest of the scenario record's own contract — immutability, staleness and t
 commit lock plan — is documented in
 [scheduler.md](scheduler.md#named-immutable-scenarios-378).
 
+### The draft surface underneath it (#386)
+
+The same blocker again, on the endpoint the scenario routes are a wrapper
+around. `draft_season_schedule` took **no principal at all** — no `user_id`, no
+`role`, no `scope` — and `POST /api/scheduler/draft` passed none, so it was
+authorized by the `MANAGE_SCHEDULE` capability and by nothing else. Both roles
+that hold that capability are `_GLOBAL_ROLES`, so a League Admin (confirmed in
+the #381 review) or an Arena Manager whose active context was Program B could
+post Program A's identifiers and receive **A's whole proposal — every pairing,
+both team names per pairing, and the ice slot each game would occupy**.
+
+That is not a latent gap, it is a live bypass of the section above: a caller
+refused a foreign *scenario* could ask the draft endpoint for the same
+Program's proposal and read the team names straight out of it. Binding the
+wrapper without binding what it wraps was never going to hold.
+
+The gate is `ApiService._authorize_schedule_target`, and it is the #381
+machinery verbatim: `resolve_with_league` → the requested ids resolved by
+`resolve_scenario_scope` into a real `(Program, Season, League)` →
+`_setup_target_edge_allows` on that **whole edge**, judged through
+`resolve_scenario_scope`'s `authorize=` callback so it runs at the earliest
+point each request shape knows its edge. Both near-miss corners refuse, a
+Program-only context fails closed against every Division of its own Program,
+and an explicit **No League** stays the Program + active-Season union it is
+everywhere else.
+
+**Two independent closures, not one restated twice.** Ordering the callback
+covers the ladder the *generator* itself climbs
+(`require_league_belongs_to_season` answers `league_missing` for a guessed
+League and `league_season_mismatch` for a real-but-unbound one, both before the
+Division lookup can answer `division_missing`). Flattening every refusal
+reached **before** the edge was known covers the rungs no callback placement
+can get in front of — a Division whose own LeagueSeason/Season/League row is
+missing, a Season and League resolving into two different Programs, a Season
+whose Program row is gone. Each of those is a fact about rows the caller may
+not see. Both are kept and both are mutation-proven, because "authorize
+earlier" and "say less" fail in different directions.
+
+**Inside the caller's own tuple nothing changed.** Once the edge has passed,
+this gate steps aside and the generator raises its own precise diagnostics
+(`Division {id} not found.`, `League belongs to a different season.`)
+unaltered. `role is None` is ungated and takes no context read at all —
+including `create_schedule_scenario`'s own nested generation, which has already
+authorized the identical edge and must not re-resolve inside its open
+`SERIALIZABLE` transaction.
+
+**One refusal helper for both entry points.** `_schedule_scope_not_found`
+(renamed from `_scenario_scope_not_found`) now serves the scenario CREATE and
+the draft generate/commit alike. Two wordings would let a caller play one route
+against the other: refused by one and refused *differently* by the other is
+itself a signal about which id was real.
+
+#### The sibling entry points
+
+The audit the blocker asked for found the same omission on every other
+scheduler-facing method, and each is bound here:
+
+| entry point | route | omission | now |
+| --- | --- | --- | --- |
+| `draft_season_schedule` | `POST /api/scheduler/draft` | no principal; caller-supplied target | active-tuple edge check before generation |
+| `commit_draft_schedule` | `POST /api/scheduler/commit` | no principal; the IDENTICAL target, behind a verb that WRITES | the same gate, twice: preflight, then re-authorized under the write locks |
+| `list_draft_games` | `GET /api/scheduler/drafts` | no principal; every draft Game in the installation, both team names, Division, Rink, time | rows filtered before any review row is built; `published_count` scoped too |
+| `publish_draft_games` | `POST /api/scheduler/drafts/publish` | no principal; `game_ids` from the body, `all` = the installation | targets narrowed to the tuple first, then the selection applied |
+| `discard_draft_games` | `POST /api/scheduler/drafts/discard` | as above, and it DELETES | as above |
+| `create/list/get/commit_schedule_scenario` | `/api/scheduler/scenarios*` | — | already bound by #381 |
+
+**The commit is checked twice, and the first check has to be first.** The
+preflight runs before `preview_required` / `preview_stale`, because the
+fingerprint gate is itself an oracle otherwise: "your preview is out of date"
+confirms the hierarchy exists where a guessed id answers not-found. The second
+check runs after the Program/Team/Rink/Season locks and before the first Game
+INSERT, in the same transaction — reading a preview is not authority to commit
+it minutes later, and a context switch landing in the gap between the preflight
+and the locks is exactly the check/use gap #372 named. An identified caller
+therefore opens that transaction `SERIALIZABLE`, since `ContextService._snapshot`
+asks for it and a nested join may not raise the open transaction's isolation.
+
+**Both copies of the commit body carry it.** `api/service.py`'s
+`_commit_draft_schedule_attempt` is SHADOWED at runtime by
+`api/league_scoped_service.py`'s override (MRO: hierarchy_import_service →
+league_scoped_service → service). Only the override actually executes, so the
+mutations below were applied there; the base copy carries the identical binding
+so the two cannot drift.
+
+**A draft Game's edge is `(its Season's Program, its Season, its `league_id`)`.**
+`Game.league_id` is the canonical competition League, the axis `Team.league_id`
+names — *not* the legacy Program id `Venue.league_id` stores. A Game reaches its
+Program only through its Season, so a row with no resolvable Season has no edge
+at all and is omitted for an identified caller: a dangling chain is never the
+permissive branch. `role is None` still sees the whole installation.
+
+**What is deliberately NOT narrowed.** `list_draft_games`' slot-conflict and
+team-double-booking indexes still scan every Game. A foreign Program's game
+genuinely occupying this Program's shared arena slot IS a real conflict for the
+in-scope draft, and hiding it would let the review screen certify a batch that
+cannot publish. Only a boolean escapes into the payload.
+
+Regression: `backend/tests/test_draft_context_scope.py`, across
+Memory/SQLite/PostgreSQL at the service boundary and over authenticated HTTP.
+Two Programs on the same shape #381's fixture uses, Program A carrying both
+near-miss corners, each corner independently schedulable *and separately
+asserted to be* — so a refusal can never be confused with an empty proposal.
+Byte-identity is compared on **raw HTTP response bytes and status**, never on
+parsed JSON: two payloads can parse equal and still differ in key order, in a
+field one omits, or in the status line.
+
+**The #380-facing clause.** #380 (bounded schedule explanations) is not merged,
+so its candidate-evidence fields cannot be exercised. What is pinned instead is
+the general property they will have to obey, written so it keeps holding when
+they land: a refused response names **no** team, slot, rink, venue, blackout
+date or candidate time of the target hierarchy, anywhere in its bytes. The
+search is on identifier boundaries rather than bare substrings (`team_1` would
+otherwise match `team_10`), and it deliberately still catches an id
+interpolated into a message, which an exact-scalar comparison over parsed JSON
+would miss.
+
+Mutation-proven, one falsifying mutation per independent clause, each with the
+fixture that isolates it:
+
+| mutation | verbatim failure |
+| --- | --- |
+| drop the gate call from `draft_season_schedule` | *"a admin active in Program B received Program A's proposal (division shape)"* with the whole payload — 74 failures across both roles, both shapes and every backend |
+| authorize on the PROGRAM alone (three axes collapsed to one) | *"a league_admin drafted the different League, same Season corner while another tuple was selected"*, *"…different Season, same Program…"* (both roles), *"a Program-only context drafted a Season-bound Division of its own Program"*, *"\"No League\" relaxed the SEASON ceiling"* — and the foreign-Program clause stays GREEN, which is the isolation |
+| judge the edge only on the RESOLVED hierarchy **and** let the ladder's own refusals through | *"a junk division_id alongside a FOREIGN season_id + league_id answered differently from a guessed pair — the refusal tells an unauthorized caller whether that LeagueSeason is real"*, with `'…"division_missing"…' != '…"league_season_missing"…'` and the same split over raw HTTP bytes |
+| drop only the `authorize=` callback (keep the flattening) | `'The selected League is not linked to the selected Season.' != 'Division division_2 not found.'` — the in-tuple caller loses the diagnostic it is entitled to |
+| split the refusal into "forbidden" vs "missing" | `'draft_scope_forbidden' != 'division_missing'`, `403 != 404`, and the raw-bytes comparison failing on every backend and over HTTP |
+| refuse only AFTER generating, attaching the candidates to the refusal | *"the refused draft response named foreign identifiers ['2026-09-07T18:00:00+00:00', …, 'A1a Team 0', …, 'Rink A', 'division_7', 'league_4', 'rink_4', 'season_2', 'slot_58', …, 'team_16']"* — the #380 clause, and byte-identity with it |
+| gate the identity-less path too (`role is None` no longer returns early) | *"'error' unexpectedly found in {'error': {… 'division_missing'}}"* on the internal/seed callers, plus `'details' unexpectedly found in {…}` where the legacy wording must stay bare |
+| drop the principal from the commit PREFLIGHT | *"a foreign COMMIT target answered differently from a nonexistent one (no fingerprint) — the fingerprint gate ran before the tuple gate"* (and for a real and a guessed fingerprint), `400 preview_required` vs `404` over HTTP |
+| drop the commit's under-lock RE-AUTHORIZATION | *"a draft was COMMITTED after the operator's context moved to Program B between the preflight and the write locks"*, with the six created Games in the failure message |
+| drop the `list_draft_games` filter | *"a league_admin active in Program B saw Program A's draft games"*, *"a admin active in Program B listed Program A's draft games"*, and the leaked-identifier list |
+| filter the review list AFTER building rows | *"a review row was assembled for a draft Game outside the active tuple — the list must be filtered on stored rows BEFORE any payload is built"* |
+| drop the `_draft_targets` filter | *"publish reached Program A's draft games"*, *"discard reached Program A's draft games"*, *"a foreign publish target answered differently from a nonexistent one"*, *"Program A's committed drafts were published or discarded by a Program-B-selected operator"* |
+| leave `published_count` installation-wide | `12 != 6 : the published count included another Program's games` |
+| let a Game with no resolvable Season match on its League alone | *"a draft Game whose Season does not resolve was served to an identified caller"* |
+
+The null-Program branch has its own fixture for the reason #381 recorded: every
+other principal in the file is a GLOBAL role, which can never resolve a null
+Program, so *"a principal authorized for NO Program drafted a schedule"* is only
+reachable through an unbound scoped identity.
+
 ## The grant-only facility contract (venue sharing)
 
 The ceiling governs the **competition** tree — Seasons, Leagues, Divisions,
@@ -842,6 +983,11 @@ real, reproducible mixed-grid defect, not a theoretical one — it is what
   authenticated HTTP, with the two-Program matrix, both near-miss corners, the
   foreign-vs-nonexistent byte comparison, the switch-between-create-and-commit
   case, and the positive control every negative is measured against.
+- `tests/test_draft_context_scope.py` — the draft generate / commit / review
+  boundary underneath it (#386), same backends and the same authenticated HTTP
+  matrix, with the raw-response-byte comparison, the ladder oracle, the
+  under-lock commit re-authorization, and the "a refusal names nothing of the
+  target hierarchy" clause #380's richer evidence will inherit.
 - `e2e/league-filtered-data.js`, `setup-v2-context-scope.js`,
   `dashboard-season-ceiling.js` — the browser layer at desktop and 390×844,
   including two delayed-response races proving the newest tuple always wins

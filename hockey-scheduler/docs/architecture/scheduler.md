@@ -263,6 +263,32 @@ league-ice invariant) — the override fully reimplements the commit body
 rather than delegating to `super()`, so any invariant the commit must
 enforce has to be added to **both**.
 
+### Who may draft, commit, review, publish and discard (#386)
+
+Orthogonal to everything else in this file, and answered before any of it: all
+five entry points above take the caller's `(user_id, role, scope)` principal
+and are bound to that caller's persisted active `(Program, Season, League)`
+tuple. `MANAGE_SCHEDULE` says the caller may operate *some* schedule; only the
+active tuple says *which*. The rule, the ordering it depends on, the
+sibling-endpoint audit table and the mutation matrix live in
+[active-context-scoping.md](active-context-scoping.md#the-draft-surface-underneath-it-386).
+
+Three consequences that belong here rather than there, because they touch this
+file's own machinery:
+
+- the commit's tuple check runs **twice** — once before the
+  `preview_required` / `preview_stale` gate below (so the fingerprint gate is
+  not itself an existence oracle) and once after the
+  Program→Team→Rink→Season locks, before the first Game INSERT, in the same
+  transaction;
+- an **identified** commit therefore opens that transaction `SERIALIZABLE`,
+  because the context resolution nested inside it asks for that level and a
+  nested join may not raise the open transaction's isolation. `role is None`
+  keeps the previous default level byte-for-byte;
+- as with every other commit invariant, the binding is in **both** copies of
+  the commit body — and, as the section header above warns, only the
+  league-scoped override actually runs.
+
 ## Concurrency: the commit-time recheck
 
 A committed draft's proposal is generated *before* its transaction opens, so

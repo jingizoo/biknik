@@ -2618,6 +2618,28 @@ class SchedulerHttpTest(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read() or b"{}")
 
+    def _select_division_context(self, opener, division_id):
+        """Select the active tuple the draft routes are now BOUND to (#386).
+
+        This class shares one server and one store across its test methods,
+        and `_build_committable_division` deliberately leaves the signed-in
+        admin's persisted context pointing at the Program IT built. Since
+        `POST /api/scheduler/draft` resolves the principal server-side and
+        refuses any hierarchy outside the caller's active tuple, a test that
+        drafts `all_divisions()[0]` after one of those ran is asking for
+        another Program's proposal — exactly the disclosure #386 closes. So
+        the context is selected explicitly rather than inherited: switching
+        Program is the context bar's job, not the scheduler's.
+        """
+        store = srv.STATE.api.store
+        ls = store.get_league_season(
+            store.get_division(division_id).league_season_id)
+        season = store.get_season(ls.season_id)
+        status, body = self._req(opener, "POST", "/api/context", {
+            "program_id": season.program_id, "season_id": season.id})
+        self.assertEqual(status, 200, repr(body))
+        return ls
+
     def test_non_operator_cannot_draft(self):
         div = srv.STATE.api.store.all_divisions()[0].id
         for who in ("coach", "player", "viewer"):
@@ -2631,6 +2653,7 @@ class SchedulerHttpTest(unittest.TestCase):
         div = srv.STATE.api.store.all_divisions()[0].id
         c = self._client()
         self._req(c, "POST", "/api/auth/login", {"username": "admin", "password": "demo"})
+        self._select_division_context(c, div)
         status, body = self._req(c, "POST", "/api/scheduler/draft",
                                  {"division_id": div})
         self.assertEqual(status, 200)
@@ -2653,6 +2676,7 @@ class SchedulerHttpTest(unittest.TestCase):
         league_id = ls.league_id
         c = self._client()
         self._req(c, "POST", "/api/auth/login", {"username": "admin", "password": "demo"})
+        self._select_division_context(c, div)
         status, body = self._req(c, "POST", "/api/scheduler/draft",
                                  {"season_id": season_id, "league_id": league_id})
         self.assertEqual(status, 200)
@@ -2846,6 +2870,7 @@ class SchedulerHttpTest(unittest.TestCase):
         c = self._client()
         self._req(c, "POST", "/api/auth/login", {"username": "admin", "password": "demo"})
         div = srv.STATE.api.store.all_divisions()[0].id
+        self._select_division_context(c, div)
         for bad in (0, -2, "many", 2.5, True):
             status, body = self._req(c, "POST", "/api/scheduler/draft", {
                 "division_id": div, "meetings_per_opponent": bad})
@@ -2872,10 +2897,16 @@ class SchedulerHttpTest(unittest.TestCase):
         srv.STATE.api.store.add_division(other_division)
         c = self._client()
         self._req(c, "POST", "/api/auth/login", {"username": "admin", "password": "demo"})
+        # In the target's own tuple, so this still proves what it claims: the
+        # cross-League Division is refused by the GENERATOR, not incidentally
+        # by #386's tuple gate (which would make the assertion vacuous).
+        self._select_division_context(c, div)
         status, body = self._req(c, "POST", "/api/scheduler/draft",
                                  {"season_id": season_id, "league_id": league_id,
                                   "division_id": "div_http_other"})
         self.assertEqual(body["error"]["code"], "not_found")
+        self.assertEqual(body["error"]["message"],
+                         "Division div_http_other not found.", repr(body))
 
 
 if __name__ == "__main__":
