@@ -9,7 +9,7 @@ let currentGame = null;     // game id whose roster we're viewing
 let pickedPlayer = null;
 let wizard = null;          // {slot_id, league_id, division_id, home_id, away_id} when scheduling
 let iceBuilder = null;      // {form, preview} when the Ice Availability Builder is open (#158)
-let calendarDate = "2026-09-05";  // YYYY-MM-DD shown on the arena calendar
+let calendarDate = todayISO();    // YYYY-MM-DD shown on the arena calendar
 let calendarMode = "day";   // day | week | month (#158)
 let calFilters = { venueId: "all", rinkId: "all", divisionId: "all", teamId: "all" };
 let toast = "";
@@ -181,6 +181,20 @@ let importState = {         // Pilot onboarding import wizard (#96)
 };
 
 const DAY_MS = 86400000;
+// "Today", as the rest of this file already means it: the current UTC calendar
+// day. Every other date here is UTC — addDays/addMonths use getUTC*, dayOf
+// slices a UTC ISO string, and the calendar's own labels pass
+// timeZone: "UTC" — and the backend lays its ice down at UTC midnight, so
+// reading the LOCAL day would put the calendar a day off its own data for
+// anyone whose offset has rolled over.
+//
+// This used to be the string "2026-09-05" in three places (#387/#389): the
+// initial calendarDate, the calendar's "Today" button, and the ice-slot
+// drawer's Date default. That literal agreed with a seed that booked
+// 2026-09-05..19, so the pair looked coherent while both were wrong; "Today"
+// navigated to a fixed day in 2026 on main, whatever the date really was.
+// e2e/calendar-today.js fails if any of them is named again.
+function todayISO() { return new Date().toISOString().slice(0, 10); }
 function addDays(dateStr, n) {
   const d = new Date(dateStr + "T00:00:00Z");
   d.setUTCDate(d.getUTCDate() + n);
@@ -2812,7 +2826,12 @@ const SETUP_ENTITIES = [
     fields: [
       { id: "f-slot-rink", label: "Rink", type: "select", required: true, ofNoun: "rink",
         options: (ov) => withPendingLink(ov, "rinks").map((r) => [r.id, `${r.venue_name ? r.venue_name + " · " : ""}${r.name}`]) },
-      { id: "f-slot-date", label: "Date", type: "date", required: true, value: "2026-09-05" },
+      // A function, not a constant: SETUP_ENTITIES is built once at load, so a
+      // literal default here would freeze whatever day the app started on. The
+      // operator opens this drawer from a calendar sitting on a particular
+      // day, and that day is what they mean (#389 review).
+      { id: "f-slot-date", label: "Date", type: "date", required: true,
+        value: () => calendarDate },
       { id: "f-slot-start", label: "Start", type: "time", required: true, value: "21:00" },
       { id: "f-slot-end", label: "End", type: "time", required: true, value: "22:30" },
       { id: "f-slot-type", label: "Type", type: "select", required: true,
@@ -6552,8 +6571,11 @@ function drawerField(f, sv) {
   const dis = locked ? " disabled" : "";
   const note = locked ? ` <span class="drawer-note-inline">— use “⇄ Move” to change</span>` : "";
   // Preserve what the user already typed/selected across an error re-render;
-  // fall back to the field's default only on first open.
-  const current = f.id in drawerValues ? drawerValues[f.id] : (f.value || "");
+  // fall back to the field's default only on first open. A default may be a
+  // function, evaluated per render, for fields whose sensible default depends
+  // on current state rather than being fixed at load (#389 review).
+  const dflt = typeof f.value === "function" ? f.value() : f.value;
+  const current = f.id in drawerValues ? drawerValues[f.id] : (dflt || "");
   // A context value the operator never picks or sees (e.g. the active Season
   // a #345 context-seeded Division carries alongside its visible League
   // select) -- present in the submitted body via the same val()/drawerValues
@@ -11752,7 +11774,7 @@ async function render() {
   });
   c.querySelectorAll("[data-cal]").forEach((b) => b.onclick = () => {
     const v = +b.dataset.cal;
-    if (v === 0) calendarDate = "2026-09-05";
+    if (v === 0) calendarDate = todayISO();
     else if (calendarMode === "month") calendarDate = addMonths(calendarDate, v);
     else shiftDate(v * (calendarMode === "week" ? 7 : 1));
     toast = ""; conflict = null; movingGameId = null; pendingMove = null; render();
