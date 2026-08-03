@@ -6,6 +6,7 @@ alternatives, and observer-only placement equivalence.
 """
 
 import copy
+import itertools
 import json
 import os
 import threading
@@ -352,14 +353,23 @@ class _ExplanationContract:
         # The real assigned id, never a literal guess: this is the single
         # most important string in the haystack below.
         secrets = NEIGHBOUR_SECRETS + (neighbour_game_id,)
-        for label, constraints in (
-                ("overlap is the first cause", None),
-                ("a blackout short-circuits the legacy path",
-                 {"season_blackout_dates": [
-                     (BASE + timedelta(minutes=30)).date().isoformat()]})):
-            with self.subTest(shape=label):
+        blackout = (BASE + timedelta(minutes=30)).date().isoformat()
+        causes = (
+            ("overlap is the first cause", None),
+            ("a blackout short-circuits the legacy path",
+             {"season_blackout_dates": [blackout]}),
+        )
+        # Both request shapes: the two entry points seed the observer
+        # independently, so a rule wired into only one of them is a hole.
+        shapes = (
+            ("division", {"division_id": "d"}),
+            ("league-wide", {"season_id": "se", "league_id": "lg"}),
+        )
+        for (cause, constraints), (shape, target) in itertools.product(
+                causes, shapes):
+            with self.subTest(cause=cause, shape=shape):
                 preview = api.draft_season_schedule(
-                    "d", slot_ids=[mine], constraints=constraints)
+                    slot_ids=[mine], constraints=constraints, **target)
                 self.assertNotIn("error", preview, preview)
                 explanation = _explanation(preview)
                 codes = {rejection["code"]
@@ -367,8 +377,8 @@ class _ExplanationContract:
                          for rejection in candidate["rejections"]}
                 # ANTI-VACUITY: the branch that carries the id really ran.
                 self.assertIn("slot_overlap_conflict", codes, explanation)
-                # The privacy clause first, over the WHOLE object: a leak that
-                # moved to another field is still a leak.
+                # The privacy clause first, over the WHOLE object: a leak
+                # that moved to another field is still a leak.
                 serialized = json.dumps(explanation, sort_keys=True)
                 for secret in secrets:
                     self.assertNotIn(
@@ -394,6 +404,114 @@ class _ExplanationContract:
                     & {"reschedule_conflicting_game",
                        "provide_non_overlapping_game_ice"},
                     {"provide_non_overlapping_game_ice"}, explanation)
+
+    def test_a_teams_other_season_game_is_named_only_inside_the_tuple(self):
+        """The same boundary on the OTHER code that carries a Game id.
+
+        ``team_overlap`` reaches its conflicting Game through the team, not
+        the rink, so it is a genuinely independent path into the same field:
+        a club team playing on in two Seasons is ordinary, and the Game that
+        double-books it belongs to whichever Season booked it.
+
+        The corner here is the SHARPER of #388's two near misses -- same
+        Program AND same League, different Season -- because a scoping rule
+        that compared only the League, or only the Program, would wave it
+        straight through.
+
+        The legacy ``team_conflicts`` row on the same response is deliberately
+        left exactly as ``main`` computes it -- this slice does not narrow an
+        existing field -- so this pins the NEW evidence only.
+        """
+        api = _seed(self.store)
+        # A second Season of the caller's OWN League. `Team.league_id` binds a
+        # team to one League, so this is the shape in which one team really
+        # can appear in two Seasons' Games.
+        self.store.add_season(Season(
+            id="se2", program_id="pg", name="Next Season"))
+        self.store.add_league_season(LeagueSeason(
+            id="ls2", league_id="lg", season_id="se2"))
+        self.store.add_division(Division(
+            id="d2", league_season_id="ls2", name="D2"))
+        self.store.add_season_venue_access(SeasonVenueAccess(
+            id="sva_next", season_id="se2", venue_id="v2", active=True))
+        self.store.add_team(Team(
+            id="t_other", name="Other", program_id="pg", league_id="lg"))
+        for reg_id, team_id in (("reg_next0", "t0"), ("reg_next1", "t_other")):
+            self.store.add_season_team_registration(SeasonTeamRegistration(
+                id=reg_id, league_season_id="ls2", team_id=team_id,
+                division_id="d2", active=True))
+        _slot(self.store, "slot_nb", "r2", BASE)
+        booked = api.create_game(
+            "se2", "d2", "t0", "t_other", "slot_nb",
+            league_id="lg", actor_id="admin")
+        self.assertNotIn("error", booked, booked)
+        # A candidate on a DIFFERENT rink, so only the team collides.
+        mine = _slot(self.store, "mine", "r1", BASE)
+
+        preview = api.draft_season_schedule("d", slot_ids=[mine])
+        explanation = _explanation(preview)
+        overlap = next(
+            rejection
+            for candidate in explanation["candidate_windows"]
+            for rejection in candidate["rejections"]
+            if rejection["code"] == "team_overlap")
+        # ANTI-VACUITY: the collision really was detected, and against the
+        # PERSISTED game rather than a same-run pick.
+        self.assertEqual(overlap["details"]["team_ids"], ["t0"])
+        self.assertEqual(
+            [row["conflict_source"] for row in overlap["details"]["conflicts"]],
+            ["existing_game"])
+        for row in overlap["details"]["conflicts"]:
+            self.assertNotIn("conflict_game_id", row)
+        self.assertNotIn(
+            booked["id"], json.dumps(explanation, sort_keys=True),
+            "team_overlap evidence named a Game from a Season this caller's "
+            "active tuple is refused")
+
+    def test_a_sibling_leagues_game_in_this_season_is_withheld_too(self):
+        """#388's OTHER near miss: same Program, same Season, different
+        League.
+
+        Stated separately from the different-Season corner because the two
+        halves of the comparison fail independently: a rule that checked only
+        the Season would pass that test and this one would still hand over a
+        sibling League's Game id.
+        """
+        api = _seed(self.store)
+        self.store.add_league(League(
+            id="lg_x", program_id="pg", name="Sibling League"))
+        self.store.add_league_season(LeagueSeason(
+            id="ls_x", league_id="lg_x", season_id="se"))
+        self.store.add_division(Division(
+            id="d_x", league_season_id="ls_x", name="DX"))
+        for index in range(2):
+            self.store.add_team(Team(
+                id=f"t_x{index}", name=f"Sibling {index}", program_id="pg",
+                league_id="lg_x"))
+            self.store.add_season_team_registration(SeasonTeamRegistration(
+                id=f"reg_x{index}", league_season_id="ls_x",
+                team_id=f"t_x{index}", division_id="d_x", active=True))
+        _slot(self.store, "slot_x", "r1", BASE)
+        booked = api.create_game(
+            "se", "d_x", "t_x0", "t_x1", "slot_x",
+            league_id="lg_x", actor_id="admin")
+        self.assertNotIn("error", booked, booked)
+        mine = _slot(self.store, "mine", "r1", BASE + timedelta(minutes=30))
+
+        preview = api.draft_season_schedule("d", slot_ids=[mine])
+        explanation = _explanation(preview)
+        overlap = next(
+            rejection
+            for candidate in explanation["candidate_windows"]
+            for rejection in candidate["rejections"]
+            if rejection["code"] == "slot_overlap_conflict")
+        # ANTI-VACUITY: the Season really does match, so only the League can
+        # be doing the work here.
+        self.assertEqual(self.store.get_game(booked["id"]).season_id, "se")
+        self.assertNotIn("conflict_game_id", overlap["details"])
+        self.assertNotIn(
+            booked["id"], json.dumps(explanation, sort_keys=True),
+            "candidate evidence named a sibling League's Game")
 
     def test_an_in_scope_conflicting_game_is_still_named(self):
         """The anti-vacuity control for the refusal above.
@@ -421,20 +539,27 @@ class _ExplanationContract:
         self.assertNotIn("error", booked, booked)
         mine = _slot(self.store, "mine", "r1", BASE + timedelta(minutes=30))
 
-        preview = api.draft_season_schedule("d", slot_ids=[mine])
-        explanation = _explanation(preview)
-        overlap = next(
-            rejection
-            for candidate in explanation["candidate_windows"]
-            for rejection in candidate["rejections"]
-            if rejection["code"] == "slot_overlap_conflict")
-        self.assertEqual(
-            overlap["details"]["conflict_game_id"], booked["id"])
-        self.assertEqual(
-            overlap["details"]["conflict_slot_id"], "host_slot")
-        self.assertIn(
-            "reschedule_conflicting_game",
-            {a["action_code"] for a in explanation["alternatives"]})
+        # Both request shapes, so neither entry point can quietly stop seeding
+        # the scope and take the fail-closed path for every caller.
+        for shape, target in (
+                ("division", {"division_id": "d"}),
+                ("league-wide", {"season_id": "se", "league_id": "lg"})):
+            with self.subTest(shape=shape):
+                preview = api.draft_season_schedule(slot_ids=[mine], **target)
+                self.assertNotIn("error", preview, preview)
+                explanation = _explanation(preview)
+                overlap = next(
+                    rejection
+                    for candidate in explanation["candidate_windows"]
+                    for rejection in candidate["rejections"]
+                    if rejection["code"] == "slot_overlap_conflict")
+                self.assertEqual(
+                    overlap["details"]["conflict_game_id"], booked["id"])
+                self.assertEqual(
+                    overlap["details"]["conflict_slot_id"], "host_slot")
+                self.assertIn(
+                    "reschedule_conflicting_game",
+                    {a["action_code"] for a in explanation["alternatives"]})
 
     def test_turnover_curfew_and_playable_time_use_shared_policy_codes(self):
         api = _seed(self.store)
@@ -573,6 +698,69 @@ class PostgresExplanationTest(_ExplanationContract, unittest.TestCase):
         store = SqlStore(os.environ["TEST_DATABASE_URL"])
         store.clear_all_data()
         return store
+
+
+class InScopeGameIdTest(unittest.TestCase):
+    """``_in_scope_game_ids``' own rules, driven directly.
+
+    The league-scoped facade rejects a dangling Division before the base
+    scheduler ever runs, so the FAIL-CLOSED branch — an unresolved Season or
+    League scope — is unreachable through the API and would survive deletion
+    with the rest of this file green. It is the branch that decides what a
+    legacy or half-resolved target discloses, so it is pinned here.
+    """
+
+    def _pairs(self, *specs):
+        return [
+            (Game(id=game_id, home_team_id="t0", away_team_id="t1",
+                  ice_slot_id="s", season_id=season_id, league_id=league_id,
+                  start_time=BASE, end_time=BASE + timedelta(hours=1)),
+             object())
+            for game_id, season_id, league_id in specs]
+
+    def test_only_the_exact_season_and_league_pair_is_in_scope(self):
+        pairs = self._pairs(
+            ("g_match", "se", "lg"),
+            ("g_other_season", "se2", "lg"),
+            ("g_other_league", "se", "lg2"),
+            ("g_other_both", "se2", "lg2"),
+        )
+        self.assertEqual(
+            sched._in_scope_game_ids(
+                pairs, {"season_id": "se", "league_id": "lg"}),
+            {"g_match"})
+
+    def test_an_unresolved_scope_withholds_every_id(self):
+        """Fail-closed: a missing half of the tuple is not a wildcard.
+
+        Each unresolved scope below is paired with a Game that a plain
+        equality comparison WOULD match once the guard is gone -- a
+        ``None``-Season row for the Season-less scope, and so on. Without
+        them the guard could be deleted and every assertion here would still
+        pass on an empty result, which is the shape of vacuity this file has
+        to avoid.
+        """
+        pairs = self._pairs(
+            ("g_match", "se", "lg"),
+            ("g_no_season", None, "lg"),
+            ("g_no_league", "se", None),
+            ("g_legacy", None, None),
+        )
+        for label, scope in (
+                ("no season", {"season_id": None, "league_id": "lg"}),
+                ("no league", {"season_id": "se", "league_id": None}),
+                ("neither", {}),
+                ("no scope at all", None)):
+            with self.subTest(scope=label):
+                self.assertEqual(
+                    sched._in_scope_game_ids(pairs, scope), frozenset(),
+                    "an unresolved scope defaulted OPEN")
+        # ...and the control: the same pairs really do yield an id when the
+        # scope resolves, so the assertions above are not empty-in/empty-out.
+        self.assertEqual(
+            sched._in_scope_game_ids(
+                pairs, {"season_id": "se", "league_id": "lg"}),
+            {"g_match"})
 
 
 class ExplanationFormatterContractTest(unittest.TestCase):
@@ -721,6 +909,57 @@ class ExplanationFormatterContractTest(unittest.TestCase):
         for leaked in ("team_name", "Team 0", "opponent_name", "Team 1",
                        "coach asked"):
             self.assertNotIn(leaked, serialized)
+
+    def test_nested_evidence_rows_are_capped_and_count_what_they_dropped(self):
+        """The two NESTED caps, which no other test in this file pins.
+
+        The per-candidate and per-pairing caps are enforced by the formatter
+        and covered above; these two live in the observer and bound the rows
+        INSIDE one rejection. ``min_rest`` is driven directly because the
+        scheduler cannot reach the cap: accepted starts for one team are at
+        least ``min_rest_hours`` apart by construction, so a candidate window
+        can only ever collide with two or three of them. That is exactly the
+        kind of clause that survives deletion with a whole suite green.
+        """
+        con = sched._normalize_constraints({"min_rest_hours": 24})
+        slot = IceSlot(id="candidate", rink_id="r1", start_time=BASE,
+                       end_time=BASE + timedelta(hours=1))
+        # Six starts per team inside the rest window: twelve conflicts.
+        team_slots = {
+            tid: [BASE + timedelta(minutes=offset)
+                  for offset in range(0, 360, 60)]
+            for tid in ("t0", "t1")}
+        rest = next(r for r in sched._slot_constraint_rejections(
+            slot, "t0", "t1", con, team_slots) if r["code"] == "min_rest")
+        self.assertEqual(len(rest["details"]["conflicts"]), 4)
+        self.assertEqual(rest["details"]["omitted_conflict_count"], 8)
+        # Which four is not arbitrary -- canonical order, so two runs over the
+        # same facts keep the same rows.
+        self.assertEqual(
+            rest["details"]["conflicts"],
+            sorted(rest["details"]["conflicts"], key=sched._canonical_sort_key))
+
+    def test_team_overlap_reports_at_most_one_row_per_team(self):
+        """The second nested cap: two teams, so never more than two rows,
+        however many bookings each of them collides with."""
+        store = InMemoryStore()
+        _seed(store)  # only so team-name lookup resolves like production
+        # Four prior games, two for each team of the pairing, all overlapping
+        # the candidate window.
+        spans = {}
+        for index, tid in enumerate(("t0", "t0", "t1", "t1")):
+            spans.setdefault(tid, []).append(
+                (BASE, BASE + timedelta(hours=1), f"g{index}"))
+        slot = IceSlot(id="candidate", rink_id="r1", start_time=BASE,
+                       end_time=BASE + timedelta(hours=1))
+        code, _message, conflicts = sched._team_overlap_reason(
+            store, slot, "t0", "t1", spans)
+        self.assertEqual(code, "team_overlap")
+        # ANTI-VACUITY: four candidate collisions really were available.
+        self.assertEqual(sum(len(v) for v in spans.values()), 4)
+        self.assertEqual(len(conflicts), 2)
+        self.assertEqual(sorted(c["team_id"] for c in conflicts),
+                         ["t0", "t1"])
 
     def test_blocking_codes_use_the_canonical_rank_not_the_alphabet(self):
         """Scope, then inventory, then the scheduler's evaluation order."""
