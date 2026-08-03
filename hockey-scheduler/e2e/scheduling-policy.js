@@ -53,13 +53,12 @@ function stopServer(server) {
   });
 }
 
-// The demo app pins its calendar to September 2026 (demo seed date
-// 2026-09-05) — like scheduler-empty-state's fixed ICE_DAY, anchor there, on
-// the 7th so this spec's slots never collide with the demo's own 09-05 ice.
-function anchor() {
-  return new Date("2026-09-07T18:00:00Z");
-}
-
+// This is the only spec here that genuinely NAVIGATES the calendar: it switches
+// to month view and clicks a `[data-cal-day=…]` cell, so its anchor only has to
+// share a MONTH with the grid on screen — not a day. It used to anchor on
+// 2026-09-07 because the app pinned its calendar to September 2026; the app now
+// opens on the real current date (#387/#389), so that cell is simply not in the
+// grid. See anchorFor() below for what replaced it.
 async function checkViewport(browser, viewport) {
   const base = `http://${HOST}:${viewport.port}`;
   const server = spawn(
@@ -85,15 +84,38 @@ async function checkViewport(browser, viewport) {
 
   const fail = (msg) => { throw new Error(`[${viewport.label}] ${msg}`); };
 
-  const t0 = anchor();
   const iso = (d) => d.toISOString().replace(/\.\d{3}Z$/, "+00:00");
   const plusMin = (d, m) => new Date(d.getTime() + m * 60 * 1000);
-  const dayKey = t0.toISOString().slice(0, 10);
+  // Month view, one step forward. Filled in once the page is up, from the
+  // app's own calendarDate and its own addMonths, so the spec and the grid
+  // can never disagree about which month "next" is.
+  let dayKey, monthKey, t0;
+  const anchorFor = async () => {
+    monthKey = (await page.evaluate(() => addMonths(calendarDate, 1))).slice(0, 7);
+    dayKey = `${monthKey}-07`;
+    t0 = new Date(`${dayKey}T18:00:00Z`);
+  };
+  // Every calendar visit below goes through here: month view, then one "›"
+  // step, so the grid on screen is the month the fixture was built in. A whole
+  // month ahead also keeps the fixture unambiguously in the future at any hour
+  // of any day, which a same-month anchor could not promise near month end.
+  const openMonthGrid = async () => {
+    await page.click('.tab[data-tab="calendar"]');
+    await page.waitForSelector('[data-mode="month"]', { state: "visible", timeout: 10000 });
+    await page.click('[data-mode="month"]');
+    await page.click('[data-cal="1"]');
+    const shown = await page.evaluate(() => calendarDate);
+    if (shown.slice(0, 7) !== monthKey) {
+      fail(`month grid shows ${shown.slice(0, 7)}, fixture is in ${monthKey}`);
+    }
+    await page.waitForSelector(".mo-grid .mo-cell", { timeout: 10000 });
+  };
 
   try {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    await anchorFor();
 
     // Seed: one Division with two registered teams, one rink with a hosted
     // game slot and a second free slot 10 minutes after it, and a rink-scope
@@ -177,11 +199,8 @@ async function checkViewport(browser, viewport) {
 
     // (A) Day board: hosted slot card shows the reserved facility span;
     // the free slot card shows none.
-    await page.click('.tab[data-tab="calendar"]');
     // Calendar defaults to Day view (today); month cells carry data-cal-day.
-    await page.waitForSelector('[data-mode="month"]', { state: "visible", timeout: 10000 });
-    await page.click('[data-mode="month"]');
-    await page.waitForSelector(".mo-grid .mo-cell", { timeout: 10000 });
+    await openMonthGrid();
     await page.waitForSelector(`[data-cal-day="${dayKey}"]`, { timeout: 10000 });
     await page.click(`[data-cal-day="${dayKey}"]`);
     await page.waitForSelector(".slot-card", { timeout: 10000 });
@@ -213,8 +232,9 @@ async function checkViewport(browser, viewport) {
     await page.waitForSelector(".ib-form", { timeout: 10000 });
     await page.check(`.ib-rink[value="${ids.rink}"]`);
     await page.fill("#ib-turnover", "0");
-    await page.fill("#ib-from", "2026-09-01");
-    await page.fill("#ib-to", "2026-09-07");
+    // The same seven days the fixture lives in, in the fixture's own month.
+    await page.fill("#ib-from", `${monthKey}-01`);
+    await page.fill("#ib-to", `${monthKey}-07`);
     await page.evaluate(() => { const p = document.querySelector(".ib-preview"); if (p) p.remove(); });
     await page.click("[data-ib-preview]");
     await page.waitForSelector(".ib-preview, .banner.warn", { timeout: 15000 });
@@ -247,9 +267,7 @@ async function checkViewport(browser, viewport) {
     if (commit.error || (commit.created || []).length !== 1)
       fail(`draft commit should create exactly one game: ${JSON.stringify(commit)}`);
     const openDay = async () => {
-      await page.click('.tab[data-tab="calendar"]');
-      await page.waitForSelector('[data-mode="month"]', { state: "visible", timeout: 10000 });
-      await page.click('[data-mode="month"]');
+      await openMonthGrid();
       await page.waitForSelector(`[data-cal-day="${dayKey}"]`, { timeout: 10000 });
       await page.click(`[data-cal-day="${dayKey}"]`);
       await page.waitForSelector(".slot-card", { timeout: 10000 });
