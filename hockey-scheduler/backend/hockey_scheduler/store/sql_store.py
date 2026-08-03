@@ -1775,12 +1775,23 @@ class SqlStore:
         the first one commits — so a write authorized under tuple A can never
         be performed under tuple B.
 
+        ``set_active_context`` deliberately takes NO explicit lock of its own.
+        Its ``INSERT ... ON CONFLICT (id) DO UPDATE`` acquires the row lock
+        itself when the row exists, so it already blocks behind this one — an
+        extra ``SELECT ... FOR UPDATE`` there would be redundant, and it also
+        put a second ``user_active_context`` statement in front of the INSERT,
+        which silently moved the barrier in
+        ``test_active_context.ContextConcurrencyPgTest`` off the write it was
+        instrumenting. The ordering is a property of this side of the protocol.
+
         The row may not exist (a caller running on `_fallback`, never having
-        selected anything). ``FOR UPDATE`` then locks nothing, and the ordering
-        comes from the SERIALIZABLE isolation the authorizing transaction runs
-        at instead: the read-write anti-dependency against a concurrent first
-        INSERT is detected and one side is retried. Both halves are needed —
-        the row lock for the ordinary case, the isolation for the first write.
+        selected anything). ``FOR UPDATE`` then locks nothing — there is no row
+        to lock and no lock the writer could block on either — and the ordering
+        comes instead from the SERIALIZABLE isolation the authorizing
+        transaction runs at: the read-write anti-dependency against a
+        concurrent first INSERT is detected and one side is retried. Both
+        halves are needed — the row lock for the ordinary case, the isolation
+        for the very first write.
         """
         return self._get_for_update(ActiveContext, user_id)
 
@@ -1808,7 +1819,6 @@ class SqlStore:
             # write it authorized. On a first write there is no row to lock;
             # the ON CONFLICT below and the reader's SERIALIZABLE isolation
             # carry the ordering for that case.
-            self._get_for_update(ActiveContext, ctx.id)
             self._exec(
                 "INSERT INTO user_active_context "
                 "(id, program_id, season_id, updated_at, league_id) "
