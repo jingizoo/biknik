@@ -798,8 +798,9 @@ context read asks for that level, and a nested join may never *raise* the open
 transaction's isolation). `_locked_draft_targets` takes three locks in order:
 
 1. the caller's **per-user ActiveContext mutex, then its row**
-   (`resolve_with_league(..., lock=True)` → `get_active_context_for_update`).
-   `set_active_context` takes the **same** mutex before writing;
+   (`resolve_with_league(..., lock=True)` → `get_active_context_for_update`),
+   **before any other read**. `set_active_context` takes the **same** mutex
+   before writing;
 2. the **pre-lock locator**: the candidate drafts, read unlocked, selected, and
    **authorized** — before any Season is touched, because locking the Season of
    an unauthorized candidate would run `_require_active_season` against a
@@ -807,6 +808,17 @@ transaction's isolation). `_locked_draft_targets` takes three locks in order:
    oracle;
 3. the **Season** rows named by that plan (`_guard_active_seasons`, sorted);
 4. the **Game** rows (`get_game_for_update`, sorted).
+
+**The mutex must precede the first read, not merely the first write.** An
+earlier revision read the candidate Games and only then took the mutex. Under
+`SERIALIZABLE` the snapshot is established by the transaction's first
+data-reading statement, so a mutex acquired after it is too late *by
+construction*: a first selection slips in between, takes the still-free
+advisory lock, inserts tuple B and commits, and the batch's already-fixed
+snapshot cannot see that row — it resolves the stale fallback tuple A and
+writes A after B is persisted. The order is therefore transaction entry →
+mutex → resolve → candidate reads, so the mutex acquisition is itself the
+statement that fixes the snapshot.
 
 **An absent-row read is not a lock.** The row lock alone covered only callers
 who had already saved a selection. A brand-new operator has no row, so
@@ -830,10 +842,26 @@ PostgreSQL resolves those by killing one side — a 500 on a legitimate pair of
 requests. One canonical order removes the cycle instead of making it rarer.
 
 Locking Seasons from an **unlocked** plan opens a window, so the plan is
-**re-verified** on the locked rows: each Game must still be a draft, still
-authorized, and still sit in a Season this transaction actually locked. Drift
-raises `placement_raced`, rolls the attempt back, and restarts under a bounded
-retry (3 attempts). That retry also covers `serialization_failure`: it is the
+**re-verified** on the locked rows. The order inside that loop is the contract:
+each Game's **exact planned Season** is compared *immediately after the lock and
+before authorization*. Putting the comparison after the authorization check
+made it dead code — a Game whose Season moved while its other parents still
+name the old one has a disagreeing parent graph, so `_game_in_active_tuple`
+answers False and `continue`s, and the raise is never reached. The comparison is
+per-Game rather than against the set of planned Seasons, because a set only
+answers "is this one we locked", which a row moving between two Seasons the
+batch happens to hold would pass. Drift raises `placement_raced`, rolls the
+attempt back, and restarts under a bounded retry (3 attempts).
+
+**What that raise can and cannot be reached by.** On PostgreSQL a *real*
+concurrent writer cannot reach it: the batch runs `SERIALIZABLE`, so its plan
+and its locked re-read come from one snapshot and cannot disagree, and a row
+another transaction genuinely changed makes `SELECT … FOR UPDATE` abort with
+`serialization_failure` first. That is precisely why "a retry happened" was not
+evidence this guard caused it, and why the guard shipped unfalsifiable for a
+round. It is kept as defence in depth for any backend or future call path whose
+re-read is not snapshot-isolated, and its regression injects the disagreement at
+the re-read itself rather than pretending a concurrent writer produced it. That retry also covers `serialization_failure`: it is the
 *same* race caught by the database a moment earlier, and refusing it would turn
 an ordinary concurrent edit into a user-visible 409 on a request that succeeds
 when re-run.
@@ -909,6 +937,14 @@ were asserted by prose and by nothing else:
 | drop the advisory lock from `get_active_context_for_update` | all four first-selection races: *"the caller's FIRST context selection COMPLETED at … while the write verb held its transaction — with no row to lock there is nothing serializing them, so the verb can write under tuple A while tuple B is persisted"* |
 | drop the advisory lock from `set_active_context` | the same four, with the same assertion — both sides must take it or it is not a mutex |
 | restore Game-before-Season order | all three batch-vs-single barriers: `'error' unexpectedly found in {… "reason": "deadlock_detected" …}` |
+| move the mutex/tuple resolution back after the first candidate read | *"the caller's FIRST context selection COMPLETED at the batch's first candidate read — the batch had already established its SERIALIZABLE snapshot without holding the per-user mutex, so it will resolve the stale fallback tuple A and write A after B is persisted"* |
+| delete the Season-mismatch raise | `1 != 2 : the locked Game named a Season the plan never locked and the batch carried on regardless — the comparison must run BEFORE authorization, which otherwise drops the changed row silently, and a mismatch must restart the whole unit` |
+| delete `_retry_on_plan_race` | the same, plus *"the batch ran ONE transaction, so the Season-drift raise and the bounded retry were never exercised"* |
+
+Both of the last round's blockers were the same failure mode — the mechanism
+right, the test shaped so the window could not occur. Every test above was
+therefore written **before** its fix and observed failing against the unfixed
+code; the two verbatim red outputs are recorded in PR #388.
 
 **The first-selection cases needed their own class, and that is the point.**
 `DraftActiveTupleRaceTest` persists a tuple in `setUp`, so every one of its
