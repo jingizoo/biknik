@@ -827,6 +827,27 @@ The alternative the ruling allowed — detect contention, then retry in a fresh
 transaction — was rejected because the required regression has to *observe the
 batch blocked*, and a try-lock-and-retry design never blocks.
 
+**Every identified mutation unit takes it, including the named-scenario
+commit.** `_commit_schedule_scenario_attempt` entered its own `SERIALIZABLE`
+transaction and called the draft commit deliberately identity-less, so nothing
+took the mutex at all — while a comment at the inner call claimed it was
+joining an outer protected unit that did not exist. The scenario's *row* lock
+orders nothing about `user_active_context`, and the `SERIALIZABLE` graph again
+holds only a read-context → write-context anti-dependency, which obliges
+neither side to abort. The mutex now wraps that unit from outside its
+transaction; the nested draft call stays identity-less so it *joins* rather
+than trying to reacquire a lock the session already holds.
+
+**The connection lock is held across the whole mutex context**, from the
+precondition check through the advisory unlock. `_txn_depth` is *store* state,
+not thread-local, and `transaction()` holds `_lock` for its entire block —
+so reading the depth without that lock let one request see a **different**
+request's open transaction, mistake it for its own re-entry, and raise instead
+of waiting. On the ordinary shared-`SqlStore` web shape that was a 500 on two
+perfectly valid concurrent requests, with no advisory-lock contention involved
+at all: a precondition check that introduced a worse failure than the race it
+guarded. `_lock` is an `RLock`, so the nested `transaction()` re-enters freely.
+
 **Releasing it is the dangerous part**, which is why it is a context manager
 and never a pair of calls. A session lock survives rollback and survives the
 connection being reused; leak it once and that user can never schedule again.
@@ -970,6 +991,8 @@ were asserted by prose and by nothing else:
 | delete `_retry_on_plan_race` | the same, plus *"the batch ran ONE transaction, so the Season-drift raise and the bounded retry were never exercised"* |
 | take the mutex inside the SERIALIZABLE transaction instead of around it | *"the batch discarded Program A's drafts after waiting behind a first selection that committed tuple B — its snapshot was fixed by the lock query itself, so winning the lock told it nothing it had not already decided"* |
 | skip the session-mutex release on the error path | *"the per-user mutex was NOT released after the unit raised — a session-scoped lock survives rollback, so this user is now permanently unable to run any scheduling batch"* |
+| remove the outer mutex from the scenario commit | *"the scenario commit was NOT blocked behind the first selection's mutex — it entered its SERIALIZABLE transaction and resolved tuple A while tuple B was still uncommitted, so it can land Program A's reviewed Games after B is persisted"* |
+| remove the connection-lock coverage from the mutex context | *"a second concurrent request RAISED instead of waiting: it read another request's transaction depth as its own"* |
 
 **Which mechanism is actually load-bearing, stated honestly.** The session
 mutex subsumes two guards that were independently falsifiable before it
