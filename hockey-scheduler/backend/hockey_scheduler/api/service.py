@@ -5350,8 +5350,19 @@ class ApiService:
         not raise the open transaction's isolation, so an identified caller
         opens SERIALIZABLE here. `role is None` keeps the previous default
         level byte-for-byte, and takes no context read at all.
+
+        #386 — the per-user context mutex wraps this unit from OUTSIDE that
+        transaction. The scenario's ROW lock orders nothing about
+        `user_active_context`, and the SERIALIZABLE graph holds only a
+        read-context -> write-context anti-dependency, which does not oblige
+        either side to abort: a first context selection could commit tuple B
+        after this unit resolved tuple A but before the reviewed Games landed.
+        The nested `_commit_draft_schedule_attempt` is deliberately left
+        identity-less so it JOINS this protection instead of trying to
+        reacquire a lock this session already holds.
         """
-        with self.store.transaction(
+        with self._active_context_mutex(user_id, role), \
+                self.store.transaction(
                 isolation=None if role is None else "SERIALIZABLE"):
             scenario = self.store.get_schedule_scenario_for_update(scenario_id)
             # Locked first, then judged: a foreign scenario and a nonexistent

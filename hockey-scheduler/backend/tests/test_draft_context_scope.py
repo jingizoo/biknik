@@ -2205,6 +2205,134 @@ class DraftFirstSelectionRaceTest(unittest.TestCase):
             "had not already decided")
         self._assert_no_cross_tuple_write(before, set(self.committed))
 
+    def _pausing_first_selection(self):
+        """A second connection that takes the per-user mutex for the first
+        selection of tuple B and PAUSES before committing it.
+
+        Returns ``(holding, release, thread, state)``: wait on ``holding``,
+        then ``release.set()`` to let it commit.
+        """
+        selector = SqlStore(os.environ["TEST_DATABASE_URL"])
+        holding = threading.Event()
+        release = threading.Event()
+        state = {"error": None, "done": False}
+        plain_exec = selector._exec
+
+        def pause_holding_the_mutex(query, params=()):
+            result = plain_exec(query, params)
+            if "user_active_context" in query and "INSERT" in query.upper():
+                holding.set()
+                release.wait(30)
+            return result
+
+        selector._exec = pause_holding_the_mutex
+
+        def run():
+            try:
+                ApiService(selector).set_active_context(
+                    NEWCOMER, Role.LEAGUE_ADMIN, {}, self.pb, self.sb,
+                    self.lb)
+                state["done"] = True
+            except BaseException as error:
+                state["error"] = error
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        self.addCleanup(release.set)
+        self.assertTrue(holding.wait(15),
+                        "the selection never reached its INSERT, so it never "
+                        "held the mutex and this race never set up")
+        return holding, release, thread, state
+
+    def test_a_scenario_commit_waiting_behind_a_first_selection_observes_it(
+            self):
+        """The named-scenario commit is a mutation unit too.
+
+        `_commit_schedule_scenario_attempt` enters its own SERIALIZABLE
+        transaction, re-authorizes the SCENARIO, and calls the draft commit
+        deliberately identity-less -- so the inner call takes no mutex, and
+        for a while the comment there claimed it was joining an outer
+        protected unit that did not exist. The scenario's row lock does not
+        order `user_active_context`, and the SERIALIZABLE graph again holds
+        only a read-context -> write-context anti-dependency, which does not
+        oblige either side to abort. A first selection can therefore commit
+        tuple B after this unit resolved tuple A but before the reviewed Games
+        land.
+        """
+        self._assert_no_saved_context()
+        # Free the corner's ice so the scenario has something to propose.
+        _ok(self.api.discard_draft_games(all_drafts=True), "clear")
+        scenario = _ok(self.api.create_schedule_scenario(
+            "A's reviewed batch", division_id=self.da), "scenario")
+        scenario_id = scenario["scenario_id"]
+        self.assertTrue(scenario["proposal"]["draft_games"], scenario)
+
+        games_before = list(self.store.all_games())
+        slots_before = {s.id: s.status for s in self.store.all_ice_slots()}
+        draft_audit_before = sum(
+            1 for row in self.store.all_setup_audit()
+            if row.action == "draft_schedule_committed")
+        scenario_audit_before = sum(
+            1 for row in self.store.all_setup_audit()
+            if row.action == "schedule_scenario_committed")
+
+        _holding, release, selection, sel_state = \
+            self._pausing_first_selection()
+
+        commit = {"result": None, "error": None}
+
+        def run_commit():
+            try:
+                commit["result"] = self.api.commit_schedule_scenario(
+                    scenario_id, actor_id=NEWCOMER, user_id=NEWCOMER,
+                    role=Role.LEAGUE_ADMIN, scope={})
+            except BaseException as error:
+                commit["error"] = error
+
+        commit_thread = threading.Thread(target=run_commit, daemon=True)
+        commit_thread.start()
+        commit_thread.join(timeout=3)
+        self.assertTrue(
+            commit_thread.is_alive(),
+            "the scenario commit was NOT blocked behind the first "
+            "selection's mutex -- it entered its SERIALIZABLE transaction and "
+            "resolved tuple A while tuple B was still uncommitted, so it can "
+            "land Program A's reviewed Games after B is persisted")
+
+        release.set()
+        selection.join(20)
+        commit_thread.join(40)
+        if sel_state["error"] is not None:
+            raise sel_state["error"]
+        self.assertTrue(sel_state["done"])
+        self.assertEqual(self.store.get_active_context(NEWCOMER).program_id,
+                         self.pb)
+        if commit["error"] is not None:
+            raise commit["error"]
+
+        result = commit["result"]
+        self.assertIn(
+            "error", result,
+            "a Program A scenario was COMMITTED after the caller's first "
+            "context selection put them in Program B")
+        # The existing non-oracle refusal, unchanged.
+        self.assertEqual(result["error"]["details"]["reason"],
+                         "schedule_scenario_missing", result)
+        # All four effect classes.
+        self.assertEqual(self.store.all_games(), games_before, "Games")
+        self.assertEqual({s.id: s.status
+                          for s in self.store.all_ice_slots()},
+                         slots_before, "ice slots")
+        self.assertEqual(
+            sum(1 for row in self.store.all_setup_audit()
+                if row.action == "draft_schedule_committed"),
+            draft_audit_before, "draft-commit audit")
+        self.assertEqual(
+            sum(1 for row in self.store.all_setup_audit()
+                if row.action == "schedule_scenario_committed"),
+            scenario_audit_before, "scenario-commit audit")
+        self.assertTrue(self._mutex_is_free())
+
     def _mutex_is_free(self):
         """Can a SEPARATE session take the per-user mutex right now?
 
