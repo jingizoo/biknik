@@ -1800,6 +1800,15 @@ class SqlStore:
         previously-saved League with NULL rather than leaving a stale one bound
         to a context it may not belong to."""
         with self.transaction():
+            # #386 — take the SAME row lock the authorizing readers take
+            # (`get_active_context_for_update`) BEFORE writing, so the two
+            # order against each other on the database rather than merely
+            # observing individually-consistent snapshots. Without it a
+            # context switch could commit between an authorization and the
+            # write it authorized. On a first write there is no row to lock;
+            # the ON CONFLICT below and the reader's SERIALIZABLE isolation
+            # carry the ordering for that case.
+            self._get_for_update(ActiveContext, ctx.id)
             self._exec(
                 "INSERT INTO user_active_context "
                 "(id, program_id, season_id, updated_at, league_id) "

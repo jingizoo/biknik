@@ -1112,6 +1112,17 @@ class InMemoryStore:
     def get_active_context(self, user_id: str) -> Optional[ActiveContext]:
         return self.user_active_context.get(user_id)
 
+    def get_active_context_for_update(
+            self, user_id: str) -> Optional[ActiveContext]:
+        """#386 — the row-locking read, a documented no-op here.
+
+        The process-wide lock this store takes for the whole
+        ``transaction()`` block already serializes every writer, so the
+        ordering guarantee ``SqlStore``'s ``SELECT ... FOR UPDATE`` buys is
+        already held. Present so call sites can use ONE spelling on every
+        backend rather than branching on the store type."""
+        return self.user_active_context.get(user_id)
+
     def set_active_context(self, ctx: ActiveContext) -> ActiveContext:
         self.user_active_context[ctx.id] = ctx
         return ctx
