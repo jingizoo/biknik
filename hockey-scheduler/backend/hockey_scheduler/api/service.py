@@ -6444,47 +6444,112 @@ class ApiService:
         mutations with `setup_guarded_mutation`, and the shape of the fix is
         the same: LOCK, then DECIDE, then MUTATE, all in one transaction.
 
-        Three locks, in this order:
+        Four steps, and the ORDER of the last two is the repo's canonical
+        **Program → Team → Rink → Season → Game** lock order, not this
+        method's own preference:
 
-        1. the caller's **ActiveContext row** (`resolve_with_league(lock=True)`)
-           — `set_active_context` takes the same one before writing, so a
-           context switch either orders wholly before this authorization or
-           waits for the write it authorized to commit;
-        2. every candidate draft **Game row** (`get_game_for_update`), taken in
-           sorted id order so two concurrent batches cannot deadlock;
-        3. the Season rows, taken by the callers' own `_guard_active_seasons`
-           after this returns — unchanged, and still after the Game locks.
+        1. the caller's **ActiveContext mutex + row** (`resolve_with_league(
+           lock=True)`) — `set_active_context` takes the same, so a context
+           switch either orders wholly before this authorization or waits for
+           the write it authorized to commit;
+        2. the **pre-lock locator**: read the candidate drafts with no locks,
+           apply the caller's selection, and AUTHORIZE each one. Authorizing
+           here, before any Season is touched, is deliberate — locking the
+           Seasons of unauthorized candidates would run
+           `_require_active_season` against a foreign Season and turn its
+           `season_read_only` refusal into an existence oracle;
+        3. the **Season** rows named by that plan (`_guard_active_seasons`,
+           sorted);
+        4. the **Game** rows (`get_game_for_update`, sorted).
 
-        The authorization then runs on the RE-READ, post-lock Game rows, never
-        on the pre-lock snapshot: a Game whose `division_id` or
-        `league_season_id` was moved out of the tuple between the read and the
-        lock is judged on what it is NOW.
+        Season BEFORE Game is load-bearing. An earlier revision locked Games
+        first and left `_guard_active_seasons` to the callers afterwards, which
+        reversed the order every single-Game path already uses:
+        `SetupService.publish_game` and `delete_game` lock the Season through
+        `_guard_game_season` and only then touch the Game. A batch discard and
+        a concurrent single-Game publish could therefore form an ABBA wait —
+        batch holding a Game and waiting for a Season, single path holding that
+        Season and waiting for that Game — and PostgreSQL would kill one of
+        them as a deadlock. One canonical order removes the cycle outright
+        rather than making it rarer.
+
+        The plan is then RE-VERIFIED on the locked rows: each Game must still
+        be a draft, still authorized, and still sit in a Season this
+        transaction actually locked. Any drift means the pre-lock locator read
+        a world that no longer exists, and the whole attempt restarts against a
+        fresh plan (`placement_raced` — the same reason and the same bounded
+        retry `commit_draft_schedule` already uses for its own locator).
         """
         drafts = [g for g in self.store.all_games() if g.is_draft]
         if role is None:
-            # Ungated and untouched: no context read, no lock, no re-read.
-            return self._select_draft_targets(drafts, game_ids, all_drafts)
+            # Ungated: no context read, no context lock, no re-read. The
+            # SEASON guard still runs, because it is not part of the #386
+            # binding at all — it is #159's archived-Season read-only rule,
+            # which every caller of this method has always been subject to.
+            # Moving it in here without this branch silently dropped it for
+            # the identity-less path (caught by
+            # `test_season_lifecycle...test_reminders_and_draft_batches_blocked`).
+            legacy = self._select_draft_targets(drafts, game_ids, all_drafts)
+            self._guard_active_seasons([g.season_id for g in legacy])
+            return legacy
         program, season, league = self.context.resolve_with_league(
             user_id, role, scope, lock=True)
         if program is None:
             return []
-        # Selected FIRST so only the rows this call could act on are locked —
-        # `all_drafts` still means every draft, and an explicit id list locks
-        # just those. Sorted, so two concurrent batches take the Game locks in
-        # one global order and cannot deadlock against each other.
-        candidates = sorted(
-            g.id for g in self._select_draft_targets(
-                drafts, game_ids, all_drafts))
+        # -- step 2: the pre-lock locator, authorized before anything is
+        # locked. Selection applies first so an explicit id list plans only
+        # those rows; `all_drafts` still means every draft of this tuple.
+        planned = [g for g in self._select_draft_targets(
+            drafts, game_ids, all_drafts)
+            if self._game_in_active_tuple(g, program, season, league)]
+        planned_seasons = {g.season_id for g in planned if g.season_id}
+
+        # -- step 3: SEASONS first, sorted, matching every other path.
+        self._guard_active_seasons(planned_seasons)
+
+        # -- step 4: then the Games, sorted, so two concurrent batches take
+        # them in one global order and cannot deadlock against each other.
         targets = []
-        for game_id in candidates:
+        for game_id in sorted(g.id for g in planned):
             locked = self.store.get_game_for_update(game_id)
             # Judged on the RE-READ row: `is_draft` and every parent as they
             # stand under the lock, never as the pre-lock scan saw them.
-            if (locked is not None and locked.is_draft
-                    and self._game_in_active_tuple(
-                        locked, program, season, league)):
-                targets.append(locked)
+            if locked is None or not locked.is_draft:
+                continue
+            if not self._game_in_active_tuple(locked, program, season,
+                                              league):
+                continue
+            if locked.season_id not in planned_seasons:
+                # The row moved to a Season this transaction never locked, so
+                # the writes below would touch unlocked ice. Restart against a
+                # fresh plan rather than proceed on a scope we do not hold.
+                raise ConcurrencyConflictError(
+                    "A draft game's season changed while processing the "
+                    "request; please retry.",
+                    {"reason": "placement_raced"})
+            targets.append(locked)
         return targets
+
+    _DRAFT_BATCH_RETRIES = 3
+
+    def _retry_on_plan_race(self, attempt):
+        """Run ``attempt()``, restarting it on ``placement_raced`` (#386).
+
+        `_locked_draft_targets` builds its plan from an UNLOCKED read and then
+        re-verifies it once the Season and Game locks are held. When the world
+        moved in that window it raises `placement_raced` and the whole
+        transaction rolls back, so a retry re-reads a snapshot that includes
+        the winner and either plans against the new truth or refuses. Bounded,
+        exactly like `commit_draft_schedule`'s own locator retry; the last
+        attempt surfaces the stable conflict rather than spinning.
+        """
+        for index in range(self._DRAFT_BATCH_RETRIES):
+            try:
+                return attempt()
+            except ConcurrencyConflictError as exc:
+                if ((exc.details or {}).get("reason") != "placement_raced"
+                        or index == self._DRAFT_BATCH_RETRIES - 1):
+                    raise
 
     @catch
     def publish_draft_games(self, game_ids=None, all_drafts=False,
@@ -6512,6 +6577,18 @@ class ApiService:
         published nor counted, and ``all_drafts`` means all of the caller's
         own.
         """
+        def attempt():
+            return self._publish_draft_games_attempt(
+                game_ids, all_drafts, actor_id, user_id, role, scope)
+        return self._retry_on_plan_race(attempt)
+
+    def _publish_draft_games_attempt(self, game_ids, all_drafts, actor_id,
+                                     user_id, role, scope) -> dict:
+        """One attempt of :meth:`publish_draft_games` (#386).
+
+        Undecorated on purpose, exactly like
+        ``_commit_draft_schedule_attempt``: a ``placement_raced`` must reach
+        the retry shell as an EXCEPTION, not as a serialized error dict."""
         published = 0
         # An identified caller opens SERIALIZABLE, because the authorization
         # inside reads the context through `ContextService._snapshot`, which
@@ -6542,9 +6619,10 @@ class ApiService:
             # rows the writes below use, rather than on a pre-lock snapshot.
             for g in targets:
                 self.setup._revalidate_game_participation(g)
-            # #159 — lock every target Season (sorted), before any slot/Game
-            # write, so no write precedes the guard.
-            self._guard_active_seasons([g.season_id for g in targets])
+            # #159's Season guard now runs INSIDE `_locked_draft_targets`,
+            # BEFORE the Game locks (#386 re-review): Season-before-Game is
+            # the repo's canonical order, and taking it here instead would
+            # reverse it against `SetupService.publish_game`/`delete_game`.
             for g in targets:
                 # Allocate the ice slot, matching the manual create_game
                 # invariant (a game's slot is ALLOCATED, not left AVAILABLE) —
@@ -6586,6 +6664,15 @@ class ApiService:
         ``_locked_draft_targets``. A foreign draft Game is not a target, so it
         is neither deleted nor audited, and ``all_drafts`` means all of the
         caller's own."""
+        def attempt():
+            return self._discard_draft_games_attempt(
+                game_ids, all_drafts, actor_id, user_id, role, scope)
+        return self._retry_on_plan_race(attempt)
+
+    def _discard_draft_games_attempt(self, game_ids, all_drafts, actor_id,
+                                     user_id, role, scope) -> dict:
+        """One attempt of :meth:`discard_draft_games` (#386) — undecorated, so
+        a ``placement_raced`` reaches the retry shell as an exception."""
         discarded = 0
         # #159 — lock every distinct target Season (sorted) and delete inside
         # ONE transaction: an archived-Season draft aborts the whole batch
@@ -6594,9 +6681,10 @@ class ApiService:
         # an identified caller (the nested context read asks for it).
         with self.store.transaction(
                 isolation=None if role is None else "SERIALIZABLE"):
+            # The Season guard runs inside `_locked_draft_targets`, before
+            # the Game locks — canonical Season-before-Game order (#386).
             targets = self._locked_draft_targets(
                 game_ids, all_drafts, user_id, role, scope)
-            self._guard_active_seasons([g.season_id for g in targets])
             for g in targets:
                 self.setup._audit("draft_game_discarded", "game", g.id,
                                   actor_id, {"division_id": g.division_id,
