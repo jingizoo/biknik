@@ -293,20 +293,21 @@ class DemoDeterminismTest(unittest.TestCase):
             built, _gid, _ids = build_full_demo_store(store,
                                                       seed_instant=FAR_FUTURE)
             digests[label] = inventory_digest(built)
-            # Premise guard: really on the backend this subTest claims, so an
-            # equal digest is evidence about three stores and not one.
+            # Premise guard: really on the backend this label claims, so an
+            # equal digest is evidence about several stores and not one store
+            # measured several times.
             self.assertEqual(built.__class__.__name__,
                              "InMemoryStore" if url is None else "SqlStore",
                              label)
             if url is not None:
                 built.close()
+        # 3 without a Postgres URL, 4 with one (CI and run_parallel set it).
         self.assertGreaterEqual(len(digests), 3, digests)
         self.assertEqual(len(set(digests.values())), 1, digests)
 
     def test_identical_across_processes_with_different_hash_seeds(self):
         script = (
             "import sys, os; sys.path.insert(0, os.environ['HS_BACKEND']);"
-            "from datetime import datetime, timezone;"
             "sys.path.insert(0, os.environ['HS_TESTS']);"
             "from test_demo_relative_ice import inventory_digest, FAR_FUTURE;"
             "from hockey_scheduler.full_demo import build_full_demo_store;"
