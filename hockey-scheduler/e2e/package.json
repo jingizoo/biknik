@@ -57,6 +57,7 @@
     "player-lifecycle": "node player-lifecycle.js",
     "season-dates": "node season-dates.js",
     "calendar-today": "node calendar-today.js",
+    "pr-body-check": "node check-pr-body.js",
     "scheduling-policy": "node scheduling-policy.js",
     "season-fmt-unit": "node season-fmt-unit.js",
     "breakpoint-contract": "node breakpoint-contract.js",
