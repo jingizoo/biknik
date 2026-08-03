@@ -49,6 +49,13 @@ from .push_transport import (
     push_transport_from_env,
 )
 from .roster_service import RosterService
+from .schedule_scenarios import (
+    SCENARIO_PLANNER_VERSION,
+    canonical_fingerprint,
+    changed_snapshot_sections,
+    material_input_snapshot,
+    resolve_scenario_scope,
+)
 
 __all__ = ["RosterService", "SetupService", "DeliveryWorker", "DeliveryLoop",
            "delivery_loop_from_env", "enqueue",
@@ -66,4 +73,7 @@ __all__ = ["RosterService", "SetupService", "DeliveryWorker", "DeliveryLoop",
            "IMPORT_SHEET_NAMES",
            "parse_csv_text",
            "validate_import", "validate_official_availability",
+           "SCENARIO_PLANNER_VERSION", "canonical_fingerprint",
+           "changed_snapshot_sections", "material_input_snapshot",
+           "resolve_scenario_scope",
            "FactoryResetService", "CONFIRMATION_PHRASE"]

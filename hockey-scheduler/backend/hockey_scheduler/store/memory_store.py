@@ -45,6 +45,7 @@ from ..domain import (
     Player,
     RescheduleRequest,
     Rink,
+    ScheduleScenario,
     Season,
     SeasonTeamRegistration,
     SeasonVenueAccess,
@@ -87,6 +88,7 @@ class InMemoryStore:
         self.rinks: Dict[str, Rink] = {}
         self.ice_slots: Dict[str, IceSlot] = {}
         self.scheduling_policies: Dict[str, SchedulingPolicy] = {}
+        self.schedule_scenarios: Dict[str, ScheduleScenario] = {}
         self.officials: Dict[str, Official] = {}
         self.official_assignments: Dict[str, OfficialAssignment] = {}
         self.game_results: Dict[str, GameResult] = {}
@@ -713,6 +715,26 @@ class InMemoryStore:
 
     def all_scheduling_policies(self) -> List[SchedulingPolicy]:
         return list(self.scheduling_policies.values())
+
+    # -- immutable schedule scenarios (#378) -----------------------------
+    def add_schedule_scenario(self, scenario: ScheduleScenario) -> ScheduleScenario:
+        # SQL persistence naturally serializes nested JSON.  Deep-copy here for
+        # parity so a caller mutating the response object cannot mutate the
+        # historical snapshot held by the in-memory store.
+        stored = copy.deepcopy(scenario)
+        self.schedule_scenarios[stored.id] = stored
+        return copy.deepcopy(stored)
+
+    def get_schedule_scenario(self, scenario_id: str) -> Optional[ScheduleScenario]:
+        scenario = self.schedule_scenarios.get(scenario_id)
+        return copy.deepcopy(scenario) if scenario is not None else None
+
+    def get_schedule_scenario_for_update(
+            self, scenario_id: str) -> Optional[ScheduleScenario]:
+        return self.get_schedule_scenario(scenario_id)
+
+    def all_schedule_scenarios(self) -> List[ScheduleScenario]:
+        return [copy.deepcopy(s) for s in self.schedule_scenarios.values()]
 
     def find_scheduling_policy(self, scope_type, scope_id):
         scope_type = getattr(scope_type, "value", scope_type)

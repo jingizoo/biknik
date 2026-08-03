@@ -275,6 +275,39 @@ class SchedulingPolicy:
 
 
 @dataclass
+class ScheduleScenario:
+    """An immutable, named scheduler generation (#206/#378).
+
+    ``proposal`` is the exact generator response the operator reviews.  It is
+    intentionally opaque here: the scheduler owns that payload's fields and
+    ordering, while this record only preserves it field-for-field and in order.
+    The canonical ``generation_snapshot`` describes every authoritative material
+    input read for that generation and ``input_fingerprint`` binds the snapshot
+    to the later atomic commit.
+
+    There is deliberately no mutable lifecycle/status field.  Committing a
+    scenario creates separate draft Games; publishing those Games remains the
+    existing distinct operation.  A scenario itself is historical evidence and
+    is never rewritten to reflect either action.
+    """
+    id: str
+    name: str
+    program_id: str
+    season_id: str
+    league_id: str
+    league_season_id: str
+    division_id: Optional[str]
+    planner_version: str
+    input_fingerprint: str
+    proposal_fingerprint: str
+    request_input: dict
+    proposal: dict
+    generation_snapshot: dict
+    created_at: datetime
+    created_by: Optional[str] = None
+
+
+@dataclass
 class RescheduleRequest:
     """A controlled request→approval→republish flow to move a PUBLISHED
     game (#29) — an uncontrolled move is the operator-only `move_game`

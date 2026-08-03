@@ -209,7 +209,9 @@ class SeasonRegistrationPersistenceTest(unittest.TestCase):
         # shape (per-Season leagues; season_id + league_id on divisions and
         # registrations; no permanent Team.league_id), so the pre-028 reversal
         # below — written against that shape — still applies. 035 re-runs on
-        # reopen alongside 021 and 028.
+        # reopen alongside 021 and 028. Migration 050 is a hierarchy child, so
+        # rewind it first and replay it after the parents as well.
+        cur.execute("DROP TABLE IF EXISTS schedule_scenarios")
         cur.execute("DROP INDEX IF EXISTS ix_leagues_program")
         cur.execute("ALTER TABLE leagues ADD COLUMN season_id TEXT")
         cur.execute("UPDATE leagues SET season_id = (SELECT MIN(ls.season_id) "
@@ -272,7 +274,8 @@ class SeasonRegistrationPersistenceTest(unittest.TestCase):
         cur.execute("DROP TABLE IF EXISTS season_team_registrations")
         cur.execute("DELETE FROM schema_migrations WHERE version IN "
                     "('021_permanent_teams', '028_competition_reset', "
-                    "'035_competition_hierarchy_reset')")
+                    "'035_competition_hierarchy_reset', "
+                    "'050_schedule_scenarios')")
         store.conn.commit()
         del api, store
 
@@ -282,6 +285,8 @@ class SeasonRegistrationPersistenceTest(unittest.TestCase):
         self.assertEqual(len(regs), 1)
         self.assertEqual(regs[0].team_id, team["id"])
         self.assertEqual(regs[0].division_id, division["id"])
+        self.assertIn("050_schedule_scenarios",
+                      reopened.migration_status()["applied"])
 
 
 if __name__ == "__main__":

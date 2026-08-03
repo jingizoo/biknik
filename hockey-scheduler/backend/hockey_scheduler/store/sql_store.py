@@ -67,6 +67,7 @@ from ..domain import (
     InstallationState,
     RosterRole,
     Season,
+    ScheduleScenario,
     SeasonStatus,
     SeasonTeamRegistration,
     SeasonVenueAccess,
@@ -170,6 +171,12 @@ class Spec:
 
 
 SPECS = {
+    # Child of the permanent scheduling hierarchy; keep it before its parents
+    # so SQLite factory-reset deletion follows child-first FK order.
+    ScheduleScenario: Spec(
+        ScheduleScenario, "schedule_scenarios",
+        {"request_input": _jsonc(), "proposal": _jsonc(),
+         "generation_snapshot": _jsonc(), "created_at": _dt()}),
     Program: Spec(Program, "programs"),
     Season: Spec(Season, "seasons", {"start_date": _dt(), "end_date": _dt(),
                                      "status": _enum(SeasonStatus),
@@ -1391,6 +1398,15 @@ class SqlStore:
         self._delete(SchedulingPolicy, policy_id)
     def all_scheduling_policies(self):
         return self._query(SchedulingPolicy, order="id")
+
+    # -- immutable schedule scenarios (#378) -----------------------------
+    def add_schedule_scenario(self, scenario): return self._insert(scenario)
+    def get_schedule_scenario(self, scenario_id):
+        return self._get(ScheduleScenario, scenario_id)
+    def get_schedule_scenario_for_update(self, scenario_id):
+        return self._get_for_update(ScheduleScenario, scenario_id)
+    def all_schedule_scenarios(self):
+        return self._query(ScheduleScenario, order="id")
     def find_scheduling_policy(self, scope_type, scope_id):
         return self._first(SchedulingPolicy, "scope_type = ? AND scope_id = ?",
                            (getattr(scope_type, "value", scope_type), scope_id))

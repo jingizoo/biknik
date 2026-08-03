@@ -27,6 +27,7 @@ from hockey_scheduler.store.sql_store import migrate
 
 _VERSION = "028_competition_reset"
 _V035 = "035_competition_hierarchy_reset"
+_V050 = "050_schedule_scenarios"
 
 
 def _sql_backends():
@@ -93,9 +94,16 @@ def _downgrade_035(store):
     legacy-shaped data. Runs on a freshly-migrated (empty) database, so only the
     SCHEMA is reversed — 035 added ``league_seasons`` + ``teams.league_id`` +
     ``leagues.program_id`` and folded ``divisions``/registration
-    ``season_id``+``league_id`` into ``league_season_id``; this restores those."""
+    ``season_id``+``league_id`` into ``league_season_id``; this restores those.
+    Later tables that reference the 035 hierarchy are removed and un-recorded
+    too, so the forward migration replay rebuilds a complete canonical schema."""
     with store.transaction():
         cur = store.conn.cursor()
+        # 050 references league_seasons (and the other permanent scope tables).
+        # PostgreSQL therefore requires the dependent table to be removed before
+        # this historical test can rewind 035. Replaying 050 below proves the
+        # current schema still composes over the legacy upgrade path.
+        cur.execute("DROP TABLE IF EXISTS schedule_scenarios")
         cur.execute("DROP INDEX IF EXISTS ix_teams_league")
         cur.execute("ALTER TABLE teams DROP COLUMN league_id")
         cur.execute("DROP INDEX IF EXISTS ux_team_league_season")
@@ -114,7 +122,8 @@ def _downgrade_035(store):
         cur.execute("DROP INDEX IF EXISTS ux_league_season")
         cur.execute("DROP TABLE IF EXISTS league_seasons")
         cur.execute(store.dialect.sql(
-            "DELETE FROM schema_migrations WHERE version = ?"), (_V035,))
+            "DELETE FROM schema_migrations WHERE version IN (?, ?)"),
+            (_V035, _V050))
 
 
 def _downgrade_028(store):

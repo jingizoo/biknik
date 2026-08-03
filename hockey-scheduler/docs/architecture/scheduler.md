@@ -1189,3 +1189,114 @@ scope-locator staleness reason #313/#314/#318 use, which the retry shell
 DOES retry) precisely so none of them are ever retried. `placement_raced`
 is not scheduler-specific; it is shared with every other placement path
 that re-verifies a pre-lock locator under its locks.
+
+## Named immutable scenarios (#378)
+
+`POST /api/scheduler/scenarios` generates the existing deterministic proposal
+inside one repeatable-read transaction and persists it as a new named
+`ScheduleScenario`. Generation writes no Game and allocates no slot. The record
+stores the exact proposal as opaque JSON (including all proposed fixtures and
+unplaced explanation values), the permanent Program → League plus Season →
+LeagueSeason/optional Division scope, the planner version, the original slot /
+constraint input, and a canonical material-input snapshot. There is no update
+method or mutable status field; committing creates separate draft Games and
+publishing remains the existing separate operation.
+
+The material snapshot is a delimiter-safe canonical JSON document whose SHA-256
+identity covers the scoped hierarchy records, every registration in the target
+LeagueSeason and its permanent Team, SeasonVenueAccess and candidate
+Venue/Rink/ice inventory, relevant Games (including lock/cancel/publish/draft
+state), stored constraint/blackout input, and every applicable Program/Season/
+Rink scheduling-policy row. Neighbor Games on candidate Rinks contribute their
+own Season/Program policy scopes because the directional turnover rule reads
+them too. Each section also has its own fingerprint so a refusal can name what
+changed without exposing database details.
+
+`POST /api/scheduler/scenarios/{id}/commit` opens one transaction, row-locks
+the immutable scenario, expands the existing scheduler's ordered Program →
+Team → Rink → Season lock plan with the scenario's material Venue and existing
+Game rows, then re-reads that complete material input and compares it with the
+generation snapshot before any Game/audit/slot write. A
+mismatch refuses the whole operation as `schedule_scenario_stale`, with
+`changed_inputs`, `required_action = "generate_new_scenario"`, and generated /
+current input fingerprints. With identical inputs, the stored reviewed proposal
+is passed into the existing draft-commit gate; the gate still owns lock order,
+competition participation, exact-pairing, physical slot, team-overlap, and
+policy checks. The shared locks give the stale comparison an explicit
+linearization point: a material writer either committed before the comparison
+or remains blocked until the all-or-nothing draft transaction finishes. The
+outer transaction makes the snapshot check, every created draft Game, every
+slot allocation, and both audit records one all-or-nothing unit on Memory,
+SQLite, and PostgreSQL; transient lock-plan races restart from a fresh
+transaction.
+
+This layer does not interpret or reshape unplaced explanations and does not add
+format knobs. Explanation fields/order/caps remain the generator's contract;
+configurable meetings and deterministic home/away remain #375's contract.
+
+### The format a scenario replays under (#382)
+
+A scenario is generated under one regular-season format and must **commit under
+that same one**. `meetings_per_opponent` is therefore persisted, not re-derived:
+
+- create passes the caller's requested value to the generator and then stores
+  **the generator's own resolved answer** (`proposal["meetings_per_opponent"]`)
+  in `request_input`, so an omitted format is recorded as the explicit `1` it
+  really ran under rather than left absent;
+- it is also part of the material snapshot's `planner_input`, because the same
+  registrations and the same ice produce a different fixture list under a
+  different N — the format is a material input, not a request detail;
+- commit passes that stored value into the draft-commit gate, where the
+  under-lock regeneration uses it. Omitting it re-derives the historical single
+  round-robin, whose `draft_fingerprint` no longer matches the reviewed one, so
+  a double round-robin would be refused as `preview_stale` instead of
+  committing its 2 × C(n,2) fixtures;
+- the stored format and the persisted proposal's format are covered by two
+  **independent** fingerprints, so their agreement is checked explicitly at
+  commit. A disagreement is `schedule_scenario_integrity_error` with
+  `fields: ["meetings_per_opponent"]` — a rewritten record cannot quietly
+  change the size of the schedule a reviewed scenario commits.
+
+### Authorization is not part of this layer's staleness contract
+
+Everything above is about whether the reviewed *world* still holds. Whether the
+caller may act on this scenario at all is a separate, earlier question, answered
+by the active-tuple rule in
+[active-context-scoping.md](active-context-scoping.md#named-schedule-scenarios-378--381)
+— including a re-authorization at commit time that runs under the scenario's
+row lock, inside this same transaction.
+
+### What immutability actually rests on
+
+A scenario has no update and no delete: the store exposes `add`, `get`,
+`get_..._for_update` and `all`, and nothing else, on either backend. Everything
+handed to a caller is deep-copied, so a client cannot reach the stored evidence
+through a response object. The remaining ways the record could still change out
+from under a commit are covered explicitly:
+
+- **the two fingerprints are re-checked at commit.** `input_fingerprint` covers
+  the generation snapshot and `proposal_fingerprint` the reviewed proposal, and
+  both are recomputed inside the write transaction. Without them a rewritten
+  proposal commits a batch nobody reviewed, and a rewritten snapshot silently
+  redefines what "nothing changed" means;
+- **the scope is held by its parents.** All five FK parents — Program, Season,
+  League, LeagueSeason, Division — name the scenario as an itemised dependent,
+  so none of them can be deleted out from under it. (The corollary is real and
+  deliberate: a scenario is permanent, so the Division it names can never be
+  deleted again. There is no scenario delete verb by design — it is evidence.)
+
+### Mutations that hold this section
+
+Recorded in re-review; each clause below survived deletion with a green suite
+before its test existed.
+
+| mutation | verbatim failure |
+| --- | --- |
+| drop the `proposal_fingerprint` integrity check | `'slot_unavailable' != 'schedule_scenario_integrity_error'` |
+| drop the `input_fingerprint` (generation-snapshot) integrity check | *"a scenario whose generation_snapshot no longer matches its own input_fingerprint COMMITTED"* |
+| blank the snapshot's `scope` section | *"the scope section changed after generation and the commit went through anyway"* — six of the seven sections had a stale test; this one did not |
+| drop the `planner_version` arm of the stale check | *"a scenario from a superseded planner version COMMITTED"* |
+| drop the `schedule scenario` dependent group from any of the five parent deletes | *"deleting the season did not name the scenario that references it: ['level', 'division', 'team registration', 'venue access']"* (and the Program / League / LeagueSeason / Division forms) |
+| drop the snapshot's Venue row locks from the commit lock plan | *"a Venue write COMPLETED while this commit held the scenario's lock plan — the snapshot's Venue rows are not being row-locked"* (PostgreSQL) |
+| replace `_commit_schedule_scenario_attempt`'s `store.transaction()` with a no-op context manager | *"the draft gate's Games survived a failure in the enclosing unit — the scenario commit is not one transaction with it"* — every other rollback test fails INSIDE the draft gate, whose own transaction would undo the Games regardless, so nothing was holding the outer unit |
+| drop `IF NOT EXISTS` from migration 050's table / index | `sqlite3.OperationalError: table schedule_scenarios already exists` / `index ix_schedule_scenarios_scope already exists` — the hierarchy-rewind tests DROP the table before replaying, so its re-runnability was never exercised |
