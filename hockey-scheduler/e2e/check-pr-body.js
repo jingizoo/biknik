@@ -51,11 +51,20 @@ const FULL_DEMO = path.join(
 const APP_JS = path.join(
   ROOT, "hockey-scheduler/backend/hockey_scheduler/web/static/app.js");
 
-// Prose that was true of the superseded body and is false at this head. Each
-// entry is a claim a reader would act on, not a stylistic preference.
+// Prose from the superseded body that is false at this head.
+//
+// Deliberately narrow: only strings that CANNOT be a historical aside. A body
+// should be free to explain what it replaced ("the first round put day zero on
+// the first Saturday…"), and no regex can reliably tell that from a live claim.
+// So anything a fact above already covers rigorously is left to the fact — the
+// `weekday_snap` check reads _DEMO_WEEKDAY straight out of the source, which
+// beats grepping prose for "Saturday" and never mistakes history for a claim.
+//
+// What remains are the two structural headings a reader navigates by, and the
+// one claim no derived fact covers: whether EXISTING tests changed
+// (`backend_tests_changed` counts changed files, and cannot distinguish an
+// added file from a modified one).
 const STALE_PROSE = [
-  { re: /first Saturday/i,
-    why: "claims day zero snaps to a Saturday; the snap was removed" },
   { re: /Outstanding\s*\/\s*not fixed here/i,
     why: "lists work as outstanding that this head actually does" },
   { re: /browser gates\s*\|?\s*in progress/i,
@@ -130,7 +139,9 @@ function parseFactBlock(body) {
   }
   const facts = {};
   for (const line of m[1].split("\n")) {
-    const kv = line.match(/^\s*([a-z_]+)\s*:\s*(\S+)\s*$/);
+    // Digits belong in key names too — `e2e_files_changed` was silently
+    // unparsed and reported "(missing)" while sitting right there in the block.
+    const kv = line.match(/^\s*([a-z0-9_]+)\s*:\s*(\S+)\s*$/);
     if (kv) facts[kv[1]] = kv[2];
   }
   return facts;
