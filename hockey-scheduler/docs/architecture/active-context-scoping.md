@@ -797,21 +797,50 @@ So the whole unit — resolve, authorize, validate, mutate — is one
 context read asks for that level, and a nested join may never *raise* the open
 transaction's isolation). `_locked_draft_targets` takes three locks in order:
 
-1. the caller's **ActiveContext row**
+1. the caller's **per-user ActiveContext mutex, then its row**
    (`resolve_with_league(..., lock=True)` → `get_active_context_for_update`).
-   `set_active_context` takes the **same** lock before writing, so a context
-   switch either orders wholly before the authorization or waits for the write
-   it authorized to commit. The row may not exist yet (a caller on
-   `_fallback`); `FOR UPDATE` then locks nothing and the `SERIALIZABLE`
-   read-write anti-dependency against the first `INSERT` carries the ordering
-   instead. Both halves are needed;
-2. every candidate draft **Game row** (`get_game_for_update`), in sorted id
-   order so two concurrent batches cannot deadlock;
-3. the **Season** rows, unchanged, still after the Game locks.
+   `set_active_context` takes the **same** mutex before writing;
+2. the **pre-lock locator**: the candidate drafts, read unlocked, selected, and
+   **authorized** — before any Season is touched, because locking the Season of
+   an unauthorized candidate would run `_require_active_season` against a
+   foreign Season and turn its `season_read_only` refusal into an existence
+   oracle;
+3. the **Season** rows named by that plan (`_guard_active_seasons`, sorted);
+4. the **Game** rows (`get_game_for_update`, sorted).
 
-The authorization then runs on the **re-read, post-lock** Game rows, so a Game
-whose parents moved between the scan and the lock is judged on what it is now.
-The commit path's under-lock re-authorization takes the same context lock.
+**An absent-row read is not a lock.** The row lock alone covered only callers
+who had already saved a selection. A brand-new operator has no row, so
+`FOR UPDATE` locks nothing, and an earlier revision leaned on `SERIALIZABLE`'s
+read→write anti-dependency to order the first `INSERT` — which PostgreSQL is
+not obliged to abort. That operator could authorize from fallback tuple A, make
+their first saved selection B concurrently, and commit **both**. The fix is a
+transaction-scoped **advisory lock** keyed on the user id
+(`_lock_active_context_mutex`), which has the one property a row lock cannot
+have here: it exists before the row does. Both sides take it, which is what
+makes it a mutex rather than a hint. `hashtext` collisions merely serialize two
+unrelated users. SQLite and the in-memory store are documented no-ops — their
+`transaction()` holds a process-wide lock, which is strictly stronger.
+
+**Season before Game, because that is the repo's order.** An earlier revision
+locked Games first and left `_guard_active_seasons` to the callers afterwards,
+reversing what every single-Game path does: `SetupService.publish_game` and
+`delete_game` lock the Season through `_guard_game_season` and only then touch
+the Game. Batch Game→Season against single Season→Game is an ABBA cycle, and
+PostgreSQL resolves those by killing one side — a 500 on a legitimate pair of
+requests. One canonical order removes the cycle instead of making it rarer.
+
+Locking Seasons from an **unlocked** plan opens a window, so the plan is
+**re-verified** on the locked rows: each Game must still be a draft, still
+authorized, and still sit in a Season this transaction actually locked. Drift
+raises `placement_raced`, rolls the attempt back, and restarts under a bounded
+retry (3 attempts). That retry also covers `serialization_failure`: it is the
+*same* race caught by the database a moment earlier, and refusing it would turn
+an ordinary concurrent edit into a user-visible 409 on a request that succeeds
+when re-run.
+
+The authorization runs on the **re-read, post-lock** Game rows, so a Game whose
+parents moved between the scan and the lock is judged on what it is now. The
+commit path's under-lock re-authorization takes the same context mutex.
 
 **The league-scoped facade no longer resolves the batch twice.** It used to
 override `publish_draft_games` entirely, resolve the targets itself, and then
@@ -877,6 +906,30 @@ were asserted by prose and by nothing else:
 | replace the full parent-graph walk with the reduced `season_id` + `league_id` edge | 16 subtests: *"a draft Game with a parent outside the active tuple was served to the review screen — the WHOLE parent graph decides, not season_id + league_id"* |
 | drop the ActiveContext row lock from `resolve_with_league(lock=True)` | *"the operator's context switch COMPLETED at the first publish_game while the write verb held its transaction — the ActiveContext row is not locked, so the verb can mutate under a tuple that no longer authorizes it"* — 4 of the 5 race tests, the anti-vacuity control correctly still passing |
 | decide the batch OUTSIDE the write transaction | the same assertion, from the publish race |
+| drop the advisory lock from `get_active_context_for_update` | all four first-selection races: *"the caller's FIRST context selection COMPLETED at … while the write verb held its transaction — with no row to lock there is nothing serializing them, so the verb can write under tuple A while tuple B is persisted"* |
+| drop the advisory lock from `set_active_context` | the same four, with the same assertion — both sides must take it or it is not a mutex |
+| restore Game-before-Season order | all three batch-vs-single barriers: `'error' unexpectedly found in {… "reason": "deadlock_detected" …}` |
+
+**The first-selection cases needed their own class, and that is the point.**
+`DraftActiveTupleRaceTest` persists a tuple in `setUp`, so every one of its
+tests exercises the existing-row lock — the advisory mutex shipped for one
+round completely unfalsifiable behind it.
+`DraftFirstSelectionRaceTest` starts with **no row**, on its own user id so the
+other classes cannot create one for it, and every test **asserts the row is
+absent** before racing: a fixture change that quietly creates it fails loudly
+rather than testing nothing. It also asserts the newcomer's `_fallback` really
+resolves to the corner the batch was committed into, so a refusal can never
+come from scope instead of from the lock. Four operations — commit, publish,
+explicit `game_ids` discard, `all_drafts` discard — each observing the block,
+then the completion, then one of the two valid serial outcomes, then zero
+cross-tuple effect.
+
+`DraftBatchVersusSingleGameLockOrderTest` fires its barrier at the batch's
+**second** Game lock, so under the old order the batch provably *holds* a Game
+while it still needs the Season — the half of the cycle a deadlock requires.
+Its fourth test forces the window the reorder opens (a target moving to an
+unplanned Season between locator and lock) and asserts the abandoned attempt
+left no audit rows behind.
 
 The full-graph matrix runs **16 cases, each on its own hierarchy** so no case
 can pass or fail for another's reason: foreign / sibling-League / other-Season
