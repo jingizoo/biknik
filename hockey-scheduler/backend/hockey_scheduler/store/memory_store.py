@@ -1109,6 +1109,16 @@ class InMemoryStore:
         return [s for s in self.sessions.values() if s.user_id == user_id]
 
     # -- per-user active Program/Season context (#159) ---------------------
+    @contextmanager
+    def active_context_mutex(self, user_id: str):
+        """#386 — a documented no-op, matching ``SqlStore``'s spelling.
+
+        ``transaction()`` holds the process-wide lock for its whole block, so
+        a mutation unit here is already serialized against every context write
+        — strictly stronger than the cross-transaction mutex PostgreSQL needs.
+        """
+        yield
+
     def get_active_context(self, user_id: str) -> Optional[ActiveContext]:
         return self.user_active_context.get(user_id)
 

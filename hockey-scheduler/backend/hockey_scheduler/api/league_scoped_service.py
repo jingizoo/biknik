@@ -158,7 +158,13 @@ class ApiService(_BaseApiService):
         # `ContextService._snapshot`, which asks for SERIALIZABLE, and a nested
         # join may never RAISE the open transaction's isolation. `role is None`
         # keeps the previous default level byte-for-byte.
-        with self.store.transaction(
+        # #386 — the per-user mutex wraps this unit from OUTSIDE the
+        # transaction, so the SERIALIZABLE snapshot the re-authorization below
+        # reads is created only after any competing context selection has
+        # finished. Nested scenario commits pass `role is None` and take
+        # nothing, so they cannot deadlock against their own outer unit.
+        with self._active_context_mutex(user_id, role), \
+                self.store.transaction(
                 isolation=None if role is None else "SERIALIZABLE"):
             # #277/#313/#318 — the global Program→Team→Rink→Season lock
             # order, exactly as the base facade: Program rows (policy scopes

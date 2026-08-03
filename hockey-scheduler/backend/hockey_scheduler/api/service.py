@@ -7,6 +7,7 @@ web framework) never see Python tracebacks across the boundary.
 """
 
 import copy
+from contextlib import contextmanager
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -5775,7 +5776,13 @@ class ApiService:
         # scenario commit path passes no principal of its own (it re-authorizes
         # the SCENARIO under its own row lock, #381) and simply joins the
         # SERIALIZABLE transaction that path already opened.
-        with self.store.transaction(
+        # #386 — the per-user mutex wraps this unit from OUTSIDE the
+        # transaction, so the SERIALIZABLE snapshot the re-authorization below
+        # reads is created only after any competing context selection has
+        # finished. Nested scenario commits pass `role is None` and take
+        # nothing, so they cannot deadlock against their own outer unit.
+        with self._active_context_mutex(user_id, role), \
+                self.store.transaction(
                 isolation=None if role is None else "SERIALIZABLE"):
             # #277/#313/#318 — the global Program→Team→Rink→Season lock
             # order: the Program rows (policy scopes the per-row gate reads —
@@ -6550,6 +6557,25 @@ class ApiService:
             targets.append(locked)
         return targets
 
+    @contextmanager
+    def _active_context_mutex(self, user_id, role):
+        """Hold the per-user context mutex around a whole mutation unit (#386).
+
+        Entered OUTSIDE the unit's transaction, so the wait for a competing
+        context selection finishes BEFORE the SERIALIZABLE snapshot is
+        created. A mutex taken inside that transaction is acquired by a
+        statement that has already fixed the snapshot, so winning it conveys
+        nothing — see `SqlStore.active_context_mutex`.
+
+        `role is None` takes nothing at all: the identity-less path is ungated
+        and must not be made to wait on, or deadlock with, anybody.
+        """
+        if role is None or not user_id:
+            yield
+            return
+        with self.store.active_context_mutex(user_id):
+            yield
+
     _DRAFT_BATCH_RETRIES = 3
     # Both ways the plan can be invalidated by a concurrent writer, and both
     # leave a fully rolled-back transaction behind, so both are safe to retry.
@@ -6632,7 +6658,13 @@ class ApiService:
         # asks for that level, and a nested join may never RAISE the isolation
         # of the open transaction. `role is None` keeps the previous default
         # level byte-for-byte and takes no context read at all.
-        with self.store.transaction(
+        #
+        # The per-user mutex wraps the transaction from OUTSIDE (#386): the
+        # snapshot must be created after any competing context selection has
+        # finished, and a lock taken inside the transaction is taken by a
+        # statement that has already fixed that snapshot.
+        with self._active_context_mutex(user_id, role), \
+                self.store.transaction(
                 isolation=None if role is None else "SERIALIZABLE"):
             targets = self._locked_draft_targets(
                 game_ids, all_drafts, user_id, role, scope)
@@ -6715,8 +6747,11 @@ class ApiService:
         # ONE transaction: an archived-Season draft aborts the whole batch
         # with zero deletes/audits, and the lock is held through the writes.
         # #386 — the target decision joins that same unit, at SERIALIZABLE for
-        # an identified caller (the nested context read asks for it).
-        with self.store.transaction(
+        # an identified caller (the nested context read asks for it), and the
+        # per-user mutex wraps it from OUTSIDE so the snapshot is created
+        # after any competing context selection has finished.
+        with self._active_context_mutex(user_id, role), \
+                self.store.transaction(
                 isolation=None if role is None else "SERIALIZABLE"):
             # The Season guard runs inside `_locked_draft_targets`, before
             # the Game locks — canonical Season-before-Game order (#386).

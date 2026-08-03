@@ -1802,6 +1802,63 @@ class SqlStore:
         self._exec("SELECT pg_advisory_xact_lock(?, hashtext(?))",
                    (self._ACTIVE_CONTEXT_LOCK_NAMESPACE, user_id))
 
+    @contextmanager
+    def active_context_mutex(self, user_id):
+        """Hold the per-user context mutex ACROSS a whole mutation unit (#386).
+
+        The transaction-scoped lock alone cannot order this, and the reason is
+        exact: PostgreSQL fixes a SERIALIZABLE transaction's view at its FIRST
+        query, and `SELECT pg_advisory_xact_lock(...)` *is* a query. A batch
+        that issues it, blocks behind a first selection, and then wins the lock
+        still holds the snapshot that statement took — taken BEFORE the
+        selection committed. Winning the lock tells it nothing it had not
+        already decided: it sees no saved context, resolves the fallback tuple
+        and mutates it after the real selection is persisted. **Blocking on a
+        lock does not refresh a view the blocking statement itself took.**
+
+        So the wait has to happen OUTSIDE the transaction that authorizes.
+        This is a SESSION-scoped advisory lock taken before ``BEGIN`` and held
+        across commit or rollback, so the mutation unit's snapshot is created
+        only after the wait is over — and any selection that lands afterwards
+        blocks until this unit is completely finished.
+
+        RELEASING IS THE DANGEROUS PART, and it is why this is a context
+        manager rather than a pair of calls. A session lock survives rollback
+        and survives the connection being reused; leaking it once leaves that
+        user permanently unable to schedule. The ``finally`` therefore always
+        runs, and if the connection is in an aborted state (the unit raised
+        mid-transaction) it is rolled back first so the unlock can execute —
+        an unlock that silently failed would be exactly the leak this guards
+        against. A failure to release is re-raised, never swallowed: a leaked
+        mutex must be loud.
+
+        MUST be entered OUTSIDE any transaction; asserted, because acquiring
+        inside one would reintroduce the very ordering bug it exists to fix.
+        SQLite is a no-op — its ``transaction()`` holds the process-wide lock,
+        which is strictly stronger and needs no cross-transaction mutex.
+        """
+        if not user_id or self.backend != "postgres":
+            yield
+            return
+        if self._txn_depth > 0:
+            raise RuntimeError(
+                "active_context_mutex() must be entered OUTSIDE any "
+                "transaction: a mutex acquired inside the transaction it "
+                "protects is taken by a statement that has already fixed "
+                "that transaction's snapshot")
+        key = (self._ACTIVE_CONTEXT_LOCK_NAMESPACE, user_id)
+        self._exec("SELECT pg_advisory_lock(?, hashtext(?))", key)
+        try:
+            yield
+        finally:
+            try:
+                self._exec("SELECT pg_advisory_unlock(?, hashtext(?))", key)
+            except Exception:
+                # The unit failed mid-transaction and left the connection
+                # aborted. Clear it and release anyway — never leak.
+                self.conn.rollback()
+                self._exec("SELECT pg_advisory_unlock(?, hashtext(?))", key)
+
     def get_active_context(self, user_id):
         return self._get(ActiveContext, user_id)
 

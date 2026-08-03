@@ -2105,6 +2105,198 @@ class DraftFirstSelectionRaceTest(unittest.TestCase):
             self.assertEqual(len(result["created"]), 6, result)
             self.assertEqual(len(in_a), 6)
 
+    def test_a_batch_waiting_behind_a_first_selection_observes_it(self):
+        """SELECTION first, batch second -- the mirror of every race above.
+
+        All the others race BATCH-first: the batch already owns the mutex when
+        the selection starts, so they prove exclusion and nothing else. The
+        unproven order is the one that matters here, and it defeats a mutex
+        taken INSIDE the mutation transaction:
+
+        1. the first context-selection transaction acquires the per-user mutex
+           and pauses before committing tuple B;
+        2. the batch opens SERIALIZABLE and issues its lock query -- and
+           **that query establishes the batch's snapshot**, then blocks;
+        3. the selection commits B and releases;
+        4. the batch wins the lock, but its already-fixed snapshot predates B,
+           so it still sees NO saved context, resolves fallback tuple A, and
+           mutates A after B is persisted.
+
+        Blocking on a lock does not refresh a view that the blocking statement
+        itself already took. The mutex therefore has to be acquired BEFORE the
+        transaction that authorizes, so the snapshot is created after the wait.
+        """
+        self._assert_no_saved_context()
+        before = self._snapshot()
+
+        selector = SqlStore(os.environ["TEST_DATABASE_URL"])
+        holding = threading.Event()
+        release = threading.Event()
+        selection = {"error": None, "done": False}
+        plain_exec = selector._exec
+
+        def pause_holding_the_mutex(query, params=()):
+            result = plain_exec(query, params)
+            # After the INSERT, still inside the selection's transaction: it
+            # holds the per-user mutex and has NOT committed B yet.
+            if "user_active_context" in query and "INSERT" in query.upper():
+                holding.set()
+                release.wait(30)
+            return result
+
+        selector._exec = pause_holding_the_mutex
+
+        def run_selection():
+            try:
+                ApiService(selector).set_active_context(
+                    NEWCOMER, Role.LEAGUE_ADMIN, {}, self.pb, self.sb,
+                    self.lb)
+                selection["done"] = True
+            except BaseException as error:
+                selection["error"] = error
+
+        selection_thread = threading.Thread(target=run_selection, daemon=True)
+        selection_thread.start()
+        self.addCleanup(release.set)
+        self.assertTrue(holding.wait(15),
+                        "the selection never reached its INSERT, so it never "
+                        "held the mutex and this race never set up")
+
+        batch = {"result": None, "error": None}
+
+        def run_batch():
+            try:
+                batch["result"] = self.api.discard_draft_games(
+                    game_ids=list(self.committed), actor_id=NEWCOMER,
+                    user_id=NEWCOMER, role=Role.LEAGUE_ADMIN, scope={})
+            except BaseException as error:
+                batch["error"] = error
+
+        batch_thread = threading.Thread(target=run_batch, daemon=True)
+        batch_thread.start()
+        batch_thread.join(timeout=3)
+        self.assertTrue(
+            batch_thread.is_alive(),
+            "the batch was NOT blocked behind the first selection's mutex -- "
+            "it never contended for it at all, so this test would prove "
+            "nothing about what the batch sees after waiting")
+
+        release.set()
+        selection_thread.join(20)
+        batch_thread.join(40)
+        if selection["error"] is not None:
+            raise selection["error"]
+        self.assertTrue(selection["done"], "the paused selection never landed")
+        self.assertEqual(self.store.get_active_context(NEWCOMER).program_id,
+                         self.pb)
+        if batch["error"] is not None:
+            raise batch["error"]
+
+        result = batch["result"]
+        self.assertNotIn("error", result, result)
+        # THE assertion. The batch waited for the mutex; what it authorizes
+        # against afterwards must be the tuple that won, not the fallback its
+        # pre-wait snapshot would still show.
+        self.assertEqual(
+            result["discarded"], 0,
+            "the batch discarded Program A's drafts after waiting behind a "
+            "first selection that committed tuple B -- its snapshot was fixed "
+            "by the lock query itself, so winning the lock told it nothing it "
+            "had not already decided")
+        self._assert_no_cross_tuple_write(before, set(self.committed))
+
+    def _mutex_is_free(self):
+        """Can a SEPARATE session take the per-user mutex right now?
+
+        The only honest way to ask: a session-scoped advisory lock is invisible
+        to the session that holds it (it would re-acquire its own lock
+        immediately), so a leak can only be detected from outside.
+        """
+        prober = SqlStore(os.environ["TEST_DATABASE_URL"])
+        try:
+            row = prober._exec(
+                "SELECT pg_try_advisory_lock(?, hashtext(?)) AS got",
+                (SqlStore._ACTIVE_CONTEXT_LOCK_NAMESPACE, NEWCOMER)
+            ).fetchone()
+            got = bool(row["got"])
+            if got:
+                prober._exec(
+                    "SELECT pg_advisory_unlock(?, hashtext(?))",
+                    (SqlStore._ACTIVE_CONTEXT_LOCK_NAMESPACE, NEWCOMER))
+            return got
+        finally:
+            prober.close()
+
+    def test_the_session_mutex_is_released_when_the_unit_raises(self):
+        """The most dangerous line in this change, tested directly.
+
+        A SESSION-scoped advisory lock survives rollback and survives the
+        connection being handed back to a pool. Leak it once and that user can
+        never schedule again — every later batch for them blocks forever. So
+        the release has to be guaranteed on the error path, not just the happy
+        one, and the proof has to come from ANOTHER session: the holder itself
+        would re-acquire its own lock without noticing.
+        """
+        self.assertTrue(self._mutex_is_free(),
+                        "the mutex was already held before this test ran")
+
+        boom = RuntimeError("mid-unit failure")
+        original = self.store.get_game_for_update
+
+        def explode(game_id):
+            raise boom
+
+        self.store.get_game_for_update = explode
+        try:
+            with self.assertRaises(RuntimeError):
+                self.api.discard_draft_games(
+                    game_ids=list(self.committed), actor_id=NEWCOMER,
+                    user_id=NEWCOMER, role=Role.LEAGUE_ADMIN, scope={})
+        finally:
+            self.store.get_game_for_update = original
+
+        self.assertTrue(
+            self._mutex_is_free(),
+            "the per-user mutex was NOT released after the unit raised -- a "
+            "session-scoped lock survives rollback, so this user is now "
+            "permanently unable to run any scheduling batch")
+        # ...and the very next operation for the SAME user still works, which
+        # is the property a freed lock is supposed to buy.
+        self.assertNotIn("error", _ok(self.api.discard_draft_games(
+            game_ids=list(self.committed), actor_id=NEWCOMER,
+            user_id=NEWCOMER, role=Role.LEAGUE_ADMIN, scope={})))
+        self.assertTrue(self._mutex_is_free(),
+                        "the mutex was not released after a SUCCESSFUL unit")
+
+    def test_the_session_mutex_is_released_when_the_unit_refuses(self):
+        """The domain-refusal path releases too -- a refusal rolls the
+        transaction back through a different route from an exception."""
+        self.assertTrue(self._mutex_is_free())
+        _ok(self.api.set_active_context(
+            NEWCOMER, Role.LEAGUE_ADMIN, {}, self.pb, self.sb, self.lb))
+        # Now out of tuple: the batch authorizes nothing and writes nothing.
+        result = _ok(self.api.discard_draft_games(
+            game_ids=list(self.committed), actor_id=NEWCOMER,
+            user_id=NEWCOMER, role=Role.LEAGUE_ADMIN, scope={}))
+        self.assertEqual(result["discarded"], 0, result)
+        self.assertTrue(
+            self._mutex_is_free(),
+            "the per-user mutex was not released after a refusing unit")
+
+    def test_the_mutex_may_not_be_taken_inside_a_transaction(self):
+        """The ordering rule, enforced in the store rather than by comment.
+
+        Acquiring inside the transaction it protects is precisely the bug this
+        replaces, so it is refused outright instead of being left as something
+        a future call site could reintroduce silently.
+        """
+        with self.assertRaises(RuntimeError) as caught:
+            with self.store.transaction():
+                with self.store.active_context_mutex(NEWCOMER):
+                    pass
+        self.assertIn("OUTSIDE any transaction", str(caught.exception))
+        self.assertTrue(self._mutex_is_free())
+
     def test_the_mutex_is_held_before_the_snapshot_is_established(self):
         """The mutex must be taken before ANY read that fixes the snapshot.
 
