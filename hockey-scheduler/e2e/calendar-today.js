@@ -217,6 +217,36 @@ async function checkViewport(browser, viewport) {
       fail(`breadcrumb disagrees with the tile: "${crumb}"`);
     }
 
+    // (5) The games card SAYS which list it is showing.
+    //
+    // The demo's first game is a few days out, never today — day zero cannot
+    // be today without being past-dated for part of the day, which is the
+    // failure #387 removed. So the card falls back from "today's games" to the
+    // whole schedule, and the point is that it RELABELS itself when it does:
+    // the blocker for this change was a silent fallback, and this is what
+    // keeps it from being silent. A card headed "Today's Games" while listing
+    // games that are not today is the thing being ruled out.
+    const card = await page.evaluate(() => {
+      // The games card is the one whose header links onward to Games.
+      const link = document.querySelector('.dash-card [data-goto="games"]');
+      if (!link) return null;
+      const box = link.closest(".dash-card");
+      const head = box.querySelector(".dash-card-head");
+      return {
+        title: head.querySelector("h3").textContent.trim(),
+        sub: head.querySelector(".dch-sub").textContent.trim(),
+        rows: box.querySelectorAll(".tg-row").length,
+      };
+    });
+    if (!card) fail("the dashboard has no games card");
+    if (card.title !== "Scheduled Games") {
+      fail(`games card is headed "${card.title}" with nothing scheduled today; `
+        + `it must relabel itself rather than call the fallback "Today's Games"`);
+    }
+    if (card.sub !== `${card.rows} games`) {
+      fail(`games card counts "${card.sub}" but lists ${card.rows} rows`);
+    }
+
     if (errors.length) fail(`browser errors: ${errors.join(" | ")}`);
     console.log(`  ${viewport.label}: calendar opens on ${today}, `
       + `"Today" returns there, slot drawer follows the viewed day, `
