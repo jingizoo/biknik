@@ -1738,21 +1738,23 @@ class DraftFirstSelectionRaceTest(unittest.TestCase):
         self.store = fresh_sql_store(os.environ["TEST_DATABASE_URL"])
         self.api = ApiService(self.store)
         self.fixture = build_two_programs(self.api)
-        # `_fallback` picks the first authorized Program by id and, within it,
-        # the LATEST active Season -- Season A2, not A1. The fixture is bound
-        # to whichever corner it really resolves to rather than to a guess,
-        # and then ASSERTED, so a fixture change that moves the fallback fails
-        # here instead of silently testing an unauthorized corner.
-        self.pa, self.sa, self.la, self.da = corner(
-            self.fixture, "A", "2", "a")
-        self.pb, self.sb, self.lb, _db = corner(self.fixture, "B", "1", "a")
+        # `_fallback` picks the first authorized Program by id STRING and,
+        # within it, the latest active Season. Which corner that lands on
+        # depends on the store's id counters, which PostgreSQL test databases
+        # carry across runs -- so the corner is DERIVED from the resolution
+        # rather than hard-coded, and then asserted to be a real, schedulable
+        # one. Hard-coding it made this class pass or fail on counter state.
         program, season, league = self.api.context.resolve_with_league(
             NEWCOMER, Role.LEAGUE_ADMIN, {})
-        self.assertEqual(
-            (program.id, season.id, league), (self.pa, self.sa, None),
-            "the newcomer's FALLBACK tuple is not the corner this fixture "
-            "commits into, so the races below would refuse for scope reasons "
-            "rather than exercising the first-selection lock")
+        self.assertIsNotNone(program, "the newcomer resolved no Program")
+        self.assertIsNotNone(season, "the newcomer resolved no Season")
+        self.assertIsNone(league, "a newcomer cannot have a saved League")
+        self.pa, self.sa, self.la, self.da = self._corner_at(
+            program.id, season.id)
+        # The switch target must be a genuinely DIFFERENT Program, or the
+        # races would prove nothing about crossing the tuple.
+        self.pb, self.sb, self.lb, _db = self._other_program_corner(program.id)
+        self.assertNotEqual(self.pa, self.pb)
         # Committed as an identity-less internal caller, so the batch exists
         # WITHOUT the newcomer ever having saved a context.
         preview = _ok(self.api.draft_season_schedule(division_id=self.da))
@@ -1765,6 +1767,36 @@ class DraftFirstSelectionRaceTest(unittest.TestCase):
 
     def tearDown(self):
         self.store.close()
+
+    def _corner_at(self, program_id, season_id):
+        """The fixture corner the newcomer's FALLBACK really resolved to.
+
+        Asserted to exist: if the fallback ever lands somewhere this fixture
+        did not build a schedulable corner for, every race below would refuse
+        for scope reasons instead of exercising the lock, and that must fail
+        loudly here rather than pass quietly there.
+        """
+        for tag, programs in self.fixture.items():
+            if programs["program"] != program_id:
+                continue
+            for season in programs["seasons"].values():
+                if season["season"] != season_id:
+                    continue
+                league = sorted(season["leagues"])[0]
+                return corner(self.fixture, tag,
+                              next(k for k, v in programs["seasons"].items()
+                                   if v["season"] == season_id), league)
+        self.fail(f"the newcomer's fallback ({program_id}, {season_id}) is "
+                  "not a corner this fixture built")
+
+    def _other_program_corner(self, program_id):
+        for tag, programs in self.fixture.items():
+            if programs["program"] == program_id:
+                continue
+            season_tag = sorted(programs["seasons"])[0]
+            league = sorted(programs["seasons"][season_tag]["leagues"])[0]
+            return corner(self.fixture, tag, season_tag, league)
+        self.fail("the fixture has only one Program")
 
     def _assert_no_saved_context(self):
         """The anti-vacuity guard: this whole class is about the ABSENT row."""
@@ -1982,6 +2014,85 @@ class DraftFirstSelectionRaceTest(unittest.TestCase):
             # hold at the time.
             self.assertEqual(len(result["created"]), 6, result)
             self.assertEqual(len(in_a), 6)
+
+    def test_the_mutex_is_held_before_the_snapshot_is_established(self):
+        """The mutex must be taken before ANY read that fixes the snapshot.
+
+        The four races above all start the racing selection at the batch's
+        first Game MUTATION, by which point the batch already owns the mutex —
+        so they cannot see this window at all. It opens strictly earlier: the
+        batch reads its candidate Games, which under SERIALIZABLE establishes
+        the transaction's snapshot, and only THEN takes the mutex. A first
+        selection landing in between acquires the (still free) advisory lock,
+        inserts tuple B and commits — and when the batch finally takes the
+        mutex its snapshot predates that INSERT, so it still resolves fallback
+        tuple A and writes A after B is persisted. The original absent-row
+        race, shifted one step earlier.
+
+        The barrier therefore fires at the batch's FIRST candidate read, which
+        is the earliest point inside the transaction that has read anything.
+        The racing selection must be BLOCKED there: if it can complete, the
+        batch does not yet hold the mutex, and its snapshot is already fixed.
+        """
+        self._assert_no_saved_context()
+        before = self._snapshot()
+        race = {"worker": None, "error": None, "done": False}
+
+        def first_selection_on_second_connection():
+            other = SqlStore(os.environ["TEST_DATABASE_URL"])
+            try:
+                ApiService(other).set_active_context(
+                    NEWCOMER, Role.LEAGUE_ADMIN, {}, self.pb, self.sb,
+                    self.lb)
+                race["done"] = True
+            except BaseException as error:
+                race["error"] = error
+            finally:
+                other.close()
+
+        original = self.store.all_games
+        seen = {"calls": 0}
+
+        def read_with_a_racing_first_selection():
+            seen["calls"] += 1
+            if seen["calls"] == 1:
+                worker = threading.Thread(
+                    target=first_selection_on_second_connection, daemon=True)
+                race["worker"] = worker
+                worker.start()
+                worker.join(timeout=2)
+                self.assertTrue(
+                    worker.is_alive(),
+                    "the caller's FIRST context selection COMPLETED at the "
+                    "batch's first candidate read -- the batch had already "
+                    "established its SERIALIZABLE snapshot without holding "
+                    "the per-user mutex, so it will resolve the stale "
+                    "fallback tuple A and write A after B is persisted")
+            return original()
+
+        self.store.all_games = read_with_a_racing_first_selection
+        try:
+            result = self.api.discard_draft_games(
+                game_ids=list(self.committed), actor_id=NEWCOMER,
+                user_id=NEWCOMER, role=Role.LEAGUE_ADMIN, scope={})
+        finally:
+            self.store.all_games = original
+
+        self.assertGreaterEqual(seen["calls"], 1,
+                                "the batch never read its candidates, so the "
+                                "barrier never fired")
+        if race["worker"] is not None:
+            race["worker"].join(timeout=15)
+            self.assertFalse(race["worker"].is_alive(),
+                             "the blocked first selection never completed")
+        if race["error"] is not None:
+            raise race["error"]
+        self.assertTrue(race["done"])
+        self.assertEqual(self.store.get_active_context(NEWCOMER).program_id,
+                         self.pb, "the racing first selection did not land")
+        self.assertNotIn("error", result, result)
+        self.assertIn(result["discarded"], (0, 6), result)
+        self._assert_no_cross_tuple_write(before, set(self.committed))
 
     def test_the_first_selection_completes_freely_when_nothing_holds_it(self):
         """The anti-vacuity control for the four races above.

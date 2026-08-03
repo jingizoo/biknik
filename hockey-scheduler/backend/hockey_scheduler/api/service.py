@@ -6480,6 +6480,21 @@ class ApiService:
         fresh plan (`placement_raced` — the same reason and the same bounded
         retry `commit_draft_schedule` already uses for its own locator).
         """
+        # -- step 1 FIRST, before ANY other read. Under SERIALIZABLE the
+        # transaction's snapshot is established by its first data-reading
+        # statement, so a mutex acquired after the candidate read is too late
+        # by construction: a first selection can slip in between, take the
+        # still-free advisory lock, insert tuple B and commit, and the batch's
+        # already-fixed snapshot will not see that row -- it resolves the
+        # stale fallback tuple A and writes A after B is persisted. Taking the
+        # mutex here makes ITS statement the one that fixes the snapshot, so
+        # whatever the batch goes on to read is at least as new as the tuple
+        # it authorized against.
+        if role is not None:
+            program, season, league = self.context.resolve_with_league(
+                user_id, role, scope, lock=True)
+            if program is None:
+                return []
         drafts = [g for g in self.store.all_games() if g.is_draft]
         if role is None:
             # Ungated: no context read, no context lock, no re-read. The
@@ -6492,10 +6507,6 @@ class ApiService:
             legacy = self._select_draft_targets(drafts, game_ids, all_drafts)
             self._guard_active_seasons([g.season_id for g in legacy])
             return legacy
-        program, season, league = self.context.resolve_with_league(
-            user_id, role, scope, lock=True)
-        if program is None:
-            return []
         # -- step 2: the pre-lock locator, authorized before anything is
         # locked. Selection applies first so an explicit id list plans only
         # those rows; `all_drafts` still means every draft of this tuple.
