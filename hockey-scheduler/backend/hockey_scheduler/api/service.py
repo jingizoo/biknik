@@ -6531,23 +6531,40 @@ class ApiService:
         return targets
 
     _DRAFT_BATCH_RETRIES = 3
+    # Both ways the plan can be invalidated by a concurrent writer, and both
+    # leave a fully rolled-back transaction behind, so both are safe to retry.
+    _DRAFT_BATCH_RETRYABLE = frozenset({"placement_raced",
+                                        "serialization_failure"})
 
     def _retry_on_plan_race(self, attempt):
-        """Run ``attempt()``, restarting it on ``placement_raced`` (#386).
+        """Run ``attempt()``, restarting it when its plan was invalidated
+        (#386).
 
         `_locked_draft_targets` builds its plan from an UNLOCKED read and then
-        re-verifies it once the Season and Game locks are held. When the world
-        moved in that window it raises `placement_raced` and the whole
-        transaction rolls back, so a retry re-reads a snapshot that includes
-        the winner and either plans against the new truth or refuses. Bounded,
-        exactly like `commit_draft_schedule`'s own locator retry; the last
-        attempt surfaces the stable conflict rather than spinning.
+        re-verifies it once the Season and Game locks are held. Two things can
+        invalidate it in that window, and neither is the caller's fault:
+
+        * a Game moved to a Season this transaction never locked — caught by
+          the re-verify itself and raised as `placement_raced`;
+        * PostgreSQL aborted the SERIALIZABLE transaction outright because a
+          concurrent writer committed a change to a row it had already read.
+          That is the SAME race, detected by the database a moment earlier
+          rather than by the re-verify; refusing it would turn an ordinary
+          concurrent edit into a user-visible 409 on a request that would
+          succeed if simply re-run.
+
+        Either way the whole transaction has rolled back, so a retry re-reads a
+        snapshot that includes the winner and plans against the new truth.
+        Bounded, exactly like `commit_draft_schedule`'s own locator retry and
+        `setup_guarded_mutation`'s; the last attempt surfaces the stable
+        conflict rather than spinning.
         """
         for index in range(self._DRAFT_BATCH_RETRIES):
             try:
                 return attempt()
             except ConcurrencyConflictError as exc:
-                if ((exc.details or {}).get("reason") != "placement_raced"
+                reason = (exc.details or {}).get("reason")
+                if (reason not in self._DRAFT_BATCH_RETRYABLE
                         or index == self._DRAFT_BATCH_RETRIES - 1):
                     raise
 

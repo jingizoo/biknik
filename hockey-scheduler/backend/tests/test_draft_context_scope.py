@@ -1460,6 +1460,249 @@ class DraftActiveTupleRaceTest(unittest.TestCase):
 
 
 @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "needs PostgreSQL: a deadlock is a DATABASE outcome")
+class DraftBatchVersusSingleGameLockOrderTest(unittest.TestCase):
+    """The batch verbs and the single-Game verbs, forced to meet.
+
+    `_locked_draft_targets` used to lock Game rows and leave
+    `_guard_active_seasons` to its callers AFTERWARDS, which is the reverse of
+    what every single-Game path does: `SetupService.publish_game` and
+    `delete_game` lock the Season through `_guard_game_season` and only then
+    touch the Game. Batch Game->Season against single Season->Game is an ABBA
+    cycle, and PostgreSQL resolves those by killing one side — a 500 on a
+    perfectly legitimate pair of requests.
+
+    One canonical order (**Season before Game**) removes the cycle rather than
+    making it rarer, and these tests force the exact interleaving that would
+    expose it. The barrier fires at the batch's SECOND Game lock, so under the
+    old order the batch provably HOLDS a Game while it still needs the Season,
+    which is the half of the cycle that has to exist for a deadlock at all.
+    """
+
+    maxDiff = None
+
+    def setUp(self):
+        self.store = fresh_sql_store(os.environ["TEST_DATABASE_URL"])
+        self.api = ApiService(self.store)
+        self.fixture = build_two_programs(self.api)
+        self.pa, self.sa, self.la, self.da = corner(
+            self.fixture, "A", "1", "a")
+        _ok(self.api.set_active_context(
+            ADMIN, Role.LEAGUE_ADMIN, {}, self.pa, self.sa, self.la))
+        preview = _ok(self.api.draft_season_schedule(
+            division_id=self.da, user_id=ADMIN, role=Role.LEAGUE_ADMIN,
+            scope={}))
+        self.committed = [row["game_id"] for row in _ok(
+            self.api.commit_draft_schedule(
+                division_id=self.da,
+                draft_fingerprint=preview["draft_fingerprint"],
+                actor_id=ADMIN, user_id=ADMIN, role=Role.LEAGUE_ADMIN,
+                scope={}), "seed commit")["created"]]
+        self.assertEqual(len(self.committed), 6)
+
+    def tearDown(self):
+        self.store.close()
+
+    def _single_game_worker(self, single_op):
+        """A SECOND connection running a single-Game mutation on one of the
+        batch's own targets — the other half of the would-be cycle."""
+        race = {"worker": None, "error": None, "done": False}
+
+        def run():
+            other = SqlStore(os.environ["TEST_DATABASE_URL"])
+            try:
+                single_op(ApiService(other))
+                race["done"] = True
+            except BaseException as error:   # surfaced on the test thread
+                race["error"] = error
+            finally:
+                other.close()
+
+        race["start"] = lambda: race.__setitem__(
+            "worker", self._start(run, race))
+        return race
+
+    def _start(self, run, race):
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(timeout=2)
+        self.assertTrue(
+            worker.is_alive(),
+            "the single-Game path COMPLETED while the batch held its "
+            "transaction -- it never contended for the batch's Season, so "
+            "this barrier is not exercising the lock order at all")
+        return worker
+
+    def _run_batch_with_the_single_path_at_the_second_game_lock(
+            self, batch_op, single_op):
+        """Fire ``single_op`` on another connection once the batch has locked
+        its FIRST Game, then let the batch finish. Returns the batch result."""
+        race = self._single_game_worker(single_op)
+        original = self.store.get_game_for_update
+        seen = {"calls": 0}
+
+        def locking_with_a_racing_single_path(game_id):
+            seen["calls"] += 1
+            if seen["calls"] == 2:
+                # One Game is already locked by this transaction. Under the
+                # OLD order no Season is held yet, so the single path can take
+                # the Season and then block on that Game — and the batch's own
+                # later Season guard closes the cycle.
+                race["start"]()
+            return original(game_id)
+
+        self.store.get_game_for_update = locking_with_a_racing_single_path
+        try:
+            result = batch_op()
+        finally:
+            self.store.get_game_for_update = original
+
+        self.assertGreaterEqual(
+            seen["calls"], 2,
+            "the batch locked fewer than two Games, so the barrier never "
+            "fired and this test proves nothing")
+        race["worker"].join(timeout=20)
+        self.assertFalse(race["worker"].is_alive(),
+                         "the single-Game path never completed")
+        return result, race
+
+    @staticmethod
+    def _assert_no_deadlock(error):
+        if error is None:
+            return
+        text = f"{type(error).__name__}: {error}"
+        assert "deadlock" not in text.lower(), (
+            f"the batch and single-Game paths DEADLOCKED: {text}")
+
+    def test_batch_publish_versus_single_game_publish(self):
+        target = self.committed[0]
+
+        def batch():
+            return self.api.publish_draft_games(
+                game_ids=list(self.committed), actor_id=ADMIN,
+                user_id=ADMIN, role=Role.LEAGUE_ADMIN, scope={})
+
+        def single(other_api):
+            other_api.setup.publish_game(target, True, "racer")
+
+        result, race = self._run_batch_with_the_single_path_at_the_second_game_lock(
+            batch, single)
+        self._assert_no_deadlock(race["error"])
+        self.assertNotIn("error", result, result)
+        self.assertEqual(result["published"], 6, result)
+        if race["error"] is not None:
+            raise race["error"]
+        # A valid serial result: the batch published all six, and the single
+        # publish of one of them is a no-op re-publish rather than a failure.
+        self.assertEqual(
+            {g.id for g in self.store.all_games() if g.published},
+            set(self.committed))
+        self.assertEqual(
+            [g.is_draft for g in self.store.all_games()], [False] * 6)
+
+    def test_batch_discard_versus_single_game_delete(self):
+        target = self.committed[0]
+
+        def batch():
+            return self.api.discard_draft_games(
+                game_ids=list(self.committed), actor_id=ADMIN,
+                user_id=ADMIN, role=Role.LEAGUE_ADMIN, scope={})
+
+        def single(other_api):
+            other_api.setup.delete_game(target, "racer")
+
+        result, race = self._run_batch_with_the_single_path_at_the_second_game_lock(
+            batch, single)
+        self._assert_no_deadlock(race["error"])
+        self.assertNotIn("error", result, result)
+        self.assertEqual(result["discarded"], 6, result)
+        # The batch ordered first and deleted everything, so the single delete
+        # finds nothing — a valid serial outcome, and NOT a deadlock.
+        self.assertEqual(self.store.all_games(), [])
+        if race["error"] is not None:
+            self.assertIn("not found", str(race["error"]).lower(),
+                          f"unexpected single-delete failure: {race['error']}")
+
+    def test_batch_publish_versus_single_delete_of_a_target(self):
+        """The opposite pairing: batch PUBLISH against single DELETE. The two
+        verbs touch the same rows through different code paths, so both
+        directions of the pair are exercised rather than one."""
+        target = self.committed[0]
+
+        def batch():
+            return self.api.publish_draft_games(
+                game_ids=list(self.committed), actor_id=ADMIN,
+                user_id=ADMIN, role=Role.LEAGUE_ADMIN, scope={})
+
+        def single(other_api):
+            other_api.setup.delete_game(target, "racer")
+
+        result, race = self._run_batch_with_the_single_path_at_the_second_game_lock(
+            batch, single)
+        self._assert_no_deadlock(race["error"])
+        self.assertNotIn("error", result, result)
+        # Serial either way: the batch published all six first, so the delete
+        # then refuses (a published Game is not a deletable draft). What must
+        # never happen is a deadlock or a half-published batch.
+        self.assertEqual(result["published"], 6, result)
+        self.assertEqual(
+            {g.id for g in self.store.all_games() if g.published},
+            set(self.committed))
+
+    def test_a_target_changing_season_between_plan_and_lock_is_retried(self):
+        """The bounded re-read/retry the reordering needs.
+
+        Locking Seasons before Games means the Season set is chosen from an
+        UNLOCKED read, so a Game can move to a Season this transaction never
+        locked in the window between. The batch must notice under the lock and
+        restart against a fresh plan rather than write onto ice it does not
+        hold — and the abandoned attempt must leave nothing behind.
+        """
+        moved = self.committed[-1]
+        other_season = self.fixture["A"]["seasons"]["2"]["season"]
+        audit_before = len(self.store.all_setup_audit())
+        original = self.store.get_game_for_update
+        seen = {"calls": 0, "moved": False}
+
+        def move_one_target_mid_plan(game_id):
+            seen["calls"] += 1
+            if seen["calls"] == 1 and not seen["moved"]:
+                seen["moved"] = True
+                # A second connection moves a not-yet-locked target into a
+                # Season this transaction never planned for, and COMMITS.
+                other = SqlStore(os.environ["TEST_DATABASE_URL"])
+                try:
+                    row = other.get_game(moved)
+                    row.season_id = other_season
+                    other.save_game(row)
+                finally:
+                    other.close()
+            return original(game_id)
+
+        self.store.get_game_for_update = move_one_target_mid_plan
+        try:
+            result = self.api.discard_draft_games(
+                game_ids=list(self.committed), actor_id=ADMIN,
+                user_id=ADMIN, role=Role.LEAGUE_ADMIN, scope={})
+        finally:
+            self.store.get_game_for_update = original
+
+        self.assertTrue(seen["moved"], "the conflict was never injected")
+        self.assertNotIn("error", result, result)
+        # The retry re-planned: the moved Game is no longer in the tuple, so
+        # the five that remain are discarded and it is left alone.
+        self.assertEqual(result["discarded"], 5, result)
+        survivors = {g.id for g in self.store.all_games()}
+        self.assertEqual(survivors, {moved},
+                         "the retry did not act on exactly the re-planned set")
+        # The abandoned first attempt rolled back completely: its audit rows
+        # are not there on top of the successful attempt's five.
+        self.assertEqual(
+            len(self.store.all_setup_audit()) - audit_before, 5,
+            "the rolled-back attempt left audit rows behind")
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
                      "needs PostgreSQL: the race is a DATABASE lock")
 class DraftFirstSelectionRaceTest(unittest.TestCase):
     """The caller's very FIRST context selection, with NO ActiveContext row.
