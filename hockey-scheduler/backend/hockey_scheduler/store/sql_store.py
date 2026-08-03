@@ -1762,6 +1762,28 @@ class SqlStore:
     def get_active_context(self, user_id):
         return self._get(ActiveContext, user_id)
 
+    def get_active_context_for_update(self, user_id):
+        """The caller's saved context, ROW-LOCKED until this transaction ends
+        (#386).
+
+        The lock half of the protocol that orders an active-tuple
+        AUTHORIZATION against a concurrent ``set_active_context``. A consistent
+        snapshot is not enough on its own: ``ContextService._snapshot`` gives
+        the resolve a coherent read, but nothing stops a competing
+        ``POST /api/context`` from committing between that read and the Games
+        landing. Whoever takes this lock first wins, and the loser blocks until
+        the first one commits — so a write authorized under tuple A can never
+        be performed under tuple B.
+
+        The row may not exist (a caller running on `_fallback`, never having
+        selected anything). ``FOR UPDATE`` then locks nothing, and the ordering
+        comes from the SERIALIZABLE isolation the authorizing transaction runs
+        at instead: the read-write anti-dependency against a concurrent first
+        INSERT is detected and one side is retried. Both halves are needed —
+        the row lock for the ordinary case, the isolation for the first write.
+        """
+        return self._get_for_update(ActiveContext, user_id)
+
     def set_active_context(self, ctx):
         """Persist a user's selected context (one row per user), last-write-wins.
 
