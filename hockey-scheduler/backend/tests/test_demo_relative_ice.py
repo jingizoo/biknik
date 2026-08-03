@@ -32,6 +32,10 @@ Four properties are proven:
    exact bug class that took main red on 2026-08-02 — a fixture booking ice at
    ``now + 31..34 days`` inherited the current HOUR and collided with these
    very slots only between 15:00 and 21:00 UTC.
+5. **Visible.** (#389 review.) Future-dated is not enough on its own — pushed
+   far enough out, the demo is future-dated AND invisible, and the landing
+   dashboard's "Games this week" tile reads 0 on a brand-new demo. Day zero is
+   therefore bounded on both sides: at least a day out, at most six.
 """
 
 import hashlib
@@ -215,7 +219,10 @@ class DemoLayoutIsExactTest(unittest.TestCase):
         early = datetime(2019, 11, 30, 4, 0, tzinfo=UTC)   # a Saturday
         store, _gid, _ids = build_full_demo_store(seed_instant=early)
         self.assertEqual(layout_only(store), expected_layout(early))
-        self.assertEqual(demo_day_zero(early), datetime(2019, 12, 7, tzinfo=UTC))
+        # A Saturday instant, deliberately: day zero is now a plain lead, so
+        # seeding ON the old anchor weekday gets no special treatment — it
+        # lands the same 3 days out as any other day (#389 review).
+        self.assertEqual(demo_day_zero(early), datetime(2019, 12, 3, tzinfo=UTC))
 
     def test_allocated_slots_are_exactly_the_games(self):
         store, _gid, _ids = build_full_demo_store(seed_instant=FAR_FUTURE)
@@ -225,30 +232,39 @@ class DemoLayoutIsExactTest(unittest.TestCase):
                               if s.status.value == "allocated"]), 20)
         self.assertEqual(allocated, {g.start_time for g in store.all_games()})
 
-    def test_day_zero_is_the_first_saturday_at_least_a_week_out(self):
-        # Every UTC day of a fortnight, spelled out — the derivation must
-        # discard the weekday it was called on and land on Saturday with a
-        # lead of 7 to 13 days.
+    def test_day_zero_is_a_fixed_lead_from_every_weekday(self):
+        # Every UTC day of a fortnight, spelled out. Day zero used to snap to
+        # the next Saturday, so this table used to repeat a date six times and
+        # jump; it is now a plain +3 from whatever day the demo was seeded on,
+        # and the interesting property has inverted: the weekday must make NO
+        # difference at all. Any snap-to-weekday rule reintroduced here shows
+        # up as a table that stutters (#389 review — see _DEMO_LEAD_DAYS for
+        # why a fixed weekday and the dashboard's current week are exclusive).
         base = datetime(2026, 8, 3, tzinfo=UTC)             # a Monday
         expected = [
-            datetime(2026, 8, 15, tzinfo=UTC),   # Mon 08-03 → +12
-            datetime(2026, 8, 15, tzinfo=UTC),   # Tue 08-04 → +11
-            datetime(2026, 8, 15, tzinfo=UTC),   # Wed 08-05 → +10
-            datetime(2026, 8, 15, tzinfo=UTC),   # Thu 08-06 → +9
-            datetime(2026, 8, 15, tzinfo=UTC),   # Fri 08-07 → +8
-            datetime(2026, 8, 15, tzinfo=UTC),   # Sat 08-08 → +7
-            datetime(2026, 8, 22, tzinfo=UTC),   # Sun 08-09 → +13
-            datetime(2026, 8, 22, tzinfo=UTC),   # Mon 08-10 → +12
-            datetime(2026, 8, 22, tzinfo=UTC),   # Tue 08-11 → +11
-            datetime(2026, 8, 22, tzinfo=UTC),   # Wed 08-12 → +10
-            datetime(2026, 8, 22, tzinfo=UTC),   # Thu 08-13 → +9
-            datetime(2026, 8, 22, tzinfo=UTC),   # Fri 08-14 → +8
-            datetime(2026, 8, 22, tzinfo=UTC),   # Sat 08-15 → +7
-            datetime(2026, 8, 29, tzinfo=UTC),   # Sun 08-16 → +13
+            datetime(2026, 8, 6, tzinfo=UTC),    # Mon 08-03 → Thu 08-06
+            datetime(2026, 8, 7, tzinfo=UTC),    # Tue 08-04 → Fri 08-07
+            datetime(2026, 8, 8, tzinfo=UTC),    # Wed 08-05 → Sat 08-08
+            datetime(2026, 8, 9, tzinfo=UTC),    # Thu 08-06 → Sun 08-09
+            datetime(2026, 8, 10, tzinfo=UTC),   # Fri 08-07 → Mon 08-10
+            datetime(2026, 8, 11, tzinfo=UTC),   # Sat 08-08 → Tue 08-11
+            datetime(2026, 8, 12, tzinfo=UTC),   # Sun 08-09 → Wed 08-12
+            datetime(2026, 8, 13, tzinfo=UTC),   # Mon 08-10 → Thu 08-13
+            datetime(2026, 8, 14, tzinfo=UTC),   # Tue 08-11 → Fri 08-14
+            datetime(2026, 8, 15, tzinfo=UTC),   # Wed 08-12 → Sat 08-15
+            datetime(2026, 8, 16, tzinfo=UTC),   # Thu 08-13 → Sun 08-16
+            datetime(2026, 8, 17, tzinfo=UTC),   # Fri 08-14 → Mon 08-17
+            datetime(2026, 8, 18, tzinfo=UTC),   # Sat 08-15 → Tue 08-18
+            datetime(2026, 8, 19, tzinfo=UTC),   # Sun 08-16 → Wed 08-19
         ]
         self.assertEqual(
             [demo_day_zero(base + timedelta(days=n)) for n in range(14)],
             expected)
+        # Premise: the table really does span every weekday, so "the weekday
+        # makes no difference" is a claim about seven cases and not one.
+        self.assertEqual({d.weekday() for d in
+                          (base + timedelta(days=n) for n in range(14))},
+                         set(range(7)))
 
     def test_day_zero_rejects_a_naive_instant(self):
         # Guessing UTC for a naive value would shift the whole inventory by
@@ -356,22 +372,109 @@ class DemoSeedInstantSweepTest(unittest.TestCase):
                 self.assertGreater(s.start_time, instant, (hour, s.id))
         self.assertEqual(len(digests), 1, "inventory varied by hour of day")
 
-    def test_every_instant_of_a_fortnight_yields_future_saturday_ice(self):
+    def test_every_instant_of_a_fortnight_yields_future_ice_at_a_fixed_lead(self):
         # 14 days x 24 hours of day-zero derivations (pure, so cheap): always
-        # a Saturday, always 7-13 days out, always after the instant itself.
+        # UTC midnight, always EXACTLY the configured lead out, always after
+        # the instant itself. The lead used to vary over 7-13 days because of
+        # the snap-to-Saturday step and could only be bounded by a range; with
+        # a plain lead it is one number, so this pins equality (#389 review).
+        base = datetime(2026, 8, 3, tzinfo=UTC)
+        leads = set()
+        for day in range(14):
+            for hour in range(24):
+                instant = base + timedelta(days=day, hours=hour, minutes=59,
+                                           seconds=59)
+                d0 = demo_day_zero(instant)
+                self.assertEqual(d0.time(), datetime.min.time(), instant)
+                leads.add((d0 - instant.replace(hour=0, minute=0,
+                                                second=0)).days)
+                # The earliest slot the demo lays down is day zero 16:00.
+                self.assertGreater(d0.replace(hour=16), instant, instant)
+        # ONE lead across all 336 instants — a snap-to-weekday step would
+        # spread these over seven values. The exact number is pinned by the
+        # spelled-out table in DemoLayoutIsExactTest; here it must simply not
+        # depend on when the demo was seeded.
+        self.assertEqual(len(leads), 1, leads)
+        self.assertIn(leads.pop(), range(1, 7))
+
+
+class DemoLandsInsideTheDashboardsCurrentWeekTest(unittest.TestCase):
+    """#389 review: the demo must have games in the operator's CURRENT week.
+
+    The landing dashboard's "Games this week" tile (``renderDashboard`` in
+    ``web/static/app.js``) counts games in the inclusive 7-day window
+    ``[today, today + 6]``. Pushing the whole inventory into the future is not
+    enough on its own: pushed far enough out, the demo is future-dated AND
+    invisible, and a freshly-seeded demo's first screen reads 0.
+
+    So day zero carries a two-sided bound, and both sides matter:
+
+    * at least 1 day out, or the demo is born partly past-dated at some hours
+      of the day (the ``DemoSeedInstantSweepTest`` half);
+    * at most 6 days out, or it never lands inside that window.
+
+    A snap-to-weekday derivation cannot satisfy both, whatever its lead: a
+    fixed weekday recurs every 7 days, so the lead it produces necessarily
+    spans a 7-wide range ``[L, L + 6]``, which cannot fit inside ``[1, 6]``.
+    That is why ``full_demo`` derives day zero from a plain fixed lead — see
+    the note above ``_DEMO_LEAD_DAYS``.
+    """
+
+    def _window(self, seed_instant):
+        """The dashboard's own window for ``seed_instant``, as calendar dates:
+        the inclusive 7 days starting the day the demo was seeded."""
+        first = seed_instant.astimezone(UTC).date()
+        return [first + timedelta(days=n) for n in range(7)]
+
+    def test_day_zero_is_both_future_and_inside_the_current_week(self):
+        # 14 days x 24 hours, so neither the weekday nor the hour of seeding
+        # can move day zero out of the window on some days and not others —
+        # a 1-in-7 outcome is the #384 bug class, not a passing test.
         base = datetime(2026, 8, 3, tzinfo=UTC)
         for day in range(14):
             for hour in range(24):
                 instant = base + timedelta(days=day, hours=hour, minutes=59,
                                            seconds=59)
                 d0 = demo_day_zero(instant)
-                self.assertEqual(d0.weekday(), 5, instant)      # Saturday
-                self.assertEqual(d0.time(), datetime.min.time(), instant)
-                lead = (d0 - instant.replace(hour=0, minute=0, second=0)).days
-                self.assertGreaterEqual(lead, 7, instant)
-                self.assertLessEqual(lead, 13, instant)
-                # The earliest slot the demo lays down is day zero 16:00.
-                self.assertGreater(d0.replace(hour=16), instant, instant)
+                lead = (d0.date() - instant.date()).days
+                self.assertGreaterEqual(lead, 1, instant)
+                self.assertLessEqual(lead, 6, instant)
+                self.assertIn(d0.date(), self._window(instant), instant)
+
+    def test_a_fresh_demo_has_games_in_the_dashboards_current_week(self):
+        # The regression itself, stated as data: count the games the dashboard
+        # tile would count, with the tile's own filter, on a brand-new demo.
+        store, _gid, _ids = build_full_demo_store(seed_instant=FAR_FUTURE)
+        games = store.all_games()
+        # Premise: the demo really did seed its full schedule, so a non-zero
+        # count below is a statement about WHERE the games are and not merely
+        # about whether any exist.
+        self.assertEqual(len(games), 20)
+        window = self._window(FAR_FUTURE)
+        this_week = [g for g in games if g.start_time.astimezone(UTC).date()
+                     in window]
+        # Exact, not ">= 1": with a 3-day lead the window holds day zero and
+        # the first three days of the pilot pack — 1 + 3 + 3 + 3 games. Half
+        # the demo's published schedule is in the operator's own week. This
+        # number moves if the lead moves, which is the point: it makes the
+        # lead a decision the suite states out loud rather than an accident.
+        self.assertEqual(len(this_week), 10)
+        self.assertEqual(
+            sorted({g.start_time.astimezone(UTC).date() for g in this_week}),
+            [demo_day_zero(FAR_FUTURE).date() + timedelta(days=n)
+             for n in range(4)])
+
+    def test_the_current_week_holds_games_whatever_weekday_it_is_seeded_on(self):
+        # Every weekday, built for real (not just derived): a demo seeded on
+        # any day of the week shows the same non-empty week.
+        base = datetime(2026, 8, 3, 13, 5, tzinfo=UTC)   # a Monday
+        for day in range(7):
+            instant = base + timedelta(days=day)
+            store, _gid, _ids = build_full_demo_store(seed_instant=instant)
+            window = self._window(instant)
+            this_week = [g for g in store.all_games()
+                         if g.start_time.astimezone(UTC).date() in window]
+            self.assertEqual(len(this_week), 10, instant)
 
 
 class DemoSeedInstantDefaultTest(unittest.TestCase):
@@ -415,11 +518,27 @@ class OtherSeedFixturesAreRelativeTest(unittest.TestCase):
         self.assertGreater(game.start_time, FAR_FUTURE)
 
     def test_first_slice_seed_game_is_future_dated_by_default(self):
+        # This assertion used to read ``> now + 7 days``, which was itself the
+        # time bomb this file exists to remove: with the old snap-to-Saturday
+        # derivation a SATURDAY seed produced a lead of exactly 7, so day zero
+        # 18:30 was EARLIER than now + 7d for the rest of that Saturday
+        # evening. It passed only because no CI run had yet started after
+        # 18:30 UTC on a Saturday (#389 review).
+        #
+        # The real property is "strictly future", and it is now stated exactly:
+        # the call is bracketed by two clock readings, so the seeded game must
+        # equal day zero 18:30 for one of them. That is a set of at most two
+        # exact datetimes (two only if the call straddles UTC midnight), never
+        # an inequality with slack in it.
         from hockey_scheduler.seed import build_seeded_store
 
+        before = datetime.now(UTC)
         store, game_id = build_seeded_store()
-        self.assertGreater(store.get_game(game_id).start_time,
-                           datetime.now(UTC) + timedelta(days=7))
+        after = datetime.now(UTC)
+        start = store.get_game(game_id).start_time
+        self.assertGreater(start, after)
+        self.assertIn(start, {demo_day_zero(i).replace(hour=18, minute=30)
+                              for i in (before, after)})
 
     def test_backup_acceptance_sample_ice_is_relative_to_its_instant(self):
         from hockey_scheduler.acceptance import backup_restore

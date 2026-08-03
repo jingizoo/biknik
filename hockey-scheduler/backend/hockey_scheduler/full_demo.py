@@ -52,20 +52,51 @@ from .store import InMemoryStore
 # 12:43Z and failed on main at 15:08Z on 2026-08-02. #384 fixed that fixture by
 # anchoring it to the rink's own occupancy; this fixes the data it tripped over.
 #
-# Day zero is derived, not chosen: UTC midnight on the first Saturday at least
-# a week after the seed instant. Saturday keeps the demo's weekend look; the
-# week of lead time keeps the whole two-week inventory below future-dated even
-# for a demo server left running for days. The derivation is a pure function of
-# the seed instant, so the same instant always rebuilds the same inventory
-# (CLAUDE.md: the domain never calls ``datetime.now()`` itself — the instant is
-# passed in).
-_DEMO_WEEKDAY = 5          # Saturday, with Monday == 0 (``date.weekday()``)
-_DEMO_LEAD_DAYS = 7
+# Day zero is derived, not chosen: UTC midnight ``_DEMO_LEAD_DAYS`` days after
+# the seed instant. The derivation is a pure function of that instant, so the
+# same instant always rebuilds the same inventory (CLAUDE.md: the domain never
+# calls ``datetime.now()`` itself — the instant is passed in).
+#
+# THE LEAD IS A PRODUCT DECISION, and it is bounded on BOTH sides (#389 review).
+# It is the only knob here; change it and the whole demo moves with it.
+#
+#   * At least 1. At a lead of 0 the demo is born partly past-dated: a demo
+#     seeded at 20:00 UTC would put day zero's 16:00 slot in the past, and
+#     whether it did would depend on the hour the operator clicked "Load" —
+#     exactly the clock-dependent failure described above.
+#   * At most 6. The landing dashboard's "Games this week" tile counts games in
+#     the inclusive window [today, today + 6] (``renderDashboard`` in
+#     ``web/static/app.js``). A lead of 7 or more puts the ENTIRE demo outside
+#     that window, so a freshly-seeded demo's very first screen reads 0 games.
+#
+# This is why there is no longer a snap-to-Saturday step. Day zero used to be
+# "the first Saturday at least 7 days out", which kept the core scenario on a
+# weekend. But a fixed weekday recurs every 7 days, so ANY snap-to-weekday rule
+# produces a lead spanning a 7-wide range [L, L+6] — which cannot fit inside
+# [1, 6], for any L. Saturday and "inside the operator's current week" are
+# mutually exclusive, and one of them had to go. The weekend look was worth
+# little in practice: the pilot pack books an evening game slot on all 14
+# consecutive days either way, so the demo already shows midweek hockey, and
+# nothing in the product asserts a weekend. An empty first screen, by contrast,
+# is the first thing anyone sees.
+#
+# 3 is the largest lead that still leaves several days of the pilot pack inside
+# the current week: the window holds day zero plus days 1-3 of the pack, which
+# is 10 of the demo's 20 published games. It also leaves 3 days of grace before
+# a seeded demo starts going stale — and staleness is measured from the last
+# "Load sample data" / "Reset" click, not from server start, because the demo
+# re-seeds on each of those and boots to a clean slate.
+#
+# To restore the old behaviour: set the lead back to 7 and re-add the snap. The
+# suite will tell you what that costs — ``DemoLandsInsideTheDashboardsCurrent
+# WeekTest`` in ``tests/test_demo_relative_ice.py`` fails with "0 != 10", which
+# is the dashboard regression stated as data.
+_DEMO_LEAD_DAYS = 3
 
 
 def demo_day_zero(seed_instant: datetime) -> datetime:
-    """The demo's day zero for ``seed_instant``: UTC midnight on the first
-    Saturday at least ``_DEMO_LEAD_DAYS`` days after it.
+    """The demo's day zero for ``seed_instant``: UTC midnight
+    ``_DEMO_LEAD_DAYS`` days after it.
 
     ``seed_instant`` must be a timezone-aware datetime — the repo's convention
     for every time that crosses a boundary. A naive value is rejected rather
@@ -78,8 +109,7 @@ def demo_day_zero(seed_instant: datetime) -> datetime:
         raise ValueError("seed_instant must be a timezone-aware datetime.")
     day = seed_instant.astimezone(timezone.utc).replace(
         hour=0, minute=0, second=0, microsecond=0)
-    day += timedelta(days=_DEMO_LEAD_DAYS)
-    return day + timedelta(days=(_DEMO_WEEKDAY - day.weekday()) % 7)
+    return day + timedelta(days=_DEMO_LEAD_DAYS)
 
 # Every seeded record is attributed to the demo's REAL League-Admin account,
 # by its account id — not to a synthetic label (#367 owner ruling).
