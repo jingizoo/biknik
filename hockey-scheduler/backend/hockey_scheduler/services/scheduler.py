@@ -566,9 +566,41 @@ def _resolve_division_season_id(store, division_id):
     return ls.season_id if ls is not None else None
 
 
+def _in_scope_game_ids(pairs, scope):
+    """The Games in ``pairs`` that lie inside the explanation's own context.
+
+    #386/#388 bound the whole draft surface to the caller's persisted active
+    tuple: a principal standing in ``(program, season, league)`` is refused a
+    proposal for any other corner, including the two near misses — same
+    Program/different Season, and same Season/different League.
+
+    The candidate SCANNER already honours that boundary (it never returns
+    another Season's ice), but the active-game snapshot deliberately does not:
+    :func:`_active_game_slot_pairs` is unfiltered by design (#373) so the
+    preview and the commit gate measure the same physical edges. That is
+    correct for DECIDING, and it is exactly why the observer must filter
+    before REPORTING — two Seasons holding access to one Venue is what
+    ``SeasonVenueAccess`` is for, so a neighbouring Season's Game routinely
+    collides with in-context ice.
+
+    Deriving the set from the run's shared snapshot keeps this free of extra
+    store reads and guarantees it covers every id the observer can encounter:
+    the policy advisory and the team-occupancy seed both read that same list.
+    Fail-closed — an unresolved Season/League scope yields the empty set, so a
+    dangling or legacy target withholds every id rather than defaulting open.
+    """
+    season_id = (scope or {}).get("season_id")
+    league_id = (scope or {}).get("league_id")
+    if not season_id or not league_id:
+        return frozenset()
+    return frozenset(
+        game.id for game, _slot in pairs
+        if game.season_id == season_id and game.league_id == league_id)
+
+
 def _candidate_explanation_record(store, slot, home, away, *, used, con,
                                   team_slots, policy_check, rink_spans,
-                                  occupancy):
+                                  occupancy, in_scope_game_ids=frozenset()):
     """Evaluate one bounded explanation candidate without changing decisions.
 
     The placement loop has already failed the pairing before this runs.  This
@@ -604,6 +636,13 @@ def _candidate_explanation_record(store, slot, home, away, *, used, con,
             slot, rink_spans.get(slot.rink_id, ()), include_details=True)
         if policy_code is not None:
             policy_details["rink_id"] = slot.rink_id
+            # The colliding Game may belong to a neighbouring Season sharing
+            # this Rink.  ``conflict_slot_id`` stays: the candidate's Rink is
+            # in-context ice, so a slot on it is the caller's OWN inventory.
+            # The GAME is not, and it is dropped rather than nulled so the
+            # allowlist simply omits the field.
+            if policy_details.get("conflict_game_id") not in in_scope_game_ids:
+                policy_details.pop("conflict_game_id", None)
             raw["rejections"].append({
                 "code": policy_code,
                 "details": policy_details,
@@ -612,22 +651,32 @@ def _candidate_explanation_record(store, slot, home, away, *, used, con,
     overlap_code, _overlap_message, conflicts = _team_overlap_reason(
         store, slot, home, away, occupancy)
     if overlap_code is not None:
+        rows = []
+        for conflict in conflicts:
+            row = {
+                "team_id": conflict["team_id"],
+                "conflict_source": conflict["conflict_source"],
+            }
+            # One rule for every conflicting Game this observer can name, so
+            # the boundary cannot hold on one code and lapse on the other. A
+            # team may appear in another Season's Game; the collision is still
+            # reported, only its out-of-context id is withheld.
+            if conflict["conflict_game_id"] in in_scope_game_ids:
+                row["conflict_game_id"] = conflict["conflict_game_id"]
+            rows.append(row)
         raw["rejections"].append({
             "code": overlap_code,
             "details": {
                 "team_ids": sorted({c["team_id"] for c in conflicts}),
-                "conflicts": [{
-                    "team_id": c["team_id"],
-                    "conflict_source": c["conflict_source"],
-                    "conflict_game_id": c["conflict_game_id"],
-                } for c in conflicts],
+                "conflicts": rows,
             },
         })
     return raw
 
 
 def _assign_ice(store, pairings, slots, constraints, policy_check=None,
-                team_spans=None, *, explain=True, explanation_context=None):
+                team_spans=None, *, explain=True, explanation_context=None,
+                active_pairs=()):
     """Greedy earliest-slot-first assignment shared by every entry point.
 
     ``pairings`` is ``[(home_team_id, away_team_id, division_id_or_None), ...]``
@@ -647,6 +696,10 @@ def _assign_ice(store, pairings, slots, constraints, policy_check=None,
     draft_games, unscheduled = [], []
     explanation_budget = ExplanationBudget() if explain else None
     explanation_context = dict(explanation_context or {})
+    # Computed ONCE per run, from the same shared snapshot the policy advisory
+    # and the team-occupancy seed read, so every Game id the observer can
+    # encounter is covered by one membership test and no extra store reads.
+    in_scope_game_ids = _in_scope_game_ids(active_pairs, explanation_context)
     used = set()
     team_slots = {}  # team_id -> [assigned start_time]
     rink_spans = {}  # rink_id -> [(slot_id, start, end)] picked this run (#277)
@@ -724,7 +777,8 @@ def _assign_ice(store, pairings, slots, constraints, policy_check=None,
                     _candidate_explanation_record(
                         store, candidate, home, away, used=used, con=con,
                         team_slots=team_slots, policy_check=policy_check,
-                        rink_spans=rink_spans, occupancy=occupancy)
+                        rink_spans=rink_spans, occupancy=occupancy,
+                        in_scope_game_ids=in_scope_game_ids)
                     for candidate in slots[:allowance]
                 ]
                 row["explanation"] = build_unplaced_explanation(
@@ -1198,6 +1252,7 @@ def draft_schedule(store, division_id, slot_ids=None, constraints=None,
         policy_check=_policy_advisor(
             store, _resolve_division_season_id(store, division_id), active),
         team_spans=_persisted_team_spans(active),
+        active_pairs=active,
         explanation_context={
             "season_id": league_season.season_id if league_season else None,
             "league_id": league_season.league_id if league_season else None,
@@ -1262,6 +1317,7 @@ def draft_schedule_for_league(store, season_id, league_id, division_id=None,
         store, pairings, slots, constraints,
         policy_check=_policy_advisor(store, season_id, active),
         team_spans=_persisted_team_spans(active),
+        active_pairs=active,
         explanation_context={
             "season_id": season_id,
             "league_id": league_id,

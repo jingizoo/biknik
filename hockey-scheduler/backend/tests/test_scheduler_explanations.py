@@ -124,6 +124,55 @@ def _explanation(preview, index=0):
     return preview["unscheduled"][index]["explanation"]
 
 
+def _neighbouring_season(store, venue_id="v1"):
+    """A SECOND Season of the same Program holding access to the same Venue.
+
+    Two Seasons with active access to one Venue is precisely what
+    ``SeasonVenueAccess`` exists to express -- arenas are shared -- and it is
+    also a corner the caller's own active tuple is REFUSED (#386/#388;
+    ``test_the_two_near_miss_corners_are_refused`` in
+    ``test_draft_context_scope``). Its Games are therefore out-of-context rows
+    that happen to sit on in-context ice, which is the only way a foreign
+    identifier can reach this observer at all: the candidate scanner never
+    returns another Season's slots, but ``_active_game_slot_pairs`` is
+    deliberately unfiltered (#373) so the preview and the commit gate measure
+    the same edges.
+    """
+    store.add_season(Season(
+        id="se_nb", program_id="pg", name="Neighbour Season"))
+    store.add_league(League(
+        id="lg_nb", program_id="pg", name="Neighbour League"))
+    store.add_league_season(LeagueSeason(
+        id="ls_nb", league_id="lg_nb", season_id="se_nb"))
+    store.add_division(Division(
+        id="d_nb", league_season_id="ls_nb", name="Neighbour Division"))
+    store.add_season_venue_access(SeasonVenueAccess(
+        id="sva_nb", season_id="se_nb", venue_id=venue_id, active=True))
+    for index in range(2):
+        store.add_team(Team(
+            id=f"t_nb{index}", name=f"Neighbour {index}", program_id="pg",
+            league_id="lg_nb"))
+        store.add_season_team_registration(SeasonTeamRegistration(
+            id=f"reg_nb{index}", league_season_id="ls_nb",
+            team_id=f"t_nb{index}", division_id="d_nb", active=True))
+
+
+# Every neighbouring-Season identifier that must not reach candidate evidence.
+# The Game id is NOT listed here -- it is assigned by the store counter, so a
+# literal would be a guess that never appears and the assertion would pass for
+# the wrong reason. It is added from the real created row by the test below.
+#
+# ``slot_nb`` is deliberately absent too, for the opposite reason: it sits on a
+# Rink whose Venue the caller's own Season holds active access to, so it is the
+# caller's OWN candidate inventory and naming it discloses nothing across the
+# boundary.
+NEIGHBOUR_SECRETS = (
+    "se_nb", "lg_nb", "ls_nb", "d_nb", "t_nb0", "t_nb1",
+    "Neighbour Season", "Neighbour League", "Neighbour Division",
+    "Neighbour 0", "Neighbour 1",
+)
+
+
 class _ExplanationContract:
     def make_store(self):
         raise NotImplementedError
@@ -257,6 +306,134 @@ class _ExplanationContract:
         self.assertNotIn("team_name", json.dumps(overlap))
         self.assertIn(
             "provide_non_overlapping_game_ice",
+            {a["action_code"] for a in explanation["alternatives"]})
+
+    # -- the #386/#388 boundary, applied to THIS slice's own fields --------
+    def _shared_rink_neighbour(self, api):
+        """Neighbour Season booked on the shared rink; one candidate of ours.
+
+        Returns ``(candidate_slot_id, neighbour_game_id)``. The explicit
+        ``slot_ids`` at the draft call keeps the pairing unplaced and the
+        evidence a single window: ``slot_nb`` is on the same Rink and is
+        therefore in the caller's own scanned inventory, so leaving the
+        selection open would let the greedy loop simply place the pairing
+        there.
+        """
+        _neighbouring_season(self.store)
+        _slot(self.store, "slot_nb", "r1", BASE)
+        booked = api.create_game(
+            "se_nb", "d_nb", "t_nb0", "t_nb1", "slot_nb",
+            league_id="lg_nb", actor_id="admin")
+        self.assertNotIn("error", booked, booked)
+        mine = _slot(self.store, "mine", "r1", BASE + timedelta(minutes=30))
+        return mine, booked["id"]
+
+    def test_a_neighbouring_seasons_game_is_never_named_in_evidence(self):
+        """#386/#388 bound the draft surface to the caller's active tuple.
+        The evidence this slice adds must obey the SAME boundary.
+
+        The caller is standing in ``(pg, se, lg)``. The conflicting Game
+        belongs to ``(pg, se_nb, lg_nb)`` -- a corner this very principal is
+        refused from drafting, listing, or reviewing. Its Game id is not the
+        caller's to learn from a Season it may not select.
+
+        Two shapes, because they fail for DIFFERENT reasons:
+
+        * overlap is the first cause -- the established decision path reaches
+          the policy advisory too, so the legacy ``reason`` prose names the
+          same Game and this is a restatement of an existing disclosure; and
+        * a blackout short-circuits the legacy path at its FIRST cause, so
+          ``reason`` names nothing of the neighbour at all -- and only this
+          slice's all-causes observer runs the advisory. That shape is a NEW
+          disclosure, not a restructured one.
+        """
+        api = _seed(self.store)
+        mine, neighbour_game_id = self._shared_rink_neighbour(api)
+        # The real assigned id, never a literal guess: this is the single
+        # most important string in the haystack below.
+        secrets = NEIGHBOUR_SECRETS + (neighbour_game_id,)
+        for label, constraints in (
+                ("overlap is the first cause", None),
+                ("a blackout short-circuits the legacy path",
+                 {"season_blackout_dates": [
+                     (BASE + timedelta(minutes=30)).date().isoformat()]})):
+            with self.subTest(shape=label):
+                preview = api.draft_season_schedule(
+                    "d", slot_ids=[mine], constraints=constraints)
+                self.assertNotIn("error", preview, preview)
+                explanation = _explanation(preview)
+                codes = {rejection["code"]
+                         for candidate in explanation["candidate_windows"]
+                         for rejection in candidate["rejections"]}
+                # ANTI-VACUITY: the branch that carries the id really ran.
+                self.assertIn("slot_overlap_conflict", codes, explanation)
+                # The privacy clause first, over the WHOLE object: a leak that
+                # moved to another field is still a leak.
+                serialized = json.dumps(explanation, sort_keys=True)
+                for secret in secrets:
+                    self.assertNotIn(
+                        secret, serialized,
+                        f"candidate evidence named {secret!r} from a Season "
+                        "this caller's active tuple is refused")
+                overlap = next(
+                    rejection
+                    for candidate in explanation["candidate_windows"]
+                    for rejection in candidate["rejections"]
+                    if rejection["code"] == "slot_overlap_conflict")
+                self.assertNotIn("conflict_game_id", overlap["details"])
+                # ...and it still says WHICH of the caller's own windows is
+                # unusable, so withholding the foreign id costs no in-scope
+                # signal.
+                self.assertEqual(overlap["details"]["rink_id"], "r1")
+                self.assertEqual(
+                    overlap["details"]["conflict_slot_id"], "slot_nb")
+                # An operator with no authority over the other Season cannot
+                # reschedule its Game, so the honest correction is ice.
+                self.assertEqual(
+                    {a["action_code"] for a in explanation["alternatives"]}
+                    & {"reschedule_conflicting_game",
+                       "provide_non_overlapping_game_ice"},
+                    {"provide_non_overlapping_game_ice"}, explanation)
+
+    def test_an_in_scope_conflicting_game_is_still_named(self):
+        """The anti-vacuity control for the refusal above.
+
+        If the two ids simply vanished from the payload, the negative would
+        pass with the whole scoping rule reverted -- and the operator would
+        lose the one correction they CAN act on. The same physical collision,
+        with the conflicting Game inside the caller's own tuple, still names
+        it and still offers the reschedule action.
+        """
+        api = _seed(self.store, team_count=4)
+        self.store.add_division(Division(
+            id="host_div", league_season_id="ls", name="Host"))
+        for index in range(2):
+            tid = f"host_t{index}"
+            self.store.add_team(Team(
+                id=tid, name=f"Host {index}", program_id="pg", league_id="lg"))
+            self.store.add_season_team_registration(SeasonTeamRegistration(
+                id=f"host_reg{index}", league_season_id="ls", team_id=tid,
+                division_id="host_div", active=True))
+        _slot(self.store, "host_slot", "r1", BASE)
+        booked = api.create_game(
+            "se", "host_div", "host_t0", "host_t1", "host_slot",
+            league_id="lg", actor_id="admin")
+        self.assertNotIn("error", booked, booked)
+        mine = _slot(self.store, "mine", "r1", BASE + timedelta(minutes=30))
+
+        preview = api.draft_season_schedule("d", slot_ids=[mine])
+        explanation = _explanation(preview)
+        overlap = next(
+            rejection
+            for candidate in explanation["candidate_windows"]
+            for rejection in candidate["rejections"]
+            if rejection["code"] == "slot_overlap_conflict")
+        self.assertEqual(
+            overlap["details"]["conflict_game_id"], booked["id"])
+        self.assertEqual(
+            overlap["details"]["conflict_slot_id"], "host_slot")
+        self.assertIn(
+            "reschedule_conflicting_game",
             {a["action_code"] for a in explanation["alternatives"]})
 
     def test_turnover_curfew_and_playable_time_use_shared_policy_codes(self):
