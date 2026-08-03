@@ -6227,25 +6227,72 @@ class ApiService:
     # straight from the request body (or `all: true`, the whole installation).
     # Binding only the generate/commit pair would have left the finished
     # article readable and publishable one route further down.
-    def _draft_game_edge(self, game):
-        """The ONE `(program_id, season_id, league_id)` link triple a Game
-        presents to `_setup_target_edge_allows`, or None when its chain does
-        not resolve.
+    def _game_in_active_tuple(self, game, program, season, league) -> bool:
+        """Is this Game's WHOLE parent graph inside the caller's tuple?
 
-        `Game.league_id` is the CANONICAL competition League
-        (`store.get_league`), the same axis `Team.league_id` names — NOT the
-        Program-scoped legacy vocabulary `Venue.league_id` carries. The
-        Program comes from the Game's Season, which is the only place it is
-        recorded. A Game with no Season, or a Season with no Program, has no
-        edge at all and fails CLOSED for an identified caller: a dangling
-        chain is never the permissive branch, exactly as
-        `setup_target_accessible`'s `saw_link` rule has it.
+        The first cut of this reduced a Game to
+        ``(its Season's Program, its Season, its ``league_id``)`` — TWO of the
+        four competition parents — and the owner's review named that for what
+        it is: a parallel mechanism with weaker semantics than the one #372
+        already landed for exactly this record. `season_id` + `league_id` can
+        both name the active tuple while `division_id` or `league_season_id`
+        points into another Program, another Season or a sibling League, and
+        the reduced edge authorized the row anyway — putting both team names,
+        the Division name, the Rink and the time of a foreign draft on the
+        review screen, and its Games under publish/discard.
+
+        So the decision is `_setup_target_edges("game", game)` VERBATIM —
+        `_game_parent_constraints` resolves EVERY non-null parent
+        INDEPENDENTLY (`season_id`, `league_id`, `league_season_id` as its two
+        separate Season and League ends, and `division_id` through its own
+        LeagueSeason likewise), and returns no edge at all when any of them
+        fails to resolve or when two of them disagree on Program, Season or
+        League. `saw_link` with an empty edge set is linked-but-unauthorized,
+        which is the fail-closed answer here.
+
+        A Game with NO competition parent whatsoever is also excluded for an
+        identified caller. `setup_target_accessible` rule 6 would hand such a
+        record to its creator, and that clause is deliberately not adopted:
+        #372 ruled creator authority surviving hierarchy linking an
+        unrevokable back door, #381 declined it for the same reason, and every
+        Game the scheduler commits carries all four parents — an unparented
+        draft is not a state this surface has to keep workable.
+
+        The two participating Teams are folded in ON TOP, by the same
+        "edges, not unions" rule and through the same `_team_edges` helper.
+        This narrows, never widens: a Game already refused by its competition
+        parents stays refused. It is here rather than in
+        `_game_parent_constraints` because it is a property of THIS payload,
+        not of Games generally — the review row serializes `home_team_name`
+        and `away_team_name`, so a foreign Team is a direct disclosure through
+        this surface even when all four competition parents agree, while
+        #372's generic setup gate deliberately judges the four FKs only (a
+        Team transferred between Leagues after a Game was played must not make
+        that historical Game unmanageable).
         """
-        season = (self.store.get_season(game.season_id)
-                  if game.season_id else None)
-        if season is None or not season.program_id:
-            return None
-        return (season.program_id, season.id, game.league_id)
+        edges, _saw_link = self._setup_target_edges("game", game)
+        if not edges:
+            # Broken parent, disagreeing parents, or no parent at all.
+            return False
+        if not any(self._setup_target_edge_allows(edge, program, season,
+                                                  league)
+                   for edge in edges):
+            return False
+        for team_id in (getattr(game, "home_team_id", None),
+                        getattr(game, "away_team_id", None)):
+            if not team_id:
+                continue                 # a Game with a missing side is not
+                                         # this predicate's business
+            team = self.store.get_team(team_id)
+            if team is None:
+                return False             # dangling: linked, unjudgeable
+            team_edges, _team_link = self._team_edges(team)
+            if not team_edges or not any(
+                    self._setup_target_edge_allows(edge, program, season,
+                                                   league)
+                    for edge in team_edges):
+                return False
+        return True
 
     def _games_in_active_tuple(self, games, user_id, role, scope):
         """The subset of ``games`` inside the caller's persisted active tuple.
@@ -6253,6 +6300,11 @@ class ApiService:
         `role is None` returns every row untouched and takes no context read
         at all — `setup_target_accessible` rule 1. A null active Program fails
         CLOSED to the empty list, exactly as `_scenario_in_active_tuple` does.
+
+        The context is resolved ONCE for the whole batch; only the per-Game
+        graph walk repeats. Callers that MUTATE must run this inside the
+        transaction that performs the mutation, under the ActiveContext row
+        lock — see `_locked_draft_targets`.
         """
         if role is None:
             return list(games)
@@ -6260,13 +6312,8 @@ class ApiService:
             user_id, role, scope)
         if program is None:
             return []
-        kept = []
-        for game in games:
-            edge = self._draft_game_edge(game)
-            if edge is not None and self._setup_target_edge_allows(
-                    edge, program, season, league):
-                kept.append(game)
-        return kept
+        return [game for game in games
+                if self._game_in_active_tuple(game, program, season, league)]
 
     @catch
     def list_draft_games(self, user_id=None, role=None, scope=None) -> dict:

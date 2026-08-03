@@ -1009,40 +1009,213 @@ class DraftActiveTupleTest(unittest.TestCase):
                 _ok(api.list_draft_games())["summary"]["published_count"], 12)
         self._on_every_backend(body)
 
-    def test_a_draft_game_with_no_resolvable_season_fails_closed(self):
-        """A dangling chain is never the permissive branch.
+    # -- the FULL Game-parent graph, one constraint at a time --------------
+    def _mixed_parent_cases(self, fixture, store):
+        """One case per INDEPENDENT parent constraint a draft Game carries.
 
-        A Game reaches its Program only through its Season. A row with no
-        Season (or a Season with no Program) therefore has no edge to judge,
-        and must be OMITTED from an identified caller's review surface rather
-        than waved through -- the same rule ``setup_target_accessible``'s
-        ``saw_link`` branch applies to a record whose chain exists but does not
-        resolve.
+        Each entry is ``(label, selected_tuple, mutate)``: the tuple the
+        caller stands in, and a callable that corrupts EXACTLY ONE parent of a
+        Game already committed inside that tuple. Every other parent is left
+        naming the active tuple, so a predicate that authorized from a SUBSET
+        of the parents would pass the case -- which is precisely the defect
+        this matrix exists to catch (`season_id` + `league_id` alone said yes
+        while `division_id`, `league_season_id` or a Team pointed elsewhere).
+        """
+        pa, sa, la, _da = corner(fixture, "A", "1", "a")
+        ab = fixture["A"]["seasons"]["1"]["leagues"]["b"]
+        a2a = fixture["A"]["seasons"]["2"]["leagues"]["a"]
+        b1a = fixture["B"]["seasons"]["1"]["leagues"]["a"]
+        pb, sb, lb, db = corner(fixture, "B", "1", "a")
+        in_tuple = (pa, sa, la)
+        # "No League" selected: the League comparison is legitimately skipped,
+        # so ONLY the Season end of a binding can refuse. Without this the
+        # Season end is untestable through `league_season_id` -- a sibling
+        # League's binding differs on BOTH ends at once, and the blocker names
+        # exactly that trap.
+        no_league = (pa, sa, None)
+
+        def ls_of(league_id, season_id):
+            return store.league_season_for(league_id, season_id).id
+
+        def set_attr(name, value):
+            def mutate(game):
+                setattr(game, name, value)
+            return mutate
+
+        return [
+            ("foreign division_id (Program B)", in_tuple,
+             set_attr("division_id", db)),
+            ("sibling-League division_id (same Program, same Season)",
+             in_tuple, set_attr("division_id", ab["division"])),
+            ("other-Season division_id (same Program)", in_tuple,
+             set_attr("division_id", a2a["division"])),
+            ("foreign league_season_id (Program B)", in_tuple,
+             set_attr("league_season_id", ls_of(lb, sb))),
+            ("league_season_id whose LEAGUE end is a sibling League",
+             in_tuple, set_attr("league_season_id",
+                                ls_of(ab["league"], sa))),
+            ("league_season_id whose SEASON end is another Season, "
+             "judged with NO League selected", no_league,
+             set_attr("league_season_id",
+                      ls_of(a2a["league"],
+                            fixture["A"]["seasons"]["2"]["season"]))),
+            ("foreign season_id (Program B)", in_tuple,
+             set_attr("season_id", sb)),
+            ("foreign league_id (Program B)", in_tuple,
+             set_attr("league_id", lb)),
+            ("foreign HOME team (Program B)", in_tuple,
+             set_attr("home_team_id", b1a["teams"][0])),
+            ("foreign AWAY team (Program B)", in_tuple,
+             set_attr("away_team_id", b1a["teams"][1])),
+            ("sibling-League HOME team (same Program)", in_tuple,
+             set_attr("home_team_id", ab["teams"][0])),
+            ("dangling season_id", in_tuple,
+             set_attr("season_id", NO_SUCH_SEASON)),
+            ("dangling league_id", in_tuple,
+             set_attr("league_id", NO_SUCH_LEAGUE)),
+            ("dangling division_id", in_tuple,
+             set_attr("division_id", NO_SUCH_DIVISION)),
+            ("dangling league_season_id", in_tuple,
+             set_attr("league_season_id", "leagueseason_no_such_row")),
+            ("dangling home_team_id", in_tuple,
+             set_attr("home_team_id", "team_no_such_row")),
+        ]
+
+    def test_every_game_parent_constrains_the_review_surface(self):
+        """A Game's WHOLE parent graph decides, never a subset of it.
+
+        `_game_parent_constraints` (#372) resolves `season_id`, `league_id`,
+        BOTH ends of `league_season_id`, and `division_id` through its own
+        binding, INDEPENDENTLY, and fails closed when any non-null one is
+        unresolvable or when two of them disagree. This surface adds the two
+        participating Teams on the same terms, because the review row
+        serializes both team NAMES.
+
+        Each case below corrupts exactly one parent of a Game the caller could
+        otherwise see, so a predicate reading only `season_id` + `league_id`
+        -- the reduced edge the owner rejected -- passes every one of them.
         """
         def body(store, api):
-            fixture, committed = self._commit_both_corners(api)
-            pa, sa, la, _da = corner(fixture, "A", "1", "a")
-            orphan = store.get_game(committed["A"][0])
-            orphan.season_id = None
-            store.save_game(orphan)
+            # A FRESH hierarchy per case. Sharing one across the matrix
+            # coupled the cases through committed Games and allocated ice, so
+            # a later case could fail for a reason that had nothing to do with
+            # the parent it isolates -- and the blocker asks for fixtures that
+            # isolate each constraint independently, which a shared one is not.
+            case_count = len(self._mixed_parent_cases(
+                build_two_programs(api), store))
+            for index in range(case_count):
+                fixture = build_two_programs(api)
+                label, selected, mutate = self._mixed_parent_cases(
+                    fixture, store)[index]
+                with self.subTest(parent=label):
+                    _p, _s, _l, da = corner(fixture, "A", "1", "a")
+                    self._select(api, ADMIN, Role.LEAGUE_ADMIN, *selected)
+                    preview = _ok(self._draft(api, ADMIN, Role.LEAGUE_ADMIN,
+                                              division_id=da), label)
+                    result = _ok(api.commit_draft_schedule(
+                        division_id=da,
+                        draft_fingerprint=preview["draft_fingerprint"],
+                        actor_id=ADMIN, user_id=ADMIN,
+                        role=Role.LEAGUE_ADMIN, scope={}), label)
+                    game_ids = [row["game_id"] for row in result["created"]]
+                    self.assertTrue(game_ids, label)
 
+                    # The CONTROL: before the corruption this caller sees them.
+                    listed = _ok(api.list_draft_games(
+                        ADMIN, Role.LEAGUE_ADMIN, {}))
+                    self.assertIn(
+                        game_ids[0],
+                        [row["game_id"] for row in listed["draft_games"]],
+                        f"{label}: the fixture never saw the Game at all, so "
+                        "its exclusion below would prove nothing")
+
+                    target = store.get_game(game_ids[0])
+                    mutate(target)
+                    store.save_game(target)
+
+                    listed = _ok(api.list_draft_games(
+                        ADMIN, Role.LEAGUE_ADMIN, {}))
+                    self.assertNotIn(
+                        game_ids[0],
+                        [row["game_id"] for row in listed["draft_games"]],
+                        f"{label}: a draft Game with a parent outside the "
+                        "active tuple was served to the review screen -- the "
+                        "WHOLE parent graph decides, not season_id + "
+                        "league_id")
+                    # The other Games of the same batch are untouched, so this
+                    # is a per-row decision and not a collapsed list.
+                    self.assertIn(
+                        game_ids[1],
+                        [row["game_id"] for row in listed["draft_games"]],
+                        f"{label}: the whole batch vanished")
+
+                    # ...and neither write verb can reach it, with the count
+                    # byte-identical to a target that never existed.
+                    for verb, call in (("publish", api.publish_draft_games),
+                                       ("discard", api.discard_draft_games)):
+                        denied = _ok(call(
+                            game_ids=[game_ids[0]], actor_id=ADMIN,
+                            user_id=ADMIN, role=Role.LEAGUE_ADMIN, scope={}),
+                            label)
+                        guessed = _ok(call(
+                            game_ids=["game_no_such_row"], actor_id=ADMIN,
+                            user_id=ADMIN, role=Role.LEAGUE_ADMIN, scope={}),
+                            label)
+                        self.assertEqual(
+                            json.dumps(denied, sort_keys=True),
+                            json.dumps(guessed, sort_keys=True),
+                            f"{label}: {verb} answered differently for a "
+                            "mixed-parent Game than for a nonexistent one")
+                    self.assertIsNotNone(
+                        store.get_game(game_ids[0]),
+                        f"{label}: the mixed-parent Game was DISCARDED")
+        self._on_every_backend(body)
+
+    def test_a_mixed_parent_game_names_nothing_on_the_review_screen(self):
+        """The exclusion happens before any review row is built, and no
+        identifier of the excluded Game reaches the payload."""
+        def body(store, api):
+            fixture = build_two_programs(api)
+            pa, sa, la, da = corner(fixture, "A", "1", "a")
+            b1a = fixture["B"]["seasons"]["1"]["leagues"]["a"]
             self._select(api, ADMIN, Role.LEAGUE_ADMIN, pa, sa, la)
-            listed = _ok(api.list_draft_games(ADMIN, Role.LEAGUE_ADMIN, {}))
+            preview = _ok(self._draft(api, ADMIN, Role.LEAGUE_ADMIN,
+                                      division_id=da))
+            result = _ok(api.commit_draft_schedule(
+                division_id=da,
+                draft_fingerprint=preview["draft_fingerprint"],
+                actor_id=ADMIN, user_id=ADMIN, role=Role.LEAGUE_ADMIN,
+                scope={}))
+            victim = store.get_game(result["created"][0]["game_id"])
+            victim.home_team_id = b1a["teams"][0]
+            store.save_game(victim)
+
+            built = []
+            plain = api._draft_review_row
+
+            def recording(game, *args, **kwargs):
+                built.append(game.id)
+                return plain(game, *args, **kwargs)
+
+            api._draft_review_row = recording
+            try:
+                listed = _ok(api.list_draft_games(
+                    ADMIN, Role.LEAGUE_ADMIN, {}))
+            finally:
+                del api._draft_review_row
+
             self.assertNotIn(
-                orphan.id, [row["game_id"] for row in listed["draft_games"]],
-                "a draft Game whose Season does not resolve was served to an "
-                "identified caller")
+                victim.id, built,
+                "a review row was assembled for a mixed-parent Game -- the "
+                "exclusion must happen BEFORE any payload is built")
+            raw = json.dumps(listed, sort_keys=True)
+            leaked = leaked_identifiers(
+                foreign_identifiers(fixture, "B", "1", "a") | {victim.id},
+                raw)
             self.assertEqual(
-                _ok(api.discard_draft_games(
-                    game_ids=[orphan.id], actor_id=ADMIN, user_id=ADMIN,
-                    role=Role.LEAGUE_ADMIN, scope={}))["discarded"], 0,
-                "an unresolvable draft Game was discarded by an identified "
-                "caller")
-            # ...and the legacy identity-less path still sees it, so this is a
-            # ceiling and not a data-repair change.
-            self.assertIn(orphan.id, [row["game_id"] for row
-                                      in _ok(api.list_draft_games())
-                                      ["draft_games"]])
+                leaked, [],
+                f"the review list named the excluded Game's identifiers "
+                f"{leaked}")
         self._on_every_backend(body)
 
     def test_the_review_surface_is_ungated_for_identity_less_callers(self):
