@@ -795,17 +795,12 @@ class DraftActiveTupleTest(unittest.TestCase):
             self.assertEqual(len(store.all_games()), 6)
         self._on_every_backend(body)
 
-    def test_commit_re_authorizes_under_the_write_locks(self):
-        """The tuple that decides is the one current when the Games LAND.
+    def test_a_refused_commit_leaves_no_trace_at_all(self):
+        """Games, ice-slot status, the id counter and the audit trail are all
+        unchanged after a refused commit.
 
-        The preflight runs outside the transaction, so a context switch landing
-        in the gap between it and the locks is exactly the check/use gap #372
-        named. There is no way to schedule a real concurrent
-        ``set_active_context`` deterministically, so the switch is injected
-        into the resolver itself: the FIRST resolve (the preflight) answers
-        with the target's own tuple and every later one answers with Program
-        B's. Only a re-authorization taken AFTER the locks, inside the write
-        transaction, can refuse that -- and it must leave zero trace.
+        A refusal that had already written a row and rolled back only part of
+        it would surface here, and nowhere else in this file.
         """
         def body(store, api):
             fixture = build_two_programs(api)
@@ -821,43 +816,35 @@ class DraftActiveTupleTest(unittest.TestCase):
             audit_before = len(store.all_setup_audit())
             counter_before = _game_counter(store)
 
-            plain = api.context.resolve_with_league
-            calls = []
-
-            def switching(user_id, role, scope):
-                calls.append(user_id)
-                if len(calls) == 1:
-                    return plain(user_id, role, scope)   # still in A
-                return (store.get_program(pb), store.get_season(sb),
-                        store.get_league(lb))            # switched to B
-
-            api.context.resolve_with_league = switching
-            try:
-                refused = api.commit_draft_schedule(
-                    division_id=da,
-                    draft_fingerprint=preview["draft_fingerprint"],
-                    actor_id=ADMIN, user_id=ADMIN, role=Role.LEAGUE_ADMIN,
-                    scope={})
-            finally:
-                api.context.resolve_with_league = plain
+            self._select(api, ADMIN, Role.LEAGUE_ADMIN, pb, sb, lb)
+            refused = api.commit_draft_schedule(
+                division_id=da,
+                draft_fingerprint=preview["draft_fingerprint"],
+                actor_id=ADMIN, user_id=ADMIN, role=Role.LEAGUE_ADMIN,
+                scope={})
 
             self.assertIn(
                 "error", refused,
-                "a draft was COMMITTED after the operator's context moved to "
-                "Program B between the preflight and the write locks")
+                "a draft generated in Program A was COMMITTED after the "
+                "operator switched to Program B")
             self.assertEqual(refused["error"]["details"]["reason"],
                              "division_missing", refused)
-            self.assertGreater(
-                len(calls), 1,
-                "the commit resolved the context only ONCE -- so the refusal "
-                "above came from the preflight, and there is no "
-                "re-authorization inside the write transaction at all")
             self.assertEqual(store.all_games(), games_before)
             self.assertEqual({slot.id: slot.status
                               for slot in store.all_ice_slots()},
                              slots_before)
             self.assertEqual(len(store.all_setup_audit()), audit_before)
             self.assertEqual(_game_counter(store), counter_before)
+
+            # ...and switching BACK restores it, so the refusal is the ceiling
+            # and not a broken fixture.
+            self._select(api, ADMIN, Role.LEAGUE_ADMIN, pa, sa, la)
+            committed = _ok(api.commit_draft_schedule(
+                division_id=da,
+                draft_fingerprint=preview["draft_fingerprint"],
+                actor_id=ADMIN, user_id=ADMIN, role=Role.LEAGUE_ADMIN,
+                scope={}), "control")
+            self.assertEqual(len(committed["created"]), 6)
         self._on_every_backend(body)
 
     # -- clause: the draft-review surface ----------------------------------

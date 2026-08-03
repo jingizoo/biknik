@@ -363,7 +363,8 @@ class ApiService(_BaseApiService):
             # dict, so the caller gets the byte-identical scope refusal
             # instead of a `preview_stale` that would misdescribe it.
             self._authorize_schedule_target(
-                division_id, season_id, league_id, user_id, role, scope)
+                division_id, season_id, league_id, user_id, role, scope,
+                lock=True)
             _locked_proposal = self.draft_season_schedule(
                 division_id=division_id, season_id=season_id,
                 league_id=league_id, slot_ids=slot_ids,
@@ -599,26 +600,26 @@ class ApiService(_BaseApiService):
             "unscheduled": proposal["unscheduled"],
         }
 
-    @catch
-    def publish_draft_games(self, game_ids=None, all_drafts=False,
-                            actor_id=None, user_id=None, role=None,
-                            scope=None) -> dict:
-        # #386 -- the principal is threaded into BOTH `_draft_targets` calls
-        # (this pre-validation pass and the base facade's own), so the batch
-        # this override validates is exactly the batch the base facade then
-        # publishes. Validating a wider set here would re-open the leak from
-        # the other side: `require_game_league_id` raises a
-        # `game_league_ambiguous` / `venue_access_missing` error naming a
-        # FOREIGN game's id and league ids, which is the disclosure again,
-        # this time as an error payload.
-        targets = self._draft_targets(game_ids, all_drafts, user_id, role,
-                                      scope)
-        # Validate the whole batch before the first slot allocation or publish;
-        # one bad legacy draft must not partially publish the selection.
+    def _publish_batch_extra_validation(self, targets) -> None:
+        """The league-ice invariant, on the batch the base facade has ALREADY
+        locked and authorized (#386).
+
+        This used to be a full override of ``publish_draft_games`` that
+        resolved the targets itself and then called ``super()``, which resolved
+        them a SECOND time. Two independent resolutions of the same request are
+        two chances to disagree — a concurrent context switch or a Game moving
+        between them meant the set validated here was not provably the set the
+        base facade published, and the validation itself leaks: on a wider set,
+        ``require_game_league_id`` raises ``game_league_ambiguous`` /
+        ``venue_access_missing`` naming a FOREIGN Game's id and league ids,
+        which is the disclosure again, this time as an error payload.
+
+        As a hook there is exactly ONE resolution, taken under the
+        ActiveContext and Game row locks, and this runs on those very rows
+        inside the write transaction. Raising here rolls the whole batch back,
+        so one bad legacy draft still cannot partially publish the selection.
+        """
         for game in targets:
             require_game_league_id(self.store, game)
             require_slot_belongs_to_season(
                 self.store, game.ice_slot_id, game.season_id)
-        return super().publish_draft_games(
-            game_ids=game_ids, all_drafts=all_drafts, actor_id=actor_id,
-            user_id=user_id, role=role, scope=scope)

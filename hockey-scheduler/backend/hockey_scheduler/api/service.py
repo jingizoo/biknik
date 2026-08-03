@@ -4814,9 +4814,18 @@ class ApiService:
     # machinery #381 landed (`resolve_with_league` + `_setup_target_edge_allows`
     # + `resolve_scenario_scope`'s `authorize` callback), never a parallel one.
     def _authorize_schedule_target(self, division_id, season_id, league_id,
-                                   user_id, role, scope) -> None:
+                                   user_id, role, scope, lock=False) -> None:
         """Refuse unless the REQUESTED hierarchy equals the caller's persisted
         active tuple. Returns None; raises to refuse.
+
+        ``lock=True`` takes the caller's ActiveContext ROW LOCK and holds it
+        for the rest of the surrounding transaction, which the caller must own
+        (#386). Every MUTATING use passes it: without it the tuple is only
+        *snapshot*-consistent, and a concurrent `POST /api/context` committing
+        between the decision and the write makes the write happen under a tuple
+        that never authorized it. `set_active_context` takes the same lock, so
+        the two order on the database. The pure preflight leaves it False —
+        it owns no transaction and is explicitly not the security boundary.
 
         The caller supplies scope ids and those ids say WHICH hierarchy to
         generate for; the session says whether this caller may. Only the second
@@ -4880,7 +4889,7 @@ class ApiService:
             return
 
         program, season, league = self.context.resolve_with_league(
-            user_id, role, scope)
+            user_id, role, scope, lock=lock)
         judged = False
 
         def _edge_allows(edge):
@@ -5986,7 +5995,8 @@ class ApiService:
             # the caller gets the byte-identical scope refusal instead of a
             # `preview_stale` that would misdescribe it.
             self._authorize_schedule_target(
-                division_id, season_id, league_id, user_id, role, scope)
+                division_id, season_id, league_id, user_id, role, scope,
+                lock=True)
             _locked_proposal = self.draft_season_schedule(
                 division_id=division_id, season_id=season_id,
                 league_id=league_id, slot_ids=slot_ids,
@@ -6422,6 +6432,60 @@ class ApiService:
         wanted = set(game_ids or [])
         return [g for g in drafts if g.id in wanted]
 
+    def _locked_draft_targets(self, game_ids, all_drafts, user_id, role,
+                              scope):
+        """The publish/discard batch, decided under the locks that make the
+        decision still true when the write lands (#386).
+
+        MUST be called inside the transaction that performs the mutation.
+        `_draft_targets` alone is a plain read: the owner's review named the
+        gap it leaves — the active tuple is resolved and the Games are read in
+        one transaction, then the writes happen in another, so a concurrent
+        `POST /api/context` (or a concurrent write moving a Game's parents)
+        landing in between makes the batch authorized under a tuple that no
+        longer holds. That is the same check/use gap #372 closed for setup
+        mutations with `setup_guarded_mutation`, and the shape of the fix is
+        the same: LOCK, then DECIDE, then MUTATE, all in one transaction.
+
+        Three locks, in this order:
+
+        1. the caller's **ActiveContext row** (`resolve_with_league(lock=True)`)
+           — `set_active_context` takes the same one before writing, so a
+           context switch either orders wholly before this authorization or
+           waits for the write it authorized to commit;
+        2. every candidate draft **Game row** (`get_game_for_update`), taken in
+           sorted id order so two concurrent batches cannot deadlock;
+        3. the Season rows, taken by the callers' own `_guard_active_seasons`
+           after this returns — unchanged, and still after the Game locks.
+
+        The authorization then runs on the RE-READ, post-lock Game rows, never
+        on the pre-lock snapshot: a Game whose `division_id` or
+        `league_season_id` was moved out of the tuple between the read and the
+        lock is judged on what it is NOW.
+        """
+        if role is None:
+            return self._draft_targets(game_ids, all_drafts)
+        program, season, league = self.context.resolve_with_league(
+            user_id, role, scope, lock=True)
+        if program is None:
+            return []
+        candidates = sorted(
+            (g.id for g in self.store.all_games() if g.is_draft),
+            )
+        if not all_drafts:
+            wanted = set(game_ids or [])
+            candidates = [gid for gid in candidates if gid in wanted]
+        targets = []
+        for game_id in candidates:
+            locked = self.store.get_game_for_update(game_id)
+            # Re-read under the lock: `is_draft` and every parent are judged
+            # on the row as it stands now, not as the pre-lock scan saw it.
+            if (locked is not None and locked.is_draft
+                    and self._game_in_active_tuple(
+                        locked, program, season, league)):
+                targets.append(locked)
+        return targets
+
     @catch
     def publish_draft_games(self, game_ids=None, all_drafts=False,
                             actor_id=None, user_id=None, role=None,
@@ -6440,24 +6504,46 @@ class ApiService:
         audit is written. Each game is routed through the same audited
         ``setup.publish_game`` as single-game publish.
 
-        Bound to the caller's active tuple through ``_draft_targets`` (#386):
-        a foreign draft Game is not a target, so it is neither published nor
-        counted, and ``all_drafts`` means all of the caller's own.
+        Bound to the caller's active tuple (#386), and the binding is decided
+        INSIDE this transaction under the ActiveContext and Game row locks —
+        see ``_locked_draft_targets``. Resolving the batch outside the write
+        transaction left a check/use gap a concurrent context switch could
+        land in. A foreign draft Game is not a target, so it is neither
+        published nor counted, and ``all_drafts`` means all of the caller's
+        own.
         """
-        targets = self._draft_targets(game_ids, all_drafts, user_id, role,
-                                      scope)
-        # Validate EVERY target BEFORE any mutation: run publish_game's own #283
-        # participation revalidation (exact LeagueSeason for a regular game,
-        # active Season participation for an exhibition) read-only up front, so a
-        # single invalid target aborts with ZERO writes — never a partial
-        # publish. The transaction below is a second, independent guarantee.
-        for g in targets:
-            self.setup._revalidate_game_participation(g)
         published = 0
-        with self.store.transaction():
-            # #159 — lock every target Season (sorted) FIRST, before any
-            # slot/Game write, so the lock order is Season-before-slot/Game
-            # (matching every other path) and no write precedes the guard.
+        # An identified caller opens SERIALIZABLE, because the authorization
+        # inside reads the context through `ContextService._snapshot`, which
+        # asks for that level, and a nested join may never RAISE the isolation
+        # of the open transaction. `role is None` keeps the previous default
+        # level byte-for-byte and takes no context read at all.
+        with self.store.transaction(
+                isolation=None if role is None else "SERIALIZABLE"):
+            targets = self._locked_draft_targets(
+                game_ids, all_drafts, user_id, role, scope)
+            # Subclass hook, run on the SAME locked batch (#386): the
+            # league-scoped facade used to override this whole method and
+            # resolve the targets a SECOND time, so the set it validated was
+            # not provably the set the base facade then published.
+            #
+            # FIRST, exactly where that override's own validation ran before
+            # this refactor. The order is the published contract, not an
+            # implementation detail: a legacy draft on wrong-league ice
+            # reports `venue_access_missing` / `game_league_ambiguous`, and
+            # running the participation check ahead of it would relabel both
+            # as `regular_game_missing_league_season`.
+            self._publish_batch_extra_validation(targets)
+            # Validate EVERY target BEFORE any mutation: run publish_game's own
+            # #283 participation revalidation (exact LeagueSeason for a regular
+            # game, active Season participation for an exhibition) read-only up
+            # front, so a single invalid target aborts with ZERO writes — never
+            # a partial publish. Now INSIDE the transaction, on the same locked
+            # rows the writes below use, rather than on a pre-lock snapshot.
+            for g in targets:
+                self.setup._revalidate_game_participation(g)
+            # #159 — lock every target Season (sorted), before any slot/Game
+            # write, so no write precedes the guard.
             self._guard_active_seasons([g.season_id for g in targets])
             for g in targets:
                 # Allocate the ice slot, matching the manual create_game
@@ -6477,6 +6563,15 @@ class ApiService:
                 published += 1
         return {"published": published}
 
+    def _publish_batch_extra_validation(self, targets) -> None:
+        """Per-facade extra validation of an ALREADY-LOCKED publish batch.
+
+        A hook rather than a method override, so the league-scoped facade
+        cannot end up validating a different set of Games from the one that is
+        published (#386). It runs inside the write transaction, after the
+        ActiveContext and Game row locks and before the first write."""
+        return None
+
     @catch
     def discard_draft_games(self, game_ids=None, all_drafts=False,
                             actor_id=None, user_id=None, role=None,
@@ -6486,16 +6581,21 @@ class ApiService:
         Each discard is audited before deletion so the review action leaves a
         trail (a draft is state; discarding it is a state change).
 
-        Bound to the caller's active tuple through ``_draft_targets`` (#386):
-        a foreign draft Game is not a target, so it is neither deleted nor
-        audited, and ``all_drafts`` means all of the caller's own."""
-        targets = self._draft_targets(game_ids, all_drafts, user_id, role,
-                                      scope)
+        Bound to the caller's active tuple (#386), decided INSIDE this
+        transaction under the ActiveContext and Game row locks — see
+        ``_locked_draft_targets``. A foreign draft Game is not a target, so it
+        is neither deleted nor audited, and ``all_drafts`` means all of the
+        caller's own."""
         discarded = 0
         # #159 — lock every distinct target Season (sorted) and delete inside
         # ONE transaction: an archived-Season draft aborts the whole batch
         # with zero deletes/audits, and the lock is held through the writes.
-        with self.store.transaction():
+        # #386 — the target decision joins that same unit, at SERIALIZABLE for
+        # an identified caller (the nested context read asks for it).
+        with self.store.transaction(
+                isolation=None if role is None else "SERIALIZABLE"):
+            targets = self._locked_draft_targets(
+                game_ids, all_drafts, user_id, role, scope)
             self._guard_active_seasons([g.season_id for g in targets])
             for g in targets:
                 self.setup._audit("draft_game_discarded", "game", g.id,
