@@ -173,7 +173,17 @@ async function checkViewport(browser, viewport, pinned) {
   try {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
 
-    // (1) The calendar opens on the current UTC date.
+    // ================= PREMISES, BEFORE ANY BEHAVIOURAL CHECK ==============
+    //
+    // Both clocks have to have actually moved. If either override silently
+    // fails — the env var never reaching the spawned server, or the `Date`
+    // patch landing after app.js has already read the clock — every
+    // behavioural assertion below would quietly re-run on the machine's real
+    // date and pass, which is precisely the hole this pass exists to close. So
+    // the two premises are asserted FIRST and fail loudly, rather than being
+    // assumed by assertions that cannot tell the difference.
+
+    // PREMISE B (browser): the app opened on the pinned UTC day.
     //
     // On the real-clock pass this is bracketed by two independent clock
     // readings, so a run that straddles UTC midnight names both permitted days
@@ -185,10 +195,59 @@ async function checkViewport(browser, viewport, pinned) {
     const after = pinned ? pinned.slice(0, 10) : utcToday();
     const opened = await calDay();
     if (![before, after].includes(opened)) {
-      fail(`calendar opened on ${opened}, not the current UTC date `
-        + `(${before === after ? before : `${before} or ${after}`})`);
+      fail(`PREMISE B: calendar opened on ${opened}, not the current UTC date `
+        + `(${before === after ? before : `${before} or ${after}`})`
+        + `${pinned ? " — the browser Date override did not take effect before "
+          + "app.js read the clock" : ""}`);
     }
     const today = opened;
+
+    // PREMISE A (server): the demo was rebuilt at the SAME instant.
+    //
+    // Read off the real inventory, not off a config echo: the earliest ice must
+    // be day zero 16:00, and day zero is the pinned day + the 3-day lead. If
+    // HOCKEY_DEMO_SEED_INSTANT never reached the spawned server, the seed falls
+    // back to the machine's clock and this names the two dates side by side.
+    const loadStatus0 = await page.evaluate(() => fetch("/api/demo/load", {
+      method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/json" }, body: "{}",
+    }).then((r) => r.status));
+    if (loadStatus0 !== 200) fail(`demo load failed (status ${loadStatus0})`);
+    const seeded = await page.evaluate(async () => {
+      const r = await fetch("/api/demo/overview", { credentials: "same-origin" });
+      const ov = await r.json();
+      return (ov.ice_slots || []).map((s) => String(s.start_time));
+    });
+    // Premise for the premise: a full inventory really came back, so the
+    // date checks below are about WHERE the ice is, not whether any exists.
+    if (seeded.length !== 57) {
+      fail(`PREMISE A: expected the demo's 57 ice slots, got ${seeded.length}`);
+    }
+    const dayZero = await page.evaluate((d) => addDays(d, 3), today);
+    const earliest = seeded.map((s) => s.slice(0, 10)).sort()[0];
+    if (earliest !== dayZero) {
+      fail(`PREMISE A: the rebuilt demo's earliest ice is ${earliest}, not `
+        + `${dayZero} (the instant the server was told to seed at, + the `
+        + `3-day lead) — the seed instant did not reach the server`);
+    }
+    const earliestStart = seeded.slice().sort()[0];
+    if (!earliestStart.startsWith(`${dayZero}T16:00`)) {
+      fail(`PREMISE A: earliest slot starts ${earliestStart}, expected `
+        + `${dayZero}T16:00`);
+    }
+    if (pinned) {
+      // And it really is on the far side of the expired bomb.
+      const retired = seeded.map((s) => s.slice(0, 10))
+        .filter((d) => d >= "2026-09-05" && d <= "2026-09-19");
+      if (retired.length) {
+        fail(`PREMISE A: ${retired.length} slot(s) still land in the retired `
+          + `2026-09-05..19 window: ${[...new Set(retired)].join(", ")}`);
+      }
+    }
+    await page.reload({ waitUntil: "domcontentloaded" });
+    await page.waitForSelector("#content > *", { timeout: 10000 });
+
+    // ===================== BEHAVIOURAL ASSERTIONS ==========================
 
     // (2) "Today" returns to today after navigating away.
     await page.click('.tab[data-tab="calendar"]');
@@ -211,17 +270,8 @@ async function checkViewport(browser, viewport, pinned) {
     }
 
     // (3) The ice-slot drawer's Date defaults to the day being VIEWED.
-    //
-    // Loaded first so the drawer has a Rink to offer; the demo's own ice is
-    // also what step (4) counts.
-    const loadStatus = await page.evaluate(() => fetch("/api/demo/load", {
-      method: "POST", credentials: "same-origin",
-      headers: { "Content-Type": "application/json" }, body: "{}",
-    }).then((r) => r.status));
-    if (loadStatus !== 200) fail(`demo load failed (status ${loadStatus})`);
-    await page.reload({ waitUntil: "domcontentloaded" });
-    await page.waitForSelector("#content > *", { timeout: 10000 });
-
+    // (The demo is already loaded — PREMISE A did it — so the drawer has a
+    // Rink to offer.)
     await page.click('.tab[data-tab="calendar"]');
     await page.waitForSelector('[data-cal="0"]', { timeout: 10000 });
     await page.click('[data-cal="1"]');
@@ -308,39 +358,14 @@ async function checkViewport(browser, viewport, pinned) {
       fail(`games card counts "${card.sub}" but lists ${card.rows} rows`);
     }
 
-    // (6) PINNED PASS ONLY — the point of travelling at all.
+    // (6) The seeded ice is REACHABLE, not merely present in the API.
     //
-    // Everything above would also pass on 2026-08-03, which is the criticism
-    // that produced this pass: a journey run against the machine's real clock
-    // proves the app correct on today's date, and today's date is still BEFORE
-    // the retired September 2026 window. So here the whole stack has been moved
-    // five years past that window, and the demo must still be a live demo:
-    // seeded on the far side of the expired bomb, with its ice on the calendar
-    // where the operator can reach it, and nothing left behind in 2026-09.
-    if (pinned) {
-      const dayZero = await page.evaluate((d) => addDays(d, 3), today);
-      const slotDays = await page.evaluate(async () => {
-        const r = await fetch("/api/demo/overview", { credentials: "same-origin" });
-        const ov = await r.json();
-        return (ov.ice_slots || []).map((s) => String(s.start_time).slice(0, 10));
-      });
-      // Premise: a full inventory really came back, so the emptiness checks
-      // below are about WHERE the ice is and not about there being none.
-      if (slotDays.length !== 57) {
-        fail(`expected the demo's 57 ice slots, got ${slotDays.length}`);
-      }
-      const retired = slotDays.filter((d) => d >= "2026-09-05" && d <= "2026-09-19");
-      if (retired.length) {
-        fail(`${retired.length} slot(s) still land in the retired 2026-09-05..19 `
-          + `window: ${[...new Set(retired)].join(", ")}`);
-      }
-      const earliest = slotDays.slice().sort()[0];
-      if (earliest !== dayZero) {
-        fail(`earliest demo ice is ${earliest}, expected day zero ${dayZero} `
-          + `(the pinned instant + a 3-day lead)`);
-      }
-      // And it is REACHABLE: three steps from the day the app opened on is
-      // day zero, and the day board paints that ice rather than an empty day.
+    // PREMISE A proved the demo was rebuilt at the pinned instant; this proves
+    // the operator can actually get to it — three steps from the day the app
+    // opened on is day zero, and the day board paints that ice rather than an
+    // empty day. Run on both passes: it is the real end-to-end statement, that
+    // Calendar and the seed still agree with each other after the retired date.
+    {
       await page.click('.tab[data-tab="calendar"]');
       await page.waitForSelector('[data-cal="0"]', { timeout: 10000 });
       await page.click('[data-cal="0"]');
