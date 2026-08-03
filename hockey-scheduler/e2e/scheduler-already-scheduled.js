@@ -41,7 +41,6 @@ const path = require("path");
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
 const READY_TIMEOUT_MS = 15000;
-const ICE_DAY = "2026-09-12";
 const VIEWPORTS = [
   { label: "desktop", width: 1440, height: 900, port: 8301 },
   { label: "phone", width: 390, height: 844, port: 8302 },
@@ -142,6 +141,14 @@ async function checkViewport(browser, viewport) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    // This journey never navigates the calendar, so its day only has to be
+    // strictly in the FUTURE — step (5) deletes the leftover open slots, and
+    // `delete_ice_slot` refuses anything at or before its clock ("past slots
+    // are history"). The literal 2026-09-12 met that only because the date had
+    // not arrived yet; a week out from the app's own current day always does,
+    // at every hour, and comes from the app's clock rather than a second one
+    // (#387/#389).
+    const ICE_DAY = await page.evaluate(() => addDays(calendarDate, 7));
 
     // Build one League with two Divisions: a 4-team "Mixed" (six round-robin
     // pairings) and a 2-team "AllDone" (exactly one pairing).

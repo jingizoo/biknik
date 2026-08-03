@@ -26,7 +26,6 @@ const path = require("path");
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
 const READY_TIMEOUT_MS = 15000;
-const CAL_DAY = "2026-09-05";
 const VIEWPORTS = [
   { label: "desktop", width: 1440, height: 900, port: 8191 },
   { label: "phone", width: 390, height: 844, port: 8192 },
@@ -98,6 +97,14 @@ async function checkViewport(browser, viewport) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    // This journey books ice and then reads it back off the Arena Calendar's
+    // DEFAULT day, without navigating — so the day it books on must be the day
+    // the calendar opens on. That used to be the literal "2026-09-05", which
+    // worked only because app.js opened on the same literal: two constants
+    // agreeing with each other about a date that real time would pass
+    // (#387/#389). Read from the app's own `calendarDate` global instead, so
+    // the booked day and the rendered day cannot drift apart.
+    const CAL_DAY = await page.evaluate(() => calendarDate);
     await page.click('.tab[data-tab="setup"]');
     await page.click('[data-setup-view="records"]');
     await page.waitForSelector(".setup-card", { timeout: 10000 });
