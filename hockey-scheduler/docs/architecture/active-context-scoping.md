@@ -584,6 +584,25 @@ the same request SHAPE — `division_missing` for the Division form,
 indistinguishable from a guessed one. A 404-vs-403 split here would itself be
 the disclosure: it turns a sequential id space into an existence oracle.
 
+**Where the edge is judged is part of that, and the first cut got it wrong.**
+The Season+League branch of `resolve_scenario_scope` learns its facts in a
+LADDER — "these ids are a real LeagueSeason", then "they share one Program",
+then "this Division hangs off that LeagueSeason" — and each rung refuses with
+its own reason. Judging the edge only on the fully RESOLVED hierarchy therefore
+left the earlier rungs answerable to anyone: a caller active in Program B who
+sent a guessed `(season_id, league_id)` **plus a junk `division_id`** got
+`division_missing` when the pair really was linked and `league_season_missing`
+when it was not — an existence oracle over another Program's hierarchy, decided
+before any authorization ran, over ids the counters hand out in sequence. The
+tuple check is now a callback (`resolve_scenario_scope(..., authorize=)`)
+invoked at the EARLIEST point each shape knows its whole edge: for the
+Season+League shape that is the instant the LeagueSeason link resolves, before
+either later refusal exists. The Division-only shape has no ladder — one lookup,
+one reason for foreign and guessed alike — so it is still judged on the result.
+Inside the caller's own tuple the precise `Division not found in the selected
+LeagueSeason.` diagnostic is unchanged; the leak was closed by ordering the
+check, not by flattening the refusals.
+
 **Commit re-authorizes; it does not trust the create.** Reading a scenario at
 generation is not authority to commit it minutes later — the operator may switch
 Program, Season or League in between, and the tuple that decides is the one
@@ -625,6 +644,19 @@ fixture that isolates it:
 | commit with `meetings_per_opponent=None` | `'error' unexpectedly found in {'error': {'code': 'concurrency_conflict', 'message': 'This preview is out of date …` on Memory / SQLite / PostgreSQL |
 | store the raw request format instead of the generator's | `None != 1` — an omitted format must be recorded as the 1 it ran under |
 | drop the stored-vs-generated format check | `'schedule_scenario_stale' != 'schedule_scenario_integrity_error'` |
+
+Added in re-review, because the clause each one covers survived deletion with a
+green suite — the scoping rule was asserted in prose above and by nothing else:
+
+| mutation | verbatim failure |
+| --- | --- |
+| judge the edge only on the RESOLVED hierarchy (drop the `authorize` callback from `resolve_scenario_scope`) | *"a junk division_id alongside a FOREIGN season_id + league_id answered differently from a guessed pair — the refusal tells an unauthorized caller whether that LeagueSeason is real"*, with `'…"reason": "division_missing"…' != '…"reason": "league_season_missing"…'` |
+| `program is None` → `return True` in `_scenario_in_active_tuple` | *"a principal authorized for NO Program read a scenario"* — every other fixture here drives a GLOBAL role, which can never produce a null Program |
+| drop `NOT NULL` from migration 050's `season_id` | `AssertionError: Exception not raised` (column='season_id') — the Season axis this whole ceiling leans on |
+
+The rest of the scenario record's own contract — immutability, staleness and the
+commit lock plan — is documented in
+[scheduler.md](scheduler.md#named-immutable-scenarios-378).
 
 ## The grant-only facility contract (venue sharing)
 

@@ -51,8 +51,27 @@ def canonical_fingerprint(value) -> str:
 
 
 def resolve_scenario_scope(store, division_id=None, season_id=None,
-                           league_id=None) -> dict:
-    """Resolve the permanent Program→League plus Season overlay identity."""
+                           league_id=None, authorize=None) -> dict:
+    """Resolve the permanent Program→League plus Season overlay identity.
+
+    ``authorize`` is an optional ``callable((program_id, season_id, league_id))``
+    the caller supplies to judge the resolved edge against its own active tuple.
+    It is invoked at the EARLIEST point a request shape knows its whole edge and
+    must RAISE to refuse.
+
+    That placement is the whole point, not a convenience. The Season+League
+    shape learns three separate facts in order — "these ids exist and are a real
+    LeagueSeason", "they share one Program", "this Division hangs off that
+    LeagueSeason" — and each one refuses with its OWN reason. Judging the edge
+    only after all three have been checked therefore lets an unauthorized caller
+    read the first two off the refusal it gets: supply a guessed
+    ``(season_id, league_id)`` plus a junk ``division_id`` and ``division_missing``
+    means the pair really is linked while ``league_season_missing`` means it is
+    not — an existence oracle over a foreign Program's hierarchy, answered before
+    any authorization ran. The Division-only shape has no such ladder (one
+    lookup, one reason for both foreign and guessed ids), so it is judged by the
+    caller on the resolved result.
+    """
     if bool(season_id) != bool(league_id):
         raise ValidationError(
             "season_id and league_id must be provided together.",
@@ -67,6 +86,12 @@ def resolve_scenario_scope(store, division_id=None, season_id=None,
             raise NotFoundError(
                 "The selected League is not linked to the selected Season.",
                 details={"reason": "league_season_missing"})
+        # Everything below reports on rows this pair NAMES, so the edge is
+        # judged here — before the Program-agreement check and before the
+        # Division lookup, the two later refusals that would otherwise confirm
+        # the pair resolved at all.
+        if authorize is not None:
+            authorize((season.program_id, season.id, league.id))
         if season.program_id != league.program_id:
             raise ValidationError(
                 "The selected Season and League do not belong to one Program.",

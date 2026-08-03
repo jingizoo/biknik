@@ -361,6 +361,84 @@ class ScenarioActiveTupleTest(unittest.TestCase):
             self.assertEqual(len(store.all_schedule_scenarios()), 1)
         self._on_every_backend(body)
 
+    def test_create_refusals_do_not_leak_whether_a_foreign_pair_is_linked(self):
+        """The MIXED request shape -- division_id AND season_id + league_id.
+
+        Found in re-review, and a real leak: the Season+League branch of
+        ``resolve_scenario_scope`` learns its facts in a LADDER (the pair is a
+        real LeagueSeason -> the two share a Program -> this Division hangs off
+        that LeagueSeason) and each rung refuses with its own reason. With the
+        tuple checked only on the RESOLVED hierarchy, a caller active in Program
+        B could add a junk ``division_id`` to a guessed ``(season_id, league_id)``
+        and read the ladder off the refusal:
+
+          ``division_missing``     -> the pair IS a real linked LeagueSeason
+          ``league_season_missing``-> it is not
+
+        -- an existence oracle over another Program's hierarchy, answered before
+        any authorization ran, over an id space (`season_3`, `league_5`, ...)
+        that is enumerable. The fix judges the edge as soon as the LINK is
+        proven, so both rungs collapse to the one refusal a guess produces.
+
+        The controls are what stop this test from passing on a facade that
+        simply answers ``league_season_missing`` to everything: inside the
+        caller's OWN tuple the specific in-LeagueSeason Division diagnostic is
+        still required, and the same shape with a real own Division still
+        creates.
+        """
+        def body(store, api):
+            fixture = build_two_programs(api)
+            _pa, sa, la, da = corner(fixture, "A", "1", "a")
+            pb, sb, lb, db = corner(fixture, "B", "1", "a")
+            self._select(api, ADMIN, Role.LEAGUE_ADMIN, pb, sb, lb)
+
+            def create(name, **kwargs):
+                return api.create_schedule_scenario(
+                    name, actor_id=ADMIN, user_id=ADMIN,
+                    role=Role.LEAGUE_ADMIN, scope={}, **kwargs)
+
+            probed = create("Probe A's link", season_id=sa, league_id=la,
+                            division_id="division_nope")
+            guessed = create("Probe a guess", season_id="season_nope",
+                             league_id="league_nope",
+                             division_id="division_nope")
+            self.assertIn("error", probed, probed)
+            self.assertEqual(
+                json.dumps(probed, sort_keys=True),
+                json.dumps(guessed, sort_keys=True),
+                "a junk division_id alongside a FOREIGN season_id + league_id "
+                "answered differently from a guessed pair -- the refusal tells "
+                "an unauthorized caller whether that LeagueSeason is real")
+            # And the same probe against a foreign division that really exists
+            # inside that foreign LeagueSeason must not answer differently
+            # either -- otherwise the oracle just moves one rung along.
+            self.assertEqual(
+                json.dumps(create("Probe A's division", season_id=sa,
+                                  league_id=la, division_id=da),
+                           sort_keys=True),
+                json.dumps(guessed, sort_keys=True))
+            self.assertEqual(store.all_schedule_scenarios(), [])
+
+            # Control 1: inside the caller's OWN tuple the mixed shape still
+            # reports the precise, useful diagnostic -- the leak was closed by
+            # ordering the check, not by flattening every refusal.
+            own_bad_division = create(
+                "Own tuple, bad division", season_id=sb, league_id=lb,
+                division_id="division_nope")
+            self.assertEqual(
+                own_bad_division["error"]["details"]["reason"],
+                "division_missing", own_bad_division)
+            self.assertEqual(
+                own_bad_division["error"]["message"],
+                "Division not found in the selected LeagueSeason.",
+                own_bad_division)
+            # Control 2: the same shape, wholly inside the tuple, still works.
+            own = create("Own tuple, own division", season_id=sb,
+                         league_id=lb, division_id=db)
+            self.assertNotIn("error", own, own)
+            self.assertEqual(len(store.all_schedule_scenarios()), 1)
+        self._on_every_backend(body)
+
     # -- clause 2: list ----------------------------------------------------
     def test_list_contains_only_the_active_exact_tuple(self):
         corners = (("A1a", ("A", "1", "a")), ("A1b", ("A", "1", "b")),
@@ -464,6 +542,63 @@ class ScenarioActiveTupleTest(unittest.TestCase):
                 scenario["scenario_id"], ADMIN, Role.LEAGUE_ADMIN, {})
             self.assertEqual(fetched["error"]["details"]["reason"],
                              "schedule_scenario_missing", fetched)
+        self._on_every_backend(body)
+
+    def test_a_principal_with_no_authorized_program_fails_closed(self):
+        """`program is None` -- rule 2 of `setup_target_accessible`, restated.
+
+        Distinct from the Program-only case above, which HAS a Program and
+        fails on the Season axis. Here `resolve_with_league` returns
+        `(None, None, None)` because the principal is authorized for nothing at
+        all: an UNBOUND Coach (`scope={}` resolves to no team, so
+        `authorized_program_ids` is empty). Found unfalsified in re-review --
+        flipping the guard to `return True` broke no test, because every other
+        fixture here drives a GLOBAL role, which is authorized for every
+        Program and so can never produce a null one.
+
+        Reachable only at the service boundary today (the HTTP layer refuses a
+        Coach on the MANAGE_SCHEDULE gate first), which is exactly why the
+        service-level clause has to be held by a service-level test: nothing
+        upstream would notice it rotting.
+        """
+        def body(store, api):
+            fixture = build_two_programs(api)
+            pa, sa, la, da = corner(fixture, "A", "1", "a")
+            self._select(api, ADMIN, Role.LEAGUE_ADMIN, pa, sa, la)
+            scenario = _ok(self._create(api, "A1a", da, ADMIN,
+                                        Role.LEAGUE_ADMIN))
+            unbound = ("user_unbound_coach", Role.COACH)
+            # The fixture's own premise: this principal really does resolve to
+            # no Program. If that ever stops being true the assertions below
+            # would pass for the wrong reason.
+            self.assertEqual(
+                api.context.resolve_with_league(*unbound, {})[0], None)
+
+            self.assertEqual(
+                api.list_schedule_scenarios(*unbound, {}), {"scenarios": []})
+            fetched = api.get_schedule_scenario(
+                scenario["scenario_id"], *unbound, {})
+            self.assertIn("error", fetched,
+                          "a principal authorized for NO Program read a "
+                          "scenario")
+            self.assertEqual(fetched["error"]["details"]["reason"],
+                             "schedule_scenario_missing", fetched)
+            committed = api.commit_schedule_scenario(
+                scenario["scenario_id"], actor_id=unbound[0],
+                user_id=unbound[0], role=unbound[1], scope={})
+            self.assertIn("error", committed,
+                          "a principal authorized for NO Program COMMITTED a "
+                          "scenario")
+            self.assertEqual(committed["error"]["details"]["reason"],
+                             "schedule_scenario_missing", committed)
+            created = self._create(api, "By nobody", da, *unbound)
+            self.assertIn("error", created,
+                          "a principal authorized for NO Program CREATED a "
+                          "scenario")
+            self.assertEqual(created["error"]["details"]["reason"],
+                             "division_missing", created)
+            self.assertEqual(store.all_games(), [])
+            self.assertEqual(len(store.all_schedule_scenarios()), 1)
         self._on_every_backend(body)
 
     def test_no_league_selection_is_the_program_plus_season_union(self):

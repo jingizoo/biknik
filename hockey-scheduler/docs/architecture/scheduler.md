@@ -1265,3 +1265,37 @@ by the active-tuple rule in
 [active-context-scoping.md](active-context-scoping.md#named-schedule-scenarios-378--381)
 — including a re-authorization at commit time that runs under the scenario's
 row lock, inside this same transaction.
+
+### What immutability actually rests on
+
+A scenario has no update and no delete: the store exposes `add`, `get`,
+`get_..._for_update` and `all`, and nothing else, on either backend. Everything
+handed to a caller is deep-copied, so a client cannot reach the stored evidence
+through a response object. The remaining ways the record could still change out
+from under a commit are covered explicitly:
+
+- **the two fingerprints are re-checked at commit.** `input_fingerprint` covers
+  the generation snapshot and `proposal_fingerprint` the reviewed proposal, and
+  both are recomputed inside the write transaction. Without them a rewritten
+  proposal commits a batch nobody reviewed, and a rewritten snapshot silently
+  redefines what "nothing changed" means;
+- **the scope is held by its parents.** All five FK parents — Program, Season,
+  League, LeagueSeason, Division — name the scenario as an itemised dependent,
+  so none of them can be deleted out from under it. (The corollary is real and
+  deliberate: a scenario is permanent, so the Division it names can never be
+  deleted again. There is no scenario delete verb by design — it is evidence.)
+
+### Mutations that hold this section
+
+Recorded in re-review; each clause below survived deletion with a green suite
+before its test existed.
+
+| mutation | verbatim failure |
+| --- | --- |
+| drop the `proposal_fingerprint` integrity check | `'slot_unavailable' != 'schedule_scenario_integrity_error'` |
+| drop the `input_fingerprint` (generation-snapshot) integrity check | *"a scenario whose generation_snapshot no longer matches its own input_fingerprint COMMITTED"* |
+| blank the snapshot's `scope` section | *"the scope section changed after generation and the commit went through anyway"* — six of the seven sections had a stale test; this one did not |
+| drop the `planner_version` arm of the stale check | *"a scenario from a superseded planner version COMMITTED"* |
+| drop the `schedule scenario` dependent group from any of the five parent deletes | *"deleting the season did not name the scenario that references it: ['level', 'division', 'team registration', 'venue access']"* (and the Program / League / LeagueSeason / Division forms) |
+| drop the snapshot's Venue row locks from the commit lock plan | *"a Venue write COMPLETED while this commit held the scenario's lock plan — the snapshot's Venue rows are not being row-locked"* (PostgreSQL) |
+| drop `IF NOT EXISTS` from migration 050's table / index | `sqlite3.OperationalError: table schedule_scenarios already exists` / `index ix_schedule_scenarios_scope already exists` — the hierarchy-rewind tests DROP the table before replaying, so its re-runnability was never exercised |

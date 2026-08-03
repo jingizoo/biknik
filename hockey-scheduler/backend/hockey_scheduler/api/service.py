@@ -5020,21 +5020,49 @@ class ApiService:
             # (the third of the `(user_id, role, scope)` principal triple this
             # whole facade names consistently), while this is the requested
             # Program/Season/League/Division the body's ids resolve to.
-            hierarchy = resolve_scenario_scope(
-                self.store, division_id=division_id, season_id=season_id,
-                league_id=league_id)
-            # BEFORE generation, so a foreign hierarchy never reaches the
-            # planner: no proposal is computed, nothing derived from another
-            # Program's rows is serialized, and the refusal cannot be told from
-            # the one a guessed id already produced.
-            if role is not None:
-                program, season, league = self.context.resolve_with_league(
-                    user_id, role, scope)
+            #
+            # Resolved BEFORE the hierarchy so the edge check can be handed to
+            # `resolve_scenario_scope` as a callback and run at the earliest
+            # point each request shape knows its whole edge — see `_edge_allows`
+            # below. `role is None` takes no context read at all, exactly as
+            # before.
+            active = (self.context.resolve_with_league(user_id, role, scope)
+                      if role is not None else None)
+
+            def _edge_allows(edge):
+                """The ONE tuple check, as a raise-to-refuse callback.
+
+                BEFORE generation, so a foreign hierarchy never reaches the
+                planner: no proposal is computed, nothing derived from another
+                Program's rows is serialized, and the refusal cannot be told
+                from the one a guessed id already produced.
+
+                The Season+League shape ALSO runs it mid-resolution (as soon as
+                the LeagueSeason link is proven, before the Program-agreement
+                and Division checks). Those later refusals name their own
+                reasons, so judging the edge only at the end let a caller
+                distinguish a real foreign LeagueSeason (`division_missing`,
+                reached only once the link resolved) from a guessed pair
+                (`league_season_missing`) by adding a junk `division_id` — an
+                existence oracle over another Program's hierarchy, answered
+                before any authorization ran.
+                """
+                program, season, league = active
                 if program is None or not self._setup_target_edge_allows(
-                        (hierarchy["program_id"], hierarchy["season_id"],
-                         hierarchy["league_id"]), program, season, league):
+                        edge, program, season, league):
                     raise self._scenario_scope_not_found(
                         division_id, season_id, league_id)
+
+            hierarchy = resolve_scenario_scope(
+                self.store, division_id=division_id, season_id=season_id,
+                league_id=league_id,
+                authorize=None if active is None else _edge_allows)
+            if active is not None:
+                # The Division-only shape reaches the check only here (it has
+                # no earlier point where the edge is known), and re-running it
+                # on the resolved hierarchy costs nothing for the other shape.
+                _edge_allows((hierarchy["program_id"], hierarchy["season_id"],
+                              hierarchy["league_id"]))
             proposal = self.draft_season_schedule(
                 division_id=division_id, season_id=season_id,
                 league_id=league_id, slot_ids=request_input["slot_ids"],
