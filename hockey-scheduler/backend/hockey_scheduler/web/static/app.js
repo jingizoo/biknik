@@ -91,6 +91,13 @@ let schedulerState = {
   // plays every other. 1 is the historical single round-robin, so an
   // operator who never touches the control gets exactly the old behaviour.
   meetings: 1,
+  // #390 — the configurable turnaround, in MINUTES, measured from the
+  // previous game's end. 0 is exactly the pre-#390 behaviour, so an operator
+  // who never touches the control gets the historical proposal; the field
+  // itself is now always SENT, which is the half of the defect that lived
+  // here: the screen never sent a rest value at all, so the backend's own
+  // field defaulted to zero and the engine's other two defects were masked.
+  turnaround: 0,
   filters: { division: "all", rink: "all", issue: "all" },  // (#106)
   selected: new Set(),  // game_ids picked for publish/discard (#106)
 };  // (#86)
@@ -554,6 +561,17 @@ const fmtClock = (iso) => {
   return `${h}:${min}${ap}`;
 };
 const dayOf = (iso) => (iso || "").slice(0, 10);
+// #390 — one proposed/draft row's own calendar DAY, for the surfaces that
+// previously rendered a bare clock time. Two proposals on different days at
+// the same hour were indistinguishable, so an operator could not see which
+// day a proposed game fell on.
+//
+// Derived by SLICING the ISO string and handing the date-only value to
+// fmtDate, exactly as `fmt` reads the clock straight out of the same string:
+// both halves of one row therefore describe the same instant by construction.
+// Converting through `new Date` here would reinterpret it in the viewer's
+// zone and could print a different day than the time beside it.
+const fmtRowDate = (iso) => { const d = dayOf(iso); return d ? fmtDate(d) : ""; };
 
 // Per-game triage: derive a status badge + a staffing note from the schedule
 // row's real fields (officials assigned/accepted, roster status, result).
@@ -8705,7 +8723,7 @@ function schedDraftRow(g) {
     : "";
   return `<div class="li">
     <input type="checkbox" class="sched-pick" data-sched-pick="${esc(g.game_id)}" ${checked ? "checked" : ""} />
-    <span class="li-time">${fmt(g.start_time)}</span>
+    <span class="li-when"><span class="li-date">${esc(fmtRowDate(g.start_time))}</span><span class="li-time">${fmt(g.start_time)}</span></span>
     <div class="li-main"><div class="li-title">${esc(g.home_team_name)} vs ${esc(g.away_team_name)}</div>
       <div class="li-sub">${esc(g.division_name || "")} · ${esc(g.rink_name || "")}${badges ? " · " + badges : ""}</div>${rsv}</div>
     <span class="pill gray">Draft</span>${delBtn("game", g.game_id,
@@ -8760,8 +8778,12 @@ function renderScheduler(ov) {
       // not silently folded into a misleading "No games generated." when
       // every pairing in the round robin is already on the calendar.
       const already = (pv.already_scheduled || []);
+      // #390 — the DATE sits inside the existing .li-time cell rather than in
+      // .li-title: every other scheduler journey compares that title with
+      // ===, and a proposal's day is a property of when it is, not of who is
+      // playing.
       const gRows = games.map((g) => `<div class="li">
-        <span class="li-time">${fmt(g.start_time)}</span>
+        <span class="li-when"><span class="li-date">${esc(fmtRowDate(g.start_time))}</span><span class="li-time">${fmt(g.start_time)}</span></span>
         <div class="li-main"><div class="li-title">${esc(g.home_team_name)} vs ${esc(g.away_team_name)}</div>
           <div class="li-sub">${esc(g.rink_name || "")}</div></div></div>`).join("");
       const aRows = already.map((a) => `<div class="li">
@@ -8847,6 +8869,12 @@ function renderScheduler(ov) {
           [1, 2, 3, 4].map((n) => `<option value="${n}"${
             n === schedulerState.meetings ? " selected" : ""
           }>${n === 1 ? "1 game" : `${n} games`} vs each opponent</option>`).join("")
+        }</select>
+        <label class="sr-only" for="sched-turnaround">Minimum turnaround between a team's games</label>
+        <select id="sched-turnaround" title="Minimum turnaround between a team's games">${
+          [0, 15, 30, 45, 60, 90, 120].map((m) => `<option value="${m}"${
+            m === schedulerState.turnaround ? " selected" : ""
+          }>${m === 0 ? "No minimum turnaround" : `${m} min turnaround`}</option>`).join("")
         }</select>
         <button class="act" data-sched-generate>Generate</button>
       </div></div>
@@ -11300,6 +11328,16 @@ async function render() {
   if (schedMeetings) schedMeetings.onchange = () => {
     schedulerState.meetings = Number(schedMeetings.value) || 1;
   };
+  // #390 — the configurable turnaround, recorded exactly like the two selects
+  // above (no re-render). It is an input to the backend's own regeneration at
+  // Commit, and therefore bound into draft_fingerprint, so changing it after a
+  // Generate makes Commit fail preview_stale — already handled by the error
+  // branch below, which clears the stale preview and returns focus to
+  // Generate.
+  const schedTurnaround = c.querySelector("#sched-turnaround");
+  if (schedTurnaround) schedTurnaround.onchange = () => {
+    schedulerState.turnaround = Number(schedTurnaround.value) || 0;
+  };
   const schedGen = c.querySelector("[data-sched-generate]");
   // #328 review round 8 finding 4 -- consume the flag set by the PREVIOUS
   // render's Commit error branch below, now that this render's fresh
@@ -11315,6 +11353,11 @@ async function render() {
     const res = await post("/api/scheduler/draft", {
       division_id: schedulerState.division,
       meetings_per_opponent: schedulerState.meetings,
+      // #390 — ALWAYS sent, including the 0 an untouched control means.
+      // Omitting the key entirely is what the pre-#390 screen did, and the
+      // backend's default then made the whole capability unreachable: an
+      // operator had no way to ask for a turnaround at all.
+      constraints: { min_turnaround_minutes: schedulerState.turnaround },
     });
     schedulerState.preview = (res && !res.error) ? res : null;
     await render();
@@ -11337,6 +11380,17 @@ async function render() {
       // forced to regenerate an unchanged one).
       meetings_per_opponent: (schedulerState.preview
         && schedulerState.preview.meetings_per_opponent) || 1,
+      // #390 — the turnaround the PREVIEW was generated with, echoed back by
+      // the server on that proposal and read off it rather than off the live
+      // select, for exactly the reason above: the select is the input to the
+      // NEXT Generate. The commit's own regeneration takes this value, so
+      // dropping it here would regenerate with no turnaround, produce a
+      // different fingerprint, and refuse every legitimate commit as
+      // preview_stale.
+      constraints: {
+        min_turnaround_minutes: (schedulerState.preview
+          && schedulerState.preview.min_turnaround_minutes) || 0,
+      },
       draft_fingerprint: schedulerState.preview && schedulerState.preview.draft_fingerprint,
     });
     if (res && !res.error) {

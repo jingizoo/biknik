@@ -1509,6 +1509,15 @@ def draft_schedule(store, division_id, slot_ids=None, constraints=None,
     return {
         "division_id": division_id, "team_count": len(teams),
         "meetings_per_opponent": meetings,
+        # #390 — echo the NORMALIZED turnaround the proposal was generated
+        # under, exactly as ``meetings_per_opponent`` above echoes the
+        # format. The Scheduler UI must send the same value back at Commit
+        # (it is an input to the regeneration the fingerprint is compared
+        # against), and reading it off the reviewed proposal rather than off
+        # a live control is what stops an operator who nudges the control
+        # while reading a valid preview from silently redefining the batch
+        # they are about to commit.
+        "min_turnaround_minutes": turnaround_minutes(constraints),
         "draft_games": draft_games, "unscheduled": unscheduled,
         "already_scheduled": already_scheduled,
         "unschedulable_teams": unschedulable_teams,
@@ -1575,6 +1584,8 @@ def draft_schedule_for_league(store, season_id, league_id, division_id=None,
         "season_id": season_id, "league_id": league_id,
         "division_id": division_id, "team_count": len(all_teams),
         "meetings_per_opponent": meetings,
+        # #390 — see the Division-only entry point above.
+        "min_turnaround_minutes": turnaround_minutes(constraints),
         "draft_games": draft_games, "unscheduled": unscheduled,
         "already_scheduled": already_scheduled,
         "unschedulable_teams": unschedulable_teams,
