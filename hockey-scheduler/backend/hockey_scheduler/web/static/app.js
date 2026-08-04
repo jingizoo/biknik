@@ -42,8 +42,17 @@ let feedTokens = [];               // signed-in user's calendar feed tokens (#82
 let newFeedUrl = null;             // freshly-minted feed URL, shown once (#82)
 // Active Program/Season context (#159): the AUTHORIZED options + the current
 // selection, from GET /api/context/options (never the unfiltered overview, so a
-// scoped user can neither select nor enumerate an unrelated context). A saved
-// DISPLAY context only — existing screens are not filtered by it yet.
+// scoped user can neither select nor enumerate an unrelated context). Since
+// #367/#369 this is NOT a display-only selection: the server resolves the same
+// tuple on its own side and the operational reads (get_demo_overview,
+// get_standings, get_setup_progress, get_setup_overview_v2) are scoped to it,
+// so switching genuinely changes what the screens show. A handful of lists are
+// still deliberately broader — the general Setup screen's "+ Add" parent
+// selects, and get_setup_overview_v2's Program-wide shape — so neither "these
+// screens are not filtered" nor "everything is filtered" is a safe thing to
+// write down; see docs/architecture/active-context-scoping.md for what is
+// actually scoped, and index.html's #ctx-scope-note for why the operator-facing
+// copy describes the control instead of listing screens.
 let contextOptions = null;         // {programs:[{id,name,seasons:[...]}], selected:{program_id,season_id,read_only}}
 // Monotonic "context generation" (#331 review round 7), bumped by every
 // successful setActiveContext() call. #159's context switcher can move the
@@ -1875,9 +1884,10 @@ async function goToSetupWorkflow(key) {
     // Seed the parent field from the ACTIVE Program (#331 review round 5
     // finding 4): left empty, drawerField()'s own fallback picks
     // rows[0] -- whichever Program/League/Team happens to sort first
-    // GLOBALLY (these fields' option lists span every Program, unfiltered
-    // -- #159's contextOptions is a display-only selection today, existing
-    // screens are not filtered by it), not the one this hub is scoped to.
+    // GLOBALLY (these SHARED drawer fields' option lists still span every
+    // Program by design, even though the operational reads behind the
+    // screens themselves have been scoped to the active tuple since #367/
+    // #369), not the one this hub is scoped to.
     // A valid submit against that silent wrong default would create data
     // under a DIFFERENT Program than the one the operator is acting from.
     // Awaited BEFORE opening the drawer (a single, cheap fetch) rather
@@ -1938,8 +1948,9 @@ let drawerSeedFetchSeq = 0;
 // hub CTA is clicked straight from the Dashboard), and NOT a change to the
 // shared drawer field definitions' own option lists, which stay
 // global/unfiltered (the general Setup screen's own "+ Add" entry points
-// are not Program-scoped by design; contextOptions is documented as
-// "existing screens are not filtered by it yet"). Seeding only the DEFAULT
+// are not Program-scoped by design -- a deliberate exception that survived
+// #367/#369 scoping the operational reads behind the screens themselves).
+// Seeding only the DEFAULT
 // selected value is enough to close the actual bug -- a silent wrong-
 // Program default on first open -- while an operator who deliberately wants
 // a different Program can still change the select same as always.
@@ -2011,8 +2022,9 @@ async function contextSeededDrawerValues(kind) {
     return { ok: true, values: teams.length ? { "f-player-team": teams[0].id } : {} };
   }
   // #345 batch 2 review blocker: the Setup workflow landings expose secondary
-  // create actions whose parent <select> spans EVERY Program (the #159
-  // context switcher is display-only, so those option lists are unfiltered).
+  // create actions whose parent <select> spans EVERY Program (these shared
+  // drawer option lists are deliberately left global -- #367/#369 scoped the
+  // operational READS, not the shared create-drawer field definitions).
   // Opened with drawerValues = {}, drawerField()'s `current || rows[0][0]`
   // fallback selects the first GLOBAL row -- so a valid submit persists the
   // record under a different Program than the landing the operator is acting
@@ -2474,8 +2486,14 @@ function renderDashboard(ov, standings) {
   const today = games.filter((g) => dayOf(g.start_time) === calendarDate);
   const todayList = today.length ? today : games;   // fall back to all if none "today"
   // "Games this week" (#118 Phase 7) means the 7-day window starting today —
-  // ov.schedule is every non-draft game in the whole demo, so counting its
-  // full length mislabeled arbitrarily-far-past/future games as "this week".
+  // ov.schedule carries every non-draft game the read returns, over the WHOLE
+  // date range, so counting its full length mislabeled arbitrarily-far-past/
+  // future games as "this week". (This comment used to say "every non-draft
+  // game in the whole demo". That stopped being true at #367/#369:
+  // get_demo_overview now excludes any game failing its active-tuple
+  // `_in_scope_game` predicate. The date bug this guards against is unchanged
+  // either way — a Season spans months, so its own games are still not all
+  // "this week" — but the stated reason was a lie about the payload.)
   const weekEnd = addDays(calendarDate, 6);
   const weekGames = games.filter((g) => {
     const d = dayOf(g.start_time);
@@ -7012,12 +7030,15 @@ const IB_WEEKDAYS = [[0, "Mon"], [1, "Tue"], [2, "Wed"], [3, "Thu"],
 function defaultIceForm(ov) {
   const seasons = ov.seasons || [];
   // Prefer the #159 ACTIVE Season selection over "the first active/global
-  // Season" (#331 review round 5 finding 4): `seasons` here spans every
-  // Program (GET /api/demo/overview is unfiltered), so picking the first
-  // status==="active" row could default the builder onto a DIFFERENT
-  // Program's Season than the one the Home/Tasks hub CTA was scoped to. A
-  // committed submit against that silent wrong default would generate ice
-  // for the wrong Program.
+  // Season" (#331 review round 5 finding 4). When that rule was written
+  // `seasons` here spanned every Program (GET /api/demo/overview was
+  // unfiltered), so picking the first status==="active" row could default the
+  // builder onto a DIFFERENT Program's Season than the one the Home/Tasks hub
+  // CTA was scoped to, and a committed submit against that silent wrong
+  // default would generate ice for the wrong Program. #369 has since narrowed
+  // `ov.seasons` to the ACTIVE Season only, which independently closes the
+  // cross-Program half -- but this binding stays load-bearing for the
+  // fail-closed half below, and must not be relaxed back to a global default.
   //
   // Fails CLOSED, not to that same global-first Season, when none is
   // actively selected -- a Program-only context, or no context at all
@@ -7072,9 +7093,11 @@ function renderIceBuilder(ov) {
   // review round 7): a form/preview cached from BEFORE the operator
   // switched Program via the #159 switcher is exactly the same
   // committable wrong-Program risk as Import's own stale Season (both
-  // send season_id verbatim to their commit endpoint, and the switcher is
-  // display-only -- nothing else validates "matches the active
-  // context"). Rinks are ALSO Program/Venue-scoped, so a context change
+  // send season_id verbatim to their commit endpoint, and the WRITE path
+  // takes that id at its word -- #367/#369 scoped the operational reads
+  // and added the parent-id write gate, but a cached form still holds an
+  // id chosen under the PREVIOUS selection, which nothing else here
+  // re-validates). Rinks are ALSO Program/Venue-scoped, so a context change
   // discards the WHOLE form, not just season_id -- defaultIceForm(ov)
   // already prefers the active Season the same way Import's own re-seed
   // does. Clearing preview too makes it uncommittable the same way an
@@ -13144,7 +13167,8 @@ function contextEntries(opts) {
 // Paint the switcher for the current authorized options + selection. One native
 // <select> for every role (full keyboard/AT semantics for free); a static chip
 // only when there is a single selectable context. The read-only badge and the
-// persistent "display only" note reflect the current state in the CLOSED view.
+// persistent scope note (#ctx-scope-note) reflect the current state in the
+// CLOSED view.
 function renderContextSwitcher() {
   const wrap = document.getElementById("context-switcher");
   const select = document.getElementById("ctx-select");

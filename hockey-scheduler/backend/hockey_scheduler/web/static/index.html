@@ -161,19 +161,42 @@
                selects snap back to the true persisted state; see app.js's own
                onchange handlers. Hidden whenever the active Program has no
                Leagues to offer (a Program-only or League-less state is
-               first-class, not an error). The "display only" note now names
-               exactly what is NOT filtered by this selection, since drawer
-               seeding/summary narrowing DOES use it -- see app.js's own scope
-               note. -->
+               first-class, not an error).
+
+               #ctx-scope-note is CAPABILITY wording on purpose, and must stay
+               that way. Its two previous revisions both enumerated ("display
+               only · screens not filtered", then "most existing screens
+               (Games, Roster, Standings, etc.) are not filtered by this
+               selection"), and BOTH rotted into a false statement the moment
+               another surface started respecting the selection -- by #367/#369
+               every screen those words named (Games, Roster, Standings) is in
+               fact scoped to the active tuple. A list of what is or is not
+               filtered is a promise about a moving inventory; a sentence about
+               what the CONTROL DOES is not, so it stays true as more surfaces
+               become context-aware. Equally, it does not swing to the opposite
+               overclaim ("everything you see is limited to this"): a few lists
+               are still deliberately broader (the general Setup screen's own
+               "+ Add" parent selects, get_setup_overview_v2's Program-wide
+               shape), and a universal claim would just be the same defect
+               pointing the other way. Do not reintroduce a screen list here.
+
+               It is wired as aria-describedby on BOTH selects rather than
+               folded into their labels: a name says what a control IS, a
+               description says what changing it DOES, and a tabbing screen-
+               reader user previously heard the note not at all (static topbar
+               text is only reachable in browse mode). The two accessible names
+               deliberately carry no overlapping explanation. -->
           <div id="context-switcher" class="ctx-switcher" hidden>
             <span class="ctx-caption" aria-hidden="true">Viewing</span>
             <select id="ctx-select" class="ctx-select"
+                    aria-describedby="ctx-scope-note"
                     aria-label="Active Program and Season"></select>
             <select id="ctx-league-select" class="ctx-select ctx-league-select" hidden
-                    aria-label="Active League — narrows create actions and Setup summaries to this League; no League is a valid state"></select>
+                    aria-describedby="ctx-scope-note"
+                    aria-label="Active League — leave it on No League to work across every League in this Season"></select>
             <span id="ctx-static" class="ctx-static" hidden></span>
             <span id="ctx-ro" class="ctx-ro" hidden>read-only</span>
-            <span class="ctx-unfiltered">most existing screens (Games, Roster, Standings, etc.) are not filtered by this selection</span>
+            <span id="ctx-scope-note" class="ctx-scope-note">Switching this changes what you see</span>
           </div>
           <button class="act ghost" data-open-drawer="ice-slot">＋ Add Ice</button>
           <button class="act primary" data-goto="calendar">＋ Schedule Game</button>

@@ -255,11 +255,20 @@ grants no authority.
 
 The topbar Program/Season switcher (`web/static`: `#context-switcher` in
 `index.html`, `renderContextSwitcher`/`setActiveContext` in `app.js`) — a saved
-**display** context, consuming the Slice-2 endpoints. It grants no authority and
-**does not filter existing screens yet** (that is the isolation slice below), so
-a persistent, always-visible “display only · screens not filtered” note sits
-next to the control in its normal closed state (not hidden inside a dropdown or a
-hover tooltip). It is one consistent control for every role.
+context, consuming the Slice-2 endpoints. It grants no authority. **It did not
+filter existing screens when this slice shipped**; #367/#369 has since scoped
+the operational reads to the same server-resolved `(Program, Season, League)`
+tuple, so switching now genuinely changes what Games, Roster, Standings, the
+Dashboard and the Setup summaries show — see
+`docs/architecture/active-context-scoping.md` for the read contracts, which are
+the authority on what is and is not scoped. A persistent, always-visible scope
+note (`#ctx-scope-note`) sits next to the control in its normal closed state
+(not hidden inside a dropdown or a hover tooltip) and is wired as
+`aria-describedby` on both selects. That note is deliberately written as
+capability wording rather than a list of screens: its two earlier revisions each
+enumerated what was or was not filtered, and each rotted into a false statement
+as more surfaces became context-aware. It is one consistent control for every
+role.
 
 - **`GET /api/context/options`** → `{programs: [{id, name, seasons: [{id, name,
   status, read_only, start_date}], leagues: [{id, name}]}], selected:
@@ -307,11 +316,13 @@ hover tooltip). It is one consistent control for every role.
 ## Scope / follow-ups
 
 Slice 1 (lifecycle), Slice 2 (backend selection foundation) and Slice 3 (this
-switcher UI + deep-link restoration) are done. Remaining #159 work, to be taken
-as separate slices: **consumer-by-consumer cross-context isolation** (lists,
-counts, exports, background jobs resolving strictly through the selected Season
-— the switcher is display-only until then); then **new-Season copy-forward
-preview**; and **prior-Team historical entitlement** — letting a scoped
+switcher UI + deep-link restoration) are done. **Consumer-by-consumer
+cross-context isolation** — lists, counts and the operational reads resolving
+strictly through the selected tuple — has since landed under #345 as #367/#369
+(`docs/architecture/active-context-scoping.md`); exports and background jobs are
+not covered by it. Remaining #159 work, to be taken as separate slices:
+**new-Season copy-forward preview**; and **prior-Team historical
+entitlement** — letting a scoped
 Coach/Player/Guardian re-enter (read-only) a Season their Team was registered in
 under a League it has since **left** (resolving view entitlement from all of a
 Team's registrations, independent of its current `league_id`, kept separate from

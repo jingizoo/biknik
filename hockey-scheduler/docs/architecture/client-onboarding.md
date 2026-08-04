@@ -292,8 +292,9 @@ preferring the #159 active Season over "the first `status === "active"`
 Season it finds," since that list also spans every Program. None of this
 changes what these destinations' own dropdowns OFFER (they stay
 Program-unfiltered, matching every other entry point into the same
-drawers/builder — #159's active-context selection is still a display-only
-convenience, not a sitewide data filter); it only fixes what they default
+drawers/builder — a deliberate exception that survived #367/#369, which
+scoped the operational READS to the active tuple but left these shared
+create-drawer field definitions global); it only fixes what they default
 to, so a silent submit against the wrong Program can no longer happen from
 this hub's own navigation.
 
@@ -325,9 +326,13 @@ so a Season/Program switch made mid-review — while the operator is still
 looking at an Import form or a live Builder preview from the PRIOR
 selection — left both cached against the old context. Both send their
 Season verbatim to a real commit endpoint (`commit_import`,
-`commit_ice_availability`), and #159's context is display-only, not a
-backend filter, so nothing else would have caught it either — a real,
-committable cross-Program write, not a cosmetic staleness. A single
+`commit_ice_availability`), which takes that id at its word, so nothing
+else would have caught it either — a real, committable cross-Program
+write, not a cosmetic staleness. (#367/#369 has since scoped the
+operational reads and added a parent-id write gate, but neither closes
+this: the stale id was chosen while the operator was legitimately in the
+OLD context, so it is a valid id — just no longer the one they are
+working in. The revision counter below remains the guard.) A single
 monotonic `contextRevision` counter, bumped by every successful
 `setActiveContext()` call, gives every context-scoped view a cheap way to
 tell "still the same selection" apart from "changed and changed back": each

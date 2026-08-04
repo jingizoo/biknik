@@ -994,8 +994,8 @@ details.tn > .tn-sum:hover { background: #f6f7fb; }
 
 /* ----- Active Program/Season switcher (#159) ----- */
 /* A native <select> (full keyboard/AT semantics for free) + a persistent
-   "display only" note that is ALWAYS visible, so the topbar selection never
-   implies the screens below it have been filtered (they haven't, yet). */
+   scope note that is ALWAYS visible, so an operator can tell at a glance that
+   the topbar selection governs what the screens below are showing them. */
 .ctx-switcher { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .ctx-switcher[hidden] { display: none; }
 .ctx-caption {
@@ -1019,11 +1019,14 @@ details.tn > .tn-sum:hover { background: #f6f7fb; }
   background: #fff0d6; color: #8a5a00; text-transform: uppercase; letter-spacing: .03em;
 }
 .ctx-ro[hidden] { display: none; }
-/* The persistent limitation notice — visible in the normal closed/static state,
-   not just inside an open menu or a (touch-invisible) title tooltip. */
-.ctx-unfiltered { font-size: 10px; color: var(--muted); letter-spacing: .02em; }
-/* Phone: keep the switcher usable without dominating the topbar; the "display
-   only" note stays visible (it is the whole point of this slice). */
+/* The persistent scope note — visible in the normal closed/static state, not
+   just inside an open menu or a (touch-invisible) title tooltip. Named for the
+   ROLE it plays, not for a claim about what is filtered: the old
+   `.ctx-unfiltered` name outlived the sentence it was coined for (see
+   index.html's own note on why the copy is capability wording). */
+.ctx-scope-note { font-size: 10px; color: var(--muted); letter-spacing: .02em; }
+/* Phone: keep the switcher usable without dominating the topbar; the scope
+   note stays visible (it is the whole point of this slice). */
 @media (max-width: 480px) {
   .ctx-select, .ctx-static { max-width: 150px; font-size: 16px; }
   .ctx-caption { display: none; }

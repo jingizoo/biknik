@@ -11,8 +11,18 @@
 //     link (hash wins over the persisted row), and NORMALIZE an invalid/stale
 //     link to the saved context with a generic message (no existence oracle);
 //   * be operable by KEYBOARD alone (focus + Arrow), persisting the change;
-//   * keep the persistent "display only — screens not filtered" notice visible
-//     in the normal closed state (a static chip too);
+//   * keep a persistent, non-empty context scope note (#ctx-scope-note) VISIBLE
+//     in the normal closed state (a static chip too). Deliberately asserted
+//     NON-LITERALLY -- presence, visibility, non-empty text -- and never by
+//     matching its wording. Twice now the assertion here froze the sentence
+//     that happened to be shipping ("display only · screens not filtered",
+//     then "most existing screens (Games, Roster, Standings, etc.) are not
+//     filtered by this selection"), and twice the sentence went stale while
+//     this gate stayed green, because a text match cannot tell "the copy
+//     changed" from "the copy became false". What the copy is ABOUT -- that
+//     switching the context changes what the screens show -- is pinned by
+//     cross-view behaviour in context-scope-truth.js instead, which is a
+//     property no wording change can quietly invalidate;
 //   * flag an archived Season as read-only; and render a static chip when a
 //     Program has no Seasons (single option);
 //   * RECONCILE a concurrent lifecycle/scope change (a Season archived, reopened,
@@ -261,7 +271,7 @@ async function checkSwitcher(browser, viewport) {
     await reloadShell(page);
 
     // (A) One Program + one Season exposes BOTH choices in a real <select>, and
-    //     the persistent "display only" notice is visible in the closed state.
+    //     the persistent scope note is visible in the closed state.
     await waitFor(page, "(A) switcher + select visible with >= 2 options", () => {
       const w = document.getElementById("context-switcher");
       const s = document.getElementById("ctx-select");
@@ -270,9 +280,10 @@ async function checkSwitcher(browser, viewport) {
     const optionValues = await page.locator("#ctx-select option").evaluateAll((os) => os.map((o) => o.value));
     if (!optionValues.includes(progOnly)) throw new Error(`[${L}] Program-only option missing: ${optionValues}`);
     if (!optionValues.includes(winter)) throw new Error(`[${L}] Season option missing: ${optionValues}`);
-    const note = await page.locator(".ctx-unfiltered");
-    if (!(await note.isVisible()) || !/display only|not filtered/i.test(await note.textContent())) {
-      throw new Error(`[${L}] persistent "display only" notice not visible`);
+    const note = await page.locator("#ctx-scope-note");
+    if (!(await note.isVisible()) || !((await note.textContent()) || "").trim()) {
+      throw new Error(`[${L}] persistent context scope note not visible / empty `
+        + `(text: ${JSON.stringify(await note.textContent())})`);
     }
 
     // (B) Select Program-only ⇒ persisted season_id:null + #ctx= hash + reload
@@ -448,7 +459,7 @@ async function checkChip(browser, viewport) {
     if ((await loginAs(page, "seer")).status !== 200) throw new Error(`[${L}] seer login failed`);
     await reloadShell(page);
     // A single selectable context (Program-only) ⇒ a static CHIP, not a select,
-    // and the persistent "display only" notice is still shown.
+    // and the persistent scope note is still shown.
     await waitFor(page, "chip visible / select hidden for a single selectable context", () => {
       const chip = document.getElementById("ctx-static");
       const sel = document.getElementById("ctx-select");
@@ -459,8 +470,10 @@ async function checkChip(browser, viewport) {
     if (chipText !== expectedChip) {
       throw new Error(`[${L}] chip text must identify its Program exactly: "${chipText}"`);
     }
-    const note = await page.locator(".ctx-unfiltered");
-    if (!(await note.isVisible())) throw new Error(`[${L}] "display only" notice missing on the chip`);
+    const note = await page.locator("#ctx-scope-note");
+    if (!(await note.isVisible()) || !((await note.textContent()) || "").trim()) {
+      throw new Error(`[${L}] context scope note missing/empty on the chip`);
+    }
     if (!page.url().includes("#ctx=")) {
       throw new Error(`[${L}] Program-only context was not written to the deep-link hash`);
     }
@@ -476,7 +489,7 @@ async function checkChip(browser, viewport) {
         && sel && sel.hidden;
     }, expectedChip, 10000);
     chipText = (await page.locator("#ctx-static").textContent()).trim();
-    if (chipText !== expectedChip || !(await page.locator(".ctx-unfiltered").isVisible())) {
+    if (chipText !== expectedChip || !(await page.locator("#ctx-scope-note").isVisible())) {
       throw new Error(`[${L}] chip/deep-link restoration lost the Program identity`);
     }
     if (errors.length) throw new Error(`[${L}] console/page errors:\n${errors.join("\n")}`);
