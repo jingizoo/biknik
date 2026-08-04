@@ -929,8 +929,11 @@ class ExplanationFormatterContractTest(unittest.TestCase):
             tid: [BASE + timedelta(minutes=offset)
                   for offset in range(0, 360, 60)]
             for tid in ("t0", "t1")}
+        # #390 added the turnaround clause, which reads the team-occupancy
+        # map rather than the start-time list this fixture drives; an empty
+        # occupancy keeps this a test of the ``min_rest`` nested cap alone.
         rest = next(r for r in sched._slot_constraint_rejections(
-            slot, "t0", "t1", con, team_slots) if r["code"] == "min_rest")
+            slot, "t0", "t1", con, team_slots, {}) if r["code"] == "min_rest")
         self.assertEqual(len(rest["details"]["conflicts"]), 4)
         self.assertEqual(rest["details"]["omitted_conflict_count"], 8)
         # Which four is not arbitrary -- canonical order, so two runs over the

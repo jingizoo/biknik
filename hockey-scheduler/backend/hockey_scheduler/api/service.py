@@ -45,6 +45,7 @@ from ..domain.errors import (
     DomainError,
     NotAuthorizedError,
     NotFoundError,
+    ScheduleConflictError,
     ValidationError,
 )
 from ..services import (
@@ -71,9 +72,13 @@ from ..services import (
     resolve_scenario_scope,
 )
 from ..services.scheduler import (
+    _active_game_slot_pairs,
     _existing_pairing_games,
+    _persisted_team_spans,
     raced_pairing_game_id,
     reviewed_existing_counts,
+    turnaround_conflicts,
+    turnaround_minutes,
 )
 from ..services.league_scoped_scheduler import season_candidate_rink_ids
 from ..services.league_scope import (
@@ -5676,6 +5681,96 @@ class ApiService:
                         or _attempt == 2):
                     raise
 
+    # -- the commit-time half of #390, defined ONCE ------------------------
+    #
+    # Both `_commit_draft_schedule_attempt` copies call these two methods.
+    # The league-scoped override reimplements the commit BODY but inherits
+    # this class, so there is exactly one turnaround predicate, one occupancy
+    # rule, and one refusal wording across the whole surface — and the
+    # predicate is literally `services.scheduler.turnaround_conflicts`, the
+    # same function the preview's decision path and its bounded explanation
+    # call. #382 shipped a commit guard that asked a DIFFERENT question from
+    # the preview and refused legitimate commits for a month; a second
+    # implementation is the defect, so there isn't one.
+    def _commit_turnaround_state(self, constraints):
+        """``(minutes, occupancy)`` for the commit gate's turnaround check.
+
+        ``occupancy`` is the SAME ``{team_id: [(start, end, game_id)]}`` shape
+        the preview builds, seeded from the persisted active-game snapshot
+        taken here — under the Program/Team/Rink/Season locks the caller
+        already holds — and grown row by row as the batch is written, exactly
+        as `_assign_ice` grows it as candidates are accepted. Rows therefore
+        see the same union of committed and same-batch bookings on both
+        sides of the commit.
+
+        With no turnaround configured the snapshot is not even taken: zero
+        must cost nothing and change nothing.
+        """
+        minutes = turnaround_minutes(constraints)
+        if minutes <= 0:
+            return 0.0, {}
+        return minutes, _persisted_team_spans(
+            _active_game_slot_pairs(self.store))
+
+    def _assert_commit_turnaround(self, row, slot, occupancy, minutes):
+        """Refuse one reviewed row whose turnaround no longer holds (#390).
+
+        Raised INSIDE the commit's transaction, so the whole batch rolls back
+        and a refused commit leaves zero Game, slot, counter or audit trace —
+        and raised as a `ScheduleConflictError`, NOT a
+        `ConcurrencyConflictError`, so `commit_draft_schedule`'s retry shell
+        (which retries `placement_raced` alone) delivers it to the caller
+        terminally rather than replaying a commit that cannot succeed.
+
+        The wide `draft_fingerprint` gate above is the first line of defence
+        and will classify most drift as `preview_stale`; this is the
+        established defense-in-depth pattern the `pairing_already_scheduled`
+        and `_assert_slot_free_for_game` per-row gates already follow, for
+        the same reason — a per-row physical fact that the wide gate's
+        "has anything changed" question cannot state precisely.
+        """
+        conflicts = turnaround_conflicts(
+            slot.start_time, slot.end_time,
+            (row["home_team_id"], row["away_team_id"]), occupancy, minutes)
+        if not conflicts:
+            return
+        # Canonically ordered by the predicate, so the SAME conflict is named
+        # on every backend and in every process.
+        first = conflicts[0]
+        blocker = (f"Game {first['conflict_game_id']}"
+                   if first["conflict_game_id"]
+                   else "another game in this batch")
+        # #328 review round 3 — the MESSAGE has to be actionable on its own:
+        # app.js's generic toast surfaces `error.message` and never
+        # `error.details`, so a vague wording would leave the operator with no
+        # idea which pairing, which game, or how short the gap was.
+        raise ScheduleConflictError(
+            f"{row['home_team_name']} vs {row['away_team_name']} leaves only "
+            f"{first['gap_minutes']:g} minutes after {blocker} — minimum "
+            f"turnaround not met ({minutes:g} minutes required). Generate a "
+            "fresh preview before committing again.",
+            {"reason": "min_turnaround",
+             "home_team_id": row["home_team_id"],
+             "away_team_id": row["away_team_id"],
+             "team_id": first["team_id"],
+             "conflict_game_id": first["conflict_game_id"],
+             "gap_minutes": first["gap_minutes"],
+             "shortfall_minutes": first["shortfall_minutes"],
+             "required_minutes": minutes})
+
+    @staticmethod
+    def _record_commit_turnaround(occupancy, row, slot, game_id):
+        """Add a just-written row to the commit gate's occupancy, so the NEXT
+        row in the same batch is checked against it — the commit-side mirror
+        of `_assign_ice` growing its own occupancy as candidates are
+        accepted. Without this the gate would enforce the turnaround against
+        committed games only, and a batch could write two of its own rows
+        back to back."""
+        for tid in (row["home_team_id"], row["away_team_id"]):
+            if tid:
+                occupancy.setdefault(tid, []).append(
+                    (slot.start_time, slot.end_time, game_id))
+
     def _commit_draft_schedule_attempt(self, division_id: str = None,
                                        season_id: str = None,
                                        league_id: str = None,
@@ -6158,6 +6253,9 @@ class ApiService:
                         "review it before committing.",
                         {"reason": "preview_stale"})
             created = []
+            # #390 — one snapshot per commit, taken under the locks already
+            # held and grown row by row below, exactly as the preview does.
+            _turnaround, _occupancy = self._commit_turnaround_state(constraints)
             for d in proposal["draft_games"]:
                 # #328 review round 4 -- checked BEFORE the physical gate
                 # below, not after: a row whose pairing already has a real
@@ -6207,6 +6305,15 @@ class ApiService:
                 slot = self.setup._assert_slot_free_for_game(
                     d["ice_slot_id"], d["home_team_id"], d["away_team_id"],
                     season_id=resolved_season_id)
+                # #390 — run AFTER the established physical gate, so every
+                # reason it already reports (slot_missing / not_game_slot /
+                # slot_unavailable / slot_already_filled / team_overlap) still
+                # wins where it applies, and BEFORE the Game id is minted, so
+                # a refusal consumes no counter. The two can never both fire:
+                # the turnaround predicate returns nothing for OVERLAPPING
+                # windows by construction, which is exactly what
+                # `team_overlap` is for.
+                self._assert_commit_turnaround(d, slot, _occupancy, _turnaround)
                 g = Game(
                     id=self.store.next_id("game"),
                     home_team_id=d["home_team_id"], away_team_id=d["away_team_id"],
@@ -6225,6 +6332,7 @@ class ApiService:
                 # game already holds, so this only ever flips AVAILABLE -> taken.
                 slot.status = IceSlotStatus.ALLOCATED
                 self.store.save_ice_slot(slot)
+                self._record_commit_turnaround(_occupancy, d, slot, g.id)
                 created.append(self._draft_game_dto(g))
             # Committing a draft creates real (unpublished) rows — a state change,
             # so it is audited (#86).

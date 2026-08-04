@@ -42,6 +42,13 @@ REASON_CODE_ORDER = (
     "rink_blackout",
     "max_per_day",
     "min_rest",
+    # #390 — placed immediately after `min_rest` because it is evaluated
+    # immediately after it in the scheduler's own request-constraint order,
+    # which is the rule this table encodes. A registered code (rather than an
+    # unknown one sorting lexically at the end) keeps the turnaround's
+    # position in the explanation deterministic and next to the rest window
+    # an operator will compare it against.
+    "min_turnaround",
     "insufficient_playable_time",
     "slot_overlap_conflict",
     "turnover_buffer_conflict",
@@ -61,6 +68,10 @@ _SAFE_DETAIL_FIELDS = {
     "max_per_day": ("date", "team_ids", "limit"),
     "min_rest": (
         "team_ids", "min_rest_hours", "conflicts",
+        "omitted_conflict_count",
+    ),
+    "min_turnaround": (
+        "team_ids", "min_turnaround_minutes", "conflicts",
         "omitted_conflict_count",
     ),
     "insufficient_playable_time": (
@@ -92,6 +103,16 @@ _SAFE_NESTED_ROW_FIELDS = {
     ("min_rest", "conflicts"): ("team_id", "start_time"),
     ("team_overlap", "conflicts"): (
         "team_id", "conflict_source", "conflict_game_id"),
+    # #390 — the turnaround's evidence rows are identifier-and-duration only:
+    # which team, which blocking game, that game's own window, and how far
+    # short the gap fell. No names, no messages, no notes. Allowlisting the
+    # ROW shape (not merely the top-level field) keeps the privacy guarantee
+    # one rule rather than "the allowlist, plus whatever the current producer
+    # happens to hand over".
+    ("min_turnaround", "conflicts"): (
+        "team_id", "conflict_source", "conflict_game_id",
+        "conflict_start_time", "conflict_end_time",
+        "gap_minutes", "shortfall_minutes"),
 }
 
 
@@ -269,6 +290,17 @@ def _alternative_for(code, details, pairing, scope):
             "action_code": "review_minimum_rest_policy",
             "reason_code": code,
             "min_rest_hours": details.get("min_rest_hours"),
+            "team_ids": details.get("team_ids") or pairing_ids,
+        }
+    if code == "min_turnaround":
+        # A DISTINCT correction from `review_minimum_rest_policy`: the two
+        # knobs are different fields with different units measured from
+        # different edges, so pointing an operator at the rest window would
+        # be an instruction that cannot resolve the refusal.
+        return {
+            "action_code": "review_minimum_turnaround_policy",
+            "reason_code": code,
+            "min_turnaround_minutes": details.get("min_turnaround_minutes"),
             "team_ids": details.get("team_ids") or pairing_ids,
         }
     if code in (

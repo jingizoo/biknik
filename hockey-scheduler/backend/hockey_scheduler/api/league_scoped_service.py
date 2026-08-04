@@ -507,6 +507,14 @@ class ApiService(_BaseApiService):
                         "you generated it. Generate a fresh preview and "
                         "review it before committing.",
                         {"reason": "preview_stale"})
+            # #390 — one snapshot per commit, taken under the locks already
+            # held and grown row by row below, exactly as the preview does.
+            # `_commit_turnaround_state` / `_assert_commit_turnaround` /
+            # `_record_commit_turnaround` are INHERITED from the base facade,
+            # so this override reimplements the commit body without
+            # reimplementing the turnaround rule: one predicate, one occupancy
+            # rule, one refusal wording on both copies (#390 req 3).
+            _turnaround, _occupancy = self._commit_turnaround_state(constraints)
             for row in proposal["draft_games"]:
                 # #328 review round 4 -- checked BEFORE the physical gate
                 # below, not after: a row whose pairing already has a real
@@ -559,6 +567,13 @@ class ApiService(_BaseApiService):
                 slot = self.setup._assert_slot_free_for_game(
                     row["ice_slot_id"], row["home_team_id"], row["away_team_id"],
                     season_id=resolved_season_id)
+                # #390 — after the established physical gate (so every reason
+                # it already reports still wins) and before the Game id is
+                # minted (so a refusal consumes no counter). The two can never
+                # both fire: the turnaround predicate returns nothing for
+                # OVERLAPPING windows, which is what `team_overlap` covers.
+                self._assert_commit_turnaround(
+                    row, slot, _occupancy, _turnaround)
                 game = Game(
                     id=self.store.next_id("game"),
                     home_team_id=row["home_team_id"],
@@ -583,6 +598,7 @@ class ApiService(_BaseApiService):
                 # rejected any slot a game holds, so this only flips AVAILABLE.
                 slot.status = IceSlotStatus.ALLOCATED
                 self.store.save_ice_slot(slot)
+                self._record_commit_turnaround(_occupancy, row, slot, game.id)
                 created.append(self._draft_game_dto(game))
             if season_id and league_id:
                 scope_type, scope_id = "league", league_id
