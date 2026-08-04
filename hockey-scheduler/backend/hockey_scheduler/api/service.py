@@ -390,8 +390,10 @@ class ApiService:
     }
 
     # Canonical kind → the store getter that reads the row AND takes its write
-    # lock (`SELECT ... FOR UPDATE` on PostgreSQL; the process-wide lock already
-    # covers Memory/SQLite). `setup_guarded_mutation` takes these before it
+    # lock (`SELECT ... FOR UPDATE` on PostgreSQL; on Memory/SQLite the store's
+    # own per-INSTANCE transaction lock — plus, on SQLite, the file write lock
+    # `BEGIN IMMEDIATE` takes — already cover it, see `_lock_setup_row`).
+    # `setup_guarded_mutation` takes these before it
     # authorizes, so the authorization snapshot is established no earlier than
     # the lock and nothing that touches a named row can commit between the
     # decision and the write.
@@ -1197,17 +1199,47 @@ class ApiService:
         # one. Plain `transaction()` would be READ COMMITTED on PostgreSQL —
         # every statement re-snapshots — so the isolation is requested
         # explicitly; on memory/SQLite it is a documented no-op because the
-        # process-wide lock already serializes the block.
+        # store's own per-instance transaction lock already serializes the
+        # block.
         #
         # Requesting isolation is legal on the outermost transaction, and also
         # on a join whose open transaction ALREADY guarantees at least this much
         # (#369) — which is how `setup_guarded_mutation` runs this predicate,
         # the context resolve above and the mutation itself as ONE SERIALIZABLE
         # unit. Standalone (the read-only predicate call), this is the outermost
-        # transaction and behaves exactly as before. READ-ONLY at REPEATABLE
-        # READ cannot raise a serialization conflict, so no retry loop is needed
-        # here (unlike the context service's `_snapshot`); when nested, the
-        # guard's own bounded retry owns that.
+        # transaction and behaves exactly as before, and when nested the guard's
+        # own bounded retry owns any conflict.
+        #
+        # WHY THERE IS STILL NO RETRY LOOP HERE, stated precisely, because the
+        # reason this comment used to give is no longer true. It said READ-ONLY
+        # at REPEATABLE READ cannot raise a serialization conflict. That remains
+        # true of SERIALIZATION conflicts, but it was never the whole set: since
+        # #392 the SQLite branch opens with `BEGIN IMMEDIATE`, so this block can
+        # now raise `ConcurrencyConflictError` from LOCK ACQUISITION — a
+        # `database is locked` at BEGIN, classified `lock_not_available` — and
+        # read-only says nothing about that. Unlike `ContextService._snapshot`
+        # this call site has no bounded retry, so the claim needed re-deciding
+        # rather than re-wording.
+        #
+        # The decision is still no retry, for reasons about reachability and
+        # about what a retry would mean:
+        #
+        # * Contending needs a SECOND connection to the same file. A serving
+        #   process has exactly ONE store (`create_store()` at web/server.py and
+        #   bootstrap.py), and `SqlStore._lock` — reentrant, per instance —
+        #   already serializes every transaction taken through it, so no two
+        #   in-process transactions can be at BEGIN at once. The one production
+        #   path that opens a second SQLite connection (`backup_sqlite`) opens
+        #   it on the DESTINATION file, never the live one.
+        # * Where a second connection does exist — the `*_lock_sqlite_file`
+        #   tests, or an operator pointing the backup drill at a live database —
+        #   BEGIN blocks in the busy handler for the full 5s `busy_timeout`
+        #   first. Anything that surfaces here has therefore ALREADY waited five
+        #   seconds. That is not a transient blip a tight retry would paper
+        #   over; it is a writer that is genuinely wedged, and the retryable
+        #   409 is the honest answer for the caller to act on.
+        # * A retry here would also be dead weight on PostgreSQL, where the
+        #   original read-only argument still holds in full.
         #
         # NOTE this predicate is NOT a security boundary on its own: it answers
         # for the instant it read, and by the time a caller acts on the answer
@@ -1497,7 +1529,16 @@ class ApiService:
     def _lock_setup_row(self, kind, record_id):
         """Take the write lock on one setup row (a no-op read on Memory/SQLite,
         ``SELECT ... FOR UPDATE`` on PostgreSQL). An unknown kind locks nothing
-        — it cannot be authorized either, so the decision still fails closed."""
+        — it cannot be authorized either, so the decision still fails closed.
+
+        The no-op is only sound because those two backends hold something
+        strictly coarser for the whole unit: Memory holds that store's own
+        lock (a per-INSTANCE ``RLock`` — not, as this said before, a
+        process-wide one), and SQLite's ``transaction()`` opens ``BEGIN
+        IMMEDIATE``, so the database's write lock is already held before this
+        runs. Neither has row locks to take, and on SQLite a DEFERRED begin
+        would leave the unit holding only a read lock — see
+        ``SqlStore.transaction``."""
         getter = self._SETUP_TARGET_LOCKS.get(kind)
         if getter is not None:
             getattr(self.store, getter)(record_id)

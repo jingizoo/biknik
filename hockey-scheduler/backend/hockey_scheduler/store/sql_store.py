@@ -481,7 +481,35 @@ def _apply_migration(conn, dialect, version, statements) -> None:
         # which is sound there because the demo reset re-migrates emptied tables.)
         conn.execute("PRAGMA foreign_keys = OFF")
         try:
-            conn.execute("BEGIN")
+            # IMMEDIATE for the same reason transaction() uses it (#392): take
+            # the write lock at BEGIN so no statement inside ever has to
+            # promote SHARED->RESERVED, the one acquisition SQLite refuses to
+            # run the busy handler for.
+            #
+            # This was very nearly left as a plain BEGIN on the argument that a
+            # migration's first statement is a write anyway. That argument was
+            # FALSE — migrations 040, 041 and 042 all open with
+            # `PRAGMA defer_foreign_keys = ON` — and, worse, it was the wrong
+            # test. What decides the promotion is whether the first statement
+            # takes a READ LOCK, not whether it is a write, and the two are not
+            # the same question. Measured on one file with a 5000ms
+            # busy_timeout, against a holder of RESERVED:
+            #
+            #   BEGIN; <no statement>; UPDATE    locked after 5.34s  honoured
+            #   BEGIN; PRAGMA defer_foreign_keys; UPDATE
+            #                                    locked after 5.39s  honoured
+            #   BEGIN; SELECT; UPDATE            locked after 0.000s BYPASSED
+            #   BEGIN; PRAGMA table_info; UPDATE locked after 0.000s BYPASSED
+            #   BEGIN IMMEDIATE; UPDATE          locked after 5.37s  honoured
+            #
+            # Two PRAGMAs, opposite answers, and nothing in either one's
+            # spelling says which. An invariant that subtle, enforced only by
+            # prose and re-checked by hand every time a migration is authored,
+            # is one `PRAGMA table_info` away from reproducing this exact bug.
+            # IMMEDIATE deletes the invariant instead of documenting it, and it
+            # is free: interleaved cold builds of the full migration set, 32
+            # samples each, median 34.90ms plain vs 35.00ms IMMEDIATE.
+            conn.execute("BEGIN IMMEDIATE")
             body()
             violations = conn.execute("PRAGMA foreign_key_check").fetchall()
             if violations:
@@ -568,8 +596,10 @@ class SqlStore:
         one SERIALIZABLE transaction around an authorization computation that
         itself asks for SERIALIZABLE (the context selector) and REPEATABLE READ
         (the target chain walk), and both are already guaranteed by the outer
-        one. On SQLite it is a no-op: the process-wide lock already serializes
-        writers.
+        one. On SQLite it is a no-op: ``self._lock`` serializes every
+        transaction taken through THIS store, and the ``BEGIN IMMEDIATE``
+        below serializes this connection against any other one on the same
+        file — together that is already strictly stronger than SERIALIZABLE.
         """
         if isolation is not None and isolation not in _ISOLATION_LEVELS:
             raise ValueError(f"unsupported isolation level: {isolation!r}")
@@ -602,7 +632,64 @@ class SqlStore:
                             yield
                     else:  # sqlite (autocommit) — explicit txn (isolation no-op)
                         try:
-                            self.conn.execute("BEGIN")
+                            # IMMEDIATE, not DEFERRED: take the database's
+                            # write lock as this transaction's FIRST statement.
+                            #
+                            # SQLite has no row locks, so `_lock_setup_row` is
+                            # a no-op read here and the file's write lock is
+                            # the only analogue there is. Under a plain BEGIN
+                            # the unit therefore held nothing but a SHARED read
+                            # lock all the way through its authorization phase
+                            # and only reached for the write lock at its first
+                            # UPDATE — a SHARED->RESERVED promotion. That is
+                            # the one acquisition SQLite deliberately refuses
+                            # to run the busy handler for: promoting while
+                            # another connection already holds RESERVED is a
+                            # potential deadlock, so it returns SQLITE_BUSY
+                            # *immediately* and the connection's 5s
+                            # busy_timeout never applies. The write failed
+                            # instantly with "database is locked", which the
+                            # translator turns into the retryable
+                            # lock_not_available conflict — a guarded mutation
+                            # losing a lock it was authorized to take, with no
+                            # wait attempted at all.
+                            #
+                            # THE BUG HAD TWO WIRE SYMPTOMS, and only one of
+                            # them looks like a lock problem. Write it down
+                            # here so the second is never chased as a separate
+                            # defect. The 409 above is what happens when the
+                            # bounded retries run out. But a retry that loses
+                            # the promotion ROLLS BACK — and if the concurrent
+                            # mover's write commits in that gap, attempt 2
+                            # re-authorizes against the new truth, correctly
+                            # finds the row outside the caller's scope, and
+                            # renders a perfectly generic
+                            #
+                            #   404 {"code": "not_found",
+                            #        "message": "Venue venue_2 not found."}
+                            #
+                            # (also "Player player_1 not found." and
+                            # "Registration streg_1 not found." — it appears in
+                            # all three *_lock_sqlite_file tests). Nothing in
+                            # that response mentions locking. It reads like a
+                            # lost write or a scope bug, and it is neither: the
+                            # refusal itself is correct, it is the rollback
+                            # that should never have happened. Measured on the
+                            # unfixed tree, two independent samples: 648
+                            # invocations -> 8x 409 / 3x 404, and 756
+                            # invocations -> 1x 409 / 7x 404. Roughly half the
+                            # failures wear the 404 face, and which one shows
+                            # is pure timing.
+                            #
+                            # Acquiring at BEGIN fixes the cause rather than
+                            # the symptom: the unit holds the write lock across
+                            # authorize -> mutate -> commit (which is what
+                            # makes the SQLite no-op row lock sound), no
+                            # statement inside it ever has to promote, and a
+                            # genuinely contended writer now blocks in the busy
+                            # handler at BEGIN — where SQLite *does* honour the
+                            # timeout — instead of failing on contact.
+                            self.conn.execute("BEGIN IMMEDIATE")
                             yield
                             self.conn.commit()
                         except Exception:
@@ -1794,8 +1881,14 @@ class SqlStore:
         X-Demo-Role fallback) can never own a row — ``set_active_context``
         refuses without a user id — so there is no first insert to race.
 
-        SQLite is a documented no-op: ``transaction()`` holds the process-wide
-        lock for the whole block, which is strictly stronger.
+        SQLite is a documented no-op, and it takes TWO mechanisms to say why —
+        the old wording, "the process-wide lock", named a thing that does not
+        exist. ``self._lock`` is a per-INSTANCE ``RLock``: it serializes every
+        transaction taken through THIS store object and nothing else. What
+        covers the rest is ``transaction()``'s ``BEGIN IMMEDIATE`` (#392),
+        which holds the database file's write lock against every OTHER
+        connection for the whole block. Together they are strictly stronger
+        than this advisory lock.
         """
         if not user_id or self.backend != "postgres":
             return
@@ -1834,8 +1927,13 @@ class SqlStore:
 
         MUST be entered OUTSIDE any transaction; asserted, because acquiring
         inside one would reintroduce the very ordering bug it exists to fix.
-        SQLite is a no-op — its ``transaction()`` holds the process-wide lock,
-        which is strictly stronger and needs no cross-transaction mutex.
+        SQLite is a no-op, for the same two-part reason as
+        ``_active_context_advisory_lock`` above: ``self._lock`` is a per-
+        INSTANCE ``RLock`` (not, as this said before, a process-wide one) and
+        serializes every transaction through this store, while
+        ``transaction()``'s ``BEGIN IMMEDIATE`` (#392) holds the file's write
+        lock against any other connection. That is strictly stronger and needs
+        no cross-transaction mutex.
         """
         if not user_id or self.backend != "postgres":
             yield

@@ -5712,3 +5712,203 @@ class SetupTargetLockAtomicityTest(unittest.TestCase):
     def test_reassign_destination_lock_postgres(self):
         self._run_reassign_destination_lock(os.environ["TEST_DATABASE_URL"],
                                             "postgres")
+
+
+class SqliteTransactionWriteLockTest(unittest.TestCase):
+    """``transaction()`` holds the FILE'S WRITE LOCK from the moment it is
+    ENTERED — before the unit has written anything (#392).
+
+    This is the property the class above rests on and cannot pin down.
+    ``SetupTargetLockAtomicityTest``'s three ``*_lock_sqlite_file`` cases need
+    two threads, an HTTP server and a real race to observe it, so they catch a
+    tree that takes the lock LATE only probabilistically: on the run that sent
+    `main` red it was roughly one invocation in fifty, and a full suite passes
+    green with the lock taken late. A fix nothing in CI would notice being
+    reverted is not fixed.
+
+    THE MECHANISM, and why "before any write" is the property and not a
+    paraphrase of the source. ``setup_guarded_mutation``'s contract is that
+    every named row is locked as the transaction's FIRST statements and held
+    to commit. On PostgreSQL ``_lock_setup_row`` is ``SELECT … FOR UPDATE``;
+    SQLite has no row locks, so it is a no-op read and the file's write lock
+    is the only analogue there is. Under a plain (DEFERRED) ``BEGIN`` the unit
+    therefore held nothing but a SHARED read lock all the way through its
+    authorization phase and first reached for the write lock at the mutation's
+    opening ``UPDATE`` — a SHARED→RESERVED promotion, which is the one
+    acquisition SQLite deliberately refuses to run the busy handler for
+    (promoting while another connection already holds RESERVED risks
+    deadlock). It returns ``SQLITE_BUSY`` immediately, the connection's 5s
+    ``busy_timeout`` never applies at all, and the store translates the
+    instant "database is locked" into the retryable ``lock_not_available``
+    409 — a guarded mutation losing a lock it had just been authorized to
+    take, without waiting for it once.
+
+    So what has to be true is TEMPORAL: the lock is held at ENTRY, not at
+    first write. That is exactly what is asserted here, from the outside, by a
+    second connection that tries to write. Asserting the string
+    ``BEGIN IMMEDIATE`` appears in the source would prove nothing — any
+    other route to holding the lock at entry is equally correct, and a source
+    that contains the string while some future branch skips it would still
+    pass.
+
+    DETERMINISTIC BY CONSTRUCTION: one thread, no sleeps, no load, no timing
+    tolerance, sub-second. The probe connection runs with its busy handler
+    DISABLED (``busy_timeout = 0``), so a write that cannot have the lock is
+    refused on contact rather than waiting for one. Nothing here races.
+    """
+
+    PROBE_TABLE = "begin_lock_probe"
+
+    def _file_store(self):
+        """A store on a REAL FILE. ``:memory:`` is not a substitute: there is
+        no file for a second connection to contend over, so the whole
+        acquisition under test does not exist there."""
+        tmp = tempfile.mkdtemp(prefix="hs-beginlock-")
+        path = os.path.join(tmp, "lock.db")
+        store = SqlStore(f"sqlite:///{path}")
+        self.addCleanup(store.close)
+        self.assertEqual(store.backend, "sqlite", store.backend)
+        self.assertFalse(store.is_memory_backed,
+                         "the probe needs a real file to contend over")
+        return store, path
+
+    def _probe(self, path):
+        """A SECOND, genuinely independent connection to the same file.
+
+        Not ``store.conn``: the contention that matters is the DATABASE'S,
+        between connections, and a write issued on the store's own connection
+        would simply join the open transaction and prove nothing.
+
+        ``busy_timeout = 0`` is what removes the timing from this test. With
+        the sqlite3 driver's default 5s handler a locked-out write would sit
+        inside ``execute()`` and the test would have to wait on a clock;
+        zeroed, the refusal is immediate and total.
+        """
+        import sqlite3
+        conn = sqlite3.connect(path)
+        conn.isolation_level = None      # autocommit: each write lands or does not
+        conn.execute("PRAGMA busy_timeout = 0")
+        self.addCleanup(conn.close)
+        return conn
+
+    def _attempt_write(self, probe, n):
+        """One write attempt on the probe. Returns the refusal, or ``None`` if
+        the write LANDED.
+
+        Deliberately returns rather than raises, so the assertions live
+        OUTSIDE ``store.transaction()``: an assertion that fired inside the
+        unit would propagate through the rollback path and be reported as a
+        transaction failure instead of the lock claim it is.
+        """
+        import sqlite3
+        try:
+            probe.execute(f"INSERT INTO {self.PROBE_TABLE} VALUES (?)", (n,))
+        except sqlite3.OperationalError as exc:
+            return exc
+        return None
+
+    def _rows(self, probe):
+        return sorted(r[0] for r in
+                      probe.execute(f"SELECT n FROM {self.PROBE_TABLE}"))
+
+    def test_entering_transaction_holds_the_write_lock_before_any_write(self):
+        store, path = self._file_store()
+        probe = self._probe(path)
+        probe.execute(f"CREATE TABLE {self.PROBE_TABLE} (n INTEGER)")
+
+        # ANTI-VACUITY CONTROL. The identical write, on the identical
+        # connection, with NO transaction open. Without this the refusal below
+        # could be true for any unrelated reason — a broken probe, a bad
+        # table, a permission — and "it was refused" would prove nothing at
+        # all about the lock.
+        self.assertIsNone(
+            self._attempt_write(probe, 1),
+            "the control write was refused with no transaction open — the "
+            "probe cannot write at all, so the refusal under the transaction "
+            "would prove nothing")
+
+        # THE CLAIM. Enter the unit and write NOTHING inside it. If the lock
+        # is taken at BEGIN the probe cannot write; if it is deferred to the
+        # unit's first write — which never comes — the probe writes freely.
+        with store.transaction():
+            refused = self._attempt_write(probe, 2)
+
+        self.assertIsNotNone(
+            refused,
+            "a second connection COMMITTED a write while the store was "
+            "inside transaction() — the unit does not hold the file's write "
+            "lock at entry, so it is holding nothing while it authorizes and "
+            "will have to promote SHARED->RESERVED at its first write, the "
+            "one acquisition SQLite refuses to run the busy handler for")
+        self.assertIn(
+            "database is locked", str(refused).lower(),
+            f"the probe was refused for the wrong reason: {refused!r}")
+
+        # The lock is RELEASED at commit — the refusal above is the open
+        # transaction and not a permanently wedged file.
+        self.assertIsNone(
+            self._attempt_write(probe, 3),
+            "the write lock was never released after the transaction "
+            "committed")
+        self.assertEqual(
+            self._rows(probe), [1, 3],
+            "the write refused inside the transaction must not have landed")
+
+    def test_migration_holds_the_write_lock_before_its_first_statement(self):
+        """The migration path takes the lock at BEGIN too (#392 review).
+
+        It was very nearly left as a plain ``BEGIN``, justified by "a
+        migration's first statement is a write". That is false — 040, 041 and
+        042 all open with ``PRAGMA defer_foreign_keys = ON`` — and it is also
+        the wrong test: what decides the promotion is whether the first
+        statement takes a READ LOCK. ``PRAGMA defer_foreign_keys`` does not
+        (the handler is honoured), ``PRAGMA table_info`` does (it is
+        bypassed), and nothing in either spelling says which. So the invariant
+        is not documented here, it is DELETED — and this pins the deletion.
+
+        The probe fires from the migrating connection's ``cursor()``, which
+        ``_apply_migration`` calls after ``BEGIN`` and before the migration's
+        own first statement: exactly the instant in question. The statements
+        below deliberately OPEN WITH A READ, the shape that reproduced the
+        bug, so this also demonstrates that such a migration is now safe.
+        """
+        import sqlite3
+        from hockey_scheduler.store.db import Dialect
+        from hockey_scheduler.store.sql_store import _apply_migration
+
+        store, path = self._file_store()
+        probe = self._probe(path)
+        probe.execute(f"CREATE TABLE {self.PROBE_TABLE} (n INTEGER)")
+        self.assertIsNone(self._attempt_write(probe, 1),
+                          "anti-vacuity: the probe cannot write at all")
+
+        attempts = []
+        test = self
+
+        class _ProbingConnection(sqlite3.Connection):
+            def cursor(self, *a, **k):
+                attempts.append(test._attempt_write(probe, 2))
+                return super().cursor(*a, **k)
+
+        conn = sqlite3.connect(path, factory=_ProbingConnection)
+        conn.isolation_level = None
+        self.addCleanup(conn.close)
+        _apply_migration(
+            conn, Dialect("qmark", "sqlite"), 9992,
+            ["PRAGMA table_info(schema_migrations)",
+             f"CREATE TABLE {self.PROBE_TABLE}_mig (n INTEGER)"])
+
+        self.assertEqual(len(attempts), 1,
+                         "the probe never fired inside the migration")
+        self.assertIsNotNone(
+            attempts[0],
+            "a second connection COMMITTED a write between the migration's "
+            "BEGIN and its first statement — the migration does not hold the "
+            "write lock at BEGIN, so a migration opening with a read (a "
+            "SELECT, or PRAGMA table_info) would promote SHARED->RESERVED at "
+            "its next write with the busy handler bypassed")
+        self.assertIn("database is locked", str(attempts[0]).lower(),
+                      f"refused for the wrong reason: {attempts[0]!r}")
+        self.assertIsNone(self._attempt_write(probe, 3),
+                          "the lock was never released after the migration")
+        self.assertEqual(self._rows(probe), [1, 3])
