@@ -5,6 +5,7 @@
   "scripts": {
     "smoke": "node smoke.js",
     "context-switcher": "node context-switcher.js",
+    "context-scope-truth": "node context-scope-truth.js",
     "context-identity-withdrawal": "node context-identity-withdrawal.js",
     "league-context-bar": "node league-context-bar.js",
     "league-filtered-data": "node league-filtered-data.js",

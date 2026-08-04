@@ -46,6 +46,22 @@ items cease to block PR #331 only and remain required before #345 can close.
 
 ## Current state (baseline — requirements below are deltas, not inventions)
 
+> **HISTORICAL — this section is a frozen snapshot, not a description of the
+> application today.** It records the state of the app as of this package's
+> sign-off (2026-07-24) purely so the requirements below read as deltas
+> against something real. It is deliberately **not** updated as those
+> requirements are delivered — rewriting it would destroy the baseline the
+> deltas are measured from. Do not cite it as current behaviour, and do not
+> use its file/line references (they are stale by construction).
+>
+> Known to be superseded since sign-off: the **Persistent context today**
+> bullet below describes the context bar as display-only and quotes a
+> `display only · screens not filtered` caption. #367/#369 scoped the
+> operational reads to the active `(Program, Season, League)` tuple and the
+> caption has been replaced; League has also been promoted into the
+> persistent bar. See `docs/architecture/active-context-scoping.md` for what
+> the application actually does now.
+
 Grounding facts, so every requirement in this doc is a stated change against
 something real rather than a guess:
 
