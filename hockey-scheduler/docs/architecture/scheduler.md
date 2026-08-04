@@ -105,6 +105,38 @@ back on the proposal, exactly as it echoes `meetings_per_opponent`, so the
 Scheduler UI sends the value the PREVIEW was generated with at Commit
 rather than whatever the live control currently reads.
 
+### The reviewed turnaround is BOUND, not merely echoed
+
+Echoing it and trusting the caller to send it back is not enforcement.
+`_draft_fingerprint` hashes the normalized `min_turnaround_minutes`
+directly, alongside `meetings_per_opponent` and for exactly the same
+reason — and it is the third time this repo has had to learn it (#382
+bound the format; #381 had to persist and replay it).
+
+Without the binding, a caller could Generate with a non-zero turnaround
+and Commit with `0` whenever both values happened to produce identical
+rows. Committing with `0` skips `_commit_turnaround_state` entirely, so a
+non-overlapping same-team game landing inside the reviewed gap committed
+straight through a rule the operator had explicitly asked for. A
+parameter that changes what is ALLOWED but is not bound to what was
+REVIEWED is echoed, not enforced.
+
+Two properties are deliberate:
+
+* the value is resolved ONCE per entry point and then both echoed and
+  hashed, so the number the operator reviewed and the number the commit
+  compares against cannot drift apart; and
+* the fingerprint parameter is **keyword-only and REQUIRED, with no
+  default**. There are two call sites — `draft_schedule` and
+  `draft_schedule_for_league` — and a default would let a missed one
+  silently reopen the bypass on that path instead of failing loudly.
+
+The regression's weight is on its fixture: one pairing and one free slot
+with nothing within an hour of it, so `0` and `60` produce byte-identical
+rows. That condition is asserted directly before any refusal is tested —
+without it the row-based fingerprint would already refuse and the tests
+would pass without the binding existing.
+
 ### The identical check at commit
 
 `ApiService._commit_turnaround_state` / `_assert_commit_turnaround` /
