@@ -8778,10 +8778,10 @@ function renderScheduler(ov) {
       // not silently folded into a misleading "No games generated." when
       // every pairing in the round robin is already on the calendar.
       const already = (pv.already_scheduled || []);
-      // #390 — the DATE sits inside the existing .li-time cell rather than in
+      // #390 — the DATE joins the clock in a .li-when wrapper, never in
       // .li-title: every other scheduler journey compares that title with
       // ===, and a proposal's day is a property of when it is, not of who is
-      // playing.
+      // playing. .li-time keeps holding exactly the clock.
       const gRows = games.map((g) => `<div class="li">
         <span class="li-when"><span class="li-date">${esc(fmtRowDate(g.start_time))}</span><span class="li-time">${fmt(g.start_time)}</span></span>
         <div class="li-main"><div class="li-title">${esc(g.home_team_name)} vs ${esc(g.away_team_name)}</div>
