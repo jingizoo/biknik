@@ -1,7 +1,7 @@
 {
   "name": "hockey-scheduler-e2e",
   "private": true,
-  "description": "Browser smoke gates for the hockey scheduler. Dev-only tooling — the app itself has no build step and no npm dependency.",
+  "description": "Browser smoke gates for the hockey scheduler. Dev-only tooling \u2014 the app itself has no build step and no npm dependency.",
   "scripts": {
     "smoke": "node smoke.js",
     "context-switcher": "node context-switcher.js",
@@ -56,6 +56,8 @@
     "player-edit": "node player-edit.js",
     "player-lifecycle": "node player-lifecycle.js",
     "season-dates": "node season-dates.js",
+    "calendar-today": "node calendar-today.js",
+    "pr-body-check": "node check-pr-body.js",
     "scheduling-policy": "node scheduling-policy.js",
     "season-fmt-unit": "node season-fmt-unit.js",
     "breakpoint-contract": "node breakpoint-contract.js",

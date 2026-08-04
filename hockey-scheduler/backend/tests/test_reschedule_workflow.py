@@ -15,13 +15,12 @@ opponent-only respond guard, server-resolved actor attribution, and a full
 create -> accept -> approve -> republished flow over real HTTP).
 """
 
-import itertools
 import json
 import threading
 import unittest
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from http.cookiejar import CookieJar
 from http.server import ThreadingHTTPServer
 
@@ -333,7 +332,35 @@ class RescheduleHttpTest(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read() or b"{}")
 
-    _game_counter = itertools.count(1)
+    def _free_main_rink_window(self):
+        """A two-hour window on the demo's Main Rink that nothing else holds.
+
+        Anchored to what the RINK ALREADY HOLDS, never to fixed calendar dates
+        and never to the wall-clock time of day. This used to book
+        ``2026-10-11``, ``2026-10-12``, … — safe only while the demo's own
+        inventory sat on fixed September 2026 dates. #387 made that inventory
+        RELATIVE to the seed instant, so it is now a window that slides forward
+        with real time: once it swept onto these October dates, every call here
+        would be refused ``schedule_conflict`` and the whole class would fail on
+        a date rather than on a behaviour. That is the #384 outage's failure
+        mode relocated — same class of bug, different fixture (#389 review).
+
+        Re-read on every call, so each successive slot lands a day past the one
+        before it and no two calls collide either.
+        """
+        rink_id = srv.STATE.ids["main_rink_id"]
+        booked_until = max(
+            [s.end_time for s in srv.STATE.api.store.all_ice_slots()
+             if s.rink_id == rink_id]
+            + [datetime.now(UTC)])
+        start = (booked_until + timedelta(days=1)).replace(
+            hour=12, minute=0, second=0, microsecond=0)
+        # Checked rather than assumed: a reschedule is only meaningful for a
+        # game that has not happened yet, and against an inventory that has
+        # drifted into the past, dropping the ``max`` above would silently
+        # start handing out slots behind "now" with nothing else noticing.
+        self.assertGreater(start, datetime.now(UTC))
+        return rink_id, start, start + timedelta(hours=2)
 
     def _fresh_published_game(self, admin):
         """A brand-new published game, distinct per call (its own ice slot on
@@ -341,11 +368,11 @@ class RescheduleHttpTest(unittest.TestCase):
         another test's "one open request per game" state — setUpClass resets
         the demo store only once for the whole class, so state persists
         across test methods."""
-        day = 10 + next(self._game_counter)
+        rink_id, start, end = self._free_main_rink_window()
         _, slot = self._post(admin, "/api/setup/ice-slot", {
-            "rink_id": srv.STATE.ids["main_rink_id"],
-            "start_time": f"2026-10-{day:02d}T18:30:00+00:00",
-            "end_time": f"2026-10-{day:02d}T20:00:00+00:00"})
+            "rink_id": rink_id,
+            "start_time": start.isoformat(),
+            "end_time": end.isoformat()})
         _, game = self._post(admin, "/api/setup/game", {
             "season_id": srv.STATE.ids["season_id"],
             "division_id": srv.STATE.ids["division_id"],
@@ -479,9 +506,13 @@ class RescheduleHttpTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn(req["id"], [r["id"] for r in pending["requests"]])
 
+        # The replacement ice, on the same rink and by the same occupancy
+        # anchor as the game's original slot — a fixed 2026-09-20 here was the
+        # same latent collision as _fresh_published_game's October dates.
+        _, free_start, free_end = self._free_main_rink_window()
         _, new_slot = self._post(admin, "/api/setup/ice-slot", {
-            "rink_id": rink_id, "start_time": "2026-09-20T18:30:00+00:00",
-            "end_time": "2026-09-20T20:00:00+00:00"})
+            "rink_id": rink_id, "start_time": free_start.isoformat(),
+            "end_time": free_end.isoformat()})
 
         status, decided = self._post(
             admin, f"/api/games/{gid}/reschedule/{req['id']}/decide",

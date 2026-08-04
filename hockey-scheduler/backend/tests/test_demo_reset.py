@@ -120,7 +120,10 @@ class DemoResetContract:
 
             original = srv.build_full_demo_store
 
-            def boom(_store):
+            # **_ so the stub keeps matching the real signature: the seed
+            # call carries seed_instant= since #389. A stub that pins the old
+            # arity turns a behavioural test into a TypeError about itself.
+            def boom(_store, **_):
                 raise RuntimeError("forced mid-seed failure")
 
             srv.build_full_demo_store = boom
@@ -151,7 +154,7 @@ class DemoResetContract:
             original = srv.build_full_demo_store
             try:
                 srv.build_full_demo_store = \
-                    lambda _s: (_ for _ in ()).throw(RuntimeError("boom"))
+                    lambda _s, **_: (_ for _ in ()).throw(RuntimeError("boom"))
                 with self.assertRaises(RuntimeError):
                     state.reset(actor_id="user_admin")
                 self.assertEqual(calls, [])  # failure → no side effect
@@ -169,7 +172,7 @@ class DemoResetContract:
             original = srv.build_full_demo_store
             srv.create_store = lambda *a, **k: made.append(real_create(*a, **k)) or made[-1]
             srv.build_full_demo_store = \
-                lambda _s: (_ for _ in ()).throw(RuntimeError("boom"))
+                lambda _s, **_: (_ for _ in ()).throw(RuntimeError("boom"))
             try:
                 with self.assertRaises(RuntimeError):
                     state.reset(actor_id="user_admin")

@@ -45,10 +45,26 @@ function stopServer(server) {
   });
 }
 
-// The Arena Calendar is pinned to this demo date in the app; putting the free
-// slot here means it renders on the default day (no navigation) and — being
-// well ahead of real "now" — is still a deletable future slot.
-const CAL_DAY = "2026-09-05";
+// The ice-slot half of this journey needs a day that satisfies TWO conditions
+// at once, and it is the only spec here that does (#387/#389):
+//
+//   * it must be the day the Arena Calendar is showing, or `.slot-del` never
+//     renders and the wait below times out; and
+//   * it must be strictly in the future, because `delete_ice_slot` refuses
+//     anything at or before its clock ("past slots are history",
+//     setup_service.py) — the delete would 404.
+//
+// This used to be the literal 2026-09-05, which met both conditions only by
+// coincidence: the app opened on that same literal, and the date had not yet
+// arrived. Both halves of that were a countdown. The app now opens on the real
+// current date, so "the day being shown" is TODAY — and a slot today is only
+// future for part of the day, which would make the delete pass or fail
+// depending on the hour the suite ran. That is exactly the failure class #384
+// was about.
+//
+// So the calendar is stepped one day forward and the journey books there: the
+// day is read back from the app's own `calendarDate` (never recomputed from a
+// second clock), and tomorrow is strictly future at every hour.
 
 async function checkViewport(browser, viewport) {
   const base = `http://${HOST}:${viewport.port}`;
@@ -68,12 +84,15 @@ async function checkViewport(browser, viewport) {
   page.on("pageerror", (e) => errors.push(`[pageerror] ${e.message}`));
   page.on("console", (m) => { if (m.type() === "error") errors.push(`[console] ${m.text()}`); });
 
-  const day = CAL_DAY;
+  const fail = (msg) => { throw new Error(`[${viewport.label}] ${msg}`); };
 
   try {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    // Tomorrow, by the app's own date arithmetic on the app's own calendar
+    // day — see the note above CAL_DAY's retirement.
+    const day = await page.evaluate(() => addDays(calendarDate, 1));
 
     const ids = await page.evaluate(async (d) => {
       const post = async (p, b) => (await fetch(p, {
@@ -158,8 +177,16 @@ async function checkViewport(browser, viewport) {
     if ((await resp).status() !== 200) throw new Error(`[${viewport.label}] club delete non-200`);
     await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
 
-    // (2) Future Ice Slot delete — Arena Calendar (opens on the pinned demo day).
+    // (2) Future Ice Slot delete — Arena Calendar, stepped forward one day to
+    // the day the fixture booked (the calendar opens on today).
     await page.click('.tab[data-tab="calendar"]');
+    await page.waitForSelector('[data-cal="1"]', { timeout: 10000 });
+    await page.click('[data-cal="1"]');
+    // Assert rather than assume the step landed where the ice is: if the run
+    // straddled UTC midnight between the two reads, the board and the fixture
+    // would disagree, and this says so instead of timing out below.
+    const shown = await page.evaluate(() => calendarDate);
+    if (shown !== day) fail(`calendar shows ${shown}, ice was booked on ${day}`);
     const slotDel = `.slot-del[data-del="ice-slot"][data-del-id="${ids.slotFree}"]`;
     await page.waitForSelector(slotDel, { timeout: 15000 });
     await page.click(slotDel);

@@ -33,6 +33,8 @@ import sqlite3
 import sys
 import tempfile
 
+from ..full_demo import demo_day_zero
+
 # Census dimensions: (label, store accessor). Every durable entity a client
 # configures, so a dropped table or lost relationship shows up as a count gap.
 _CENSUS = [
@@ -60,7 +62,7 @@ def census(store) -> dict:
     return {label: len(getattr(store, accessor)()) for label, accessor in _CENSUS}
 
 
-def configure_sample(api, actor_id: str = SAMPLE_ADMIN) -> None:
+def configure_sample(api, actor_id: str = SAMPLE_ADMIN, seed_instant=None) -> None:
     """Configure a small but complete client hierarchy into an empty store via
     the public facade — the same shape the restart proof uses, so the sample
     exercises every relationship the census and onboarding status inspect.
@@ -69,6 +71,10 @@ def configure_sample(api, actor_id: str = SAMPLE_ADMIN) -> None:
     printed. Leaves the installation fully onboarded (an active League Admin,
     game ice, a roster, an official) so the restored onboarding status is a rich
     payload to compare, not an all-blockers stub.
+
+    ``seed_instant`` is the timezone-aware instant the sample's game ice is
+    laid out relative to; omitted, it comes from the facade's own SetupService
+    clock (#387).
     """
     api.accounts.create_account(SAMPLE_ADMIN, "not-a-real-secret", "league_admin")
     org = api.create_organization("Canlon", short_name="CAN", actor_id=actor_id)
@@ -77,8 +83,14 @@ def configure_sample(api, actor_id: str = SAMPLE_ADMIN) -> None:
     venue = api.create_venue("Plainfield", address="1 Rink Rd",
                              league_id=league["id"], actor_id=actor_id)
     rink = api.create_rink(venue["id"], "Rink 1", actor_id=actor_id)
-    api.create_ice_slot(rink["id"], "2026-09-01T18:30:00+00:00",
-                        "2026-09-01T20:00:00+00:00", actor_id=actor_id)
+    # Game ice, placed relative to the facade's own clock rather than a fixed
+    # calendar date (#387). The census only counts rows, but a sample
+    # deployment an operator actually boots should not be born past-dated —
+    # a past slot is not deletable ("past slots are history") and shows an
+    # already-finished season on every schedule surface.
+    day = demo_day_zero(api.setup.clock() if seed_instant is None else seed_instant)
+    api.create_ice_slot(rink["id"], day.replace(hour=18, minute=30).isoformat(),
+                        day.replace(hour=20).isoformat(), actor_id=actor_id)
     season = api.create_season(league["id"], "Fall 2026", actor_id=actor_id)
     division = api.create_division(season["id"], "Div A", actor_id=actor_id)
     club = api.create_club("Club X", country="US", actor_id=actor_id)

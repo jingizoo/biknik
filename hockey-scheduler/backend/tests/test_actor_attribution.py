@@ -77,13 +77,20 @@ class ActorAttributionHttpTest(unittest.TestCase):
 
         The slot is anchored to what the RINK ALREADY HOLDS, never to the
         wall-clock time of day. ``datetime.now() + 31 days`` was a latent
-        time bomb: the demo seed books this same rink on FIXED calendar
-        dates (2026-09-05 … 2026-09-19, 16:00/18:00/18:30/20:30 UTC), so
-        once "now + 31 days" drifted onto a seeded date the create was
-        refused ``schedule_conflict`` — but only when the clock-time window
-        [start, start+2h) happened to hit a seeded slot. The suite's verdict
-        then depended on the hour CI started: identical tree, green at
-        12:43Z as PR #382, red at 15:08Z as the merge on main.
+        time bomb: the demo seed used to book this same rink on FIXED
+        calendar dates (2026-09-05 … 2026-09-19, 16:00/18:00/18:30/20:30
+        UTC), so once "now + 31 days" drifted onto a seeded date the create
+        was refused ``schedule_conflict`` — but only when the clock-time
+        window [start, start+2h) happened to hit a seeded slot. The suite's
+        verdict then depended on the hour CI started: identical tree, green
+        at 12:43Z as PR #382, red at 15:08Z as the merge on main.
+
+        #387 has since made the seed's own inventory relative to a seed
+        instant (``full_demo.demo_day_zero``), so the specific dates above
+        no longer exist — but the anchoring below is what makes this fixture
+        correct against ANY inventory, seeded or hand-built, and is
+        deliberately not relaxed back to a wall-clock offset now that one
+        particular collision is gone.
 
         Deriving the anchor from the rink's own occupancy is collision-proof
         by construction: ``create_ice_slot`` refuses on a half-open interval
@@ -91,7 +98,7 @@ class ActorAttributionHttpTest(unittest.TestCase):
         every such slot ends cannot satisfy it. Recomputing per call also
         makes each successive slot land a day past the one the previous call
         just created. ``max`` with the current time keeps the slot in the
-        future once real time overtakes the seeded dates.
+        future however the seeded ice is placed.
         """
         rink_id = srv.STATE.ids["main_rink_id"]
         booked_until = max(
@@ -103,9 +110,9 @@ class ActorAttributionHttpTest(unittest.TestCase):
         end = start + timedelta(hours=2)
         # These tests enroll substitutes into the game they get back, which is
         # only meaningful for a game that has not happened yet. Checked rather
-        # than assumed: with the seed's dates fixed in 2026-09, dropping the
-        # ``max`` above silently starts handing out PAST slots the moment real
-        # time overtakes them, and nothing else in the suite would notice.
+        # than assumed: against any inventory that has drifted into the past,
+        # dropping the ``max`` above silently starts handing out PAST slots,
+        # and nothing else in the suite would notice.
         self.assertGreater(start, datetime.now(timezone.utc))
         status, slot = self._req(
             admin, "POST", "/api/setup/ice-slot",

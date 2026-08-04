@@ -7,14 +7,17 @@ creates a manual game on that slot and shows it driving the existing roster
 engine. Also demonstrates the duplicate-slot conflict.
 """
 
-from datetime import datetime, timezone
-
 from .api import ApiService
+from .full_demo import demo_day_zero
 
 
 def main() -> None:
     api = ApiService()
     actor = "league_admin"
+    # Relative to the facade's own clock, never a fixed calendar date (#387):
+    # a pinned slot turns this script into a demonstration of scheduling a
+    # game onto ice that has already passed.
+    day = demo_day_zero(api.setup.clock())
 
     league = api.create_program("EU Premier Hockey", country="DE", actor_id=actor)
     season = api.create_season(league["id"], "2026/27", actor_id=actor)
@@ -33,8 +36,8 @@ def main() -> None:
     api.grant_season_venue_access(season["id"], venue["id"], actor_id=actor)
     rink = api.create_rink(venue["id"], "Rink 2", actor_id=actor)
     slot = api.create_ice_slot(
-        rink["id"], "2026-09-05T18:30:00+00:00", "2026-09-05T20:00:00+00:00",
-        actor_id=actor,
+        rink["id"], day.replace(hour=18, minute=30).isoformat(),
+        day.replace(hour=20).isoformat(), actor_id=actor,
     )
 
     print("=== Setup ===")
