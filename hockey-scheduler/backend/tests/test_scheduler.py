@@ -108,7 +108,23 @@ class DraftFingerprintTest(unittest.TestCase):
             }],
             unschedulable_teams=[],
             already_scheduled=[],
+            # #390 review — keyword-only and REQUIRED on the function, so a
+            # missed call site fails loudly instead of silently reopening the
+            # commit bypass on that path.
+            min_turnaround_minutes=0.0,
         )
+
+    def test_changed_min_turnaround_changes_fingerprint(self):
+        # #390 review blocker -- the reviewed TURNAROUND POLICY is bound
+        # directly, so a preview generated under one turnaround and a commit
+        # asking for another is a guaranteed mismatch even when every row
+        # above is byte-for-byte identical. Without this, a caller could
+        # Generate with a turnaround and Commit with 0 -- which skips the
+        # commit-time turnaround check entirely.
+        a = self._base_args()
+        b = self._base_args()
+        b["min_turnaround_minutes"] = 60.0
+        self.assertNotEqual(_draft_fingerprint(**a), _draft_fingerprint(**b))
 
     def test_changed_team_ids_changes_fingerprint(self):
         a = self._base_args()

@@ -1273,7 +1273,7 @@ def _canonical_sort_key(row):
 
 def _draft_fingerprint(league_season_id, team_ids, draft_games, unscheduled,
                         unschedulable_teams, already_scheduled,
-                        meetings_per_opponent=1):
+                        meetings_per_opponent=1, *, min_turnaround_minutes):
     """Deterministic identity of exactly what this proposal reviewed — #328
     review round 5, widened rounds 7, 10, 11, 12, 15, and 16. Bound into the response
     so the commit path can prove, right before writing, that this fact
@@ -1451,6 +1451,30 @@ def _draft_fingerprint(league_season_id, team_ids, draft_games, unscheduled,
         # commit is asking for" a guaranteed mismatch instead of one that
         # happens to fall out of the row lists.
         "meetings_per_opponent": meetings_per_opponent,
+        # #390 review blocker — the reviewed TURNAROUND POLICY, bound directly
+        # for exactly the reason `meetings_per_opponent` above is, and it is
+        # the third time this repo has had to learn it (#382 bound the format,
+        # #381 had to persist and replay it).
+        #
+        # A parameter that changes what is ALLOWED but is not bound to what
+        # was REVIEWED is echoed, not enforced. Before this, a caller could
+        # Generate with a non-zero turnaround and Commit with 0 whenever both
+        # values happened to produce identical rows — and committing with 0
+        # skips the commit-time turnaround state entirely, so a same-team game
+        # landing inside the reviewed gap could be committed straight through
+        # a safety rule the operator had explicitly asked for.
+        #
+        # Binding the NORMALIZED value (a float, from
+        # :func:`_normalize_constraints`) rather than the raw request field
+        # means `60`, `60.0` and an equivalent restatement hash identically,
+        # while any real change to the reviewed policy is a guaranteed
+        # mismatch instead of one that happens to fall out of the row lists.
+        #
+        # The parameter is keyword-only and REQUIRED, with no default: this
+        # function has two call sites (Division-only and League-wide), and a
+        # default would let a missed one silently reopen the hole on that path
+        # rather than failing loudly.
+        "min_turnaround_minutes": min_turnaround_minutes,
     }
     return hashlib.sha256(json.dumps(
         payload, sort_keys=True, separators=(",", ":"), default=str
@@ -1510,6 +1534,11 @@ def draft_schedule(store, division_id, slot_ids=None, constraints=None,
         })
     unschedulable_teams = _unschedulable_teams(
         store, teams, pairings, unscheduled)
+    # #390 — resolved ONCE, then both echoed and hashed. Computing it twice
+    # would let the number the operator reviewed and the number the commit
+    # compares against drift apart, which is the whole class of defect the
+    # binding below exists to close.
+    turnaround = turnaround_minutes(constraints)
     return {
         "division_id": division_id, "team_count": len(teams),
         "meetings_per_opponent": meetings,
@@ -1521,13 +1550,14 @@ def draft_schedule(store, division_id, slot_ids=None, constraints=None,
         # a live control is what stops an operator who nudges the control
         # while reading a valid preview from silently redefining the batch
         # they are about to commit.
-        "min_turnaround_minutes": turnaround_minutes(constraints),
+        "min_turnaround_minutes": turnaround,
         "draft_games": draft_games, "unscheduled": unscheduled,
         "already_scheduled": already_scheduled,
         "unschedulable_teams": unschedulable_teams,
         "draft_fingerprint": _draft_fingerprint(
             ls_id, teams, draft_games, unscheduled, unschedulable_teams,
-            already_scheduled, meetings),
+            already_scheduled, meetings,
+            min_turnaround_minutes=turnaround),
     }
 
 
@@ -1584,16 +1614,20 @@ def draft_schedule_for_league(store, season_id, league_id, division_id=None,
         })
     unschedulable_teams = _unschedulable_teams(
         store, all_teams, pairings, unscheduled)
+    # #390 — see the Division-only entry point above. This is the SECOND
+    # fingerprint call site, and binding only the other one would leave the
+    # reviewed policy unenforced on every League-wide commit.
+    turnaround = turnaround_minutes(constraints)
     return {
         "season_id": season_id, "league_id": league_id,
         "division_id": division_id, "team_count": len(all_teams),
         "meetings_per_opponent": meetings,
-        # #390 — see the Division-only entry point above.
-        "min_turnaround_minutes": turnaround_minutes(constraints),
+        "min_turnaround_minutes": turnaround,
         "draft_games": draft_games, "unscheduled": unscheduled,
         "already_scheduled": already_scheduled,
         "unschedulable_teams": unschedulable_teams,
         "draft_fingerprint": _draft_fingerprint(
             ls_id, all_teams, draft_games, unscheduled, unschedulable_teams,
-            already_scheduled, meetings),
+            already_scheduled, meetings,
+            min_turnaround_minutes=turnaround),
     }

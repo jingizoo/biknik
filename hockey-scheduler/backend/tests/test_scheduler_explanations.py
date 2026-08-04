@@ -1043,8 +1043,12 @@ class ExplanationBudgetAndObserverTest(unittest.TestCase):
         args = ("ls", ["t0", "t1"], preview["draft_games"], rows,
                 preview["unschedulable_teams"], preview["already_scheduled"],
                 preview["meetings_per_opponent"])
+        # #390 review -- the reviewed turnaround is bound too, so reproducing
+        # the preview's own fingerprint means replaying its value as well.
+        turnaround = preview["min_turnaround_minutes"]
         self.assertEqual(
-            preview["draft_fingerprint"], sched._draft_fingerprint(*args))
+            preview["draft_fingerprint"],
+            sched._draft_fingerprint(*args, min_turnaround_minutes=turnaround))
         rewritten = copy.deepcopy(rows)
         rewritten[0]["explanation"] = {
             "value_object_version": 99,
@@ -1056,7 +1060,7 @@ class ExplanationBudgetAndObserverTest(unittest.TestCase):
         self.assertEqual(
             sched._draft_fingerprint(
                 args[0], args[1], args[2], rewritten, args[4], args[5],
-                args[6]),
+                args[6], min_turnaround_minutes=turnaround),
             preview["draft_fingerprint"])
         # Control: the fields the gate DOES bind still move it, so the
         # equality above is a statement about `explanation`, not about a
@@ -1065,7 +1069,7 @@ class ExplanationBudgetAndObserverTest(unittest.TestCase):
         self.assertNotEqual(
             sched._draft_fingerprint(
                 args[0], args[1], args[2], rewritten, args[4], args[5],
-                args[6]),
+                args[6], min_turnaround_minutes=turnaround),
             preview["draft_fingerprint"])
 
     def test_rejection_and_alternative_caps_report_exact_omitted_counts(self):

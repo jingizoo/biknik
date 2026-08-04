@@ -445,6 +445,296 @@ class SameBatchTurnaroundTest(TurnaroundFixture):
                          {"slot1", "slot2", "slot3"}, repr(res))
 
 
+class TurnaroundFingerprintBindingTest(TurnaroundFixture):
+    """The REVIEWED turnaround is bound into ``draft_fingerprint`` (#390
+    review blocker).
+
+    Echoing the value on the proposal and trusting the UI to send it back is
+    not enforcement. `_draft_fingerprint` hashed the proposal buckets plus
+    `meetings_per_opponent` and nothing else, so a caller could Generate with
+    a non-zero turnaround and Commit with `0` whenever both values happened to
+    produce the same rows — and committing with `0` skips the commit-time
+    turnaround state entirely. The same lesson this repo learned twice: #382
+    had to bind `meetings_per_opponent`, #381 had to persist and replay it. A
+    policy parameter that changes what is ALLOWED but is not bound to what was
+    REVIEWED is echoed, not enforced.
+
+    EVERY test below rests on one fixture condition, asserted directly in
+    :meth:`test_zero_and_sixty_produce_identical_draft_rows`: at this geometry
+    the two turnaround values produce byte-identical `draft_games`. Without
+    that, the row-based fingerprint would already refuse and none of these
+    tests would be testing the binding at all.
+    """
+
+    REVIEWED = 60
+
+    def _identical_rows_fixture(self):
+        """Two teams, one pairing, ONE free slot at 18:00-19:00 with nothing
+        within an hour of it. Both turnaround values place that pairing on
+        that slot, so every fingerprint-bearing bucket is identical and the
+        ONLY thing that can distinguish the two previews is the reviewed
+        parameter itself."""
+        self._hierarchy()
+        self._slot("slotB", DAY.replace(hour=18), DAY.replace(hour=19))
+
+    def _race_into_the_reviewed_gap(self):
+        """The exploit's second half: a non-overlapping SAME-TEAM game landing
+        inside the reviewed gap, 17:00-17:30, thirty minutes before the
+        reviewed 18:00 start.
+
+        EXHIBITION on its own slot, deliberately: it satisfies no round-robin
+        obligation (so `pairing_already_scheduled` cannot fire), it does not
+        take the reviewed slot (so the slot gate cannot fire), and it does not
+        overlap (so `team_overlap` cannot fire). Regenerating with `0` yields
+        the identical rows — which is exactly why only the bound parameter can
+        refuse this.
+        """
+        self._slot("slotRace", DAY.replace(hour=17),
+                   DAY.replace(hour=17, minute=30), IceSlotStatus.ALLOCATED)
+        self.store.add_game(Game(
+            id="g_race", home_team_id="t0", away_team_id="t1",
+            start_time=DAY.replace(hour=17),
+            end_time=DAY.replace(hour=17, minute=30),
+            ice_slot_id="slotRace", division_id="div1", season_id="se1",
+            league_id="lg1", league_season_id="ls1",
+            game_type=GameType.EXHIBITION.value))
+
+    @staticmethod
+    def _rows(proposal):
+        return [dict(row) for row in proposal["draft_games"]]
+
+    def _scope(self, shape):
+        """Division-only vs League-wide — two independent fingerprint call
+        sites, and binding one leaves the hole open on the other."""
+        if shape == "division":
+            return {"division_id": "div1"}
+        return {"season_id": "se1", "league_id": "lg1"}
+
+    # -- the fixture's own precondition ------------------------------------
+    def test_zero_and_sixty_produce_identical_draft_rows(self):
+        """THE PRECONDITION every test in this class depends on. Asserted
+        directly, not assumed: if the two values produced different rows the
+        existing row-based fingerprint would already refuse, and every
+        refusal below would pass without the binding existing at all."""
+        self._identical_rows_fixture()
+        reviewed = self.api.draft_season_schedule(
+            "div1", constraints={"min_turnaround_minutes": self.REVIEWED})
+        zero = self.api.draft_season_schedule(
+            "div1", constraints={"min_turnaround_minutes": 0})
+        self.assertEqual(len(reviewed["draft_games"]), 1, repr(reviewed))
+        self.assertEqual(self._rows(reviewed), self._rows(zero))
+        for bucket in ("unscheduled", "already_scheduled",
+                       "unschedulable_teams"):
+            self.assertEqual(reviewed[bucket], zero[bucket], bucket)
+
+    def test_the_reviewed_turnaround_changes_the_fingerprint(self):
+        """Same rows, same buckets, different reviewed policy — therefore a
+        different fingerprint. This is the binding itself."""
+        self._identical_rows_fixture()
+        reviewed = self.api.draft_season_schedule(
+            "div1", constraints={"min_turnaround_minutes": self.REVIEWED})
+        zero = self.api.draft_season_schedule(
+            "div1", constraints={"min_turnaround_minutes": 0})
+        self.assertNotEqual(reviewed["draft_fingerprint"],
+                            zero["draft_fingerprint"])
+
+    def test_the_league_wide_fingerprint_binds_it_too(self):
+        """The second call site. Binding only the Division-only entry point
+        leaves the identical hole open on the League-wide one."""
+        self._identical_rows_fixture()
+        reviewed = self.api.draft_season_schedule(
+            season_id="se1", league_id="lg1",
+            constraints={"min_turnaround_minutes": self.REVIEWED})
+        zero = self.api.draft_season_schedule(
+            season_id="se1", league_id="lg1",
+            constraints={"min_turnaround_minutes": 0})
+        self.assertEqual(self._rows(reviewed), self._rows(zero))
+        self.assertEqual(len(reviewed["draft_games"]), 1, repr(reviewed))
+        self.assertNotEqual(reviewed["draft_fingerprint"],
+                            zero["draft_fingerprint"])
+
+    def test_an_unchanged_turnaround_keeps_the_same_fingerprint(self):
+        """THE ANTI-VACUITY CONTROL for the binding: the fingerprint must
+        still be a function of the inputs, not merely different every time.
+        Two previews at the SAME reviewed turnaround agree."""
+        self._identical_rows_fixture()
+        first = self.api.draft_season_schedule(
+            "div1", constraints={"min_turnaround_minutes": self.REVIEWED})
+        second = self.api.draft_season_schedule(
+            "div1", constraints={"min_turnaround_minutes": self.REVIEWED})
+        self.assertEqual(first["draft_fingerprint"],
+                         second["draft_fingerprint"])
+
+    # -- (a) the parameter is dropped or changed at commit ------------------
+    def _assert_no_trace(self, res, before):
+        games, audits, counter, slot_status = before
+        self.assertIn("error", res, repr(res))
+        self.assertEqual(res["error"]["details"]["reason"], "preview_stale",
+                         repr(res))
+        self.assertEqual(len(self.store.all_games()), games, repr(res))
+        self.assertEqual(len(self.store.all_setup_audit()), audits, repr(res))
+        self.assertEqual(self.store.get_ice_slot("slotB").status, slot_status)
+        # ``next_id`` has no peek, so the claim is a DELTA: one bump for this
+        # probe and no others. A refused commit that minted a Game id shows two.
+        self.assertEqual(
+            int(self.store.next_id("game").rsplit("_", 1)[1]), counter + 1,
+            repr(res))
+
+    def _before(self):
+        return (len(self.store.all_games()),
+                len(self.store.all_setup_audit()),
+                int(self.store.next_id("game").rsplit("_", 1)[1]),
+                self.store.get_ice_slot("slotB").status)
+
+    def _dropped_turnaround_is_refused(self, api_cls, shape, committed):
+        """(a) Generate with the reviewed turnaround, Commit with a different
+        one, NO intervening write. The rows are identical either way, so only
+        the bound parameter can refuse it."""
+        self._identical_rows_fixture()
+        api = api_cls(self.store)
+        scope = self._scope(shape)
+        reviewed = api.draft_season_schedule(
+            constraints={"min_turnaround_minutes": self.REVIEWED}, **scope)
+        self.assertEqual(len(reviewed["draft_games"]), 1, repr(reviewed))
+        before = self._before()
+        res = api.commit_draft_schedule(
+            constraints={"min_turnaround_minutes": committed},
+            draft_fingerprint=reviewed["draft_fingerprint"], **scope)
+        self._assert_no_trace(res, before)
+
+    def _committing_the_reviewed_turnaround_succeeds(self, api_cls, shape):
+        """THE ANTI-VACUITY CONTROL for (a) and (b): the identical fixture and
+        the identical reviewed value commits normally. Without it, "refused"
+        is indistinguishable from "this path refuses every commit once a
+        turnaround is configured"."""
+        self._identical_rows_fixture()
+        api = api_cls(self.store)
+        scope = self._scope(shape)
+        constraints = {"min_turnaround_minutes": self.REVIEWED}
+        reviewed = api.draft_season_schedule(constraints=constraints, **scope)
+        res = api.commit_draft_schedule(
+            constraints=constraints,
+            draft_fingerprint=reviewed["draft_fingerprint"], **scope)
+        self.assertNotIn("error", res, repr(res))
+        self.assertEqual(len(res["created"]), 1, repr(res))
+        self.assertEqual(self.store.get_ice_slot("slotB").status,
+                         IceSlotStatus.ALLOCATED)
+
+    # -- (b) the actual exploit --------------------------------------------
+    def _racing_game_in_the_reviewed_gap_is_refused(self, api_cls, shape):
+        """(b) A non-overlapping same-team game lands INSIDE the reviewed gap
+        after the preview, and the commit drops the turnaround to 0 — which
+        skips the commit-time turnaround check entirely. The regenerated rows
+        stay byte-identical, so the bound parameter is the only thing that can
+        refuse this, and it must, with zero trace."""
+        self._identical_rows_fixture()
+        api = api_cls(self.store)
+        scope = self._scope(shape)
+        reviewed = api.draft_season_schedule(
+            constraints={"min_turnaround_minutes": self.REVIEWED}, **scope)
+        self.assertEqual(len(reviewed["draft_games"]), 1, repr(reviewed))
+        self._race_into_the_reviewed_gap()
+        # The premise, asserted rather than assumed: regenerating with 0 after
+        # the race still produces the SAME rows, so nothing else in the
+        # fingerprint has moved.
+        after_race = api.draft_season_schedule(
+            constraints={"min_turnaround_minutes": 0}, **scope)
+        self.assertEqual(self._rows(reviewed), self._rows(after_race))
+        before = self._before()
+        res = api.commit_draft_schedule(
+            constraints={"min_turnaround_minutes": 0},
+            draft_fingerprint=reviewed["draft_fingerprint"], **scope)
+        self._assert_no_trace(res, before)
+
+    def _racing_game_with_the_reviewed_turnaround_is_also_refused(
+            self, api_cls, shape):
+        """The honest commit of the SAME race: the caller keeps the reviewed
+        60 minutes, so the commit-time turnaround check runs and refuses on
+        its own terms. Proves the two defences are independent — the binding
+        closes the bypass, the gate closes the race."""
+        self._identical_rows_fixture()
+        api = api_cls(self.store)
+        scope = self._scope(shape)
+        constraints = {"min_turnaround_minutes": self.REVIEWED}
+        reviewed = api.draft_season_schedule(constraints=constraints, **scope)
+        self._race_into_the_reviewed_gap()
+        api.draft_season_schedule = lambda *a, **k: reviewed
+        before = self._before()
+        res = api.commit_draft_schedule(
+            constraints=constraints,
+            draft_fingerprint=reviewed["draft_fingerprint"], **scope)
+        self.assertIn("error", res, repr(res))
+        self.assertEqual(res["error"]["details"]["reason"], "min_turnaround",
+                         repr(res))
+        self.assertEqual(res["error"]["details"]["conflict_game_id"], "g_race")
+        self.assertEqual(len(self.store.all_games()), before[0], repr(res))
+        self.assertEqual(len(self.store.all_setup_audit()), before[1])
+        self.assertEqual(self.store.get_ice_slot("slotB").status, before[3])
+
+    # -- both facades x both scopes ----------------------------------------
+    def test_league_scoped_facade_division_scope_dropped_turnaround(self):
+        self._dropped_turnaround_is_refused(ApiService, "division", 0)
+
+    def test_league_scoped_facade_division_scope_changed_turnaround(self):
+        self._dropped_turnaround_is_refused(ApiService, "division", 30)
+
+    def test_league_scoped_facade_league_scope_dropped_turnaround(self):
+        self._dropped_turnaround_is_refused(ApiService, "league", 0)
+
+    def test_base_facade_division_scope_dropped_turnaround(self):
+        self._dropped_turnaround_is_refused(BaseApiService, "division", 0)
+
+    def test_base_facade_league_scope_dropped_turnaround(self):
+        self._dropped_turnaround_is_refused(BaseApiService, "league", 0)
+
+    def test_league_scoped_facade_division_scope_commits_the_reviewed_value(self):
+        self._committing_the_reviewed_turnaround_succeeds(ApiService, "division")
+
+    def test_league_scoped_facade_league_scope_commits_the_reviewed_value(self):
+        self._committing_the_reviewed_turnaround_succeeds(ApiService, "league")
+
+    def test_base_facade_division_scope_commits_the_reviewed_value(self):
+        self._committing_the_reviewed_turnaround_succeeds(
+            BaseApiService, "division")
+
+    def test_league_scoped_facade_division_scope_race_with_zero(self):
+        self._racing_game_in_the_reviewed_gap_is_refused(ApiService, "division")
+
+    def test_league_scoped_facade_league_scope_race_with_zero(self):
+        self._racing_game_in_the_reviewed_gap_is_refused(ApiService, "league")
+
+    def test_base_facade_division_scope_race_with_zero(self):
+        self._racing_game_in_the_reviewed_gap_is_refused(
+            BaseApiService, "division")
+
+    def test_base_facade_league_scope_race_with_zero(self):
+        self._racing_game_in_the_reviewed_gap_is_refused(
+            BaseApiService, "league")
+
+    def test_league_scoped_facade_race_with_the_reviewed_turnaround(self):
+        self._racing_game_with_the_reviewed_turnaround_is_also_refused(
+            ApiService, "division")
+
+    def test_base_facade_race_with_the_reviewed_turnaround(self):
+        self._racing_game_with_the_reviewed_turnaround_is_also_refused(
+            BaseApiService, "division")
+
+
+class MemoryFingerprintBindingTest(TurnaroundFingerprintBindingTest,
+                                   unittest.TestCase):
+    def make_store(self):
+        return InMemoryStore()
+
+
+class DurableFingerprintBindingTest(TurnaroundFingerprintBindingTest,
+                                    unittest.TestCase):
+    def make_store(self):
+        url = os.environ.get("TEST_DATABASE_URL") or ":memory:"
+        store = SqlStore(url)
+        store.reset_schema()
+        return store
+
+
 class MemoryTurnaroundTest(ExistingGameTurnaroundTest, unittest.TestCase):
     def make_store(self):
         return InMemoryStore()
@@ -956,6 +1246,120 @@ class TurnaroundHttpTest(unittest.TestCase):
             "division_id": division_id, "meetings_per_opponent": 2,
             "constraints": {"min_turnaround_minutes": -5}})
         self.assertEqual(body["error"]["code"], "validation_error", repr(body))
+
+    def _identical_rows_fixture_http(self, c, label):
+        """Two Teams, one pairing, ONE free slot with nothing within an hour
+        of it — built through the real setup routes. Both turnaround values
+        place that pairing on that slot, so the reviewed parameter is the only
+        thing that can distinguish the two previews (#390 review blocker)."""
+        def post(path, body):
+            status, resp = self._req(c, "POST", path, body)
+            self.assertEqual(status, 200, repr(resp))
+            return resp
+        program = post("/api/setup/league", {"name": f"FP {label}"})
+        post("/api/context", {"program_id": program["id"]})
+        season = post("/api/setup/season",
+                      {"league_id": program["id"], "name": "FP Season"})
+        level = post("/api/setup/level",
+                     {"season_id": season["id"], "name": "FP Level"})
+        division = post("/api/setup/division", {
+            "season_id": season["id"], "level_id": level["id"],
+            "name": "FP Division"})
+        club = post("/api/setup/club", {"name": f"FP Club {label}"})
+        post("/api/context",
+             {"program_id": program["id"], "season_id": season["id"]})
+        teams = [post("/api/v2/setup/team",
+                      {"club_id": club["id"], "league_id": level["id"],
+                       "name": f"FP {n} {label}"})
+                 for n in ("Home", "Away")]
+        for team in teams:
+            post(f"/api/setup/seasons/{season['id']}/team-registrations",
+                 {"team_id": team["id"], "division_id": division["id"]})
+        venue = post("/api/setup/venue",
+                     {"name": f"FP Arena {label}", "league_id": program["id"]})
+        post(f"/api/v2/setup/seasons/{season['id']}/venue-access",
+             {"venue_id": venue["id"]})
+        rink = post("/api/setup/rink",
+                    {"venue_id": venue["id"], "name": "FP Rink"})
+        post("/api/setup/ice-slot", {
+            "rink_id": rink["id"],
+            "start_time": DAY.replace(hour=18).isoformat(),
+            "end_time": DAY.replace(hour=19).isoformat(), "slot_type": "game"})
+        return {"division_id": division["id"], "season_id": season["id"],
+                "league_id": level["id"], "team_ids": [t["id"] for t in teams],
+                "rink_id": rink["id"]}
+
+    def _http_draft(self, c, fixture, minutes):
+        status, body = self._req(c, "POST", "/api/scheduler/draft", {
+            "division_id": fixture["division_id"],
+            "constraints": {"min_turnaround_minutes": minutes}})
+        self.assertEqual(status, 200, repr(body))
+        return body
+
+    def test_http_dropping_the_reviewed_turnaround_is_preview_stale(self):
+        """(a) over real HTTP. The rows are asserted identical under both
+        values FIRST, so the refusal cannot be an artefact of the two
+        previews simply differing."""
+        c = self._client()
+        self._req(c, "POST", "/api/auth/login",
+                  {"username": "admin", "password": "demo"})
+        fixture = self._identical_rows_fixture_http(c, "drop")
+        reviewed = self._http_draft(c, fixture, 60)
+        zero = self._http_draft(c, fixture, 0)
+        self.assertEqual(len(reviewed["draft_games"]), 1, repr(reviewed))
+        self.assertEqual(reviewed["draft_games"], zero["draft_games"])
+        self.assertNotEqual(reviewed["draft_fingerprint"],
+                            zero["draft_fingerprint"])
+        status, body = self._req(c, "POST", "/api/scheduler/commit", {
+            "division_id": fixture["division_id"],
+            "constraints": {"min_turnaround_minutes": 0},
+            "draft_fingerprint": reviewed["draft_fingerprint"]})
+        self.assertEqual(body.get("error", {}).get("details", {}).get("reason"),
+                         "preview_stale", repr(body))
+        # Zero Games: the pairing is still proposable, not committed.
+        again = self._http_draft(c, fixture, 60)
+        self.assertEqual(len(again["draft_games"]), 1, repr(again))
+        self.assertEqual(again["already_scheduled"], [], repr(again))
+
+    def test_http_a_race_into_the_reviewed_gap_cannot_be_committed_with_zero(self):
+        """(b) over real HTTP — the actual exploit. A non-overlapping
+        same-team EXHIBITION lands inside the reviewed gap, and the commit
+        drops the turnaround to 0, which would skip the commit-time check
+        entirely. The rows stay identical, so only the bound parameter
+        refuses."""
+        c = self._client()
+        self._req(c, "POST", "/api/auth/login",
+                  {"username": "admin", "password": "demo"})
+        fixture = self._identical_rows_fixture_http(c, "race")
+        reviewed = self._http_draft(c, fixture, 60)
+        self.assertEqual(len(reviewed["draft_games"]), 1, repr(reviewed))
+
+        status, race_slot = self._req(c, "POST", "/api/setup/ice-slot", {
+            "rink_id": fixture["rink_id"],
+            "start_time": DAY.replace(hour=17).isoformat(),
+            "end_time": DAY.replace(hour=17, minute=30).isoformat(),
+            "slot_type": "game"})
+        self.assertEqual(status, 200, repr(race_slot))
+        status, race_game = self._req(c, "POST", "/api/v2/setup/game", {
+            "season_id": fixture["season_id"],
+            "division_id": fixture["division_id"],
+            "home_team_id": fixture["team_ids"][0],
+            "away_team_id": fixture["team_ids"][1],
+            "ice_slot_id": race_slot["id"], "game_type": "exhibition"})
+        self.assertEqual(status, 200, repr(race_game))
+
+        after = self._http_draft(c, fixture, 0)
+        self.assertEqual(reviewed["draft_games"], after["draft_games"],
+                         "the race must leave the rows identical, or this "
+                         "test proves nothing about the bound parameter")
+        status, body = self._req(c, "POST", "/api/scheduler/commit", {
+            "division_id": fixture["division_id"],
+            "constraints": {"min_turnaround_minutes": 0},
+            "draft_fingerprint": reviewed["draft_fingerprint"]})
+        self.assertEqual(body.get("error", {}).get("details", {}).get("reason"),
+                         "preview_stale", repr(body))
+        again = self._http_draft(c, fixture, 60)
+        self.assertEqual(again["already_scheduled"], [], repr(again))
 
     def test_http_commit_round_trip_with_a_turnaround(self):
         """Generate then Commit carrying the SAME constraints — the shape
