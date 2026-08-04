@@ -481,7 +481,35 @@ def _apply_migration(conn, dialect, version, statements) -> None:
         # which is sound there because the demo reset re-migrates emptied tables.)
         conn.execute("PRAGMA foreign_keys = OFF")
         try:
-            conn.execute("BEGIN")
+            # IMMEDIATE for the same reason transaction() uses it (#392): take
+            # the write lock at BEGIN so no statement inside ever has to
+            # promote SHARED->RESERVED, the one acquisition SQLite refuses to
+            # run the busy handler for.
+            #
+            # This was very nearly left as a plain BEGIN on the argument that a
+            # migration's first statement is a write anyway. That argument was
+            # FALSE — migrations 040, 041 and 042 all open with
+            # `PRAGMA defer_foreign_keys = ON` — and, worse, it was the wrong
+            # test. What decides the promotion is whether the first statement
+            # takes a READ LOCK, not whether it is a write, and the two are not
+            # the same question. Measured on one file with a 5000ms
+            # busy_timeout, against a holder of RESERVED:
+            #
+            #   BEGIN; <no statement>; UPDATE    locked after 5.34s  honoured
+            #   BEGIN; PRAGMA defer_foreign_keys; UPDATE
+            #                                    locked after 5.39s  honoured
+            #   BEGIN; SELECT; UPDATE            locked after 0.000s BYPASSED
+            #   BEGIN; PRAGMA table_info; UPDATE locked after 0.000s BYPASSED
+            #   BEGIN IMMEDIATE; UPDATE          locked after 5.37s  honoured
+            #
+            # Two PRAGMAs, opposite answers, and nothing in either one's
+            # spelling says which. An invariant that subtle, enforced only by
+            # prose and re-checked by hand every time a migration is authored,
+            # is one `PRAGMA table_info` away from reproducing this exact bug.
+            # IMMEDIATE deletes the invariant instead of documenting it, and it
+            # is free: interleaved cold builds of the full migration set, 32
+            # samples each, median 34.90ms plain vs 35.00ms IMMEDIATE.
+            conn.execute("BEGIN IMMEDIATE")
             body()
             violations = conn.execute("PRAGMA foreign_key_check").fetchall()
             if violations:

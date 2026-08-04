@@ -5853,3 +5853,62 @@ class SqliteTransactionWriteLockTest(unittest.TestCase):
         self.assertEqual(
             self._rows(probe), [1, 3],
             "the write refused inside the transaction must not have landed")
+
+    def test_migration_holds_the_write_lock_before_its_first_statement(self):
+        """The migration path takes the lock at BEGIN too (#392 review).
+
+        It was very nearly left as a plain ``BEGIN``, justified by "a
+        migration's first statement is a write". That is false — 040, 041 and
+        042 all open with ``PRAGMA defer_foreign_keys = ON`` — and it is also
+        the wrong test: what decides the promotion is whether the first
+        statement takes a READ LOCK. ``PRAGMA defer_foreign_keys`` does not
+        (the handler is honoured), ``PRAGMA table_info`` does (it is
+        bypassed), and nothing in either spelling says which. So the invariant
+        is not documented here, it is DELETED — and this pins the deletion.
+
+        The probe fires from the migrating connection's ``cursor()``, which
+        ``_apply_migration`` calls after ``BEGIN`` and before the migration's
+        own first statement: exactly the instant in question. The statements
+        below deliberately OPEN WITH A READ, the shape that reproduced the
+        bug, so this also demonstrates that such a migration is now safe.
+        """
+        import sqlite3
+        from hockey_scheduler.store.db import Dialect
+        from hockey_scheduler.store.sql_store import _apply_migration
+
+        store, path = self._file_store()
+        probe = self._probe(path)
+        probe.execute(f"CREATE TABLE {self.PROBE_TABLE} (n INTEGER)")
+        self.assertIsNone(self._attempt_write(probe, 1),
+                          "anti-vacuity: the probe cannot write at all")
+
+        attempts = []
+        test = self
+
+        class _ProbingConnection(sqlite3.Connection):
+            def cursor(self, *a, **k):
+                attempts.append(test._attempt_write(probe, 2))
+                return super().cursor(*a, **k)
+
+        conn = sqlite3.connect(path, factory=_ProbingConnection)
+        conn.isolation_level = None
+        self.addCleanup(conn.close)
+        _apply_migration(
+            conn, Dialect("qmark", "sqlite"), 9992,
+            ["PRAGMA table_info(schema_migrations)",
+             f"CREATE TABLE {self.PROBE_TABLE}_mig (n INTEGER)"])
+
+        self.assertEqual(len(attempts), 1,
+                         "the probe never fired inside the migration")
+        self.assertIsNotNone(
+            attempts[0],
+            "a second connection COMMITTED a write between the migration's "
+            "BEGIN and its first statement — the migration does not hold the "
+            "write lock at BEGIN, so a migration opening with a read (a "
+            "SELECT, or PRAGMA table_info) would promote SHARED->RESERVED at "
+            "its next write with the busy handler bypassed")
+        self.assertIn("database is locked", str(attempts[0]).lower(),
+                      f"refused for the wrong reason: {attempts[0]!r}")
+        self.assertIsNone(self._attempt_write(probe, 3),
+                          "the lock was never released after the migration")
+        self.assertEqual(self._rows(probe), [1, 3])
