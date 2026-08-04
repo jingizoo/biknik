@@ -568,8 +568,10 @@ class SqlStore:
         one SERIALIZABLE transaction around an authorization computation that
         itself asks for SERIALIZABLE (the context selector) and REPEATABLE READ
         (the target chain walk), and both are already guaranteed by the outer
-        one. On SQLite it is a no-op: the process-wide lock already serializes
-        writers.
+        one. On SQLite it is a no-op: ``self._lock`` serializes every
+        transaction taken through THIS store, and the ``BEGIN IMMEDIATE``
+        below serializes this connection against any other one on the same
+        file — together that is already strictly stronger than SERIALIZABLE.
         """
         if isolation is not None and isolation not in _ISOLATION_LEVELS:
             raise ValueError(f"unsupported isolation level: {isolation!r}")
@@ -602,7 +604,37 @@ class SqlStore:
                             yield
                     else:  # sqlite (autocommit) — explicit txn (isolation no-op)
                         try:
-                            self.conn.execute("BEGIN")
+                            # IMMEDIATE, not DEFERRED: take the database's
+                            # write lock as this transaction's FIRST statement.
+                            #
+                            # SQLite has no row locks, so `_lock_setup_row` is
+                            # a no-op read here and the file's write lock is
+                            # the only analogue there is. Under a plain BEGIN
+                            # the unit therefore held nothing but a SHARED read
+                            # lock all the way through its authorization phase
+                            # and only reached for the write lock at its first
+                            # UPDATE — a SHARED->RESERVED promotion. That is
+                            # the one acquisition SQLite deliberately refuses
+                            # to run the busy handler for: promoting while
+                            # another connection already holds RESERVED is a
+                            # potential deadlock, so it returns SQLITE_BUSY
+                            # *immediately* and the connection's 5s
+                            # busy_timeout never applies. The write failed
+                            # instantly with "database is locked", which the
+                            # translator turns into the retryable
+                            # lock_not_available conflict — a guarded mutation
+                            # losing a lock it was authorized to take, with no
+                            # wait attempted at all.
+                            #
+                            # Acquiring at BEGIN fixes the cause rather than
+                            # the symptom: the unit holds the write lock across
+                            # authorize -> mutate -> commit (which is what
+                            # makes the SQLite no-op row lock sound), no
+                            # statement inside it ever has to promote, and a
+                            # genuinely contended writer now blocks in the busy
+                            # handler at BEGIN — where SQLite *does* honour the
+                            # timeout — instead of failing on contact.
+                            self.conn.execute("BEGIN IMMEDIATE")
                             yield
                             self.conn.commit()
                         except Exception:

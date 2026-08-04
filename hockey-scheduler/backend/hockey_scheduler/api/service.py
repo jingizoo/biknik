@@ -1497,7 +1497,14 @@ class ApiService:
     def _lock_setup_row(self, kind, record_id):
         """Take the write lock on one setup row (a no-op read on Memory/SQLite,
         ``SELECT ... FOR UPDATE`` on PostgreSQL). An unknown kind locks nothing
-        — it cannot be authorized either, so the decision still fails closed."""
+        — it cannot be authorized either, so the decision still fails closed.
+
+        The no-op is only sound because those two backends hold something
+        strictly coarser for the whole unit: Memory holds the process-wide
+        store lock, and SQLite's ``transaction()`` opens ``BEGIN IMMEDIATE``,
+        so the database's write lock is already held before this runs. Neither
+        has row locks to take, and on SQLite a DEFERRED begin would leave the
+        unit holding only a read lock — see ``SqlStore.transaction``."""
         getter = self._SETUP_TARGET_LOCKS.get(kind)
         if getter is not None:
             getattr(self.store, getter)(record_id)
