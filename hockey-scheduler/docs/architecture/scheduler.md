@@ -58,9 +58,81 @@ earliest still-free candidate slot that satisfies every constraint
 the #373 team-occupancy check); a pairing with no satisfying slot is
 reported in `unscheduled[]` with structured `reason_codes`
 (`season_blackout`, `holiday`, `team_blackout`, `rink_blackout`,
-`max_per_day`, `min_rest`, `no_ice_available`, `turnover_buffer_conflict`,
-`insufficient_playable_time`, `curfew_violation`, `team_overlap`), and
-`unschedulable_teams[]` rolls up any team whose *every* pairing failed.
+`max_per_day`, `min_rest`, `min_turnaround`, `no_ice_available`,
+`turnover_buffer_conflict`, `insufficient_playable_time`,
+`curfew_violation`, `team_overlap`), and `unschedulable_teams[]` rolls up
+any team whose *every* pairing failed.
+
+## Turnaround from the previous game's end (#390)
+
+`min_turnaround_minutes` is the configurable ice-free interval a team must
+get between two of its games. It is a SECOND constraint alongside
+`min_rest_hours`, not a redefinition of it: `min_rest_hours` is a
+start-to-start rest window (#85) and every caller that sets it means
+exactly that, while a rink turnaround is a resurfacing-and-changeover
+interval that hours cannot express and that is measured from a different
+edge.
+
+Before #390 a 14:00-15:30 game followed by a 15:30 game was accepted, and
+three defects compounded so that none was visible alone:
+
+1. the Generate screen sent no rest value at all, so the backend's field
+   defaulted to zero;
+2. the calculation compared game START times, so one configured hour of
+   rest reported ninety minutes for a pairing with zero minutes of actual
+   ice-free time; and
+3. it consulted only this batch's own picks, never the games already on
+   the ice.
+
+One predicate, `scheduler.turnaround_conflicts`, is the whole rule. It
+reads the same `{team_id: [(start, end, game_id_or_None)]}` occupancy map
+#373 built — persisted games from `_persisted_team_spans` PLUS every
+candidate this batch has already accepted — so enforcement against
+committed games and against same-batch proposals falls out of one lookup
+rather than two code paths. The gap is measured edge to edge, and it is
+UNDIRECTED: occupancy is not ordered relative to the candidate, so a
+candidate ending moments before an already-booked game begins is refused
+just as one starting moments after another ends. Overlapping windows
+yield no gap at all — an overlap is a physical impossibility already
+refused, and far better diagnosed, by `team_overlap`.
+
+Zero (the default, and every pre-#390 caller) returns no conflicts without
+reading occupancy at all, so the historical proposal — `draft_fingerprint`
+included — is byte-identical.
+
+`draft_season_schedule` echoes the normalized `min_turnaround_minutes`
+back on the proposal, exactly as it echoes `meetings_per_opponent`, so the
+Scheduler UI sends the value the PREVIEW was generated with at Commit
+rather than whatever the live control currently reads.
+
+### The identical check at commit
+
+`ApiService._commit_turnaround_state` / `_assert_commit_turnaround` /
+`_record_commit_turnaround` live once on the base facade and are INHERITED
+by the league-scoped override, which reimplements the commit body but not
+this rule. `_assert_commit_turnaround` calls
+`scheduler.turnaround_conflicts` — literally the function the preview
+calls — over an occupancy snapshot taken under the locks already held and
+grown row by row as the batch is written, mirroring `_assign_ice`. #382
+shipped a commit guard that asked a different question from the preview
+and refused legitimate commits for a month; one predicate is the
+structural fix for that class of defect, and the mutation that makes the
+commit gate one notch stricter than the preview is caught by four separate
+acceptance controls.
+
+It runs AFTER `_assert_slot_free_for_game` (so every physical reason that
+gate already reports still wins) and BEFORE the Game id is minted (so a
+refusal consumes no counter). It raises `ScheduleConflictError` with
+`details.reason = "min_turnaround"`, not `ConcurrencyConflictError`, so
+the commit retry shell — which retries `placement_raced` alone — delivers
+it terminally. Raised inside the transaction, so a refused commit leaves
+zero Game, slot, counter or audit trace.
+
+The wide `draft_fingerprint` gate remains the first line of defence and
+classifies most drift as `preview_stale`; this is the same
+defense-in-depth shape the `pairing_already_scheduled` and
+`_assert_slot_free_for_game` per-row gates already have, for the same
+reason.
 
 ## Team occupancy in the preview (#373)
 
