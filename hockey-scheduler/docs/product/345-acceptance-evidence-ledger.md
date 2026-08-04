@@ -20,17 +20,19 @@ this document merges — the ledger records the gap, it does not fill it.
 accurate for the stated `main` SHA and UTC timestamp below, and for nothing
 else.
 
-- **Snapshot taken**: `2026-08-04T13:05Z`. Every SHA, PR state, issue state,
+- **Snapshot taken**: `2026-08-04T12:23Z` — **read from the system clock, not composed.**
+  See §3.11: Rounds 5 and 6 both stated a time that had not yet happened.
+  Every SHA, PR state, issue state,
   CI result, repository path, symbol, and test/journey name below was
   re-verified against the merged tree at that time — by reading the files at
   the recorded SHA and by querying live GitHub state — not carried over from
   an earlier revision of this document.
 - **Inspected base**: `main` at
-  `57cd84dcafc231de697cd5cff7ea2059c70dd6e9` (merge of PR #392), which is
-  `main`'s **tip** at snapshot time.
+  `36195faa` (merge of PR #394), which is `main`'s **tip** at snapshot time.
 - **`main` CI at that SHA: GREEN.** Workflow run
-  [30889038050](https://github.com/jingizoo/biknik/actions/runs/30889038050)
-  ("Hockey Scheduler Backend CI", push to `main`), **completed `success`**,
+  [30907548648](https://github.com/jingizoo/biknik/actions/runs/30907548648)
+  ("Hockey Scheduler Backend CI", push to `main`), started
+  `2026-08-04T12:05:12Z`, **completed `success` at `2026-08-04T12:19:07Z`**,
   all nine jobs green: `changes`, `classifier-test`, `frontend-check`,
   `test` (Memory/SQLite), `postgres`, and all four `browser-smoke` shards.
 
@@ -51,13 +53,19 @@ later merge readiness.** This document is a reading of the repository at one
 instant. If any of the following occur after this snapshot, its status values
 become stale and must not be relied on:
 
-- New #345 work is opened, merged, reverted, or force-pushed — **including PR
-  #394, which is open at this snapshot and changes a surface this document
-  cites** (see §3.1).
-- The tracked open issues listed in §4 advance or are closed.
+- New #345 work is opened, merged, reverted, or force-pushed.
+- **#357 advances** — the only open #345 child.
 - #345's nine acceptance boxes are edited.
 - Any cited merge commit is reverted.
-- `main` moves past `57cd84dc`.
+- `main` moves past `36195faa` **in a way that touches a cited file**.
+
+**Deliberately NOT staleness triggers**, corrected this round: activity on
+#393, #376, #206 or #287. Round 6 listed "the tracked open issues in §4" as a
+blanket trigger, which swept in four items that are **not #345 work** — a
+scheduling epic, a playoff-bracket child, a substitute-engine epic and a
+Schedule/Facilities journey sequenced *after* #345. None of them can change
+whether a #345 acceptance box has evidence, and treating their activity as
+invalidating made this document look stale far more often than it was.
 
 Every one of #345's nine acceptance boxes is currently **unchecked on the
 issue itself** (verified at snapshot time: nine `- [ ]` entries, none `[x]`).
@@ -74,9 +82,10 @@ Exactly four values are used. No others.
   journey name that resolves in that tree, plus the merge PR and commit)
   covers the *entire* criterion, not a subset of it.
 - **`Pending active PR`** — real evidence exists, cited at an exact head SHA,
-  but has not merged. **Non-authoritative** for #345's merge gate. *(This
-  value is in use again this round: PR #394 addresses the §3.1 defect and is
-  open, not merged. It is cited as pending and nothing above rests on it.)*
+  but has not merged. **Non-authoritative** for #345's merge gate. *(No
+  criterion carries this value at this snapshot. Round 6 used it for PR #394,
+  which has since merged as `36195faa`; the value is retained because it is
+  part of the required vocabulary.)*
 - **`Missing`** — no implementation and no pending PR addresses it.
 - **`Human-only / unperformed`** — the *procedure* to produce this evidence
   may be merged, but the evidence itself can only come from an actual human
@@ -120,13 +129,16 @@ calling them merge commits. Both resolve; they are not the same object.
 | [#371](https://github.com/jingizoo/biknik/pull/371) | #367 prereq | Scope setup hierarchy; refuse cross-Program Team writes | `a4d48507ec01036d9e9c6cd135859624327f1af0` | `9de4439629075a1ed49fd9f9c0c49683d98f821d` | 2026-07-29T18:58:10Z |
 | [#372](https://github.com/jingizoo/biknik/pull/372) | #369 prereq | Centralize target-record authorization for setup mutations | `e0dd8bdd6fdde2723f8575a5d7f540ede5a7bd2e` | `f170e1a985c4f0974bc17f77d620d7c5db5567a8` | 2026-07-31T04:39:48Z |
 | [#377](https://github.com/jingizoo/biknik/pull/377) | #365 | Home and Setup per-card state matrix (model + browser matrix) | `c2666b8b4defd00d78bd6c3a8970e49f5849e652` | `71bad79fc991b49a8136ef98eef14a493b4fa78b` | 2026-08-02T11:38:30Z |
+| [#394](https://github.com/jingizoo/biknik/pull/394) | #345 | Context caption truth; K5/S5 protocol correction; cross-view regression | `26f9d679c87b6c8c2cc9251d8f35108a714f621e` | `36195faa` | 2026-08-04T12:05:09Z |
 
-**No #345 work has merged since Round 4's base (`71bad79f`).** Nine PRs merged
-between then and this snapshot — #382, #384, #385, #381, #388, #380, #389,
-#391 and #392 — and **all nine are #206/#375/#379/#387/#390 scheduling work or
-the #392 lock fix, not #345.** They are named only so a reader can see why
-every `app.js` and `service.py` line number moved without any acceptance
-status changing. None is cited as evidence for any box.
+**One #345 PR has merged since Round 4's base (`71bad79f`): #394**, this
+round's only acceptance-relevant change, and the first #345 work to merge
+since #377. Nine other PRs merged in the same window — #382, #384, #385,
+#381, #388, #380, #389, #391 and #392 — and **all nine are #206/#375/#379/#387/#390
+scheduling work or the #392 SQLite lock fix, not #345.** They are named only
+so a reader can see why every `app.js` and `service.py` line number moved
+without any acceptance status changing. None of the nine is cited as evidence
+for any box.
 
 **Other sources read in full for this refresh**: issue
 [#345](https://github.com/jingizoo/biknik/issues/345) (body and checklist),
@@ -135,7 +147,7 @@ status changing. None is cited as evidence for any box.
 `docs/product/manual-keyboard-screenreader-validation-protocol.md`,
 `docs/architecture/active-context-scoping.md`,
 `.github/workflows/hockey-scheduler-ci.yml`, `hockey-scheduler/e2e/package.json`,
-every `hockey-scheduler/e2e/*.js` file (63 of them, enumerated
+every `hockey-scheduler/e2e/*.js` file (64 of them, enumerated
 programmatically — see §3.8), and the merged trees of every PR above.
 
 ---
@@ -150,7 +162,7 @@ so a future line shift does not invalidate the citation.
 | | |
 | --- | --- |
 | Required boundary/evidence | Home/Tasks landing computes the next incomplete workflow without the operator reading raw entity data, exposes exactly one primary action, and that action opens the correct destination directly (not merely the Setup tab). |
-| Evidence merged to `main` | `renderSetupProgressCard()` (`backend/hockey_scheduler/web/static/app.js:1476`) emits a single `data-setup-progress-action` primary button (emitted `app.js:1683,1712`; wired `app.js:1798`) naming the real next-incomplete workflow in operator vocabulary. `goToSetupWorkflow(key)` (`app.js:1859`) deep-links that one click into the correct destination for all six keys, using `contextSeededDrawerValues()` (`app.js:1964`) for the context-seeded create drawers and `focusParticipationRegisterControl()` (`app.js:2423`) for the Register-Team control. Backend: `ApiService.get_setup_progress()` (`backend/hockey_scheduler/api/service.py:1563`), regression `backend/tests/test_setup_progress.py` (48 tests). Browser: `e2e/home-tasks-hub.js` (PR #331, merge `16fe833`), asserting the deep-link lands on the real control — not just the tab — for each key, at desktop and 390×844. Extended by `e2e/home-tasks-state-matrix.js` (PR #377, merge `71bad79f`), whose leg 2a proves the authorized primary action **by using it**, and leg 2c proves the unauthorized role cannot. |
+| Evidence merged to `main` | `renderSetupProgressCard()` (`backend/hockey_scheduler/web/static/app.js:1485`) emits a single `data-setup-progress-action` primary button (emitted `app.js:1692,1721`; wired `app.js:1807`) naming the real next-incomplete workflow in operator vocabulary. `goToSetupWorkflow(key)` (`app.js:1868`) deep-links that one click into the correct destination for all six keys, using `contextSeededDrawerValues()` (`app.js:1975`) for the context-seeded create drawers and `focusParticipationRegisterControl()` (`app.js:2435`) for the Register-Team control. Backend: `ApiService.get_setup_progress()` (`backend/hockey_scheduler/api/service.py:1563`), regression `backend/tests/test_setup_progress.py` (48 tests). Browser: `e2e/home-tasks-hub.js` (PR #331, merge `16fe833`), asserting the deep-link lands on the real control — not just the tab — for each key, at desktop and 390×844. Extended by `e2e/home-tasks-state-matrix.js` (PR #377, merge `71bad79f`), whose leg 2a proves the authorized primary action **by using it**, and leg 2c proves the unauthorized role cannot. |
 | Remaining gap | None identified for the literal criterion text. |
 | **Status** | **`Verified on main`** |
 
@@ -159,7 +171,7 @@ so a future line shift does not invalidate the citation.
 | | |
 | --- | --- |
 | Required boundary/evidence | A hub index listing all six #204-named workflows, each with its own summary-first landing; Workflow 6 ("Imports and onboarding") carries a third status distinct from done/todo, never `next`, never blocking. |
-| Evidence merged to `main` | `SETUP_WORKFLOWS` (`app.js:4637`) declares exactly six entries — `league_season` (4638), `teams` (4652), `participation` (4667), `roster` (4718), `facilities` (4749), `import` (4831, carrying `optional: true`). `renderSetupHub()` (`app.js:6297`) renders the six-card index; `renderSetupWorkflowLanding()` (`app.js:6503`) renders one summary-first landing per workflow; both share one body renderer, `setupCardBodyHtml()` (`app.js:5528`), via `setupCardSlotHtml()` (`app.js:5662`). The pre-existing Records/Hierarchy sub-views remain reachable through `renderSetup()` (`app.js:6534`) and `setupCard()` (`app.js:6557`), so no previously-reachable screen became unreachable. Browser: `e2e/setup-workflow-hub.js` (PR #347, merge `f0b2caf4`; extended by PR #377). Workflow 6's optional contract is asserted end to end by `legOptionalCannotFail()` (`e2e/setup-state-matrix.js:1383`), which forces the setup overview, the player list **and** the progress read all to 500 at once and requires `import` to stay READY, reachable and optional; and by `assertWorkflowSixInvariants()` (`e2e/setup-state-matrix.js:1331`). |
+| Evidence merged to `main` | `SETUP_WORKFLOWS` (`app.js:4655`) declares exactly six entries — `league_season` (4656), `teams` (4670), `participation` (4685), `roster` (4736), `facilities` (4767), `import` (4849, carrying `optional: true`). `renderSetupHub()` (`app.js:6315`) renders the six-card index; `renderSetupWorkflowLanding()` (`app.js:6521`) renders one summary-first landing per workflow; both share one body renderer, `setupCardBodyHtml()` (`app.js:5546`), via `setupCardSlotHtml()` (`app.js:5680`). The pre-existing Records/Hierarchy sub-views remain reachable through `renderSetup()` (`app.js:6552`) and `setupCard()` (`app.js:6575`), so no previously-reachable screen became unreachable. Browser: `e2e/setup-workflow-hub.js` (PR #347, merge `f0b2caf4`; extended by PR #377). Workflow 6's optional contract is asserted end to end by `legOptionalCannotFail()` (`e2e/setup-state-matrix.js:1383`), which forces the setup overview, the player list **and** the progress read all to 500 at once and requires `import` to stay READY, reachable and optional; and by `assertWorkflowSixInvariants()` (`e2e/setup-state-matrix.js:1331`). |
 | Remaining gap | None identified for the literal criterion text. |
 | **Status** | **`Verified on main`** |
 
@@ -168,7 +180,7 @@ so a future line shift does not invalidate the citation.
 | | |
 | --- | --- |
 | Required boundary/evidence | The approved seven-area IA (Home/Tasks, Schedule, Teams & People, Facilities, Communications, Reports, Administration — `operator-ux-requirements.md` §2) replaces the five prior nav groups, with every previously reachable destination mapped into the new IA. |
-| Evidence merged to `main` | **PR #361 (issue #358), merge `768ce2a084cd352e7fabe3a3e36423da4e0d4760`.** `index.html` carries exactly seven `nav-group-label` elements, in the approved order and names: Home/Tasks (`index.html:68`, `data-nav-area="home_tasks"` at `:67`), Schedule (`:76`), Teams & People (`:85`), Facilities (`:89`), Communications (`:103`), Reports (`:108`), Administration (`:112`). The five prior groups are gone. `e2e/seven-area-navigation.js` (801 lines) drives the **real** production navigation and asserts, at desktop and 390×844: (1) **inventory in both directions** — every key in the production `NAV` map (`app.js:244`) appears exactly once in the rendered nav, and every rendered destination is a real `NAV` key, so a screen can neither be dropped from the IA nor invented by it; (2) **uniqueness**; (3) **identity** — activating each destination opens the same view, asserted against `document.body.dataset.view` rather than the clicked label; (4) **role parity** for all seven roles, with at least one forbidden destination per restricted role proven hidden *and* non-functional on direct navigation; (5) **keyboard** — a real Tab walk reaches every authorized destination; (6) **deep links**; (7) **no horizontal overflow or clipped destination at 390×844**. Registered in CI browser-smoke shard 1 (`.github/workflows/hockey-scheduler-ci.yml:261`). |
+| Evidence merged to `main` | **PR #361 (issue #358), merge `768ce2a084cd352e7fabe3a3e36423da4e0d4760`.** `index.html` carries exactly seven `nav-group-label` elements, in the approved order and names: Home/Tasks (`index.html:68`, `data-nav-area="home_tasks"` at `:67`), Schedule (`:76`), Teams & People (`:85`), Facilities (`:89`), Communications (`:103`), Reports (`:108`), Administration (`:112`). The five prior groups are gone. `e2e/seven-area-navigation.js` (801 lines) drives the **real** production navigation and asserts, at desktop and 390×844: (1) **inventory in both directions** — every key in the production `NAV` map (`app.js:253`) appears exactly once in the rendered nav, and every rendered destination is a real `NAV` key, so a screen can neither be dropped from the IA nor invented by it; (2) **uniqueness**; (3) **identity** — activating each destination opens the same view, asserted against `document.body.dataset.view` rather than the clicked label; (4) **role parity** for all seven roles, with at least one forbidden destination per restricted role proven hidden *and* non-functional on direct navigation; (5) **keyboard** — a real Tab walk reaches every authorized destination; (6) **deep links**; (7) **no horizontal overflow or clipped destination at 390×844**. Registered in CI browser-smoke shard 1 (`.github/workflows/hockey-scheduler-ci.yml:262`). |
 | Remaining gap | None identified. Assertion (1) is precisely the "nothing became unreachable" proof this box asks for, enforced in CI rather than asserted in prose. |
 | **Status** | **`Verified on main`** |
 
@@ -177,16 +189,16 @@ so a future line shift does not invalidate the citation.
 | | |
 | --- | --- |
 | Required boundary/evidence | League is promoted into the persistent Program/Season context bar while Division stays screen-local; every changed screen filters by the selected context or documents a narrow, approved exception; the permanent "display only · screens not filtered" caption is removed or narrowed. |
-| Evidence merged to `main` | **Four merged slices.**<br><br>**(1) Backend foundation — PR #356, merge `9447bb69`.** `ActiveContext.league_id`, `exact_league_season_or_conflict()`, `authorized_league_ids()`, and `resolve_with_league` / `options_with_league` / `set_with_league` on `ContextService`. Regression: `backend/tests/test_active_context_league.py`.<br><br>**(2) Authenticated HTTP transport — PR #363 (issue #360), merge `79baac59`.** Regression: `backend/tests/test_context_league_http.py`.<br><br>**(3) Persistent context-bar UI — PR #366 (issue #364), merge `6a486b70`.** `#ctx-league-select` (`index.html:172`) beside the pre-existing `#ctx-select` (`index.html:170`) inside `#context-switcher` (`index.html:168`). **Division is not an axis in the context bar**, so Division remains screen-local as required. Browser: `e2e/league-context-bar.js` (1,293 lines). Backend: `test_league_context_canonical.py`, `test_league_context_http.py`, `test_league_context_races.py`.<br><br>**(4) Changed-screen filtering — PR #369 (issue #367), merge `802caa06`** (prerequisites #371 `9de44396`, #372 `f170e1a9`). `get_setup_progress` (`service.py:1563`), `get_demo_overview` (`service.py:7020`), `get_standings` (`service.py:4548`) and `get_setup_overview_v2` (`service.py:7853`) all resolve the persisted tuple through `ContextService.resolve_with_league()`. Facade regression: `test_league_filtered_setup_progress.py`, `test_league_filtered_dashboard.py`, `test_league_filtered_standings.py`, `test_league_filtered_overview_v2.py`. HTTP regression for the roster read: `test_players_http_scope.py`. Browser: `e2e/league-filtered-data.js`. **The named exceptions are documented**: `docs/architecture/active-context-scoping.md` carries a per-surface rules table (line 38) and an explicit "Venues have no League axis" section (line 1191) recording that `Venue.league_id` is legacy vocabulary storing a *Program* id.<br><br>**(5) Caption narrowed.** PR #366 replaced the permanent `display only · screens not filtered` caption with a narrowed one (`index.html:176`). **That narrowed text is itself false — see §3.1, which is corrected this round and is more serious than Round 5 recorded.** |
-| Remaining gap | The criterion's own requirement — caption "removed or narrowed" — was met by #366, and every changed screen does filter. But the replacement copy is **wholly false**, not partly: all three screens it names are filtered (§3.1). PR [#394](https://github.com/jingizoo/biknik/pull/394) is open and addresses it; it has not merged, so it is `Pending active PR` and nothing here rests on it. |
-| **Status** | **`Verified on main`** for the criterion's literal requirements. **Flagged as the status call most open to disagreement this round**: a reviewer who reads "context filters changed screens correctly" as including *telling the operator the truth about it* would mark this `Missing` until #394 lands. Recorded so that disagreement is available rather than buried. |
+| Evidence merged to `main` | **Four merged slices.**<br><br>**(1) Backend foundation — PR #356, merge `9447bb69`.** `ActiveContext.league_id`, `exact_league_season_or_conflict()`, `authorized_league_ids()`, and `resolve_with_league` / `options_with_league` / `set_with_league` on `ContextService`. Regression: `backend/tests/test_active_context_league.py`.<br><br>**(2) Authenticated HTTP transport — PR #363 (issue #360), merge `79baac59`.** Regression: `backend/tests/test_context_league_http.py`.<br><br>**(3) Persistent context-bar UI — PR #366 (issue #364), merge `6a486b70`.** `#ctx-league-select` (`index.html:194`) beside the pre-existing `#ctx-select` (`index.html:191`) inside `#context-switcher` (`index.html:189`). **Division is not an axis in the context bar**, so Division remains screen-local as required. Browser: `e2e/league-context-bar.js` (1,293 lines). Backend: `test_league_context_canonical.py`, `test_league_context_http.py`, `test_league_context_races.py`.<br><br>**(4) Changed-screen filtering — PR #369 (issue #367), merge `802caa06`** (prerequisites #371 `9de44396`, #372 `f170e1a9`). `get_setup_progress` (`service.py:1563`), `get_demo_overview` (`service.py:7020`), `get_standings` (`service.py:4548`) and `get_setup_overview_v2` (`service.py:7853`) all resolve the persisted tuple through `ContextService.resolve_with_league()`. Facade regression: `test_league_filtered_setup_progress.py`, `test_league_filtered_dashboard.py`, `test_league_filtered_standings.py`, `test_league_filtered_overview_v2.py`. HTTP regression for the roster read: `test_players_http_scope.py`. Browser: `e2e/league-filtered-data.js`. **The named exceptions are documented**: `docs/architecture/active-context-scoping.md` carries a per-surface rules table (line 38) and an explicit "Venues have no League axis" section (line 1191) recording that `Venue.league_id` is legacy vocabulary storing a *Program* id.<br><br>**(5) Caption — now true, after two false revisions.** PR #366 replaced the permanent `display only · screens not filtered` caption with a narrowed enumeration, which was **itself false**. **PR #394 (merge `36195faa`) replaced it with capability wording**: `index.html:199` now reads *"Switching this changes what you see"*, wired as `aria-describedby` on **both** selects (`index.html:192`, `:195`) — so a keyboard user hears it at all, which the previous static topbar text never achieved in browse mode. See §3.1, now **resolved**. |
+| Remaining gap | **None outstanding.** The criterion's requirement — caption "removed or narrowed" — was met by #366; every changed screen filters; and the false replacement copy that Round 6 flagged is fixed on `main` by #394. The Round 6 caveat ("a reviewer who reads this as including *telling the operator the truth about it* would mark it `Missing`") no longer bites: under either reading, this criterion now has evidence. |
+| **Status** | **`Verified on main`** |
 
 ### Criterion 5 — "Loading, empty, stale, error, retry, confirmation, optional, and complete states match the approved matrix."
 
 | | |
 | --- | --- |
 | Required boundary/evidence | Per `operator-ux-requirements.md` §5, the full states matrix applies to Home/Tasks **and each of the six Setup workflows**, at desktop and 390×844, including keyboard activation and exact focus after retry, confirmation and completion. |
-| Evidence merged to `main` | **PR #377 (issue #365), merge `71bad79fc991b49a8136ef98eef14a493b4fa78b`.**<br><br>**The state model.** `CARD_STATE` (`app.js:633`) — `loading \| ready \| empty \| stale \| error \| confirm \| pending \| success`; `CARD_STATUS` (`app.js:651`) — `done \| todo \| optional \| unknown`, backend-owned; `CARD_READ` (`app.js:666`). Card identity is workflow/card id + exact `(program, season, league)` tuple + request generation, enforced by `cardIdentityCurrent()` (`app.js:1089`) and `cardTupleCurrent()` (`app.js:1123`), with `beginCardRequest()` (`app.js:1031`), `commitCardState()` (`app.js:1135`) and `readCardState()` (`app.js:1191`). Setup-side: `buildSetupWorkflowCardModel()` (`app.js:5291`), `setupHubRollup()` (`app.js:5418`), `setupCardBodyHtml()` (`app.js:5528`), `retrySetupWorkflowCard()` (`app.js:5794`), `resolveSetupCardConfirm()` (`app.js:5913`), `SETUP_SEASON_REOPEN_ACTION` (`app.js:5071`). Backend prerequisite authority: `_workflow_prerequisite_rows()` (`service.py:2124`).<br><br>**Home/Tasks EMPTY is a real rendered state.** The `!program_id` test lives in `buildTasksCardModel()` (`app.js:1367`), returning `CARD_STATE.EMPTY` with `reason: "no_program"` (`app.js:1383`) or `"nothing_actionable"` (`app.js:1411`); the renderer branches on the named reason at `app.js:1618`–`1641`, painting a heading and status sentence for both, and gating `Start Initial Setup` on `canBootstrap = hasPerm("manage_setup")` (`app.js:1619`).<br><br>**The browser matrix.** `e2e/home-tasks-state-matrix.js` (2,207 lines) and `e2e/setup-state-matrix.js` (2,722 lines), both at desktop and 390×844, both driving real production entry points with the *transport* forced by route interception. Supporting journeys: `e2e/setup-card-write-identity.js` (4,628 lines), `e2e/setup-prerequisite-floors.js` (748 lines). Backend: `test_setup_progress.py` grew by 607 lines. **All six journey files remain byte-identical at `57cd84dc` to their state at `71bad79f`** (verified by diff), so every leg line number in §2 resolves unchanged.<br><br>**CI registration**: `setup-state-matrix` shard 1 (line 261), `home-tasks-state-matrix` shard 3 (line 265), `setup-prerequisite-floors` and `setup-card-write-identity` shard 4 (line 267). |
+| Evidence merged to `main` | **PR #377 (issue #365), merge `71bad79fc991b49a8136ef98eef14a493b4fa78b`.**<br><br>**The state model.** `CARD_STATE` (`app.js:642`) — `loading \| ready \| empty \| stale \| error \| confirm \| pending \| success`; `CARD_STATUS` (`app.js:660`) — `done \| todo \| optional \| unknown`, backend-owned; `CARD_READ` (`app.js:675`). Card identity is workflow/card id + exact `(program, season, league)` tuple + request generation, enforced by `cardIdentityCurrent()` (`app.js:1098`) and `cardTupleCurrent()` (`app.js:1132`), with `beginCardRequest()` (`app.js:1040`), `commitCardState()` (`app.js:1144`) and `readCardState()` (`app.js:1200`). Setup-side: `buildSetupWorkflowCardModel()` (`app.js:5309`), `setupHubRollup()` (`app.js:5436`), `setupCardBodyHtml()` (`app.js:5546`), `retrySetupWorkflowCard()` (`app.js:5812`), `resolveSetupCardConfirm()` (`app.js:5931`), `SETUP_SEASON_REOPEN_ACTION` (`app.js:5089`). Backend prerequisite authority: `_workflow_prerequisite_rows()` (`service.py:2124`).<br><br>**Home/Tasks EMPTY is a real rendered state.** The `!program_id` test lives in `buildTasksCardModel()` (`app.js:1376`), returning `CARD_STATE.EMPTY` with `reason: "no_program"` (`app.js:1392`) or `"nothing_actionable"` (`app.js:1420`); the renderer branches on the named reason at `app.js:1627`–`1650`, painting a heading and status sentence for both, and gating `Start Initial Setup` on `canBootstrap = hasPerm("manage_setup")` (`app.js:1628`).<br><br>**The browser matrix.** `e2e/home-tasks-state-matrix.js` (2,207 lines) and `e2e/setup-state-matrix.js` (2,722 lines), both at desktop and 390×844, both driving real production entry points with the *transport* forced by route interception. Supporting journeys: `e2e/setup-card-write-identity.js` (4,628 lines), `e2e/setup-prerequisite-floors.js` (748 lines). Backend: `test_setup_progress.py` grew by 607 lines. **All six journey files remain byte-identical at `57cd84dc` to their state at `71bad79f`** (verified by diff), so every leg line number in §2 resolves unchanged.<br><br>**CI registration**: `setup-state-matrix` shard 1 (line 262), `home-tasks-state-matrix` shard 3 (line 266), `setup-prerequisite-floors` and `setup-card-write-identity` shard 4 (line 268). |
 | Remaining gap | One bound, taken verbatim from the merged journey's own header (`e2e/setup-state-matrix.js:120`–`135`): Workflow 6's confirmation completes by navigating, so the live region is populated and emptied inside one task before paint. `legConfirmImport()` asserts the sentence was **written exactly once** and asserts nothing about whether it survived to be spoken. A bound on one announcement, not an unimplemented state. |
 | **Status** | **`Verified on main`** |
 
@@ -195,7 +207,7 @@ so a future line shift does not invalidate the citation.
 | | |
 | --- | --- |
 | Required boundary/evidence | All seven roles land on their correct destination, see the correct nav, reach their one authorized action, and cannot bypass authorization by direct navigation or a real HTTP mutation — Viewer specifically has zero enabled mutation action anywhere. |
-| Evidence merged to `main` | **PR #353, head `322a9594`, merge `8decc0c416da1b6c1899fc4fe215dd4e630feb34`.** `e2e/role-authorization-matrix.js` covers all seven roles with real authenticated sessions, bounded `Tab`/`Shift+Tab` traversal, unauthorized-absent checks, direct-navigation bypass probes, and real negative HTTP mutations with a per-response failure tracker. `assertForbiddenNoChange()` snapshots both the setup audit and per-game audit arrays, and was verified falsifiable by the reviewer before merge. Registered in shard 3 (`hockey-scheduler-ci.yml:265`).<br><br>**Independently reinforced** by `e2e/seven-area-navigation.js` (PR #361, merge `768ce2a0`), re-proving all seven roles' destination visibility in the new IA, with Viewer proven to have zero enabled mutation control anywhere it can reach. |
+| Evidence merged to `main` | **PR #353, head `322a9594`, merge `8decc0c416da1b6c1899fc4fe215dd4e630feb34`.** `e2e/role-authorization-matrix.js` covers all seven roles with real authenticated sessions, bounded `Tab`/`Shift+Tab` traversal, unauthorized-absent checks, direct-navigation bypass probes, and real negative HTTP mutations with a per-response failure tracker. `assertForbiddenNoChange()` snapshots both the setup audit and per-game audit arrays, and was verified falsifiable by the reviewer before merge. Registered in shard 3 (`hockey-scheduler-ci.yml:266`).<br><br>**Independently reinforced** by `e2e/seven-area-navigation.js` (PR #361, merge `768ce2a0`), re-proving all seven roles' destination visibility in the new IA, with Viewer proven to have zero enabled mutation control anywhere it can reach. |
 | Remaining gap | None identified. |
 | **Status** | **`Verified on main`** |
 
@@ -204,19 +216,19 @@ so a future line shift does not invalidate the citation.
 | Sub-item | Evidence merged to `main` | Sub-item stage |
 | --- | --- | --- |
 | Desktop + 390×844 | Standing convention across every merged browser journey (viewport pairs `1440×900` / `390×844`). Both #365 matrix journeys run both (`VIEWPORTS`, `e2e/setup-state-matrix.js:188`, `e2e/home-tasks-state-matrix.js:167`), as does `e2e/seven-area-navigation.js`. | **Merged** |
-| Breakpoint-boundary (480/720/880/1040) | **Merged.** PR #351 (`49d662a`) fixed `styles.css`'s two out-of-contract widths; **PR #354 (merge `d190a6f6`) closed the remaining two.** Re-verified at `57cd84dc`: every `@media` width feature across all four production stylesheets is one of 480/720/880/1040 (`styles.css` 402, 861, 965, 979, 1027, 1145, 1219; `web.css` 327, 331, 370; `onboarding.css` 315; `setup.css` 135) — the only other `@media` rules are `prefers-reduced-motion` (`web.css:30`) and `print` (`styles.css:403`). `e2e/breakpoint-contract.js` **discovers** the stylesheet set from every `<link rel="stylesheet">` in `index.html` and `setup.html`, so a newly linked stylesheet is under contract immediately. `e2e/breakpoint-boundaries.js` proves the **browser** collapses and restores one pixel each side of all four tokens using the real stylesheets and the real `<nav class="side-nav">`. Registered at `hockey-scheduler-ci.yml:221` (standalone) and shard 1 (line 261). | **Merged** |
-| Keyboard-only (manual pass) | `docs/product/manual-keyboard-screenreader-validation-protocol.md` (PR #350, merge `e8c7d96d`) — a **protocol and blank evidence template only**, whose own Status section states no validation has been performed under it. Re-verified at `57cd84dc`: no filled-in artifact exists under `docs/`. **See §3.9 — the protocol's own K5/S5 expectations are currently wrong, which blocks running this pass at all.** | **Human-only, unperformed — and currently blocked** |
-| Screen-reader (manual pass) | Same protocol, same disclaimer, same absence, same §3.9 block. `e2e/setup-state-matrix.js:136`–`139` states its own boundary: *"This journey drives a real browser with real keyboard events. It is NOT a screen-reader session and NOT a moderated human session."* | **Human-only, unperformed — and currently blocked** |
-| WCAG 2.2 AA — **automated repository accessibility** | **Merged.** `axe-core@^4.12.1` is a declared `devDependency` (`e2e/package.json:64`), called by exactly three journeys: `e2e/setup-accessibility-axe-gate.js:161`, `e2e/shell-accessibility-coverage.js:189`, `e2e/home-tasks-hub.js:183`. **PR #362 (issue #359), merge `9eadfb85`**, added the always-run gate reaching **twelve** surfaces through real clicks/navigation — signed-out login, anonymous public schedule, authenticated Home/Tasks, the Setup hub, **each of the six Setup workflow landings**, a forced 502, and an Official's restricted early-return — requiring zero serious/critical axe violations, zero console/page errors, no dangling skip-link target, no stale page title, no hidden focused control, at both viewports. Registered shard 4 (line 267). **This is automated repository accessibility. It is not, and is not evidence for, the two manual rows above.** | **Merged** |
+| Breakpoint-boundary (480/720/880/1040) | **Merged.** PR #351 (`49d662a`) fixed `styles.css`'s two out-of-contract widths; **PR #354 (merge `d190a6f6`) closed the remaining two.** Re-verified at `57cd84dc`: every `@media` width feature across all four production stylesheets is one of 480/720/880/1040 (`styles.css` 402, 861, 965, 979, 1030, 1148, 1222; `web.css` 327, 331, 370; `onboarding.css` 315; `setup.css` 135) — the only other `@media` rules are `prefers-reduced-motion` (`web.css:30`) and `print` (`styles.css:403`). `e2e/breakpoint-contract.js` **discovers** the stylesheet set from every `<link rel="stylesheet">` in `index.html` and `setup.html`, so a newly linked stylesheet is under contract immediately. `e2e/breakpoint-boundaries.js` proves the **browser** collapses and restores one pixel each side of all four tokens using the real stylesheets and the real `<nav class="side-nav">`. Registered at `hockey-scheduler-ci.yml:222` (standalone) and shard 1 (line 262). | **Merged** |
+| Keyboard-only (manual pass) | `docs/product/manual-keyboard-screenreader-validation-protocol.md` (PR #350, merge `e8c7d96d`) — a **protocol and blank evidence template only**, whose own Status section states no validation has been performed under it. Re-verified at `36195faa`: no filled-in artifact exists under `docs/`. **The K5/S5 defect that blocked this pass is fixed** by #394 (§3.9, resolved), so the pass is now runnable and waits only on a human. | **Human-only, unperformed** |
+| Screen-reader (manual pass) | Same protocol, same disclaimer, same absence. `e2e/setup-state-matrix.js:136`–`139` states its own boundary: *"This journey drives a real browser with real keyboard events. It is NOT a screen-reader session and NOT a moderated human session."* #394 additionally added an S5 step asking the validator to record **how a non-sighted operator learns the content re-filtered** — the repaint is silent today, and that gap was deliberately left to be logged by the session rather than papered over with an unvalidated live-region announcement. | **Human-only, unperformed** |
+| WCAG 2.2 AA — **automated repository accessibility** | **Merged.** `axe-core@^4.12.1` is a declared `devDependency` (`e2e/package.json:64`), called by exactly three journeys: `e2e/setup-accessibility-axe-gate.js:161`, `e2e/shell-accessibility-coverage.js:189`, `e2e/home-tasks-hub.js:183`. **PR #362 (issue #359), merge `9eadfb85`**, added the always-run gate reaching **twelve** surfaces through real clicks/navigation — signed-out login, anonymous public schedule, authenticated Home/Tasks, the Setup hub, **each of the six Setup workflow landings**, a forced 502, and an Official's restricted early-return — requiring zero serious/critical axe violations, zero console/page errors, no dangling skip-link target, no stale page title, no hidden focused control, at both viewports. Registered shard 4 (line 268). **This is automated repository accessibility. It is not, and is not evidence for, the two manual rows above.** | **Merged** |
 | Zero-console-error | **Re-derived at `57cd84dc`** (see §3.8). `e2e/` contains **63** `*.js` files. **56** are real Playwright journeys. **55 of those 56** install both `page.on("pageerror", …)` and `page.on("console", …)`. The single exception is `e2e/api-error-resilience.js`, which installs `pageerror` (line 49) only, by design — it deliberately provokes 401/403/502. The seven non-journey files (`breakpoint-contract.js`, `check-pr-body.js`, `check-v1-route-contract.js`, `ci-classify.js`, `ci-classify.test.js`, `ci-classify.integration.test.js`, `season-fmt-unit.js`) are static/unit checks. **The durable invariant holds again this round: the 56 Playwright journeys and the 56 names registered across the four browser-smoke shards are the same set exactly** — no orphan journey CI never runs, no registered name without a file. Both #365 matrix journeys additionally run a **delivery reconciler** (`reconcileDeliveries()`, `e2e/home-tasks-state-matrix.js:303`) keyed to (method, URL, status), consumed at most once, with unmatched responses failing the run. | **Merged** |
 
 **Overall status for Criterion 7: `Human-only / unperformed`.** Four of the six
 required evidence types are merged with citations that resolve. The two that
 remain — **manual keyboard-only and manual screen-reader passes** — have zero
-human evidence and cannot be produced by merging any PR. **This round adds a
-second reason they are outstanding**: per §3.9 the protocol that governs them
-currently instructs the validator to expect the *opposite* of shipped
-behaviour, so running the pass as written would produce invalid evidence.
+human evidence and cannot be produced by merging any PR. **Round 6's second
+reason is now discharged**: the protocol no longer instructs the validator to
+expect the opposite of shipped behaviour (§3.9, resolved by #394), so these
+two rows are blocked on nothing but the passes being performed.
 
 ### Criterion 8 — "All three moderated operator-validation sessions are completed and documented."
 
@@ -232,8 +244,8 @@ behaviour, so running the pass as written would produce invalid evidence.
 | | |
 | --- | --- |
 | Required boundary/evidence | The full backend matrix (Memory/SQLite/PostgreSQL), authenticated HTTP where relevant, and all required browser CI green at the inspected head. |
-| Evidence merged to `main` | **`main` at `57cd84dc` — its current tip — is green.** Workflow run [30889038050](https://github.com/jingizoo/biknik/actions/runs/30889038050), push to `main`, concluded `success`, all nine jobs green: `changes`, `classifier-test`, `frontend-check`, `test` (Memory/SQLite), `postgres`, and browser-smoke shards 1–4 covering **56 registered journeys** (`hockey-scheduler-ci.yml:261`–`267`). Authenticated-HTTP coverage sits inside the `test`/`postgres` jobs: `test_players_http_scope.py` (real `ThreadingHTTPServer`, real `Handler`, real session cookies, raw-response assertions), `test_context_league_http.py`, `test_league_context_http.py`, `test_server_authz.py`. Every merged batch in the table above was green on its own exact head at merge time. |
-| Remaining gap | **This box is satisfied for the merged #345 work at this SHA only.** It is not a statement that #345 may merge: #345's Done condition additionally requires *every* box to have evidence and the moderated sessions to be documented, and criteria 7 and 8 do not. Round 5 recorded a red tip; that red is resolved (§"Snapshot semantics"), but the recurrence shows this row is the most perishable in the document — it is a claim about a moving branch, and it was false for roughly six hours between Round 5 and this round. |
+| Evidence merged to `main` | **`main` at `36195faa` — its current tip — is green.** Workflow run [30907548648](https://github.com/jingizoo/biknik/actions/runs/30907548648), push to `main`, concluded `success` at `2026-08-04T12:19:07Z`, all nine jobs green: `changes`, `classifier-test`, `frontend-check`, `test` (Memory/SQLite), `postgres`, and browser-smoke shards 1–4 covering **57 registered journeys** (`hockey-scheduler-ci.yml:262`–`268`). Authenticated-HTTP coverage sits inside the `test`/`postgres` jobs: `test_players_http_scope.py` (real `ThreadingHTTPServer`, real `Handler`, real session cookies, raw-response assertions), `test_context_league_http.py`, `test_league_context_http.py`, `test_server_authz.py`. Every merged batch in the table above was green on its own exact head at merge time. |
+| Remaining gap | **This box is satisfied for the merged #345 work at this SHA only.** It is not a statement that #345 may merge: #345's Done condition additionally requires *every* box to have evidence and the moderated sessions to be documented, and criteria 7 and 8 do not. This remains the most perishable row in the document — a claim about a moving branch. It was false for roughly six hours during Round 5's window, which is why Round 5 pinned behind the tip; it has now been true across two consecutive tips (`57cd84dc`, `36195faa`). |
 | **Status** | **`Verified on main`** — at `57cd84dc`, `main`'s tip, with no carve-out needed this round. Recorded reasoning: under this document's own vocabulary `Missing` means "no implementation and no pending PR addresses it", which is plainly false — a completed green CI run on the recorded SHA is exactly the evidence this box asks for. |
 
 ---
@@ -248,26 +260,26 @@ numbers are unchanged from Rounds 4–5; only the `app.js` and `service.py`
 production citations moved.
 
 Shared production symbols for the six Setup landings:
-`SETUP_WORKFLOWS` (`app.js:4637`), `buildSetupWorkflowCardModel()`
-(`app.js:5291`), `setupCardBodyHtml()` (`app.js:5528`), `setupHubRollup()`
-(`app.js:5418`), `retrySetupWorkflowCard()` (`app.js:5794`),
-`resolveSetupCardConfirm()` (`app.js:5913`), `commitCardState()`
-(`app.js:1135`), `readCardState()` (`app.js:1191`).
+`SETUP_WORKFLOWS` (`app.js:4655`), `buildSetupWorkflowCardModel()`
+(`app.js:5309`), `setupCardBodyHtml()` (`app.js:5546`), `setupHubRollup()`
+(`app.js:5436`), `retrySetupWorkflowCard()` (`app.js:5812`),
+`resolveSetupCardConfirm()` (`app.js:5931`), `commitCardState()`
+(`app.js:1144`), `readCardState()` (`app.js:1200`).
 
-### Home/Tasks hub — `renderSetupProgressCard()` (`app.js:1476`), `loadSetupProgressCard()` (`app.js:1757`), `buildTasksCardModel()` (`app.js:1367`)
+### Home/Tasks hub — `renderSetupProgressCard()` (`app.js:1485`), `loadSetupProgressCard()` (`app.js:1766`), `buildTasksCardModel()` (`app.js:1376`)
 
 Journey: `e2e/home-tasks-state-matrix.js` (PR #377, merge `71bad79f`),
 desktop + 390×844. Also `e2e/home-tasks-hub.js` (PR #331, merge `16fe833`).
 
 | State | Production entry point/symbol | Merged journey leg | Missing behavior/evidence |
 | --- | --- | --- | --- |
-| Loading | `CARD_STATE.LOADING` (`app.js:633`); heading "Setup progress", visually-hidden "Loading setup progress…" | **Leg 1a** — `home-tasks-state-matrix.js:1315` | None identified |
-| Empty | `buildTasksCardModel()` (`app.js:1367`) returns `EMPTY` with a named `reason` — `"no_program"` (`app.js:1383`) or `"nothing_actionable"` (`app.js:1411`); renderer branches at `app.js:1618`–`1641`. Two reasons, each with its own `<h3>`: "Setup progress — no program yet" (offers `Start Initial Setup` only under `canBootstrap`, `app.js:1619`) and "Setup progress — nothing for your role to do" | **Leg 1h** — `home-tasks-state-matrix.js:1181` | None identified |
-| Stale | `cardTupleCurrent()` (`app.js:1123`); heading "Setup progress — showing earlier data" | **Legs 1f** (`:1556`) and **3** (`:1646`) | None identified |
-| Per-card error + retry | `CARD_STATE.ERROR`; heading "Setup progress unavailable", sentence "Could not load your setup progress.", `data-setup-progress-retry` (`app.js:1557,1574`, wired `:1801`); focus after retry via `focusCardTarget()` (`app.js:1265`) | **Legs 1c/1d/1e** — `home-tasks-state-matrix.js:1435`, including **keyboard-activated** retry with exact focus asserted | None. The matrix **found and fixed a real defect here**: a keyboard-activated Retry resolving into `EMPTY` dropped focus onto `<body>` |
+| Loading | `CARD_STATE.LOADING` (`app.js:642`); heading "Setup progress", visually-hidden "Loading setup progress…" | **Leg 1a** — `home-tasks-state-matrix.js:1315` | None identified |
+| Empty | `buildTasksCardModel()` (`app.js:1376`) returns `EMPTY` with a named `reason` — `"no_program"` (`app.js:1392`) or `"nothing_actionable"` (`app.js:1420`); renderer branches at `app.js:1627`–`1650`. Two reasons, each with its own `<h3>`: "Setup progress — no program yet" (offers `Start Initial Setup` only under `canBootstrap`, `app.js:1628`) and "Setup progress — nothing for your role to do" | **Leg 1h** — `home-tasks-state-matrix.js:1181` | None identified |
+| Stale | `cardTupleCurrent()` (`app.js:1132`); heading "Setup progress — showing earlier data" | **Legs 1f** (`:1556`) and **3** (`:1646`) | None identified |
+| Per-card error + retry | `CARD_STATE.ERROR`; heading "Setup progress unavailable", sentence "Could not load your setup progress.", `data-setup-progress-retry` (`app.js:1566,1583`, wired `:1810`); focus after retry via `focusCardTarget()` (`app.js:1274`) | **Legs 1c/1d/1e** — `home-tasks-state-matrix.js:1435`, including **keyboard-activated** retry with exact focus asserted | None. The matrix **found and fixed a real defect here**: a keyboard-activated Retry resolving into `EMPTY` dropped focus onto `<body>` |
 | Confirmation | — | **Leg 1i** — `home-tasks-state-matrix.js:2110`: the card is a pure read, and the leg requires that **no** confirmation/pending markup ever appears in the slot, in any state | **N/A, asserted not skipped** |
 | Success/complete | `CARD_STATE.SUCCESS`; heading "✓ All setup steps complete" | **Leg 1g** — `home-tasks-state-matrix.js:1375` | None identified |
-| Optional (Workflow 6) | `tasksWorkflowRowsHtml()` (`app.js:1433`) renders the "Optional" badge from `w.optional` (`app.js:1443`–`1445`), set by `partitionSetupWorkflows()` (`app.js:1283`, flag at `:1288`) from `CARD_STATUS.OPTIONAL` (`app.js:652`), backend-owned (`service.py:2003`, `"status": "optional"`). The badge and the completion arithmetic read the **same flag**; the SUCCESS branch reads `model.part.optional[0]` (`app.js:1659`) rather than the string `"import"` | `home-tasks-state-matrix.js`; `e2e/home-tasks-hub.js` | None identified |
+| Optional (Workflow 6) | `tasksWorkflowRowsHtml()` (`app.js:1442`) renders the "Optional" badge from `w.optional` (`app.js:1452`–`1454`), set by `partitionSetupWorkflows()` (`app.js:1292`, flag at `:1297`) from `CARD_STATUS.OPTIONAL` (`app.js:661`), backend-owned (`service.py:2003`, `"status": "optional"`). The badge and the completion arithmetic read the **same flag**; the SUCCESS branch reads `model.part.optional[0]` (`app.js:1668`) rather than the string `"import"` | `home-tasks-state-matrix.js`; `e2e/home-tasks-hub.js` | None identified |
 
 ### The six Setup workflow landings
 
@@ -303,53 +315,58 @@ blank and no cell is unexplained.
 
 ## 3. Stale or contradictory claims found (called out, not silently reconciled)
 
-**1. The context caption is FALSE, and this ledger previously understated it.**
-`index.html:176` reads, verbatim: *"most existing screens (Games, Roster,
-Standings, etc.) are not filtered by this selection"*. **All three screens it
-names are filtered at `57cd84dc`:**
+**1. RESOLVED — the context caption was FALSE, and this ledger understated it
+for two rounds.** `index.html` told the operator *"most existing screens
+(Games, Roster, Standings, etc.) are not filtered by this selection"*. All
+three named screens were filtered:
 
-- **Games** — `renderGames()` (`app.js:7486`) renders `ov.schedule`;
+- **Games** — `renderGames()` (`app.js:7509`) renders `ov.schedule`;
   `get_demo_overview()` (`service.py:7020`) resolves the active tuple and
   excludes every game failing `_in_scope_game()`.
 - **Roster** — the selectable/current game is revalidated against that same
-  scoped `ov.schedule` before the per-game lineup reads run, so a game outside
-  the new tuple is not retained after a context switch.
-- **Standings** — `get_standings()` (`service.py:4548`) independently requires
-  the Division to match the active Program and exact Season, plus the selected
-  League when present.
+  scoped `ov.schedule` before the per-game lineup reads run.
+- **Standings** — `get_standings()` (`service.py:4548`) requires the Division
+  to match the active Program and exact Season, plus the selected League.
 
-**Rounds 4 and 5 of this document both recorded that "Games remains genuinely
-unfiltered, so the caption is not wholly wrong." That was wrong**, and it was
-wrong in the direction that mattered: it is the finding that made the caption
-look like a cosmetic inaccuracy rather than false operator-facing copy beside
-the persistent control. A ledger whose job is to catch overstated claims
-produced one, twice, and carried it forward. **Corrected here.** PR
-[#394](https://github.com/jingizoo/biknik/pull/394) is open against this
-defect; per the status vocabulary it is `Pending active PR` and **no row above
-rests on it.**
+**Fixed by PR [#394](https://github.com/jingizoo/biknik/pull/394), merge
+`36195faa`.** `index.html:199` now reads *"Switching this changes what you
+see"* — capability wording that names no screens, so it cannot rot as more
+surfaces become context-aware. It is wired `aria-describedby` on both selects
+(`index.html:192`, `:195`); previously a keyboard user heard the scope
+statement not at all, static topbar text being browse-mode only.
+
+**Retained as a record of this document's own failure, not as an open
+defect.** Rounds 4 and 5 both wrote that "Games remains genuinely unfiltered,
+so the caption is not wholly wrong". Both were wrong, and the understatement
+is what let false operator-facing copy survive two rounds of an audit whose
+entire purpose is catching overstated claims. The merged fix carries the
+lesson in the markup itself: a comment at `index.html:166`–`176` records that
+**both** prior revisions enumerated screens and both rotted, and that a list
+of what is filtered is a promise about a moving inventory while a sentence
+about what the control *does* is not.
 
 **2. Round 4 cited one symbol at two different line numbers.**
 `buildTasksCardModel()` was cited as `app.js:1331` in criterion 5 and
 `app.js:1346` in §2's header — the same function at two addresses. Verified
 against `71bad79f`: it was at **1331**; the §2 header's `1346` resolved to
-unrelated code. Both now read `app.js:1367`.
+unrelated code. Both now read `app.js:1376`.
 
 **3. A previously cited code branch no longer exists.** The Round 3 revision
 recorded Home/Tasks' Empty state as `!progress || !progress.program_id`
 returning `""`. That branch is gone: the test lives in `buildTasksCardModel()`
-(`app.js:1367`) and returns `CARD_STATE.EMPTY` with a named reason. The merged
-comment at `app.js:1582` says so: *"Both reasons used to return the empty
+(`app.js:1376`) and returns `CARD_STATE.EMPTY` with a named reason. The merged
+comment at `app.js:1591` says so: *"Both reasons used to return the empty
 string."* Two `return ""` paths do still exist in `renderSetupProgressCard()`
-— `app.js:1541` (a *held* EMPTY carries no retained read) and `app.js:1731`
-(an unreachable-by-design fallthrough on `model.nextBlocked`, `app.js:1730`) —
+— `app.js:1550` (a *held* EMPTY carries no retained read) and `app.js:1740`
+(an unreachable-by-design fallthrough on `model.nextBlocked`, `app.js:1739`) —
 but neither is the branch previously cited.
 
 **4. Two symbols this ledger previously cited no longer exist.**
 `setupProgressFetchSeq` was removed by #365 — the name survives only in
-explanatory comments (`app.js:166, 610, 681, 1751, 1927, 13737`), and
-`app.js:1751` states the replacement verbatim. `setupSummaryHtml()` was
+explanatory comments (`app.js:175, 610, 681, 1751, 1927, 13737`), and
+`app.js:1760` states the replacement verbatim. `setupSummaryHtml()` was
 removed in the same work; the shared renderer is now `setupCardBodyHtml()`
-(`app.js:5528`). **The Round 4 follow-up is still open**: `setupSummaryHtml`
+(`app.js:5546`). **The Round 4 follow-up is still open**: `setupSummaryHtml`
 is still named as if live in `e2e/setup-v2-context-scope.js:763` and
 `e2e/league-filtered-data.js:278`.
 
@@ -371,21 +388,24 @@ Closed `2026-07-27T11:59:41Z`, **two seconds after PR #347 merged** at
 `2026-08-03T06:56:32Z`, reopened `2026-08-03T15:20:49Z`, unnoticed for over
 eight hours. A child PR must use `Part of #<epic>`, never a closing keyword.
 
-**8. The zero-console-error inventory has now drifted in three consecutive
-rounds** — 35/34, then 59/53/52, then 62/55/54, now **63/56/55**. The
+**8. The zero-console-error inventory has now drifted in FOUR consecutive
+rounds** — 35/34, then 59/53/52, then 62/55/54, then 63/56/55, now
+**64/57/56**. The
 *identified exception* (`api-error-resilience.js`) has been correct every
 time; only the arithmetic drifts, because any new `e2e/*.js` file changes it
-(this round's addition is `scheduler-turnaround`, from #391). These numbers
+(this round's addition is `context-scope-truth`, from #394). These numbers
 are **derived, not authored**: enumerate `hockey-scheduler/e2e/*.js` at the
 inspected SHA, test each for `require("playwright")`, test each journey for
 both `page.on("pageerror"` and `page.on("console"`. The durable claim is the
 **set equality** against the four browser-smoke `scripts:` lists
-(`hockey-scheduler-ci.yml:261,263,265,267`) — 56 = 56 this round, no orphans
-in either direction. The raw counts are not durable and must never be copied
+(`hockey-scheduler-ci.yml:262,264,266,268`) — **57 = 57** this round, no
+orphans in either direction. Four rounds, four different count triples, one
+unchanged invariant: that is the whole argument for preferring it. The raw counts are not durable and must never be copied
 forward.
 
-**9. NEW — the manual-validation protocol instructs the validator to expect
-the OPPOSITE of shipped behaviour, which blocks criterion 7's human passes.**
+**9. RESOLVED — the manual-validation protocol instructed the validator to
+expect the OPPOSITE of shipped behaviour, which blocked criterion 7's human
+passes.**
 `docs/product/manual-keyboard-screenreader-validation-protocol.md` still tells
 a human at steps **K5/S5** that no content re-filters on a context change, and
 records that as the **expected passing result**. Since the product does
@@ -393,14 +413,45 @@ re-filter (§3.1), a conscientious validator following the protocol as written
 would produce a filled-in artifact asserting the opposite of what ships — and
 that artifact would look like valid #345 evidence. This is a sharper form of
 the §3.1 defect: the thing carrying a false claim is the *test procedure
-itself*, so it cannot be caught by running the procedure. **Criterion 7's two
-manual rows are therefore blocked on a documentation correction before they
-are blocked on recruiting humans.** PR #394 addresses this; it has not merged.
+itself*, so it could not be caught by running the procedure. **Fixed by PR
+#394, merge `36195faa`**, which corrected the K5/S5 expectations and added an
+S5 step asking the validator to record how a non-sighted operator learns the
+content re-filtered. Criterion 7's two manual rows are now blocked on nothing
+but performing them. Recorded rather than deleted because it is the sharpest
+instance of this document's recurring subject: **a false claim inside the
+instrument meant to detect false claims.**
 
-**10. A supporting `app.js` comment is false in the same way.** A current-tense
-comment states `ov.schedule` is "every non-draft game in the whole demo",
-which #369's scoping falsified. Recorded because §3.1's caption is the
-operator-facing face of a claim the code repeats to its own maintainers.
+**10. RESOLVED — a supporting `app.js` comment was false in the same way.** A
+current-tense comment stated `ov.schedule` is "every non-draft game in the
+whole demo", which #369's scoping had falsified. Corrected by PR #394 along
+with several sibling comments asserting the switcher was "display-only" and
+that `/api/demo/overview` was unfiltered. Recorded because §3.1's caption was
+the operator-facing face of a claim the code was repeating to its own
+maintainers.
+
+**11. NEW — this document's own snapshot timestamp was authored, not
+measured, in Rounds 5 and 6.** Both rounds opened with *"Snapshot taken:
+`<time>`. Every SHA, PR state, issue state, CI result … was re-verified
+against the merged tree at that time"* — the field that certifies every other
+value in the document. Both times were **in the future when written**:
+
+| revision | stated | actual authoring time (commit `%cI`, UTC) | error |
+| --- | --- | --- | --- |
+| Round 5 | `2026-08-04T09:10Z` | `2026-08-04T03:39:13Z` | **+5h31m** |
+| Round 6 | `2026-08-04T13:05Z` | `2026-08-04T10:37:21Z` | **+2h28m** |
+
+The verification work those sentences describe genuinely happened; the
+timestamps attached to it did not. Two rounds is a pattern, not a slip: a
+plausible-looking value was composed where a measured one was required.
+
+**This is the document's own thesis turned on the document.** Every §3 finding
+above is some version of *a value that was rendered, declared, or argued
+standing in for one that was asserted* — and the provenance stamp, the one
+field a reader must trust before trusting anything else, was exactly that.
+A reader who spot-checked a SHA would have found it correct; a reader who
+checked the clock would have found the whole certification unverifiable.
+Round 7's timestamp is read from the system clock at authoring time, and the
+two false ones are corrected above rather than silently overwritten.
 
 **Superseded findings removed rather than kept.** Round 5's finding that
 `main`'s tip was red is resolved and moved to §"Snapshot semantics" as history.
@@ -417,11 +468,13 @@ immune to.
 | Item | State at snapshot | Scope |
 | --- | --- | --- |
 | [#357](https://github.com/jingizoo/biknik/issues/357) | **OPEN** | Refresh this ledger as a current-`main` snapshot — this task |
-| [PR #394](https://github.com/jingizoo/biknik/pull/394) | **OPEN (draft)** | `Part of #345` — corrects the §3.1 caption, the §3.9 protocol expectations, and the §3.10 comment, and adds a cross-view context regression. **`Pending active PR`; nothing in §1 rests on it** |
-| [#393](https://github.com/jingizoo/biknik/issues/393) | **OPEN** | Schedule/Facilities operator journey. Sequenced **after** #345 closes; **not #345 work** |
+| [#393](https://github.com/jingizoo/biknik/issues/393) | **OPEN** | Schedule/Facilities operator journey. Sequenced **after** #345 closes; **not #345 work**, and explicitly not a staleness trigger for this document |
 | [#376](https://github.com/jingizoo/biknik/issues/376) | **OPEN** | Child of #31 — playoff bracket. **Not #345 work** |
 | [#206](https://github.com/jingizoo/biknik/issues/206) | **OPEN** (reopened 2026-08-03) | Epic — scheduling planner v2. **Not #345 work.** Its children drove every merge since Round 4 |
 | [#287](https://github.com/jingizoo/biknik/issues/287) | **OPEN** | Epic — substitute matching engine. Sequenced after #345 and #393 |
+
+**Merged since Round 6**: PR #394 (`36195faa`) — **#345 work**, cited in §1
+criterion 4 and retiring §3.1/§3.9/§3.10.
 
 **Closed since Round 4, none of it #345 work**: #375, #379, #383 (duplicate of
 #375), #386, #387, #390 — all #206 children — plus PR #392, the SQLite lock
@@ -437,12 +490,11 @@ commit, never the issue number): #358 (via PR #361), #359 (#362), #360 (#363),
 
 | Outstanding item | Criterion | Why it is not closed |
 | --- | --- | --- |
-| Correct the manual-validation protocol's K5/S5 expectations | 7 (prerequisite) | **Blocks the two human passes below from being runnable at all.** The protocol currently records the pre-#369 behaviour as the expected passing result (§3.9), so a validator following it would produce invalid evidence. PR #394 addresses this and has not merged |
-| Manual keyboard-only validation pass | 7 | No human pass has been run. **Publishing a protocol is not performing it** — and until the row above lands, the protocol is not safe to perform |
-| Manual screen-reader validation pass | 7 | Same document, same disclaimer, same block. The merged axe gate (#362) is **automated repository accessibility** and explicitly not a substitute — `setup-accessibility-axe-gate.js:14`–`16` records that boundary in the file itself |
+| Manual keyboard-only validation pass | 7 | No human pass has been run. **Publishing a protocol is not performing it.** The K5/S5 correction that previously blocked this landed in #394, so the protocol is now safe to perform |
+| Manual screen-reader validation pass | 7 | Same document, same disclaimer. The merged axe gate (#362) is **automated repository accessibility** and explicitly not a substitute — `setup-accessibility-axe-gate.js:14`–`16` records that boundary in the file itself. #394's new S5 step asks the validator to record how a non-sighted operator learns the content re-filtered; the repaint is silent today and that gap is to be **logged by the session**, not pre-answered |
 | Three moderated operator sessions (League Admin, Arena Manager, Coach) | 8 | None run. Transferred to #345 as a merge gate, **not waived and not simulable** |
 
-The last three are human work that no PR can produce. **No automated run, no
+All three are human work that no PR can produce. **No automated run, no
 merged protocol, and no revision of this document can convert them.** They are
 the reason #345 remains open regardless of how much of §1 reads
 `Verified on main`.
@@ -459,11 +511,13 @@ the reason #345 remains open regardless of how much of §1 reads
   re-verified against the merged tree rather than PR descriptions. Criteria 3,
   4, 5, 9 moved `Missing` → `Verified on main`; criterion 7 moved `Missing` →
   `Human-only / unperformed`.
-- **Round 5** (2026-08-04T09:10Z): re-pinned to `4365e477`, deliberately
+- **Round 5** (stated `2026-08-04T09:10Z`; actually authored
+  `2026-08-04T03:39:13Z` — see §3.11): re-pinned to `4365e477`, deliberately
   **behind** `main`'s tip because the tip (`29ca277d`) was red. All 111 line
   citations re-resolved. Four findings added (§3.2, §3.7, §3.8, and the red
   tip).
-- **Round 6** (2026-08-04T13:05Z, this revision, per issue
+- **Round 6** (stated `2026-08-04T13:05Z`; actually authored
+  `2026-08-04T10:37:21Z` — see §3.11): per issue
   [#357](https://github.com/jingizoo/biknik/issues/357)): re-pinned to
   **`57cd84dc`, `main`'s own tip, now green** — the red Round 5 carve-out is
   retired and recorded as history. **No acceptance status changed**; no #345
@@ -480,3 +534,28 @@ the reason #345 remains open regardless of how much of §1 reads
   recruiting humans; and §5 now carries that correction as its own row. PR
   #394 is open against all of it and is cited as `Pending active PR` — the
   first use of that vocabulary value since Round 3.
+
+- **Round 7** (`2026-08-04T12:23Z`, this revision, per issue
+  [#357](https://github.com/jingizoo/biknik/issues/357)): re-pinned to
+  **`36195faa`**, `main`'s tip, green across all nine jobs. **The first round
+  in which findings are RETIRED AS RESOLVED rather than corrected or carried
+  forward**: PR #394 merged, so §3.1 (the false caption), §3.9 (the protocol
+  telling validators to expect the opposite of shipped behaviour) and §3.10
+  (the false `ov.schedule` comment) are all closed, and criterion 4 loses the
+  caveat Round 6 flagged as its most disputable call.<br><br>**Criteria 7 and
+  8 are unchanged and remain `Human-only / unperformed`** — but what blocks
+  them changed. Round 6 recorded two blockers on criterion 7's manual rows: a
+  broken protocol and the absence of humans. The first is discharged; the
+  second is not, and no PR can discharge it.<br><br>Two corrections to this
+  document itself. §3.11 records that Rounds 5 and 6 both stated a snapshot
+  timestamp that had not yet happened (+5h31m and +2h28m) — an authored value
+  in the one field that certifies every other value, which is this ledger's
+  own thesis turned on the ledger. And the staleness triggers are narrowed:
+  Round 6 made activity on #393, #376, #206 and #287 automatically invalidate
+  this snapshot, though none of them is #345 work and none can change whether
+  a #345 box has evidence.<br><br>All citations re-resolved again — 67 moved
+  (`app.js` +9 then +18, `index.html` +21 in the context-bar block, CI shard
+  lines +1, `styles.css` +3 below line 1027). The console-error inventory
+  drifted for the fourth consecutive round (63/56/55 → 64/57/56, adding
+  `context-scope-truth` from #394) while its set-equality invariant held for
+  the fourth consecutive round at 57 = 57.
