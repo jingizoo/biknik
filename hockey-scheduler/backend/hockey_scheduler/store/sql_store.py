@@ -654,6 +654,33 @@ class SqlStore:
                             # losing a lock it was authorized to take, with no
                             # wait attempted at all.
                             #
+                            # THE BUG HAD TWO WIRE SYMPTOMS, and only one of
+                            # them looks like a lock problem. Write it down
+                            # here so the second is never chased as a separate
+                            # defect. The 409 above is what happens when the
+                            # bounded retries run out. But a retry that loses
+                            # the promotion ROLLS BACK — and if the concurrent
+                            # mover's write commits in that gap, attempt 2
+                            # re-authorizes against the new truth, correctly
+                            # finds the row outside the caller's scope, and
+                            # renders a perfectly generic
+                            #
+                            #   404 {"code": "not_found",
+                            #        "message": "Venue venue_2 not found."}
+                            #
+                            # (also "Player player_1 not found." and
+                            # "Registration streg_1 not found." — it appears in
+                            # all three *_lock_sqlite_file tests). Nothing in
+                            # that response mentions locking. It reads like a
+                            # lost write or a scope bug, and it is neither: the
+                            # refusal itself is correct, it is the rollback
+                            # that should never have happened. Measured on the
+                            # unfixed tree, two independent samples: 648
+                            # invocations -> 8x 409 / 3x 404, and 756
+                            # invocations -> 1x 409 / 7x 404. Roughly half the
+                            # failures wear the 404 face, and which one shows
+                            # is pure timing.
+                            #
                             # Acquiring at BEGIN fixes the cause rather than
                             # the symptom: the unit holds the write lock across
                             # authorize -> mutate -> commit (which is what
