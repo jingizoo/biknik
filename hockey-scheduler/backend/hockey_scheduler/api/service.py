@@ -390,8 +390,10 @@ class ApiService:
     }
 
     # Canonical kind → the store getter that reads the row AND takes its write
-    # lock (`SELECT ... FOR UPDATE` on PostgreSQL; the process-wide lock already
-    # covers Memory/SQLite). `setup_guarded_mutation` takes these before it
+    # lock (`SELECT ... FOR UPDATE` on PostgreSQL; on Memory/SQLite the store's
+    # own per-INSTANCE transaction lock — plus, on SQLite, the file write lock
+    # `BEGIN IMMEDIATE` takes — already cover it, see `_lock_setup_row`).
+    # `setup_guarded_mutation` takes these before it
     # authorizes, so the authorization snapshot is established no earlier than
     # the lock and nothing that touches a named row can commit between the
     # decision and the write.
@@ -1530,11 +1532,13 @@ class ApiService:
         — it cannot be authorized either, so the decision still fails closed.
 
         The no-op is only sound because those two backends hold something
-        strictly coarser for the whole unit: Memory holds the process-wide
-        store lock, and SQLite's ``transaction()`` opens ``BEGIN IMMEDIATE``,
-        so the database's write lock is already held before this runs. Neither
-        has row locks to take, and on SQLite a DEFERRED begin would leave the
-        unit holding only a read lock — see ``SqlStore.transaction``."""
+        strictly coarser for the whole unit: Memory holds that store's own
+        lock (a per-INSTANCE ``RLock`` — not, as this said before, a
+        process-wide one), and SQLite's ``transaction()`` opens ``BEGIN
+        IMMEDIATE``, so the database's write lock is already held before this
+        runs. Neither has row locks to take, and on SQLite a DEFERRED begin
+        would leave the unit holding only a read lock — see
+        ``SqlStore.transaction``."""
         getter = self._SETUP_TARGET_LOCKS.get(kind)
         if getter is not None:
             getattr(self.store, getter)(record_id)
