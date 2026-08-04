@@ -1854,8 +1854,14 @@ class SqlStore:
         X-Demo-Role fallback) can never own a row — ``set_active_context``
         refuses without a user id — so there is no first insert to race.
 
-        SQLite is a documented no-op: ``transaction()`` holds the process-wide
-        lock for the whole block, which is strictly stronger.
+        SQLite is a documented no-op, and it takes TWO mechanisms to say why —
+        the old wording, "the process-wide lock", named a thing that does not
+        exist. ``self._lock`` is a per-INSTANCE ``RLock``: it serializes every
+        transaction taken through THIS store object and nothing else. What
+        covers the rest is ``transaction()``'s ``BEGIN IMMEDIATE`` (#392),
+        which holds the database file's write lock against every OTHER
+        connection for the whole block. Together they are strictly stronger
+        than this advisory lock.
         """
         if not user_id or self.backend != "postgres":
             return
@@ -1894,8 +1900,13 @@ class SqlStore:
 
         MUST be entered OUTSIDE any transaction; asserted, because acquiring
         inside one would reintroduce the very ordering bug it exists to fix.
-        SQLite is a no-op — its ``transaction()`` holds the process-wide lock,
-        which is strictly stronger and needs no cross-transaction mutex.
+        SQLite is a no-op, for the same two-part reason as
+        ``_active_context_advisory_lock`` above: ``self._lock`` is a per-
+        INSTANCE ``RLock`` (not, as this said before, a process-wide one) and
+        serializes every transaction through this store, while
+        ``transaction()``'s ``BEGIN IMMEDIATE`` (#392) holds the file's write
+        lock against any other connection. That is strictly stronger and needs
+        no cross-transaction mutex.
         """
         if not user_id or self.backend != "postgres":
             yield

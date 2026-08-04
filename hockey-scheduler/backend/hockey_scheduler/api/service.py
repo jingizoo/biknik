@@ -1197,17 +1197,47 @@ class ApiService:
         # one. Plain `transaction()` would be READ COMMITTED on PostgreSQL —
         # every statement re-snapshots — so the isolation is requested
         # explicitly; on memory/SQLite it is a documented no-op because the
-        # process-wide lock already serializes the block.
+        # store's own per-instance transaction lock already serializes the
+        # block.
         #
         # Requesting isolation is legal on the outermost transaction, and also
         # on a join whose open transaction ALREADY guarantees at least this much
         # (#369) — which is how `setup_guarded_mutation` runs this predicate,
         # the context resolve above and the mutation itself as ONE SERIALIZABLE
         # unit. Standalone (the read-only predicate call), this is the outermost
-        # transaction and behaves exactly as before. READ-ONLY at REPEATABLE
-        # READ cannot raise a serialization conflict, so no retry loop is needed
-        # here (unlike the context service's `_snapshot`); when nested, the
-        # guard's own bounded retry owns that.
+        # transaction and behaves exactly as before, and when nested the guard's
+        # own bounded retry owns any conflict.
+        #
+        # WHY THERE IS STILL NO RETRY LOOP HERE, stated precisely, because the
+        # reason this comment used to give is no longer true. It said READ-ONLY
+        # at REPEATABLE READ cannot raise a serialization conflict. That remains
+        # true of SERIALIZATION conflicts, but it was never the whole set: since
+        # #392 the SQLite branch opens with `BEGIN IMMEDIATE`, so this block can
+        # now raise `ConcurrencyConflictError` from LOCK ACQUISITION — a
+        # `database is locked` at BEGIN, classified `lock_not_available` — and
+        # read-only says nothing about that. Unlike `ContextService._snapshot`
+        # this call site has no bounded retry, so the claim needed re-deciding
+        # rather than re-wording.
+        #
+        # The decision is still no retry, for reasons about reachability and
+        # about what a retry would mean:
+        #
+        # * Contending needs a SECOND connection to the same file. A serving
+        #   process has exactly ONE store (`create_store()` at web/server.py and
+        #   bootstrap.py), and `SqlStore._lock` — reentrant, per instance —
+        #   already serializes every transaction taken through it, so no two
+        #   in-process transactions can be at BEGIN at once. The one production
+        #   path that opens a second SQLite connection (`backup_sqlite`) opens
+        #   it on the DESTINATION file, never the live one.
+        # * Where a second connection does exist — the `*_lock_sqlite_file`
+        #   tests, or an operator pointing the backup drill at a live database —
+        #   BEGIN blocks in the busy handler for the full 5s `busy_timeout`
+        #   first. Anything that surfaces here has therefore ALREADY waited five
+        #   seconds. That is not a transient blip a tight retry would paper
+        #   over; it is a writer that is genuinely wedged, and the retryable
+        #   409 is the honest answer for the caller to act on.
+        # * A retry here would also be dead weight on PostgreSQL, where the
+        #   original read-only argument still holds in full.
         #
         # NOTE this predicate is NOT a security boundary on its own: it answers
         # for the instant it read, and by the time a caller acts on the answer

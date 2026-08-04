@@ -27,7 +27,9 @@ concurrent revocation (Official unassign, Player/Guardian reassignment) either
 orders entirely before this request (it sees the old scope) or entirely after it
 (it sees the new scope) — the result can never be a hybrid of the two (e.g. an
 old Program set with a now-empty Season set). Memory/SQLite get the same guarantee
-for free: their process-wide lock fully serializes every transaction.
+for free: each store's per-INSTANCE transaction lock (not a process-wide one)
+fully serializes every transaction taken through that store, and on SQLite the
+``BEGIN IMMEDIATE`` of #392 extends it to any other connection on the file.
 
 **League is the optional third axis (#345).** It is added ADDITIVELY: ``resolve``,
 ``options`` and ``set`` keep their exact pre-#345 signatures and tuple shapes, and
@@ -55,8 +57,14 @@ from .league_scope import exact_league_season_or_conflict
 # request can never observe a hybrid of pre- and post-revocation scope (#159). A
 # serialization conflict (e.g. two concurrent writes for one user, or a scope
 # change the snapshot anti-depends on) is retried a bounded number of times; each
-# attempt re-reads a fresh consistent snapshot. Memory/SQLite serialize via their
-# process lock, so the retry never fires there.
+# attempt re-reads a fresh consistent snapshot. Memory/SQLite serialize via each
+# store's own per-INSTANCE transaction lock (a ``threading.RLock``, not — as this
+# said before — a process-wide one), so no SERIALIZATION conflict arises there.
+# On SQLite the retry is not dead code, though: since #392 ``transaction()``
+# opens with ``BEGIN IMMEDIATE``, so a second connection to the same file can
+# make BEGIN itself fail ``lock_not_available`` after the busy handler gives up,
+# and that lands here as the same ConcurrencyConflictError. This loop already
+# handles it.
 _SNAPSHOT_ISOLATION = "SERIALIZABLE"
 _MAX_SNAPSHOT_RETRIES = 10
 
