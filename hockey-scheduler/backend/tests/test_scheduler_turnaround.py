@@ -321,6 +321,35 @@ class ExistingGameTurnaroundTest(TurnaroundFixture):
         self.assertEqual(res["unscheduled"], [], repr(res))
         self.assertEqual(len(res["draft_games"]), 2, repr(res))
 
+    def test_the_row_level_conflict_list_is_bounded_and_reports_the_near_miss(self):
+        """One row per (team, source, blocking game) — the NEAREST miss.
+
+        A pairing is tried against EVERY free slot, and each candidate has its
+        own gap from the same blocker, so a list keyed by the measured gap
+        would grow as slots x blockers x teams. That list is returned in the
+        response AND hashed into ``draft_fingerprint``, so it has to be bounded
+        by something structural, exactly as ``team_conflicts`` is (#373).
+
+        Which row survives is not arbitrary: an operator asking "how close did
+        this come?" wants the SMALLEST shortfall, so the surviving row is the
+        largest gap. Ten candidates against one blocker and two teams must
+        therefore yield two rows, naming the closest candidate's gap.
+        """
+        self._hierarchy()
+        self._prior_game()
+        for i in range(1, 11):
+            start = PRIOR_END + _minutes(30 * i)
+            self._slot(f"slotB{i}", start, start + _minutes(20))
+        res = self._draft(min_turnaround_minutes=600)
+        conflicts = res["unscheduled"][0]["turnaround_conflicts"]
+        self.assertEqual(len(conflicts), 2, repr(conflicts))
+        self.assertEqual({c["team_id"] for c in conflicts}, {"t0", "t1"})
+        for conflict in conflicts:
+            self.assertEqual(conflict["conflict_game_id"], "g_prior")
+            # The last candidate starts 300 minutes after the blocker ends.
+            self.assertEqual(conflict["gap_minutes"], 300.0)
+            self.assertEqual(conflict["shortfall_minutes"], 300.0)
+
     def test_a_cancelled_game_does_not_block_the_turnaround(self):
         """Cancelled ice is free ice — the same rule every other occupancy
         reader in this engine follows (``_active_game_slot_pairs``). Proves

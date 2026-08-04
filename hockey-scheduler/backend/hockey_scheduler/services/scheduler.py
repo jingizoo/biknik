@@ -1026,28 +1026,32 @@ def _dedupe_team_conflicts(conflicts):
 
 def _dedupe_turnaround_conflicts(conflicts):
     """Collapse the per-candidate-slot turnaround records into one
-    deterministic list (#390), exactly as :func:`_dedupe_team_conflicts` does
-    for overlaps.
+    deterministic, STRUCTURALLY BOUNDED list (#390) — the same shape
+    :func:`_dedupe_team_conflicts` gives overlaps.
 
-    A pairing is tried against EVERY free slot, so the same blocking game is
-    reported once per candidate it blocks — and the SHORTFALL differs between
-    those candidates, which is the point: the row an operator wants is the
-    nearest miss, not an arbitrary one. Keyed by (team, source, game,
-    blocking window) so genuinely distinct near-misses against the same
-    blocker survive, and ordered canonically so two runs over the same facts
-    produce the identical list — and therefore the identical
-    ``draft_fingerprint`` — on every backend.
+    A pairing is tried against EVERY free slot, and each candidate has its own
+    gap from the same blocker, so a list keyed by the measured gap would grow
+    as ``slots x blockers x teams``. This list is returned in the response AND
+    hashed into ``draft_fingerprint``, so its size has to be a function of the
+    facts rather than of how much ice happened to be scanned. Keyed by
+    ``(team, source, blocking game)`` alone, it is bounded exactly as the
+    overlap sibling is: two teams times the games they are actually booked in.
+
+    Which row survives is not arbitrary. An operator asking "how close did
+    this come?" wants the SMALLEST shortfall, so the surviving row is the
+    LARGEST gap — the nearest miss. Ties fall back to the row's own canonical
+    JSON, so the choice never depends on generation order, and the final list
+    is canonically ordered: two runs over the same facts produce the identical
+    list, and therefore the identical ``draft_fingerprint``, on every backend.
     """
-    seen, out = set(), []
+    best = {}
     for c in conflicts:
-        key = (c["team_id"], c["conflict_source"], c["conflict_game_id"],
-               c["conflict_start_time"], c["conflict_end_time"],
-               c["gap_minutes"])
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(c)
-    return sorted(out, key=_canonical_sort_key)
+        key = (c["team_id"], c["conflict_source"], c["conflict_game_id"])
+        current = best.get(key)
+        if current is None or (c["gap_minutes"], _canonical_sort_key(c)) > (
+                current["gap_minutes"], _canonical_sort_key(current)):
+            best[key] = c
+    return sorted(best.values(), key=_canonical_sort_key)
 
 
 def _unschedulable_teams(store, team_ids, pairings, unscheduled):
