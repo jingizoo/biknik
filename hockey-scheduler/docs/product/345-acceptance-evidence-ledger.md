@@ -20,7 +20,7 @@ this document merges — the ledger records the gap, it does not fill it.
 accurate for the stated `main` SHA and UTC timestamp below, and for nothing
 else.
 
-- **Snapshot taken**: `2026-08-04T12:23Z` — **read from the system clock, not composed.**
+- **Snapshot taken**: `2026-08-04T15:26Z` — **read from the system clock, not composed.**
   See §3.11: Rounds 5 and 6 both stated a time that had not yet happened.
   Every SHA, PR state, issue state,
   CI result, repository path, symbol, and test/journey name below was
@@ -154,7 +154,7 @@ programmatically — see §3.8), and the merged trees of every PR above.
 
 ## 1. Acceptance-criterion ledger
 
-All line numbers below are as of `57cd84dc`. Symbol names are given alongside
+All line numbers below are as of `36195faa`. Symbol names are given alongside
 so a future line shift does not invalidate the citation.
 
 ### Criterion 1 — "A first-time League Admin can identify and open the correct next incomplete setup step from one primary action."
@@ -198,7 +198,7 @@ so a future line shift does not invalidate the citation.
 | | |
 | --- | --- |
 | Required boundary/evidence | Per `operator-ux-requirements.md` §5, the full states matrix applies to Home/Tasks **and each of the six Setup workflows**, at desktop and 390×844, including keyboard activation and exact focus after retry, confirmation and completion. |
-| Evidence merged to `main` | **PR #377 (issue #365), merge `71bad79fc991b49a8136ef98eef14a493b4fa78b`.**<br><br>**The state model.** `CARD_STATE` (`app.js:642`) — `loading \| ready \| empty \| stale \| error \| confirm \| pending \| success`; `CARD_STATUS` (`app.js:660`) — `done \| todo \| optional \| unknown`, backend-owned; `CARD_READ` (`app.js:675`). Card identity is workflow/card id + exact `(program, season, league)` tuple + request generation, enforced by `cardIdentityCurrent()` (`app.js:1098`) and `cardTupleCurrent()` (`app.js:1132`), with `beginCardRequest()` (`app.js:1040`), `commitCardState()` (`app.js:1144`) and `readCardState()` (`app.js:1200`). Setup-side: `buildSetupWorkflowCardModel()` (`app.js:5309`), `setupHubRollup()` (`app.js:5436`), `setupCardBodyHtml()` (`app.js:5546`), `retrySetupWorkflowCard()` (`app.js:5812`), `resolveSetupCardConfirm()` (`app.js:5931`), `SETUP_SEASON_REOPEN_ACTION` (`app.js:5089`). Backend prerequisite authority: `_workflow_prerequisite_rows()` (`service.py:2124`).<br><br>**Home/Tasks EMPTY is a real rendered state.** The `!program_id` test lives in `buildTasksCardModel()` (`app.js:1376`), returning `CARD_STATE.EMPTY` with `reason: "no_program"` (`app.js:1392`) or `"nothing_actionable"` (`app.js:1420`); the renderer branches on the named reason at `app.js:1627`–`1650`, painting a heading and status sentence for both, and gating `Start Initial Setup` on `canBootstrap = hasPerm("manage_setup")` (`app.js:1628`).<br><br>**The browser matrix.** `e2e/home-tasks-state-matrix.js` (2,207 lines) and `e2e/setup-state-matrix.js` (2,722 lines), both at desktop and 390×844, both driving real production entry points with the *transport* forced by route interception. Supporting journeys: `e2e/setup-card-write-identity.js` (4,628 lines), `e2e/setup-prerequisite-floors.js` (748 lines). Backend: `test_setup_progress.py` grew by 607 lines. **All six journey files remain byte-identical at `57cd84dc` to their state at `71bad79f`** (verified by diff), so every leg line number in §2 resolves unchanged.<br><br>**CI registration**: `setup-state-matrix` shard 1 (line 262), `home-tasks-state-matrix` shard 3 (line 266), `setup-prerequisite-floors` and `setup-card-write-identity` shard 4 (line 268). |
+| Evidence merged to `main` | **PR #377 (issue #365), merge `71bad79fc991b49a8136ef98eef14a493b4fa78b`.**<br><br>**The state model.** `CARD_STATE` (`app.js:642`) — `loading \| ready \| empty \| stale \| error \| confirm \| pending \| success`; `CARD_STATUS` (`app.js:660`) — `done \| todo \| optional \| unknown`, backend-owned; `CARD_READ` (`app.js:675`). Card identity is workflow/card id + exact `(program, season, league)` tuple + request generation, enforced by `cardIdentityCurrent()` (`app.js:1098`) and `cardTupleCurrent()` (`app.js:1132`), with `beginCardRequest()` (`app.js:1040`), `commitCardState()` (`app.js:1144`) and `readCardState()` (`app.js:1200`). Setup-side: `buildSetupWorkflowCardModel()` (`app.js:5309`), `setupHubRollup()` (`app.js:5436`), `setupCardBodyHtml()` (`app.js:5546`), `retrySetupWorkflowCard()` (`app.js:5812`), `resolveSetupCardConfirm()` (`app.js:5931`), `SETUP_SEASON_REOPEN_ACTION` (`app.js:5089`). Backend prerequisite authority: `_workflow_prerequisite_rows()` (`service.py:2124`).<br><br>**Home/Tasks EMPTY is a real rendered state.** The `!program_id` test lives in `buildTasksCardModel()` (`app.js:1376`), returning `CARD_STATE.EMPTY` with `reason: "no_program"` (`app.js:1392`) or `"nothing_actionable"` (`app.js:1420`); the renderer branches on the named reason at `app.js:1627`–`1650`, painting a heading and status sentence for both, and gating `Start Initial Setup` on `canBootstrap = hasPerm("manage_setup")` (`app.js:1628`).<br><br>**The browser matrix.** `e2e/home-tasks-state-matrix.js` (2,207 lines) and `e2e/setup-state-matrix.js` (2,722 lines), both at desktop and 390×844, both driving real production entry points with the *transport* forced by route interception. Supporting journeys: `e2e/setup-card-write-identity.js` (4,628 lines), `e2e/setup-prerequisite-floors.js` (748 lines). Backend: `test_setup_progress.py` grew by 607 lines. **All six journey files remain byte-identical at `36195faa` to their state at `71bad79f`** (verified by diff), so every leg line number in §2 resolves unchanged.<br><br>**CI registration**: `setup-state-matrix` shard 1 (line 262), `home-tasks-state-matrix` shard 3 (line 266), `setup-prerequisite-floors` and `setup-card-write-identity` shard 4 (line 268). |
 | Remaining gap | One bound, taken verbatim from the merged journey's own header (`e2e/setup-state-matrix.js:120`–`135`): Workflow 6's confirmation completes by navigating, so the live region is populated and emptied inside one task before paint. `legConfirmImport()` asserts the sentence was **written exactly once** and asserts nothing about whether it survived to be spoken. A bound on one announcement, not an unimplemented state. |
 | **Status** | **`Verified on main`** |
 
@@ -216,11 +216,11 @@ so a future line shift does not invalidate the citation.
 | Sub-item | Evidence merged to `main` | Sub-item stage |
 | --- | --- | --- |
 | Desktop + 390×844 | Standing convention across every merged browser journey (viewport pairs `1440×900` / `390×844`). Both #365 matrix journeys run both (`VIEWPORTS`, `e2e/setup-state-matrix.js:188`, `e2e/home-tasks-state-matrix.js:167`), as does `e2e/seven-area-navigation.js`. | **Merged** |
-| Breakpoint-boundary (480/720/880/1040) | **Merged.** PR #351 (`49d662a`) fixed `styles.css`'s two out-of-contract widths; **PR #354 (merge `d190a6f6`) closed the remaining two.** Re-verified at `57cd84dc`: every `@media` width feature across all four production stylesheets is one of 480/720/880/1040 (`styles.css` 402, 861, 965, 979, 1030, 1148, 1222; `web.css` 327, 331, 370; `onboarding.css` 315; `setup.css` 135) — the only other `@media` rules are `prefers-reduced-motion` (`web.css:30`) and `print` (`styles.css:403`). `e2e/breakpoint-contract.js` **discovers** the stylesheet set from every `<link rel="stylesheet">` in `index.html` and `setup.html`, so a newly linked stylesheet is under contract immediately. `e2e/breakpoint-boundaries.js` proves the **browser** collapses and restores one pixel each side of all four tokens using the real stylesheets and the real `<nav class="side-nav">`. Registered at `hockey-scheduler-ci.yml:222` (standalone) and shard 1 (line 262). | **Merged** |
+| Breakpoint-boundary (480/720/880/1040) | **Merged.** PR #351 (`49d662a`) fixed `styles.css`'s two out-of-contract widths; **PR #354 (merge `d190a6f6`) closed the remaining two.** Re-verified at `36195faa`: every `@media` width feature across all four production stylesheets is one of 480/720/880/1040 (`styles.css` 402, 861, 965, 979, 1030, 1148, 1222; `web.css` 327, 331, 370; `onboarding.css` 315; `setup.css` 135) — the only other `@media` rules are `prefers-reduced-motion` (`web.css:30`) and `print` (`styles.css:403`). `e2e/breakpoint-contract.js` **discovers** the stylesheet set from every `<link rel="stylesheet">` in `index.html` and `setup.html`, so a newly linked stylesheet is under contract immediately. `e2e/breakpoint-boundaries.js` proves the **browser** collapses and restores one pixel each side of all four tokens using the real stylesheets and the real `<nav class="side-nav">`. Registered at `hockey-scheduler-ci.yml:222` (standalone) and shard 1 (line 262). | **Merged** |
 | Keyboard-only (manual pass) | `docs/product/manual-keyboard-screenreader-validation-protocol.md` (PR #350, merge `e8c7d96d`) — a **protocol and blank evidence template only**, whose own Status section states no validation has been performed under it. Re-verified at `36195faa`: no filled-in artifact exists under `docs/`. **The K5/S5 defect that blocked this pass is fixed** by #394 (§3.9, resolved), so the pass is now runnable and waits only on a human. | **Human-only, unperformed** |
 | Screen-reader (manual pass) | Same protocol, same disclaimer, same absence. `e2e/setup-state-matrix.js:136`–`139` states its own boundary: *"This journey drives a real browser with real keyboard events. It is NOT a screen-reader session and NOT a moderated human session."* #394 additionally added an S5 step asking the validator to record **how a non-sighted operator learns the content re-filtered** — the repaint is silent today, and that gap was deliberately left to be logged by the session rather than papered over with an unvalidated live-region announcement. | **Human-only, unperformed** |
 | WCAG 2.2 AA — **automated repository accessibility** | **Merged.** `axe-core@^4.12.1` is a declared `devDependency` (`e2e/package.json:64`), called by exactly three journeys: `e2e/setup-accessibility-axe-gate.js:161`, `e2e/shell-accessibility-coverage.js:189`, `e2e/home-tasks-hub.js:183`. **PR #362 (issue #359), merge `9eadfb85`**, added the always-run gate reaching **twelve** surfaces through real clicks/navigation — signed-out login, anonymous public schedule, authenticated Home/Tasks, the Setup hub, **each of the six Setup workflow landings**, a forced 502, and an Official's restricted early-return — requiring zero serious/critical axe violations, zero console/page errors, no dangling skip-link target, no stale page title, no hidden focused control, at both viewports. Registered shard 4 (line 268). **This is automated repository accessibility. It is not, and is not evidence for, the two manual rows above.** | **Merged** |
-| Zero-console-error | **Re-derived at `57cd84dc`** (see §3.8). `e2e/` contains **63** `*.js` files. **56** are real Playwright journeys. **55 of those 56** install both `page.on("pageerror", …)` and `page.on("console", …)`. The single exception is `e2e/api-error-resilience.js`, which installs `pageerror` (line 49) only, by design — it deliberately provokes 401/403/502. The seven non-journey files (`breakpoint-contract.js`, `check-pr-body.js`, `check-v1-route-contract.js`, `ci-classify.js`, `ci-classify.test.js`, `ci-classify.integration.test.js`, `season-fmt-unit.js`) are static/unit checks. **The durable invariant holds again this round: the 56 Playwright journeys and the 56 names registered across the four browser-smoke shards are the same set exactly** — no orphan journey CI never runs, no registered name without a file. Both #365 matrix journeys additionally run a **delivery reconciler** (`reconcileDeliveries()`, `e2e/home-tasks-state-matrix.js:303`) keyed to (method, URL, status), consumed at most once, with unmatched responses failing the run. | **Merged** |
+| Zero-console-error | **Re-derived at `36195faa`** (see §3.8 for the derivation rule and why these counts must never be copied forward). `e2e/` contains **64** `*.js` files. **57** are real Playwright journeys. **56 of those 57** install both `page.on("pageerror", …)` and `page.on("console", …)`. The single exception is `e2e/api-error-resilience.js`, which installs `pageerror` (line 49) only, by design — it deliberately provokes 401/403/502. The seven non-journey files (`breakpoint-contract.js`, `check-pr-body.js`, `check-v1-route-contract.js`, `ci-classify.js`, `ci-classify.test.js`, `ci-classify.integration.test.js`, `season-fmt-unit.js`) are static/unit checks. **The durable invariant holds again: the 57 Playwright journeys and the 57 names registered across the four browser-smoke shards are the same set exactly** — no orphan journey CI never runs, no registered name without a file. Both #365 matrix journeys additionally run a **delivery reconciler** (`reconcileDeliveries()`, `e2e/home-tasks-state-matrix.js:303`) keyed to (method, URL, status), consumed at most once, with unmatched responses failing the run. | **Merged** |
 
 **Overall status for Criterion 7: `Human-only / unperformed`.** Four of the six
 required evidence types are merged with citations that resolve. The two that
@@ -235,7 +235,7 @@ two rows are blocked on nothing but the passes being performed.
 | | |
 | --- | --- |
 | Required boundary/evidence | Three real moderated sessions (League Admin, Arena Manager, Coach) — commissioned, run, and documented with completion, timing, interventions, ease rating, and confusion quotes. Not waived, not simulated. |
-| Evidence merged to `main` | `docs/product/moderated-operator-validation-protocol.md` (PR #349, merge `9d090fe6`) — a protocol and blank evidence-template document whose own Status section states verbatim: *"Protocol and evidence templates only. No moderated session has been run under this document."* A full listing of `docs/` at `57cd84dc` confirms **no filled-in session artifact exists**. |
+| Evidence merged to `main` | `docs/product/moderated-operator-validation-protocol.md` (PR #349, merge `9d090fe6`) — a protocol and blank evidence-template document whose own Status section states verbatim: *"Protocol and evidence templates only. No moderated session has been run under this document."* A full listing of `docs/` at `36195faa` confirms **no filled-in session artifact exists**. |
 | Remaining gap | The three sessions themselves. **Human-only** work that no code change or automated check can satisfy. |
 | **Status** | **`Human-only / unperformed`**. **Publishing the protocol (#349) is not performing it.** |
 
@@ -246,7 +246,7 @@ two rows are blocked on nothing but the passes being performed.
 | Required boundary/evidence | The full backend matrix (Memory/SQLite/PostgreSQL), authenticated HTTP where relevant, and all required browser CI green at the inspected head. |
 | Evidence merged to `main` | **`main` at `36195faa` — its current tip — is green.** Workflow run [30907548648](https://github.com/jingizoo/biknik/actions/runs/30907548648), push to `main`, concluded `success` at `2026-08-04T12:19:07Z`, all nine jobs green: `changes`, `classifier-test`, `frontend-check`, `test` (Memory/SQLite), `postgres`, and browser-smoke shards 1–4 covering **57 registered journeys** (`hockey-scheduler-ci.yml:262`–`268`). Authenticated-HTTP coverage sits inside the `test`/`postgres` jobs: `test_players_http_scope.py` (real `ThreadingHTTPServer`, real `Handler`, real session cookies, raw-response assertions), `test_context_league_http.py`, `test_league_context_http.py`, `test_server_authz.py`. Every merged batch in the table above was green on its own exact head at merge time. |
 | Remaining gap | **This box is satisfied for the merged #345 work at this SHA only.** It is not a statement that #345 may merge: #345's Done condition additionally requires *every* box to have evidence and the moderated sessions to be documented, and criteria 7 and 8 do not. This remains the most perishable row in the document — a claim about a moving branch. It was false for roughly six hours during Round 5's window, which is why Round 5 pinned behind the tip; it has now been true across two consecutive tips (`57cd84dc`, `36195faa`). |
-| **Status** | **`Verified on main`** — at `57cd84dc`, `main`'s tip, with no carve-out needed this round. Recorded reasoning: under this document's own vocabulary `Missing` means "no implementation and no pending PR addresses it", which is plainly false — a completed green CI run on the recorded SHA is exactly the evidence this box asks for. |
+| **Status** | **`Verified on main`** — at `36195faa`, `main`'s tip, with no carve-out needed this round. Recorded reasoning: under this document's own vocabulary `Missing` means "no implementation and no pending PR addresses it", which is plainly false — a completed green CI run on the recorded SHA is exactly the evidence this box asks for. |
 
 ---
 
@@ -376,7 +376,7 @@ conflicting draft. Accurate then, superseded now (merge `d190a6f6`,
 stylesheet set **discovered** from the production HTML rather than declared.
 
 **6. `ROADMAP.md` still describes #345 as one undifferentiated deliverable.**
-Re-verified at `57cd84dc`: its "Currently active sequencing" section
+Re-verified at `36195faa`: its "Currently active sequencing" section
 (`ROADMAP.md:276` onward, #345 at 290, 297, 301) does not reflect the batch
 split across fourteen-plus merged pieces. Flagged for the owner; out of scope
 for this PR.
@@ -405,21 +405,29 @@ forward.
 
 **9. RESOLVED — the manual-validation protocol instructed the validator to
 expect the OPPOSITE of shipped behaviour, which blocked criterion 7's human
-passes.**
-`docs/product/manual-keyboard-screenreader-validation-protocol.md` still tells
-a human at steps **K5/S5** that no content re-filters on a context change, and
-records that as the **expected passing result**. Since the product does
-re-filter (§3.1), a conscientious validator following the protocol as written
-would produce a filled-in artifact asserting the opposite of what ships — and
-that artifact would look like valid #345 evidence. This is a sharper form of
-the §3.1 defect: the thing carrying a false claim is the *test procedure
-itself*, so it could not be caught by running the procedure. **Fixed by PR
-#394, merge `36195faa`**, which corrected the K5/S5 expectations and added an
-S5 step asking the validator to record how a non-sighted operator learns the
-content re-filtered. Criterion 7's two manual rows are now blocked on nothing
-but performing them. Recorded rather than deleted because it is the sharpest
-instance of this document's recurring subject: **a false claim inside the
-instrument meant to detect false claims.**
+passes.** Before PR #394, `manual-keyboard-screenreader-validation-protocol.md`
+told a human at steps **K5/S5** that no content re-filtered on a context
+change, and recorded that as the **expected passing result**. Because the
+product did re-filter, a conscientious validator following the protocol as
+written would have produced a filled-in artifact asserting the opposite of what
+shipped — and that artifact would have looked like valid #345 evidence. It was
+a sharper form of §3.1: the document carrying the false claim was the *test
+procedure itself*, so running the procedure could not have caught it.
+
+**Fixed by PR #394, merge `36195faa`.** The protocol at the inspected base now
+opens that section with an explicit **"Superseded — do not run the earlier
+gating"** warning recording that the previous revision "told a validator that
+context filtering was *not*" expected and "would have failed a correct
+implementation, which is why K5/S5 are restated below"; K5 is restated around
+**observed** filtering through `#ctx-select`; and the **Conflicts log** carries
+a dated `2026-08-04` row recording that the earlier `2026-07-27` resolution
+"inverted with the code and became the blocker". The prior row is preserved
+rather than rewritten, so the inversion is auditable instead of erased.
+
+Criterion 7's two manual rows are now blocked on nothing but being performed.
+Recorded rather than deleted because it is the sharpest instance of this
+document's recurring subject: **a false claim inside the instrument meant to
+detect false claims.**
 
 **10. RESOLVED — a supporting `app.js` comment was false in the same way.** A
 current-tense comment stated `ov.schedule` is "every non-draft game in the
@@ -535,7 +543,7 @@ the reason #345 remains open regardless of how much of §1 reads
   #394 is open against all of it and is cited as `Pending active PR` — the
   first use of that vocabulary value since Round 3.
 
-- **Round 7** (`2026-08-04T12:23Z`, this revision, per issue
+- **Round 7** (`2026-08-04T15:26Z`, this revision, per issue
   [#357](https://github.com/jingizoo/biknik/issues/357)): re-pinned to
   **`36195faa`**, `main`'s tip, green across all nine jobs. **The first round
   in which findings are RETIRED AS RESOLVED rather than corrected or carried
@@ -549,13 +557,26 @@ the reason #345 remains open regardless of how much of §1 reads
   second is not, and no PR can discharge it.<br><br>Two corrections to this
   document itself. §3.11 records that Rounds 5 and 6 both stated a snapshot
   timestamp that had not yet happened (+5h31m and +2h28m) — an authored value
-  in the one field that certifies every other value, which is this ledger's
-  own thesis turned on the ledger. And the staleness triggers are narrowed:
-  Round 6 made activity on #393, #376, #206 and #287 automatically invalidate
-  this snapshot, though none of them is #345 work and none can change whether
-  a #345 box has evidence.<br><br>All citations re-resolved again — 67 moved
-  (`app.js` +9 then +18, `index.html` +21 in the context-bar block, CI shard
-  lines +1, `styles.css` +3 below line 1027). The console-error inventory
-  drifted for the fourth consecutive round (63/56/55 → 64/57/56, adding
-  `context-scope-truth` from #394) while its set-equality invariant held for
-  the fourth consecutive round at 57 = 57.
+  in the one field that certifies every other value. And the staleness
+  triggers are narrowed: Round 6 made activity on #393, #376, #206 and #287
+  automatically invalidate this snapshot, though none is #345 work.<br><br>All
+  citations re-resolved again — 67 moved (`app.js` +9 then +18, `index.html`
+  +21 in the context-bar block, CI shard lines +1, `styles.css` +3). The
+  console-error inventory drifted for the fourth consecutive round (63/56/55 →
+  64/57/56, adding `context-scope-truth` from #394) while its set-equality
+  invariant held for the fourth consecutive round at 57 = 57.<br><br>**This
+  revision was pushed once and rejected, correctly.** The first push mixed
+  Round 6 facts into current-snapshot assertions: seven rows still named
+  `57cd84dc` as the base they were verified against, criterion 7's console row
+  still carried `63/56/55` while §3.8 said `64/57/56`, and §3.9 was labelled
+  RESOLVED while still asserting in the present tense that the protocol "still
+  tells" validators the wrong expectation. Every individual citation resolved;
+  the document simply contradicted itself, and neither the citation checker nor
+  docs CI can see that. The checker now also asserts, mechanically: that no
+  current-snapshot assertion names a base other than the declared one; that
+  exactly one console inventory and one set-equality appear outside explicitly
+  historical text; that no `RESOLVED` finding contains a present-tense claim
+  the cited current file contradicts; and that the snapshot timestamp is not in
+  the future. **The lesson is the document's own: an instrument that checks
+  only what it was built to check will certify a document that disagrees with
+  itself.**
