@@ -294,9 +294,21 @@ async function checkViewport(browser, viewport) {
 
     // (4) COMMIT sends the reviewed turnaround, and really creates the game.
     await page.click("[data-sched-commit]");
-    await page.waitForFunction(
-      () => /Committed 1 draft game\(s\)/.test(document.body.textContent || ""),
-      null, { timeout: 15000 });
+    try {
+      await page.waitForFunction(
+        () => /Committed 1 draft game\(s\)/.test(document.body.textContent || ""),
+        null, { timeout: 15000 });
+    } catch (_) {
+      // A Commit that dropped the reviewed turnaround regenerates with none,
+      // produces a different fingerprint, and is refused as preview_stale.
+      // Report what the operator would actually see rather than a bare
+      // timeout, since that is the whole diagnosis.
+      const toastText = await page.evaluate(() => {
+        const root = document.querySelector("#toast-root");
+        return (root ? root.textContent : "").replace(/\s+/g, " ").trim();
+      });
+      fail(`commit never reported success; the live region read: "${toastText}"`);
+    }
     if (commitBodies.length !== 1
         || !commitBodies[0].constraints
         || commitBodies[0].constraints.min_turnaround_minutes !== 30) {
