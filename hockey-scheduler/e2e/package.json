@@ -30,6 +30,7 @@
     "scheduler-already-scheduled": "node scheduler-already-scheduled.js",
     "scheduler-team-overlap": "node scheduler-team-overlap.js",
     "scheduler-meetings-format": "node scheduler-meetings-format.js",
+    "scheduler-turnaround": "node scheduler-turnaround.js",
     "ice-availability-builder": "node ice-availability-builder.js",
     "facilities-venue-access": "node facilities-venue-access.js",
     "setup-prerequisite-floors": "node setup-prerequisite-floors.js",

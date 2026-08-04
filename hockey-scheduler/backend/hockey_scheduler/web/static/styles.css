@@ -550,6 +550,13 @@ select.player-picker {
 .li .li-title { font-size: 15px; font-weight: 500; }
 .li .li-sub { font-size: 12px; color: var(--muted); margin-top: 1px; }
 .li .li-time { font-size: 13px; font-weight: 600; color: var(--ink); }
+/* #390 — the calendar day ABOVE the clock time on scheduler rows. A wrapper
+   rather than nesting the date inside .li-time, so .li-time keeps holding
+   exactly the clock: it is styled and read by surfaces that predate this.
+   Stacked (not inline) so the 390px viewport keeps the matchup title on its
+   own line, and muted so the time stays the primary reading. */
+.li .li-when { display: flex; flex-direction: column; white-space: nowrap; }
+.li .li-when .li-date { font-size: 11px; font-weight: 600; color: var(--muted); }
 
 .pill { font-size: 11px; font-weight: 600; padding: 3px 9px; border-radius: 20px; }
 .pill.available { background: #e3f9e8; color: #1c8c39; }

@@ -929,8 +929,11 @@ class ExplanationFormatterContractTest(unittest.TestCase):
             tid: [BASE + timedelta(minutes=offset)
                   for offset in range(0, 360, 60)]
             for tid in ("t0", "t1")}
+        # #390 added the turnaround clause, which reads the team-occupancy
+        # map rather than the start-time list this fixture drives; an empty
+        # occupancy keeps this a test of the ``min_rest`` nested cap alone.
         rest = next(r for r in sched._slot_constraint_rejections(
-            slot, "t0", "t1", con, team_slots) if r["code"] == "min_rest")
+            slot, "t0", "t1", con, team_slots, {}) if r["code"] == "min_rest")
         self.assertEqual(len(rest["details"]["conflicts"]), 4)
         self.assertEqual(rest["details"]["omitted_conflict_count"], 8)
         # Which four is not arbitrary -- canonical order, so two runs over the
@@ -1040,8 +1043,12 @@ class ExplanationBudgetAndObserverTest(unittest.TestCase):
         args = ("ls", ["t0", "t1"], preview["draft_games"], rows,
                 preview["unschedulable_teams"], preview["already_scheduled"],
                 preview["meetings_per_opponent"])
+        # #390 review -- the reviewed turnaround is bound too, so reproducing
+        # the preview's own fingerprint means replaying its value as well.
+        turnaround = preview["min_turnaround_minutes"]
         self.assertEqual(
-            preview["draft_fingerprint"], sched._draft_fingerprint(*args))
+            preview["draft_fingerprint"],
+            sched._draft_fingerprint(*args, min_turnaround_minutes=turnaround))
         rewritten = copy.deepcopy(rows)
         rewritten[0]["explanation"] = {
             "value_object_version": 99,
@@ -1053,7 +1060,7 @@ class ExplanationBudgetAndObserverTest(unittest.TestCase):
         self.assertEqual(
             sched._draft_fingerprint(
                 args[0], args[1], args[2], rewritten, args[4], args[5],
-                args[6]),
+                args[6], min_turnaround_minutes=turnaround),
             preview["draft_fingerprint"])
         # Control: the fields the gate DOES bind still move it, so the
         # equality above is a statement about `explanation`, not about a
@@ -1062,7 +1069,7 @@ class ExplanationBudgetAndObserverTest(unittest.TestCase):
         self.assertNotEqual(
             sched._draft_fingerprint(
                 args[0], args[1], args[2], rewritten, args[4], args[5],
-                args[6]),
+                args[6], min_turnaround_minutes=turnaround),
             preview["draft_fingerprint"])
 
     def test_rejection_and_alternative_caps_report_exact_omitted_counts(self):

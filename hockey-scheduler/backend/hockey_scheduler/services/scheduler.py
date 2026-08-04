@@ -39,6 +39,20 @@ team-wide — keyed by stable team id and actual interval, never by rink or
 display name — and covers BOTH already-persisted games and the candidates
 this very batch has already accepted, so the preview can no longer show (and
 offer to commit) a physically impossible schedule.
+
+A team also gets a configurable TURNAROUND between consecutive games (#390),
+``min_turnaround_minutes``, measured in minutes from the previous game's END.
+Three defects compounded before it existed and none was visible alone: the
+Generate screen sent no rest value at all, so it defaulted to zero; the
+calculation compared game START times, so a 14:00-15:30 game followed by a
+15:30 game reported 90 minutes of "rest" and no actual ice-free time; and it
+consulted only this batch's own picks, never the games already on the ice.
+The fix reads the SAME occupancy map #373 built — persisted games plus this
+batch's accepted candidates — through one predicate,
+:func:`turnaround_conflicts`, which the preview's decision path, the
+preview's bounded explanation, and the commit gate all call. Zero (the
+default) returns no conflicts without reading occupancy at all, so every
+pre-#390 proposal is byte-identical.
 """
 
 import hashlib
@@ -253,6 +267,20 @@ def _normalize_constraints(constraints):
             or min_rest < 0:
         raise ValidationError("'min_rest_hours' must be a number >= 0.")
 
+    # #390 — the turnaround, in MINUTES and measured from the previous game's
+    # END. Deliberately a SECOND field rather than a redefinition of
+    # ``min_rest_hours``: that one is a start-to-start rest window (#85) and
+    # every caller and regression that uses it means exactly that. A rink
+    # turnaround is a resurfacing-and-changeover interval, so hours cannot
+    # express it and the edge it measures from is different. Both may be set;
+    # they are independent clauses evaluated independently.
+    turnaround = c.get("min_turnaround_minutes")
+    turnaround = 0 if turnaround is None else turnaround
+    if isinstance(turnaround, bool) \
+            or not isinstance(turnaround, (int, float)) or turnaround < 0:
+        raise ValidationError(
+            "'min_turnaround_minutes' must be a number >= 0.")
+
     max_per_day = c.get("max_games_per_team_per_day")
     max_per_day = 0 if max_per_day is None else max_per_day
     if isinstance(max_per_day, bool) or not isinstance(max_per_day, int) \
@@ -267,8 +295,19 @@ def _normalize_constraints(constraints):
             c.get("season_blackout_dates"), "season_blackout_dates"),
         "holiday_dates": _date_set(c.get("holiday_dates"), "holiday_dates"),
         "min_rest_hours": float(min_rest),
+        "min_turnaround_minutes": float(turnaround),
         "max_per_day": int(max_per_day),
     }
+
+
+def turnaround_minutes(constraints):
+    """The normalized turnaround (minutes) from a raw constraints mapping.
+
+    The commit gate needs the same number the preview used and must derive it
+    the same way — including the same ``ValidationError`` for a bad shape —
+    so it reads it through this one accessor rather than reaching into the
+    request body itself (#390 req 3)."""
+    return _normalize_constraints(constraints)["min_turnaround_minutes"]
 
 
 # Every code this engine can report, in the fixed priority order _slot_reason
@@ -282,6 +321,15 @@ TEAM_BLACKOUT = "team_blackout"
 RINK_BLACKOUT = "rink_blackout"
 MAX_PER_DAY = "max_per_day"
 MIN_REST = "min_rest"
+# #390 — the configurable turnaround, measured from the previous game's END.
+# A DISTINCT code from MIN_REST rather than an overload of it: the two answer
+# different questions (start-to-start rest vs. ice-free changeover time),
+# carry different units, and an operator remediating one is not remediating
+# the other. It is registered in #379's own tables — the reason-code order,
+# the detail allowlist, the nested-row allowlist and the alternatives
+# formatter — so the explanation extends that contract through its existing
+# mechanisms instead of inventing a parallel one.
+MIN_TURNAROUND = "min_turnaround"
 NO_ICE_AVAILABLE = "no_ice_available"
 # #277 Slice B — the scheduler's ADVISORY mirror of the commit gate's policy
 # checks (SetupService._slot_policy_violation, the single shared
@@ -311,7 +359,114 @@ TEAM_OVERLAP = "team_overlap"
 ICE_ALREADY_SELECTED = "ice_already_selected"
 
 
-def _slot_constraint_rejections(slot, home, away, con, team_slots):
+MAX_TURNAROUND_CONFLICTS = 4
+# One wording, used by the preview's short-circuit reason, the preview's
+# bounded explanation, and the commit gate's refusal — the phrase the issue
+# asks an operator to see.
+TURNAROUND_MESSAGE = "minimum turnaround not met"
+
+
+def _turnaround_gap_minutes(start, end, other_start, other_end):
+    """Ice-free minutes between two of ONE team's games, or ``None`` if the
+    two windows overlap (#390).
+
+    This is the whole arithmetic of the fix, isolated so preview and commit
+    cannot drift apart. Two properties are load-bearing:
+
+    * the gap is measured EDGE TO EDGE — the later game's start minus the
+      earlier game's END. Comparing starts (what ``min_rest_hours`` does, and
+      what this engine did for every rest calculation before #390) reports 90
+      minutes of rest for a 14:00-15:30 game followed by a 15:30 game, which
+      has none;
+    * it is UNDIRECTED. The comparison set is a team's persisted occupancy
+      plus this batch's accepted candidates, neither of which is ordered
+      relative to the candidate being tested, so the neighbour may be on
+      either side. A one-sided check would silently pass a candidate that
+      ends the instant an already-booked game begins.
+
+    Overlapping windows return ``None`` rather than a negative gap: an
+    overlap is a physical impossibility, already refused (and far more
+    precisely diagnosed) by ``team_overlap``, and turning it into a
+    turnaround refusal would change which reason an established fixture
+    reports.
+    """
+    if start >= other_end:
+        return (start - other_end).total_seconds() / 60.0
+    if other_start >= end:
+        return (other_start - end).total_seconds() / 60.0
+    return None
+
+
+def turnaround_conflicts(start, end, team_ids, occupancy, minutes,
+                         in_scope_game_ids=None):
+    """Every booking that leaves one of ``team_ids`` less than ``minutes`` of
+    turnaround around the window ``start``-``end`` (#390).
+
+    THE shared predicate. The preview's decision path, the preview's bounded
+    explanation observer, and the commit gate all call this one function over
+    the same shape of input, so "the identical check at commit" is a property
+    of the code rather than a claim about two implementations. #382 shipped a
+    commit guard that asked a different question from the preview and refused
+    legitimate commits for a month; one predicate is the structural fix for
+    that class of defect.
+
+    ``occupancy`` is ``{team_id: [(start, end, game_id_or_None)]}`` — exactly
+    the map :func:`_team_overlap_reason` reads, which is what makes BOTH of
+    the issue's enforcement clauses fall out of one lookup: it is seeded from
+    :func:`_persisted_team_spans` (the games already on the ice, which the
+    pre-#390 rest calculation never consulted at all) and grown in place with
+    every candidate this batch accepts (``game_id`` ``None``, since nothing is
+    persisted yet). A pairing placed earlier in the same generation is as real
+    a constraint as one already committed.
+
+    ``minutes`` of zero (the default, and every pre-#390 caller) returns no
+    conflicts without reading ``occupancy``, so the proposal is byte-identical
+    to the historical one.
+
+    ``in_scope_game_ids``, when supplied, is the set of Game ids the caller is
+    entitled to be told about (#379). The occupancy snapshot is deliberately
+    unfiltered so preview and commit measure the same physical edges (#373),
+    which is exactly why a neighbouring Season sharing a Venue can put a
+    foreign Game into this comparison: the collision is still reported, with
+    its ``conflict_game_id`` withheld. ``None`` means "no boundary applies" —
+    the commit gate's own use, where the conflicting Game is by construction
+    blocking the caller's own batch and every sibling gate
+    (``_assert_slot_free_for_game``) already names it.
+
+    Rows are returned in canonical order so two runs over the same facts
+    produce the identical list, and therefore the identical
+    ``draft_fingerprint``, on every backend.
+    """
+    if minutes <= 0:
+        return []
+    conflicts = []
+    for tid in team_ids:
+        for other_start, other_end, game_id in occupancy.get(tid, ()):
+            gap = _turnaround_gap_minutes(start, end, other_start, other_end)
+            if gap is None or gap >= minutes:
+                continue
+            # The SOURCE is decided before the id is withheld, so a foreign
+            # existing Game is never mislabelled as one of this batch's own
+            # proposals just because its id was suppressed.
+            source = "existing_game" if game_id is not None else "proposed_game"
+            reported_id = game_id
+            if in_scope_game_ids is not None \
+                    and reported_id not in in_scope_game_ids:
+                reported_id = None
+            conflicts.append({
+                "team_id": tid,
+                "conflict_source": source,
+                "conflict_game_id": reported_id,
+                "conflict_start_time": other_start.isoformat(),
+                "conflict_end_time": other_end.isoformat(),
+                "gap_minutes": gap,
+                "shortfall_minutes": minutes - gap,
+            })
+    return sorted(conflicts, key=_canonical_sort_key)
+
+
+def _slot_constraint_rejections(slot, home, away, con, team_slots, occupancy,
+                                in_scope_game_ids=None):
     """All request-constraint rejections for one candidate, in stable priority.
 
     The order mirrors :func:`_slot_reason`, whose independent established path
@@ -393,10 +548,36 @@ def _slot_constraint_rejections(slot, home, away, con, team_slots):
                     "omitted_conflict_count": len(conflicts) - len(kept),
                 },
             })
+    # #390 — the same nested bound ``min_rest`` above carries: the nearest few
+    # blocking games are enough to remediate this candidate, and the rest is
+    # COUNTED rather than dropped silently.
+    turnaround = turnaround_conflicts(
+        slot.start_time, slot.end_time, (home, away), occupancy,
+        con["min_turnaround_minutes"], in_scope_game_ids)
+    if turnaround:
+        kept = turnaround[:MAX_TURNAROUND_CONFLICTS]
+        rejected.append({
+            "code": MIN_TURNAROUND,
+            "message": TURNAROUND_MESSAGE,
+            "details": {
+                "team_ids": sorted({c["team_id"] for c in turnaround}),
+                "min_turnaround_minutes": con["min_turnaround_minutes"],
+                # An unnameable blocker DROPS the field rather than nulling
+                # it — byte-identical to how the `team_overlap` observer
+                # treats an out-of-context (or not-yet-persisted) Game, so
+                # the allowlist simply omits it and a reader never has to
+                # tell "no id" from "id withheld" by inspecting a null.
+                "conflicts": [
+                    {k: v for k, v in c.items()
+                     if not (k == "conflict_game_id" and v is None)}
+                    for c in kept],
+                "omitted_conflict_count": len(turnaround) - len(kept),
+            },
+        })
     return rejected
 
 
-def _slot_reason(slot, home, away, con, team_slots):
+def _slot_reason(slot, home, away, con, team_slots, occupancy):
     """Why ``slot`` can't host ``home`` vs ``away`` under the constraints, as
     ``(code, message)``, or ``(None, None)`` if it can. ``team_slots`` maps
     team_id -> [assigned start_time]."""
@@ -424,6 +605,14 @@ def _slot_reason(slot, home, away, con, team_slots):
             for start in team_slots.get(tid, []):
                 if abs(slot.start_time - start) < rest:
                     return MIN_REST, "minimum rest between games not met"
+    # #390 — evaluated LAST of the request constraints and through the SAME
+    # predicate the explanation observer and the commit gate call. Appending
+    # it here keeps every reason code an existing slot already reported
+    # unchanged: with the default zero turnaround the predicate returns
+    # nothing without reading ``occupancy`` at all.
+    if turnaround_conflicts(slot.start_time, slot.end_time, (home, away),
+                            occupancy, con["min_turnaround_minutes"]):
+        return MIN_TURNAROUND, TURNAROUND_MESSAGE
     return None, None
 
 
@@ -629,7 +818,13 @@ def _candidate_explanation_record(store, slot, home, away, *, used, con,
         "code": item["code"],
         "details": item.get("details") or {},
     } for item in _slot_constraint_rejections(
-        slot, home, away, con, team_slots))
+        slot, home, away, con, team_slots, occupancy,
+        # #379's in-scope-game-id rule applies to the turnaround evidence for
+        # the same reason it applies to ``team_overlap``: the occupancy this
+        # reads is the UNFILTERED active-game snapshot (#373), so a
+        # neighbouring Season sharing a Venue routinely collides with
+        # in-context ice.
+        in_scope_game_ids))
 
     if policy_check is not None:
         policy_code, _policy_message, policy_details = policy_check(
@@ -710,10 +905,21 @@ def _assign_ice(store, pairings, slots, constraints, policy_check=None,
     for home, away, division_id in pairings:
         chosen, messages, codes = None, [], []
         team_conflicts = []
+        turnaround_rows = []
         for s in slots:
             if s.id in used:
                 continue
-            code, message = _slot_reason(s, home, away, con, team_slots)
+            code, message = _slot_reason(s, home, away, con, team_slots,
+                                         occupancy)
+            if code == MIN_TURNAROUND:
+                # #390 — the structured half of the turnaround report, built
+                # from the SAME predicate that just refused the slot. The
+                # in-scope filter is applied here too, one notch tighter than
+                # #379 requires of the explanation alone, so no out-of-context
+                # Game id can reach the response through this field either.
+                turnaround_rows.extend(turnaround_conflicts(
+                    s.start_time, s.end_time, (home, away), occupancy,
+                    con["min_turnaround_minutes"], in_scope_game_ids))
             if code is None and policy_check is not None:
                 code, message = policy_check(
                     s, rink_spans.get(s.rink_id, ()))
@@ -770,6 +976,13 @@ def _assign_ice(store, pairings, slots, constraints, policy_check=None,
                 # blackouts/rest/policy, so it is a positive signal rather
                 # than a field that is always present and usually noise.
                 "team_conflicts": _dedupe_team_conflicts(team_conflicts),
+                # #390 — the same shape for the turnaround: WHICH team, which
+                # blocking game, and the shortfall in minutes, so a caller can
+                # act on the refusal without parsing English. Empty for every
+                # pairing not blocked by turnaround, and always empty when no
+                # turnaround is configured.
+                "turnaround_conflicts": _dedupe_turnaround_conflicts(
+                    turnaround_rows),
             }
             if explanation_budget is not None:
                 allowance, preview_limited = explanation_budget.reserve(len(slots))
@@ -809,6 +1022,36 @@ def _dedupe_team_conflicts(conflicts):
         seen.add(key)
         out.append(c)
     return sorted(out, key=_canonical_sort_key)
+
+
+def _dedupe_turnaround_conflicts(conflicts):
+    """Collapse the per-candidate-slot turnaround records into one
+    deterministic, STRUCTURALLY BOUNDED list (#390) — the same shape
+    :func:`_dedupe_team_conflicts` gives overlaps.
+
+    A pairing is tried against EVERY free slot, and each candidate has its own
+    gap from the same blocker, so a list keyed by the measured gap would grow
+    as ``slots x blockers x teams``. This list is returned in the response AND
+    hashed into ``draft_fingerprint``, so its size has to be a function of the
+    facts rather than of how much ice happened to be scanned. Keyed by
+    ``(team, source, blocking game)`` alone, it is bounded exactly as the
+    overlap sibling is: two teams times the games they are actually booked in.
+
+    Which row survives is not arbitrary. An operator asking "how close did
+    this come?" wants the SMALLEST shortfall, so the surviving row is the
+    LARGEST gap — the nearest miss. Ties fall back to the row's own canonical
+    JSON, so the choice never depends on generation order, and the final list
+    is canonically ordered: two runs over the same facts produce the identical
+    list, and therefore the identical ``draft_fingerprint``, on every backend.
+    """
+    best = {}
+    for c in conflicts:
+        key = (c["team_id"], c["conflict_source"], c["conflict_game_id"])
+        current = best.get(key)
+        if current is None or (c["gap_minutes"], _canonical_sort_key(c)) > (
+                current["gap_minutes"], _canonical_sort_key(current)):
+            best[key] = c
+    return sorted(best.values(), key=_canonical_sort_key)
 
 
 def _unschedulable_teams(store, team_ids, pairings, unscheduled):
@@ -1030,7 +1273,7 @@ def _canonical_sort_key(row):
 
 def _draft_fingerprint(league_season_id, team_ids, draft_games, unscheduled,
                         unschedulable_teams, already_scheduled,
-                        meetings_per_opponent=1):
+                        meetings_per_opponent=1, *, min_turnaround_minutes):
     """Deterministic identity of exactly what this proposal reviewed — #328
     review round 5, widened rounds 7, 10, 11, 12, 15, and 16. Bound into the response
     so the commit path can prove, right before writing, that this fact
@@ -1176,6 +1419,13 @@ def _draft_fingerprint(league_season_id, team_ids, draft_games, unscheduled,
             # identical — the reviewed diagnosis has changed even though the
             # reviewed batch looks unmoved.
             "team_conflicts": list(u.get("team_conflicts") or ()),
+            # #390 — bound for the identical reason `team_conflicts` is: the
+            # blocking game and the shortfall an operator read on screen are
+            # part of what was reviewed. A blocking game being cancelled (or
+            # moved a few minutes) between Generate and Commit rewrites the
+            # named game and the shortfall while the pairing, its reason
+            # codes and every placement above stay byte-for-byte identical.
+            "turnaround_conflicts": list(u.get("turnaround_conflicts") or ()),
         }
         for u in unscheduled), key=_canonical_sort_key)
     blocked_teams = sorted((
@@ -1201,6 +1451,30 @@ def _draft_fingerprint(league_season_id, team_ids, draft_games, unscheduled,
         # commit is asking for" a guaranteed mismatch instead of one that
         # happens to fall out of the row lists.
         "meetings_per_opponent": meetings_per_opponent,
+        # #390 review blocker — the reviewed TURNAROUND POLICY, bound directly
+        # for exactly the reason `meetings_per_opponent` above is, and it is
+        # the third time this repo has had to learn it (#382 bound the format,
+        # #381 had to persist and replay it).
+        #
+        # A parameter that changes what is ALLOWED but is not bound to what
+        # was REVIEWED is echoed, not enforced. Before this, a caller could
+        # Generate with a non-zero turnaround and Commit with 0 whenever both
+        # values happened to produce identical rows — and committing with 0
+        # skips the commit-time turnaround state entirely, so a same-team game
+        # landing inside the reviewed gap could be committed straight through
+        # a safety rule the operator had explicitly asked for.
+        #
+        # Binding the NORMALIZED value (a float, from
+        # :func:`_normalize_constraints`) rather than the raw request field
+        # means `60`, `60.0` and an equivalent restatement hash identically,
+        # while any real change to the reviewed policy is a guaranteed
+        # mismatch instead of one that happens to fall out of the row lists.
+        #
+        # The parameter is keyword-only and REQUIRED, with no default: this
+        # function has two call sites (Division-only and League-wide), and a
+        # default would let a missed one silently reopen the hole on that path
+        # rather than failing loudly.
+        "min_turnaround_minutes": min_turnaround_minutes,
     }
     return hashlib.sha256(json.dumps(
         payload, sort_keys=True, separators=(",", ":"), default=str
@@ -1260,15 +1534,30 @@ def draft_schedule(store, division_id, slot_ids=None, constraints=None,
         })
     unschedulable_teams = _unschedulable_teams(
         store, teams, pairings, unscheduled)
+    # #390 — resolved ONCE, then both echoed and hashed. Computing it twice
+    # would let the number the operator reviewed and the number the commit
+    # compares against drift apart, which is the whole class of defect the
+    # binding below exists to close.
+    turnaround = turnaround_minutes(constraints)
     return {
         "division_id": division_id, "team_count": len(teams),
         "meetings_per_opponent": meetings,
+        # #390 — echo the NORMALIZED turnaround the proposal was generated
+        # under, exactly as ``meetings_per_opponent`` above echoes the
+        # format. The Scheduler UI must send the same value back at Commit
+        # (it is an input to the regeneration the fingerprint is compared
+        # against), and reading it off the reviewed proposal rather than off
+        # a live control is what stops an operator who nudges the control
+        # while reading a valid preview from silently redefining the batch
+        # they are about to commit.
+        "min_turnaround_minutes": turnaround,
         "draft_games": draft_games, "unscheduled": unscheduled,
         "already_scheduled": already_scheduled,
         "unschedulable_teams": unschedulable_teams,
         "draft_fingerprint": _draft_fingerprint(
             ls_id, teams, draft_games, unscheduled, unschedulable_teams,
-            already_scheduled, meetings),
+            already_scheduled, meetings,
+            min_turnaround_minutes=turnaround),
     }
 
 
@@ -1325,14 +1614,20 @@ def draft_schedule_for_league(store, season_id, league_id, division_id=None,
         })
     unschedulable_teams = _unschedulable_teams(
         store, all_teams, pairings, unscheduled)
+    # #390 — see the Division-only entry point above. This is the SECOND
+    # fingerprint call site, and binding only the other one would leave the
+    # reviewed policy unenforced on every League-wide commit.
+    turnaround = turnaround_minutes(constraints)
     return {
         "season_id": season_id, "league_id": league_id,
         "division_id": division_id, "team_count": len(all_teams),
         "meetings_per_opponent": meetings,
+        "min_turnaround_minutes": turnaround,
         "draft_games": draft_games, "unscheduled": unscheduled,
         "already_scheduled": already_scheduled,
         "unschedulable_teams": unschedulable_teams,
         "draft_fingerprint": _draft_fingerprint(
             ls_id, all_teams, draft_games, unscheduled, unschedulable_teams,
-            already_scheduled, meetings),
+            already_scheduled, meetings,
+            min_turnaround_minutes=turnaround),
     }

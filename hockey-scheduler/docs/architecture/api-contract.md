@@ -136,7 +136,23 @@ Create accepts a strict body:
 ```
 
 Alternatively, the existing Division-only scope may omit `season_id` and
-`league_id`. `meetings_per_opponent` (#375) is the regular-season format; the
+`league_id`. `constraints` carries the optional blackout/holiday dates,
+`min_rest_hours` (start-to-start), `max_games_per_team_per_day`, and
+`min_turnaround_minutes` (#390 — the ice-free interval measured from the
+previous game's END, in minutes; zero, the default, is exactly the
+pre-#390 behaviour). `POST /api/scheduler/draft` echoes the normalized
+`min_turnaround_minutes` back on the proposal, and
+`POST /api/scheduler/commit` must be sent the SAME `constraints` the
+preview was generated with. The normalized `min_turnaround_minutes` is
+bound into `draft_fingerprint` itself, so a dropped or changed reviewed
+turnaround is refused as `preview_stale` **even when the resulting rows
+are byte-for-byte identical** — echoing the value would leave a caller
+free to Generate with a turnaround and Commit with `0`, which skips the
+commit-time turnaround check entirely.
+A commit whose reviewed row no longer meets the turnaround is refused with
+`409 schedule_conflict` and `details.reason = "min_turnaround"`, naming
+the blocking Game, the measured `gap_minutes` and the
+`shortfall_minutes`. `meetings_per_opponent` (#375) is the regular-season format; the
 scenario records the value the generator actually applied (an omitted format is
 stored as `1`, not left absent) and **replays that same N at commit**.
 

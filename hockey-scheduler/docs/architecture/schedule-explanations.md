@@ -136,7 +136,14 @@ Venue names, blackout notes, Player/guardian/contact/medical data, or arbitrary
 operator-entered text. The allowlist applies to the ROWS of the two nested
 evidence lists (`min_rest.conflicts`, `team_overlap.conflicts`) as well as to
 the top-level detail fields — a nested dict is rebuilt from
-`_SAFE_NESTED_ROW_FIELDS`, never copied. The producer of the team-overlap rows
+`_SAFE_NESTED_ROW_FIELDS`, never copied. #390's `min_turnaround.conflicts`
+is a third such list and is registered the same way — its rows carry only
+identifiers and durations (team, blocking Game, that Game's own window, the
+measured gap, the shortfall), it is capped at the same four rows with an
+explicit `omitted_conflict_count`, and an unnameable blocking Game DROPS
+`conflict_game_id` rather than nulling it, byte-identically to how the
+team-overlap observer treats an out-of-context or not-yet-persisted Game.
+The producer of the team-overlap rows
 sits beside `_team_overlap_reason`, whose own conflict records carry
 `team_name`, so "whatever today's producer passes" is not a safe rule. A Season with zero active venue-access grants receives
 the concrete `review_season_venue_access` correction carrying only the selected
@@ -227,6 +234,9 @@ the suite green before its test existed.
 | Stop seeding the scope from the Division entry point | `test_an_in_scope_conflicting_game_is_still_named` (`shape='division'`) |
 | Stop seeding the scope from the League-wide entry point | `test_an_in_scope_conflicting_game_is_still_named` (`shape='league-wide'`) |
 | Uncap `min_rest.conflicts` (`kept = conflicts`) | `test_nested_evidence_rows_are_capped_and_count_what_they_dropped` |
+| Copy `min_turnaround.conflicts` rows verbatim | `test_nested_conflict_rows_are_allowlisted_and_capped` (`test_scheduler_turnaround`) |
+| Uncap `min_turnaround.conflicts` | `test_conflicts_are_capped_at_four_with_an_omitted_count` (`test_scheduler_turnaround`) |
+| Keep the `min_turnaround` `conflict_game_id` unconditionally | `test_out_of_scope_game_ids_never_reach_the_payload` (`test_scheduler_turnaround`) |
 | Drop the per-team `break` in `_team_overlap_reason` | `test_team_overlap_reports_at_most_one_row_per_team` |
 | Delete `_authorize_schedule_target` from `draft_season_schedule` | `test_no_candidate_evidence_is_built_for_a_refused_target` (`test_draft_context_scope`) |
 
@@ -237,6 +247,11 @@ naming/persistence, generation fingerprints, stale/atomic commit refusal, and
 transactions belong to #378 and are intentionally unchanged here. Configurable
 meeting counts, existing/cancelled/exhibition counting, deterministic home/away,
 and regeneration/idempotence belong to #375 and are also unchanged.
+The `min_turnaround` code registers itself in this module's existing tables
+(`REASON_CODE_ORDER` next to `min_rest`, `_SAFE_DETAIL_FIELDS`,
+`_SAFE_NESTED_ROW_FIELDS`, and one `_alternative_for` branch yielding
+`review_minimum_turnaround_policy`); the turnaround RULE itself belongs to
+#390 and lives in `services/scheduler.py`.
 
 ### `explanation` is deliberately OUT of `draft_fingerprint`
 
