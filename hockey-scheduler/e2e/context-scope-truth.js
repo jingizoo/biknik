@@ -745,6 +745,16 @@ async function checkScopeTruth(browser, viewport) {
     await alphaPaint;
     assertHeld(`${L}/C`, "overview", "Alpha");
 
+    // IN PLACE, before touching anything. This is the assertion that actually
+    // pins the property, and it has to happen here: every navigation triggers
+    // a fresh render, so checking after one would wipe a stale repaint before
+    // it could ever be seen. An earlier revision of this file only checked
+    // after navigating, and disabling the render-generation guard chain
+    // outright still passed -- the journey was reading the screen the stale
+    // response had already been painted over.
+    assertStandings(`${L}/C after-stale-overview-lands`,
+      await readStandings(page, `${L}/C after-stale-overview-lands`), "Bravo");
+
     // -----------------------------------------------------------------------
     // (D) The stale Alpha overview has now been delivered. Bravo must still be
     //     on screen, on all three views -- and Roster must have dropped the
@@ -799,6 +809,11 @@ async function checkScopeTruth(browser, viewport) {
     await new Promise((r) => setTimeout(r, HOLD_MS + 1500));
     await bravoPaint;
     assertHeld(`${L}/E`, "standings", "Bravo");
+
+    // Again IN PLACE, for the same reason as (C): a stale repaint is only
+    // observable before the next navigation repaints over it.
+    assertStandings(`${L}/E after-stale-standings-lands`,
+      await readStandings(page, `${L}/E after-stale-standings-lands`), "Alpha");
 
     await assertAllThree(page, "Alpha", `${L}/E alpha-again`);
     await page.unroute(/\/api\/(demo\/overview|standings\/)/);
