@@ -93,7 +93,7 @@ def _annotate_missing_venue_access(store, result, season_id, league_id):
 
 
 def draft_schedule(store, division_id, slot_ids=None, constraints=None,
-                   meetings_per_opponent=None):
+                   meetings_per_opponent=None, games_per_team=None):
     division = store.get_division(division_id) if division_id else None
     # Preserve the scheduler/API's established not-found behavior via the shared
     # resolver rather than returning an empty cross-league proposal.
@@ -113,7 +113,8 @@ def draft_schedule(store, division_id, slot_ids=None, constraints=None,
     base_ids = scoped_slot_ids or ["\0no-season-scoped-slot"]
     result = _base_draft_schedule(
         store, division_id, slot_ids=base_ids, constraints=constraints,
-        meetings_per_opponent=meetings_per_opponent)
+        meetings_per_opponent=meetings_per_opponent,
+        games_per_team=games_per_team)
 
     if not scoped_slot_ids:
         for row in result["unscheduled"]:
@@ -131,7 +132,8 @@ def draft_schedule(store, division_id, slot_ids=None, constraints=None,
 
 def draft_schedule_for_league(store, season_id, league_id, division_id=None,
                               slot_ids=None, constraints=None,
-                              meetings_per_opponent=None):
+                              meetings_per_opponent=None,
+                              games_per_team=None):
     """League-wide counterpart of ``draft_schedule`` (#233 Slice G): the
     ``league_id`` here is the canonical grouping League
     (``store.get_league``), never this module's own Program-scoped
@@ -154,7 +156,8 @@ def draft_schedule_for_league(store, season_id, league_id, division_id=None,
     result = _base_draft_schedule_for_league(
         store, season_id, league_id, division_id=division_id,
         slot_ids=base_ids, constraints=constraints,
-        meetings_per_opponent=meetings_per_opponent)
+        meetings_per_opponent=meetings_per_opponent,
+        games_per_team=games_per_team)
 
     if not scoped_slot_ids:
         for row in result["unscheduled"]:

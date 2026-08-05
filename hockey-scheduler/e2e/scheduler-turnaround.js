@@ -220,10 +220,21 @@ async function checkViewport(browser, viewport) {
     }
 
     await page.selectOption("#sched-div", ids.div);
-    // Two meetings per opponent: the REGULAR game above satisfies the first,
-    // which is what leaves exactly ONE obligation outstanding for the
-    // candidate slots to compete over.
-    await page.selectOption("#sched-meetings", "2");
+    // Two guaranteed games per team: this Division has exactly two teams, so
+    // that is two meetings for the one pair. The REGULAR game above satisfies
+    // the first, which is what leaves exactly ONE obligation outstanding for
+    // the candidate slots to compete over. (#375 inverted this control from
+    // "meetings per opponent" to guaranteed games per team; with T=2 the two
+    // spellings coincide, so the fixture's arithmetic is unchanged.)
+    // The format is now TWO controls: `#sched-format` chooses between the
+    // legacy single round-robin and the guaranteed-games format, and
+    // `#sched-games` is a bounded numeric input carrying the number (a list of
+    // options could never represent the whole 1..MAX_GAMES_PER_TEAM range the
+    // backend accepts). The number input stays disabled until the
+    // guaranteed-games format is chosen, so the order below matters.
+    await page.selectOption("#sched-format", "games");
+    await page.fill("#sched-games", "2");
+    await page.dispatchEvent("#sched-games", "change");
 
     // (1) DEFAULT: no turnaround configured -> the 3:30 slot is proposed
     // behind the 2:00-3:30 game. The defect, reachable by choice, and the
@@ -244,7 +255,7 @@ async function checkViewport(browser, viewport) {
       fail(`default: proposed row must show its calendar date, got ${JSON.stringify(s.rows[0])}`);
     }
     // The matchup title is what scheduler-already-scheduled.js and
-    // scheduler-meetings-format.js compare with ===; the date must not have
+    // scheduler-games-per-team.js compare with ===; the date must not have
     // leaked into it.
     if (s.rows[0].title !== "Turn Home vs Turn Away"
         && s.rows[0].title !== "Turn Away vs Turn Home") {

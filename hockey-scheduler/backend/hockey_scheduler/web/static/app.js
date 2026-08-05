@@ -96,10 +96,28 @@ let publicState = { schedule: null, standings: null, division: null, game: null,
 let publicTab = "schedule";        // "schedule" | "standings" (#83)
 let schedulerState = {
   division: null, preview: null, drafts: [], summary: null,
-  // #375 — the configurable regular-season format: how many times each team
-  // plays every other. 1 is the historical single round-robin, so an
-  // operator who never touches the control gets exactly the old behaviour.
-  meetings: 1,
+  // #375 — the regular-season format, INVERTED to the number the operator
+  // actually signs up for: guaranteed games their own team plays. `null`
+  // means "single round-robin" (the historical default, sent as the legacy
+  // meetings_per_opponent: 1), so an operator who never touches the control
+  // gets exactly the old behaviour; any other value is a games_per_team.
+  //
+  // Held as ONE field rather than two, because the two request spellings are
+  // alternatives the backend refuses to receive together — a second piece of
+  // state would make "both set" representable on the client, which is the
+  // drift the refusal exists to prevent.
+  gamesPerTeam: null,
+  // #375 residual blocker — the backend's structured refusal of the CURRENT
+  // format request (`games_per_team_infeasible` and its two residual
+  // siblings), held so the guidance renders next to the control that caused
+  // it instead of only in a toast. Cleared by any successful Generate.
+  //
+  // It exists because the option list no longer pre-filters feasibility:
+  // whether a G works depends on the selected Division's team count and on
+  // the Games it already has, and this screen knows neither before Generate
+  // runs. Refusing to offer the value was the old answer, and it cost every
+  // even-team Division its odd formats.
+  formatRefusal: null,
   // #390 — the configurable turnaround, in MINUTES, measured from the
   // previous game's end. 0 is exactly the pre-#390 behaviour, so an operator
   // who never touches the control gets the historical proposal; the field
@@ -8752,6 +8770,58 @@ function schedDraftRow(g) {
     <span class="pill gray">Draft</span>${delBtn("game", g.game_id,
       g.home_team_name + " vs " + g.away_team_name, "Delete draft")}</div>`;
 }
+// #375 residual blocker — MIRRORS `MAX_GAMES_PER_TEAM` in
+// `services/scheduler.py`, the ceiling `_normalize_games_per_team` enforces.
+// It is a mirror because this file cannot import Python, and a mirror is only
+// safe if something fails when it drifts: `e2e/scheduler-games-per-team.js`
+// reads the real constant out of `scheduler.py` and asserts the rendered
+// control's `max` equals it, so a change on either side that is not made on
+// both fails the journey rather than silently shrinking what an operator can
+// ask for.
+const SCHED_MAX_GAMES_PER_TEAM = 120;
+// Where the number input starts when the operator first switches to the
+// guaranteed-games format. A starting point, not a limit — every integer in
+// 1..SCHED_MAX_GAMES_PER_TEAM is typeable.
+const SCHED_DEFAULT_GAMES_PER_TEAM = 20;
+
+// The format refusals this screen explains in place rather than only in a
+// toast. All three are the same operator decision — the requested number of
+// guaranteed games cannot be honoured by THIS Division as it stands — and all
+// three carry a number to ask for instead.
+const SCHED_FORMAT_REFUSALS = [
+  "games_per_team_infeasible",
+  "games_per_team_over_scheduled",
+  "games_per_team_residual_infeasible",
+];
+
+function schedFormatRefusalBlock() {
+  const refusal = schedulerState.formatRefusal;
+  if (!refusal) return "";
+  const details = refusal.details || {};
+  // `games_per_team_infeasible` names both parity neighbours; the residual
+  // refusals name the single smallest count the existing Games can still be
+  // completed to. Normalised to one list so the guidance reads the same way
+  // whichever condition failed.
+  const nearest = (Array.isArray(details.nearest_achievable)
+    ? details.nearest_achievable
+    : (details.nearest_achievable == null ? [] : [details.nearest_achievable]))
+    .filter((n) => typeof n === "number");
+  const advice = nearest.length
+    ? `<p class="li-sub">Achievable instead: <strong>${
+      nearest.map((n) => esc(String(n))).join(" or ")}</strong>.</p>`
+    : "";
+  return `<div id="sched-format-refusal" class="card sched-empty"
+      role="status" data-reason="${esc(details.reason || "")}"
+      data-nearest="${esc(nearest.join(","))}">
+    <div class="sched-empty-lead">This Division cannot play ${
+      esc(String(details.games_per_team == null ? "" : details.games_per_team))
+    } guaranteed games per team.</div>
+    <p>${esc(refusal.message || "")}</p>
+    ${advice}
+    <p class="li-sub">Pick a different number of guaranteed games and Generate again.</p>
+  </div>`;
+}
+
 function renderScheduler(ov) {
   if (!hasPerm("manage_schedule")) {
     return `<div class="banner neutral"><h2>Operators only</h2>
@@ -8885,14 +8955,72 @@ function renderScheduler(ov) {
   return `${pageIntro("Generate draft games from open ice slots, review for conflicts, then publish.")}
     <div class="card">
       <div class="section-title" style="margin-top:0">Generate draft schedule</div>
-      <div class="dq-actions">
+      <div class="dq-actions sched-generate-row">
         <select id="sched-div">${divOptions(schedulerState.division)}</select>
-        <label class="sr-only" for="sched-meetings">Games against each opponent</label>
-        <select id="sched-meetings" title="Games against each opponent">${
-          [1, 2, 3, 4].map((n) => `<option value="${n}"${
-            n === schedulerState.meetings ? " selected" : ""
-          }>${n === 1 ? "1 game" : `${n} games`} vs each opponent</option>`).join("")
+        ${
+          // #375 — the regular-season format, as TWO controls rather than one
+          // list, because the two things being chosen are not the same kind of
+          // thing.
+          //
+          // `#sched-format` picks BETWEEN the formats. "Single round-robin"
+          // sends the legacy meetings_per_opponent: 1 and is not a spelling of
+          // any fixed games-per-team number — "play everyone once" is (T-1)
+          // games, which differs per Division — so it stays a distinct choice
+          // rather than being folded into the numbers.
+          //
+          // `#sched-games` is the NUMBER, and it is a bounded numeric input
+          // rather than a list of options. That is the whole point: the
+          // backend accepts every integer in 1..MAX_GAMES_PER_TEAM
+          // (`_normalize_games_per_team`), and any hand-written list is a
+          // strictly smaller set. The first version of this control offered
+          // only EVEN numbers, which deleted every odd season length; its
+          // replacement offered 1..30 plus a sparse tail, which still left 31,
+          // 33, 41, 42, 45, 50, 61, 119 and dozens more unreachable while
+          // claiming the full range was exposed. A list cannot represent a
+          // range; an input can, so the product and the API now agree by
+          // construction instead of by maintenance.
+          //
+          // THE ACCESSIBLE-NAME FIX THIS SUPERSEDES. A previous round put the
+          // round-robin option and the numeric options into separate labelled
+          // `<optgroup>`s, because ONE control named "Guaranteed games per
+          // team" announced a first option that is not a games-per-team value.
+          // That diagnosis was right, and splitting the control answers it at
+          // the root rather than annotating around it: each control now has a
+          // name true of everything it contains — "Regular-season format" for
+          // the choice, "Guaranteed games per team" for the number — so there
+          // is no group left to disclaim. The grouping is dropped because the
+          // two-control shape makes it unnecessary, not because the concern
+          // was wrong.
+          //
+          // FEASIBILITY is still not this control's job — it depends on the
+          // selected Division's live team count and on the Games it already
+          // has, neither of which this screen can know before Generate runs.
+          // The backend answers it and `schedFormatRefusalBlock` surfaces the
+          // answer, naming the counts that would work.
+          //
+          // `required` + the min/max/step bounds mean the browser's own
+          // constraint validation rejects 0, 121 and 1.5 before a request is
+          // built (see the Generate handler's reportValidity call) — native,
+          // keyboard-operable and screen-reader-announced, with no duplicated
+          // range logic to drift from the backend's.
+          ""
+        }<label class="sr-only" for="sched-format">Regular-season format</label>
+        <select id="sched-format" title="Regular-season format">${
+          [{ value: "rr", label: "Single round-robin (play everyone once)" },
+           { value: "games", label: "Guaranteed games per team" }]
+            .map((opt) => `<option value="${opt.value}"${
+              opt.value === (schedulerState.gamesPerTeam === null
+                ? "rr" : "games") ? " selected" : ""
+            }>${opt.label}</option>`).join("")
         }</select>
+        <label class="sr-only" for="sched-games">Guaranteed games per team</label>
+        <input id="sched-games" type="number" inputmode="numeric" required
+          min="1" max="${SCHED_MAX_GAMES_PER_TEAM}" step="1"
+          class="sched-games-input"
+          title="Guaranteed games per team (1–${SCHED_MAX_GAMES_PER_TEAM})"
+          value="${schedulerState.gamesPerTeam === null
+            ? SCHED_DEFAULT_GAMES_PER_TEAM : schedulerState.gamesPerTeam}"
+          ${schedulerState.gamesPerTeam === null ? "disabled" : ""}>
         <label class="sr-only" for="sched-turnaround">Minimum turnaround between a team's games</label>
         <select id="sched-turnaround" title="Minimum turnaround between a team's games">${
           [0, 15, 30, 45, 60, 90, 120].map((m) => `<option value="${m}"${
@@ -8901,7 +9029,7 @@ function renderScheduler(ov) {
         }</select>
         <button class="act" data-sched-generate>Generate</button>
       </div></div>
-    ${previewBlock}${summaryBlock}${draftBlock}`;
+    ${schedFormatRefusalBlock()}${previewBlock}${summaryBlock}${draftBlock}`;
 }
 
 /* ---------- Pilot onboarding import wizard (#96/#99) ----------
@@ -11342,15 +11470,32 @@ async function render() {
   const schedDiv = c.querySelector("#sched-div");
   if (schedDiv) schedDiv.onchange = () => { schedulerState.division = schedDiv.value; };
   // #375 — the configurable format. Recorded exactly like the Division
-  // select above (no re-render): the value is read fresh by BOTH the
-  // Generate and Commit handlers below, and the backend binds it into
-  // draft_fingerprint, so changing it after a Generate makes Commit fail
-  // preview_stale — already handled by the error branch, which clears the
-  // stale preview and returns focus to Generate.
-  const schedMeetings = c.querySelector("#sched-meetings");
-  if (schedMeetings) schedMeetings.onchange = () => {
-    schedulerState.meetings = Number(schedMeetings.value) || 1;
+  // select above (no re-render).
+  //
+  // ONLY GENERATE reads these controls. Commit deliberately does NOT: it
+  // reads the format off the PREVIEW the operator reviewed (see
+  // `schedCommit.onclick` below), because the controls are the input to the
+  // NEXT Generate, and an operator who nudges one while reading a still-valid
+  // proposal must not thereby redefine the batch they are about to commit.
+  // The backend binds the format into draft_fingerprint, so a Commit that did
+  // send a nudged value would regenerate a different schedule and be refused
+  // as preview_stale — handled by the error branch, which clears the stale
+  // preview and returns focus to Generate.
+  const schedFormat = c.querySelector("#sched-format");
+  const schedGames = c.querySelector("#sched-games");
+  // Read BOTH controls into the single state field. `null` means the legacy
+  // single round-robin; any number means guaranteed-games. Held as one field
+  // rather than two because the two request spellings are alternatives the
+  // backend refuses to receive together, so "both set" must not be
+  // representable on the client either.
+  const schedSyncFormat = () => {
+    const useGames = !!schedFormat && schedFormat.value === "games";
+    if (schedGames) schedGames.disabled = !useGames;
+    schedulerState.gamesPerTeam = (useGames && schedGames)
+      ? Number(schedGames.value) : null;
   };
+  if (schedFormat) schedFormat.onchange = schedSyncFormat;
+  if (schedGames) schedGames.onchange = schedSyncFormat;
   // #390 — the configurable turnaround, recorded exactly like the two selects
   // above (no re-render). It is an input to the backend's own regeneration at
   // Commit, and therefore bound into draft_fingerprint, so changing it after a
@@ -11373,9 +11518,27 @@ async function render() {
   }
   if (schedGen) schedGen.onclick = async () => {
     toast = "";
+    // Read the live controls first: `onchange` fires on blur, and a click on
+    // Generate does blur the number input, but depending on that ordering to
+    // decide what gets SENT is exactly the kind of implicit coupling that
+    // silently sends a stale format.
+    schedSyncFormat();
+    // The browser's own constraint validation (min/max/step/required on the
+    // input) rejects 0, 121 and 1.5 — announced natively, with the range read
+    // off the same single mirror of MAX_GAMES_PER_TEAM the control renders
+    // from, so there is no second copy of the bounds to drift.
+    if (schedulerState.gamesPerTeam !== null && schedGames
+        && !schedGames.reportValidity()) {
+      return;
+    }
     const res = await post("/api/scheduler/draft", {
       division_id: schedulerState.division,
-      meetings_per_opponent: schedulerState.meetings,
+      // #375 — EXACTLY ONE format field, never both: the backend refuses a
+      // request carrying both spellings, because they cannot be reconciled
+      // when a League's Divisions differ in team count.
+      ...(schedulerState.gamesPerTeam === null
+        ? { meetings_per_opponent: 1 }
+        : { games_per_team: schedulerState.gamesPerTeam }),
       // #390 — ALWAYS sent, including the 0 an untouched control means.
       // Omitting the key entirely is what the pre-#390 screen did, and the
       // backend's default then made the whole capability unreachable: an
@@ -11383,6 +11546,29 @@ async function render() {
       constraints: { min_turnaround_minutes: schedulerState.turnaround },
     });
     schedulerState.preview = (res && !res.error) ? res : null;
+    // #375 residual blocker — keep the format refusal on screen, next to the
+    // control that caused it. post() puts error.message in a toast, but the
+    // toast is one line with no room for the achievable counts and is
+    // dismissible, and this is a decision the operator has to act on: the
+    // control now spans the backend's whole accepted range, so learning which
+    // of those values THIS Division can honour is the whole replacement for
+    // the curated lists that used to answer it by omission. A successful
+    // Generate clears it.
+    const failure = (res && res.error && res.error.details) || null;
+    schedulerState.formatRefusal =
+      (failure && SCHED_FORMAT_REFUSALS.indexOf(failure.reason) !== -1)
+        ? { message: res.error.message, details: failure }
+        : null;
+    if (schedulerState.formatRefusal) {
+      // #328 review round 8 finding 4, same defect on this path: render()
+      // below replaces #content wholesale, so the Generate button the
+      // operator just activated is gone and nothing moves focus anywhere —
+      // silently dropping a keyboard user to the document body while the
+      // guidance tells them to pick another number and Generate again. The
+      // next action is always Generate, and that control always exists on
+      // this screen, so send focus back to it once the fresh content lands.
+      schedFocusGenerateAfterRender = true;
+    }
     await render();
   };
   const schedCommit = c.querySelector("[data-sched-commit]");
@@ -11401,8 +11587,16 @@ async function render() {
       // operator who nudges it while reading a still-valid proposal must
       // not thereby redefine the batch they are about to commit (nor be
       // forced to regenerate an unchanged one).
-      meetings_per_opponent: (schedulerState.preview
-        && schedulerState.preview.meetings_per_opponent) || 1,
+      //
+      // The proposal echoes exactly one of the two spellings and `null` for
+      // the other, so this forwards whichever one it actually ran under —
+      // sending both would be refused, and sending the wrong one would
+      // regenerate a different schedule and fail preview_stale.
+      ...((schedulerState.preview
+        && schedulerState.preview.games_per_team) != null
+        ? { games_per_team: schedulerState.preview.games_per_team }
+        : { meetings_per_opponent: (schedulerState.preview
+          && schedulerState.preview.meetings_per_opponent) || 1 }),
       // #390 — the turnaround the PREVIEW was generated with, echoed back by
       // the server on that proposal and read off it rather than off the live
       // select, for exactly the reason above: the select is the input to the

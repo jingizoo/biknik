@@ -242,21 +242,34 @@ def material_input_snapshot(store, scope: dict, request_input: dict,
          if (getattr(p.scope_type, "value", p.scope_type), p.scope_id)
          in policy_scope_keys), key=lambda p: p.id)
 
+    planner_input = {
+        "scope_mode": request_input.get("scope_mode"),
+        "slot_ids": _plain(requested_slot_ids),
+        # Includes the current constraint/blackout contract opaquely.
+        "constraints": _plain(request_input.get("constraints")),
+        # #382 — the regular-season format (meetings per opponent) is a
+        # material planner input: the same registrations and ice produce a
+        # different fixture list under a different N.  Recorded here so the
+        # evidence names the format, and so a stored scenario replays under
+        # the N it was generated with rather than the historical default.
+        "meetings_per_opponent": request_input.get(
+            "meetings_per_opponent"),
+    }
+    # #375 — the games-per-team spelling of that same material input, added
+    # ONLY when it is the one in play. This snapshot is hashed into
+    # `input_fingerprint`, and `_guard_material_inputs` re-derives it at
+    # commit time from a scenario's OWN stored `request_input` and refuses
+    # any difference as `schedule_scenario_stale`. An unconditional key —
+    # even one holding `None` — would therefore change the recomputed
+    # fingerprint of every scenario stored before this field existed and
+    # refuse all of them, which is the same breakage as removing the legacy
+    # field, only harder to attribute. Absent means "generated from the
+    # legacy meetings-shaped request", whose evidence must not move.
+    if request_input.get("games_per_team") is not None:
+        planner_input["games_per_team"] = request_input["games_per_team"]
     sections = {
         "scope": _scope_entities(store, scope),
-        "planner_input": {
-            "scope_mode": request_input.get("scope_mode"),
-            "slot_ids": _plain(requested_slot_ids),
-            # Includes the current constraint/blackout contract opaquely.
-            "constraints": _plain(request_input.get("constraints")),
-            # #382 — the regular-season format (meetings per opponent) is a
-            # material planner input: the same registrations and ice produce a
-            # different fixture list under a different N.  Recorded here so the
-            # evidence names the format, and so a stored scenario replays under
-            # the N it was generated with rather than the historical default.
-            "meetings_per_opponent": request_input.get(
-                "meetings_per_opponent"),
-        },
+        "planner_input": planner_input,
         "registrations": {
             "rows": _plain(registrations),
             "teams": _plain(teams),

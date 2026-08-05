@@ -131,7 +131,7 @@ Create accepts a strict body:
   "division_id": "division_1",
   "slot_ids": ["slot_1"],
   "constraints": {},
-  "meetings_per_opponent": 2
+  "games_per_team": 12
 }
 ```
 
@@ -152,12 +152,48 @@ commit-time turnaround check entirely.
 A commit whose reviewed row no longer meets the turnaround is refused with
 `409 schedule_conflict` and `details.reason = "min_turnaround"`, naming
 the blocking Game, the measured `gap_minutes` and the
-`shortfall_minutes`. `meetings_per_opponent` (#375) is the regular-season format; the
-scenario records the value the generator actually applied (an omitted format is
-stored as `1`, not left absent) and **replays that same N at commit**.
+`shortfall_minutes`.
+
+`games_per_team` (#375) is the regular-season format: the number of games each
+team is GUARANTEED, from which the per-opponent count is derived
+(`base = G // (T-1)` against everyone, with `rem = G % (T-1)` opponents played
+once more). It is refused with `400 validation_error` and
+`details.reason = "games_per_team_infeasible"` when `teams x games` is odd —
+every game contributes 2 to the league-wide count, so no construction can then
+give every team exactly G — and the message names the nearest achievable counts
+(`G-1`, `G+1`) in `details.nearest_achievable`.
+
+The number guaranteed is the team's **final season total**, counting the
+non-cancelled Regular Games already in scope, so a draft generates only the
+games still MISSING and `already_scheduled[]` reports every counted existing
+Game (one row each, carrying that Game's own home/away). Two further
+`400 validation_error` refusals cover the cases the existing Games make
+impossible — both raised before any placement or persistence, so a refused
+Generate *or* Commit writes nothing at all:
+
+* `details.reason = "games_per_team_over_scheduled"` — at least one team
+  already plays more than `G`, and generation can only add. `details` carries
+  `over_scheduled_teams[]` (`team_id`, `team_name`, `existing_games`).
+* `details.reason = "games_per_team_residual_infeasible"` — some team needs
+  more games than every other team combined can still supply, so the remaining
+  games would have to be played against teams that have reached their own
+  total. `details` carries `short_teams[]` (`team_id`, `team_name`,
+  `residual_games`, `available_games`).
+
+Both carry `details.nearest_achievable`: the smallest accepted `games_per_team`
+these existing Games can still be completed to, or `null` when none can.
+
+`meetings_per_opponent` is the LEGACY spelling (how many times each team plays
+every other) and remains accepted, because stored scenarios replay under it and
+it is the only way to say "play everyone once" without knowing a Division's
+size. **Sending both is refused** with
+`details.reason = "schedule_format_conflict"`: they cannot be reconciled when a
+League's Divisions differ in team count. A proposal echoes exactly one of them
+and `null` for the other. A scenario records the values the generator actually
+applied and **replays that same format at commit**.
 
 The response includes immutable `name`, `scope`, `planner`
-fingerprints/version, `request_input` (carrying `meetings_per_opponent`), the
+fingerprints/version, `request_input` (carrying the resolved format), the
 opaque `proposal`, and the full `generation_snapshot`. Commit takes an empty
 body. It creates unpublished draft Games only when the current material-input
 fingerprint still matches; otherwise it returns `409 concurrency_conflict` with

@@ -161,6 +161,805 @@ def round_robin_pairings(team_ids, meetings=1):
             for m in range(meetings) for h, a in base]
 
 
+# #375 — the ceiling on GUARANTEED GAMES PER TEAM. The bound is an
+# ALLOCATION bound, not a taste judgement: the pairing list this engine
+# materializes in memory before any ice is consulted is exactly
+# ``teams x games / 2`` rows, so an unbounded ``games_per_team`` turns one
+# request into an arbitrarily large allocation. 120 sits far above any real
+# regular season (the NHL plays 82) while still being a ceiling.
+MAX_GAMES_PER_TEAM = 120
+
+
+def _normalize_games_per_team(value, field="games_per_team"):
+    """Validate the operator-facing guaranteed-games-per-team count (#375).
+
+    Client input, so every bad shape raises a structured ``ValidationError``
+    rather than letting a raw TypeError cross the facade boundary — the same
+    contract :func:`_normalize_meetings` and :func:`_normalize_constraints`
+    already hold. ``None`` means "not specified" and is returned as ``None``
+    rather than defaulted, because the caller still has to tell the legacy
+    ``meetings_per_opponent`` path apart from this one.
+
+    ``bool`` is rejected explicitly even though it is an ``int`` subclass:
+    ``True`` would otherwise silently mean "1 game" and ``False`` "0",
+    neither of which any caller can have intended.
+
+    FEASIBILITY (``teams x games`` must be even) is deliberately NOT checked
+    here — it needs the team count, which only the draft entry points know.
+    See :func:`_require_feasible_games_per_team`.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValidationError(f"'{field}' must be an integer >= 1.")
+    if value < 1:
+        raise ValidationError(f"'{field}' must be an integer >= 1.")
+    if value > MAX_GAMES_PER_TEAM:
+        raise ValidationError(
+            f"'{field}' must be at most {MAX_GAMES_PER_TEAM}.")
+    return value
+
+
+def _resolve_schedule_format(meetings_per_opponent, games_per_team):
+    """Pick the ONE regular-season format this draft runs under (#375).
+
+    Returns ``(meetings, games)`` with exactly one of them set:
+
+    * ``games`` set — the operator-facing control. They asked for a number
+      of games THEIR OWN TEAM is guaranteed; the per-opponent count is
+      derived (see :func:`games_per_team_pairings`).
+    * ``meetings`` set — the LEGACY control, kept accepted. It is bound into
+      ``_draft_fingerprint`` and stored inside named scenarios (#381), so
+      dropping it would invalidate every scenario already on disk. Omitting
+      both keeps the historical single round-robin exactly.
+
+    SUPPLYING BOTH IS REFUSED rather than resolved. They are not always two
+    spellings of one thing: ``meetings_per_opponent=3`` means three meetings
+    in every Division regardless of size, while ``games_per_team=G`` derives
+    a different per-opponent count in each Division of a League-wide draft,
+    so "do they agree?" has no answer that survives a heterogeneous League.
+    Picking a winner would make the losing field a silent no-op — the exact
+    way two controls for one setting drift apart — so the caller is told to
+    send one.
+    """
+    games = _normalize_games_per_team(games_per_team)
+    if games is not None and meetings_per_opponent is not None:
+        raise ValidationError(
+            "Send either 'games_per_team' (guaranteed games each team "
+            "plays) or the legacy 'meetings_per_opponent' (games against "
+            "every opponent), not both — they set the same schedule format "
+            "two different ways and cannot be reconciled when a League's "
+            "Divisions have different team counts.",
+            {"reason": "schedule_format_conflict",
+             "games_per_team": games_per_team,
+             "meetings_per_opponent": meetings_per_opponent})
+    if games is not None:
+        return None, games
+    return _normalize_meetings(meetings_per_opponent), None
+
+
+def _games_per_team_split(store, groups, existing_rows, league_season_id,
+                          games):
+    """``(pairings, already_scheduled)`` for the guaranteed-games format,
+    derived from the EXISTING Games rather than against them (#375 residual
+    blocker).
+
+    ``groups`` is an ordered list of ``(division_id, sorted_team_ids)`` — one
+    entry for a Division-only draft, one per Division for a League-wide one.
+    ``existing_rows`` is the whole call's
+    :func:`_existing_pairing_game_rows` snapshot.
+
+    This replaces "build a target from nothing, then consume existing Games
+    against it". The order is now the other way round, and that ordering IS
+    the fix: what a team still needs cannot be known before what it already
+    has is counted. Concretely, three things are derived per group before a
+    single pairing is generated — each team's residual degree, each pair's
+    existing spread, and each pair's home/away demand — and all three feed
+    the completion (:func:`games_per_team_residual_pairings`).
+
+    FEASIBILITY IS A SEPARATE PASS over the groups in SORTED order, before
+    any group's pairings are built, for the two reasons the parity refusal
+    already had: WHICH Division a League-wide refusal names must not depend
+    on registration order (and therefore on the store backend), and the
+    generation loop below must keep the groups' ORIGINAL order, because that
+    order decides which pairings are offered ice first. One infeasible
+    Division refuses the whole request rather than quietly delivering it an
+    uneven schedule — the control is labelled "guaranteed", and a guarantee
+    honoured in three Divisions out of four is not one.
+
+    ``already_scheduled`` reports EVERY counted existing Game, one row each,
+    with that Game's own orientation. The pre-residual split reported at most
+    as many rows as the target asked for, so a pair with surplus Games had
+    the extras silently omitted from the proposal, from the operator's view
+    of their own season, and from ``draft_fingerprint``. Games in scope that
+    are not counted (see :func:`fixed_pair_counts`) are not reported here
+    either, exactly as before.
+    """
+    plans = {}
+    for division_id, teams in sorted(
+            groups, key=lambda g: (g[0] is None, g[0] or "")):
+        label = _division_label(store, division_id)
+        _require_feasible_games_per_team(len(teams), games, label=label)
+        rows = {key: value for key, value in existing_rows.items()
+                if key[0] == league_season_id and key[1] == division_id}
+        multiplicity, hosted = fixed_pair_counts(teams, rows)
+        require_completable_games_per_team(
+            teams, games, multiplicity, label=label,
+            team_names={t: _team_name(store, t) for t in teams})
+        plans[division_id] = (teams, rows, multiplicity, hosted)
+    pairings, already = [], []
+    for division_id, _teams in groups:
+        teams, rows, multiplicity, hosted = plans[division_id]
+        pairings.extend(
+            (home, away, division_id) for home, away in
+            games_per_team_residual_pairings(
+                teams, games, multiplicity, hosted))
+        members = set(teams)
+        for key in sorted(rows, key=lambda k: sorted(k[2])):
+            pair = key[2]
+            if len(pair) != 2 or not pair <= members:
+                continue
+            count = multiplicity[_pair_key(*sorted(pair))]
+            for game_id, home, away in rows[key]:
+                already.append({
+                    "home_team_id": home, "away_team_id": away,
+                    "home_team_name": _team_name(store, home),
+                    "away_team_name": _team_name(store, away),
+                    "division_id": division_id,
+                    "existing_game_id": game_id,
+                    "existing_game_count": count,
+                })
+    return pairings, already
+
+
+def _division_label(store, division_id):
+    """Human name for the group an infeasible request was asked of, so a
+    League-wide refusal says WHICH Division cannot honour it."""
+    if not division_id:
+        return None
+    division = store.get_division(division_id) if store else None
+    return division.name if division is not None else division_id
+
+
+def _require_feasible_games_per_team(team_count, games, label=None):
+    """Refuse an arithmetically impossible guarantee (#375), actionably.
+
+    Every game is played by two teams, so it contributes 2 to the
+    league-wide game count: the total ``T x G`` MUST be even. When ``T`` and
+    ``G`` are both odd it is not, and no amount of scheduling cleverness
+    fixes it — some team will always end up one game short. The owner's
+    ruling is to REFUSE rather than quietly deliver an uneven schedule under
+    a control the operator reads as "guaranteed".
+
+    The single parity condition suffices for the whole construction, not
+    just the total: ``T x (T-1)`` is always even (one of two consecutive
+    integers is), so ``T x G`` even is equivalent to ``T x rem`` even, which
+    is exactly the precondition :func:`_extra_pairs` needs — odd ``T``
+    requires an even ``rem`` to build its symmetric chords.
+
+    The message NAMES THE NEAREST ACHIEVABLE COUNTS (``G-1`` and ``G+1``,
+    both of which flip the parity) rather than merely reporting failure: an
+    operator told "20 is impossible" has to guess, while one told "ask for
+    19 or 21" can act. A neighbour that falls outside the accepted range is
+    dropped rather than suggested — ``G-1`` is not offered when it is 0, and
+    ``G+1`` is not offered past the ceiling.
+
+    ``label`` names the team group when a League-wide draft has several
+    Divisions with different team counts, so the operator learns WHICH one
+    cannot honour the request instead of just that something could not.
+
+    A group of fewer than two teams is skipped HERE, but that is a division
+    of labour and NOT an exemption from refusal (#375 review). The parity
+    argument is vacuous for such a group — with no opponent there is no
+    ``rem`` to build — so this check has nothing to say about it, and a
+    parity message ("ask for G-1 or G+1") would be useless advice when no G
+    at all is achievable. :func:`require_completable_games_per_team` refuses
+    it instead, naming the team and telling the operator to register an
+    opponent. Both entry points run that check on every group, so nothing
+    reaches the generator on the strength of this early return.
+    """
+    if team_count < 2 or (team_count * games) % 2 == 0:
+        return
+    nearest = [value for value in (games - 1, games + 1)
+               if 1 <= value <= MAX_GAMES_PER_TEAM]
+    where = f" in {label}" if label else ""
+    advice = (f" Ask for {' or '.join(str(v) for v in nearest)} games "
+              f"instead." if nearest else "")
+    raise ValidationError(
+        f"{games} guaranteed games per team is impossible with "
+        f"{team_count} teams{where}: every game is played by two teams, so "
+        f"the league-wide total ({team_count} x {games} = "
+        f"{team_count * games}) would have to be an odd number of team "
+        f"appearances and one team would always finish a game short."
+        f"{advice}",
+        {"reason": "games_per_team_infeasible",
+         "team_count": team_count,
+         "games_per_team": games,
+         "nearest_achievable": nearest})
+
+
+def _extra_pairs(teams, rem):
+    """A ``rem``-REGULAR multigraph on ``teams`` — the heart of #375.
+
+    "rem-regular" means every single team gains exactly ``rem`` extra games.
+    That is the whole correctness burden of the remainder: the ``base``
+    complete round-robins below already give everyone ``base x (T-1)``, so
+    if this function is rem-regular the total is exactly ``G`` for every
+    team, and if it is off by one anywhere the guarantee is a lie for that
+    team. Returned as UNORDERED pairs; orientation is decided by the caller.
+
+    Two constructions, because one shape does not cover both parities:
+
+    EVEN T — the circle method's rounds. With an even number of teams each
+    of the ``T-1`` rotation rounds is a PERFECT MATCHING (every team appears
+    in exactly one pair of that round), so taking the first ``rem`` rounds
+    gives every team exactly ``rem`` extra games. There are always enough
+    rounds: ``rem < T-1`` by construction, since it is a remainder mod
+    ``T-1``. Rounds of a round-robin are edge-disjoint, so no PAIR gains
+    more than one — which is what keeps the per-opponent spread at 1.
+
+    ODD T — a circulant. Odd ``T`` has no perfect matching at all (a
+    matching covers an even number of vertices), so the round trick cannot
+    work. But odd ``T`` also forces ``rem`` to be EVEN: feasibility requires
+    ``T x G`` even, so odd ``T`` forces ``G`` even; ``T-1`` is then even
+    too; and ``rem = G - base x (T-1)`` is even minus even. So the extras
+    can be built from symmetric chords: for each ``k`` in ``1..rem/2``, join
+    team ``i`` to team ``(i+k) mod T`` for every ``i``. Each ``k`` adds
+    exactly 2 to every team's degree (its ``+k`` chord and its ``-k`` one),
+    so the total is ``2 x rem/2 = rem`` — rem-regular. The chords are
+    distinct and non-degenerate because ``k < T/2``: ``rem <= T-2`` gives
+    ``rem/2 <= (T-2)/2 < T/2``, so ``k`` and ``T-k`` never collide and no
+    chord doubles back on itself. Different ``k`` touch disjoint pairs, so
+    again no pair gains more than one.
+
+    Both are pure functions of the SORTED team list — no RNG, no clock, no
+    set or dict iteration order, no store state — which is the determinism
+    contract ``round_robin_pairings`` already holds and ``_draft_fingerprint``
+    depends on.
+    """
+    if rem <= 0:
+        return []
+    n = len(teams)
+    if n % 2 == 0:
+        # Replay the same rotation `round_robin_pairings` uses, keeping only
+        # the first `rem` rounds.
+        #
+        # A prefix slice of that function's flat output WOULD work here, and
+        # an earlier version of this comment claimed otherwise: with even
+        # `n` every round contributes exactly `n // 2` pairs, so the round
+        # boundaries sit at a fixed stride and `[:rem * (n // 2)]` is the
+        # same set of pairs (orientation aside, which the caller discards).
+        # The rotation is written out anyway for a reason that is true: it
+        # depends only on `round_robin_pairings`'s DOCUMENTED contract —
+        # rounds emitted whole, in round order — rather than on the stride
+        # of its flat list, which is a layout detail that function does not
+        # promise and an odd-`n` bye already breaks. It also keeps this
+        # branch shaped like the odd-`n` one below, which has no slice to
+        # take.
+        pairs = []
+        fixed, rot = teams[0], list(teams[1:])
+        for _round in range(rem):
+            arrangement = [fixed] + rot
+            for i in range(n // 2):
+                pairs.append((arrangement[i], arrangement[n - 1 - i]))
+            rot = [rot[-1]] + rot[:-1]
+        return pairs
+    # Odd T: `rem` is guaranteed even here (see the docstring), so this
+    # halving is exact. `_require_feasible_games_per_team` is what makes
+    # that guarantee true before the generator is ever reached.
+    return [(teams[i], teams[(i + k) % n])
+            for k in range(1, rem // 2 + 1)
+            for i in range(n)]
+
+
+def _pair_key(a, b):
+    """The canonical, orientation-free identity of a matchup: the two team
+    ids as a SORTED tuple. Used as the single key type across the residual
+    planner so a pair looked up from an existing Game's orientation and one
+    looked up from a generated pairing can never miss each other."""
+    return (a, b) if a <= b else (b, a)
+
+
+def _canonical_orientation(teams):
+    """``{pair_key: (home, away)}`` — the circle method's OWN orientation for
+    meeting 0, which is the reference every home/away decision falls back to
+    when the two sides are level. Depends only on the sorted team ids."""
+    return {_pair_key(*pair): pair for pair in round_robin_pairings(teams, 1)}
+
+
+def _target_pair_order(teams, games_per_team):
+    """The canonical target as an ORDERED list of ``_pair_key`` values — the
+    exact sequence, and therefore the exact ice-assignment priority, that
+    :func:`games_per_team_pairings` emits for an EMPTY schedule.
+
+    Orientation is deliberately dropped here: it is re-derived from the
+    home/away ledger (see :class:`_HomeLedger`), which reproduces this
+    function's own alternation exactly when nothing is fixed and corrects for
+    the fixed Games when something is.
+    """
+    opponents = len(teams) - 1
+    base, rem = divmod(games_per_team, opponents)
+    order = [_pair_key(*pair) for pair in round_robin_pairings(teams, base)]
+    order.extend(_pair_key(*pair) for pair in _extra_pairs(teams, rem))
+    return order
+
+
+class _HomeLedger:
+    """Who hosts the NEXT meeting of a pair, given who has hosted so far.
+
+    Seeded with the EXISTING Games' actual orientation, then asked once per
+    generated pairing. The rule is one line — give home to whichever side has
+    hosted this pair fewer times, and fall back to the circle method's own
+    orientation when they are level — and it has two properties that are the
+    whole reason it replaces the old fixed alternation:
+
+    * WITH NO FIXED GAMES IT IS THE OLD RULE, meeting for meeting. The old
+      rule oriented meeting *m* canonically for even *m* and reversed for
+      odd; starting from 0–0, "fewer hosts, ties canonical" produces exactly
+      that alternation, and the extras (oriented as meeting number ``base``)
+      likewise fall out of it — after ``base`` meetings the canonical side
+      leads by one iff ``base`` is odd. So every pre-existing pairing,
+      fingerprint and property-test expectation is preserved BYTE FOR BYTE.
+    * WITH FIXED GAMES IT REPAIRS THEM. A pair that already met once in the
+      reverse orientation has the next meeting handed to the other side, so
+      four meetings finish 2–2 rather than the 3–1 the fixed alternation
+      produced by ignoring what was already on the calendar.
+
+    The correction is bounded by the residual, not unbounded: a pair with a
+    fixed imbalance larger than the number of meetings still to generate
+    ends as close to level as those meetings allow. That is the best any
+    completion can do without cancelling a Game, which is not this planner's
+    to do.
+    """
+
+    def __init__(self, teams, fixed_home=None):
+        self._canonical = _canonical_orientation(teams)
+        # {pair_key: [times the LOW id hosted, times the HIGH id hosted]}
+        self._hosted = {key: list(counts)
+                        for key, counts in (fixed_home or {}).items()}
+
+    def orient(self, key):
+        low, high = key
+        hosted = self._hosted.setdefault(key, [0, 0])
+        if hosted[0] < hosted[1]:
+            home, away = low, high
+        elif hosted[1] < hosted[0]:
+            home, away = high, low
+        else:
+            home, away = self._canonical[key]
+        hosted[0 if home == low else 1] += 1
+        return home, away
+
+
+def fixed_pair_counts(teams, existing_rows):
+    """The EXISTING Regular Games of one team group, read as a multigraph.
+
+    Returns ``(multiplicity, hosted)``:
+
+    * ``multiplicity[pair_key]`` — how many Games that pair has already
+      played, which is what the per-team residual degree and the per-pair
+      spread are both computed from.
+    * ``hosted[pair_key]`` — ``[times the low id hosted, times the high id
+      hosted]``, the home/away demand's starting point.
+
+    ``existing_rows`` is one group's rows from
+    :func:`_existing_pairing_game_rows`.
+
+    ONLY Games between two CURRENTLY REGISTERED members of the group are
+    counted, and that restriction is deliberate rather than incidental. A
+    Regular Game stamped with this Division that involves a team no longer
+    registered in it cannot be completed against (there is no second team to
+    give the balancing games to), cannot be balanced against, and — because
+    it contributes 1 rather than 2 to the group's degree sum — would flip the
+    parity of the residual and make an otherwise ordinary request
+    unrealizable through no fault of the request. It is also exactly the set
+    the pre-residual code already skipped, since no generated pairing ever
+    named an unregistered team, so nothing regresses. The consequence worth
+    stating plainly: after a team is moved out of a Division, its leftover
+    Games there do NOT count toward its former opponents' guarantee.
+    """
+    members = set(teams)
+    multiplicity, hosted = {}, {}
+    for (_ls_id, _div_id, pair), rows in sorted(
+            existing_rows.items(), key=lambda item: sorted(item[0][2])):
+        if len(pair) != 2 or not pair <= members:
+            continue
+        key = _pair_key(*sorted(pair))
+        counts = hosted.setdefault(key, [0, 0])
+        for _game_id, home_team_id, _away_team_id in rows:
+            multiplicity[key] = multiplicity.get(key, 0) + 1
+            counts[0 if home_team_id == key[0] else 1] += 1
+    return multiplicity, hosted
+
+
+def smallest_completable_games(team_count, degrees, ceiling=MAX_GAMES_PER_TEAM):
+    """The smallest guaranteed-games count the EXISTING Games could still be
+    completed to, or ``None`` if no accepted value can be (#375 residual
+    blocker) — the number a refusal names so the operator can act.
+
+    ``degrees`` is every team's current count of existing Regular Games in
+    the group (one entry per team, including the zeroes). A value ``g`` is
+    completable exactly when it satisfies the three conditions
+    :func:`require_completable_games_per_team` enforces, so this is a direct
+    scan of them rather than a second, drift-prone derivation. Bounded by
+    ``ceiling``, so it is a few dozen integer comparisons at worst.
+    """
+    total = sum(degrees)
+    floor = max(degrees) if degrees else 0
+    for games in range(max(1, floor), ceiling + 1):
+        if (team_count * games) % 2:
+            continue
+        if any(2 * (games - d) > team_count * games - total for d in degrees):
+            continue
+        return games
+    return None
+
+
+def require_completable_games_per_team(team_ids, games, fixed_multiplicity,
+                                       label=None, team_names=None):
+    """Refuse, BEFORE any placement or persistence, a guarantee the existing
+    Games make impossible (#375 residual blocker).
+
+    THE GUARANTEE IS OVER FINAL SEASON TOTALS, not over the generated list.
+    So the question is not "can a fresh schedule give everyone G games?" but
+    "can the Games already on the calendar be COMPLETED to G games each,
+    without touching any of them?". That is a degree-constrained completion,
+    and the empty-graph parity rule is only one of its three conditions.
+
+    Write ``V`` for the group's registered teams, ``T = |V|``, ``F`` for the
+    multigraph of existing Regular Games between two members of ``V``, and
+    ``r(v) = G - deg_F(v)`` for each team's residual demand. A completion
+    exists IF AND ONLY IF:
+
+      1. ``r(v) >= 0`` for every team — nobody has already exceeded G. A
+         completion can only ADD games, so a team at G+1 can never come back
+         down to G.
+      2. ``sum(r) is even`` — every new game contributes 2 to the residual
+         degree sum, so an odd sum cannot be spent exactly. Since
+         ``sum(r) = T*G - 2*|F|``, this is the SAME condition as the
+         empty-graph parity rule (``T*G`` even) and is already refused, with
+         its own nearest-achievable advice, by
+         :func:`_require_feasible_games_per_team`. It is re-asserted here so
+         no path can reach the generator with an unspendable residual.
+      3. ``max(r) <= sum of the other teams' r`` — no team may need more
+         games than the rest of the group can collectively supply. Every
+         residual game of the neediest team must have its other end on a
+         DIFFERENT team, so its demand is capped by everyone else's combined
+         demand.
+
+    WHY THOSE THREE ARE SUFFICIENT, not merely necessary. They are exactly
+    the classical realizability conditions for a LOOPLESS MULTIGRAPH with a
+    prescribed degree sequence (Hakimi). Sufficiency is constructive, and the
+    construction is the one :func:`_residual_completion` runs: repeatedly
+    join a team of MAXIMUM residual to any other team of positive residual.
+    That step preserves both (2) — it removes exactly 2 from the sum — and
+    (3): writing ``S`` for the sum and ``u`` for a maximum, the new maximum
+    is either ``r(u) - 1``, for which ``2(r(u)-1) <= S-2`` follows directly
+    from ``2r(u) <= S``, or some tied team still at ``r(u)``, for which
+    ``S >= 2r(u) + 1`` plus the evenness of ``S`` gives ``S >= 2r(u) + 2``.
+    Condition (3) also guarantees a partner exists whenever any demand
+    remains, so the loop always terminates with every residual at zero.
+
+    Unbounded multiplicity in the residual is what makes three conditions
+    enough. Requiring the FINAL per-opponent spread to stay within one as
+    well would be a bounded-multiplicity problem with strictly more
+    conditions — and would refuse requests the operator's own fixed Games
+    can honour on the promise actually made, which is the season total. The
+    spread is therefore aimed at (see :func:`_residual_completion`) and
+    exactly preserved whenever the fixed Games fit inside the canonical
+    target, but it is not a refusal criterion.
+
+    Both refusals NAME A NUMBER TO ASK FOR instead of merely reporting
+    failure, via :func:`smallest_completable_games`.
+    """
+    teams = sorted(team_ids)
+    names = team_names or {}
+    degree = {t: 0 for t in teams}
+    for (low, high), count in fixed_multiplicity.items():
+        degree[low] += count
+        degree[high] += count
+    degrees = [degree[t] for t in teams]
+    where = f" in {label}" if label else ""
+
+    # #375 review — a group of EXACTLY ONE team fails condition (3) like any
+    # other over-demanded group, but for a reason that has nothing to do
+    # with the existing Games: there is no opponent, so `r(v) = G` and the
+    # rest of the group can supply 0. Falling through to the general message
+    # below tells the operator their "already scheduled games" cannot be
+    # completed and advises them to "cancel some of them first" — when the
+    # group has no games to cancel and cancelling could not help if it did.
+    # The condition is the same; only the diagnosis and the action differ,
+    # so they are said separately.
+    #
+    # EXACTLY ONE, not "fewer than two". A group with NO teams has no team
+    # whose guarantee goes unhonoured and nothing to say to the operator; it
+    # already falls through every condition below without refusing (an empty
+    # residual is trivially completable), and it must keep doing so, or a
+    # League-wide draft would start failing on an empty Division that costs
+    # it nothing today.
+    #
+    # Note this IS a refusal, so a one-team Division does veto a League-wide
+    # draft. `_require_feasible_games_per_team`'s `team_count < 2` early
+    # return no longer keeps that from happening; what it buys instead is
+    # that the guarantee is never quietly left unhonoured.
+    if len(teams) == 1 and games > 0:
+        lone = names.get(teams[0], teams[0])
+        # Same `details` SHAPE as the general condition-(3) refusal below,
+        # because it is the same reason code and api-contract.md documents
+        # one payload for it: `short_teams[]` rows and a
+        # `nearest_achievable` that is the smallest completable count or
+        # `None` when there is none. A lone team is the latter — no G is
+        # achievable for it at any number — which
+        # `smallest_completable_games(1, [0])` independently returns.
+        raise ValidationError(
+            f"{games} guaranteed games per team is impossible{where}: "
+            f"{lone} has no opponent to play. Register at least one more "
+            f"team in this division, or leave it out of the draft.",
+            {"reason": "games_per_team_residual_infeasible",
+             "games_per_team": games,
+             "team_count": 1,
+             "short_teams": [{"team_id": teams[0], "team_name": lone,
+                              "residual_games": games - degrees[0],
+                              "available_games": 0}],
+             "nearest_achievable": smallest_completable_games(
+                 len(teams), degrees)})
+
+    achievable = smallest_completable_games(len(teams), degrees)
+    advice = (f" Ask for {achievable} guaranteed games instead, or cancel "
+              f"some of the existing games first."
+              if achievable is not None else
+              " No accepted guarantee can complete these existing games — "
+              "cancel some of them first.")
+
+    over = [t for t in teams if degree[t] > games]
+    if over:
+        listed = ", ".join(
+            f"{names.get(t, t)} ({degree[t]})" for t in over)
+        raise ValidationError(
+            f"{games} guaranteed games per team is impossible with the games "
+            f"already scheduled{where}: {listed} already "
+            f"{'play' if len(over) > 1 else 'plays'} more than {games} "
+            f"regular-season games, and generating more can only add to that."
+            f"{advice}",
+            {"reason": "games_per_team_over_scheduled",
+             "games_per_team": games,
+             "team_count": len(teams),
+             "over_scheduled_teams": [
+                 {"team_id": t, "team_name": names.get(t, t),
+                  "existing_games": degree[t]} for t in over],
+             "nearest_achievable": achievable})
+
+    residual = {t: games - degree[t] for t in teams}
+    total = sum(residual.values())
+    if total % 2:
+        # Unreachable behind `_require_feasible_games_per_team` (see (2)
+        # above), and asserted rather than assumed: an unspendable residual
+        # reaching the generator is a silently uneven schedule, which is the
+        # entire class of defect this module refuses instead of shipping.
+        _require_feasible_games_per_team(len(teams), games, label=label)
+        raise ValidationError(
+            f"{games} guaranteed games per team cannot be completed from the "
+            f"games already scheduled{where}.{advice}",
+            {"reason": "games_per_team_infeasible",
+             "games_per_team": games, "team_count": len(teams),
+             "nearest_achievable": [achievable] if achievable else []})
+
+    short = [t for t in teams if 2 * residual[t] > total]
+    if short:
+        listed = ", ".join(
+            f"{names.get(t, t)} (needs {residual[t]}, the rest of the "
+            f"division can supply {total - residual[t]})" for t in short)
+        raise ValidationError(
+            f"{games} guaranteed games per team cannot be completed from the "
+            f"games already scheduled{where}: {listed}. The remaining games "
+            f"would all have to be played against teams that have already "
+            f"reached their own total.{advice}",
+            {"reason": "games_per_team_residual_infeasible",
+             "games_per_team": games,
+             "team_count": len(teams),
+             "short_teams": [
+                 {"team_id": t, "team_name": names.get(t, t),
+                  "residual_games": residual[t],
+                  "available_games": total - residual[t]} for t in short],
+             "nearest_achievable": achievable})
+    return residual
+
+
+def _residual_completion(teams, residual, fixed_multiplicity):
+    """A loopless multigraph on ``teams`` realizing the ``residual`` degrees
+    exactly — the constructive half of
+    :func:`require_completable_games_per_team`'s sufficiency proof.
+
+    Returns ``_pair_key`` values in emission order (which is also ice
+    priority). Used only when the fixed Games do NOT fit inside the canonical
+    target; when they do, the deficit of that target is already a realization
+    and is preferred, because it also preserves the canonical spread.
+
+    Each step joins a team of MAXIMUM remaining demand — that endpoint is
+    what keeps the realizability conditions invariant, and picking a
+    non-maximum pair can strand demand on a team nobody can still play. The
+    OTHER endpoint is free, which is where the spread is bought back: among
+    the teams that still need games, it takes the one this team has met
+    fewest times so far COUNTING THE FIXED GAMES, then the neediest, then the
+    lowest id. So the completion spreads across opponents rather than piling
+    a team's whole residual onto one rival, without ever risking the exact
+    degrees, which are the actual guarantee.
+
+    Every iteration reads sorted lists and breaks every tie on the team id,
+    so the output depends on the sorted team ids, the residual and the fixed
+    multiplicities alone — no set or dict iteration order, no store state, no
+    clock. That is the determinism ``_draft_fingerprint`` requires.
+    """
+    need = dict(residual)
+    met = dict(fixed_multiplicity)
+    edges = []
+    while True:
+        positive = [t for t in teams if need.get(t, 0) > 0]
+        if not positive:
+            return edges
+        first = min(positive, key=lambda t: (-need[t], t))
+        partners = [t for t in positive if t != first]
+        if not partners:
+            # Unreachable: condition (3) is checked up front and preserved by
+            # every step (see the sufficiency proof). Raised rather than
+            # asserted so that a future change which breaks the invariant
+            # surfaces as a refusal, never as a schedule that quietly leaves
+            # one team short of the number it was guaranteed.
+            raise ValidationError(
+                "The games already scheduled cannot be completed to the "
+                "guaranteed total without changing them.",
+                {"reason": "games_per_team_residual_infeasible",
+                 "short_teams": [{"team_id": first,
+                                  "residual_games": need[first],
+                                  "available_games": 0}]})
+        second = min(partners,
+                     key=lambda t: (met.get(_pair_key(first, t), 0),
+                                    -need[t], t))
+        key = _pair_key(first, second)
+        edges.append(key)
+        need[first] -= 1
+        need[second] -= 1
+        met[key] = met.get(key, 0) + 1
+
+
+def games_per_team_residual_pairings(team_ids, games_per_team,
+                                     fixed_multiplicity=None,
+                                     fixed_hosted=None):
+    """The pairings still MISSING before every team's FINAL season total is
+    exactly ``games_per_team`` (#375 residual blocker).
+
+    This is the function :func:`games_per_team_pairings` should always have
+    been. That one builds a fresh target from nothing, which is only the
+    right answer when the calendar is empty; the operator is promised a
+    season total, and a season contains the Games already on the calendar.
+    Reading them afterwards — matching a fixed Game off against a target row
+    — cannot work, because the target was chosen without them: a pair with
+    more Games than the target asked for had its surplus silently dropped
+    (leaving those two teams above the guarantee) and a reverse-oriented
+    fixed Game was matched against a row that then kept the wrong home side.
+
+    ``fixed_multiplicity``/``fixed_hosted`` come from
+    :func:`fixed_pair_counts`. Empty (the default) means an empty calendar,
+    for which the output is byte-identical to
+    :func:`games_per_team_pairings` — same pairs, same order, same
+    orientation — which is what keeps every existing property, contract and
+    fingerprint expectation true.
+
+    TWO WAYS TO COMPLETE, and the first is preferred whenever it applies:
+
+    * THE CANONICAL TARGET'S DEFICIT. If no pair has MORE fixed Games than
+      the canonical target asks of it, the target's own leftover rows are a
+      valid completion: fixed degrees are then bounded by target degrees, so
+      the leftovers realize exactly the residual demand. Emitting them in the
+      target's own order preserves the canonical per-opponent spread (within
+      one) AND the ice-assignment priority, so an untouched Division is
+      scheduled exactly as before and a partially-scheduled one is finished
+      along the same plan.
+    * THE DEGREE-CONSTRAINED COMPLETION. Once some pair is over-played
+      relative to the target, the target is simply not reachable — no subset
+      of it has the right degrees — so the residual is built directly from
+      the residual degree sequence (:func:`_residual_completion`), which
+      still hits every team's total exactly and still spreads across
+      opponents, but cannot promise the canonical spread that the fixed
+      Games themselves have already broken.
+
+    FEASIBILITY is the caller's, exactly as before: see
+    :func:`require_completable_games_per_team`, which must run first so an
+    impossible request is refused with an actionable message instead of
+    silently producing an uneven schedule.
+    """
+    teams = sorted(team_ids)
+    if len(teams) < 2:
+        return []
+    multiplicity = dict(fixed_multiplicity or {})
+    ledger = _HomeLedger(teams, fixed_hosted)
+    order = _target_pair_order(teams, games_per_team)
+    target = {}
+    for key in order:
+        target[key] = target.get(key, 0) + 1
+    if all(count <= target.get(key, 0)
+           for key, count in multiplicity.items()):
+        outstanding = dict(multiplicity)
+        keys = []
+        for key in order:
+            if outstanding.get(key, 0) > 0:
+                outstanding[key] -= 1  # this meeting is already on the calendar
+                continue
+            keys.append(key)
+    else:
+        degree = {t: 0 for t in teams}
+        for (low, high), count in multiplicity.items():
+            degree[low] += count
+            degree[high] += count
+        keys = _residual_completion(
+            teams, {t: games_per_team - degree[t] for t in teams},
+            multiplicity)
+    return [ledger.orient(key) for key in keys]
+
+
+def games_per_team_pairings(team_ids, games_per_team):
+    """Pairings giving EVERY team exactly ``games_per_team`` games (#375).
+
+    The operator-facing inversion: instead of asking for N meetings against
+    every opponent and letting games-per-team fall out as ``N x (T-1)``, the
+    operator asks for the number of games their own team is guaranteed and
+    the per-opponent count is derived:
+
+        opponents = T - 1
+        base      = G // opponents   # games against EVERY opponent
+        rem       = G %  opponents   # this many opponents are played once more
+
+    So the output is ``base`` complete round-robins (the existing circle-method
+    generator, reused unchanged) plus a ``rem``-regular extras multigraph
+    (:func:`_extra_pairs`). Every team plays ``base x opponents + rem == G``
+    games, and no opponent is played more than one time more than any other.
+
+    Worked examples from the issue, all of which the property tests pin:
+    T=2/G=20 -> the two teams meet 20 times (20 games); T=5/G=20 -> base 5,
+    rem 0, every pair meets 5x (50 games); T=20/G=20 -> base 1, rem 1,
+    everyone meets once (19 games) plus one extra each (10 more) = 200.
+
+    FEASIBILITY is the caller's job, not this function's: ``T x G`` must be
+    even or no construction can give every team exactly G (see
+    :func:`_require_feasible_games_per_team`, which refuses with an
+    actionable message). Reaching here with an infeasible pair would
+    silently produce an odd ``rem`` on odd ``T`` and lose a game, so the
+    assertion of that precondition lives at the entry points where the team
+    count is known and a refusal can still be reported to the operator.
+
+    Fewer than two teams yields no pairings — the same answer
+    :func:`round_robin_pairings` already gives, and what keeps the ``T-1``
+    denominator away from zero.
+
+    HOME/AWAY is balanced within one game per pair and decided
+    deterministically from the sorted team ids alone. The base cycles
+    inherit :func:`round_robin_pairings`'s own alternation (meeting *m*
+    reuses the base orientation when *m* is even, reverses it when odd), and
+    the extras are oriented as if they were meeting number ``base`` — the
+    NEXT meeting in that same alternation. That is what keeps the guarantee
+    exact rather than approximately right: an extra game blindly added in
+    the base orientation would push a pair that had already hosted one more
+    (odd ``base``) to a two-game imbalance. Following the alternation
+    instead means an even ``base`` becomes a one-game difference and an odd
+    ``base`` comes out exactly level.
+
+    THIS IS THE EMPTY-CALENDAR CASE of
+    :func:`games_per_team_residual_pairings`, and delegates to it rather than
+    keeping a second copy of the construction. The alternation described
+    above is not lost in the delegation — it is what the home/away ledger
+    reproduces from a level start (see :class:`_HomeLedger`) — and the two
+    functions cannot drift apart into "the generator says one thing, the
+    completion another", which is the shape of the defect that made this
+    residual planner necessary in the first place.
+
+    A caller that has EXISTING Games to honour must use the residual
+    function: this one answers a different question (what a season would
+    look like from nothing), and using its answer where the other was needed
+    is exactly how a Division finished on 5, 5, 4, 4 under a guarantee of 4.
+    """
+    return games_per_team_residual_pairings(team_ids, games_per_team)
+
+
 def _available_game_slots(store, slot_ids=None):
     """Game-type ice slots that are AVAILABLE and not already tied to a game,
     earliest first (deterministic tie-break on id)."""
@@ -1133,6 +1932,28 @@ def _existing_pairing_games(store, division_scope):
     therefore the ``draft_fingerprint`` derived from it — differ between
     Memory, SQLite and PostgreSQL for identical data. Sorting here is the
     single point that makes the count and its reporting backend-independent.
+
+    Projected from :func:`_existing_pairing_game_rows` rather than scanning
+    independently, so the ids this returns and the orientations the residual
+    planner reads can never describe two different sets of Games.
+    """
+    return {key: [row[0] for row in rows]
+            for key, rows in
+            _existing_pairing_game_rows(store, division_scope).items()}
+
+
+def _existing_pairing_game_rows(store, division_scope):
+    """``{(league_season_id, division_id, pairing): [(game_id, home_team_id,
+    away_team_id), …]}`` — :func:`_existing_pairing_games` plus each Game's
+    ACTUAL orientation, sorted by game id (#375 residual blocker).
+
+    Every counting rule is that function's; this one only carries more of
+    each row. The orientation is what makes the guarantee's home/away half
+    derivable: the operator is promised a balanced season, and a season is
+    the fixed Games plus the generated ones, so a planner that cannot see
+    which side already hosted cannot compensate for it. Reading the pairing
+    alone is exactly how a two-team Division with one reverse-oriented Game
+    finished 3–1 instead of 2–2.
     """
     wanted = set(division_scope)
     found = {}
@@ -1145,8 +1966,9 @@ def _existing_pairing_games(store, division_scope):
         if g.game_type != GameType.REGULAR.value:
             continue
         found.setdefault(
-            scope + (frozenset((g.home_team_id, g.away_team_id)),), []).append(g.id)
-    return {key: sorted(ids) for key, ids in found.items()}
+            scope + (frozenset((g.home_team_id, g.away_team_id)),), []).append(
+                (g.id, g.home_team_id, g.away_team_id))
+    return {key: sorted(rows) for key, rows in found.items()}
 
 
 def reviewed_existing_counts(already_scheduled, league_season_id):
@@ -1273,7 +2095,8 @@ def _canonical_sort_key(row):
 
 def _draft_fingerprint(league_season_id, team_ids, draft_games, unscheduled,
                         unschedulable_teams, already_scheduled,
-                        meetings_per_opponent=1, *, min_turnaround_minutes):
+                        meetings_per_opponent=1, *, min_turnaround_minutes,
+                        games_per_team=None):
     """Deterministic identity of exactly what this proposal reviewed — #328
     review round 5, widened rounds 7, 10, 11, 12, 15, and 16. Bound into the response
     so the commit path can prove, right before writing, that this fact
@@ -1476,13 +2299,32 @@ def _draft_fingerprint(league_season_id, team_ids, draft_games, unscheduled,
         # rather than failing loudly.
         "min_turnaround_minutes": min_turnaround_minutes,
     }
+    # #375 — the GUARANTEED-GAMES-PER-TEAM format, bound for exactly the
+    # reason `meetings_per_opponent` above is: it is part of what the
+    # operator reviewed, so previewing one format and committing another
+    # must be a guaranteed mismatch rather than one that happens to fall
+    # out of the row lists.
+    #
+    # Added CONDITIONALLY, and this is deliberate rather than sloppy. A key
+    # present with a `None` value would change the hashed payload of every
+    # legacy proposal ever made, and #381 persists whole proposals —
+    # including their `draft_fingerprint` — inside named scenarios. A
+    # scenario stored before this change and committed after it would
+    # regenerate a different fingerprint and be refused as `preview_stale`,
+    # which is the same breakage as dropping the legacy field outright, just
+    # slower to notice. Absent means "this proposal came from the legacy
+    # meetings-shaped request", whose fingerprint must not move; and the two
+    # fields can never both be operative, because `_resolve_schedule_format`
+    # refuses that combination before either reaches here.
+    if games_per_team is not None:
+        payload["games_per_team"] = games_per_team
     return hashlib.sha256(json.dumps(
         payload, sort_keys=True, separators=(",", ":"), default=str
     ).encode()).hexdigest()[:16]
 
 
 def draft_schedule(store, division_id, slot_ids=None, constraints=None,
-                   meetings_per_opponent=None):
+                   meetings_per_opponent=None, games_per_team=None):
     """Generate a draft round-robin schedule for a division (#84/#85).
 
     Returns ``{division_id, team_count, draft_games, unscheduled,
@@ -1497,28 +2339,45 @@ def draft_schedule(store, division_id, slot_ids=None, constraints=None,
     split AND each missing pairing's placement (slot, time) so a later
     commit can detect drift in either. Nothing is persisted.
 
-    ``meetings_per_opponent`` (#375) configures how many times each team
-    plays every other; ``None`` keeps the historical single round-robin.
-    Existing Regular Games count toward the requirement, so a regeneration
-    proposes only the meetings still missing.
+    ``games_per_team`` (#375) is the OPERATOR-FACING regular-season format:
+    the number of games each team is guaranteed, with the per-opponent count
+    derived from it. ``meetings_per_opponent`` is the legacy spelling — how
+    many times each team plays every other — still accepted; ``None`` for
+    both keeps the historical single round-robin. Sending both is refused
+    (:func:`_resolve_schedule_format`). Existing Regular Games count toward
+    the requirement either way, so a regeneration proposes only the games
+    still missing.
     """
-    meetings = _normalize_meetings(meetings_per_opponent)
+    meetings, games = _resolve_schedule_format(
+        meetings_per_opponent, games_per_team)
     # A division's teams are those validly registered in it this season (#180),
     # via the shared resolver — active rows whose Team exists and whose league
     # matches, so an orphaned or cross-league registration row can never enter a
     # draft (#199/#200 review). Same source of truth game creation, moves,
     # publishing, and standings use.
     teams = sorted(registered_team_ids_in_division(store, division_id))
-    all_pairings = [(h, a, division_id)
-                    for h, a in round_robin_pairings(teams, meetings)]
     # #328 review — scope the exclusion by this Division's own LeagueSeason,
     # not division_id alone (see _existing_pairing_games).
     division = store.get_division(division_id) if division_id else None
     ls_id = division.league_season_id if division else None
     league_season = store.get_league_season(ls_id) if ls_id else None
     scope = {(ls_id, division_id)}
-    pairings, already_scheduled = _split_already_scheduled(
-        store, all_pairings, _existing_pairing_games(store, scope), ls_id)
+    # #375 residual blocker — the existing Games are read FIRST under the
+    # guaranteed-games format, because they are part of the total being
+    # guaranteed; the legacy meetings format keeps asking its own question
+    # ("which of the N requested meetings already happened?") and its own
+    # answer, unchanged.
+    existing_rows = _existing_pairing_game_rows(store, scope)
+    if games is not None:
+        pairings, already_scheduled = _games_per_team_split(
+            store, [(division_id, teams)], existing_rows, ls_id, games)
+    else:
+        all_pairings = [(h, a, division_id)
+                        for h, a in round_robin_pairings(teams, meetings)]
+        pairings, already_scheduled = _split_already_scheduled(
+            store, all_pairings,
+            {key: [row[0] for row in rows]
+             for key, rows in existing_rows.items()}, ls_id)
     slots = _available_game_slots(store, slot_ids)
     active = _active_game_slot_pairs(store)
     draft_games, unscheduled = _assign_ice(
@@ -1541,7 +2400,15 @@ def draft_schedule(store, division_id, slot_ids=None, constraints=None,
     turnaround = turnaround_minutes(constraints)
     return {
         "division_id": division_id, "team_count": len(teams),
+        # #375 — exactly ONE of these two is the format this proposal ran
+        # under; the other is None. Echoing a derived value into the unused
+        # one would be a lie the commit path then has to reconcile: a
+        # games-per-team draft has no single meetings-per-opponent number
+        # (that is the whole point of the `rem` remainder), and a legacy
+        # draft has no single games-per-team number across a League whose
+        # Divisions differ in size.
         "meetings_per_opponent": meetings,
+        "games_per_team": games,
         # #390 — echo the NORMALIZED turnaround the proposal was generated
         # under, exactly as ``meetings_per_opponent`` above echoes the
         # format. The Scheduler UI must send the same value back at Commit
@@ -1557,13 +2424,13 @@ def draft_schedule(store, division_id, slot_ids=None, constraints=None,
         "draft_fingerprint": _draft_fingerprint(
             ls_id, teams, draft_games, unscheduled, unschedulable_teams,
             already_scheduled, meetings,
-            min_turnaround_minutes=turnaround),
+            min_turnaround_minutes=turnaround, games_per_team=games),
     }
 
 
 def draft_schedule_for_league(store, season_id, league_id, division_id=None,
                               slot_ids=None, constraints=None,
-                              meetings_per_opponent=None):
+                              meetings_per_opponent=None, games_per_team=None):
     """Generate a draft schedule for a whole League within a Season, optionally
     narrowed to one Division (#233 Slice G).
 
@@ -1574,21 +2441,22 @@ def draft_schedule_for_league(store, season_id, league_id, division_id=None,
     because they share a League; each Division's teams get their own
     round-robin, all sharing the same season-scoped ice pool for assignment.
 
-    ``meetings_per_opponent`` (#375) applies to every Division group alike:
-    each group's own round-robin is repeated N times, so a team plays every
-    opponent IN ITS OWN DIVISION N times and still never meets one from
-    another Division.
+    Either regular-season format (#375) applies to every Division group
+    alike, and neither ever pairs across Divisions. ``meetings_per_opponent``
+    repeats each group's own round-robin N times, so a team plays every
+    opponent IN ITS OWN DIVISION N times. ``games_per_team`` guarantees each
+    team that many games INSIDE ITS OWN DIVISION, so the derived
+    per-opponent count differs between a 6-team and a 10-team Division of
+    the same League — which is the point of the control, and the reason
+    feasibility is judged per group below rather than once for the League.
     """
-    meetings = _normalize_meetings(meetings_per_opponent)
+    meetings, games = _resolve_schedule_format(
+        meetings_per_opponent, games_per_team)
     groups = registered_teams_by_division_in_league(
         store, season_id, league_id, division_id)
-    all_pairings = []
     all_teams = set()
-    for div_id, team_ids in groups.items():
+    for team_ids in groups.values():
         all_teams |= team_ids
-        all_pairings.extend(
-            (h, a, div_id)
-            for h, a in round_robin_pairings(sorted(team_ids), meetings))
     # #328 review — scope the exclusion by THIS League+Season's own
     # LeagueSeason, not division_id alone (see _existing_pairing_games):
     # the "no Division" group's div_id is None for every League, so
@@ -1598,8 +2466,26 @@ def draft_schedule_for_league(store, season_id, league_id, division_id=None,
                      if league_id else None)
     ls_id = league_season.id if league_season is not None else None
     scope = {(ls_id, div_id) for div_id in groups.keys()}
-    pairings, already_scheduled = _split_already_scheduled(
-        store, all_pairings, _existing_pairing_games(store, scope), ls_id)
+    existing_rows = _existing_pairing_game_rows(store, scope)
+    if games is not None:
+        # #375 — feasibility (parity, and now the residual completion the
+        # existing Games leave) is judged for EVERY group before any group is
+        # built, in sorted order, while generation keeps the groups' ORIGINAL
+        # order. See `_games_per_team_split` for why both orders matter.
+        pairings, already_scheduled = _games_per_team_split(
+            store, [(div_id, sorted(team_ids))
+                    for div_id, team_ids in groups.items()],
+            existing_rows, ls_id, games)
+    else:
+        all_pairings = []
+        for div_id, team_ids in groups.items():
+            all_pairings.extend(
+                (h, a, div_id)
+                for h, a in round_robin_pairings(sorted(team_ids), meetings))
+        pairings, already_scheduled = _split_already_scheduled(
+            store, all_pairings,
+            {key: [row[0] for row in rows]
+             for key, rows in existing_rows.items()}, ls_id)
     slots = _available_game_slots(store, slot_ids)
     active = _active_game_slot_pairs(store)
     draft_games, unscheduled = _assign_ice(
@@ -1621,7 +2507,10 @@ def draft_schedule_for_league(store, season_id, league_id, division_id=None,
     return {
         "season_id": season_id, "league_id": league_id,
         "division_id": division_id, "team_count": len(all_teams),
+        # #375 — exactly one of these is operative; see the Division-only
+        # entry point above.
         "meetings_per_opponent": meetings,
+        "games_per_team": games,
         "min_turnaround_minutes": turnaround,
         "draft_games": draft_games, "unscheduled": unscheduled,
         "already_scheduled": already_scheduled,
@@ -1629,5 +2518,5 @@ def draft_schedule_for_league(store, season_id, league_id, division_id=None,
         "draft_fingerprint": _draft_fingerprint(
             ls_id, all_teams, draft_games, unscheduled, unschedulable_teams,
             already_scheduled, meetings,
-            min_turnaround_minutes=turnaround),
+            min_turnaround_minutes=turnaround, games_per_team=games),
     }

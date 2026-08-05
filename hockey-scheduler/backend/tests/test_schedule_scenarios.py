@@ -37,6 +37,9 @@ from hockey_scheduler.domain.errors import (
     ScheduleConflictError,
     ValidationError,
 )
+from hockey_scheduler.services.schedule_scenarios import (
+    canonical_fingerprint,
+)
 from hockey_scheduler.store import InMemoryStore, SqlStore
 from hockey_scheduler.store.sql_store import _load_migrations
 from hockey_scheduler.web import server as srv
@@ -539,6 +542,127 @@ class _ScenarioContract:
         self.assertNotIn("error", result, result)
         self.assertEqual(len(result["created"]), 12)
         self.assertEqual(len(self.store.all_games()), 12)
+
+    def test_games_per_team_format_is_persisted_and_replayed(self):
+        """#375 — the games-per-team spelling round-trips through a named
+        scenario exactly as the legacy one does.
+
+        Four teams guaranteed 6 games each is 12 fixtures — twice the 6 a
+        single round-robin produces — so the count alone falsifies a commit
+        that quietly replayed the historical default: the under-lock
+        regeneration inside the commit gate would then disagree with the
+        reviewed ``draft_fingerprint`` and refuse the batch as
+        ``preview_stale`` rather than create 12 Games.
+        """
+        for index in range(8, 20):
+            self.store.add_ice_slot(IceSlot(
+                id=f"slot_{index}", rink_id="rink",
+                start_time=BASE + timedelta(days=index),
+                end_time=BASE + timedelta(days=index, hours=1)))
+        scenario = self._scenario("Guaranteed", games_per_team=6)
+        self.assertEqual(scenario["request_input"]["games_per_team"], 6)
+        self.assertEqual(scenario["proposal"]["games_per_team"], 6)
+        # The legacy spelling is recorded as the explicit None it ran under,
+        # so the replay can tell WHICH format to reproduce.
+        self.assertIsNone(scenario["request_input"]["meetings_per_opponent"])
+        self.assertIsNone(scenario["proposal"]["meetings_per_opponent"])
+        self.assertEqual(
+            scenario["generation_snapshot"]["planner_input"][
+                "games_per_team"], 6)
+        self.assertEqual(len(scenario["proposal"]["draft_games"]), 12)
+
+        # Re-read from the store, not the create response: the value must
+        # have survived persistence, which is what the commit relies on.
+        stored = self.api.get_schedule_scenario(scenario["scenario_id"])
+        self.assertEqual(stored["request_input"]["games_per_team"], 6)
+
+        result = self.api.commit_schedule_scenario(
+            scenario["scenario_id"], actor_id="operator")
+        self.assertNotIn("error", result, result)
+        self.assertEqual(len(result["created"]), 12)
+        counts = {}
+        for game in self.store.all_games():
+            for tid in (game.home_team_id, game.away_team_id):
+                counts[tid] = counts.get(tid, 0) + 1
+        self.assertEqual(set(counts.values()), {6})
+
+    def test_a_scenario_stored_before_games_per_team_existed_still_commits(self):
+        """THE COMPATIBILITY GUARANTEE, asserted against a record shaped the
+        way #381 actually wrote them.
+
+        `meetings_per_opponent` is bound into `_draft_fingerprint` and into
+        the material-input snapshot hashed as `input_fingerprint`. Adding an
+        unconditional `games_per_team` key to EITHER would change the hash
+        recomputed at commit time for a scenario stored before this change
+        and refuse all of them — `preview_stale` from the fingerprint,
+        `schedule_scenario_stale` from the snapshot. Both fields are
+        therefore added only when games-per-team is the operative format.
+
+        A genuine pre-#375 record is reconstructed across ALL THREE places
+        the old code never wrote the new key. Two of them are DELETED from
+        (`request_input` and `proposal`); the third,
+        `generation_snapshot.planner_input`, is ASSERTED ABSENT instead,
+        because `material_input_snapshot` already omits the key when
+        games-per-team is not the operative format — there is nothing to
+        strip, and that omission is itself half of what is under test. The
+        two fingerprints are then re-derived over the stripped halves. Then
+        it is COMMITTED,
+        so the assertion runs through `_guard_material_inputs` and the
+        fingerprint gate rather than stopping at the replay resolver.
+
+        This is the falsifiable part: making either key unconditional makes
+        the recomputed snapshot (or payload) carry a `games_per_team: None`
+        that the stripped record does not, and this commit fails with
+        `schedule_scenario_stale` or `preview_stale`.
+        """
+        scenario = self._scenario("Legacy", meetings_per_opponent=1)
+        original = self.store.get_schedule_scenario_for_update
+
+        def as_pre_375(scenario_id):
+            # A stored scenario is immutable (no update path exists at all),
+            # so the older shape is injected at read time -- the same
+            # technique `test_stored_replay_format_must_match_the_generated
+            # _proposal` uses, here reconstructing a VALID older record
+            # rather than a tampered one: both fingerprints are re-derived
+            # over the stripped halves, so every pre-existing integrity
+            # check still passes and only the missing field is under test.
+            row = original(scenario_id)
+            if row is not None and "games_per_team" in row.request_input:
+                # The MATERIAL SNAPSHOT already looks pre-#375 without any
+                # help: `material_input_snapshot` omits the key entirely
+                # when games-per-team is not the operative format, which is
+                # the half of the compatibility guarantee that protects
+                # `input_fingerprint`. Asserted here rather than stripped,
+                # because there is nothing to strip.
+                self.assertNotIn(
+                    "games_per_team",
+                    row.generation_snapshot["planner_input"],
+                    "a legacy scenario's material snapshot grew a "
+                    "games_per_team key; every scenario stored before #375 "
+                    "will now fail its stale check")
+                del row.request_input["games_per_team"]
+                del row.proposal["games_per_team"]
+                row.input_fingerprint = canonical_fingerprint(
+                    row.generation_snapshot)
+                row.proposal_fingerprint = canonical_fingerprint(row.proposal)
+            return row
+
+        # The replay resolver reads it as a legacy record: no missing field,
+        # no integrity complaint.
+        meetings, games, bad = self.api._scenario_replay_format(
+            as_pre_375(scenario["scenario_id"]))
+        self.assertEqual(meetings, 1)
+        self.assertIsNone(games)
+        self.assertEqual(bad, [])
+
+        self.store.get_schedule_scenario_for_update = as_pre_375
+        try:
+            result = self.api.commit_schedule_scenario(
+                scenario["scenario_id"], actor_id="operator")
+        finally:
+            self.store.get_schedule_scenario_for_update = original
+        self.assertNotIn("error", result, result)
+        self.assertEqual(len(result["created"]), 6)
 
     def test_stored_replay_format_must_match_the_generated_proposal(self):
         """A rewritten format is an integrity failure, not a silent resize.

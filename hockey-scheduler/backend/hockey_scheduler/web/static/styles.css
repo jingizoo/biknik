@@ -1192,6 +1192,13 @@ details.tn > .tn-sum:hover { background: #f6f7fb; }
 .dq-stat.ign .dq-n { color: var(--muted); }
 .dq-stat.chan .dq-n { color: var(--muted); }
 .dq-actions { display: flex; align-items: center; gap: 12px; margin: 0 4px 14px; }
+/* #375 — the Scheduler's Generate row carries five controls (Division,
+   format, guaranteed-games number, turnaround, Generate). `.dq-actions` is
+   nowrap, which is right for the two- and three-button rows everywhere else
+   but pushes this one off the side of a 390px phone. Scoped to this row so no
+   other `.dq-actions` layout changes. */
+.sched-generate-row { flex-wrap: wrap; }
+.sched-games-input { width: 5.5rem; min-width: 0; }
 .dq-actions .act[disabled] { opacity: .45; pointer-events: none; }
 .cd-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .cd-table th { text-align: left; font-size: 11px; text-transform: uppercase;
