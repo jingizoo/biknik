@@ -449,10 +449,10 @@ class SchedulerContract:
         """One League with a normal 4-team Division and a Division holding a
         SINGLE registered team (#375 review).
 
-        The lone team has nobody to play, so no pairing is ever generated
-        for it — the case `_require_feasible_games_per_team` exempts from the
-        parity refusal so that one such Division cannot veto a whole League
-        draft, and the case `_no_opponent_teams` reports instead.
+        The lone team has nobody to play. `_require_feasible_games_per_team`
+        skips it — the parity argument is vacuous with no opponent — and
+        `require_completable_games_per_team` refuses it, with its own
+        diagnosis rather than the general residual one.
         """
         self._base()
         self.store.add_league(League(id="lg1", program_id="prog1", name="League"))
