@@ -50,22 +50,67 @@
 //     without a console error or horizontal overflow. That surface is what
 //     replaces the even-only list: the operator is told what to ask for
 //     instead, rather than never being allowed to ask.
+//   * (7) A VALUE NEITHER LIST COULD EXPRESS — 31 guaranteed games on a
+//     2-team Division. The control is a bounded numeric INPUT rather than a
+//     list precisely because the backend accepts every integer in
+//     1..MAX_GAMES_PER_TEAM and no hand-written list is that set: the
+//     even-only version had no odd values, and the version after it ran 1..30
+//     then jumped to 32, leaving 31 as the first of dozens of gaps.
+//
+// Before any scenario runs, the whole accepted range is checked in the
+// direction that matters — EVERY integer the backend accepts must be
+// expressible by the control, with MAX_GAMES_PER_TEAM read out of
+// `services/scheduler.py` rather than restated here. The check this replaces
+// asserted the reverse containment (every OFFERED value is accepted), which a
+// sparse list satisfies by construction and which therefore passed while the
+// product and the API disagreed about dozens of season lengths.
 //
 // Fails on any browser console/page error.
 const { chromium } = require("playwright");
 const { spawn } = require("child_process");
+const fs = require("fs");
 const http = require("http");
 const path = require("path");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
+
+// THE ACCEPTED RANGE, READ OUT OF THE BACKEND — never hard-coded here.
+//
+// The claim this journey checks is `accepted ⊆ offered`: every value
+// `_normalize_games_per_team` accepts must be reachable through the screen. A
+// literal 120 in this file would make that claim self-referential the moment
+// either side moved — and the direction of the claim is exactly what went
+// wrong before. The first control offered only even numbers; its replacement
+// offered 1..30 plus a sparse tail, leaving 31, 33, 41, 42, 45, 50, 61, 119
+// and dozens more unreachable. The check at the time asserted every OFFERED
+// value was valid (`offered ⊆ accepted`) — the opposite containment — which a
+// sparse list satisfies by construction, so it passed while the gap grew.
+const SCHEDULER_PY = path.join(
+  BACKEND_DIR, "hockey_scheduler", "services", "scheduler.py");
+const MAX_GAMES_PER_TEAM = (() => {
+  const source = fs.readFileSync(SCHEDULER_PY, "utf8");
+  const match = source.match(/^MAX_GAMES_PER_TEAM\s*=\s*(\d+)\s*$/m);
+  if (!match) {
+    throw new Error(
+      `could not read MAX_GAMES_PER_TEAM from ${SCHEDULER_PY} — this journey `
+      + "derives the accepted range from the backend and must not guess it");
+  }
+  return Number(match[1]);
+})();
+// A value the SPARSE list did not offer, asserted by name below. Without it
+// the range check could be satisfied by a control that merely happens to be
+// dense in the region the other scenarios exercise.
+const SPARSE_LIST_GAP = 31;
 const READY_TIMEOUT_MS = 15000;
 const ICE_DAY = "2026-09-05";
-// Deliberately MORE ice than every scenario below needs put together (16 rows
-// committed by (3), then 10 more for (5)), so scenario (4)'s "0 proposed" is
-// proof that regeneration found nothing missing — never that it ran out of ice
-// to propose onto — and (5)'s 10 rows are all genuinely placed.
-const ICE_HOURS = 44;
+// Deliberately MORE ice than every scenario below needs put together: 16 rows
+// are COMMITTED by (3) and never come back, then (5) previews 10, (6) previews
+// 10 and (7) previews 31 against what is left. So scenario (4)'s "0 proposed"
+// is proof that regeneration found nothing missing — never that it ran out of
+// ice — and (7)'s 31 rows are all genuinely placed rather than truncated.
+// One slot per DAY, so a pair meeting 31 times needs 31 distinct days.
+const ICE_HOURS = 80;
 const VIEWPORTS = [
   // 8311/8312 are unique across the whole e2e suite — no other journey binds
   // them, so this one can never race a shard-mate for a port.
@@ -130,9 +175,15 @@ const SELECT_TYPEAHEAD_RESET_MS = 1100;
 
 // Change a <select> with the REAL KEYBOARD, never page.selectOption(): that
 // sets the value straight through the DOM and passes even on a control a
-// keyboard user cannot reach at all. Focus it, then TYPE the number — the
-// option labels start with it ("5 guaranteed games per team"), so Chromium's
-// own typeahead lands on it and fires a real `change`.
+// keyboard user cannot reach at all. Focus it, then TYPE the shortest prefix
+// of the wanted option's label that no other option shares, so Chromium's own
+// typeahead lands on it and fires a real `change`.
+//
+// A UNIQUE prefix, not the bare value: typeahead searches FORWARD from the
+// current selection, so an ambiguous prefix silently lands on whichever
+// matching option happens to come next — a mis-selection that still produces a
+// valid-looking preview. A prefix only one option matches lands correctly from
+// any starting value.
 //
 // Typed rather than arrowed on purpose. On macOS, ArrowUp/ArrowDown on a
 // CLOSED select opens the native popup instead of moving the selection, and
@@ -145,25 +196,58 @@ async function keyboardSelect(page, selector, value, fail) {
   const focused = await page.$eval(selector, (el) => el === document.activeElement);
   if (!focused) fail(`${selector} did not take keyboard focus`);
   const options = await page.$$eval(`${selector} option`,
-    (els) => els.map((el) => ({ value: el.value, label: el.textContent })));
+    (els) => els.map((el) => ({ value: el.value, label: (el.textContent || "").trim() })));
   const wanted = options.find((o) => o.value === value);
   if (!wanted) fail(`${selector} offers no option "${value}"`);
-  // The TRAILING SPACE is load-bearing. Typeahead searches forward from the
-  // current selection, so typing "5" from "8" finds "52 guaranteed games per
-  // team" before wrapping round to "5 …" — a silent mis-selection that still
-  // produces a valid-looking preview. Searching for "5 " cannot match "52…",
-  // so the landing option is the one asked for from ANY starting value.
-  if (!wanted.label.startsWith(`${value} `)) {
-    fail(`${selector} option "${value}" is labelled "${wanted.label}", which `
-      + `keyboard typeahead cannot address unambiguously`);
+  let prefix = "";
+  for (let n = 1; n <= wanted.label.length; n++) {
+    prefix = wanted.label.slice(0, n);
+    const matches = options.filter(
+      (o) => o.label.toLowerCase().startsWith(prefix.toLowerCase()));
+    if (matches.length === 1) break;
+  }
+  const unique = options.filter(
+    (o) => o.label.toLowerCase().startsWith(prefix.toLowerCase()));
+  if (unique.length !== 1) {
+    fail(`${selector} option "${value}" has no label prefix keyboard typeahead `
+      + `can address unambiguously (${JSON.stringify(options)})`);
   }
   await page.waitForTimeout(SELECT_TYPEAHEAD_RESET_MS);
-  await page.keyboard.type(`${value} `);
+  await page.keyboard.type(prefix);
   await page.waitForTimeout(150);
   const landed = await page.$eval(selector, (el) => el.value);
   if (landed !== value) {
     fail(`keyboard selection of "${value}" on ${selector} landed on "${landed}"`);
   }
+}
+
+// Put the screen on the guaranteed-games format at `games`, entirely from the
+// keyboard: typeahead onto the format select, then select-all + type into the
+// bounded number input, then Tab to fire its `change`. This is the path an
+// operator without a mouse actually has, and it is the one that has to reach
+// every accepted value.
+async function keyboardSetGuaranteedGames(page, games, fail) {
+  await keyboardSelect(page, "#sched-format", "games", fail);
+  const enabled = await page.$eval("#sched-games", (el) => !el.disabled);
+  if (!enabled) {
+    fail("#sched-games must become editable once the guaranteed-games format "
+      + "is chosen");
+  }
+  await page.focus("#sched-games");
+  const focused = await page.$eval(
+    "#sched-games", (el) => el === document.activeElement);
+  if (!focused) fail("#sched-games did not take keyboard focus");
+  await page.keyboard.press("ControlOrMeta+A");
+  await page.keyboard.type(String(games));
+  await page.keyboard.press("Tab");
+  const landed = await page.$eval("#sched-games", (el) => el.value);
+  if (landed !== String(games)) {
+    fail(`keyboard entry of ${games} into #sched-games landed on "${landed}"`);
+  }
+}
+
+async function keyboardSetRoundRobin(page, fail) {
+  await keyboardSelect(page, "#sched-format", "rr", fail);
 }
 
 // The page must never scroll sideways — asserted at BOTH viewports, since a
@@ -251,6 +335,11 @@ async function checkViewport(browser, viewport) {
       // appearances, which no schedule can split into whole games.
       const odd = await post("/api/setup/division", {
         season_id: season.id, level_id: level.id, name: "FormatOdd" });
+      // A TWO-team Division for scenario (7): 2 x 31 = 62 team appearances =
+      // 31 pairings, all between the same pair, so "every team plays 31" and
+      // "31 rows" are the same statement and the count is unambiguous.
+      const pair = await post("/api/setup/division", {
+        season_id: season.id, level_id: level.id, name: "FormatPair" });
       const club = await post("/api/setup/club", { name: "Club" });
       const team = async (n) =>
         (await post("/api/v2/setup/team", { club_id: club.id, league_id: level.id, name: n })).id;
@@ -264,6 +353,7 @@ async function checkViewport(browser, viewport) {
       await register(["Format 1", "Format 2", "Format 3", "Format 4"], div.id);
       await register(["South 1", "South 2", "South 3", "South 4"], south.id);
       await register(["Odd 1", "Odd 2", "Odd 3", "Odd 4", "Odd 5"], odd.id);
+      await register(["Pair 1", "Pair 2"], pair.id);
       const venue = await post("/api/setup/venue", { name: "Arena", league_id: league.id });
       // Without an active SeasonVenueAccess grant the league-scoped scheduler
       // filters out every slot as "not assigned to this season".
@@ -281,7 +371,7 @@ async function checkViewport(browser, viewport) {
           end_time: `${iso}T09:00:00+00:00`, slot_type: "game",
         });
       }
-      return { div: div.id, south: south.id, odd: odd.id };
+      return { div: div.id, south: south.id, odd: odd.id, pair: pair.id };
     }, [ICE_DAY, ICE_HOURS]);
 
     await page.waitForSelector('.tab[data-tab="scheduler"]', { state: "visible", timeout: 10000 });
@@ -304,32 +394,85 @@ async function checkViewport(browser, viewport) {
     if (gamesLabel !== "Guaranteed games per team") {
       fail(`the format control's label must say what it sets, got "${gamesLabel}"`);
     }
-    // Every numeric option must be one the backend ACCEPTS — an integer in
-    // 1..MAX_GAMES_PER_TEAM (120), the range `_normalize_games_per_team`
-    // validates. That is a different and much weaker bar than the one this
-    // replaces ("every option is EVEN, so no Division can ever refuse it"),
-    // and deliberately so: an even-only list is unconditionally safe only
-    // because it deletes every odd format, including the ones an even-team
-    // Division can play perfectly well. Feasibility is a fact about the
-    // SELECTED Division, so the backend decides it and the screen surfaces
-    // the answer — scenarios (5) and (6) below drive both halves for real.
-    const offered = await page.$$eval(
-      "#sched-games option", (els) => els.map((el) => el.value));
-    const numeric = offered.filter((v) => v !== "rr").map(Number);
-    for (const n of numeric) {
-      if (!Number.isInteger(n) || n < 1 || n > 120) {
-        fail(`#sched-games offers "${n}", outside the range the backend accepts`);
+    // ---- EVERY ACCEPTED VALUE MUST BE REACHABLE --------------------------
+    //
+    // `accepted ⊆ offered`, checked in that direction. The previous version
+    // of this block checked the reverse — that every offered value was
+    // accepted — which a sparse list satisfies by construction and which
+    // therefore passed while 31, 33, 41, 42, 45, 50, 61, 119 and dozens more
+    // were unreachable through the product.
+    //
+    // Driven against the LIVE control: for every integer the backend accepts,
+    // set it and require the control to both KEEP it (a <select> silently
+    // drops a value it has no option for, which is exactly how a sparse list
+    // hides its gaps) and report it VALID. Then the reverse containment, so
+    // the bounds are real rather than absent: 0, a negative, MAX+1 and a
+    // fraction must all be rejected. A control with no constraints at all
+    // would pass the first half and fail the second.
+    const range = await page.evaluate((max) => {
+      const el = document.querySelector("#sched-games");
+      if (!el) return { missing: true };
+      const before = { value: el.value, disabled: el.disabled };
+      el.disabled = false;
+      const unreachable = [];
+      for (let n = 1; n <= max; n++) {
+        el.value = String(n);
+        const kept = el.value === String(n);
+        const valid = typeof el.checkValidity === "function"
+          ? el.checkValidity() : true;
+        if (!kept || !valid) unreachable.push(n);
       }
+      const acceptedOutOfRange = [];
+      for (const bad of ["0", "-1", String(max + 1), "1.5"]) {
+        el.value = bad;
+        if (el.value === bad
+            && (typeof el.checkValidity !== "function" || el.checkValidity())) {
+          acceptedOutOfRange.push(bad);
+        }
+      }
+      el.value = before.value;
+      el.disabled = before.disabled;
+      return {
+        unreachable, acceptedOutOfRange,
+        tag: el.tagName.toLowerCase(), type: el.type,
+        min: el.getAttribute("min"), max: el.getAttribute("max"),
+        step: el.getAttribute("step"),
+      };
+    }, MAX_GAMES_PER_TEAM);
+    if (range.missing) fail("the Scheduler panel has no #sched-games control");
+    if (range.unreachable.length) {
+      fail(`#sched-games cannot express ${range.unreachable.length} of the `
+        + `${MAX_GAMES_PER_TEAM} values the backend accepts, including `
+        + `${JSON.stringify(range.unreachable.slice(0, 12))} — the control and `
+        + `_normalize_games_per_team disagree about what an operator may ask for`);
     }
-    // ANTI-VACUITY. Without this, the range check above is satisfied by the
-    // very even-only list it replaces, and the whole blocker would look
-    // fixed while the capability was still missing. Odd values must actually
-    // be on offer, and 5 specifically, since (5) and (6) select it.
-    if (!numeric.some((n) => n % 2 === 1)) {
-      fail(`#sched-games offers no odd value: ${JSON.stringify(offered)}`);
+    // Named explicitly, and chosen because the SPARSE list this replaces did
+    // not offer it: without this line the block could be satisfied by a
+    // control that is merely dense wherever the other scenarios happen to
+    // look. Scenario (7) then drives this same value end to end.
+    if (range.unreachable.includes(SPARSE_LIST_GAP)) {
+      fail(`#sched-games cannot express ${SPARSE_LIST_GAP} guaranteed games, `
+        + "which the backend accepts");
     }
-    if (!numeric.includes(5)) {
-      fail(`#sched-games does not offer 5: ${JSON.stringify(offered)}`);
+    if (range.acceptedOutOfRange.length) {
+      fail(`#sched-games accepts ${JSON.stringify(range.acceptedOutOfRange)}, `
+        + "which the backend refuses — its bounds are not real");
+    }
+    // The rendered bound must equal the backend's own constant, so the
+    // client-side mirror of MAX_GAMES_PER_TEAM cannot drift silently.
+    if (range.max !== String(MAX_GAMES_PER_TEAM) || range.min !== "1"
+        || range.step !== "1") {
+      fail(`#sched-games is bounded ${range.min}..${range.max} step `
+        + `${range.step}; the backend accepts integers 1..${MAX_GAMES_PER_TEAM}`);
+    }
+    // The legacy format stays a DISTINCT choice — "play everyone once" is
+    // (T-1) games, which differs per Division, so no fixed number expresses
+    // it — and must not have been folded into the numeric control.
+    const formats = await page.$$eval(
+      "#sched-format option", (els) => els.map((el) => el.value));
+    if (JSON.stringify(formats) !== JSON.stringify(["rr", "games"])) {
+      fail(`#sched-format must offer the legacy round-robin and the `
+        + `guaranteed-games format, got ${JSON.stringify(formats)}`);
     }
 
     // (1) DEFAULT: untouched control -> the historical single round-robin.
@@ -354,7 +497,7 @@ async function checkViewport(browser, viewport) {
     // meetings picker cannot express -- 8 with 3 opponents is base 2
     // remainder 2, so each team plays two opponents THREE times and one
     // opponent twice.
-    await page.selectOption("#sched-games", "8");
+    await keyboardSetGuaranteedGames(page, 8, fail);
     await page.click("[data-sched-generate]");
     await page.waitForSelector('#sched-preview[data-games="16"]', { timeout: 15000 });
     s = await previewState(page);
@@ -418,7 +561,7 @@ async function checkViewport(browser, viewport) {
 
     // (4) IDEMPOTENT: regenerate unchanged at the same format -> nothing
     // missing, everything already scheduled, commit disabled.
-    await page.selectOption("#sched-games", "8");
+    await keyboardSetGuaranteedGames(page, 8, fail);
     await page.click("[data-sched-generate]");
     await page.waitForSelector(
       '#sched-preview[data-games="0"][data-already-scheduled="16"]', { timeout: 15000 });
@@ -434,7 +577,7 @@ async function checkViewport(browser, viewport) {
     // option list removed. 4 teams x 5 games = 20 team appearances = 10
     // games, entirely feasible; the option is reached with the REAL KEYBOARD.
     await page.selectOption("#sched-div", ids.south);
-    await keyboardSelect(page, "#sched-games", "5", fail);
+    await keyboardSetGuaranteedGames(page, 5, fail);
     await page.click("[data-sched-generate]");
     await page.waitForSelector('#sched-preview[data-games="10"]', { timeout: 15000 });
     s = await previewState(page);
@@ -477,7 +620,7 @@ async function checkViewport(browser, viewport) {
     // (6) THE SAME FORMAT ON AN ODD DIVISION — genuinely impossible, and the
     // screen must say so ACTIONABLY rather than the option never existing.
     await page.selectOption("#sched-div", ids.odd);
-    await keyboardSelect(page, "#sched-games", "5", fail);
+    await keyboardSetGuaranteedGames(page, 5, fail);
     expectingFormatRefusal = true;
     await page.click("[data-sched-generate]");
     await page.waitForSelector("#sched-format-refusal", { timeout: 15000 });
@@ -528,17 +671,62 @@ async function checkViewport(browser, viewport) {
     // plausible-looking one. The 400 allowance closes here — this Generate
     // must succeed, so any console error from it is a real one again.
     expectingFormatRefusal = false;
-    await keyboardSelect(page, "#sched-games", "4", fail);
+    await keyboardSetGuaranteedGames(page, 4, fail);
     await page.click("[data-sched-generate]");
     await page.waitForSelector('#sched-preview[data-games="10"]', { timeout: 15000 });
     if (await page.$("#sched-format-refusal")) {
       fail("a successful Generate must clear the previous format refusal");
     }
 
+    // (7) A VALUE THE OLD LISTS COULD NOT EXPRESS — 31 guaranteed games on a
+    // 2-team Division (31 meetings of the one pair). The even-only list had no
+    // odd values at all; the list that replaced it ran 1..30 and then jumped to
+    // 32, so 31 was the first gap. Driven end to end, from the keyboard, to
+    // prove the range check above is about a control that really works and not
+    // just about attributes.
+    await page.selectOption("#sched-div", ids.pair);
+    await keyboardSetGuaranteedGames(page, SPARSE_LIST_GAP, fail);
+    await page.click("[data-sched-generate]");
+    await page.waitForSelector(
+      `#sched-preview[data-games="${SPARSE_LIST_GAP}"]`, { timeout: 20000 });
+    s = await previewState(page);
+    const gapBody = draftBodies[draftBodies.length - 1];
+    if (!gapBody || gapBody.games_per_team !== SPARSE_LIST_GAP) {
+      fail(`${SPARSE_LIST_GAP} games: Generate must send games_per_team `
+        + `${SPARSE_LIST_GAP}, sent ${JSON.stringify(gapBody)}`);
+    }
+    if (gapBody.meetings_per_opponent !== undefined) {
+      fail(`${SPARSE_LIST_GAP} games: Generate must not send both format `
+        + `fields, sent ${JSON.stringify(gapBody)}`);
+    }
+    if (s.titles.length !== SPARSE_LIST_GAP) {
+      fail(`${SPARSE_LIST_GAP} games: expected ${SPARSE_LIST_GAP} proposed `
+        + `rows, got ${s.titles.length}`);
+    }
+    const gapPerTeam = {};
+    for (const title of s.titles) {
+      for (const name of title.split(" vs ").map((n) => n.trim())) {
+        gapPerTeam[name] = (gapPerTeam[name] || 0) + 1;
+      }
+    }
+    if (Object.keys(gapPerTeam).length !== 2) {
+      fail(`${SPARSE_LIST_GAP} games: expected 2 teams, got ${JSON.stringify(gapPerTeam)}`);
+    }
+    for (const name of Object.keys(gapPerTeam)) {
+      if (gapPerTeam[name] !== SPARSE_LIST_GAP) {
+        fail(`${SPARSE_LIST_GAP} games: "${name}" plays ${gapPerTeam[name]}, `
+          + `not the guaranteed ${SPARSE_LIST_GAP}: ${JSON.stringify(gapPerTeam)}`);
+      }
+    }
+    if (s.commitPresent !== true || s.commitDisabled !== false) {
+      fail(`${SPARSE_LIST_GAP} games: commit must be enabled: ${JSON.stringify(s)}`);
+    }
+    await assertNoHorizontalOverflow(page, `${SPARSE_LIST_GAP} games on 2 teams`, fail);
+
     if (errors.length) {
       fail(`console/page errors:\n${errors.join("\n")}`);
     }
-    console.log(`[${viewport.label}] OK — the picker sends games_per_team on Generate AND Commit; 8 guaranteed games per team (base 2, remainder 2) previewed and committed; regeneration is a visible no-op; 5 guaranteed games is keyboard-reachable and honoured on a 4-team Division, and refused with actionable 4-or-6 guidance on a 5-team one.`);
+    console.log(`[${viewport.label}] OK — the picker sends games_per_team on Generate AND Commit; 8 guaranteed games per team (base 2, remainder 2) previewed and committed; regeneration is a visible no-op; 5 guaranteed games is keyboard-reachable and honoured on a 4-team Division, and refused with actionable 4-or-6 guidance on a 5-team one; every one of the ${MAX_GAMES_PER_TEAM} accepted values is expressible by the control, including ${SPARSE_LIST_GAP}, driven end to end on a 2-team Division.`);
   } catch (error) {
     throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {

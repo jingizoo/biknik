@@ -226,7 +226,15 @@ async function checkViewport(browser, viewport) {
     // the candidate slots to compete over. (#375 inverted this control from
     // "meetings per opponent" to guaranteed games per team; with T=2 the two
     // spellings coincide, so the fixture's arithmetic is unchanged.)
-    await page.selectOption("#sched-games", "2");
+    // The format is now TWO controls: `#sched-format` chooses between the
+    // legacy single round-robin and the guaranteed-games format, and
+    // `#sched-games` is a bounded numeric input carrying the number (a list of
+    // options could never represent the whole 1..MAX_GAMES_PER_TEAM range the
+    // backend accepts). The number input stays disabled until the
+    // guaranteed-games format is chosen, so the order below matters.
+    await page.selectOption("#sched-format", "games");
+    await page.fill("#sched-games", "2");
+    await page.dispatchEvent("#sched-games", "change");
 
     // (1) DEFAULT: no turnaround configured -> the 3:30 slot is proposed
     // behind the 2:00-3:30 game. The defect, reachable by choice, and the

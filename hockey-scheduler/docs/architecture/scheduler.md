@@ -315,35 +315,61 @@ every legacy proposal and refuse every scenario stored before #375 as
 `preview_stale`. A regression test pins four legacy fingerprint hexes
 captured from before the field existed.
 
-### The picker offers every ACCEPTED value; feasibility is the backend's answer
+### A RANGE, not a list: the control represents every accepted value
 
-`#sched-games` in `web/static/app.js` used to offer only EVEN numbers, so that
-no option could ever be refused: `T × G` must be even, an even `G` satisfies
-that for every `T`, and the screen cannot know a Division's team count before
-Generate runs. That reasoning is sound and the conclusion was still wrong —
-odd `G` is fully feasible for every EVEN team count, so a 4-team Division's
-perfectly ordinary 5-game season was unreachable through the product. Trading
-away a supported format to make a static list unconditionally safe is the
-wrong trade.
+The number the operator asks for is entered in a bounded numeric input
+(`#sched-games`, `min=1 max=MAX_GAMES_PER_TEAM step=1 required`), with
+`#sched-format` choosing between it and the legacy single round-robin. That
+shape was arrived at by getting it wrong twice, and the two failures are the
+argument for it:
 
-The picker now offers every value `_normalize_games_per_team` accepts, odd
-ones included, and feasibility — which depends on the selected Division's live
-team count *and* on the Games it already has, neither of which the screen can
-know in advance — is answered by the backend and **surfaced**:
-`schedFormatRefusalBlock` renders `games_per_team_infeasible` and its two
-residual siblings in place, next to the control, with the achievable counts
-the refusal names. A failed Generate leaves no preview, so Commit is
-unavailable; a successful one clears the block.
+1. **Even numbers only.** The reasoning was sound — `T × G` must be even, an
+   even `G` satisfies that for every `T`, and the screen cannot know a
+   Division's team count before Generate runs — and the conclusion was still
+   wrong. Odd `G` is fully feasible for every EVEN team count, so a 4-team
+   Division's ordinary 5-game season was simply unreachable.
+2. **1..30 plus a sparse tail.** Fixed odd `G`, and still left 74 of the 120
+   accepted values — 31, 33, 41, 42, 45, 50, 61, 119 — with no way to ask for
+   them, while the code claimed the full range was exposed.
 
-`e2e/scheduler-games-per-team.js` drives both halves at desktop and 390×844,
-selecting the option with the **real keyboard** (typeahead — on macOS an arrow
-key opens a native popup headless Chromium never renders): 5 guaranteed games
-on a 4-team Division previews 10 rows with every team on exactly 5, and the
-same request on a 5-team Division surfaces the 4-or-6 guidance with no preview,
-no Commit, no console error and no horizontal overflow. The old "every numeric
-option is even" assertion is replaced by a range check plus an explicit
-anti-vacuity assertion that odd values are actually offered — without which
-the range check would pass on the very list it replaces.
+Both are the same mistake: **a list cannot represent a range.** Any
+hand-written set of options is strictly smaller than
+`1..MAX_GAMES_PER_TEAM`, so the product and `_normalize_games_per_team` drift
+apart by construction and stay apart until someone notices. An input with the
+matching bounds agrees by construction instead of by maintenance, and the
+browser's own constraint validation rejects `0`, `121` and `1.5` natively,
+with no second copy of the range to go stale.
+
+The one client-side mirror that remains is `SCHED_MAX_GAMES_PER_TEAM` in
+`app.js` (JavaScript cannot import the Python constant). It is safe only
+because something fails when it drifts: the journey reads
+`MAX_GAMES_PER_TEAM` out of `services/scheduler.py` and asserts the rendered
+`max` equals it.
+
+"Single round-robin" stays a **distinct** choice rather than a number: "play
+everyone once" is `T-1` games, which differs per Division, so no fixed
+games-per-team value expresses it.
+
+Feasibility is still not the control's job — it depends on the selected
+Division's live team count *and* on the Games it already has, neither knowable
+before Generate runs — so the backend answers it and
+`schedFormatRefusalBlock` **surfaces** the answer in place, with the
+achievable counts the refusal names. A refused Generate leaves no preview (so
+Commit is unavailable) and returns focus to Generate; a successful one clears
+the block.
+
+`e2e/scheduler-games-per-team.js` covers it at desktop and 390×844, driving
+the controls with the **real keyboard** (select typeahead plus typed digits —
+on macOS an arrow key on a closed select opens a native popup headless
+Chromium never renders). Before any scenario runs it checks the containment
+that matters: for every integer the backend accepts, the control must both
+KEEP the value and report it valid, and `0`/`-1`/`MAX+1`/`1.5` must all be
+rejected. **The direction is the point.** The assertion this replaces checked
+that every OFFERED value was accepted — the reverse containment — which a
+sparse list satisfies by construction, so it passed while 74 values were
+missing. `31` is additionally asserted by name, because it was the first gap
+in the sparse list, and scenario (7) drives it end to end on a 2-team Division
+(31 pairings, both teams on 31).
 
 ### The guarantee is over the PAIRING LIST, not over placement
 
