@@ -489,6 +489,12 @@ async function checkViewport(browser, viewport) {
         text: el.textContent.replace(/\s+/g, " ").trim(),
         preview: !!document.querySelector("#sched-preview"),
         commit: !!document.querySelector("[data-sched-commit]"),
+        // render() replaces #content wholesale, so the Generate button the
+        // operator just activated is destroyed. Where focus lands decides
+        // whether a keyboard user can act on the guidance at all.
+        focused: document.activeElement
+          ? document.activeElement.getAttribute("data-sched-generate") !== null
+          : false,
       };
     });
     if (refusal.reason !== "games_per_team_infeasible") {
@@ -504,6 +510,13 @@ async function checkViewport(browser, viewport) {
     // Commit must be unavailable: there is no reviewed proposal to commit.
     if (refusal.preview || refusal.commit) {
       fail(`5 games on 5 teams: a refusal must leave no preview and no Commit: ${JSON.stringify(refusal)}`);
+    }
+    // The guidance says "pick a different number and Generate again", so the
+    // operator has to be able to. Focus must be back on Generate, not on the
+    // document body the wholesale re-render would otherwise leave it in.
+    if (!refusal.focused) {
+      fail("5 games on 5 teams: a refusal must return focus to Generate, "
+        + "not drop a keyboard user to the document body");
     }
     await assertNoHorizontalOverflow(page, "5 games on 5 teams", fail);
     if (errors.length) {

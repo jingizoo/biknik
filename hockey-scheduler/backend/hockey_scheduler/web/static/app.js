@@ -11505,6 +11505,16 @@ async function render() {
       (failure && SCHED_FORMAT_REFUSALS.indexOf(failure.reason) !== -1)
         ? { message: res.error.message, details: failure }
         : null;
+    if (schedulerState.formatRefusal) {
+      // #328 review round 8 finding 4, same defect on this path: render()
+      // below replaces #content wholesale, so the Generate button the
+      // operator just activated is gone and nothing moves focus anywhere —
+      // silently dropping a keyboard user to the document body while the
+      // guidance tells them to pick another number and Generate again. The
+      // next action is always Generate, and that control always exists on
+      // this screen, so send focus back to it once the fresh content lands.
+      schedFocusGenerateAfterRender = true;
+    }
     await render();
   };
   const schedCommit = c.querySelector("[data-sched-commit]");
