@@ -222,11 +222,13 @@ and is not attempted here.
 
 The pack found four places where the owner's brief for it ("neutral task
 prompts, no UI hints") and the protocols' own text pull in different directions.
-It resolved none of them: the protocol wins, and the pack delivers the protocol.
-They are listed here so the owner can rule, and so nothing gets settled quietly
-by a moderator mid-session. Where a ruling changes what is read aloud, it belongs
-in the moderated protocol's own Conflicts log — this pack must not edit either
-protocol, and does not.
+It settled none of them on the owner's behalf. For 1–3 there is a protocol
+wording to fall back on, and the pack delivers it. For 4 there is not — the
+protocol supplies no wording at all — so instead of inventing one the pack
+stops: it is a gate, and the sessions wait. They are listed here so the owner
+can rule, and so nothing gets settled quietly by a moderator mid-session. Where
+a ruling changes what is read aloud, it belongs in the moderated protocol's own
+Conflicts log — this pack must not edit either protocol, and does not.
 
 **Items 1–3 do not block a session; item 4 does.** For 1–3 the pack delivers the
 protocol's own wording and running today is the defensible default — a ruling
