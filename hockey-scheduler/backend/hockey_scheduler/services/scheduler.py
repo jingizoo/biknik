@@ -161,6 +161,65 @@ def round_robin_pairings(team_ids, meetings=1):
             for m in range(meetings) for h, a in base]
 
 
+# #375 — the ceiling on GUARANTEED GAMES PER TEAM. The bound is an
+# ALLOCATION bound, not a taste judgement: the pairing list this engine
+# materializes in memory before any ice is consulted is exactly
+# ``teams x games / 2`` rows, so an unbounded ``games_per_team`` turns one
+# request into an arbitrarily large allocation. 120 sits far above any real
+# regular season (the NHL plays 82) while still being a ceiling.
+MAX_GAMES_PER_TEAM = 120
+
+
+def _normalize_games_per_team(value, field="games_per_team"):
+    """Validate the operator-facing guaranteed-games-per-team count (#375).
+
+    Client input, so every bad shape raises a structured ``ValidationError``
+    rather than letting a raw TypeError cross the facade boundary — the same
+    contract :func:`_normalize_meetings` and :func:`_normalize_constraints`
+    already hold. ``None`` means "not specified" and is returned as ``None``
+    rather than defaulted, because the caller still has to tell the legacy
+    ``meetings_per_opponent`` path apart from this one.
+
+    ``bool`` is rejected explicitly even though it is an ``int`` subclass:
+    ``True`` would otherwise silently mean "1 game" and ``False`` "0",
+    neither of which any caller can have intended.
+
+    FEASIBILITY (``teams x games`` must be even) is deliberately NOT checked
+    here — it needs the team count, which only the draft entry points know.
+    See :func:`_require_feasible_games_per_team`.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValidationError(f"'{field}' must be an integer >= 1.")
+    if value < 1:
+        raise ValidationError(f"'{field}' must be an integer >= 1.")
+    if value > MAX_GAMES_PER_TEAM:
+        raise ValidationError(
+            f"'{field}' must be at most {MAX_GAMES_PER_TEAM}.")
+    return value
+
+
+def games_per_team_pairings(team_ids, games_per_team):
+    """PLACEHOLDER — deliberately wrong, replaced by the real construction.
+
+    This is the naive implementation, committed first so the property tests
+    in ``tests/test_scheduler_games_per_team.py`` can be shown FAILING
+    against it: take ``ceil(G / opponents)`` whole round-robins and truncate
+    the flat list to the right TOTAL number of pairings. It gets the total
+    exactly right and the per-team guarantee wrong whenever ``G`` is not a
+    multiple of ``opponents``, because truncating a flat round-robin list
+    cuts mid-round and leaves the teams of the severed rounds uneven.
+    """
+    teams = sorted(team_ids)
+    if len(teams) < 2:
+        return []
+    opponents = len(teams) - 1
+    cycles = -(-games_per_team // opponents)
+    return round_robin_pairings(teams, cycles)[
+        :(len(teams) * games_per_team) // 2]
+
+
 def _available_game_slots(store, slot_ids=None):
     """Game-type ice slots that are AVAILABLE and not already tied to a game,
     earliest first (deterministic tie-break on id)."""
