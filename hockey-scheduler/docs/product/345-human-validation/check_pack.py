@@ -190,6 +190,29 @@ def _inject_row(text: str, anchor: str, row: str) -> str:
 _IDENTITY_ROW = "| Participant identity (see the privacy rule below) | |"
 
 
+def mut(break_name: str, before: str, after: str, what: str = "") -> str:
+    """Apply a mutation, and refuse to let it silently do nothing.
+
+    A mutation whose anchor text has moved becomes a no-op: the injected defect
+    is never actually injected, and the run stays green (or goes red for some
+    unrelated reason) while the mutation reports success. That is the same
+    failure as a check that stops checking, and it has already happened twice
+    on this branch — once where a mutation's fixture tripped a second guard,
+    and once where half of `readme-denies-ci` stopped matching after the
+    sentence it targeted was rewrapped.
+
+    verify_breaks catches the AssertionError and reports the break as
+    TOOTHLESS, naming it.
+    """
+    if before == after:
+        raise AssertionError(
+            f"--break {break_name} had no effect{f' ({what})' if what else ''} — "
+            f"its anchor text has moved, so this mutation injects nothing and "
+            f"tests nothing. Fix the anchor; do not delete the mutation."
+        )
+    return after
+
+
 def read_pack(name: str) -> str:
     text = (PACK_DIR / name).read_text(encoding="utf-8")
 
@@ -202,7 +225,11 @@ def read_pack(name: str) -> str:
         if broken(B_PII_NAME_FIELD):
             text = _inject_row(text, "| Date | |", "| Participant's full name | |")
         if broken(B_PII_CODE_MISSING):
-            text = re.sub(r"(?m)^\|\s*Participant code[^\n]*\n", "", text)
+            text = mut(
+                B_PII_CODE_MISSING,
+                text,
+                re.sub(r"(?m)^\|\s*Participant code[^\n]*\n", "", text),
+            )
     if name == "11-capture-sheet-coach.md":
         if broken(B_PII_CONTACT_FIELD):
             text = _inject_row(text, "| Date | |", "| Contact details | |")
@@ -212,28 +239,54 @@ def read_pack(name: str) -> str:
                 RULE_MAPPING_OUTSIDE_REPO,
                 RULE_REDACTION_CHECK,
             ):
-                text = flex(marker).sub("", text)
+                text = mut(B_PII_RULE_MISSING, text, flex(marker).sub("", text), marker[:40])
 
     if name == "06-task-prompts-league-admin.md" and broken(B_PRIMARY_OLD_RULE):
-        text = text.replace(
-            "- Record their exact words",
-            "- Let them proceed and score the match against the control they "
-            "actually named.\n- Record their exact words",
-            1,
+        text = mut(
+            B_PRIMARY_OLD_RULE,
+            text,
+            text.replace(
+                "- Record their exact words",
+                "- Let them proceed and score the match against the control they "
+                "actually named.\n- Record their exact words",
+                1,
+            ),
         )
     if name == "09-capture-sheet-league-admin.md" and broken(B_PRIMARY_RULE_MISSING):
-        text = flex(RULE_NEVER_YES).sub("", text)
+        text = mut(B_PRIMARY_RULE_MISSING, text, flex(RULE_NEVER_YES).sub("", text))
 
     if name == "07-task-prompts-arena-manager.md" and broken(B_EASE_LOCAL_COPY):
         text += (
             "\n\n```text\nOn a scale of one to five, how easy did you find that?\n```\n"
         )
     if name == "08-task-prompts-coach.md" and broken(B_EASE_POINTER_MISSING):
-        text = text.replace(f"({EASE_CANON})", "(README.md)")
+        text = mut(
+            B_EASE_POINTER_MISSING, text, text.replace(f"({EASE_CANON})", "(README.md)")
+        )
     if name == "02-environment-arena-manager.md" and broken(B_GATE_ROW_MISSING):
-        text = re.sub(r"(?m)^\|[^\n]*" + re.escape(GATE_MARKER) + r"[^\n]*\n", "", text)
+        text = mut(
+            B_GATE_ROW_MISSING,
+            text,
+            re.sub(r"(?m)^\|[^\n]*" + re.escape(GATE_MARKER) + r"[^\n]*\n", "", text),
+        )
     if name == "README.md" and broken(B_README_NONBLOCKING):
         text += "\n\n**None of these blocks a session.**\n"
+    if name == "README.md" and broken(B_README_DENIES_CI):
+        text = mut(
+            B_README_DENIES_CI,
+            text,
+            flex(README_CI_ADMISSION).sub("It adds nothing outside this pack", text),
+            "drop the CI admission",
+        )
+        text = mut(
+            B_README_DENIES_CI,
+            text,
+            flex(
+                "This pack adds **no application code, no product behaviour, and no "
+                "change to any application test**"
+            ).sub(OLD_README_SCOPE_DENIAL.rstrip("."), text),
+            "restore the CI denial",
+        )
     if name == "README.md" and broken(B_BLOCKQUOTE_NOT_PROTOCOL):
         text += (
             "\n\n> Ask the participant to confirm the room is quiet before you\n"
@@ -242,26 +295,40 @@ def read_pack(name: str) -> str:
     if name == "01-environment-league-admin.md" and broken(
         B_RECORDING_RUNBOOK_PERMISSIVE
     ):
-        text = text.replace(
-            "3. These sessions run without audio or video recording.",
-            OLD_PERMISSIVE_RECORDING_STEP,
-            1,
+        text = mut(
+            B_RECORDING_RUNBOOK_PERMISSIVE,
+            text,
+            text.replace(
+                "3. These sessions run without audio or video recording.",
+                OLD_PERMISSIVE_RECORDING_STEP,
+                1,
+            ),
         )
     if name == "02-environment-arena-manager.md" and broken(
         B_RECORDING_PROHIBITION_MISSING
     ):
-        text = flex(RULE_NO_RECORDINGS).sub("Reset the browser profile.", text)
+        text = mut(
+            B_RECORDING_PROHIBITION_MISSING,
+            text,
+            flex(RULE_NO_RECORDINGS).sub("Reset the browser profile.", text),
+        )
 
     if broken(B_RECORDINGS_PERMITTED):
         text = flex(RULE_NO_RECORDINGS).sub(
             "Recording is at the moderator's discretion.", text
         )
-    if broken(B_SUPERSESSION_NOTE_MISSING):
-        text = flex(RULE_SUPERSEDED_IDENTITY).sub("", text)
+    if broken(B_SUPERSESSION_NOTE_MISSING) and flex(
+        RULE_SUPERSEDED_IDENTITY
+    ).search(text):
+        text = mut(
+            B_SUPERSESSION_NOTE_MISSING,
+            text,
+            flex(RULE_SUPERSEDED_IDENTITY).sub("", text),
+        )
     if broken(B_PIN_MISSING) and name == "09-capture-sheet-league-admin.md":
-        text = text.replace(PINNED_COMMIT, "origin/main")
+        text = mut(B_PIN_MISSING, text, text.replace(PINNED_COMMIT, "origin/main"))
         for blob in PROTOCOL_BLOBS.values():
-            text = text.replace(blob, "")
+            text = mut(B_PIN_MISSING, text, text.replace(blob, ""), f"blob {blob[:8]}")
 
     return text
 
@@ -1427,6 +1494,160 @@ def check_recording_consistency() -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# The pack's public scope claim vs. what the diff actually ships, and the
+# CI job's description of the guarantee it enforces.
+#
+# THIS CHECK DELIBERATELY READS TWO FILES OUTSIDE THE PACK DIRECTORY.
+# That is not an oversight, and it must not be "tidied up" into a
+# pack-only check. The reason: this checker is registered as a CI job, and
+# the job's own comments and log output state the contract the job
+# enforces. If the registration drifts away from the contract — or the
+# README goes on claiming the pack touches no CI while the job exists —
+# then the surfaces a reviewer and a maintainer actually read are lying
+# about the thing this file does. Nothing inside the pack directory can
+# see that. So the checker guards its own registration.
+#
+# Concretely, this exists because the workflow kept teaching the WEAKER
+# guarantee ("every mutation must make at least one check fail") after the
+# harness had moved to the stronger one ("its OWN named check"). That
+# weaker rule is exactly what let `recordings-permitted` bite the capture
+# sheets while the live defect sat in the runbooks. A maintainer reading
+# the workflow could reasonably have deleted BREAK_TARGETS believing the
+# documented guarantee still held.
+# ---------------------------------------------------------------------------
+
+REPO_ROOT = PACK_DIR.parents[3]
+CI_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "hockey-scheduler-ci.yml"
+HUMAN_VALIDATION_JOB = "human-validation-pack:"
+
+B_README_DENIES_CI = register_break(
+    "readme-denies-ci",
+    "restore the README sentence claiming the pack adds no CI configuration",
+    "scope-and-ci-contract",
+)
+B_WORKFLOW_WEAK_CONTRACT = register_break(
+    "workflow-weak-contract",
+    "restore the workflow's superseded 'at least one check fail' guarantee",
+    "scope-and-ci-contract",
+)
+
+OLD_README_SCOPE_DENIAL = (
+    "This pack adds no application code, tests, CI configuration, or product\n"
+    "behaviour, and it modifies neither protocol."
+)
+
+# The README must say, in its own words, that this change reaches CI.
+README_CI_ADMISSION = (
+    "It adds a checker for this pack and a dedicated CI job that runs it"
+)
+
+# Ways a document can deny touching CI.
+CI_DENIAL_PATTERNS = (
+    ("\"adds no ... CI ...\"", r"adds?\s+no\b[^.]{0,120}\bCI\b"),
+    ("\"no CI configuration/change/job\"", r"\bno\s+CI\s+(?:configuration|change|job)"),
+    ("\"does not touch/change CI\"", r"does\s+not\s+(?:touch|change|modify|add)\s+[^.]{0,40}\bCI\b"),
+)
+
+# The superseded, weaker falsification guarantee.
+WEAK_CONTRACT_PATTERNS = (
+    ("\"at least one check\"", r"at\s+least\s+one\s+check"),
+    ("\"make(s) a check fail\"", r"makes?\s+a\s+check\s+fail"),
+    ("\"some/any check fails\"", r"\b(?:some|any)\s+check\s+fails?\b"),
+)
+
+STRONG_CONTRACT_PHRASE = "own named check"
+
+
+def read_ci_workflow() -> str:
+    text = CI_WORKFLOW_PATH.read_text(encoding="utf-8")
+    if broken(B_WORKFLOW_WEAK_CONTRACT):
+        text = text.replace(
+            "must still make the mutation's own named check fail",
+            "must still make at least one check fail",
+        )
+        text = text.replace(
+            "every injected defect must still fail its own named check",
+            "every injected defect must still make a check fail",
+        )
+    return text
+
+
+@check("scope-and-ci-contract")
+def check_scope_and_ci_contract() -> list[str]:
+    """README's scope claim and the CI job's stated guarantee must both be true.
+
+    Reads `README.md` and `.github/workflows/hockey-scheduler-ci.yml` — see the
+    block comment above for why reaching outside the pack directory is the point
+    of this check rather than a bug in it.
+    """
+    failures = []
+    readme = read_pack("README.md")
+    workflow = read_ci_workflow()
+    job_exists = HUMAN_VALIDATION_JOB in workflow
+
+    # --- Direction 1: the README must not deny a CI change that exists -------
+    if job_exists:
+        for label, pattern in CI_DENIAL_PATTERNS:
+            match = re.search(pattern, normalize(readme), re.IGNORECASE)
+            if match:
+                failures.append(
+                    f"README.md: denies touching CI ({label}: {match.group(0)!r}) "
+                    f"while the `{HUMAN_VALIDATION_JOB[:-1]}` job exists in "
+                    f"{CI_WORKFLOW_PATH.name}. README is the scope surface a "
+                    f"reviewer sizes this change from; it must not hide a real "
+                    f"CI change"
+                )
+        if not flex(README_CI_ADMISSION).search(readme):
+            failures.append(
+                f"README.md: never states that this change adds a checker and a "
+                f"CI job (expected {README_CI_ADMISSION!r}). Not denying CI is "
+                f"not the same as disclosing it — a reader must be able to tell "
+                f"from README alone that this touches CI"
+            )
+    else:
+        if flex(README_CI_ADMISSION).search(readme):
+            failures.append(
+                f"README.md: claims a dedicated CI job runs the checker, but no "
+                f"`{HUMAN_VALIDATION_JOB[:-1]}` job exists in "
+                f"{CI_WORKFLOW_PATH.name} — the claim is now false in the other "
+                f"direction"
+            )
+
+    # --- Direction 2: the workflow must not teach the superseded contract ----
+    for lineno, line in enumerate(workflow.splitlines(), start=1):
+        for label, pattern in WEAK_CONTRACT_PATTERNS:
+            if re.search(pattern, line, re.IGNORECASE):
+                failures.append(
+                    f"{CI_WORKFLOW_PATH.name}:{lineno}: describes the superseded "
+                    f"any-check guarantee ({label}) — {line.strip()[:90]!r}. That "
+                    f"is the rule that let a mutation bite the wrong surface "
+                    f"while the real defect went unseen; a maintainer reading it "
+                    f"could remove BREAK_TARGETS believing the guarantee held"
+                )
+
+    # --- Direction 3: the workflow must state the real contract, in BOTH the
+    # comments a maintainer reads in the file and the text emitted into the
+    # Actions log, which is the only version most people ever see.
+    if job_exists:
+        comment_lines = [
+            l for l in workflow.splitlines() if l.lstrip().startswith("#")
+        ]
+        emitted_lines = [l for l in workflow.splitlines() if "echo " in l]
+        if not any(STRONG_CONTRACT_PHRASE in l for l in comment_lines):
+            failures.append(
+                f"{CI_WORKFLOW_PATH.name}: no comment states the actual "
+                f"guarantee ({STRONG_CONTRACT_PHRASE!r})"
+            )
+        if not any(STRONG_CONTRACT_PHRASE in l for l in emitted_lines):
+            failures.append(
+                f"{CI_WORKFLOW_PATH.name}: the step emits no line stating the "
+                f"actual guarantee ({STRONG_CONTRACT_PHRASE!r}) — the Actions log "
+                f"is the version a maintainer reads when the job fails"
+            )
+    return failures
+
+
+# ---------------------------------------------------------------------------
 # Safeguard S1 — the source pin
 # ---------------------------------------------------------------------------
 
@@ -1800,7 +2021,14 @@ def run(selected: str | None = None) -> int:
         if selected and fn.check_name != selected:
             continue
         ran += 1
-        found = fn()
+        try:
+            found = fn()
+        except AssertionError as exc:
+            # A mutation that no longer applies is a real finding, not a crash.
+            print(f"[FAIL] {fn.check_name}")
+            print(f"         {exc}")
+            failures.append(f"{fn.check_name}: {exc}")
+            continue
         status = "FAIL" if found else "ok"
         print(f"[{status:>4}] {fn.check_name}")
         for line in found:

@@ -2,9 +2,11 @@
 
 ## This pack contains no evidence
 
-Everything in here is **blank instrumentation**: environments to bring up,
-scripts to run, prompts to read, and sheets to fill in. Nothing in this
-directory is, or may be cited as, a performed pass.
+Every session document in here is **blank instrumentation**: environments to
+bring up, scripts to run, prompts to read, and sheets to fill in. The one
+non-document is [`check_pack.py`](check_pack.py), which checks this pack's own
+consistency and performs no part of a session. Nothing in this directory is, or
+may be cited as, a performed pass.
 
 - No keyboard pass, screen-reader pass, or moderated operator session has been
   run under this pack.
@@ -34,7 +36,7 @@ evidence. This pack is the operational layer that makes those sessions runnable
 by a facilitator — seeded environments with checkable preconditions, the
 scripts, neutral task prompts, and capture sheets.
 
-## The two protocols are the authority — this pack never restates them
+## The two protocols are the authority — this pack never paraphrases them
 
 Both are already merged and both govern:
 
@@ -88,7 +90,8 @@ advancing the pin.
 
 ## The files
 
-Print or fill exactly the ones a given session needs.
+Print or fill exactly the ones a given session needs. The last row is not a
+session document — it is the checker, and it is run, not printed.
 
 | File | What it is | Used by |
 | --- | --- | --- |
@@ -357,8 +360,24 @@ caught by a mutation, the other by a human reading the runbooks end to end.
 
 ## Scope
 
-This pack adds no application code, tests, CI configuration, or product
-behaviour, and it modifies neither protocol. Defects found while running it are
-recorded in the protocols' own defect tables for separate follow-up work, not
-fixed inline — the keyboard/screen-reader protocol §6 is explicit that running
-a protocol does not authorise changing the application.
+This pack adds **no application code, no product behaviour, and no
+change to any application test**, and it modifies neither protocol. Defects
+found while running it are recorded in the protocols' own defect tables for
+separate follow-up work, not fixed inline — the keyboard/screen-reader protocol
+§6 is explicit that running a protocol does not authorise changing the
+application.
+
+**It does change CI, and that is the whole of what it changes outside this
+directory.** It adds a checker for this pack and a dedicated CI job that runs it:
+[`check_pack.py`](check_pack.py) here, and a `human-validation-pack` job in
+`.github/workflows/hockey-scheduler-ci.yml`. The job is ungated by the repo's
+fail-closed path classifier, because the protocols this checker guards are
+markdown and the classifier routes markdown to `docs`, where every other job
+skips — so gating it would mean the one change it exists to catch never starts
+it.
+
+So a reviewer can size this from this page alone: one new Python file inside this
+directory, one new job in the existing CI workflow, and markdown. No application
+source, no application tests, no product behaviour, neither protocol. The
+`scope-and-ci-contract` check fails if this paragraph and the workflow ever stop
+agreeing with each other.
