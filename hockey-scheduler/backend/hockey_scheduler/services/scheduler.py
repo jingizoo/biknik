@@ -347,6 +347,16 @@ def _require_feasible_games_per_team(team_count, games, label=None):
     ``label`` names the team group when a League-wide draft has several
     Divisions with different team counts, so the operator learns WHICH one
     cannot honour the request instead of just that something could not.
+
+    A group of fewer than two teams is skipped HERE, but that is a division
+    of labour and NOT an exemption from refusal (#375 review). The parity
+    argument is vacuous for such a group — with no opponent there is no
+    ``rem`` to build — so this check has nothing to say about it, and a
+    parity message ("ask for G-1 or G+1") would be useless advice when no G
+    at all is achievable. :func:`require_completable_games_per_team` refuses
+    it instead, naming the team and telling the operator to register an
+    opponent. Both entry points run that check on every group, so nothing
+    reaches the generator on the strength of this early return.
     """
     if team_count < 2 or (team_count * games) % 2 == 0:
         return
@@ -412,9 +422,20 @@ def _extra_pairs(teams, rem):
     n = len(teams)
     if n % 2 == 0:
         # Replay the same rotation `round_robin_pairings` uses, keeping only
-        # the first `rem` rounds. Written out rather than sliced off that
-        # function's flat output because the flat list carries orientation
-        # and round boundaries are exactly what a naive slice loses.
+        # the first `rem` rounds.
+        #
+        # A prefix slice of that function's flat output WOULD work here, and
+        # an earlier version of this comment claimed otherwise: with even
+        # `n` every round contributes exactly `n // 2` pairs, so the round
+        # boundaries sit at a fixed stride and `[:rem * (n // 2)]` is the
+        # same set of pairs (orientation aside, which the caller discards).
+        # The rotation is written out anyway for a reason that is true: it
+        # depends only on `round_robin_pairings`'s DOCUMENTED contract —
+        # rounds emitted whole, in round order — rather than on the stride
+        # of its flat list, which is a layout detail that function does not
+        # promise and an odd-`n` bye already breaks. It also keeps this
+        # branch shaped like the odd-`n` one below, which has no slice to
+        # take.
         pairs = []
         fixed, rot = teams[0], list(teams[1:])
         for _round in range(rem):
@@ -639,6 +660,39 @@ def require_completable_games_per_team(team_ids, games, fixed_multiplicity,
         degree[high] += count
     degrees = [degree[t] for t in teams]
     where = f" in {label}" if label else ""
+
+    # #375 review — a group of EXACTLY ONE team fails condition (3) like any
+    # other over-demanded group, but for a reason that has nothing to do
+    # with the existing Games: there is no opponent, so `r(v) = G` and the
+    # rest of the group can supply 0. Falling through to the general message
+    # below tells the operator their "already scheduled games" cannot be
+    # completed and advises them to "cancel some of them first" — when the
+    # group has no games to cancel and cancelling could not help if it did.
+    # The condition is the same; only the diagnosis and the action differ,
+    # so they are said separately.
+    #
+    # EXACTLY ONE, not "fewer than two". A group with NO teams has no team
+    # whose guarantee goes unhonoured and nothing to say to the operator; it
+    # already falls through every condition below without refusing (an empty
+    # residual is trivially completable), and it must keep doing so, or a
+    # League-wide draft would start failing on an empty Division that costs
+    # it nothing today.
+    #
+    # Note this IS a refusal, so a one-team Division does veto a League-wide
+    # draft. `_require_feasible_games_per_team`'s `team_count < 2` early
+    # return no longer keeps that from happening; what it buys instead is
+    # that the guarantee is never quietly left unhonoured.
+    if len(teams) == 1 and games > 0:
+        lone = names.get(teams[0], teams[0])
+        raise ValidationError(
+            f"{games} guaranteed games per team is impossible{where}: "
+            f"{lone} has no opponent to play. Register at least one more "
+            f"team in this division, or leave it out of the draft.",
+            {"reason": "games_per_team_residual_infeasible",
+             "games_per_team": games,
+             "team_count": 1,
+             "nearest_achievable": []})
+
     achievable = smallest_completable_games(len(teams), degrees)
     advice = (f" Ask for {achievable} guaranteed games instead, or cancel "
               f"some of the existing games first."

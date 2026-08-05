@@ -177,9 +177,41 @@ counts**, `G-1` and `G+1`, because an operator told "20 is impossible" has to
 guess while one told "ask for 19 or 21" can act. A neighbour outside the
 accepted range is dropped rather than suggested, so the advice can never name
 a value the backend would itself reject. League-wide, the message also names
-the Division that cannot honour the request. A group with fewer than two
-teams is exempt: it has no opponents and produces no pairings at all (the
-pre-existing answer), so one empty Division cannot veto a whole League draft.
+the Division that cannot honour the request.
+
+Feasibility is judged in a **separate pass over every group in sorted order,
+before any group is built**. Judging it inside the generation loop would read
+`groups`' insertion order — registration order, and therefore store-backend
+dependent — so *which* Division a League-wide refusal names would differ
+between Memory, SQLite and PostgreSQL for identical data. The generation loop
+itself must keep the original order, because that order decides which
+pairings are offered ice first.
+
+#### A group with fewer than two teams
+
+The parity check **skips** it, and that is a division of labour rather than
+an exemption from refusal. The parity argument is vacuous with no opponent —
+there is no `rem` to build — and "ask for `G-1` or `G+1`" would be useless
+advice when no `G` at all is achievable.
+
+`require_completable_games_per_team` refuses it instead, as a case of
+condition (3): the lone team needs `G` and the rest of the division can
+supply `0`. It is refused with its **own diagnosis**, not the general
+residual one — that message blames "the games already scheduled" and offers
+cancelling some of them, and a one-team division has no games to cancel and
+would not be helped if it did. The operator is told the team has no opponent
+and to register another one.
+
+Two consequences, both deliberate and both pinned by tests:
+
+* Under the guaranteed-games format a one-team Division **does refuse the
+  whole League-wide draft**, including Divisions that could have been
+  scheduled perfectly. The older claim that "one empty Division cannot veto a
+  whole League draft" is no longer true for a Division with a team in it —
+  what it buys instead is that the guarantee is never quietly unhonoured.
+* Under the legacy `meetings_per_opponent` control nothing is refused: "N
+  games against each of your 0 opponents" really is 0, so every pre-#375
+  request keeps working unchanged.
 
 ### Construction: `base` round-robins plus a `rem`-regular extras multigraph
 

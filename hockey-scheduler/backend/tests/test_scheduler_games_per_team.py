@@ -645,5 +645,41 @@ class ResidualCompletionPropertyTest(unittest.TestCase):
             repr(games_per_team_residual_pairings(ids, 8, fixed)))
 
 
+class GamesPerTeamNoOpponentTest(unittest.TestCase):
+    """The two ends of "this group is too small to play" (#375 review).
+
+    A group of ONE gets a refusal with its own diagnosis; a group of NONE
+    gets no refusal at all. Both are asserted here, at the function's own
+    contract, because neither is reachable through the draft entry points:
+    `registered_teams_by_division_in_league` never yields a Division with no
+    registrations, so a test that went through a draft would pass whichever
+    boundary the guard used and prove nothing.
+    """
+
+    def test_one_team_is_refused_for_the_reason_that_is_actually_true(self):
+        # Condition (3) catches this anyway, but with a message that blames
+        # "the games already scheduled" and offers cancelling some of them.
+        # This group has none, and cancelling could not help if it did.
+        with self.assertRaises(ValidationError) as caught:
+            require_completable_games_per_team(
+                ["solo"], 6, {}, label="Lone",
+                team_names={"solo": "Lone 0"})
+        message = str(caught.exception)
+        self.assertIn("Lone 0", message)
+        self.assertIn("no opponent", message)
+        self.assertNotIn("already scheduled", message)
+        self.assertNotIn("cancel", message.lower())
+        self.assertEqual(caught.exception.details["team_count"], 1)
+
+    def test_no_teams_is_not_refused_at_all(self):
+        # An empty group has no team whose guarantee goes unhonoured, so
+        # there is nobody to name and nothing to refuse — and an empty
+        # residual is trivially completable. Writing the guard above as
+        # "fewer than two" rather than "exactly one" would raise here, which
+        # is a strictly larger blast radius than the defect it fixes.
+        require_completable_games_per_team([], 6, {})
+        require_completable_games_per_team([], 5, {}, label="Empty")
+
+
 if __name__ == "__main__":
     unittest.main()

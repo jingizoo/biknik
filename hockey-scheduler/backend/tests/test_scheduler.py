@@ -398,10 +398,19 @@ class SchedulerContract:
                 division_id="div1", active=True))
         self._slots(n_slots)
 
-    def _league_two_divisions_fixture(self, per_division=2, n_slots=8):
+    def _league_two_divisions_fixture(self, per_division=2, n_slots=8,
+                                      silver_first=False):
         """One League with two Divisions (Gold/Silver), each with its own
         teams — for asserting a league-wide draft never pairs across
-        Divisions (#233 Slice G)."""
+        Divisions (#233 Slice G).
+
+        ``silver_first`` reverses the order the registrations are ADDED,
+        which is the order `registered_teams_by_division_in_league` hands
+        the groups back on an insertion-ordered store. Nothing about the
+        request changes, so anything that moves under it is reading
+        registration order — see
+        `test_league_wide_refusal_names_the_same_division_either_order`.
+        """
         self._base()
         self.store.add_league(League(id="lg1", program_id="prog1", name="League"))
         self.store.add_league_season(LeagueSeason(
@@ -410,17 +419,60 @@ class SchedulerContract:
             id="gold", league_season_id="ls_lg1_se1", name="Gold"))
         self.store.add_division(Division(
             id="silver", league_season_id="ls_lg1_se1", name="Silver"))
-        for i in range(per_division):
+
+        def add_gold(i):
             self.store.add_team(Team(id=f"g{i}", name=f"Gold {i}",
                                      program_id="prog1", league_id="lg1"))
             self.store.add_season_team_registration(SeasonTeamRegistration(
                 id=f"streg_g{i}", league_season_id="ls_lg1_se1", team_id=f"g{i}",
                 division_id="gold", active=True))
+
+        def add_silver(i):
             self.store.add_team(Team(id=f"s{i}", name=f"Silver {i}",
                                      program_id="prog1", league_id="lg1"))
             self.store.add_season_team_registration(SeasonTeamRegistration(
                 id=f"streg_s{i}", league_season_id="ls_lg1_se1", team_id=f"s{i}",
                 division_id="silver", active=True))
+
+        if silver_first:
+            for i in range(per_division):
+                add_silver(i)
+            for i in range(per_division):
+                add_gold(i)
+        else:
+            for i in range(per_division):
+                add_gold(i)
+                add_silver(i)
+        self._slots(n_slots)
+
+    def _one_team_division_fixture(self, n_slots=40):
+        """One League with a normal 4-team Division and a Division holding a
+        SINGLE registered team (#375 review).
+
+        The lone team has nobody to play, so no pairing is ever generated
+        for it — the case `_require_feasible_games_per_team` exempts from the
+        parity refusal so that one such Division cannot veto a whole League
+        draft, and the case `_no_opponent_teams` reports instead.
+        """
+        self._base()
+        self.store.add_league(League(id="lg1", program_id="prog1", name="League"))
+        self.store.add_league_season(LeagueSeason(
+            id="ls_lg1_se1", league_id="lg1", season_id="se1"))
+        self.store.add_division(Division(
+            id="gold", league_season_id="ls_lg1_se1", name="Gold"))
+        self.store.add_division(Division(
+            id="lone", league_season_id="ls_lg1_se1", name="Lone"))
+        for i in range(4):
+            self.store.add_team(Team(id=f"g{i}", name=f"Gold {i}",
+                                     program_id="prog1", league_id="lg1"))
+            self.store.add_season_team_registration(SeasonTeamRegistration(
+                id=f"streg_g{i}", league_season_id="ls_lg1_se1", team_id=f"g{i}",
+                division_id="gold", active=True))
+        self.store.add_team(Team(id="lone0", name="Lone 0",
+                                 program_id="prog1", league_id="lg1"))
+        self.store.add_season_team_registration(SeasonTeamRegistration(
+            id="streg_lone0", league_season_id="ls_lg1_se1", team_id="lone0",
+            division_id="lone", active=True))
         self._slots(n_slots)
 
     def _two_leagues_fixture(self, n_slots=8):
@@ -2907,6 +2959,123 @@ class SchedulerContract:
             res.get("error", {}).get("details", {}).get("reason"),
             "games_per_team_infeasible", repr(res))
         self.assertEqual(self.store.all_games(), [])
+
+    def test_league_wide_refusal_names_the_same_division_either_order(self):
+        """#375 review — WHICH Division a League-wide refusal names must not
+        depend on registration order.
+
+        `_games_per_team_split` judges feasibility in a separate pass over
+        the groups in SORTED order, before any group is built, precisely so
+        the answer does not depend on `groups`' own insertion order — which
+        is registration order, and therefore store-backend dependent.
+        Nothing pinned that ordering: judging feasibility in the generation
+        loop instead (which must keep the original order, because it decides
+        which pairings are offered ice first) still passed the whole suite.
+
+        Both Divisions here are infeasible (3 teams, G=5), so BOTH orders
+        have a choice to make and only the sorted-first answer is correct.
+        The two fixtures differ only in the order the registrations are
+        added, and `gold` sorts before `silver`, so "Gold" is the required
+        answer both times. Registering Silver first is what fails against an
+        insertion-ordered refusal.
+        """
+        for silver_first in (False, True):
+            with self.subTest(silver_first=silver_first):
+                self.setUp()
+                self._league_two_divisions_fixture(
+                    per_division=3, n_slots=40, silver_first=silver_first)
+                with self.assertRaises(ValidationError) as caught:
+                    draft_schedule_for_league(
+                        self.store, "se1", "lg1", games_per_team=5)
+                self.assertIn(
+                    "Gold", str(caught.exception),
+                    "the Division a League-wide refusal names moved when the "
+                    "registration order changed; the refusal text is now "
+                    "store-backend dependent")
+
+    def test_a_lone_team_is_refused_for_having_no_opponent_not_for_its_games(self):
+        """#375 review — a Division with ONE registered team cannot be given
+        any guaranteed games, and what the operator is TOLD about it has to
+        be true and actionable.
+
+        The completability check catches this as a case of condition (3):
+        the lone team needs G and the rest of the division can supply 0. But
+        the general message for that condition blames "the games already
+        scheduled" and advises cancelling some of them — and this division
+        has no games at all, so the diagnosis is wrong and the only action
+        offered is impossible. The real cause is structural (no opponent)
+        and the real action is to register another team.
+
+        Both entry points are asserted, because the operator reaches this
+        from a League-wide draft and from the Division directly, and one
+        request must not get two different explanations.
+        """
+        for kwargs in ({"season_id": "se1", "league_id": "lg1"},
+                       {"division_id": "lone"}):
+            with self.subTest(**kwargs):
+                self.setUp()
+                self._one_team_division_fixture(n_slots=40)
+                res = self.api.draft_season_schedule(
+                    games_per_team=6, **kwargs)
+                details = res.get("error", {}).get("details", {})
+                self.assertEqual(details.get("reason"),
+                                 "games_per_team_residual_infeasible",
+                                 repr(res))
+                message = res["error"]["message"]
+                self.assertIn("Lone 0", message)
+                self.assertIn("no opponent", message)
+                # The two claims that were false for this division.
+                self.assertNotIn("already scheduled", message)
+                self.assertNotIn("cancel", message.lower())
+                self.assertEqual(self.store.all_games(), [])
+
+    def test_a_lone_division_refuses_the_whole_league_draft(self):
+        """The consequence of the refusal above, pinned rather than assumed.
+
+        `_require_feasible_games_per_team` skips groups of fewer than two
+        teams, and the docs used to justify that as "one empty Division
+        cannot veto a whole League draft". Under the guaranteed-games format
+        that is no longer what happens: the completability check refuses the
+        lone Division, and the League-wide draft — including the four-team
+        Division that could have been scheduled perfectly — produces
+        nothing.
+
+        This test does not argue the behaviour is right; it makes it a
+        DECISION rather than an accident, so changing it has to be
+        deliberate. The legacy format is asserted alongside precisely
+        because it is NOT refused, which is what keeps every pre-#375
+        request working.
+        """
+        self._one_team_division_fixture(n_slots=40)
+        with self.assertRaises(ValidationError):
+            draft_schedule_for_league(
+                self.store, "se1", "lg1", games_per_team=6)
+        # Gold's 12 games are collateral: nothing at all is proposed.
+        self.assertEqual(self.store.all_games(), [])
+        # The legacy control asks a different question ("N games against
+        # each of your 0 opponents" is honestly 0) and is not refused.
+        for kwargs in ({}, {"meetings_per_opponent": 2}):
+            with self.subTest(**kwargs):
+                legacy = draft_schedule_for_league(
+                    self.store, "se1", "lg1", **kwargs)
+                self.assertEqual(legacy["unschedulable_teams"], [])
+                self.assertTrue(legacy["draft_games"], repr(kwargs))
+
+    def test_max_games_per_team_is_the_value_the_picker_journey_hardcodes(self):
+        """#375 review — `e2e/scheduler-games-per-team.js` asserts that every
+        option the picker offers is inside the range the backend accepts, and
+        the upper end of that range is MAX_GAMES_PER_TEAM. A browser journey
+        cannot import a Python constant, so it hardcodes 120.
+
+        This pins the duplicate. Raising or lowering MAX_GAMES_PER_TEAM fails
+        HERE, where the message says which file to update, rather than
+        leaving the journey asserting a bound that no longer exists — green
+        while offering a value Generate would reject.
+        """
+        self.assertEqual(
+            MAX_GAMES_PER_TEAM, 120,
+            "MAX_GAMES_PER_TEAM moved; update the hardcoded copy in "
+            "hockey-scheduler/e2e/scheduler-games-per-team.js too")
 
     # -- THE RESIDUAL: existing Games are part of the total (#375 blocker) --
     #
