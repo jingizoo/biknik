@@ -26,7 +26,7 @@ pairing/ice-assignment core:
 `commit_draft_schedule`, and on both HTTP routes; `None`/omitted means 1)
 is how many times each team plays every other. 6 teams × 3 meetings is
 C(6,2) × 3 = 45 fixtures, i.e. **15 games per team**. It is validated as an
-integer in `1..MAX_MEETINGS_PER_OPPONENT` (20) — `bool` is rejected
+integer in `1..MAX_MEETINGS_PER_OPPONENT` (30) — `bool` is rejected
 explicitly, since `True` would otherwise silently mean 1 — and a bad value
 raises a structured `ValidationError` rather than letting a raw `TypeError`
 cross the facade boundary. The ceiling exists because the materialized

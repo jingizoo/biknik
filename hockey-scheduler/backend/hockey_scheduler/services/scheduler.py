@@ -76,10 +76,13 @@ from .setup_service import SetupService as _PolicySetup
 # #375 — an operator-configurable regular-season format is still a bounded
 # one: the pairing list this engine materializes grows as
 # ``meetings × C(teams, 2)``, so an unbounded value turns one request into an
-# arbitrarily large allocation. Real formats sit in the 1–4 range (single,
-# double, triple, quadruple round-robin); the ceiling is deliberately far
-# above any of them while still being a ceiling.
-MAX_MEETINGS_PER_OPPONENT = 20
+# arbitrarily large allocation. Common formats sit in the 1–4 range (single,
+# double, triple, quadruple round-robin), but a league playing a short bench of
+# opponents many times over runs far higher, so the ceiling is set at the most
+# an operator may ask for rather than near the common cases. 30 against each
+# opponent in a 12-team division is 30 × C(12, 2) = 1,980 games in one request
+# — large, but bounded, which is the property this constant exists to give.
+MAX_MEETINGS_PER_OPPONENT = 30
 
 
 def _normalize_meetings(value, field="meetings_per_opponent"):

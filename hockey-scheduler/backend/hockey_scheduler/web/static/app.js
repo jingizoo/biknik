@@ -8752,6 +8752,11 @@ function schedDraftRow(g) {
     <span class="pill gray">Draft</span>${delBtn("game", g.game_id,
       g.home_team_name + " vs " + g.away_team_name, "Delete draft")}</div>`;
 }
+// Meetings-per-opponent choices offered by #sched-meetings. The ceiling is the
+// backend's MAX_MEETINGS_PER_OPPONENT (services/scheduler.py) — a value past it
+// is refused server-side, so offering one would be a control that cannot work.
+const MEETINGS_OPTIONS = Array.from({ length: 30 }, (_, i) => i + 1);
+
 function renderScheduler(ov) {
   if (!hasPerm("manage_schedule")) {
     return `<div class="banner neutral"><h2>Operators only</h2>
@@ -8889,7 +8894,7 @@ function renderScheduler(ov) {
         <select id="sched-div">${divOptions(schedulerState.division)}</select>
         <label class="sr-only" for="sched-meetings">Games against each opponent</label>
         <select id="sched-meetings" title="Games against each opponent">${
-          [1, 2, 3, 4].map((n) => `<option value="${n}"${
+          MEETINGS_OPTIONS.map((n) => `<option value="${n}"${
             n === schedulerState.meetings ? " selected" : ""
           }>${n === 1 ? "1 game" : `${n} games`} vs each opponent</option>`).join("")
         }</select>
