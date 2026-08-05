@@ -26,33 +26,66 @@ Moderator discipline is protocol §1.7:
 >   - Do not react (verbally or visibly) differently to a correct vs. incorrect
 >     click; a moderator's tone or hesitation is itself a leading cue.
 
-**On the two wordings printed for each step.** The "read this" line is the
-protocol's task with UI vocabulary removed; the protocol's own line is printed
-beneath it, verbatim. §1.7 governs: either is legitimate delivery and neither may
-add a hint. Record which wording you used.
+**What you read aloud, and what you don't.** Every numbered step in §§2–4 has the
+same shape: a bolded sentence in quotation marks, then an em-dash, then the rest.
+The bolded sentence is the prompt — it is printed below under **Read this**, and
+that is the whole of what the participant hears. Everything after the em-dash is
+moderator-facing: what to observe, what to record, what the step is scored
+against. It was never a line to read, so not reading it withholds nothing. That
+includes §3 step 3's "without entering any unrelated Administration area" — a
+scoring condition sitting outside the quoted prompt, printed below under the pass
+condition.
 
-**One clause is deliberately not read aloud.** §3 step 3 carries a scoring
-constraint about unrelated Administration areas. It is a pass condition, not an
-instruction — saying it would tell the participant that such an area exists and
-that it is the wrong way. It is printed below under the pass condition.
+**There is one delivery, and it is the protocol's.** §1.7 allows "verbatim, or as
+close to verbatim as natural delivery allows" and nothing more. This pack prints
+no alternative wording of its own and blesses none: three sessions delivered at
+three different wordings are not comparable, and the comparison is the evidence.
+If a prompt reads to you as though it names something the participant should have
+had to find, do not repair it in delivery — see
+[README, "Open questions for the owner"](README.md#open-questions-for-the-owner)
+and raise it there.
+
+Timing, per §1.7: "Time the task from the moment the prompt finishes being read
+to the moment the participant either completes it or the moderator ends it."
 
 ---
 
 ## Task 1
 
-**Read this:**
+**Read this** — protocol §3 step 1's own prompt, verbatim:
 
 ```text
-Find where you would set up recurring ice.
+Find where you'd set up recurring ice.
 ```
 
-**Protocol §3 step 1, verbatim:**
+**The step in full** (everything after the em-dash is yours, not theirs):
 
 > 1. **"Find where you'd set up recurring ice."** — through the normal
 >    navigation only (no search, no help text, no hints). Observe the path
 >    taken.
 
-The trailing sentence is an instruction to you, not a line to read.
+**Part of that trailing clause is a condition on the run, not just an
+observation note.** "Observe the path taken" is an instruction to you. "no
+hints" binds you too — §1.7 already forbids them. But "through the normal
+navigation only (no search, no help text)" is the method by which the find is
+expected to happen, and it decides whether a find counts. The protocol does not
+put any of it in the spoken prompt, and this pack does not invent a spoken ground
+rule for it. So if the participant reaches for search or in-app help:
+
+- **Do not interrupt, redirect, or answer.** Either would be a moderator
+  intervention under §1.7 and would have to be logged as one, and it would narrow
+  their search, which §1.7 forbids outright.
+- Record that it happened, at which task, what they typed or opened, and whether
+  you said anything — [10-capture-sheet-arena-manager.md](10-capture-sheet-arena-manager.md)
+  has a row for it.
+- Score the step against the path they actually took, and name the deviation in
+  the completion note rather than passing it silently. A destination reached
+  through search is not one reached "through the normal navigation only".
+
+Whether this constraint should instead be stated to the participant as a ground
+rule before the first task is [open question 3](README.md#open-questions-for-the-owner)
+for the owner: it would need wording no protocol supplies, so the pack does not
+supply it either.
 
 **Intended path (do not say it).** From the Facilities area, the venues/rinks/ice
 destination; the same workflow is also listed in the Setup area's workflow list
@@ -63,17 +96,14 @@ not which of the two routes they take.
 
 ## Task 2
 
-**Read this:**
+**Read this** — protocol §3 step 2's own prompt, verbatim:
 
 ```text
-Before you go further — which program, season and league are you working in
-right now, and how can you tell?
+Before you go further — what Program/Season/League is currently active, and how
+do you know?
 ```
 
-*(De-hinted delivery: the protocol's wording is nearly identical; this one avoids
-implying a single place to look.)*
-
-**Protocol §3 step 2, verbatim:**
+**The step in full** (everything after the em-dash is yours, not theirs):
 
 > 2. **"Before you go further — what Program/Season/League is currently
 >    active, and how do you know?"** — record their answer and whether it
@@ -85,24 +115,30 @@ Score against the value you recorded at pre-flight C6, exactly as displayed.
 
 ## Task 3
 
-**Read this:**
+**Read this** — protocol §3 step 3's own prompt, verbatim:
 
 ```text
-Now get to the point where you would actually create that recurring ice. Stop
-when you are at the thing you would use to do it — you do not need to create
-anything.
+Now reach the action you'd use to actually create that recurring ice.
 ```
 
-*(De-hinted delivery. The protocol's own step carries the Administration
-constraint, which is scoring, not instruction — see below.)*
+Say nothing about stopping. Where the task stops is a scoring rule for you (the
+pass condition below), not an instruction to them. Telling them up front that
+they need not create anything does two things the protocol does not: it hands
+them a self-declared stopping point, so any control they happen to be looking at
+can be pointed at and called the answer; and it forecloses the continuation the
+protocol explicitly permits (quoted further down this page) — a participant told
+they need not create anything will not carry on naturally.
 
-**Protocol §3 step 3, verbatim:**
+**The step in full** (everything after the em-dash is yours, not theirs):
 
 > 3. **"Now reach the action you'd use to actually create that recurring
 >    ice."** — the pass condition is reaching the authorized primary action
 >    (see [Reconciling the two source documents](#reconciling-the-two-source-documents--no-conflict-found)
 >    above for why this protocol stops at "reach," not "complete"), **without
 >    entering any unrelated Administration area** along the way.
+
+(The link inside that quote points into the protocol document, not into this
+sheet. What it points at is quoted below.)
 
 **Pass condition** — §3's "Record" subsection, verbatim:
 
@@ -117,9 +153,13 @@ section, that reaching is the bar and completing the write is not required:
 > body and this protocol's default. The §8 draft's fuller "complete the
 > write" task is superseded for the purpose of this validation session.
 
-If the participant carries on past that point of their own accord, that is
-allowed — the same section says a moderator "may let a participant continue
-through completion if they reach it naturally". Do not prompt them to.
+End the task, silently, when they reach the authorized primary action — that is
+where §1.7's clock stops. If the participant carries on past that point of their
+own accord, that is allowed: the same section says a moderator "may let a
+participant continue through completion if they reach it naturally". Do not
+prompt them to. If they ask whether they should go through with the creation,
+whatever you answer is a moderator intervention — log it as one, with your exact
+words.
 
 **Intended path (do not say it).** The venues/rinks/ice destination's primary
 action leads to the recurring-ice builder, which previews slots before creating
@@ -135,11 +175,45 @@ anything. Observed at `36195fa`.
 
 ---
 
-## Immediately after each task
+## Immediately after each task — the ease rating
 
-Ask for the ease rating before moving on. §5:
+Protocol §5 requires it once per task, immediately after that task:
 
 > | Ease rating | See the 1–5 scale in §6 — collected once per task, immediately after that task, before moving to the next. |
+
+The protocol supplies the scale and its anchors but no wording for asking. Use
+the two lines below every time, in all three sessions, so the most-repeated
+utterance in the whole pack is not improvised nine different ways — an
+off-the-cuff rating question is where leading creeps in ("that seemed easy
+enough, right?"). **These two lines are this pack's wording, not protocol text**;
+see [README, "Open questions for the owner"](README.md#open-questions-for-the-owner),
+item 4.
+
+```text
+On a scale of one to five, where one is very difficult and five is very easy,
+how easy was that?
+```
+
+Then, once they have given a number:
+
+```text
+Which of these descriptions fits the number you gave?
+```
+
+Read the five anchors as they are — protocol §6's own scale, verbatim:
+
+> 1 = Very difficult — could not complete without heavy intervention
+>
+> 2 = Difficult — completed only with significant help
+>
+> 3 = Neutral — completed with some hesitation or minor help
+>
+> 4 = Easy — completed with little to no hesitation
+>
+> 5 = Very easy — completed immediately and confidently
+
+Record the number and the anchor **they** chose. §6 asks for the anchor the
+participant's number maps to; do not map it on their behalf.
 
 And judge completion against the stated condition, not an impression. §5:
 

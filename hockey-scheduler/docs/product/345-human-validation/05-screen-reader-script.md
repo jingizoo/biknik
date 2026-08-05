@@ -46,7 +46,7 @@ Every field below is required. Protocol §5 (evidence template) sets that bar:
 | --- | --- |
 | Validator (the person running this pass) | |
 | Date | |
-| Tested `main` SHA | |
+| Git head SHA under test | |
 | Application version / release tag | |
 | Deployment target (local dev server / staging / other) | |
 | OS + version | |
@@ -69,6 +69,90 @@ same privacy rule applies to whoever is named above — see the moderated
 operator-validation protocol §1.6, quoted in full on each moderated capture
 sheet in this pack. Record what is needed to interpret the result and nothing
 more.
+
+---
+
+## The eight surfaces — protocol §2, verbatim
+
+Every step below has a **"Surface exercised (protocol §2 item)"** row, and the
+session blanks above ask which surfaces this pass covered. This is the list those
+fields refer to. Record the number and the name.
+
+> Every pass must eventually cover all eight; track completion across passes
+> rather than requiring one marathon session. Each surface below maps to the
+> keyboard procedure (§3) and screen-reader procedure (§4) that apply to it —
+> not every procedure step applies to every surface (e.g. "context switching"
+> only applies where a context bar exists).
+>
+> 1. **Signed-out login** — the `showLogin()` shell state.
+> 2. **Public Schedule and Staff sign-in transition** — the anonymous
+>    `showPublicGuest()` shell state and the control that returns to Staff
+>    sign-in.
+> 3. **Authenticated Home/Tasks** — the Home/Tasks hub, its task cards, and
+>    its own loading/empty/error/complete states.
+> 4. **Program/Season/League context switching** — the persistent context
+>    bar (`#context-switcher` and, once delivered, the promoted League
+>    control), including its effect on whichever screen is active.
+> 5. **All six Setup workflows** — League profile and seasons (Add Season);
+>    Permanent teams (Add Team); Season participation/divisions (Register
+>    Team); Clubs, players and staff (Add Player); Venues, rinks and ice (Add
+>    Ice); Imports and onboarding (Import data, including its non-blocking
+>    optional status per Decision 9).
+> 6. **Drawers and confirmation modals** — every `role="dialog"
+>    aria-modal="true"` surface (the Setup `.drawer` and the `.modal`
+>    confirmation shape), including nested modal-over-drawer.
+> 7. **Loading, empty, error, retry, restricted, optional, and completed
+>    states** — exercised on at least one screen that genuinely reaches each
+>    state (per the §5 states matrix in the requirements package), not
+>    inferred from markup alone.
+> 8. **Desktop and canonical 390×844 behavior** — every surface above,
+>    repeated at both.
+
+Surfaces 5 and 7 are the reason the environment sheets make you verify an
+incomplete workflow, a restricted case and an error condition before you start:
+a state that never occurred cannot be recorded as a pass.
+
+---
+
+## The rules that govern this pass — protocol §6, verbatim
+
+Read these before the first step. The third one is the one you will need in the
+middle of a pass, the moment you find something broken.
+
+> - Do not fabricate results, recordings, announcements, or sign-offs. Every
+>   field in §5's template must reflect something actually observed in a real
+>   browser/screen-reader session, or be explicitly marked not yet run.
+> - Do not state, in this document or elsewhere, that manual accessibility
+>   validation is complete. Completion is established only by filled-in,
+>   signed-off copies of the §5 template covering every surface in §2 —
+>   never by this protocol document itself.
+> - This protocol does not authorize and must not be used to justify changing
+>   application code, tests, CI configuration, or permissions. Defects found
+>   here are recorded (§5's "Confirmed defects" table) for separate follow-up
+>   work, not fixed inline as part of running the protocol.
+> - The approved [#345][issue-345] requirements and WCAG 2.2 AA (per
+>   `operator-ux-requirements.md` §7) are the authority for expected
+>   behavior. Where this protocol's expected-outcome text and the actual
+>   application contract conflict, or where a step's expected behavior is
+>   genuinely unclear, record it in the [Conflicts log](#conflicts-log) for
+>   owner review rather than resolving it unilaterally.
+> - Keep this protocol's evidence separate from the moderated operator
+>   sessions' evidence (see
+>   [Relationship to the moderated operator-validation protocol](#relationship-to-the-moderated-operator-validation-protocol)
+>   above) — this validates accessibility mechanics, not task usability, and
+>   the two evidence sets answer different questions for #345's merge gate.
+
+The two links inside that quote — the Conflicts log, and the Relationship
+section — point into the protocol document, not into this sheet; they are part
+of the quoted text.
+
+Two of those rules bind this pack directly. A defect you find here is written into the
+protocol's own defect table for separate follow-up work — running the protocol
+does not authorise touching the application. And an expected outcome that turns
+out to be unclear or in tension with what the app actually does goes into the
+protocol's Conflicts log for the owner, never quietly loosened on this sheet:
+that is precisely how K5/S5 came to instruct validators to expect the opposite of
+shipped behaviour until #394 corrected it.
 
 ---
 

@@ -27,12 +27,21 @@ prompts stay clean:
 >   - Do not react (verbally or visibly) differently to a correct vs. incorrect
 >     click; a moderator's tone or hesitation is itself a leading cue.
 
-**On the two wordings printed for each step.** The "read this" line is the
-protocol's task with UI vocabulary removed; the protocol's own line is printed
-directly beneath it, verbatim. §1.7 governs: either wording is legitimate
-delivery, neither may add a hint, and the de-hinted line exists only because
-some of the protocol's phrasing names things the participant would otherwise
-have to find. Record on the capture sheet which wording you actually used.
+**What you read aloud, and what you don't.** Every numbered step in §§2–4 has the
+same shape: a bolded sentence in quotation marks, then an em-dash, then the rest.
+The bolded sentence is the prompt — it is printed below under **Read this**, and
+that is the whole of what the participant hears. Everything after the em-dash is
+moderator-facing: what to observe, what to record, what the step is scored
+against. It was never a line to read, so not reading it withholds nothing.
+
+**There is one delivery, and it is the protocol's.** §1.7 allows "verbatim, or as
+close to verbatim as natural delivery allows" and nothing more. This pack prints
+no alternative wording of its own and blesses none: three sessions delivered at
+three different wordings are not comparable, and the comparison is the evidence.
+If a prompt reads to you as though it names something the participant should have
+had to find, do not repair it in delivery — see
+[README, "Open questions for the owner"](README.md#open-questions-for-the-owner)
+and raise it there.
 
 Timing, per §1.7: "Time the task from the moment the prompt finishes being read
 to the moment the participant either completes it or the moderator ends it."
@@ -41,16 +50,13 @@ to the moment the participant either completes it or the moderator ends it."
 
 ## Task 1
 
-**Read this:**
+**Read this** — protocol §2 step 1's own prompt, verbatim:
 
 ```text
-You have just been handed this league to run. Looking at what is in front of
-you, what do you think still needs doing before it is ready to use?
+Looking at this screen, what Setup work do you think should happen next?
 ```
 
-*(The line above is this pack's de-hinted delivery, not protocol text.)*
-
-**Protocol §2 step 1, verbatim:**
+**The step in full** (everything after the em-dash is yours, not theirs):
 
 > 1. **"Looking at this screen, what Setup work do you think should happen
 >    next?"** — without explaining the underlying Program/Season/League/
@@ -78,15 +84,13 @@ genuinely incomplete in this environment (pre-flight C7).
 
 ## Task 2
 
-**Read this:**
+**Read this** — protocol §2 step 2's own prompt, verbatim:
 
 ```text
-Go ahead and start on that.
+Go ahead and open that.
 ```
 
-*(De-hinted only in tense; §2's own wording is one word different.)*
-
-**Protocol §2 step 2, verbatim:**
+**The step in full** (everything after the em-dash is yours, not theirs):
 
 > 2. **"Go ahead and open that."** — observe whether they open the correct
 >    incomplete workflow, or a different one.
@@ -101,21 +105,24 @@ Go ahead and start on that.
 "Named exactly" means the screen's own name as it appears, not "some setup
 page".
 
+The clock stops when the workflow **opens**. That is the event §2's "Record"
+names, and it is why the prompt is "open that" and not "start on that" —
+starting the work and opening it are different moments, and only one of them is
+a defined stop for the timer. If they carry straight on into the form, that is
+fine; the recorded time is still to the open.
+
 ---
 
 ## Task 3
 
-**Read this:**
+**Read this** — protocol §2 step 3's own prompt, verbatim:
 
 ```text
-Before you do anything else — what do you expect to happen if you take the
-action this screen is putting in front of you?
+Before you do anything else — what do you think the primary button on this
+screen will do if you click it?
 ```
 
-*(De-hinted delivery: the protocol's wording names the control by prominence,
-which on some surfaces is itself a pointer.)*
-
-**Protocol §2 step 3, verbatim:**
+**The step in full** (everything after the em-dash is yours, not theirs):
 
 > 3. **"Before you do anything else — what do you think the primary button
 >    on this screen will do if you click it?"** — record their stated
@@ -128,6 +135,22 @@ which on some surfaces is itself a pointer.)*
 >   matched its actual effect (yes/no), with their exact words for both the
 >   expectation and, if different, their reaction to the actual result.
 
+**If they describe a control that is not the primary action.** The step names
+the primary button; the participant may still answer about a different control,
+or may not be able to tell which control is the primary one. That is itself a
+result — #345's requirement is one primary action per screen — and it is not a
+reason to intervene. Do not redirect them and do not point at the right control:
+§1.7 forbids narrowing their search and forbids correcting a misstated
+understanding mid-task. Instead:
+
+- Record their exact words, and record **which control they took to be the one
+  on offer**, named exactly ([09-capture-sheet-league-admin.md](09-capture-sheet-league-admin.md)
+  has a row for it).
+- Let them proceed and score the match against the control they actually named,
+  flagging in the same row that it was not the screen's primary action.
+- Carry the mismatch into the follow-up findings table — an operator who cannot
+  identify the primary action is a finding about the screen, not a spoiled task.
+
 **Do not correct them.** §1.7:
 
 > - Do not correct a wrong destination or a misstated understanding of what
@@ -137,11 +160,45 @@ which on some surfaces is itself a pointer.)*
 
 ---
 
-## Immediately after each task
+## Immediately after each task — the ease rating
 
-Ask for the ease rating before moving on. §5:
+Protocol §5 requires it once per task, immediately after that task:
 
 > | Ease rating | See the 1–5 scale in §6 — collected once per task, immediately after that task, before moving to the next. |
+
+The protocol supplies the scale and its anchors but no wording for asking. Use
+the two lines below every time, in all three sessions, so the most-repeated
+utterance in the whole pack is not improvised nine different ways — an
+off-the-cuff rating question is where leading creeps in ("that seemed easy
+enough, right?"). **These two lines are this pack's wording, not protocol text**;
+see [README, "Open questions for the owner"](README.md#open-questions-for-the-owner),
+item 4.
+
+```text
+On a scale of one to five, where one is very difficult and five is very easy,
+how easy was that?
+```
+
+Then, once they have given a number:
+
+```text
+Which of these descriptions fits the number you gave?
+```
+
+Read the five anchors as they are — protocol §6's own scale, verbatim:
+
+> 1 = Very difficult — could not complete without heavy intervention
+>
+> 2 = Difficult — completed only with significant help
+>
+> 3 = Neutral — completed with some hesitation or minor help
+>
+> 4 = Easy — completed with little to no hesitation
+>
+> 5 = Very easy — completed immediately and confidently
+
+Record the number and the anchor **they** chose. §6 asks for the anchor the
+participant's number maps to; do not map it on their behalf.
 
 And judge completion against the stated condition, not an impression. §5:
 

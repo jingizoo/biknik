@@ -26,26 +26,39 @@ Moderator discipline is protocol §1.7:
 >   - Do not react (verbally or visibly) differently to a correct vs. incorrect
 >     click; a moderator's tone or hesitation is itself a leading cue.
 
-**On the two wordings printed for each step.** The "read this" line is the
-protocol's task with UI vocabulary removed; the protocol's own line is printed
-beneath it, verbatim. §1.7 governs: either is legitimate delivery and neither may
-add a hint. Record which wording you used.
+**What you read aloud, and what you don't.** Every numbered step in §§2–4 has the
+same shape: a bolded sentence in quotation marks, then an em-dash, then the rest.
+The bolded sentence is the prompt — it is printed below under **Read this**, and
+that is the whole of what the participant hears. Everything after the em-dash is
+moderator-facing: what to observe, what to record, what the step is scored
+against. It was never a line to read, so not reading it withholds nothing. That
+includes the areas §4 steps 1 and 2 name as the expected route — those sit
+outside the quoted prompts, in the trailing clauses, and are printed below only
+because you score against them.
 
-**Two clauses are deliberately not read aloud.** §4 steps 1 and 2 name the areas
-the participant is expected to travel through. Those are observation and scoring
-notes for you; saying them would hand over the route.
+**There is one delivery, and it is the protocol's.** §1.7 allows "verbatim, or as
+close to verbatim as natural delivery allows" and nothing more. This pack prints
+no alternative wording of its own and blesses none: three sessions delivered at
+three different wordings are not comparable, and the comparison is the evidence.
+If a prompt reads to you as though it names something the participant should have
+had to find, do not repair it in delivery — see
+[README, "Open questions for the owner"](README.md#open-questions-for-the-owner)
+and raise it there.
+
+Timing, per §1.7: "Time the task from the moment the prompt finishes being read
+to the moment the participant either completes it or the moderator ends it."
 
 ---
 
 ## Task 1
 
-**Read this:**
+**Read this** — protocol §4 step 1's own prompt, verbatim:
 
 ```text
 Find your roster.
 ```
 
-**Protocol §4 step 1, verbatim:**
+**The step in full** (everything after the em-dash is yours, not theirs):
 
 > 1. **"Find your roster."** — observe the path taken (through Home/Tasks,
 >    direct navigation, or elsewhere).
@@ -66,16 +79,13 @@ each of the two finds."
 
 ## Task 2
 
-**Read this:**
+**Read this** — protocol §4 step 2's own prompt, verbatim:
 
 ```text
-Now find what needs doing for your next game.
+Now find the workflow for your next game.
 ```
 
-*(De-hinted delivery: the protocol's wording names the two areas the path is
-expected to run through.)*
-
-**Protocol §4 step 2, verbatim:**
+**The step in full** (everything after the em-dash is yours, not theirs):
 
 > 2. **"Now find the workflow for your next game."** — specifically through
 >    Home/Tasks and Schedule; note if the participant instead tries an
@@ -83,7 +93,12 @@ expected to run through.)*
 
 **Pass condition**: the second half of the completion line quoted under Task 1 —
 "found the next-game workflow through Home/Tasks and Schedule". The route is part
-of this condition, so record the actual path, not just the destination.
+of this condition, so record the actual path, not just the destination. The task
+asks them to *arrive* somewhere: an answer given only in words ("I'd fill the
+roster") has not found the workflow, and it also pre-empts Task 3, which asks
+what they would do next based on what they are looking at. If they answer Task 2
+verbally, record the words, do not accept them as the find, and let them carry on
+without prompting.
 
 **Also record, per §4's "Record" subsection, verbatim:**
 
@@ -94,13 +109,13 @@ of this condition, so record the actual path, not just the destination.
 
 ## Task 3
 
-**Read this:**
+**Read this** — protocol §4 step 3's own prompt, verbatim:
 
 ```text
-Based on what you are looking at, what would you do next?
+Based on what you're looking at, what would you do next?
 ```
 
-**Protocol §4 step 3, verbatim:**
+**The step in full** (everything after the em-dash is yours, not theirs):
 
 > 3. **"Based on what you're looking at, what would you do next?"** — record
 >    their stated next action (not necessarily performed) and whether it
@@ -118,11 +133,45 @@ prompting them.
 
 ---
 
-## Immediately after each task
+## Immediately after each task — the ease rating
 
-Ask for the ease rating before moving on. §5:
+Protocol §5 requires it once per task, immediately after that task:
 
 > | Ease rating | See the 1–5 scale in §6 — collected once per task, immediately after that task, before moving to the next. |
+
+The protocol supplies the scale and its anchors but no wording for asking. Use
+the two lines below every time, in all three sessions, so the most-repeated
+utterance in the whole pack is not improvised nine different ways — an
+off-the-cuff rating question is where leading creeps in ("that seemed easy
+enough, right?"). **These two lines are this pack's wording, not protocol text**;
+see [README, "Open questions for the owner"](README.md#open-questions-for-the-owner),
+item 4.
+
+```text
+On a scale of one to five, where one is very difficult and five is very easy,
+how easy was that?
+```
+
+Then, once they have given a number:
+
+```text
+Which of these descriptions fits the number you gave?
+```
+
+Read the five anchors as they are — protocol §6's own scale, verbatim:
+
+> 1 = Very difficult — could not complete without heavy intervention
+>
+> 2 = Difficult — completed only with significant help
+>
+> 3 = Neutral — completed with some hesitation or minor help
+>
+> 4 = Easy — completed with little to no hesitation
+>
+> 5 = Very easy — completed immediately and confidently
+
+Record the number and the anchor **they** chose. §6 asks for the anchor the
+participant's number maps to; do not map it on their behalf.
 
 And judge completion against the stated condition, not an impression. §5:
 

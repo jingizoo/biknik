@@ -86,26 +86,47 @@ place you verified.
 
 ### A5. Reset between participants
 
-The reset procedure is the moderated protocol §1.5. Run it in full — it is five
-steps, not one — before every participant. Its first step:
+The reset procedure is the moderated protocol §1.5. It is five steps, not one,
+and all five run before every participant. Here it is in full, verbatim, so you
+never have to leave this sheet mid-session:
 
+> Run this between every participant so no session inherits state, partial
+> progress, or artifacts from the prior one:
+>
 > 1. From the header menu, run **Reset** (type `RESET` to confirm) — this
 >    calls `POST /api/demo/reset` and rebuilds the canonical demo dataset from
 >    scratch, matching the existing `e2e/demo-lifecycle.js` reset journey.
 >    Confirm the league tree is non-empty and the header again reads its
 >    pre-reset state before proceeding.
-
-After the reset completes, check whether you are still signed in. A reset
-rebuilds the accounts, and depending on the store the session may or may not
-survive it; if the app returns to the sign-in card, or an action reports that
-the session expired, sign in again as the persona (A4) before continuing.
-
-Then §1.5's second step is what section B below exists to satisfy:
-
 > 2. Re-apply whatever fixture deviates from the canonical demo dataset that
 >    this session's script needs (e.g. the League Admin script's requirement
 >    that a specific workflow starts incomplete) and record exactly what was
 >    changed in §1.4 above for that participant's copy of this template.
+> 3. Re-confirm the git head SHA (§1.1) has not changed since the previous
+>    participant; if it has, treat this as a new session build and restart
+>    the readiness checklist.
+> 4. If the session runs against a non-demo (staging/production-like)
+>    environment, use the production factory-reset flow instead
+>    (`e2e/factory-reset.js` covers its safety gating) — never reuse a
+>    participant's mutated state for the next participant.
+> 5. Sign the participant out completely before the next participant signs
+>    in; do not reuse an open session/token.
+
+How that lands on this environment:
+
+- **Step 1.** After the reset completes, check whether you are still signed in.
+  A reset rebuilds the accounts, and depending on the store the session may or
+  may not survive it; if the app returns to the sign-in card, or an action
+  reports that the session expired, sign in again as the persona (A4) before
+  continuing.
+- **Step 2** is what section B below exists to satisfy — a reset discards the
+  deviation, so B always runs after the reset, never before it.
+- **Step 3** is C1: re-record the SHA, do not assume it.
+- **Step 4** applies only if you are not on the demo server this sheet brings
+  up. On a non-demo environment, run the production factory-reset flow instead
+  of the header-menu Reset in step 1.
+- **Step 5** is section E, and it comes first in wall-clock order: sign the
+  outgoing participant out before you reset anything.
 
 ### A6. Have the error-triggering condition ready (do not fire it yet)
 
@@ -149,12 +170,24 @@ So create one, using nothing but the app's own operator controls:
 3. Use the landing's primary action, **Add Season**.
 4. In the **New season** drawer, fill in **Season name** only — leave the dates
    blank and leave the pre-filled Program as it is. Submit (**Create season**).
-   Suggested name: `Validation Season` plus the session date, so the deviation
-   is self-documenting.
+   **Name it as a real next season would be named** — e.g. `2027–28 Winter
+   Season`, one season on from the canonical `2026–27 Winter Season` the loaded
+   dataset ships with.
 5. In the context bar, select that new Season.
 
 That is the entire deviation: one Season, added through the UI, then selected.
-Record it verbatim in the evidence template's fixture field (C6).
+Record the exact name you used in C6 and carry it into the evidence template's
+fixture field.
+
+**Do not label it as test scaffolding.** A name like "Validation Season" is
+sitting in the context bar, in the participant's field of view, while task 1 asks
+what still needs doing — it tells them the data is a rig and it marks, among the
+selectable Seasons, exactly which one is the deliberately empty one. That
+pre-answers half the pass condition ("the correct incomplete workflow") without a
+word being spoken, which is the same leakage as a prompt naming a control,
+arriving through the fixture instead. The deviation is documented in writing on
+this sheet and in the evidence — §1.5 step 2 and C6 both require it — and that is
+where it belongs, not on screen.
 
 Two notes on why this shape:
 
@@ -189,7 +222,7 @@ entry records for K5/S5.)
 | C5 | Landing screen is the Home/Tasks hub (Dashboard), not the Initial Setup wizard. If it is the wizard, the dataset was not loaded — go back to A3. | ☐ PASS ☐ FAIL |
 | C6 | Active context recorded exactly as the participant will see it. Program: ____________ Season: ____________ League: ____________ | ☐ PASS ☐ FAIL |
 | C7 | **§1.4 condition 1 — an incomplete Setup workflow exists and is visible.** On the Dashboard, the setup-progress card is in its "continue" state and at least one workflow row is badged as not done (observed wording: card heading "Continue setup"; rows badged "To do"). Count of not-done rows: ____ | ☐ PASS ☐ FAIL |
-| C8 | **§1.4 condition 2 — a restricted/403 case is reachable.** League Admin holds every operator permission, so nothing in this console is restricted *to this role*; the reachable case uses another seeded persona, which protocol §1.3 explicitly allows ("or `player`/`guardian`/`official`/`viewer` as the surface requires"). Verified path: sign in as `coach`, open Games, expand a game that does not involve the coach's own team, choose **Open Roster** — the screen reports the access refusal instead of the roster (observed heading: "Restricted"). Sign back in as `admin` afterwards. Which persona/path did you use? ____________________ | ☐ PASS ☐ FAIL |
+| C8 | **§1.4 condition 2 — a restricted/403 case is reachable.** League Admin holds every operator permission, so nothing in this console is restricted *to this role*; the reachable case uses another seeded persona, which protocol §1.3 explicitly allows ("or `player`/`guardian`/`official`/`viewer` as the surface requires"). Verified path: sign in as `coach`, open Games, expand a game that does not involve the coach's own team, choose **Open Roster** — the screen reports the access refusal instead of the roster (observed heading: "Restricted"). **Then sign back in as `admin` and re-confirm C5 and C6** — signing out and back in is exactly the round-trip that can land the console somewhere other than the view you verified, and it drops the per-account context selection this environment depends on. A verified starting state that a later check invalidated is not a verified starting state. (Run this check before C5/C6 if you prefer; what must not happen is C5/C6 being the earlier of the two.) Which persona/path did you use? ____________________ C5 and C6 re-confirmed after signing back in: ☐ | ☐ PASS ☐ FAIL |
 | C9 | **§1.4 condition 3 — an error-triggering condition is available.** The request-blocking rule from A6 is prepared and you have confirmed you can enable and disable it. Do not leave it enabled. | ☐ PASS ☐ FAIL |
 | C10 | For a keyboard or screen-reader pass only: the assistive-technology setup is confirmed working *before* the session (moderated protocol §7, item 5). Screen reader + version: ____________________ | ☐ PASS ☐ FAIL / ☐ N/A |
 | C11 | Any wording that differed from the observed copy quoted above, noted here: ______________________________________________ | ☐ done |

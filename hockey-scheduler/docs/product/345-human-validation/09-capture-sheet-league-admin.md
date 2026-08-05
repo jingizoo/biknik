@@ -25,7 +25,7 @@ Protocol §6 on empty fields:
 | Date | |
 | Session start time / end time | |
 | Moderator | |
-| Tested `main` SHA | |
+| Git head SHA under test | |
 | Application version / release tag | |
 | Backend datastore (Memory / SQLite / PostgreSQL) | |
 | Deployment target (local dev server / staging / other) | |
@@ -37,7 +37,7 @@ Protocol §6 on empty fields:
 | Participant's experience level with this app (New / some exposure / regular user) | |
 | Participant's real-world familiarity with the role | |
 | Consent obtained (see below) — how, and at what time | |
-| Prompt wording used (neutral sheet / protocol verbatim / mixed — note per task) | |
+| Any deviation from verbatim delivery of the §§2–4 prompts (exact words spoken, at which task; "none" is the expected value) | |
 | Persona signed in as (never the password) | |
 | Permissions confirmed to match the role table (yes/no, note deviations) | |
 | Active Program / Season / League at hand-over | |
@@ -129,7 +129,11 @@ they said, step 2 is what they opened.
 
 ## Ease rating — protocol §6's scale, verbatim
 
-Collected once per task, immediately after that task.
+Collected once per task, immediately after that task. Ask it with the two fixed
+lines on [06-task-prompts-league-admin.md](06-task-prompts-league-admin.md) — the same
+wording in all three sessions — and read the five anchors below to the
+participant, so the anchor column records **their** mapping rather than your
+interpretation of their number.
 
 > **Ease rating scale** (record which anchor the participant's number maps to):
 >
@@ -209,12 +213,23 @@ which task, before or after which action, and what was on screen.
 
 ## Stated expectation vs. actual effect (step 3)
 
+Step 3 asks about the primary button. If the participant answers about some other
+control, that is a result, not a spoiled task — record it here and score the match
+against the control they actually named. Do not redirect them mid-task
+([06-task-prompts-league-admin.md](06-task-prompts-league-admin.md), Task 3).
+
 | Field | Value |
 | --- | --- |
+| Which control they took to be the one on offer, named exactly | |
+| Was that the screen's primary action? (yes/no) | |
 | Their exact words for what they expected | |
 | What the action actually did | |
-| Matched? (yes/no) | |
+| Matched? (yes/no — judged against the control they named above) | |
 | Their exact words reacting to the actual result (if different) | |
+
+A "no" in the second row belongs in the follow-up findings table as well: #345
+requires one primary action per screen, so an operator who could not tell which
+control that was is a finding about the screen.
 
 ## What they said before touching anything (step 1)
 

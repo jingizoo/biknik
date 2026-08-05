@@ -57,17 +57,45 @@ Manager cannot create it.
 
 ### A5. Reset between participants
 
-Moderated protocol §1.5 is the reset procedure; run all five steps. Step 1:
+Moderated protocol §1.5 is the reset procedure, and all five of its steps run
+before every participant. Here it is in full, verbatim, so you never have to
+leave this sheet mid-session:
 
+> Run this between every participant so no session inherits state, partial
+> progress, or artifacts from the prior one:
+>
 > 1. From the header menu, run **Reset** (type `RESET` to confirm) — this
 >    calls `POST /api/demo/reset` and rebuilds the canonical demo dataset from
 >    scratch, matching the existing `e2e/demo-lifecycle.js` reset journey.
 >    Confirm the league tree is non-empty and the header again reads its
 >    pre-reset state before proceeding.
+> 2. Re-apply whatever fixture deviates from the canonical demo dataset that
+>    this session's script needs (e.g. the League Admin script's requirement
+>    that a specific workflow starts incomplete) and record exactly what was
+>    changed in §1.4 above for that participant's copy of this template.
+> 3. Re-confirm the git head SHA (§1.1) has not changed since the previous
+>    participant; if it has, treat this as a new session build and restart
+>    the readiness checklist.
+> 4. If the session runs against a non-demo (staging/production-like)
+>    environment, use the production factory-reset flow instead
+>    (`e2e/factory-reset.js` covers its safety gating) — never reuse a
+>    participant's mutated state for the next participant.
+> 5. Sign the participant out completely before the next participant signs
+>    in; do not reuse an open session/token.
 
-A reset rebuilds the accounts; check afterwards whether you are still signed in,
-and sign in again as the persona if the app has returned to the sign-in card.
-Reset first, deviation (B) second — a reset discards the deviation.
+How that lands on this environment:
+
+- **Step 1.** A reset rebuilds the accounts; check afterwards whether you are
+  still signed in, and sign in again as the persona if the app has returned to
+  the sign-in card.
+- **Step 2** is section B. Reset first, deviation second — a reset discards the
+  deviation. B is applied as `admin`, then you sign back in as `arena` (A7).
+- **Step 3** is C1: re-record the SHA, do not assume it.
+- **Step 4** applies only if you are not on the demo server this sheet brings
+  up; on a non-demo environment, run the production factory-reset flow instead
+  of the header-menu Reset in step 1.
+- **Step 5** is section E, and it comes first in wall-clock order: sign the
+  outgoing participant out before you reset anything.
 
 ### A6. Have the error-triggering condition ready (do not fire it yet)
 
@@ -116,7 +144,13 @@ Signed in as `admin` (not `arena`):
    **Add Season**.
 3. In the **New season** drawer fill in **Season name** only; leave the dates
    blank and the pre-filled Program as it is. Submit (**Create season**).
-   Suggested name: `Validation Season` plus the session date.
+   **Name it as a real next season would be named** — e.g. `2027–28 Winter
+   Season`, one season on from the canonical `2026–27 Winter Season`. Do not
+   label it as test scaffolding: §3 step 2 asks this participant what context is
+   active and how they know, so the Season list is somewhere they will look, and
+   a name like "Validation Season" tells them the data is a rig. The deviation is
+   documented on this sheet and in the evidence (C6, D), which is where it
+   belongs.
 4. Sign out and sign in as `arena`. Leave the **canonical** Season selected for
    the session (A7).
 

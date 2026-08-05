@@ -25,7 +25,7 @@ Protocol §6 on empty fields:
 | Date | |
 | Session start time / end time | |
 | Moderator | |
-| Tested `main` SHA | |
+| Git head SHA under test | |
 | Application version / release tag | |
 | Backend datastore (Memory / SQLite / PostgreSQL) | |
 | Deployment target (local dev server / staging / other) | |
@@ -37,7 +37,7 @@ Protocol §6 on empty fields:
 | Participant's experience level with this app (New / some exposure / regular user) | |
 | Participant's real-world familiarity with the role | |
 | Consent obtained (see below) — how, and at what time | |
-| Prompt wording used (neutral sheet / protocol verbatim / mixed — note per task) | |
+| Any deviation from verbatim delivery of the §§2–4 prompts (exact words spoken, at which task; "none" is the expected value) | |
 | Persona signed in as (never the password) | |
 | Permissions confirmed to match the role table (yes/no, note deviations) | |
 | Active Program / Season / League at hand-over | |
@@ -131,7 +131,11 @@ record the path actually taken, not only the destination.
 
 ## Ease rating — protocol §6's scale, verbatim
 
-Collected once per task, immediately after that task.
+Collected once per task, immediately after that task. Ask it with the two fixed
+lines on [08-task-prompts-coach.md](08-task-prompts-coach.md) — the same
+wording in all three sessions — and read the five anchors below to the
+participant, so the anchor column records **their** mapping rather than your
+interpretation of their number.
 
 > **Ease rating scale** (record which anchor the participant's number maps to):
 >
