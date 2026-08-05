@@ -96,10 +96,17 @@ let publicState = { schedule: null, standings: null, division: null, game: null,
 let publicTab = "schedule";        // "schedule" | "standings" (#83)
 let schedulerState = {
   division: null, preview: null, drafts: [], summary: null,
-  // #375 — the configurable regular-season format: how many times each team
-  // plays every other. 1 is the historical single round-robin, so an
-  // operator who never touches the control gets exactly the old behaviour.
-  meetings: 1,
+  // #375 — the regular-season format, INVERTED to the number the operator
+  // actually signs up for: guaranteed games their own team plays. `null`
+  // means "single round-robin" (the historical default, sent as the legacy
+  // meetings_per_opponent: 1), so an operator who never touches the control
+  // gets exactly the old behaviour; any other value is a games_per_team.
+  //
+  // Held as ONE field rather than two, because the two request spellings are
+  // alternatives the backend refuses to receive together — a second piece of
+  // state would make "both set" representable on the client, which is the
+  // drift the refusal exists to prevent.
+  gamesPerTeam: null,
   // #390 — the configurable turnaround, in MINUTES, measured from the
   // previous game's end. 0 is exactly the pre-#390 behaviour, so an operator
   // who never touches the control gets the historical proposal; the field
@@ -8887,11 +8894,32 @@ function renderScheduler(ov) {
       <div class="section-title" style="margin-top:0">Generate draft schedule</div>
       <div class="dq-actions">
         <select id="sched-div">${divOptions(schedulerState.division)}</select>
-        <label class="sr-only" for="sched-meetings">Games against each opponent</label>
-        <select id="sched-meetings" title="Games against each opponent">${
-          [1, 2, 3, 4].map((n) => `<option value="${n}"${
-            n === schedulerState.meetings ? " selected" : ""
-          }>${n === 1 ? "1 game" : `${n} games`} vs each opponent</option>`).join("")
+        <label class="sr-only" for="sched-games">Guaranteed games per team</label>
+        <select id="sched-games" title="Guaranteed games per team">${
+          // #375 — the control the operator actually thinks in: how many
+          // games THEIR team is guaranteed. The per-opponent count is the
+          // backend's derivation, not theirs.
+          //
+          // "round-robin" is kept as the first option and sends the legacy
+          // meetings_per_opponent: 1. It is not a duplicate spelling of any
+          // number here: "play everyone once" is (T-1) games, which differs
+          // per Division, so no fixed games-per-team value expresses it.
+          // Dropping it would remove a capability the screen has today.
+          //
+          // Every games-per-team option is EVEN, and that is a correctness
+          // property rather than a style choice. The backend refuses a
+          // request when `teams x games` is odd — no construction can give
+          // every team exactly G games when both are odd — and the screen
+          // cannot know a Division's team count before Generate runs. An
+          // even G makes `teams x games` even for EVERY team count, so this
+          // list can never offer a value the backend would refuse.
+          [{ value: "rr", label: "Single round-robin (play everyone once)" }]
+            .concat([2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 24, 28, 32, 36, 40]
+              .map((n) => ({ value: String(n), label: `${n} guaranteed games per team` })))
+            .map((opt) => `<option value="${opt.value}"${
+              opt.value === (schedulerState.gamesPerTeam === null
+                ? "rr" : String(schedulerState.gamesPerTeam)) ? " selected" : ""
+            }>${opt.label}</option>`).join("")
         }</select>
         <label class="sr-only" for="sched-turnaround">Minimum turnaround between a team's games</label>
         <select id="sched-turnaround" title="Minimum turnaround between a team's games">${
@@ -11347,9 +11375,10 @@ async function render() {
   // draft_fingerprint, so changing it after a Generate makes Commit fail
   // preview_stale — already handled by the error branch, which clears the
   // stale preview and returns focus to Generate.
-  const schedMeetings = c.querySelector("#sched-meetings");
-  if (schedMeetings) schedMeetings.onchange = () => {
-    schedulerState.meetings = Number(schedMeetings.value) || 1;
+  const schedGames = c.querySelector("#sched-games");
+  if (schedGames) schedGames.onchange = () => {
+    schedulerState.gamesPerTeam = schedGames.value === "rr"
+      ? null : Number(schedGames.value);
   };
   // #390 — the configurable turnaround, recorded exactly like the two selects
   // above (no re-render). It is an input to the backend's own regeneration at
@@ -11375,7 +11404,12 @@ async function render() {
     toast = "";
     const res = await post("/api/scheduler/draft", {
       division_id: schedulerState.division,
-      meetings_per_opponent: schedulerState.meetings,
+      // #375 — EXACTLY ONE format field, never both: the backend refuses a
+      // request carrying both spellings, because they cannot be reconciled
+      // when a League's Divisions differ in team count.
+      ...(schedulerState.gamesPerTeam === null
+        ? { meetings_per_opponent: 1 }
+        : { games_per_team: schedulerState.gamesPerTeam }),
       // #390 — ALWAYS sent, including the 0 an untouched control means.
       // Omitting the key entirely is what the pre-#390 screen did, and the
       // backend's default then made the whole capability unreachable: an
@@ -11401,8 +11435,16 @@ async function render() {
       // operator who nudges it while reading a still-valid proposal must
       // not thereby redefine the batch they are about to commit (nor be
       // forced to regenerate an unchanged one).
-      meetings_per_opponent: (schedulerState.preview
-        && schedulerState.preview.meetings_per_opponent) || 1,
+      //
+      // The proposal echoes exactly one of the two spellings and `null` for
+      // the other, so this forwards whichever one it actually ran under —
+      // sending both would be refused, and sending the wrong one would
+      // regenerate a different schedule and fail preview_stale.
+      ...((schedulerState.preview
+        && schedulerState.preview.games_per_team) != null
+        ? { games_per_team: schedulerState.preview.games_per_team }
+        : { meetings_per_opponent: (schedulerState.preview
+          && schedulerState.preview.meetings_per_opponent) || 1 }),
       // #390 — the turnaround the PREVIEW was generated with, echoed back by
       // the server on that proposal and read off it rather than off the live
       // select, for exactly the reason above: the select is the input to the

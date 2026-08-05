@@ -1,28 +1,40 @@
-// Configurable regular-season format on the real Scheduler UI (#375).
+// GUARANTEED GAMES PER TEAM on the real Scheduler UI (#375).
 //
-// The backend takes `meetings_per_opponent` on BOTH /api/scheduler/draft and
-// /api/scheduler/commit, and binds it into draft_fingerprint so a Commit that
-// disagrees with the reviewed preview is refused. None of that is reachable by
-// an operator unless the select is rendered, read, and sent on both requests —
-// which is exactly what unit and HTTP tests cannot prove and this journey can.
+// The operator control is inverted: instead of asking how many times a team
+// plays each opponent and letting games-per-team fall out, the operator asks
+// for the number of games THEIR team is guaranteed and the backend derives the
+// per-opponent count (`base = G // (T-1)`, with `rem = G % (T-1)` opponents
+// played once more). The backend takes `games_per_team` on BOTH
+// /api/scheduler/draft and /api/scheduler/commit, and binds it into
+// draft_fingerprint so a Commit that disagrees with the reviewed preview is
+// refused. None of that is reachable by an operator unless the select is
+// rendered, read, and sent on both requests — which is exactly what unit and
+// HTTP tests cannot prove and this journey can.
 //
 // At desktop and 390px, against a 4-team Division with ice to spare:
-//   * (1) DEFAULT — an operator who never touches the control gets the
-//     historical single round-robin: 6 games (C(4,2)), one per pair.
-//   * (2) THREE MEETINGS — selecting "3 games vs each opponent" and clicking
-//     Generate previews 18 games, and every one of the 6 pairs appears exactly
-//     three times. The request body is captured and asserted to actually carry
-//     meetings_per_opponent: 3 — a preview that merely LOOKED bigger would
-//     otherwise pass.
+//   * (1) DEFAULT — an operator who never touches the control still gets the
+//     historical single round-robin: 6 games (C(4,2)), one per pair, sent as
+//     the legacy meetings_per_opponent: 1. "Play everyone once" is (T-1)
+//     games, which differs per Division, so no fixed games-per-team value
+//     expresses it and the option is kept rather than dropped.
+//   * (2) EIGHT GUARANTEED GAMES — the case a meetings picker CANNOT express,
+//     and therefore the one worth driving through the real UI. 8 games with 3
+//     opponents is base 2 remainder 2: every team plays two opponents three
+//     times and one opponent twice, for 16 rows (4 x 8 / 2). Asserted as the
+//     operator experiences it — every TEAM appears exactly 8 times — plus the
+//     per-pair 3/3/2 shape the remainder produces. The request body is
+//     captured and asserted to carry games_per_team: 8 and NOT
+//     meetings_per_opponent, since sending both is refused.
 //   * (3) COMMIT SENDS THE REVIEWED FORMAT — committing that preview creates
-//     18 real games, and the captured commit body carries the same 3. If app.js
-//     dropped the field here, the backend's own regeneration would be a single
-//     round-robin, the fingerprint could not match, and the commit would be
-//     refused as preview_stale instead of creating anything.
+//     16 real games, and the captured commit body carries the same 8. If
+//     app.js dropped the field here, the backend's own regeneration would be a
+//     single round-robin, the fingerprint could not match, and the commit
+//     would be refused as preview_stale instead of creating anything.
 //   * (4) IDEMPOTENT REGENERATION — Generate again, unchanged, at the same
-//     format: every pair is now satisfied, so the preview proposes 0 games and
-//     reports all 18 as already scheduled, and Commit is DISABLED. This is the
-//     operator-visible face of "running it twice produces no second set".
+//     format: every obligation is now satisfied, so the preview proposes 0
+//     games and reports all 16 as already scheduled, and Commit is DISABLED.
+//     This is the operator-visible face of "running it twice produces no
+//     second set".
 //
 // Fails on any browser console/page error.
 const { chromium } = require("playwright");
@@ -34,9 +46,10 @@ const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
 const READY_TIMEOUT_MS = 15000;
 const ICE_DAY = "2026-09-05";
-// 24 game slots for 18 meetings: deliberately MORE ice than the format needs,
-// so scenario (4)'s "0 proposed" is proof that regeneration found nothing
-// missing, never that it ran out of ice to propose onto.
+// 24 game slots for the 16 rows 8 guaranteed games needs: deliberately MORE
+// ice than the format requires, so scenario (4)'s "0 proposed" is proof that
+// regeneration found nothing missing, never that it ran out of ice to propose
+// onto.
 const ICE_HOURS = 24;
 const VIEWPORTS = [
   // 8311/8312 are unique across the whole e2e suite — no other journey binds
@@ -179,8 +192,30 @@ async function checkViewport(browser, viewport) {
       ids.div, { timeout: 10000 });
 
     // The control must actually exist before anything below means anything.
-    if (!(await page.$("#sched-meetings"))) {
-      fail("the Scheduler panel has no games-per-opponent control");
+    if (!(await page.$("#sched-games"))) {
+      fail("the Scheduler panel has no guaranteed-games-per-team control");
+    }
+    // The accessible name must describe what the control now MEANS. A picker
+    // that still says "games against each opponent" while sending
+    // games_per_team is the doc-contradicts-code defect, in the one place a
+    // screen-reader user cannot work around.
+    const gamesLabel = await page.$eval(
+      'label[for="sched-games"]', (el) => (el.textContent || "").trim());
+    if (gamesLabel !== "Guaranteed games per team") {
+      fail(`the format control's label must say what it sets, got "${gamesLabel}"`);
+    }
+    // No option may be one the backend would refuse. `teams x games` must be
+    // even or no construction can honour the guarantee, and the screen cannot
+    // know a Division's team count before Generate runs — so every numeric
+    // option is even, which is feasible for EVERY team count.
+    const offered = await page.$$eval(
+      "#sched-games option", (els) => els.map((el) => el.value));
+    for (const value of offered) {
+      if (value === "rr") continue;
+      const n = Number(value);
+      if (!Number.isInteger(n) || n < 1 || n % 2 !== 0) {
+        fail(`#sched-games offers "${value}", which the backend can refuse`);
+      }
     }
 
     // (1) DEFAULT: untouched control -> the historical single round-robin.
@@ -197,54 +232,82 @@ async function checkViewport(browser, viewport) {
     if (draftBodies.length !== 1 || draftBodies[0].meetings_per_opponent !== 1) {
       fail(`default: Generate must send meetings_per_opponent 1, sent ${JSON.stringify(draftBodies)}`);
     }
+    if (draftBodies[0].games_per_team !== undefined) {
+      fail(`default: Generate must not send both format fields, sent ${JSON.stringify(draftBodies)}`);
+    }
 
-    // (2) THREE MEETINGS: 6 pairs x 3 = 18, each pair exactly three times.
-    await page.selectOption("#sched-meetings", "3");
+    // (2) EIGHT GUARANTEED GAMES: 4 x 8 / 2 = 16 rows, and -- the part a
+    // meetings picker cannot express -- 8 with 3 opponents is base 2
+    // remainder 2, so each team plays two opponents THREE times and one
+    // opponent twice.
+    await page.selectOption("#sched-games", "8");
     await page.click("[data-sched-generate]");
-    await page.waitForSelector('#sched-preview[data-games="18"]', { timeout: 15000 });
+    await page.waitForSelector('#sched-preview[data-games="16"]', { timeout: 15000 });
     s = await previewState(page);
-    if (draftBodies.length !== 2 || draftBodies[1].meetings_per_opponent !== 3) {
-      fail(`3 meetings: Generate must send meetings_per_opponent 3, sent ${JSON.stringify(draftBodies)}`);
+    if (draftBodies.length !== 2 || draftBodies[1].games_per_team !== 8) {
+      fail(`8 games: Generate must send games_per_team 8, sent ${JSON.stringify(draftBodies)}`);
     }
-    if (s.titles.length !== 18) {
-      fail(`3 meetings: expected 18 proposed rows, got ${s.titles.length}`);
+    if (draftBodies[1].meetings_per_opponent !== undefined) {
+      fail(`8 games: Generate must not send both format fields, sent ${JSON.stringify(draftBodies)}`);
     }
+    if (s.titles.length !== 16) {
+      fail(`8 games: expected 16 proposed rows, got ${s.titles.length}`);
+    }
+    // THE GUARANTEE, as the operator reads it: every TEAM appears 8 times.
+    // Counted per team rather than per pair, because "16 rows exist" is
+    // satisfied by a schedule that gives one team 9 games and another 7.
+    const perTeam = {};
     const perPair = {};
     for (const title of s.titles) {
+      const names = title.split(" vs ").map((n) => n.trim());
+      for (const name of names) perTeam[name] = (perTeam[name] || 0) + 1;
       // "A vs B" and "B vs A" are the same pair meeting twice, so normalise
       // the orientation before counting -- otherwise the home/away split
       // would make every meeting look like a different matchup.
-      const key = title.split(" vs ").map((n) => n.trim()).sort().join(" | ");
+      const key = names.slice().sort().join(" | ");
       perPair[key] = (perPair[key] || 0) + 1;
     }
-    const pairKeys = Object.keys(perPair);
-    if (pairKeys.length !== 6) {
-      fail(`3 meetings: expected 6 distinct pairs, got ${JSON.stringify(perPair)}`);
+    const teamNames = Object.keys(perTeam);
+    if (teamNames.length !== 4) {
+      fail(`8 games: expected 4 teams to appear, got ${JSON.stringify(perTeam)}`);
     }
-    for (const key of pairKeys) {
-      if (perPair[key] !== 3) {
-        fail(`3 meetings: pair "${key}" appears ${perPair[key]} times, expected 3: ${JSON.stringify(perPair)}`);
+    for (const name of teamNames) {
+      if (perTeam[name] !== 8) {
+        fail(`8 games: "${name}" plays ${perTeam[name]} games, not the guaranteed 8: ${JSON.stringify(perTeam)}`);
       }
     }
+    // The remainder's shape: 6 distinct pairs, four met 3x and two met 2x
+    // (each team: two opponents 3x, one 2x -> 3+3+2 = 8).
+    const pairKeys = Object.keys(perPair);
+    if (pairKeys.length !== 6) {
+      fail(`8 games: expected 6 distinct pairs, got ${JSON.stringify(perPair)}`);
+    }
+    const pairCounts = pairKeys.map((k) => perPair[k]).sort();
+    if (JSON.stringify(pairCounts) !== JSON.stringify([2, 2, 3, 3, 3, 3])) {
+      fail(`8 games: expected a base-2 remainder-2 split (2,2,3,3,3,3), got ${JSON.stringify(perPair)}`);
+    }
     if (s.commitPresent !== true || s.commitDisabled !== false) {
-      fail(`3 meetings: commit must be enabled with 18 games: ${JSON.stringify(s)}`);
+      fail(`8 games: commit must be enabled with 16 games: ${JSON.stringify(s)}`);
     }
 
-    // (3) COMMIT sends the reviewed format, and really creates 18 games.
+    // (3) COMMIT sends the reviewed format, and really creates 16 games.
     await page.click("[data-sched-commit]");
     await page.waitForFunction(
-      () => /Committed 18 draft game\(s\)/.test(document.body.textContent || ""),
+      () => /Committed 16 draft game\(s\)/.test(document.body.textContent || ""),
       null, { timeout: 15000 });
-    if (commitBodies.length !== 1 || commitBodies[0].meetings_per_opponent !== 3) {
-      fail(`commit must send meetings_per_opponent 3, sent ${JSON.stringify(commitBodies)}`);
+    if (commitBodies.length !== 1 || commitBodies[0].games_per_team !== 8) {
+      fail(`commit must send games_per_team 8, sent ${JSON.stringify(commitBodies)}`);
+    }
+    if (commitBodies[0].meetings_per_opponent !== undefined) {
+      fail(`commit must not send both format fields, sent ${JSON.stringify(commitBodies)}`);
     }
 
     // (4) IDEMPOTENT: regenerate unchanged at the same format -> nothing
     // missing, everything already scheduled, commit disabled.
-    await page.selectOption("#sched-meetings", "3");
+    await page.selectOption("#sched-games", "8");
     await page.click("[data-sched-generate]");
     await page.waitForSelector(
-      '#sched-preview[data-games="0"][data-already-scheduled="18"]', { timeout: 15000 });
+      '#sched-preview[data-games="0"][data-already-scheduled="16"]', { timeout: 15000 });
     s = await previewState(page);
     if (s.commitDisabled !== true) {
       fail(`idempotent regenerate: commit must be disabled with nothing missing: ${JSON.stringify(s)}`);
@@ -256,7 +319,7 @@ async function checkViewport(browser, viewport) {
     if (errors.length) {
       fail(`console/page errors:\n${errors.join("\n")}`);
     }
-    console.log(`[${viewport.label}] OK — format control sends meetings_per_opponent on Generate AND Commit; 3 meetings per pair previewed and committed; regeneration is a visible no-op.`);
+    console.log(`[${viewport.label}] OK — the picker sends games_per_team on Generate AND Commit; 8 guaranteed games per team (base 2, remainder 2) previewed and committed; regeneration is a visible no-op.`);
   } catch (error) {
     throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {
@@ -271,7 +334,7 @@ async function main() {
     browser = await chromium.launch(
       process.env.SMOKE_CHROMIUM_PATH ? { executablePath: process.env.SMOKE_CHROMIUM_PATH } : {});
     for (const viewport of VIEWPORTS) await checkViewport(browser, viewport);
-    console.log("Scheduler meetings-format browser journey passed.");
+    console.log("Scheduler games-per-team browser journey passed.");
   } catch (error) {
     console.error("Scheduler meetings-format browser journey FAILED.");
     console.error(error && error.message ? error.message : error);
