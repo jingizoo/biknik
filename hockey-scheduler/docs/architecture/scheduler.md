@@ -187,20 +187,30 @@ between Memory, SQLite and PostgreSQL for identical data. The generation loop
 itself must keep the original order, because that order decides which
 pairings are offered ice first.
 
-#### A group with fewer than two teams
+#### A group with one team — and one with none
 
-The parity check **skips** it, and that is a division of labour rather than
-an exemption from refusal. The parity argument is vacuous with no opponent —
-there is no `rem` to build — and "ask for `G-1` or `G+1`" would be useless
-advice when no `G` at all is achievable.
+The parity check **skips** a group of fewer than two teams, and that is a
+division of labour rather than an exemption from refusal. The parity argument
+is vacuous with no opponent — there is no `rem` to build — and "ask for `G-1`
+or `G+1`" would be useless advice when no `G` at all is achievable.
 
-`require_completable_games_per_team` refuses it instead, as a case of
-condition (3): the lone team needs `G` and the rest of the division can
-supply `0`. It is refused with its **own diagnosis**, not the general
-residual one — that message blames "the games already scheduled" and offers
-cancelling some of them, and a one-team division has no games to cancel and
-would not be helped if it did. The operator is told the team has no opponent
-and to register another one.
+`require_completable_games_per_team` refuses the **one-team** group instead,
+as a case of condition (3): the lone team needs `G` and the rest of the
+division can supply `0`. It is refused with its **own diagnosis**, not the
+general residual one — that message blames "the games already scheduled" and
+offers cancelling some of them, and a one-team division has no games to
+cancel and would not be helped if it did. The operator is told the team has
+no opponent and to register another one.
+
+That diagnosis is guarded on **exactly one** team, not "fewer than two". A
+group with **no** teams has nobody whose guarantee goes unhonoured, so there
+is nothing to name and nothing to refuse; an empty residual is trivially
+completable and it already falls through every condition. Widening the guard
+would start refusing on an empty Division that costs a draft nothing today —
+a larger blast radius than the defect. Neither boundary is reachable through
+a draft (`registered_teams_by_division_in_league` never yields a Division
+with no registrations), so both are pinned at the function's own contract,
+where they are actually falsifiable.
 
 Two consequences, both deliberate and both pinned by tests:
 
