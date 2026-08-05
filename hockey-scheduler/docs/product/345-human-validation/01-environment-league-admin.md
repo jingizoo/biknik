@@ -279,5 +279,11 @@ mechanics pass, keyboard/screen-reader protocol §5):
 2. Re-run A5 (reset), then B (deviation), then the whole of C again for the next
    participant. §1.5 step 3 also requires re-confirming the SHA has not changed;
    if it has, this is a new session build and the readiness checklist restarts.
-3. Recording, if any, is stored outside this repository — moderated protocol
-   §1.6 covers this and nothing in this pack overrides it.
+3. These sessions run without audio or video recording. There is nothing to
+   store, transfer or delete between participants, and no recording to secure
+   if a participant withdraws consent. The moderated protocol §1.6 leaves
+   recording to the moderator and says only where not to store it; the
+   repository owner ruled on 2026-08-05 that this pack runs without it until
+   an approved retention, access and deletion policy exists. The protocol is
+   quoted here, never edited — see
+   [README, "Why no recordings"](README.md#why-no-recordings--this-is-decided-not-pending).

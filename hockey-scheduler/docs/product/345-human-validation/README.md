@@ -330,14 +330,30 @@ What it covers, and why each one is executable rather than a paragraph:
 | `pii-export` | the issue-ready export leaking a name, email, phone, employer, account identifier or an unrelated personal disclosure, run against a synthetic record that contains all of them |
 | `primary-action-rubric`, `primary-action-text` | a correct prediction about a *secondary* control being transcribed as the canonical primary-action match |
 | `ease-readiness`, `ease-single-source`, `ease-preflight-gate` | a session starting on an unruled ease wording, three role sheets drifting to three different questions, or the README going back to saying nothing blocks |
+| `recording-consistency` | any pack-authored instruction, in any file, drifting back to permitting recording — or an operational file simply going quiet about it |
+| `blockquote-is-protocol-text` | pack-authored text smuggled behind a `>`, which would give it protocol authority and hide it from every check that separates the two |
 | `protocol-pin`, `pin-present` | either protocol changing by one byte while this pack goes on quoting the old text |
 | `ksr-steps-verbatim` | any of the 17 K steps or 14 S steps drifting from the protocol's own wording |
 
 Every check has at least one `--break` mutation that injects the exact defect it
-targets, and `--verify-breaks` runs all of them and requires each to fail. CI
-runs both halves on every push. That second half is not ceremony: a check whose
-target text has drifted away reports green while testing nothing, which has
-happened twice in this repository's tooling, and nothing except this notices.
+targets, and `--verify-breaks` runs all of them and requires **the mutation's own
+named check** to fail. CI runs both halves on every push.
+
+The "own named check" part is not pedantry, and it was added because the weaker
+version missed a live defect. The three environment runbooks used to end with a
+pack-authored step permitting recording, contradicting the owner ruling that the
+capture sheets carried. The `recordings-permitted` mutation existed and appeared
+to work — but it only ever removed the prohibition from the *capture sheets*, so
+it proved the suite could go red, not that the rule was enforced where the defect
+actually was. A mutation that lands on a surface its check never inspects looks
+identical to one that works. `--verify-breaks` now reports that as `MISDIRECT`
+and fails.
+
+That is the same shape as the earlier `ease-readiness-blind` case, where a
+fixture tripped two guards so blinding one changed nothing. Both are checks
+reporting green while testing nothing, which is the failure this whole file
+exists to prevent — and neither was caught by reading the checker. One was
+caught by a mutation, the other by a human reading the runbooks end to end.
 
 ## Scope
 

@@ -91,12 +91,24 @@ This is a **proposal**, not the ruling. It has no force until it is copied into
 the ruling block above. It is recorded here so the owner has something concrete
 to accept or reject rather than a blank page.
 
-> On a scale of one to five, where one is very difficult and five is very easy,
-> how easy was that?
+It is deliberately **not** shown as a `>` blockquote. Everywhere else in this
+pack a blockquote means verbatim protocol text, and dressing an unratified
+proposal in that marker would give it exactly the authority it does not have —
+a facilitator skimming for what to say would find quoted-looking text and read
+it out. `check_pack.py`'s `blockquote-is-protocol-text` check enforces the
+convention by proving every blockquote in the pack appears verbatim in one of
+the two pinned protocols.
+
+```text
+On a scale of one to five, where one is very difficult and five is very easy,
+how easy was that?
+```
 
 and then, once they have given a number:
 
-> Which of these descriptions fits the number you gave?
+```text
+Which of these descriptions fits the number you gave?
+```
 
 Why this shape: it states the scale and both poles before asking, so a
 participant does not have to guess which end is which; it asks about the task

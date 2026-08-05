@@ -97,10 +97,22 @@ PACK_FILES = (
 _ACTIVE_BREAK: str | None = None
 
 BREAKS: dict[str, str] = {}
+BREAK_TARGETS: dict[str, str] = {}
 
 
-def register_break(name: str, description: str) -> str:
+def register_break(name: str, description: str, target: str) -> str:
+    """Register an injectable defect, and the check that must catch it.
+
+    `target` is not bookkeeping. Verifying only that a mutation makes
+    *something* fail is too weak: it passes when the mutation lands on a
+    surface the check does not inspect, and the failure comes from an
+    unrelated check. That is exactly how the permissive recording instruction
+    survived in the three environment runbooks while `recordings-permitted`
+    reported green — the mutation only ever touched the capture sheets, so it
+    proved the suite ran, not that the rule was enforced where the defect was.
+    """
     BREAKS[name] = description
+    BREAK_TARGETS[name] = target
     return name
 
 
@@ -117,34 +129,42 @@ def broken(name: str) -> bool:
 B_PII_IDENTITY_FIELD = register_break(
     "pii-identity-field",
     "put the `Participant identity` row back on the League Admin capture sheet",
+    "pii-fields",
 )
 B_PII_NAME_FIELD = register_break(
     "pii-name-field",
     "add a participant full-name field to the Arena Manager capture sheet",
+    "pii-fields",
 )
 B_PII_CONTACT_FIELD = register_break(
     "pii-contact-field",
     "add a contact-details field to the Coach capture sheet",
+    "pii-fields",
 )
 B_PII_EMPLOYER_FIELD = register_break(
     "pii-employer-field",
     "add an employer field to the League Admin capture sheet",
+    "pii-fields",
 )
 B_PII_CODE_MISSING = register_break(
     "pii-code-missing",
     "drop the anonymous participant-code row from the Arena Manager sheet",
+    "pii-fields",
 )
 B_PII_RULE_MISSING = register_break(
     "pii-rule-missing",
     "delete the no-names / mapping-outside-the-repo / redaction rules from the Coach sheet",
+    "pii-rules",
 )
 B_RECORDINGS_PERMITTED = register_break(
     "recordings-permitted",
     "let the pack permit audio/video recording with no retention rule in force",
+    "pii-rules",
 )
 B_SUPERSESSION_NOTE_MISSING = register_break(
     "supersession-note-missing",
     "remove the note that the earlier 'explicit blank for participant identity' requirement is superseded",
+    "pii-supersession-note",
 )
 
 
@@ -214,6 +234,23 @@ def read_pack(name: str) -> str:
         text = re.sub(r"(?m)^\|[^\n]*" + re.escape(GATE_MARKER) + r"[^\n]*\n", "", text)
     if name == "README.md" and broken(B_README_NONBLOCKING):
         text += "\n\n**None of these blocks a session.**\n"
+    if name == "README.md" and broken(B_BLOCKQUOTE_NOT_PROTOCOL):
+        text += (
+            "\n\n> Ask the participant to confirm the room is quiet before you\n"
+            "> begin, and note anything unusual about the setup.\n"
+        )
+    if name == "01-environment-league-admin.md" and broken(
+        B_RECORDING_RUNBOOK_PERMISSIVE
+    ):
+        text = text.replace(
+            "3. These sessions run without audio or video recording.",
+            OLD_PERMISSIVE_RECORDING_STEP,
+            1,
+        )
+    if name == "02-environment-arena-manager.md" and broken(
+        B_RECORDING_PROHIBITION_MISSING
+    ):
+        text = flex(RULE_NO_RECORDINGS).sub("Reset the browser profile.", text)
 
     if broken(B_RECORDINGS_PERMITTED):
         text = flex(RULE_NO_RECORDINGS).sub(
@@ -281,14 +318,17 @@ RULE_SUPERSEDED_IDENTITY = (
 B_EXPORT_LEAK_NAME = register_break(
     "export-leak-name",
     "let the issue-ready export carry the participant's name through",
+    "pii-export",
 )
 B_EXPORT_REDACTION_OFF = register_break(
     "export-redaction-off",
     "stop redacting unrelated personal disclosures out of quotes",
+    "pii-export",
 )
 B_EXPORT_KEY_ALLOWLIST_OFF = register_break(
     "export-key-allowlist-off",
     "export the whole source record instead of the allowed fields",
+    "pii-export",
 )
 
 REDACTION_MARKER = (
@@ -628,10 +668,12 @@ def check_pii_export() -> list[str]:
 B_RUBRIC_SCORE_NAMED = register_break(
     "rubric-score-named-control",
     "score the §2 match against whichever control the participant named (the original defect)",
+    "primary-action-rubric",
 )
 B_RUBRIC_TRANSCRIPTION_YES = register_break(
     "rubric-transcription-yes",
     "let the §6 transcription turn a diagnostic match into a primary-action Yes",
+    "primary-action-rubric",
 )
 
 NOT_EVALUATED = "Not evaluated"
@@ -789,10 +831,12 @@ def check_primary_action_rubric() -> list[str]:
 B_PRIMARY_OLD_RULE = register_break(
     "primary-action-old-rule",
     "put the 'score the match against the control they actually named' instruction back",
+    "primary-action-text",
 )
 B_PRIMARY_RULE_MISSING = register_break(
     "primary-action-rule-missing",
     "delete the never-Yes rule from the League Admin capture sheet",
+    "primary-action-text",
 )
 
 RULE_PRIMARY_ONLY = (
@@ -857,26 +901,32 @@ def check_primary_action_text() -> list[str]:
 B_EASE_LOCAL_COPY = register_break(
     "ease-local-copy",
     "give the Arena Manager prompt sheet its own copy of the ease wording again",
+    "ease-single-source",
 )
 B_EASE_POINTER_MISSING = register_break(
     "ease-pointer-missing",
     "drop the Coach prompt sheet's reference to the canonical ease wording",
+    "ease-single-source",
 )
 B_EASE_READINESS_BLIND = register_break(
     "ease-readiness-blind",
     "make the readiness check ignore an unruled (blank) ease wording",
+    "ease-readiness",
 )
 B_EASE_DIVERGENCE_BLIND = register_break(
     "ease-divergence-blind",
     "make the readiness check ignore role sheets resolving to different wording",
+    "ease-readiness",
 )
 B_GATE_ROW_MISSING = register_break(
     "gate-row-missing",
     "remove the hard pre-flight gate row from the Arena Manager environment sheet",
+    "ease-preflight-gate",
 )
 B_README_NONBLOCKING = register_break(
     "readme-nonblocking-claim",
     "put the README's 'none of these blocks a session' claim back",
+    "ease-preflight-gate",
 )
 
 UNRULED_SENTINEL = "NOT YET RULED"
@@ -891,6 +941,7 @@ GATE_BLOCKS = "No session starts until this line is PASS."
 B_EASE_NOSOURCE_BLIND = register_break(
     "ease-nosource-blind",
     "make the readiness check ignore a role sheet that names no ease wording at all",
+    "ease-readiness",
 )
 
 FENCE_RE = re.compile(r"```text\n(.*?)\n```", re.DOTALL)
@@ -1158,16 +1209,236 @@ def check_ease_preflight_gate() -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Pack-authored text vs. quoted protocol text.
+#
+# This pack reserves `>` for verbatim protocol text and writes everything of
+# its own outside a blockquote. That convention is what lets a check tell
+# "the protocol says recording is optional" (which is true, and must stay
+# quoted exactly) apart from "this pack tells you to record" (which
+# contradicts an owner ruling).
+#
+# The convention is therefore load-bearing, so it is asserted rather than
+# assumed: every blockquote in the pack must appear verbatim in one of the two
+# pinned protocols. Without this, a pack-authored instruction could be smuggled
+# behind a `>` and every check below would skip it by design.
+# ---------------------------------------------------------------------------
+
+B_BLOCKQUOTE_NOT_PROTOCOL = register_break(
+    "blockquote-not-protocol",
+    "smuggle a pack-authored instruction into a `>` blockquote in the README",
+    "blockquote-is-protocol-text",
+)
+
+
+def normalize(text: str) -> str:
+    return " ".join(text.split())
+
+
+def blockquote_blocks(text: str) -> list[tuple[int, str]]:
+    out: list[tuple[int, str]] = []
+    cur: list[str] = []
+    start: int | None = None
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        if line.lstrip().startswith(">"):
+            if start is None:
+                start = lineno
+            cur.append(re.sub(r"^\s*>\s?", "", line))
+        else:
+            if cur and start is not None:
+                out.append((start, "\n".join(cur)))
+            cur, start = [], None
+    if cur and start is not None:
+        out.append((start, "\n".join(cur)))
+    return out
+
+
+def pack_authored_lines(text: str) -> list[tuple[int, str]]:
+    """Every line the pack wrote itself — blockquotes excluded."""
+    return [
+        (lineno, line)
+        for lineno, line in enumerate(text.splitlines(), start=1)
+        if not line.lstrip().startswith(">")
+    ]
+
+
+@check("blockquote-is-protocol-text")
+def check_blockquote_is_protocol_text() -> list[str]:
+    failures = []
+    protocols = {
+        name: normalize(read_protocol(name).decode("utf-8"))
+        for name in PROTOCOL_BLOBS
+    }
+    for filename in PACK_FILES:
+        if not (PACK_DIR / filename).exists():
+            continue
+        for lineno, block in blockquote_blocks(read_pack(filename)):
+            norm = normalize(block)
+            if not norm:
+                continue
+            if not any(norm in body for body in protocols.values()):
+                failures.append(
+                    f"{filename}:{lineno}: blockquote is not verbatim protocol "
+                    f"text. `>` is this pack's marker for quoted protocol, and "
+                    f"every check that separates pack instructions from quoted "
+                    f"protocol relies on it: {norm[:110]!r}"
+                )
+    return failures
+
+
+# ---------------------------------------------------------------------------
+# The owner's no-recording ruling, enforced across EVERY pack-authored line.
+#
+# The three environment runbooks used to end with a pack-authored step reading
+# "Recording, if any, is stored outside this repository — moderated protocol
+# §1.6 covers this and nothing in this pack overrides it." That is backwards:
+# the pack DOES override it, by owner ruling. A facilitator following the
+# runbook — on the between-participants path, the one operational page open
+# during a session — was told recording was permitted, while the capture sheet
+# in their other hand said it was prohibited.
+#
+# The original `recordings-permitted` mutation did not catch this, because it
+# only ever removed the prohibition from the CAPTURE SHEETS. It made the suite
+# go red, so it looked like proof the rule was enforced; it was proof only that
+# the rule was enforced on the one surface the mutation touched. Hence the
+# three directions below, and hence BREAK_TARGETS above.
+# ---------------------------------------------------------------------------
+
+B_RECORDING_RUNBOOK_PERMISSIVE = register_break(
+    "recording-runbook-permissive",
+    "restore the exact old 'Recording, if any' instruction in the League Admin runbook",
+    "recording-consistency",
+)
+B_RECORDING_PROHIBITION_MISSING = register_break(
+    "recording-prohibition-missing",
+    "delete the no-recording instruction from the Arena Manager runbook",
+    "recording-consistency",
+)
+
+OLD_PERMISSIVE_RECORDING_STEP = (
+    "3. Recording, if any, is stored outside this repository — moderated protocol\n"
+    "   §1.6 covers this and nothing in this pack overrides it."
+)
+
+# Phrasings that tell a reader recording may happen. Matched against
+# pack-authored text only: the protocol genuinely does permit recording, and
+# its own wording must stay quoted exactly, so blockquotes are exempt.
+PERMISSIVE_RECORDING_INSTRUCTIONS = (
+    ('"recording, if any"', r"recording,?\s+if\s+any"),
+    ('"if recording ..."', r"\bif\s+recording\b"),
+    (
+        "recording called optional/permitted in the pack's own voice",
+        r"\brecording\s+is\s+(?:optional|permitted|allowed|fine|acceptable|up\s+to)",
+    ),
+    # Deliberately NOT a pattern: "recording at the moderator's choice".
+    # The capture sheets and README use that phrase correctly, to state what
+    # §1.6 permits immediately before explaining why this pack overrides it.
+    # Banning it would force the pack to stop saying what it is overriding,
+    # which is worse than the defect. The patterns here are instruction-shaped
+    # instead — they match the pack telling someone recording may happen, not
+    # the pack describing the protocol.
+    (
+        "an instruction that a recording may be made",
+        r"\byou\s+may\s+record\b|\brecord\s+(?:the\s+session|audio|video)\b"
+        r"|\brecording\s+is\s+your\s+call\b",
+    ),
+    ('"nothing in this pack overrides it"', r"nothing\s+in\s+this\s+pack\s+overrides\s+it"),
+    (
+        "an instruction on where a recording is stored (implies one exists)",
+        r"recording[^.]{0,60}?\bis\s+stored\s+outside\b",
+    ),
+)
+
+RECORDING_MENTION = re.compile(r"\brecordings?\b|\baudio\b|\bvideo\b", re.IGNORECASE)
+
+# Files that carry operational instructions for running a session. Each must
+# state the rule outright — silence is how the runbooks got it wrong.
+RECORDING_RULE_FILES = ENVIRONMENT_SHEETS + tuple(CAPTURE_SHEETS) + ("README.md",)
+
+
+@check("recording-consistency")
+def check_recording_consistency() -> list[str]:
+    """Every pack-authored instruction must agree that recording is OFF.
+
+    Three directions, because catching only the first would pass a file that
+    simply says nothing:
+      1. the prohibition is present in every operational file;
+      2. any file that mentions recording at all states the rule;
+      3. no pack-authored line carries permissive recording language.
+    """
+    failures = []
+
+    # (1) Required presence.
+    for filename in RECORDING_RULE_FILES:
+        if not flex(RULE_NO_RECORDINGS).search(read_pack(filename)):
+            failures.append(
+                f"{filename}: does not state the no-recording rule (expected the "
+                f"exact sentence {RULE_NO_RECORDINGS!r}). This file gives "
+                f"operational instructions for running a session; leaving the "
+                f"rule out is how the runbooks came to permit what the capture "
+                f"sheets forbid"
+            )
+
+    # (2) Co-location: mention it, state the rule.
+    for filename in PACK_FILES:
+        if not (PACK_DIR / filename).exists():
+            continue
+        text = read_pack(filename)
+        mentions = [
+            lineno
+            for lineno, line in pack_authored_lines(text)
+            if RECORDING_MENTION.search(line)
+        ]
+        if mentions and not flex(RULE_NO_RECORDINGS).search(text):
+            failures.append(
+                f"{filename}: mentions recording in its own voice (line "
+                f"{mentions[0]}) but never states the no-recording rule"
+            )
+
+    # (3) No permissive pack-authored instruction, anywhere.
+    for filename in PACK_FILES:
+        if not (PACK_DIR / filename).exists():
+            continue
+        lines = pack_authored_lines(read_pack(filename))
+        authored = normalize("\n".join(line for _, line in lines))
+        for label, pattern in PERMISSIVE_RECORDING_INSTRUCTIONS:
+            match = re.search(pattern, authored, re.IGNORECASE)
+            if not match:
+                continue
+            # Attribute to the line the match actually starts on. Matching on
+            # the first word alone pointed at the first line that merely
+            # contained that word, which named innocent lines.
+            head = normalize(match.group(0)).split()[:4]
+            head_rx = re.compile(r"\s+".join(re.escape(w) for w in head), re.IGNORECASE)
+            where = next(
+                (
+                    lineno
+                    for lineno, line in lines
+                    if head_rx.search(normalize(line))
+                ),
+                "(wrapped across lines)",
+            )
+            failures.append(
+                f"{filename}:{where}: pack-authored text still permits "
+                f"recording — {label}: {match.group(0)!r}. The protocol does "
+                f"permit it and its own wording stays quoted; every instruction "
+                f"the pack writes itself must say recording is off"
+            )
+    return failures
+
+
+# ---------------------------------------------------------------------------
 # Safeguard S1 — the source pin
 # ---------------------------------------------------------------------------
 
 B_PROTOCOL_DRIFT = register_break(
     "protocol-drift",
     "change one word of the keyboard/screen-reader protocol, as an upstream correction would",
+    "protocol-pin",
 )
 B_PIN_MISSING = register_break(
     "pin-missing",
     "strip the source pin from the League Admin capture sheet",
+    "pin-present",
 )
 
 
@@ -1251,10 +1522,12 @@ def check_pin_present() -> list[str]:
 B_K_STEP_DRIFT = register_break(
     "k-step-drift",
     "reword one K step's expected outcome in the keyboard script",
+    "ksr-steps-verbatim",
 )
 B_S_STEP_DRIFT = register_break(
     "s-step-drift",
     "reword one S step's expected announcement in the screen-reader script",
+    "ksr-steps-verbatim",
 )
 
 PROCEDURES = {
@@ -1416,6 +1689,17 @@ def collect(selected: str | None = None) -> list[str]:
     return failures
 
 
+def collect_by_check(selected: str | None = None) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    for fn in CHECKS:
+        if selected and fn.check_name != selected:
+            continue
+        found = fn()
+        if found:
+            out[fn.check_name] = found
+    return out
+
+
 def verify_breaks(verbose: bool = False) -> int:
     """Prove every check can still fail.
 
@@ -1437,10 +1721,12 @@ def verify_breaks(verbose: bool = False) -> int:
     print(f"clean run: {len(CHECKS)} check(s) passed, 0 failures")
 
     toothless = []
+    misdirected = []
     for name in sorted(BREAKS):
+        target = BREAK_TARGETS[name]
         _ACTIVE_BREAK = name
         try:
-            found = collect()
+            by_check = collect_by_check()
         except AssertionError as exc:
             # A mutation whose anchor vanished is itself a drift report.
             print(f"[TOOTHLESS] {name}: mutation could not be applied: {exc}")
@@ -1448,15 +1734,25 @@ def verify_breaks(verbose: bool = False) -> int:
             continue
         finally:
             _ACTIVE_BREAK = None
-        if found:
-            first = found[0]
-            print(f"[  bites ] {name}: {len(found)} failure(s); first: {first}")
-            if verbose:
-                for line in found[1:]:
-                    print(f"            {line}")
-        else:
+
+        if not by_check:
             print(f"[TOOTHLESS] {name}: injected the defect and NOTHING failed")
             toothless.append(name)
+        elif target not in by_check:
+            # The suite went red, but not where it was supposed to. Counting
+            # this as "bites" is what let a mutation on the wrong surface look
+            # like proof that the rule was enforced.
+            print(
+                f"[MISDIRECT] {name}: {target} PASSED; only "
+                f"{', '.join(sorted(by_check))} failed"
+            )
+            misdirected.append((name, target, sorted(by_check)))
+        else:
+            hits = by_check[target]
+            print(f"[  bites ] {name} -> {target}: {hits[0]}")
+            if verbose:
+                for line in hits[1:]:
+                    print(f"            {line}")
 
     print()
     if toothless:
@@ -1466,13 +1762,26 @@ def verify_breaks(verbose: bool = False) -> int:
         )
         for name in toothless:
             print(f"  {name} — {BREAKS[name]}")
+    if misdirected:
         print(
-            "Either the defect drifted out of the text (fix the check) or the "
-            "mutation's anchor moved (fix the mutation). Do not delete the "
-            "mutation to make this pass."
+            "FAIL: these mutations made the suite red, but their OWN check "
+            "passed. The defect landed on a surface that check does not "
+            "inspect, so the failure came from somewhere else and proves "
+            "nothing about the rule:"
+        )
+        for name, target, actual in misdirected:
+            print(f"  {name}: expected {target} to fail; instead {actual} failed")
+    if toothless or misdirected:
+        print(
+            "Either the defect drifted out of the text (fix the check), the "
+            "mutation's anchor moved (fix the mutation), or the check does not "
+            "cover the surface the mutation targets (widen the check). Do not "
+            "delete the mutation to make this pass."
         )
         return 1
-    print(f"all {len(BREAKS)} mutation(s) still make at least one check fail")
+    print(
+        f"all {len(BREAKS)} mutation(s) still make their OWN named check fail"
+    )
     return 0
 
 
