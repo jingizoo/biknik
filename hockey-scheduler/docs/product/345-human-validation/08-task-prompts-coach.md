@@ -157,24 +157,21 @@ Protocol §5 requires it once per task, immediately after that task:
 
 > | Ease rating | See the 1–5 scale in §6 — collected once per task, immediately after that task, before moving to the next. |
 
-The protocol supplies the scale and its anchors but no wording for asking. Use
-the two lines below every time, in all three sessions, so the most-repeated
-utterance in the whole pack is not improvised nine different ways — an
-off-the-cuff rating question is where leading creeps in ("that seemed easy
-enough, right?"). **These two lines are this pack's wording, not protocol text**;
-see [README, "Open questions for the owner"](README.md#open-questions-for-the-owner),
-item 4.
+The protocol supplies the scale and its anchors but no wording for asking, and
+this pack does not print one here. **The wording lives in exactly one place:
+[12-ease-rating-question.md](12-ease-rating-question.md).** Three copies of the
+most-repeated utterance in the pack become three different questions, and the
+question is asked nine times across the three sessions — its consistency is what
+makes the three sets comparable at all.
 
-```text
-On a scale of one to five, where one is very difficult and five is very easy,
-how easy was that?
-```
-
-Then, once they have given a number:
-
-```text
-Which of these descriptions fits the number you gave?
-```
+**The wording is not yet ruled, and that is a hard pre-flight gate.** No session
+starts until the owner has filled in the ruling block in
+[12-ease-rating-question.md](12-ease-rating-question.md). The environment sheet's
+pre-flight checklist carries the line, and
+`python3 check_pack.py --session-readiness` exits non-zero until it is filled.
+Do not improvise a wording to get started; a rating collected under a different
+question is not the same measurement, and settling it after session one
+invalidates the whole set.
 
 Read the five anchors as they are — protocol §6's own scale, verbatim:
 

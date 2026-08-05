@@ -103,13 +103,18 @@ Print or fill exactly the ones a given session needs.
 | [09-capture-sheet-league-admin.md](09-capture-sheet-league-admin.md) | Completion, timing, interventions, ease, verbatim quotes — shaped to the §6 template | League Admin session |
 | [10-capture-sheet-arena-manager.md](10-capture-sheet-arena-manager.md) | Same, plus §3's authorization/terminology categories | Arena Manager session |
 | [11-capture-sheet-coach.md](11-capture-sheet-coach.md) | Same, plus §4's navigation-ambiguity category | Coach session |
+| [12-ease-rating-question.md](12-ease-rating-question.md) | The one canonical home of the ease-rating wording, with the owner ruling block that gates every session | All three moderated sessions |
+| [check_pack.py](check_pack.py) | Executable regression coverage for this pack, and the `--session-readiness` pre-flight gate | Before a session; on every CI run |
 
 ## Running order
 
+0. Run `python3 check_pack.py --session-readiness`. It exits non-zero while the
+   ease-rating wording is unruled, which is the one thing in this pack that
+   blocks a session outright. See item 4 under "Open questions for the owner".
 1. Bring up the environment for the role and complete its pre-flight checklist.
-   Every line has a pass/fail box. Protocol §7: "Do not proceed on a partial
-   checklist — an incomplete readiness check invalidates the session's
-   evidentiary value for #345's merge gate."
+   Every line has a pass/fail box, and the last line is the ease-rating gate.
+   Protocol §7: "Do not proceed on a partial checklist — an incomplete readiness
+   check invalidates the session's evidentiary value for #345's merge gate."
 2. Read the prompts from the role's task sheet, exactly as printed under **Read
    this** — see "What the moderator says" below. Do not show that sheet to the
    participant; it names the intended path.
@@ -141,11 +146,12 @@ cannot be compared, and comparing them is what the three-session evidence set is
 for. The capture sheets record any deviation from verbatim delivery, with the
 exact words spoken — "none" is the expected value.
 
-The one participant-facing line this pack does supply is the ease-rating
-question, because the protocol supplies the 1–5 scale and its anchors but no
-wording for asking, and something has to be said nine times across three
-sessions. It is marked as this pack's wording wherever it appears, and it is
-item 4 below.
+The one participant-facing line the protocol does not supply at all is the
+ease-rating question: it gives the 1–5 scale and its anchors but no wording for
+asking, and something has to be said nine times across three sessions. This pack
+does not supply one either — it *proposes* one, in a single file, clearly marked
+as a proposal, and the owner rules. Until they do, no session starts. That is
+item 4 below, and it is the only thing here that blocks.
 
 ## Participants are recorded by code, and nothing else
 
@@ -222,8 +228,12 @@ by a moderator mid-session. Where a ruling changes what is read aloud, it belong
 in the moderated protocol's own Conflicts log — this pack must not edit either
 protocol, and does not.
 
-**None of these blocks a session.** Running today with the protocol's wording is
-the defensible default; each ruling would only make the next run better.
+**Items 1–3 do not block a session; item 4 does.** For 1–3 the pack delivers the
+protocol's own wording and running today is the defensible default — a ruling
+would only make the next run better. Item 4 is different in kind: it is a
+participant-facing line the protocol does not supply at all, so there is nothing
+to fall back on. It is a **hard pre-flight gate**, on every environment sheet,
+and no session starts until it is filled in.
 
 1. **§2 step 1 names "Setup".** The prompt read to the League Admin is *"Looking
    at this screen, what Setup work do you think should happen next?"* — and Setup
@@ -250,9 +260,24 @@ the defensible default; each ruling would only make the next run better.
    score the path actually taken. Rule whether it should instead be stated as a
    ground rule before the first task — that would need wording no protocol
    supplies, and the pack will not invent participant-facing text.
-4. **The ease-rating question is this pack's wording.** Ratify it, or replace it,
-   before the first session; whatever it ends up being must be identical in all
-   three sessions.
+4. **The ease-rating wording is unruled — and this one blocks.** The protocol
+   supplies the 1–5 scale and its anchors but no wording for asking, and the
+   question is asked **nine times** across the three sessions. Its consistency is
+   the only thing that makes the three sets comparable, so a wording settled
+   after session one invalidates the set — session one asked a different
+   question and there is no way to recover it short of re-running it.
+
+   The pack does not default one on the owner's behalf. Doing that would be the
+   same class of defect as item 2's: the instrumentation quietly deciding
+   something a person was supposed to decide, in a way nothing downstream could
+   see. So the wording lives unruled in exactly one place —
+   [12-ease-rating-question.md](12-ease-rating-question.md), which carries the
+   pack's *proposal* clearly marked as a proposal — and all three role sheets
+   resolve to it rather than printing their own copy.
+
+   **No session starts until the ruling block in that file is filled in.** It is
+   the last line of every environment sheet's pre-flight checklist, and
+   `python3 check_pack.py --session-readiness` exits non-zero until it is ruled.
 
 ## Decide once, before the first session — and then do not change it
 

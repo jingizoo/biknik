@@ -246,6 +246,7 @@ entry records for K5/S5.)
 | C11 | Any wording that differed from the observed copy quoted above, noted here: ______________________________________________ | ☐ done |
 | C12 | The participant has not seen the task script or either protocol before the session (moderated protocol §7, item 4). | ☐ PASS ☐ FAIL |
 | C13 | A plan exists for where results will be attached to #345 (moderated protocol §7, item 6). | ☐ PASS ☐ FAIL |
+| C14 | **HARD GATE — the ease-rating wording is ruled and recorded.** [12-ease-rating-question.md](12-ease-rating-question.md) carries an owner ruling with the exact wording, and that is the wording this session will use. The ease question is asked nine times across the three sessions and its consistency is the only thing that makes them comparable, so a wording settled after session one invalidates the set. **No session starts until this line is PASS.** Confirm with `python3 check_pack.py --session-readiness`. | ☐ PASS ☐ FAIL |
 
 Moderated protocol §7 is explicit about what a partial checklist means:
 

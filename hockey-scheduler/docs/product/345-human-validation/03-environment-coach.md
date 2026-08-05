@@ -198,6 +198,7 @@ state is the one described, the check passes — note the difference in C12.
 | C12 | For a keyboard or screen-reader pass only: assistive-technology setup confirmed working before the session (moderated protocol §7, item 5). Screen reader + version: ____________ Any wording that differed from the copy quoted above: ____________________ | ☐ PASS ☐ FAIL / ☐ N/A |
 | C13 | The participant has not seen the task script or either protocol before the session (moderated protocol §7, item 4). | ☐ PASS ☐ FAIL |
 | C14 | A plan exists for where results will be attached to #345 (moderated protocol §7, item 6). | ☐ PASS ☐ FAIL |
+| C15 | **HARD GATE — the ease-rating wording is ruled and recorded.** [12-ease-rating-question.md](12-ease-rating-question.md) carries an owner ruling with the exact wording, and that is the wording this session will use. The ease question is asked nine times across the three sessions and its consistency is the only thing that makes them comparable, so a wording settled after session one invalidates the set. **No session starts until this line is PASS.** Confirm with `python3 check_pack.py --session-readiness`. | ☐ PASS ☐ FAIL |
 
 Moderated protocol §7:
 

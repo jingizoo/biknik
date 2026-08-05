@@ -87,7 +87,7 @@ PACK_FILES = (
     + ("04-keyboard-script.md", "05-screen-reader-script.md")
     + TASK_PROMPT_SHEETS
     + tuple(CAPTURE_SHEETS)
-    + ("README.md",)
+    + (EASE_CANON, "README.md")
 )
 
 # ---------------------------------------------------------------------------
@@ -203,6 +203,17 @@ def read_pack(name: str) -> str:
         )
     if name == "09-capture-sheet-league-admin.md" and broken(B_PRIMARY_RULE_MISSING):
         text = flex(RULE_NEVER_YES).sub("", text)
+
+    if name == "07-task-prompts-arena-manager.md" and broken(B_EASE_LOCAL_COPY):
+        text += (
+            "\n\n```text\nOn a scale of one to five, how easy did you find that?\n```\n"
+        )
+    if name == "08-task-prompts-coach.md" and broken(B_EASE_POINTER_MISSING):
+        text = text.replace(f"({EASE_CANON})", "(README.md)")
+    if name == "02-environment-arena-manager.md" and broken(B_GATE_ROW_MISSING):
+        text = re.sub(r"(?m)^\|[^\n]*" + re.escape(GATE_MARKER) + r"[^\n]*\n", "", text)
+    if name == "README.md" and broken(B_README_NONBLOCKING):
+        text += "\n\n**None of these blocks a session.**\n"
 
     if broken(B_RECORDINGS_PERMITTED):
         text = flex(RULE_NO_RECORDINGS).sub(
@@ -828,6 +839,303 @@ def check_primary_action_text() -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Blocker 3 — the ease-rating wording is a hard pre-flight gate.
+#
+# The README used to say none of the four owner questions blocks a session,
+# while item 4 said the ease-rating wording must be ratified or replaced before
+# the first session. A facilitator could follow the first and start, and the
+# second then said that session should not have started.
+#
+# The ease question is asked NINE times across the three sessions, and its
+# consistency is the thing that makes the three sets comparable. Ruling on it
+# after session one invalidates the set. The owner has ratified no wording, and
+# defaulting one on their behalf would be the same class of defect as blocker 2
+# — the pack quietly deciding something the protocol left to a person. So the
+# ruling is a gate, not a default, and it has exactly one home.
+# ---------------------------------------------------------------------------
+
+B_EASE_LOCAL_COPY = register_break(
+    "ease-local-copy",
+    "give the Arena Manager prompt sheet its own copy of the ease wording again",
+)
+B_EASE_POINTER_MISSING = register_break(
+    "ease-pointer-missing",
+    "drop the Coach prompt sheet's reference to the canonical ease wording",
+)
+B_EASE_READINESS_BLIND = register_break(
+    "ease-readiness-blind",
+    "make the readiness check ignore an unruled (blank) ease wording",
+)
+B_EASE_DIVERGENCE_BLIND = register_break(
+    "ease-divergence-blind",
+    "make the readiness check ignore role sheets resolving to different wording",
+)
+B_GATE_ROW_MISSING = register_break(
+    "gate-row-missing",
+    "remove the hard pre-flight gate row from the Arena Manager environment sheet",
+)
+B_README_NONBLOCKING = register_break(
+    "readme-nonblocking-claim",
+    "put the README's 'none of these blocks a session' claim back",
+)
+
+UNRULED_SENTINEL = "NOT YET RULED"
+RULING_START = "<!-- ease-ruling:start -->"
+RULING_END = "<!-- ease-ruling:end -->"
+EASE_HEADING = "## Immediately after each task — the ease rating"
+
+GATE_MARKER = "HARD GATE — the ease-rating wording is ruled and recorded."
+GATE_BLOCKS = "No session starts until this line is PASS."
+
+B_EASE_NOSOURCE_BLIND = register_break(
+    "ease-nosource-blind",
+    "make the readiness check ignore a role sheet that names no ease wording at all",
+)
+
+FENCE_RE = re.compile(r"```text\n(.*?)\n```", re.DOTALL)
+
+
+class _NoSource:
+    """A role sheet that neither names the canonical file nor carries text.
+
+    Distinct from None, which means "points at the canonical ruling, and the
+    ruling is blank". Collapsing the two would make each guard's fixture trip
+    the other guard, so blinding one guard would change nothing and its break
+    would silently stop biting.
+    """
+
+    def __repr__(self) -> str:  # pragma: no cover - display only
+        return "<names no ease wording>"
+
+
+NO_SOURCE = _NoSource()
+
+
+def extract_ruling(text: str) -> str | None:
+    """The owner-ratified wording, or None while it is unruled."""
+    if RULING_START not in text or RULING_END not in text:
+        return None
+    block = text.split(RULING_START, 1)[1].split(RULING_END, 1)[0]
+    if UNRULED_SENTINEL in block:
+        return None
+    quoted = [b.strip() for b in FENCE_RE.findall(block)]
+    quoted = [q for q in quoted if q]
+    if not quoted:
+        return None
+    return "\n---\n".join(quoted)
+
+
+def ease_section(text: str) -> str:
+    if EASE_HEADING not in text:
+        return ""
+    return text.split(EASE_HEADING, 1)[1]
+
+
+def resolve_ease_wording() -> tuple[str | None, dict[str, str | None]]:
+    """What each role sheet actually resolves the ease wording to.
+
+    A sheet that prints its own copy resolves to that copy — which is how three
+    sessions end up asking three different questions. A sheet that names the
+    canonical file resolves to the canonical ruling. A sheet that does neither
+    resolves to nothing.
+    """
+    try:
+        canonical = extract_ruling(read_pack(EASE_CANON))
+    except FileNotFoundError:
+        canonical = None
+
+    per_role: dict[str, str | None] = {}
+    for sheet in TASK_PROMPT_SHEETS:
+        section = ease_section(read_pack(sheet))
+        local = [b.strip() for b in FENCE_RE.findall(section) if b.strip()]
+        if local:
+            per_role[sheet] = "\n---\n".join(local)
+        elif re.search(r"\(" + re.escape(EASE_CANON) + r"\)", section):
+            per_role[sheet] = canonical
+        else:
+            per_role[sheet] = NO_SOURCE
+    return canonical, per_role
+
+
+def ease_readiness(
+    canonical: str | None, per_role: dict[str, str | None]
+) -> tuple[bool, list[str]]:
+    """The session-readiness check for the ease wording.
+
+    Fails when the ruling is blank, or when any role sheet resolves to
+    different wording. Passes only when all three use the same recorded text.
+    """
+    reasons: list[str] = []
+
+    if canonical is None and not broken(B_EASE_READINESS_BLIND):
+        reasons.append(
+            "the ease-rating wording has not been ruled — "
+            f"{EASE_CANON} carries no owner-ratified text"
+        )
+
+    if not broken(B_EASE_NOSOURCE_BLIND):
+        for sheet, resolved in sorted(per_role.items()):
+            if resolved is NO_SOURCE:
+                reasons.append(
+                    f"{sheet} names no ease wording at all — it neither "
+                    f"references {EASE_CANON} nor carries ruled text"
+                )
+
+    resolved_values = {
+        v for v in per_role.values() if isinstance(v, str)
+    }
+    if len(resolved_values) > 1 and not broken(B_EASE_DIVERGENCE_BLIND):
+        reasons.append(
+            "the role sheets resolve to different ease wording, so the three "
+            "sessions would not be comparable: "
+            + "; ".join(
+                f"{s} -> {v!r}"
+                for s, v in sorted(per_role.items())
+                if isinstance(v, str)
+            )
+        )
+
+    return (not reasons), reasons
+
+
+# Each fixture isolates ONE guard, so blinding that guard changes this
+# fixture's verdict and nothing else. A fixture that trips two guards would
+# stay red when one is blinded, and that guard's break would report green
+# while testing nothing.
+EASE_READINESS_FIXTURES = (
+    (
+        "ruling blank, all three sheets point at the canonical file",
+        None,
+        {s: None for s in TASK_PROMPT_SHEETS},
+        False,
+    ),
+    (
+        "one role sheet resolves to different wording",
+        "How easy was that, one to five?",
+        {
+            TASK_PROMPT_SHEETS[0]: "How easy was that, one to five?",
+            TASK_PROMPT_SHEETS[1]: "How easy was that, one to five?",
+            TASK_PROMPT_SHEETS[2]: "That seemed easy enough, right?",
+        },
+        False,
+    ),
+    (
+        "a role sheet names no ease wording at all",
+        "How easy was that, one to five?",
+        {
+            TASK_PROMPT_SHEETS[0]: "How easy was that, one to five?",
+            TASK_PROMPT_SHEETS[1]: NO_SOURCE,
+            TASK_PROMPT_SHEETS[2]: "How easy was that, one to five?",
+        },
+        False,
+    ),
+    (
+        "ruled, and all three resolve to the same recorded text",
+        "How easy was that, one to five?",
+        {s: "How easy was that, one to five?" for s in TASK_PROMPT_SHEETS},
+        True,
+    ),
+)
+
+
+@check("ease-readiness")
+def check_ease_readiness() -> list[str]:
+    """Blocker 3's executable regression: the readiness check itself."""
+    failures = []
+    for label, canonical, per_role, expected_ready in EASE_READINESS_FIXTURES:
+        ready, reasons = ease_readiness(canonical, per_role)
+        if ready != expected_ready:
+            failures.append(
+                f"readiness fixture {label!r}: got ready={ready}, expected "
+                f"ready={expected_ready} (reasons: {reasons or 'none'})"
+            )
+        if not expected_ready and not reasons:
+            failures.append(
+                f"readiness fixture {label!r}: refused the session without saying "
+                f"why — a gate with no reason cannot be cleared"
+            )
+    return failures
+
+
+@check("ease-single-source")
+def check_ease_single_source() -> list[str]:
+    """The ruled wording has exactly one home, and all three sheets use it."""
+    failures = []
+
+    if not (PACK_DIR / EASE_CANON).exists():
+        return [
+            f"{EASE_CANON} does not exist — there is no single canonical location "
+            f"for the ease-rating wording, so the three role sheets can drift"
+        ]
+
+    canon_text = read_pack(EASE_CANON)
+    if RULING_START not in canon_text or RULING_END not in canon_text:
+        failures.append(
+            f"{EASE_CANON}: no machine-readable ruling block "
+            f"({RULING_START} ... {RULING_END}), so nothing can tell whether the "
+            f"owner has ruled"
+        )
+
+    for sheet in TASK_PROMPT_SHEETS:
+        section = ease_section(read_pack(sheet))
+        if not section:
+            failures.append(f"{sheet}: no ease-rating section found")
+            continue
+        local = [b.strip() for b in FENCE_RE.findall(section) if b.strip()]
+        if local:
+            failures.append(
+                f"{sheet}: prints its own copy of the ease wording. Three copies "
+                f"drift into three different questions, and the ease question is "
+                f"asked nine times — its consistency is what makes the three "
+                f"sessions comparable. Reference {EASE_CANON} instead."
+            )
+        if not re.search(r"\(" + re.escape(EASE_CANON) + r"\)", section):
+            failures.append(
+                f"{sheet}: its ease-rating section does not reference "
+                f"{EASE_CANON}, so it resolves to no ruled wording"
+            )
+    return failures
+
+
+@check("ease-preflight-gate")
+def check_ease_preflight_gate() -> list[str]:
+    """Every environment sheet must block the session on the unruled wording,
+    and the README must not say otherwise."""
+    failures = []
+    for sheet in ENVIRONMENT_SHEETS:
+        text = read_pack(sheet)
+        if GATE_MARKER not in text:
+            failures.append(
+                f"{sheet}: pre-flight checklist has no hard gate on the "
+                f"ease-rating ruling"
+            )
+        if GATE_BLOCKS not in text:
+            failures.append(
+                f"{sheet}: the ease-rating gate does not say it blocks the "
+                f"session, so a facilitator can note it and carry on"
+            )
+        if not re.search(r"\(" + re.escape(EASE_CANON) + r"\)", text):
+            failures.append(
+                f"{sheet}: the ease-rating gate does not point at {EASE_CANON}"
+            )
+
+    readme = read_pack("README.md")
+    contradictions = (
+        "None of these blocks a session.",
+        "none of these blocks a session",
+    )
+    for phrase in contradictions:
+        if flex(phrase).search(readme):
+            failures.append(
+                f"README.md: still claims {phrase!r} while the ease-rating ruling "
+                f"is a hard pre-flight gate — a facilitator can follow one "
+                f"sentence and start a session the other says should not have "
+                f"started"
+            )
+    return failures
+
+
+# ---------------------------------------------------------------------------
 # Safeguard S1 — the source pin
 # ---------------------------------------------------------------------------
 
@@ -880,6 +1188,9 @@ def check_pin_present() -> list[str]:
     """
     failures = []
     for filename in PACK_FILES:
+        if not (PACK_DIR / filename).exists():
+            failures.append(f"{filename}: expected pack file is missing")
+            continue
         text = read_pack(filename)
         cites = [p for p in PROTOCOL_BLOBS if p in text]
         if not cites:
@@ -909,6 +1220,30 @@ def check_pin_present() -> list[str]:
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
+
+
+def session_readiness() -> int:
+    """What a facilitator runs before inviting a participant.
+
+    This is NOT the same question as `check_pack.py` with no arguments. That
+    asks whether the pack is built correctly. This asks whether a session may
+    start today, and it exits non-zero while the ease-rating wording is
+    unruled — which is the hard gate, working as intended, not a defect.
+    """
+    canonical, per_role = resolve_ease_wording()
+    ready, reasons = ease_readiness(canonical, per_role)
+    if ready:
+        print("READY — the ease-rating wording is ruled and identical everywhere:")
+        print(f"  {canonical!r}")
+        return 0
+    print("NOT READY — a session must not start. Reasons:")
+    for reason in reasons:
+        print(f"  - {reason}")
+    print(
+        f"\nFill the ruling block in {EASE_CANON} with the owner's exact wording, "
+        f"then re-run this."
+    )
+    return 1
 
 
 def collect(selected: str | None = None) -> list[str]:
@@ -1013,6 +1348,11 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="run clean, then run every mutation and require each one to fail",
     )
+    parser.add_argument(
+        "--session-readiness",
+        action="store_true",
+        help="pre-flight gate: may a session start today? (non-zero while unruled)",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args(argv)
 
@@ -1023,6 +1363,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.verify_breaks:
         return verify_breaks(args.verbose)
+
+    if args.session_readiness:
+        return session_readiness()
 
     if args.break_name:
         if args.break_name not in BREAKS:
