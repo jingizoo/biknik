@@ -450,9 +450,17 @@ class SchedulerContract:
         SINGLE registered team (#375 review).
 
         The lone team has nobody to play. `_require_feasible_games_per_team`
-        skips it — the parity argument is vacuous with no opponent — and
-        `require_completable_games_per_team` refuses it, with its own
-        diagnosis rather than the general residual one.
+        skips it — the parity argument is vacuous with no opponent, and "ask
+        for G-1 or G+1" is useless advice when no G is achievable at all —
+        and `require_completable_games_per_team` refuses it, under
+        `games_per_team_residual_infeasible`, with its own diagnosis rather
+        than the general residual one: that team has no opponent, register
+        another one.
+
+        So the lone Division DOES refuse a League-wide guaranteed-games
+        draft, including Divisions that would have scheduled perfectly. The
+        tests below pin exactly that, and pin that the LEGACY meetings format
+        is not refused.
         """
         self._base()
         self.store.add_league(League(id="lg1", program_id="prog1", name="League"))

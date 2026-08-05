@@ -440,6 +440,24 @@ async function checkViewport(browser, viewport) {
       };
     }, MAX_GAMES_PER_TEAM);
     if (range.missing) fail("the Scheduler panel has no #sched-games control");
+    // THE BOUND FIRST, and naming the file that has to change. `app.js`
+    // cannot import a Python constant, so `SCHED_MAX_GAMES_PER_TEAM` mirrors
+    // MAX_GAMES_PER_TEAM — this is the ONLY duplicate of that number left,
+    // and it is the one a ceiling change has to be made in. Checked before
+    // the per-value sweep below because otherwise a raised ceiling reports
+    // "cannot express 1 of the 121 values", which is true but points at the
+    // symptom instead of the file.
+    if (range.max !== String(MAX_GAMES_PER_TEAM) || range.min !== "1"
+        || range.step !== "1") {
+      fail(`#sched-games is bounded ${range.min}..${range.max} step `
+        + `${range.step}, but the backend accepts integers `
+        + `1..${MAX_GAMES_PER_TEAM}. MAX_GAMES_PER_TEAM in `
+        + `backend/hockey_scheduler/services/scheduler.py and its client `
+        + `mirror SCHED_MAX_GAMES_PER_TEAM in `
+        + `backend/hockey_scheduler/web/static/app.js have drifted — update `
+        + `the app.js mirror (this journey reads the backend constant and `
+        + `never restates it, so there is nothing to change here)`);
+    }
     if (range.unreachable.length) {
       fail(`#sched-games cannot express ${range.unreachable.length} of the `
         + `${MAX_GAMES_PER_TEAM} values the backend accepts, including `
@@ -457,13 +475,6 @@ async function checkViewport(browser, viewport) {
     if (range.acceptedOutOfRange.length) {
       fail(`#sched-games accepts ${JSON.stringify(range.acceptedOutOfRange)}, `
         + "which the backend refuses — its bounds are not real");
-    }
-    // The rendered bound must equal the backend's own constant, so the
-    // client-side mirror of MAX_GAMES_PER_TEAM cannot drift silently.
-    if (range.max !== String(MAX_GAMES_PER_TEAM) || range.min !== "1"
-        || range.step !== "1") {
-      fail(`#sched-games is bounded ${range.min}..${range.max} step `
-        + `${range.step}; the backend accepts integers 1..${MAX_GAMES_PER_TEAM}`);
     }
     // The legacy format stays a DISTINCT choice — "play everyone once" is
     // (T-1) games, which differs per Division, so no fixed number expresses

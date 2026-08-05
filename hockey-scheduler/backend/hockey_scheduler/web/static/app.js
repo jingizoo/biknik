@@ -11470,11 +11470,17 @@ async function render() {
   const schedDiv = c.querySelector("#sched-div");
   if (schedDiv) schedDiv.onchange = () => { schedulerState.division = schedDiv.value; };
   // #375 — the configurable format. Recorded exactly like the Division
-  // select above (no re-render): the value is read fresh by BOTH the
-  // Generate and Commit handlers below, and the backend binds it into
-  // draft_fingerprint, so changing it after a Generate makes Commit fail
-  // preview_stale — already handled by the error branch, which clears the
-  // stale preview and returns focus to Generate.
+  // select above (no re-render).
+  //
+  // ONLY GENERATE reads these controls. Commit deliberately does NOT: it
+  // reads the format off the PREVIEW the operator reviewed (see
+  // `schedCommit.onclick` below), because the controls are the input to the
+  // NEXT Generate, and an operator who nudges one while reading a still-valid
+  // proposal must not thereby redefine the batch they are about to commit.
+  // The backend binds the format into draft_fingerprint, so a Commit that did
+  // send a nudged value would regenerate a different schedule and be refused
+  // as preview_stale — handled by the error branch, which clears the stale
+  // preview and returns focus to Generate.
   const schedFormat = c.querySelector("#sched-format");
   const schedGames = c.querySelector("#sched-games");
   // Read BOTH controls into the single state field. `null` means the legacy
