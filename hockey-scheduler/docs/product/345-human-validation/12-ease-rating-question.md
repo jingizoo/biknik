@@ -59,7 +59,7 @@ loud, verbatim, in all three sessions.
 | --- | --- |
 | Ruled by (repository owner) | Repository owner (`jingizoo`) |
 | Date ruled | 2026-08-05 |
-| Where the ruling was recorded (issue comment, PR review, etc.) | This PR — the owner ratified the pack's proposed wording as-is, unchanged. See the PR body for the instruction as given. |
+| Where the ruling was recorded (issue comment, PR review, etc.) | [PR #396](https://github.com/jingizoo/biknik/pull/396) — the owner ratified the pack's proposed wording as-is, unchanged. See the PR body for the instruction as given. |
 
 <!-- ease-ruling:start -->
 
