@@ -57,22 +57,23 @@ loud, verbatim, in all three sessions.
 
 | Field | Value |
 | --- | --- |
-| Ruled by (repository owner) | |
-| Date ruled | |
-| Where the ruling was recorded (issue comment, PR review, etc.) | |
+| Ruled by (repository owner) | Repository owner (`jingizoo`) |
+| Date ruled | 2026-08-05 |
+| Where the ruling was recorded (issue comment, PR review, etc.) | This PR — the owner ratified the pack's proposed wording as-is, unchanged. See the PR body for the instruction as given. |
 
 <!-- ease-ruling:start -->
 
 **Ratified wording — first line**, asked immediately after each task:
 
 ```text
-NOT YET RULED — no wording is ratified, and no session may start.
+On a scale of one to five, where one is very difficult and five is very easy,
+how easy was that?
 ```
 
 **Ratified wording — second line**, asked once they have given a number:
 
 ```text
-NOT YET RULED — no wording is ratified, and no session may start.
+Which of these descriptions fits the number you gave?
 ```
 
 <!-- ease-ruling:end -->
