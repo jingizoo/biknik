@@ -335,7 +335,7 @@ What it covers, and why each one is executable rather than a paragraph:
 | `ease-readiness`, `ease-single-source`, `ease-preflight-gate` | a session starting on an unruled ease wording, three role sheets drifting to three different questions, or the README going back to saying nothing blocks |
 | `recording-consistency` | any pack-authored instruction, in any file, drifting back to permitting recording — or an operational file simply going quiet about it |
 | `blockquote-is-protocol-text` | pack-authored text smuggled behind a `>`, which would give it protocol authority and hide it from every check that separates the two |
-| `mutation-guard` | a document-reader mutation writing the buffer — by assignment, `+=`, or a rebuilt return — without `mut()` proving the edit landed, plus any replacement call outside `mut()` in any mutation body. An unguarded edit silently stops injecting anything the moment its anchor moves, and the mutation goes on reporting success |
+| `mutation-guard` | a mutation writing one of its function's **declared** document buffers (`MUTATION_BUFFERS`) — by assignment, `+=`, or a rebuilt return — without `mut()` proving the edit landed, plus any replacement call outside `mut()` in any mutation body. An unguarded edit silently stops injecting anything the moment its anchor moves, and the mutation goes on reporting success |
 | `protocol-pin`, `pin-present` | either protocol changing by one byte while this pack goes on quoting the old text |
 | `ksr-steps-verbatim` | any of the 17 K steps or 14 S steps drifting from the protocol's own wording |
 

@@ -1772,21 +1772,44 @@ B_RESUB_IN_MUTATION = register_break(
     "reintroduce an unguarded re.sub() rewrite inside a mutation body",
     "mutation-guard",
 )
+B_NESTED_BUFFER_EDIT = register_break(
+    "nested-buffer-edit-in-mutation",
+    "reintroduce an unguarded buffer write nested inside a mutation body, "
+    "alongside a nested scratch variable",
+    "mutation-guard",
+)
 
 # Calls that are themselves guarded, so a mutation body may use them directly.
 GUARDED_EDIT_CALLS = {"mut", "_inject_row"}
-# Functions that load a document and apply text mutations to it. Rule B (below)
-# applies inside these, because they are the ones with a document buffer to
-# write. Behavioural breaks elsewhere — the rubric's scoring, the readiness
-# guards, the export allowlist — change computed values rather than editing a
-# document, so mut() does not apply to them and Rule B would only produce false
-# positives. Adding a new reader means adding it here.
-DOCUMENT_READERS = {
-    "read_pack",
-    "read_protocol",
-    "read_ci_workflow",
-    "read_own_source",
-    "pack_steps",
+
+# The document buffer each mutating function edits, declared explicitly.
+#
+# This used to be INFERRED — parameters, plus every name assigned outside an
+# `if broken(...)` block — and the inference is what kept producing edge cases.
+# It only skipped mutation bodies at the function's top level, so a scratch
+# variable assigned inside a NESTED mutation body counted as "outside" and was
+# promoted to a buffer; writing it without mut() was then reported as an
+# unguarded edit. Comprehension targets and tuple unpacking had the same shape.
+#
+# An explicit map is checkable by reading it. An inference is not: you have to
+# simulate it to know what it claims. So a name in this map must always be
+# written through mut(); a name not in it is not a buffer and is never flagged,
+# whatever it is called and wherever it is assigned.
+#
+# Behavioural breaks elsewhere — the rubric's scoring, the readiness guards,
+# the export allowlist — change computed values rather than editing a document,
+# so they have no entry here and Rule B does not apply to them.
+#
+# Adding a mutating reader means adding its entry. Do NOT add a name here to
+# silence a failure: a mutation editing an undeclared name is a finding about
+# the mutation, not a gap in the map.
+MUTATION_BUFFERS: dict[str, set[str]] = {
+    "read_pack": {"text"},
+    "read_protocol": {"data"},
+    "read_ci_workflow": {"text"},
+    "read_own_source": {"text"},
+    "pack_steps": {"text"},
+    "_inject_row": {"text"},
 }
 # Helpers that exist only to perform mutation edits; their bodies are held to
 # the same rule as a mutation body, so the guard cannot be bypassed by moving
@@ -1830,6 +1853,32 @@ def read_own_source() -> str:
                 1,
             ),
             "un-guard the README non-blocking mutation into a +=",
+        )
+    if broken(B_NESTED_BUFFER_EDIT):
+        # Both halves of the nested case in one injection:
+        #   `fragment` is scratch, assigned inside a NESTED block. The old
+        #       inference promoted such names to buffers and flagged them.
+        #       With a declared map it is simply not a buffer, and must stay
+        #       unreported.
+        #   `text = text + fragment` is a real buffer write, nested one level
+        #       deeper than the mutation body. It must still be caught.
+        # So a correct run reports exactly one failure, naming the text write.
+        text = mut(
+            B_NESTED_BUFFER_EDIT,
+            text,
+            text.replace(
+                "        text = mut(\n"
+                "            B_README_NONBLOCKING,\n"
+                "            text,\n"
+                '            text + "\\n\\n**None of these blocks a session.**\\n",\n'
+                '            "append the non-blocking claim",\n'
+                "        )",
+                "        if True:\n"
+                '            fragment = "\\n\\n**None of these blocks a session.**\\n"\n'
+                "            text = text + fragment",
+                1,
+            ),
+            "nest an unguarded buffer write beside a scratch variable",
         )
     if broken(B_RESUB_IN_MUTATION):
         # A different replacement API, called as a module function rather than
@@ -1887,37 +1936,6 @@ def _is_guarded(value: ast.expr | None) -> bool:
     )
 
 
-def _assigned_names(stmts: list[ast.stmt]) -> set[str]:
-    names: set[str] = set()
-    for stmt in stmts:
-        for node in ast.walk(stmt):
-            if isinstance(node, ast.Assign):
-                for tgt in node.targets:
-                    if isinstance(tgt, ast.Name):
-                        names.add(tgt.id)
-            elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
-                names.add(node.target.id)
-    return names
-
-
-def _buffer_names(fn: ast.FunctionDef) -> set[str]:
-    """The document buffer(s) a reader function mutates.
-
-    A buffer is a name that exists before any mutation body runs: a parameter,
-    or something the function assigned outside its `if broken(...)` blocks.
-    Names created *inside* a mutation body are local scratch (the drift
-    mutation's `target, old_word, new_word`, for instance) and are not edits to
-    the document.
-    """
-    names = {a.arg for a in fn.args.args}
-    outside: list[ast.stmt] = []
-    for stmt in fn.body:
-        if isinstance(stmt, ast.If) and _calls_broken_unnegated(stmt.test):
-            continue
-        outside.append(stmt)
-    return names | _assigned_names(outside)
-
-
 def _unguarded_edits(
     body: list[ast.stmt], where: str, buffers: set[str] | None
 ) -> list[str]:
@@ -1927,7 +1945,8 @@ def _unguarded_edits(
 
     Rule A (everywhere): a replacement call outside mut().
 
-    Rule B (document readers only): ANY write to the document buffer whose
+    Rule B (functions with a MUTATION_BUFFERS entry): ANY write to a declared
+    document buffer whose
     outermost call is not mut(), whatever the right-hand side does. This is the
     rule the check's name implies. An earlier version only implemented Rule A,
     so it asked "is this a replacement?" instead of "is this an edit?", and
@@ -2000,10 +2019,11 @@ def check_mutation_guard() -> list[str]:
 
     (A) In any mutation body, a string-replacement call must go through mut().
 
-    (B) In a DOCUMENT_READERS function or a mutation helper, ANY write to the
-        document buffer — assignment, `+=`, or a return of a rebuilt value —
-        must have mut() as its outermost call, whatever the right-hand side
-        does.
+    (B) In a function with a MUTATION_BUFFERS entry, ANY write to one of that
+        function's DECLARED buffer names — assignment, `+=`, or a return of a
+        rebuilt value — must have mut() as its outermost call, whatever the
+        right-hand side does. Buffers are declared, never inferred: a name
+        outside the map is never treated as a buffer.
 
     Rule B is the real rule; Rule A is a net for replacement calls in the
     behavioural mutations, which have no document buffer. Both are narrower
@@ -2025,11 +2045,7 @@ def check_mutation_guard() -> list[str]:
     for node in ast.walk(tree):
         if isinstance(node, ast.If) and _calls_broken_unnegated(node.test):
             fn = fn_of.get(id(node))
-            buffers = (
-                _buffer_names(fn)
-                if fn is not None and fn.name in DOCUMENT_READERS
-                else None
-            )
+            buffers = MUTATION_BUFFERS.get(fn.name) if fn is not None else None
             failures.extend(
                 _unguarded_edits(
                     node.body, f"mutation body at line {node.lineno}", buffers
@@ -2038,7 +2054,9 @@ def check_mutation_guard() -> list[str]:
         if isinstance(node, ast.FunctionDef) and node.name in MUTATION_HELPERS:
             failures.extend(
                 _unguarded_edits(
-                    node.body, f"mutation helper {node.name}()", _buffer_names(node)
+                    node.body,
+                    f"mutation helper {node.name}()",
+                    MUTATION_BUFFERS.get(node.name),
                 )
             )
 
