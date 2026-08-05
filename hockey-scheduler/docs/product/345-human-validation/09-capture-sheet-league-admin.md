@@ -286,22 +286,46 @@ which task, before or after which action, and what was on screen.
 ## Stated expectation vs. actual effect (step 3)
 
 Step 3 asks about the primary button. If the participant answers about some other
-control, that is a result, not a spoiled task — record it here and score the match
-against the control they actually named. Do not redirect them mid-task
+control, that is a result, not a spoiled task — record it. But record it as
+**diagnostic detail**, in the first table below, kept apart from the §2
+measurement in the second. Do not redirect them mid-task
 ([06-task-prompts-league-admin.md](06-task-prompts-league-admin.md), Task 3).
+
+**If the control they described was not the screen's primary action, the
+canonical §2 result is Fail/No or Not evaluated — never Yes.** A correct
+prediction about a secondary control is not a primary-action match; it is
+evidence that the screen failed to make its primary action identifiable, which
+is the failure #345's "one primary action per screen" requirement exists to
+prevent. Recording it as a match would transcribe the defect under test into §6
+as positive evidence. **Only an expectation about the actual primary action may
+be compared for the §2 yes/no result.**
+
+**Diagnostic detail — always recorded, never the §2 answer**
 
 | Field | Value |
 | --- | --- |
 | Which control they took to be the one on offer, named exactly | |
 | Was that the screen's primary action? (yes/no) | |
 | Their exact words for what they expected | |
-| What the action actually did | |
-| Matched? (yes/no — judged against the control they named above) | |
+| What that control actually did when they used it | |
+| Did their prediction match *that* control? (yes/no — diagnostic only) | |
 | Their exact words reacting to the actual result (if different) | |
 
-A "no" in the second row belongs in the follow-up findings table as well: #345
-requires one primary action per screen, so an operator who could not tell which
-control that was is a finding about the screen.
+**The canonical §2 measurement — this is the value that transcribes**
+
+> - Whether the participant's stated expectation of the primary action
+>   matched its actual effect (yes/no), with their exact words for both the
+>   expectation and, if different, their reaction to the actual result.
+
+| Field | Value |
+| --- | --- |
+| Was the expectation they stated an expectation about the screen's **actual primary action**? (yes/no) | |
+| §2 result — expectation of the primary action matched its actual effect. `Yes` only if the row above is yes **and** the prediction was right; `No` if the row above is yes and the prediction was wrong; `Not evaluated` if the row above is no. | |
+
+A "no" in "Was that the screen's primary action?" belongs in the follow-up
+findings table as well: #345 requires one primary action per screen, so an
+operator who could not tell which control that was is a finding about the
+screen.
 
 ## What they said before touching anything (step 1)
 

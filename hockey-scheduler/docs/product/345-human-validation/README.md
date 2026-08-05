@@ -236,10 +236,13 @@ the defensible default; each ruling would only make the next run better.
 2. **§2 step 3 names "the primary button" and says "click".** The protocol's
    Authority section grounds this step in #345's "one primary action per screen",
    so the control class is the object of the measurement — but it is also the
-   vocabulary §1.7 tells the moderator not to use. Delivered verbatim, with a
-   scoring rule on the League Admin sheet for the case where the participant
-   describes some other control instead (which is itself a finding, not a spoiled
-   task).
+   vocabulary §1.7 tells the moderator not to use. Delivered verbatim. Where the
+   participant describes some other control instead, the League Admin sheet keeps
+   that as diagnostic detail and as a finding about the screen — and the
+   canonical §2 result is `Fail/No` or `Not evaluated`, never `Yes`. Only an
+   expectation about the actual primary action is compared for the §2 yes/no,
+   because a correct prediction about a secondary control is the failure under
+   test, not a match.
 3. **§3 step 1's "no search, no help text" is never spoken.** It is a constraint
    on how the find happens, but it sits outside the quoted prompt, so no
    participant is ever told it. The pack's default: do not interrupt, do not

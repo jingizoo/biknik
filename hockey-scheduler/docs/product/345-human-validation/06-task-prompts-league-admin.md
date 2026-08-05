@@ -164,10 +164,31 @@ understanding mid-task. Instead:
 - Record their exact words, and record **which control they took to be the one
   on offer**, named exactly ([09-capture-sheet-league-admin.md](09-capture-sheet-league-admin.md)
   has a row for it).
-- Let them proceed and score the match against the control they actually named,
-  flagging in the same row that it was not the screen's primary action.
+- Let them proceed, and record what that control actually did. Both of those are
+  **diagnostic detail**. Neither is the §2 measurement.
+- **If the control they described was not the screen's primary action, the
+  canonical §2 result is Fail/No or Not evaluated — never Yes.** Use `Not
+  evaluated` when they never stated an expectation about the primary action at
+  all, which is the usual shape of this case; use `Fail/No` if they did state one
+  and it turned out wrong.
 - Carry the mismatch into the follow-up findings table — an operator who cannot
   identify the primary action is a finding about the screen, not a spoiled task.
+
+**Why that distinction is the whole point of the step.** §2's "Record"
+subsection defines exactly one yes/no here, and it is about the primary action:
+
+> - Whether the participant's stated expectation of the primary action
+>   matched its actual effect (yes/no), with their exact words for both the
+>   expectation and, if different, their reaction to the actual result.
+
+A participant who misreads which control is primary and then correctly predicts
+what that *other* control does has demonstrated the exact failure the
+"one primary action per screen" requirement exists to prevent. Scoring that as a
+match writes a `yes` into the field that transcribes into §6 as the canonical
+primary-action measurement — so the product defect under test would be filed as
+valid-looking positive evidence for #345, and nothing downstream could tell.
+**Only an expectation about the actual primary action may be compared for the §2
+yes/no result.**
 
 **Do not correct them.** §1.7:
 

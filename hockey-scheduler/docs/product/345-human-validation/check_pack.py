@@ -194,6 +194,16 @@ def read_pack(name: str) -> str:
             ):
                 text = flex(marker).sub("", text)
 
+    if name == "06-task-prompts-league-admin.md" and broken(B_PRIMARY_OLD_RULE):
+        text = text.replace(
+            "- Record their exact words",
+            "- Let them proceed and score the match against the control they "
+            "actually named.\n- Record their exact words",
+            1,
+        )
+    if name == "09-capture-sheet-league-admin.md" and broken(B_PRIMARY_RULE_MISSING):
+        text = flex(RULE_NEVER_YES).sub("", text)
+
     if broken(B_RECORDINGS_PERMITTED):
         text = flex(RULE_NO_RECORDINGS).sub(
             "Recording is at the moderator's discretion.", text
@@ -579,6 +589,241 @@ def check_pii_export() -> list[str]:
             "redaction removed the on-task part of the Task 1 quote; only the "
             "unrelated disclosure should be struck"
         )
+    return failures
+
+
+# ---------------------------------------------------------------------------
+# Blocker 2 — League Admin task 3 must not record a passing match for the
+# wrong control.
+#
+# Moderated protocol §2's "Record" subsection defines exactly one yes/no here:
+#
+#   "Whether the participant's stated expectation of the primary action
+#    matched its actual effect (yes/no) ..."
+#
+# The measurement is about THE PRIMARY ACTION. If a participant misidentifies
+# which control is primary and then correctly predicts what that OTHER control
+# does, they have demonstrated the failure #345's "one primary action per
+# screen" requirement exists to prevent — and scoring that as a match writes a
+# `yes` into the field that transcribes as the canonical primary-action
+# measurement. The product failure under test becomes valid-looking positive
+# evidence.
+#
+# So: the mistaken control and its observed effect are recorded as DIAGNOSTIC
+# detail, and the canonical result is never `Yes` unless the expectation was
+# about the actual primary action.
+# ---------------------------------------------------------------------------
+
+B_RUBRIC_SCORE_NAMED = register_break(
+    "rubric-score-named-control",
+    "score the §2 match against whichever control the participant named (the original defect)",
+)
+B_RUBRIC_TRANSCRIPTION_YES = register_break(
+    "rubric-transcription-yes",
+    "let the §6 transcription turn a diagnostic match into a primary-action Yes",
+)
+
+NOT_EVALUATED = "Not evaluated"
+CANONICAL_MEASURE = (
+    "Whether the participant's stated expectation of the primary action "
+    "matched its actual effect"
+)
+
+
+def score_primary_action(obs: dict) -> dict:
+    """The §2 step-3 result, plus the diagnostic detail that explains it."""
+    matched_named = obs["prediction_matched_named_control"]
+
+    if obs["named_control_is_primary"]:
+        canonical = "Yes" if matched_named else "No"
+    elif broken(B_RUBRIC_SCORE_NAMED):
+        canonical = "Yes" if matched_named else "No"
+    else:
+        # They never stated an expectation about the primary action, so the
+        # canonical measurement has no value to report. It is emphatically not
+        # a match.
+        canonical = NOT_EVALUATED
+
+    return {
+        "canonical_result": canonical,
+        "diagnostic": {
+            "control_they_named": obs["named_control"],
+            "was_it_the_primary_action": "yes" if obs["named_control_is_primary"] else "no",
+            "screen_primary_action": obs["screen_primary_action"],
+            "their_words": obs["stated_expectation"],
+            "what_that_control_actually_did": obs["actual_effect_of_named_control"],
+            "did_their_prediction_match_that_control": "yes" if matched_named else "no",
+        },
+        "is_a_finding_about_the_screen": not obs["named_control_is_primary"],
+    }
+
+
+def transcribe_to_section6(scored: dict) -> str:
+    """Render the lines that go into the protocol's own §6 evidence template."""
+    result = scored["canonical_result"]
+    if broken(B_RUBRIC_TRANSCRIPTION_YES):
+        if scored["diagnostic"]["did_their_prediction_match_that_control"] == "yes":
+            result = "Yes"
+
+    lines = [f"{CANONICAL_MEASURE}: {result}"]
+    diag = scored["diagnostic"]
+    lines.append(
+        f"Diagnostic — control the participant described: "
+        f"{diag['control_they_named']} (screen's primary action: "
+        f"{diag['screen_primary_action']}; was it the primary action: "
+        f"{diag['was_it_the_primary_action']})"
+    )
+    lines.append(f"Diagnostic — their words: \"{diag['their_words']}\"")
+    lines.append(
+        f"Diagnostic — what that control actually did: "
+        f"{diag['what_that_control_actually_did']}"
+    )
+    if scored["is_a_finding_about_the_screen"]:
+        lines.append(
+            "Follow-up finding — the participant could not identify the screen's "
+            "primary action; #345 requires one primary action per screen."
+        )
+    return "\n".join(lines)
+
+
+# Three fixtures. (a) is the blocker: it must never produce a passing match.
+RUBRIC_FIXTURES = (
+    (
+        "a) secondary control, correct prediction about it",
+        {
+            "named_control": "Import data",
+            "named_control_is_primary": False,
+            "screen_primary_action": "Add Season",
+            "stated_expectation": "That one loads a spreadsheet of teams, I think.",
+            "actual_effect_of_named_control": "opened the Imports and onboarding workflow",
+            "prediction_matched_named_control": True,
+        },
+        NOT_EVALUATED,
+        False,
+    ),
+    (
+        "b) primary control, wrong prediction",
+        {
+            "named_control": "Add Season",
+            "named_control_is_primary": True,
+            "screen_primary_action": "Add Season",
+            "stated_expectation": "It'll take me to a list of the seasons already set up.",
+            "actual_effect_of_named_control": "opened the New season drawer",
+            "prediction_matched_named_control": False,
+        },
+        "No",
+        False,
+    ),
+    (
+        "c) primary control, correct prediction",
+        {
+            "named_control": "Add Season",
+            "named_control_is_primary": True,
+            "screen_primary_action": "Add Season",
+            "stated_expectation": "It should open a form to create a new season.",
+            "actual_effect_of_named_control": "opened the New season drawer",
+            "prediction_matched_named_control": True,
+        },
+        "Yes",
+        True,
+    ),
+)
+
+
+@check("primary-action-rubric")
+def check_primary_action_rubric() -> list[str]:
+    """Blocker 2's executable regression, including the §6 transcription."""
+    failures = []
+    for label, obs, expected, should_pass in RUBRIC_FIXTURES:
+        scored = score_primary_action(obs)
+        actual = scored["canonical_result"]
+        if actual != expected:
+            failures.append(
+                f"fixture {label}: canonical §2 result is {actual!r}, expected "
+                f"{expected!r}"
+            )
+        if actual == "Yes" and not should_pass:
+            failures.append(
+                f"fixture {label}: recorded a PASSING primary-action match for a "
+                f"control that was not the primary action — this is the defect "
+                f"under test being written up as positive evidence"
+            )
+
+        # The transcription into §6 must preserve the outcome, not launder it.
+        section6 = transcribe_to_section6(scored)
+        transcribed = None
+        for line in section6.splitlines():
+            if line.startswith(CANONICAL_MEASURE):
+                transcribed = line.split(": ", 1)[1]
+        if transcribed != expected:
+            failures.append(
+                f"fixture {label}: §6 transcription says {transcribed!r} but the "
+                f"scored result was {expected!r} — the transcription changed the "
+                f"answer"
+            )
+        if not obs["named_control_is_primary"]:
+            if obs["named_control"] not in section6:
+                failures.append(
+                    f"fixture {label}: §6 transcription dropped the diagnostic "
+                    f"detail naming the control the participant described"
+                )
+            if obs["actual_effect_of_named_control"] not in section6:
+                failures.append(
+                    f"fixture {label}: §6 transcription dropped the observed effect "
+                    f"of the control the participant described"
+                )
+    return failures
+
+
+B_PRIMARY_OLD_RULE = register_break(
+    "primary-action-old-rule",
+    "put the 'score the match against the control they actually named' instruction back",
+)
+B_PRIMARY_RULE_MISSING = register_break(
+    "primary-action-rule-missing",
+    "delete the never-Yes rule from the League Admin capture sheet",
+)
+
+RULE_PRIMARY_ONLY = (
+    "Only an expectation about the actual primary action may be compared for "
+    "the §2 yes/no result."
+)
+RULE_NEVER_YES = (
+    "If the control they described was not the screen's primary action, the "
+    "canonical §2 result is Fail/No or Not evaluated — never Yes."
+)
+
+FORBIDDEN_SCORING_PHRASES = (
+    "score the match against the control they actually named",
+    "judged against the control they named",
+    "score the match against the control they named",
+)
+
+PRIMARY_ACTION_FILES = (
+    "06-task-prompts-league-admin.md",
+    "09-capture-sheet-league-admin.md",
+)
+
+
+@check("primary-action-text")
+def check_primary_action_text() -> list[str]:
+    """The League Admin prompt sheet and capture sheet must say the same thing
+    the rubric does — the sheet is what a facilitator actually reads."""
+    failures = []
+    for filename in PRIMARY_ACTION_FILES:
+        text = read_pack(filename)
+        for phrase in FORBIDDEN_SCORING_PHRASES:
+            if flex(phrase).search(text):
+                failures.append(
+                    f"{filename}: still instructs the facilitator to {phrase!r} — "
+                    f"a correct prediction about a secondary control would be "
+                    f"transcribed as the canonical primary-action match"
+                )
+        for marker in (RULE_PRIMARY_ONLY, RULE_NEVER_YES):
+            if not flex(marker).search(text):
+                failures.append(
+                    f"{filename}: missing the rule {marker!r}"
+                )
     return failures
 
 
