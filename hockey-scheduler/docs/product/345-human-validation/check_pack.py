@@ -261,8 +261,13 @@ def read_pack(name: str) -> str:
         text = mut(B_PRIMARY_RULE_MISSING, text, flex(RULE_NEVER_YES).sub("", text))
 
     if name == "07-task-prompts-arena-manager.md" and broken(B_EASE_LOCAL_COPY):
-        text += (
-            "\n\n```text\nOn a scale of one to five, how easy did you find that?\n```\n"
+        text = mut(
+            B_EASE_LOCAL_COPY,
+            text,
+            text
+            + "\n\n```text\nOn a scale of one to five, how easy did you find "
+            "that?\n```\n",
+            "append a local copy of the ease wording",
         )
     if name == "08-task-prompts-coach.md" and broken(B_EASE_POINTER_MISSING):
         text = mut(
@@ -275,7 +280,12 @@ def read_pack(name: str) -> str:
             re.sub(r"(?m)^\|[^\n]*" + re.escape(GATE_MARKER) + r"[^\n]*\n", "", text),
         )
     if name == "README.md" and broken(B_README_NONBLOCKING):
-        text += "\n\n**None of these blocks a session.**\n"
+        text = mut(
+            B_README_NONBLOCKING,
+            text,
+            text + "\n\n**None of these blocks a session.**\n",
+            "append the non-blocking claim",
+        )
     if name == "README.md" and broken(B_README_DENIES_CI):
         text = mut(
             B_README_DENIES_CI,
@@ -293,9 +303,13 @@ def read_pack(name: str) -> str:
             "restore the CI denial",
         )
     if name == "README.md" and broken(B_BLOCKQUOTE_NOT_PROTOCOL):
-        text += (
-            "\n\n> Ask the participant to confirm the room is quiet before you\n"
-            "> begin, and note anything unusual about the setup.\n"
+        text = mut(
+            B_BLOCKQUOTE_NOT_PROTOCOL,
+            text,
+            text
+            + "\n\n> Ask the participant to confirm the room is quiet before you\n"
+            "> begin, and note anything unusual about the setup.\n",
+            "append a pack-authored blockquote",
         )
     if name == "01-environment-league-admin.md" and broken(
         B_RECORDING_RUNBOOK_PERMISSIVE
@@ -1748,9 +1762,32 @@ B_RAW_REPLACE_IN_MUTATION = register_break(
     "reintroduce an unguarded .replace() inside a mutation body",
     "mutation-guard",
 )
+B_AUGASSIGN_IN_MUTATION = register_break(
+    "augassign-edit-in-mutation",
+    "reintroduce an unguarded `text += ...` edit inside a mutation body",
+    "mutation-guard",
+)
+B_RESUB_IN_MUTATION = register_break(
+    "resub-edit-in-mutation",
+    "reintroduce an unguarded re.sub() rewrite inside a mutation body",
+    "mutation-guard",
+)
 
 # Calls that are themselves guarded, so a mutation body may use them directly.
 GUARDED_EDIT_CALLS = {"mut", "_inject_row"}
+# Functions that load a document and apply text mutations to it. Rule B (below)
+# applies inside these, because they are the ones with a document buffer to
+# write. Behavioural breaks elsewhere — the rubric's scoring, the readiness
+# guards, the export allowlist — change computed values rather than editing a
+# document, so mut() does not apply to them and Rule B would only produce false
+# positives. Adding a new reader means adding it here.
+DOCUMENT_READERS = {
+    "read_pack",
+    "read_protocol",
+    "read_ci_workflow",
+    "read_own_source",
+    "pack_steps",
+}
 # Helpers that exist only to perform mutation edits; their bodies are held to
 # the same rule as a mutation body, so the guard cannot be bypassed by moving
 # a raw replacement one function call away.
@@ -1775,6 +1812,39 @@ def read_own_source() -> str:
                 1,
             ),
             "un-guard the ease-pointer mutation",
+        )
+    if broken(B_AUGASSIGN_IN_MUTATION):
+        # A plain `+=` with a string literal: no replacement call anywhere, so
+        # the pre-inversion predicate could not see it at all.
+        text = mut(
+            B_AUGASSIGN_IN_MUTATION,
+            text,
+            text.replace(
+                "        text = mut(\n"
+                "            B_README_NONBLOCKING,\n"
+                "            text,\n"
+                '            text + "\\n\\n**None of these blocks a session.**\\n",\n'
+                '            "append the non-blocking claim",\n'
+                "        )",
+                '        text += "\\n\\n**None of these blocks a session.**\\n"',
+                1,
+            ),
+            "un-guard the README non-blocking mutation into a +=",
+        )
+    if broken(B_RESUB_IN_MUTATION):
+        # A different replacement API, called as a module function rather than
+        # a method, rebuilding the buffer. Rule B catches it because it writes
+        # the buffer, not because of what it calls.
+        text = mut(
+            B_RESUB_IN_MUTATION,
+            text,
+            text.replace(
+                "        text = mut(B_PRIMARY_RULE_MISSING, text, "
+                'flex(RULE_NEVER_YES).sub("", text))',
+                '        text = re.sub(flex(RULE_NEVER_YES), "", text)',
+                1,
+            ),
+            "un-guard the never-Yes mutation into a bare re.sub",
         )
     return text
 
@@ -1808,25 +1878,113 @@ def _replacement_calls(node: ast.AST) -> list[ast.Call]:
     ]
 
 
-def _unguarded_edits(body: list[ast.stmt], where: str) -> list[str]:
-    """Statements in `body` that replace text without going through mut()."""
+def _is_guarded(value: ast.expr | None) -> bool:
+    """True when the OUTERMOST call of an edit is mut() (or a guarded helper)."""
+    return (
+        isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Name)
+        and value.func.id in GUARDED_EDIT_CALLS
+    )
+
+
+def _assigned_names(stmts: list[ast.stmt]) -> set[str]:
+    names: set[str] = set()
+    for stmt in stmts:
+        for node in ast.walk(stmt):
+            if isinstance(node, ast.Assign):
+                for tgt in node.targets:
+                    if isinstance(tgt, ast.Name):
+                        names.add(tgt.id)
+            elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Name):
+                names.add(node.target.id)
+    return names
+
+
+def _buffer_names(fn: ast.FunctionDef) -> set[str]:
+    """The document buffer(s) a reader function mutates.
+
+    A buffer is a name that exists before any mutation body runs: a parameter,
+    or something the function assigned outside its `if broken(...)` blocks.
+    Names created *inside* a mutation body are local scratch (the drift
+    mutation's `target, old_word, new_word`, for instance) and are not edits to
+    the document.
+    """
+    names = {a.arg for a in fn.args.args}
+    outside: list[ast.stmt] = []
+    for stmt in fn.body:
+        if isinstance(stmt, ast.If) and _calls_broken_unnegated(stmt.test):
+            continue
+        outside.append(stmt)
+    return names | _assigned_names(outside)
+
+
+def _unguarded_edits(
+    body: list[ast.stmt], where: str, buffers: set[str] | None
+) -> list[str]:
+    """Unguarded edits in `body`.
+
+    Two rules, and the second is the one that matters.
+
+    Rule A (everywhere): a replacement call outside mut().
+
+    Rule B (document readers only): ANY write to the document buffer whose
+    outermost call is not mut(), whatever the right-hand side does. This is the
+    rule the check's name implies. An earlier version only implemented Rule A,
+    so it asked "is this a replacement?" instead of "is this an edit?", and
+    `text += "..."`, `text = re.sub(...)`, an f-string rebuild and a slice
+    splice all walked straight past a check whose docstring claimed to catch
+    every edit.
+
+    AugAssign on a buffer is flagged unconditionally: mut() returns the new
+    value, so a guarded edit is always `buffer = mut(...)` and never
+    `buffer += ...`.
+    """
     problems = []
     for stmt in body:
         for node in ast.walk(stmt):
-            # Returns count: `return text.replace(...)` edits text just as much
-            # as an assignment does, and skipping them left _inject_row's own
-            # replacement unpoliced by the first version of this check.
             if not isinstance(node, (ast.Assign, ast.AugAssign, ast.Return)):
                 continue
             value = node.value
-            if value is None or not _replacement_calls(value):
-                continue
-            outermost_is_guarded = (
-                isinstance(value, ast.Call)
-                and isinstance(value.func, ast.Name)
-                and value.func.id in GUARDED_EDIT_CALLS
-            )
-            if not outermost_is_guarded:
+            guarded = _is_guarded(value)
+
+            # --- Rule B: does this statement write the document buffer? -----
+            if buffers is not None:
+                writes_buffer = False
+                if isinstance(node, ast.Assign):
+                    writes_buffer = any(
+                        isinstance(t, ast.Name) and t.id in buffers
+                        for t in node.targets
+                    )
+                elif isinstance(node, ast.AugAssign):
+                    writes_buffer = (
+                        isinstance(node.target, ast.Name)
+                        and node.target.id in buffers
+                    )
+                elif isinstance(node, ast.Return):
+                    # `return text` unchanged is not an edit; anything built is.
+                    writes_buffer = value is not None and not isinstance(
+                        value, ast.Name
+                    )
+
+                if writes_buffer and not guarded:
+                    how = (
+                        "augmented assignment (`+=`)"
+                        if isinstance(node, ast.AugAssign)
+                        else "return of a rebuilt value"
+                        if isinstance(node, ast.Return)
+                        else "assignment"
+                    )
+                    problems.append(
+                        f"check_pack.py:{node.lineno}: {where} writes the "
+                        f"document buffer via {how} without mut(). Every edit a "
+                        f"mutation makes must be proven to land; an unguarded "
+                        f"one becomes a silent no-op the moment its anchor moves "
+                        f"and the mutation goes on reporting success"
+                    )
+                    continue
+
+            # --- Rule A: a replacement call outside mut(), anywhere ----------
+            if value is not None and _replacement_calls(value) and not guarded:
                 problems.append(
                     f"check_pack.py:{node.lineno}: {where} performs a string "
                     f"replacement outside mut(). An edit with no guard becomes a "
@@ -1838,18 +1996,50 @@ def _unguarded_edits(body: list[ast.stmt], where: str) -> list[str]:
 
 @check("mutation-guard")
 def check_mutation_guard() -> list[str]:
-    """No mutation may edit text without mut() proving the edit landed."""
+    """Enforce, exactly:
+
+    (A) In any mutation body, a string-replacement call must go through mut().
+
+    (B) In a DOCUMENT_READERS function or a mutation helper, ANY write to the
+        document buffer — assignment, `+=`, or a return of a rebuilt value —
+        must have mut() as its outermost call, whatever the right-hand side
+        does.
+
+    Rule B is the real rule; Rule A is a net for replacement calls in the
+    behavioural mutations, which have no document buffer. Both are narrower
+    than "no mutation may edit anything", and this docstring is deliberately
+    written to what the code does rather than to the intent, because a
+    guard whose stated scope exceeds its implemented scope is the defect this
+    file exists to catch.
+    """
     tree = ast.parse(read_own_source(), filename=str(OWN_SOURCE))
     failures = []
 
+    fn_of: dict[int, ast.FunctionDef] = {}
+    for fn in ast.walk(tree):
+        if isinstance(fn, ast.FunctionDef):
+            for node in ast.walk(fn):
+                if isinstance(node, ast.If) and _calls_broken_unnegated(node.test):
+                    fn_of[id(node)] = fn
+
     for node in ast.walk(tree):
         if isinstance(node, ast.If) and _calls_broken_unnegated(node.test):
+            fn = fn_of.get(id(node))
+            buffers = (
+                _buffer_names(fn)
+                if fn is not None and fn.name in DOCUMENT_READERS
+                else None
+            )
             failures.extend(
-                _unguarded_edits(node.body, f"mutation body at line {node.lineno}")
+                _unguarded_edits(
+                    node.body, f"mutation body at line {node.lineno}", buffers
+                )
             )
         if isinstance(node, ast.FunctionDef) and node.name in MUTATION_HELPERS:
             failures.extend(
-                _unguarded_edits(node.body, f"mutation helper {node.name}()")
+                _unguarded_edits(
+                    node.body, f"mutation helper {node.name}()", _buffer_names(node)
+                )
             )
 
     # Anti-vacuity. If the mutation-body detector ever stops matching — someone

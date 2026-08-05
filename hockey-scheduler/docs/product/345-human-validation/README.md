@@ -335,7 +335,7 @@ What it covers, and why each one is executable rather than a paragraph:
 | `ease-readiness`, `ease-single-source`, `ease-preflight-gate` | a session starting on an unruled ease wording, three role sheets drifting to three different questions, or the README going back to saying nothing blocks |
 | `recording-consistency` | any pack-authored instruction, in any file, drifting back to permitting recording — or an operational file simply going quiet about it |
 | `blockquote-is-protocol-text` | pack-authored text smuggled behind a `>`, which would give it protocol authority and hide it from every check that separates the two |
-| `mutation-guard` | a mutation editing text without `mut()` proving the edit landed — an unguarded edit silently stops injecting anything the moment its anchor moves, and the mutation goes on reporting success |
+| `mutation-guard` | a document-reader mutation writing the buffer — by assignment, `+=`, or a rebuilt return — without `mut()` proving the edit landed, plus any replacement call outside `mut()` in any mutation body. An unguarded edit silently stops injecting anything the moment its anchor moves, and the mutation goes on reporting success |
 | `protocol-pin`, `pin-present` | either protocol changing by one byte while this pack goes on quoting the old text |
 | `ksr-steps-verbatim` | any of the 17 K steps or 14 S steps drifting from the protocol's own wording |
 
@@ -361,12 +361,21 @@ caught by a mutation, the other by a human reading the runbooks end to end.
 
 **The mutations need the same treatment as the checks.** A mutation whose
 anchor text has moved injects nothing, and looks exactly like one that works.
-So every edit a mutation makes goes through `mut()`, which raises when the edit
-changes nothing, and `mutation-guard` reads this checker's own source and fails
-if any mutation body edits text outside `mut()`. Per edit, not per mutation:
-a mutation with two edits, one of whose anchors had moved, kept its check red
-on the strength of the surviving edit and reported success — which is how one
-of them sat here half-working until every edit was forced through the guard.
+So every edit a document-reader mutation makes goes through `mut()`, which
+raises when the edit changes nothing, and `mutation-guard` reads this checker's
+own source and enforces it. Per edit, not per mutation: a mutation with two
+edits, one of whose anchors had moved, kept its check red on the strength of
+the surviving edit and reported success — which is how one sat here
+half-working until every edit was forced through the guard.
+
+`mutation-guard` asks what a statement **writes**, not what it calls. An
+earlier version asked the second question — it flagged `.replace()` calls
+outside `mut()` — while its docstring claimed to catch every edit. So
+`text += "..."`, `text = re.sub(...)`, an f-string rebuild and a slice splice
+all walked straight past it. The gap between what a guard claims and what it
+verifies is the same defect the guard exists to catch, so the rule is now
+stated in the code's terms and the docstring is written to the implementation
+rather than to the intent.
 
 ## Scope
 
