@@ -11544,9 +11544,10 @@ async function render() {
     // control that caused it. post() puts error.message in a toast, but the
     // toast is one line with no room for the achievable counts and is
     // dismissible, and this is a decision the operator has to act on: the
-    // picker now offers every value the backend ACCEPTS, so learning which
-    // of them THIS Division can honour is the whole replacement for the old
-    // even-only list. A successful Generate clears it.
+    // control now spans the backend's whole accepted range, so learning which
+    // of those values THIS Division can honour is the whole replacement for
+    // the curated lists that used to answer it by omission. A successful
+    // Generate clears it.
     const failure = (res && res.error && res.error.details) || null;
     schedulerState.formatRefusal =
       (failure && SCHED_FORMAT_REFUSALS.indexOf(failure.reason) !== -1)
