@@ -48,6 +48,12 @@ from hockey_scheduler.services import (
     draft_schedule_for_league,
     round_robin_pairings,
 )
+from hockey_scheduler.services.league_scope import (
+    registered_team_ids_in_division,
+)
+from hockey_scheduler.services.league_scoped_scheduler import (
+    season_candidate_rink_ids,
+)
 from hockey_scheduler.services.scheduler import (
     MAX_GAMES_PER_TEAM,
     MAX_MEETINGS_PER_OPPONENT,
@@ -2902,6 +2908,279 @@ class SchedulerContract:
             "games_per_team_infeasible", repr(res))
         self.assertEqual(self.store.all_games(), [])
 
+    # -- THE RESIDUAL: existing Games are part of the total (#375 blocker) --
+    #
+    # The guarantee is the operator's FINAL SEASON TOTAL, not the size of the
+    # generated list. Everything below is about the difference: a Division
+    # that already has Regular Games on the calendar must finish on exactly
+    # G including them, and a set of existing Games that cannot be completed
+    # to G must be REFUSED rather than half-honoured.
+
+    def _plant_regular_game(self, game_id, home, away, day, division_id="div1"):
+        """One existing, non-cancelled REGULAR Game in the fixture's own
+        LeagueSeason — the fact the residual has to be derived from. Dated
+        well before the fixture's slots so it can never be confused with a
+        placement this draft made."""
+        start = BASE_TIME - timedelta(days=200 + day)
+        self.store.add_game(Game(
+            id=game_id, home_team_id=home, away_team_id=away,
+            start_time=start, end_time=start + timedelta(hours=1),
+            division_id=division_id, season_id="se1", league_id="lg1",
+            league_season_id="ls_lg1_se1"))
+
+    def _final_season_totals(self):
+        """``{team_id: regular games played}`` over the PERSISTED store —
+        the number the operator was actually promised, counting the Games
+        that were already there as well as the ones just committed."""
+        counts = {}
+        for game in self.store.all_games():
+            if game.cancelled or game.game_type != GameType.REGULAR.value:
+                continue
+            for tid in (game.home_team_id, game.away_team_id):
+                counts[tid] = counts.get(tid, 0) + 1
+        return counts
+
+    def _final_home_counts(self):
+        counts = {}
+        for game in self.store.all_games():
+            if game.cancelled or game.game_type != GameType.REGULAR.value:
+                continue
+            counts[game.home_team_id] = counts.get(game.home_team_id, 0) + 1
+        return counts
+
+    def _id_counters(self):
+        """The store's id-allocation counters, on either backend. A refusal
+        must not even BURN an id: a counter that moved is a write, and the
+        contract is that an infeasible request leaves no trace at all."""
+        counters = getattr(self.store, "_counters", None)
+        if counters is not None:
+            return dict(counters)
+        cur = self.store._exec("SELECT prefix, value FROM counters", ())
+        return {row["prefix"]: row["value"] for row in cur.fetchall()}
+
+    def _write_free_snapshot(self):
+        return {
+            "games": sorted(g.id for g in self.store.all_games()),
+            "slots": sorted((s.id, s.status.value if hasattr(s.status, "value")
+                             else s.status) for s in self.store.all_ice_slots()),
+            "scenarios": sorted(
+                s.id for s in self.store.all_schedule_scenarios()),
+            "setup_audit": len(self.store.all_setup_audit()),
+            "counters": self._id_counters(),
+        }
+
+    def test_existing_games_count_toward_the_guaranteed_total(self):
+        """THE BLOCKER, in its smallest reproducing shape.
+
+        4 teams, G=4, and two existing Regular Games on t0-t2 — a pair the
+        canonical target only asks to meet ONCE, so the second Game is
+        surplus relative to it. Building a fresh target and then consuming
+        existing Games against that fixed edge list silently dropped the
+        surplus: it proposed 7 more games, the commit succeeded, and the
+        season finished 5, 5, 4, 4 under a control labelled "guaranteed".
+
+        Deriving the residual from the existing Games FIRST gives t0 and t2
+        two games each and t1/t3 four, which is 6 games — and every team
+        finishes on exactly the 4 they were promised.
+        """
+        self._division_fixture(4, 40)
+        self._plant_regular_game("pre1", "t0", "t2", 0)
+        self._plant_regular_game("pre2", "t2", "t0", 1)
+        preview = self.api.draft_season_schedule(
+            division_id="div1", games_per_team=4)
+        self.assertNotIn("error", preview, repr(preview))
+        self.assertEqual(len(preview["draft_games"]), 6, repr(preview))
+        self.assertEqual(preview["unscheduled"], [], repr(preview))
+        # BOTH existing Games are reported, surplus included. The pre-fix
+        # split capped its rows at what the target asked for, so the second
+        # one was invisible to the operator and to draft_fingerprint alike.
+        self.assertEqual(len(preview["already_scheduled"]), 2, repr(preview))
+        self.assertEqual(
+            sorted(a["existing_game_id"] for a in preview["already_scheduled"]),
+            ["pre1", "pre2"], repr(preview))
+        res = commit_fresh_draft(self.api, "div1", games_per_team=4)
+        self.assertNotIn("error", res, repr(res))
+        self.assertEqual(len(res["created"]), 6, repr(res))
+        self.assertEqual(self._final_season_totals(),
+                         {"t0": 4, "t1": 4, "t2": 4, "t3": 4})
+
+    def test_existing_games_never_pushed_a_pair_past_its_own_spread(self):
+        """Anti-vacuity partner of the test above: the completion is not
+        merely the right SIZE. t0 and t2 have already met twice, so the six
+        generated games must give each of them exactly two more, and neither
+        may be handed a third meeting with the other."""
+        self._division_fixture(4, 40)
+        self._plant_regular_game("pre1", "t0", "t2", 0)
+        self._plant_regular_game("pre2", "t2", "t0", 1)
+        preview = self.api.draft_season_schedule(
+            division_id="div1", games_per_team=4)
+        proposed = [frozenset((d["home_team_id"], d["away_team_id"]))
+                    for d in preview["draft_games"]]
+        self.assertNotIn(frozenset(("t0", "t2")), proposed, repr(preview))
+        counts = {}
+        for pair in proposed:
+            for tid in pair:
+                counts[tid] = counts.get(tid, 0) + 1
+        self.assertEqual(counts, {"t0": 2, "t1": 4, "t2": 2, "t3": 4})
+
+    def test_a_reverse_oriented_existing_game_is_balanced_not_compounded(self):
+        """The home/away half of the same defect.
+
+        Two teams, G=4, one existing Game in the REVERSE of the canonical
+        orientation. Four meetings can and should finish 2-2. Consuming that
+        Game against a target row while keeping the target's own orientation
+        finished 3-1: the fixed Game's actual home side was never read, so
+        the alternation compounded the imbalance instead of correcting it.
+        """
+        self._division_fixture(2, 40)
+        canonical_home, canonical_away = round_robin_pairings(["t0", "t1"])[0]
+        self._plant_regular_game("pre1", canonical_away, canonical_home, 0)
+        res = commit_fresh_draft(self.api, "div1", games_per_team=4)
+        self.assertNotIn("error", res, repr(res))
+        self.assertEqual(len(res["created"]), 3, repr(res))
+        self.assertEqual(self._final_season_totals(), {"t0": 4, "t1": 4})
+        self.assertEqual(self._final_home_counts(), {"t0": 2, "t1": 2})
+
+    def test_an_over_scheduled_team_is_refused_before_anything_is_written(self):
+        """Condition (1) of the completion: a team already ABOVE G can never
+        come back down, because generation only ever adds. Refused with the
+        team named and a number to ask for instead — and with nothing at all
+        written, since the refusal happens before placement."""
+        self._division_fixture(4, 40)
+        for day in range(3):
+            self._plant_regular_game(f"pre{day}", "t0", "t1", day)
+        before = self._write_free_snapshot()
+        res = self.api.draft_season_schedule(
+            division_id="div1", games_per_team=2)
+        details = res.get("error", {}).get("details", {})
+        self.assertEqual(details.get("reason"), "games_per_team_over_scheduled",
+                         repr(res))
+        self.assertEqual(
+            sorted(t["team_id"] for t in details["over_scheduled_teams"]),
+            ["t0", "t1"], repr(res))
+        # 3, not 4: t0 and t1 are on 3 already, and G=3 leaves t2/t3 needing
+        # 3 each, which they can supply to one another. The advice is derived
+        # from the SAME three conditions the refusal enforces, so it can
+        # never name a number the very next request would reject.
+        self.assertEqual(details["nearest_achievable"], 3, repr(res))
+        self.assertIn("Team 0", res["error"]["message"], repr(res))
+        self.assertEqual(self._write_free_snapshot(), before, repr(res))
+        # And the number the refusal named actually works, end to end —
+        # advice that cannot be taken is not actionable.
+        taken = commit_fresh_draft(self.api, "div1", games_per_team=3)
+        self.assertNotIn("error", taken, repr(taken))
+        self.assertEqual(self._final_season_totals(),
+                         {"t0": 3, "t1": 3, "t2": 3, "t3": 3})
+
+    def test_a_concentrated_fixed_graph_is_refused_before_anything_is_written(
+            self):
+        """Condition (3): no team may need more games than the rest of the
+        Division can collectively supply.
+
+        t1, t2 and t3 have already played each other, leaving them one game
+        short each while t0 still needs all 4. Four games for t0 cannot be
+        drawn from three opponents with one game left apiece — and NO parity
+        rule sees this: 4 x 4 is even, so the empty-graph check passes it
+        straight through to a generator that cannot honour it.
+        """
+        self._division_fixture(4, 40)
+        self._plant_regular_game("pre1", "t1", "t2", 0)
+        self._plant_regular_game("pre2", "t2", "t3", 1)
+        self._plant_regular_game("pre3", "t3", "t1", 2)
+        for extra, (home, away) in enumerate(
+                (("t1", "t2"), ("t2", "t3"), ("t3", "t1"))):
+            self._plant_regular_game(f"pre{extra}x", home, away, 10 + extra)
+        before = self._write_free_snapshot()
+        res = self.api.draft_season_schedule(
+            division_id="div1", games_per_team=4)
+        details = res.get("error", {}).get("details", {})
+        self.assertEqual(details.get("reason"),
+                         "games_per_team_residual_infeasible", repr(res))
+        self.assertEqual([t["team_id"] for t in details["short_teams"]],
+                         ["t0"], repr(res))
+        self.assertEqual(details["short_teams"][0]["residual_games"], 4)
+        self.assertEqual(details["short_teams"][0]["available_games"], 0)
+        self.assertEqual(self._write_free_snapshot(), before, repr(res))
+
+    def test_the_refusal_also_stops_the_commit_path_with_zero_writes(self):
+        """A refusal that only guarded Generate would be no guard at all:
+        commit re-derives its own proposal server-side. Asserted against the
+        facade that actually runs (`league_scoped_service` shadows the base
+        copy) AND the base one, with a fingerprint from a preview taken
+        while the request was still feasible."""
+        for api_cls in (ApiService, BaseApiService):
+            with self.subTest(facade=api_cls.__module__):
+                self.setUp()
+                self._division_fixture(4, 40)
+                api = api_cls(self.store)
+                preview = api.draft_season_schedule(
+                    division_id="div1", games_per_team=4)
+                fingerprint = preview["draft_fingerprint"]
+                # Now make it impossible, after the operator reviewed it.
+                for extra in range(6):
+                    self._plant_regular_game(
+                        f"late{extra}", "t0", "t1", 20 + extra)
+                before = self._write_free_snapshot()
+                res = api.commit_draft_schedule(
+                    division_id="div1", games_per_team=4,
+                    draft_fingerprint=fingerprint)
+                self.assertEqual(
+                    res.get("error", {}).get("details", {}).get("reason"),
+                    "games_per_team_over_scheduled", repr(res))
+                self.assertEqual(self._write_free_snapshot(), before, repr(res))
+
+    def test_the_residual_completion_is_deterministic_across_orderings(self):
+        """`_draft_fingerprint` requires identical inputs to produce
+        identical pairings, so the completion may not depend on registration
+        order, dict iteration or anything else the inputs do not fix. Two
+        stores built with the SAME facts in a DIFFERENT order must agree row
+        for row, orientation included."""
+        self._division_fixture(4, 40)
+        self._plant_regular_game("pre1", "t0", "t2", 0)
+        self._plant_regular_game("pre2", "t2", "t0", 1)
+        first = self.api.draft_season_schedule(
+            division_id="div1", games_per_team=4)
+        original = self.store
+        self.setUp()
+        try:
+            self._division_fixture(4, 40)
+            # Same two Games, planted in the opposite order.
+            self._plant_regular_game("pre2", "t2", "t0", 1)
+            self._plant_regular_game("pre1", "t0", "t2", 0)
+            second = self.api.draft_season_schedule(
+                division_id="div1", games_per_team=4)
+        finally:
+            conn = getattr(original, "conn", None)
+            if conn is not None:
+                conn.close()
+        self.assertEqual(
+            [(d["home_team_id"], d["away_team_id"]) for d in first["draft_games"]],
+            [(d["home_team_id"], d["away_team_id"]) for d in second["draft_games"]])
+        self.assertEqual(first["draft_fingerprint"],
+                         second["draft_fingerprint"])
+
+    def test_league_wide_residual_is_derived_per_division(self):
+        """Each Division's residual is its own: Gold's existing Games must
+        not change what Silver is asked to generate, and the refusal (when
+        one comes) names the Division that cannot honour the request."""
+        self._league_two_divisions_fixture(per_division=2, n_slots=60)
+        start = BASE_TIME - timedelta(days=300)
+        self.store.add_game(Game(
+            id="goldpre", home_team_id="g1", away_team_id="g0",
+            start_time=start, end_time=start + timedelta(hours=1),
+            division_id="gold", season_id="se1", league_id="lg1",
+            league_season_id="ls_lg1_se1"))
+        res = draft_schedule_for_league(
+            self.store, "se1", "lg1", games_per_team=4)
+        counts = {}
+        for row in res["draft_games"]:
+            for tid in (row["home_team_id"], row["away_team_id"]):
+                counts[tid] = counts.get(tid, 0) + 1
+        # Gold owes 3 more meetings, Silver all 4 — 7 rows, not 8.
+        self.assertEqual(len(res["draft_games"]), 7, repr(res))
+        self.assertEqual(counts, {"g0": 3, "g1": 3, "s0": 4, "s1": 4})
+        self.assertEqual(len(res["already_scheduled"]), 1, repr(res))
+
     def test_legacy_meetings_fingerprints_are_byte_identical_to_before(self):
         """#381 persists whole proposals — including `draft_fingerprint` —
         inside named scenarios, and the commit gate recomputes that hash and
@@ -3304,6 +3583,149 @@ class SchedulerHttpTest(unittest.TestCase):
         self.assertEqual(body["error"]["details"]["nearest_achievable"],
                          [4, 6], repr(body))
         self.assertIn("4 or 6", body["error"]["message"])
+
+    # -- THE RESIDUAL over the REAL transport (#375 blocker) ---------------
+    #
+    # The unit contract above proves the planner; these prove the whole
+    # request path — routes, serialization, the commit's own server-side
+    # regeneration — honours the operator's FINAL SEASON TOTAL when Games
+    # already exist, and refuses (with a real HTTP status and a real
+    # structured body) when they make the request impossible.
+
+    def _division_team_ids(self, division_id):
+        store = srv.STATE.api.store
+        return sorted(registered_team_ids_in_division(store, division_id))
+
+    def _seed_regular_game_over_http(self, c, division_id, home, away, index):
+        """One existing Regular Game, created through the REAL setup route —
+        never a direct store write, so the residual is derived from the same
+        rows a real operator's own earlier scheduling would have left."""
+        store = srv.STATE.api.store
+        season_id = store.get_league_season(
+            store.get_division(division_id).league_season_id).season_id
+        # Scoped to THIS Season's own candidate Rinks — the same pool the
+        # draft draws from. This class shares one server and one store across
+        # its methods, so an unscoped "first free slot" picks up another
+        # test's Season and the setup route refuses it for venue access.
+        rinks = season_candidate_rink_ids(store, season_id, None)
+        free = [s for s in store.all_ice_slots()
+                if s.rink_id in rinks and s.slot_type == IceSlotType.GAME
+                and store.game_using_ice_slot(s.id) is None]
+        free.sort(key=lambda s: (s.start_time, s.id))
+        status, seeded = self._req(c, "POST", "/api/setup/game", {
+            "season_id": season_id, "division_id": division_id,
+            "home_team_id": home, "away_team_id": away,
+            "ice_slot_id": free[index].id})
+        self.assertEqual(status, 200, repr(seeded))
+        return seeded
+
+    def _final_totals_over_http(self, division_id):
+        store = srv.STATE.api.store
+        ls_id = store.get_division(division_id).league_season_id
+        counts = {}
+        for game in store.all_games():
+            if (game.cancelled or game.league_season_id != ls_id
+                    or game.division_id != division_id
+                    or game.game_type != GameType.REGULAR.value):
+                continue
+            for tid in (game.home_team_id, game.away_team_id):
+                counts[tid] = counts.get(tid, 0) + 1
+        return counts
+
+    def _final_homes_over_http(self, division_id):
+        store = srv.STATE.api.store
+        ls_id = store.get_division(division_id).league_season_id
+        counts = {}
+        for game in store.all_games():
+            if (game.cancelled or game.league_season_id != ls_id
+                    or game.division_id != division_id
+                    or game.game_type != GameType.REGULAR.value):
+                continue
+            counts[game.home_team_id] = counts.get(game.home_team_id, 0) + 1
+        return counts
+
+    def test_existing_games_count_toward_the_total_over_http(self):
+        """4 teams, G=4, two existing Regular Games on ONE pair — the shape
+        that used to preview 7 more games, commit them all, and finish the
+        season 5, 5, 4, 4 over this exact transport. Now: exactly 6 missing,
+        and every team on the 4 they were guaranteed."""
+        c = self._client()
+        self._req(c, "POST", "/api/auth/login",
+                  {"username": "admin", "password": "demo"})
+        div = self._build_committable_division(c, n_slots=12, n_teams=4)
+        t0, t1, t2, t3 = self._division_team_ids(div)
+        self._seed_regular_game_over_http(c, div, t0, t2, 0)
+        self._seed_regular_game_over_http(c, div, t2, t0, 1)
+        status, preview = self._req(c, "POST", "/api/scheduler/draft", {
+            "division_id": div, "games_per_team": 4})
+        self.assertEqual(status, 200, repr(preview))
+        self.assertEqual(len(preview["draft_games"]), 6, repr(preview))
+        self.assertEqual(len(preview["already_scheduled"]), 2, repr(preview))
+        status, body = self._req(c, "POST", "/api/scheduler/commit", {
+            "division_id": div, "games_per_team": 4,
+            "draft_fingerprint": preview["draft_fingerprint"]})
+        self.assertEqual(status, 200, repr(body))
+        self.assertEqual(len(body["created"]), 6, repr(body))
+        self.assertEqual(self._final_totals_over_http(div),
+                         {t0: 4, t1: 4, t2: 4, t3: 4})
+
+    def test_a_reverse_oriented_existing_game_finishes_level_over_http(self):
+        """Two teams, G=4, one existing Game in the reverse of the canonical
+        orientation: the season must finish 2-2 at home, not the 3-1 that
+        ignoring the fixed Game's actual home side produced."""
+        c = self._client()
+        self._req(c, "POST", "/api/auth/login",
+                  {"username": "admin", "password": "demo"})
+        div = self._build_committable_division(c, n_slots=8, n_teams=2)
+        teams = self._division_team_ids(div)
+        canonical_home, canonical_away = round_robin_pairings(teams)[0]
+        self._seed_regular_game_over_http(
+            c, div, canonical_away, canonical_home, 0)
+        status, preview = self._req(c, "POST", "/api/scheduler/draft", {
+            "division_id": div, "games_per_team": 4})
+        self.assertEqual(status, 200, repr(preview))
+        self.assertEqual(len(preview["draft_games"]), 3, repr(preview))
+        status, body = self._req(c, "POST", "/api/scheduler/commit", {
+            "division_id": div, "games_per_team": 4,
+            "draft_fingerprint": preview["draft_fingerprint"]})
+        self.assertEqual(status, 200, repr(body))
+        self.assertEqual(self._final_totals_over_http(div),
+                         {teams[0]: 4, teams[1]: 4})
+        self.assertEqual(self._final_homes_over_http(div),
+                         {teams[0]: 2, teams[1]: 2})
+
+    def test_an_impossible_fixed_graph_is_refused_over_http_with_no_writes(self):
+        """A residual that cannot be completed reaches the operator as a 400
+        with the structured reason and the team named — and writes NOTHING:
+        no Game, no scenario, no ice-slot state change."""
+        c = self._client()
+        self._req(c, "POST", "/api/auth/login",
+                  {"username": "admin", "password": "demo"})
+        div = self._build_committable_division(c, n_slots=12, n_teams=4)
+        t0, t1, t2, t3 = self._division_team_ids(div)
+        for index, (home, away) in enumerate(
+                ((t1, t2), (t2, t3), (t3, t1),
+                 (t1, t2), (t2, t3), (t3, t1))):
+            self._seed_regular_game_over_http(c, div, home, away, index)
+        store = srv.STATE.api.store
+        games_before = sorted(g.id for g in store.all_games())
+        scenarios_before = len(store.all_schedule_scenarios())
+        slots_before = sorted(
+            (s.id, str(s.status)) for s in store.all_ice_slots())
+        status, body = self._req(c, "POST", "/api/scheduler/draft", {
+            "division_id": div, "games_per_team": 4})
+        self.assertEqual(status, 400, repr(body))
+        self.assertEqual(body["error"]["code"], "validation_error", repr(body))
+        self.assertEqual(body["error"]["details"]["reason"],
+                         "games_per_team_residual_infeasible", repr(body))
+        self.assertEqual(
+            [t["team_id"] for t in body["error"]["details"]["short_teams"]],
+            [t0], repr(body))
+        self.assertEqual(sorted(g.id for g in store.all_games()), games_before)
+        self.assertEqual(len(store.all_schedule_scenarios()), scenarios_before)
+        self.assertEqual(
+            sorted((s.id, str(s.status)) for s in store.all_ice_slots()),
+            slots_before)
 
     def test_invalid_games_per_team_is_rejected_over_http(self):
         c = self._client()

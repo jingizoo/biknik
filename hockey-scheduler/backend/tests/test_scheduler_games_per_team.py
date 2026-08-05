@@ -41,6 +41,7 @@ is refused (see `GamesPerTeamValidationTest`), so the matrix below skips
 those combinations rather than asserting nonsense about them.
 """
 
+import random
 import subprocess
 import sys
 import unittest
@@ -53,6 +54,8 @@ from hockey_scheduler.services.scheduler import (
     _normalize_games_per_team,
     _require_feasible_games_per_team,
     games_per_team_pairings,
+    games_per_team_residual_pairings,
+    require_completable_games_per_team,
 )
 
 # The matrix every property below is asserted over. T stops at 20 because
@@ -478,6 +481,168 @@ class GamesPerTeamFeasibilityTest(unittest.TestCase):
         with self.assertRaises(ValidationError) as caught:
             _require_feasible_games_per_team(5, 21, label="Gold")
         self.assertIn("in Gold", str(caught.exception))
+
+
+class ResidualCompletionPropertyTest(unittest.TestCase):
+    """The residual planner's properties, over a matrix of FIXED graphs.
+
+    The guarantee is the operator's final season total, so the generator's
+    real question is not "what does a season look like from nothing?" but
+    "what is still missing, given what is already on the calendar?". The
+    three conditions `require_completable_games_per_team` enforces are
+    claimed to be NECESSARY AND SUFFICIENT for that completion to exist, and
+    a claim of sufficiency is exactly the kind that a handful of worked
+    examples cannot support: a planner that refused every non-empty fixed
+    graph would satisfy "never produces a wrong schedule" perfectly.
+
+    So both directions are asserted over the same matrix:
+
+    * whenever the conditions HOLD, a completion must be produced, and every
+      team's fixed + generated total must be exactly G — no false refusals,
+      no silently uneven schedule;
+    * whenever they FAIL, the request must be refused — and independently of
+      the planner's own opinion, since the expectation is computed here from
+      the degree sequence rather than read back off the code under test.
+
+    The fixed graphs are drawn from a SEEDED generator, so the matrix is the
+    same on every machine, every backend and every run — the same
+    determinism `_draft_fingerprint` depends on.
+    """
+
+    SEED = 20260805
+
+    def fixed_graphs(self):
+        """(teams, G, fixed multigraph) triples — deterministic, and covering
+        the shapes that matter: the empty graph, a prefix of the canonical
+        target (which the planner completes along its own plan), and graphs
+        with SURPLUS on some pair (which force the degree-constrained
+        completion instead)."""
+        rng = random.Random(self.SEED)
+        for team_count in range(2, 9):
+            ids = teams(team_count)
+            pairs = [(ids[i], ids[j])
+                     for i in range(team_count)
+                     for j in range(i + 1, team_count)]
+            for games in range(1, 13):
+                if not feasible(team_count, games):
+                    continue
+                target = games_per_team_pairings(ids, games)
+                for trial in range(6):
+                    fixed = {}
+                    if trial == 0:
+                        pass                      # empty calendar
+                    elif trial == 1:              # a prefix of the target
+                        for home, away in target[:len(target) // 2]:
+                            key = tuple(sorted((home, away)))
+                            fixed[key] = fixed.get(key, 0) + 1
+                    else:                         # arbitrary, surplus included
+                        for _ in range(rng.randrange(1, 2 * len(pairs) + 1)):
+                            key = pairs[rng.randrange(len(pairs))]
+                            fixed[key] = fixed.get(key, 0) + 1
+                    yield ids, games, fixed
+
+    def expected_to_be_completable(self, ids, games, fixed):
+        """The three conditions, computed HERE from the degree sequence, so
+        the test's expectation never comes from the code it is judging."""
+        degree = {t: 0 for t in ids}
+        for (low, high), count in fixed.items():
+            degree[low] += count
+            degree[high] += count
+        residual = [games - degree[t] for t in ids]
+        if any(r < 0 for r in residual):
+            return False
+        if sum(residual) % 2:
+            return False
+        return all(2 * r <= sum(residual) for r in residual)
+
+    def test_completable_iff_the_three_conditions_hold(self):
+        completed = refused = 0
+        for ids, games, fixed in self.fixed_graphs():
+            expected = self.expected_to_be_completable(ids, games, fixed)
+            with self.subTest(teams=len(ids), games=games, fixed=sorted(fixed)):
+                if not expected:
+                    with self.assertRaises(ValidationError):
+                        require_completable_games_per_team(ids, games, fixed)
+                    refused += 1
+                    continue
+                require_completable_games_per_team(ids, games, fixed)
+                pairings = games_per_team_residual_pairings(ids, games, fixed)
+                counts = {t: 0 for t in ids}
+                for (low, high), count in fixed.items():
+                    counts[low] += count
+                    counts[high] += count
+                for home, away in pairings:
+                    self.assertNotEqual(home, away, "a team cannot play itself")
+                    counts[home] += 1
+                    counts[away] += 1
+                for tid in ids:
+                    self.assertEqual(
+                        counts[tid], games,
+                        f"T={len(ids)} G={games}: {tid} finishes on "
+                        f"{counts[tid]}, not {games}")
+                completed += 1
+        # Anti-vacuity: both branches must actually have been exercised, or
+        # "refuses the impossible" is satisfied by refusing everything and
+        # "completes the possible" by a matrix that is all empty graphs.
+        self.assertGreater(completed, 200, "too few completable cases tried")
+        self.assertGreater(refused, 50, "too few infeasible cases tried")
+
+    def test_the_empty_calendar_is_the_plain_generator(self):
+        """The residual planner subsumes `games_per_team_pairings` rather
+        than sitting beside it: with nothing fixed the two must agree row for
+        row AND orientation for orientation, which is what keeps every
+        property above, every stored fingerprint and every contract test
+        true. Asserted over the whole matrix, not spot-checked."""
+        for team_count in TEAM_COUNTS:
+            for games in GAME_COUNTS:
+                if not feasible(team_count, games):
+                    continue
+                with self.subTest(teams=team_count, games=games):
+                    ids = teams(team_count)
+                    self.assertEqual(
+                        games_per_team_residual_pairings(ids, games, {}, {}),
+                        games_per_team_pairings(ids, games))
+
+    def test_home_away_repairs_an_existing_imbalance(self):
+        """The home/away half of the residual: a pair whose fixed Games are
+        lopsided must have the remaining meetings handed to the other side,
+        not have the imbalance compounded by a fixed alternation."""
+        ids = teams(2)
+        low, high = ids
+        for fixed_home_for_high in range(1, 4):
+            with self.subTest(reverse_games=fixed_home_for_high):
+                games = 6
+                fixed = {(low, high): fixed_home_for_high}
+                hosted = {(low, high): [0, fixed_home_for_high]}
+                pairings = games_per_team_residual_pairings(
+                    ids, games, fixed, hosted)
+                homes = {low: 0, high: fixed_home_for_high}
+                for home, _away in pairings:
+                    homes[home] += 1
+                self.assertEqual(
+                    homes[low], homes[high],
+                    f"{fixed_home_for_high} reverse games then "
+                    f"{len(pairings)} more should finish level: {homes}")
+
+    def test_the_completion_is_stable_across_a_fresh_interpreter(self):
+        """Determinism the way `_draft_fingerprint` needs it. Within one
+        process a set- or dict-ordered construction produces the same wrong
+        answer twice and the two agree, so this re-runs the completion in a
+        SEPARATE interpreter and compares."""
+        script = (
+            "import sys; sys.path.insert(0, %r)\n"
+            "from hockey_scheduler.services.scheduler import "
+            "games_per_team_residual_pairings as f\n"
+            "ids = ['t%%02d' %% i for i in range(6)]\n"
+            "fixed = {('t00','t03'): 3, ('t01','t02'): 1, ('t04','t05'): 2}\n"
+            "print(f(ids, 8, fixed))\n" % str(BACKEND))
+        out = subprocess.run([sys.executable, "-c", script],
+                             capture_output=True, text=True, check=True)
+        ids = teams(6)
+        fixed = {("t00", "t03"): 3, ("t01", "t02"): 1, ("t04", "t05"): 2}
+        self.assertEqual(
+            out.stdout.strip(),
+            repr(games_per_team_residual_pairings(ids, 8, fixed)))
 
 
 if __name__ == "__main__":
