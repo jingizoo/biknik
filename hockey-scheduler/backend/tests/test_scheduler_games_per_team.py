@@ -669,7 +669,18 @@ class GamesPerTeamNoOpponentTest(unittest.TestCase):
         self.assertIn("no opponent", message)
         self.assertNotIn("already scheduled", message)
         self.assertNotIn("cancel", message.lower())
-        self.assertEqual(caught.exception.details["team_count"], 1)
+        details = caught.exception.details
+        self.assertEqual(details["team_count"], 1)
+        # Same reason code as the general condition-(3) refusal, so the same
+        # `details` shape api-contract.md documents for it — a consumer must
+        # not have to special-case this one. `nearest_achievable` is null
+        # rather than a number because no count is achievable for a team
+        # with no opponent.
+        self.assertEqual(
+            details["short_teams"],
+            [{"team_id": "solo", "team_name": "Lone 0",
+              "residual_games": 6, "available_games": 0}])
+        self.assertIsNone(details["nearest_achievable"])
 
     def test_no_teams_is_not_refused_at_all(self):
         # An empty group has no team whose guarantee goes unhonoured, so

@@ -684,6 +684,13 @@ def require_completable_games_per_team(team_ids, games, fixed_multiplicity,
     # that the guarantee is never quietly left unhonoured.
     if len(teams) == 1 and games > 0:
         lone = names.get(teams[0], teams[0])
+        # Same `details` SHAPE as the general condition-(3) refusal below,
+        # because it is the same reason code and api-contract.md documents
+        # one payload for it: `short_teams[]` rows and a
+        # `nearest_achievable` that is the smallest completable count or
+        # `None` when there is none. A lone team is the latter — no G is
+        # achievable for it at any number — which
+        # `smallest_completable_games(1, [0])` independently returns.
         raise ValidationError(
             f"{games} guaranteed games per team is impossible{where}: "
             f"{lone} has no opponent to play. Register at least one more "
@@ -691,7 +698,11 @@ def require_completable_games_per_team(team_ids, games, fixed_multiplicity,
             {"reason": "games_per_team_residual_infeasible",
              "games_per_team": games,
              "team_count": 1,
-             "nearest_achievable": []})
+             "short_teams": [{"team_id": teams[0], "team_name": lone,
+                              "residual_games": games - degrees[0],
+                              "available_games": 0}],
+             "nearest_achievable": smallest_completable_games(
+                 len(teams), degrees)})
 
     achievable = smallest_completable_games(len(teams), degrees)
     advice = (f" Ask for {achievable} guaranteed games instead, or cancel "

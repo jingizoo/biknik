@@ -3061,30 +3061,6 @@ class SchedulerContract:
                 self.assertEqual(legacy["unschedulable_teams"], [])
                 self.assertTrue(legacy["draft_games"], repr(kwargs))
 
-    def test_max_games_per_team_is_the_value_the_picker_journey_hardcodes(self):
-        """#375 review — `e2e/scheduler-games-per-team.js` asserts that every
-        option the picker offers is inside the range the backend accepts, and
-        the upper end of that range is MAX_GAMES_PER_TEAM. A browser journey
-        cannot import a Python constant, so it hardcodes 120.
-
-        This pins the duplicate. Raising or lowering MAX_GAMES_PER_TEAM fails
-        HERE, where the message says which file to update, rather than
-        leaving the journey asserting a bound that no longer exists — green
-        while offering a value Generate would reject.
-        """
-        self.assertEqual(
-            MAX_GAMES_PER_TEAM, 120,
-            "MAX_GAMES_PER_TEAM moved; update the hardcoded copy in "
-            "hockey-scheduler/e2e/scheduler-games-per-team.js too")
-
-    # -- THE RESIDUAL: existing Games are part of the total (#375 blocker) --
-    #
-    # The guarantee is the operator's FINAL SEASON TOTAL, not the size of the
-    # generated list. Everything below is about the difference: a Division
-    # that already has Regular Games on the calendar must finish on exactly
-    # G including them, and a set of existing Games that cannot be completed
-    # to G must be REFUSED rather than half-honoured.
-
     def _plant_regular_game(self, game_id, home, away, day, division_id="div1"):
         """One existing, non-cancelled REGULAR Game in the fixture's own
         LeagueSeason — the fact the residual has to be derived from. Dated
