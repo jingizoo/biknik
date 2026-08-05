@@ -46,6 +46,120 @@ guarantees each team that many games inside its own group, so a 6-team and a
 That is the point of the control, and the reason feasibility is judged per
 group.
 
+### The guarantee is the FINAL SEASON TOTAL, not the generated list
+
+The number promised is what a team **finishes the season on**, counting the
+Regular Games already on the calendar. So generation runs the other way round
+from the obvious one: the existing Games are read FIRST, and what is generated
+is the **residual** — the games still missing before every team reaches `G`.
+
+Three quantities are derived per Division before a single pairing is built
+(`fixed_pair_counts`, `_games_per_team_split`):
+
+| Derived | From | Used for |
+|---------|------|----------|
+| residual degree `r(v) = G − deg_F(v)` | existing Games per team | how many games each team still needs |
+| per-pair existing multiplicity | existing Games per pair | keeping the per-opponent spread |
+| per-pair home/away counts | each existing Game's **actual orientation** | which side hosts the next meeting |
+
+Building a target for an empty calendar and then *consuming* existing Games
+against that fixed edge list is what this replaces, and it was wrong twice
+over. A pair with more Games than the target asked of it had the surplus
+silently dropped — 4 teams at `G=4` with two existing Games on one pair
+previewed 7 more, committed them, and finished the season **5, 5, 4, 4**. And
+because a fixed Game was matched to a target row without reading its
+orientation, a two-team Division with one reverse-oriented Game finished
+**3–1** at home where four meetings can finish 2–2.
+
+Only Games between two **currently registered** members of the group count. A
+Regular Game stamped with this Division involving a team that has since left
+it cannot be completed against (there is no second team to balance it), and
+contributes 1 rather than 2 to the group's degree sum, so counting it would
+flip the residual's parity and make an ordinary request unrealizable through
+no fault of the request. Consequence, stated plainly: after a team moves out
+of a Division, its leftover Games there do not count toward its former
+opponents' guarantee.
+
+`already_scheduled[]` reports **every** counted existing Game, one row each,
+with that Game's own home/away. The pre-residual split capped its rows at
+what the target asked for, so surplus Games were invisible to the operator
+and to `draft_fingerprint` alike.
+
+### Residual feasibility: three conditions, necessary AND sufficient
+
+Completing a fixed multigraph to a prescribed total is a **degree-constrained
+completion**, not the empty-graph parity check, and the parity rule does not
+carry over on its own. Write `V` for the group's registered teams, `T = |V|`,
+`F` for the counted existing Games, and `r(v) = G − deg_F(v)`. A completion —
+a set of new games, adding nothing to `F`, giving every team exactly `G` —
+exists **if and only if**:
+
+1. `r(v) ≥ 0` for every team. Generation only ADDS, so a team already past
+   `G` can never come back down. Refused as `games_per_team_over_scheduled`.
+2. `sum(r)` is even. Each new game contributes 2, so an odd sum cannot be
+   spent exactly. Since `sum(r) = T×G − 2|F|`, this is *the same* condition as
+   the empty-graph parity rule below, and is refused there with its own
+   nearest-achievable advice. Re-asserted in the residual planner so no path
+   can reach the generator with an unspendable residual.
+3. `max(r) ≤ sum of the other teams' r`. Every residual game of the neediest
+   team has its other end on a *different* team, so its demand is capped by
+   everyone else's combined demand. Refused as
+   `games_per_team_residual_infeasible`. **This one has no empty-graph
+   analogue**: with `F` empty every `r(v)` is `G` and `G ≤ (T−1)G` always
+   holds for `T ≥ 2`, so it can only ever fire once real Games exist.
+
+These are exactly the classical realizability conditions for a **loopless
+multigraph** with a prescribed degree sequence (Hakimi). Necessity is the
+argument given per condition above. Sufficiency is *constructive*, and the
+construction is the one `_residual_completion` runs: repeatedly join a team of
+maximum residual to any other team of positive residual. That step preserves
+(2) — it removes exactly 2 from the sum — and (3): writing `S` for the sum and
+`u` for a maximum, the new maximum is either `r(u) − 1`, for which
+`2(r(u)−1) ≤ S−2` follows from `2r(u) ≤ S`, or a team still tied at `r(u)`,
+for which `S ≥ 2r(u) + 1` plus the evenness of `S` gives `S ≥ 2r(u) + 2`.
+Condition (3) also guarantees a partner exists whenever demand remains, so the
+loop terminates with every residual at zero.
+
+**Unbounded multiplicity in the residual is what makes three conditions
+enough.** Requiring the FINAL per-opponent spread to stay within one as well
+would be a bounded-multiplicity problem with strictly more conditions, and it
+would refuse requests the operator's own fixed Games can honour on the promise
+actually made — the season total. So the spread is *aimed at*, not enforced:
+exactly preserved whenever the fixed Games fit inside the canonical target,
+and as even as the completion allows once they do not.
+
+Both residual refusals **name a number to ask for**
+(`smallest_completable_games`), derived by scanning the same three conditions
+the refusal enforces — so the advice can never name a value the very next
+request would reject.
+
+### Two ways to complete, and why the empty case is byte-identical
+
+* **The canonical target's deficit.** If no pair has more fixed Games than the
+  canonical target asks of it, the target's own leftover rows are already a
+  valid completion (fixed degrees are bounded by target degrees, so the
+  leftovers realize the residual exactly). Emitted in the target's own order,
+  which preserves both the canonical spread and the ice-assignment priority.
+* **The degree-constrained completion.** Once a pair is over-played relative
+  to the target, no subset of the target has the right degrees, so the
+  residual is built straight from the degree sequence. Each step joins a
+  maximum-residual team (the endpoint that keeps the conditions invariant) to
+  the still-needy team it has met *fewest* times counting fixed Games — which
+  is where the spread is bought back without risking the exact degrees.
+
+Home/away is decided by a **ledger** (`_HomeLedger`) rather than a fixed
+alternation: give home to whichever side has hosted this pair fewer times,
+falling back to the circle method's own orientation when level. With no fixed
+Games that reproduces the old meeting-parity alternation *exactly* — including
+the `rem` extras, since after `base` meetings the canonical side leads by one
+iff `base` is odd — so `games_per_team_pairings(teams, G)` is byte-identical
+to its pre-residual output for every `(T, G)` in `T` 0..24 × `G` 1..40. With
+fixed Games it *repairs* them, up to what the remaining meetings allow.
+
+`games_per_team_pairings` is now the empty-calendar case of
+`games_per_team_residual_pairings` and delegates to it, so the generator and
+the completion cannot drift into disagreeing.
+
 ### Feasibility: `T × G` must be even, and odd × odd is REFUSED
 
 Every game is played by two teams, so it contributes 2 to the league-wide
@@ -124,17 +238,18 @@ A proposal echoes **exactly one** of the two, with `None` for the other.
 Echoing a derived value into the unused field would be a second source of
 truth the commit path then has to reconcile.
 
-**Home/away is deterministic, not arbitrary.** Meeting *m* (0-indexed)
-reuses the base round-robin's orientation when *m* is even and reverses it
-when *m* is odd. The `rem` extras are oriented as if they were meeting number
-`base` — the next step in that same alternation. That is what keeps the
-guarantee exact: an extra game added blindly in the base orientation would
-push an odd-`base` pair to a TWO-game imbalance, while following the
-alternation makes even `base` differ by one and odd `base` come out level.
-Two properties follow:
+**Home/away is deterministic, not arbitrary.** The `_HomeLedger` rule (above)
+gives home to whichever side has hosted this pair fewer times, falling back to
+the circle method's own orientation when level. From an empty calendar that is
+identical to the meeting-parity alternation it replaced — meeting *m*
+canonical for even *m*, reversed for odd, with the `rem` extras oriented as
+meeting number `base` — because starting level and alternating are the same
+thing. What the ledger adds is that it starts from the EXISTING Games'
+orientation rather than from zero. Two properties follow:
 
 * every pair's split is balanced to within one game — exactly even whenever
-  the pair meets an even number of times;
+  the pair meets an even number of times — and, when the pair has existing
+  Games, as close to level as the remaining meetings can bring it;
 * the decision reads only the sorted team ids and the format. No RNG, no
   clock, no dict/set iteration order, no store state — so the same inputs
   reproduce the same split in another process, on another store backend,
@@ -157,6 +272,36 @@ fingerprint, so a key present with a `None` value would change the hash of
 every legacy proposal and refuse every scenario stored before #375 as
 `preview_stale`. A regression test pins four legacy fingerprint hexes
 captured from before the field existed.
+
+### The picker offers every ACCEPTED value; feasibility is the backend's answer
+
+`#sched-games` in `web/static/app.js` used to offer only EVEN numbers, so that
+no option could ever be refused: `T × G` must be even, an even `G` satisfies
+that for every `T`, and the screen cannot know a Division's team count before
+Generate runs. That reasoning is sound and the conclusion was still wrong —
+odd `G` is fully feasible for every EVEN team count, so a 4-team Division's
+perfectly ordinary 5-game season was unreachable through the product. Trading
+away a supported format to make a static list unconditionally safe is the
+wrong trade.
+
+The picker now offers every value `_normalize_games_per_team` accepts, odd
+ones included, and feasibility — which depends on the selected Division's live
+team count *and* on the Games it already has, neither of which the screen can
+know in advance — is answered by the backend and **surfaced**:
+`schedFormatRefusalBlock` renders `games_per_team_infeasible` and its two
+residual siblings in place, next to the control, with the achievable counts
+the refusal names. A failed Generate leaves no preview, so Commit is
+unavailable; a successful one clears the block.
+
+`e2e/scheduler-games-per-team.js` drives both halves at desktop and 390×844,
+selecting the option with the **real keyboard** (typeahead — on macOS an arrow
+key opens a native popup headless Chromium never renders): 5 guaranteed games
+on a 4-team Division previews 10 rows with every team on exactly 5, and the
+same request on a 5-team Division surfaces the 4-or-6 guidance with no preview,
+no Commit, no console error and no horizontal overflow. The old "every numeric
+option is even" assertion is replaced by a range check plus an explicit
+anti-vacuity assertion that odd values are actually offered — without which
+the range check would pass on the very list it replaces.
 
 ### The guarantee is over the PAIRING LIST, not over placement
 
@@ -416,7 +561,15 @@ existing Game a given `already_scheduled[]` row reports — and therefore the
 PostgreSQL for identical data. Sorting here is the single point that makes
 the count and its reporting backend-independent.
 
-`_split_already_scheduled` partitions the full computed pairing list
+`_split_already_scheduled` serves the **legacy `meetings_per_opponent`
+format only**. The guaranteed-games format no longer partitions a
+pre-built list at all — it derives the residual from the existing Games
+first (see "The guarantee is the FINAL SEASON TOTAL" above), because a
+consume-against-a-fixed-list split structurally cannot report a pair's
+surplus Games or read their orientation. Everything in the rest of this
+section describes the legacy path, whose behaviour is unchanged.
+
+It partitions the full computed pairing list
 against that index *before* `_assign_ice` ever runs. Each pair's existing
 Games are consumed one per requested meeting, in meeting order: the first
 K requested meetings (K = qualifying Games, capped at the number requested)
@@ -1426,6 +1579,21 @@ names the same fact from either side. `pairing_already_scheduled`,
   no fingerprint supplied at all.
 * `preview_stale` (`ConcurrencyConflictError`) — the wide preview-binding
   gate, fingerprint supplied but no longer matches current state.
+
+The three `games_per_team` refusals (`ValidationError`, all raised in
+`services/scheduler.py` before placement or persistence, so a refused
+Generate *or* Commit writes nothing) are:
+
+* `games_per_team_infeasible` — `T × G` odd; `nearest_achievable` is the
+  list `[G−1, G+1]`, trimmed to the accepted range.
+* `games_per_team_over_scheduled` — a team already plays more than `G`;
+  `over_scheduled_teams[]` names them with their current counts.
+* `games_per_team_residual_infeasible` — a team needs more games than every
+  other team combined can supply; `short_teams[]` names them with
+  `residual_games` and `available_games`.
+
+The latter two carry `nearest_achievable` as the single smallest accepted
+count these existing Games can still be completed to (`null` if none can).
 
 All three are deliberately distinct from `placement_raced` (the pre-lock
 scope-locator staleness reason #313/#314/#318 use, which the retry shell

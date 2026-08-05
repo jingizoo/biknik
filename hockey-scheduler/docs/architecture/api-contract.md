@@ -163,6 +163,26 @@ every game contributes 2 to the league-wide count, so no construction can then
 give every team exactly G — and the message names the nearest achievable counts
 (`G-1`, `G+1`) in `details.nearest_achievable`.
 
+The number guaranteed is the team's **final season total**, counting the
+non-cancelled Regular Games already in scope, so a draft generates only the
+games still MISSING and `already_scheduled[]` reports every counted existing
+Game (one row each, carrying that Game's own home/away). Two further
+`400 validation_error` refusals cover the cases the existing Games make
+impossible — both raised before any placement or persistence, so a refused
+Generate *or* Commit writes nothing at all:
+
+* `details.reason = "games_per_team_over_scheduled"` — at least one team
+  already plays more than `G`, and generation can only add. `details` carries
+  `over_scheduled_teams[]` (`team_id`, `team_name`, `existing_games`).
+* `details.reason = "games_per_team_residual_infeasible"` — some team needs
+  more games than every other team combined can still supply, so the remaining
+  games would have to be played against teams that have reached their own
+  total. `details` carries `short_teams[]` (`team_id`, `team_name`,
+  `residual_games`, `available_games`).
+
+Both carry `details.nearest_achievable`: the smallest accepted `games_per_team`
+these existing Games can still be completed to, or `null` when none can.
+
 `meetings_per_opponent` is the LEGACY spelling (how many times each team plays
 every other) and remains accepted, because stored scenarios replay under it and
 it is the only way to say "play everyone once" without knowing a Division's
