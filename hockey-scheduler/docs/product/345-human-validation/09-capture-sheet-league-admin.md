@@ -201,11 +201,13 @@ they said, step 2 is what they opened.
 
 ## Ease rating — protocol §6's scale, verbatim
 
-Collected once per task, immediately after that task. Ask it with the two fixed
-lines on [06-task-prompts-league-admin.md](06-task-prompts-league-admin.md) — the same
-wording in all three sessions — and read the five anchors below to the
-participant, so the anchor column records **their** mapping rather than your
-interpretation of their number.
+Collected once per task, immediately after that task. Ask it with the wording
+ruled in [12-ease-rating-question.md](12-ease-rating-question.md) — the one
+canonical location, so the question is identical in all three sessions — and
+read the five anchors below to the participant, so the anchor column records
+**their** mapping rather than your interpretation of their number. If that
+ruling block still reads NOT YET RULED, this session should not have started;
+see the pre-flight gate on the environment sheet.
 
 > **Ease rating scale** (record which anchor the participant's number maps to):
 >

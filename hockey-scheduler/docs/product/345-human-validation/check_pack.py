@@ -883,6 +883,7 @@ UNRULED_SENTINEL = "NOT YET RULED"
 RULING_START = "<!-- ease-ruling:start -->"
 RULING_END = "<!-- ease-ruling:end -->"
 EASE_HEADING = "## Immediately after each task — the ease rating"
+EASE_HEADING_SHEET = "## Ease rating — protocol §6's scale, verbatim"
 
 GATE_MARKER = "HARD GATE — the ease-rating wording is ruled and recorded."
 GATE_BLOCKS = "No session starts until this line is PASS."
@@ -925,10 +926,10 @@ def extract_ruling(text: str) -> str | None:
     return "\n---\n".join(quoted)
 
 
-def ease_section(text: str) -> str:
-    if EASE_HEADING not in text:
+def ease_section(text: str, heading: str = EASE_HEADING) -> str:
+    if heading not in text:
         return ""
-    return text.split(EASE_HEADING, 1)[1]
+    return text.split(heading, 1)[1].split("\n---\n", 1)[0]
 
 
 def resolve_ease_wording() -> tuple[str | None, dict[str, str | None]]:
@@ -1094,6 +1095,27 @@ def check_ease_single_source() -> list[str]:
                 f"{sheet}: its ease-rating section does not reference "
                 f"{EASE_CANON}, so it resolves to no ruled wording"
             )
+
+    # The capture sheets tell the moderator where the wording lives too. If they
+    # keep pointing at a role prompt sheet, a facilitator reading only the
+    # capture sheet is sent to a file that no longer carries any wording.
+    for sheet in CAPTURE_SHEETS:
+        section = ease_section(read_pack(sheet), EASE_HEADING_SHEET)
+        if not section:
+            failures.append(f"{sheet}: no ease-rating section found")
+            continue
+        if not re.search(r"\(" + re.escape(EASE_CANON) + r"\)", section):
+            failures.append(
+                f"{sheet}: its ease-rating section does not point at "
+                f"{EASE_CANON} — it sends the moderator somewhere that no "
+                f"longer carries the wording"
+            )
+        for prompt_sheet in TASK_PROMPT_SHEETS:
+            if re.search(r"\(" + re.escape(prompt_sheet) + r"\)", section):
+                failures.append(
+                    f"{sheet}: its ease-rating section still names "
+                    f"{prompt_sheet} as the source of the wording"
+                )
     return failures
 
 
