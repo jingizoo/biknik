@@ -184,13 +184,18 @@ def _inject_row(text: str, anchor: str, row: str) -> str:
         raise AssertionError(
             f"break anchor not found, the mutation would be a no-op: {anchor!r}"
         )
-    return text.replace(anchor, anchor + "\n" + row, 1)
+    return mut(
+        _ACTIVE_BREAK or "(none)",
+        text,
+        text.replace(anchor, anchor + "\n" + row, 1),
+        f"insert row after {anchor!r}",
+    )
 
 
 _IDENTITY_ROW = "| Participant identity (see the privacy rule below) | |"
 
 
-def mut(break_name: str, before: str, after: str, what: str = "") -> str:
+def mut(break_name: str, before, after, what: str = ""):
     """Apply a mutation, and refuse to let it silently do nothing.
 
     A mutation whose anchor text has moved becomes a no-op: the injected defect
@@ -313,9 +318,18 @@ def read_pack(name: str) -> str:
             flex(RULE_NO_RECORDINGS).sub("Reset the browser profile.", text),
         )
 
-    if broken(B_RECORDINGS_PERMITTED):
-        text = flex(RULE_NO_RECORDINGS).sub(
-            "Recording is at the moderator's discretion.", text
+    # Scoped to the capture sheets, which is the surface this mutation's own
+    # check (pii-rules) inspects. It used to run against every file, so on the
+    # files with no such sentence it was a silent no-op — invisible, because
+    # the sheets it did hit kept the check red.
+    if name in CAPTURE_SHEETS and broken(B_RECORDINGS_PERMITTED):
+        text = mut(
+            B_RECORDINGS_PERMITTED,
+            text,
+            flex(RULE_NO_RECORDINGS).sub(
+                "Recording is at the moderator's discretion.", text
+            ),
+            f"drop the no-recording rule from {name}",
         )
     if broken(B_SUPERSESSION_NOTE_MISSING) and flex(
         RULE_SUPERSEDED_IDENTITY
@@ -338,7 +352,12 @@ def read_protocol(filename: str) -> bytes:
     if broken(B_PROTOCOL_DRIFT) and filename == KSR_PROTOCOL:
         # Stand in for "the protocol was corrected upstream and the pack was
         # not re-verified against it" — the pre-#394 K5/S5 failure mode.
-        data = data.replace(b"re-filters", b"re-renders", 1)
+        data = mut(
+            B_PROTOCOL_DRIFT,
+            data,
+            data.replace(b"re-filters", b"re-renders", 1),
+            "reword K5's expected outcome in the protocol",
+        )
     return data
 
 
@@ -1561,13 +1580,30 @@ STRONG_CONTRACT_PHRASE = "own named check"
 def read_ci_workflow() -> str:
     text = CI_WORKFLOW_PATH.read_text(encoding="utf-8")
     if broken(B_WORKFLOW_WEAK_CONTRACT):
-        text = text.replace(
-            "must still make the mutation's own named check fail",
-            "must still make at least one check fail",
+        # The anchor is the comment EXACTLY as it wraps in the file. An earlier
+        # version anchored on the unwrapped sentence, which never matched — so
+        # this half of the mutation injected nothing while the other half kept
+        # the check red. Found only once every edit was forced through mut().
+        text = mut(
+            B_WORKFLOW_WEAK_CONTRACT,
+            text,
+            text.replace(
+                "      #   (b) EVERY --break mutation must still make the "
+                "mutation's own named\n      #       check fail.",
+                "      #   (b) EVERY --break mutation must still make at least "
+                "one check fail.",
+                1,
+            ),
+            "weaken the YAML comment",
         )
-        text = text.replace(
-            "every injected defect must still fail its own named check",
-            "every injected defect must still make a check fail",
+        text = mut(
+            B_WORKFLOW_WEAK_CONTRACT,
+            text,
+            text.replace(
+                "every injected defect must still fail its own named check",
+                "every injected defect must still make a check fail",
+            ),
+            "weaken the emitted log line",
         )
     return text
 
@@ -1614,16 +1650,52 @@ def check_scope_and_ci_contract() -> list[str]:
             )
 
     # --- Direction 2: the workflow must not teach the superseded contract ----
-    for lineno, line in enumerate(workflow.splitlines(), start=1):
+    #
+    # Scanned twice. Line by line catches the emitted `echo` text. Then each
+    # run of consecutive comment lines is unwrapped and scanned as one string,
+    # because a YAML comment wraps at the margin and the phrase this is looking
+    # for straddles the wrap — "... must still make at least one\n#  check
+    # fail." is invisible to a per-line scan, and that is not a hypothetical:
+    # the mutation for this very check had a stale anchor for exactly that
+    # reason. Blocks are joined individually, never the whole file, so two
+    # unrelated comments cannot concatenate into a false match.
+    def _report(lineno: int, label: str, snippet: str) -> None:
+        failures.append(
+            f"{CI_WORKFLOW_PATH.name}:{lineno}: describes the superseded "
+            f"any-check guarantee ({label}) — {snippet[:90]!r}. That is the "
+            f"rule that let a mutation bite the wrong surface while the real "
+            f"defect went unseen; a maintainer reading it could remove "
+            f"BREAK_TARGETS believing the guarantee held"
+        )
+
+    lines = workflow.splitlines()
+    for lineno, line in enumerate(lines, start=1):
         for label, pattern in WEAK_CONTRACT_PATTERNS:
             if re.search(pattern, line, re.IGNORECASE):
-                failures.append(
-                    f"{CI_WORKFLOW_PATH.name}:{lineno}: describes the superseded "
-                    f"any-check guarantee ({label}) — {line.strip()[:90]!r}. That "
-                    f"is the rule that let a mutation bite the wrong surface "
-                    f"while the real defect went unseen; a maintainer reading it "
-                    f"could remove BREAK_TARGETS believing the guarantee held"
-                )
+                _report(lineno, label, line.strip())
+
+    block: list[str] = []
+    block_start = 0
+    for lineno, line in enumerate(lines + [""], start=1):
+        if line.lstrip().startswith("#"):
+            if not block:
+                block_start = lineno
+            block.append(re.sub(r"^\s*#\s?", "", line))
+            continue
+        if block:
+            joined = normalize(" ".join(block))
+            for label, pattern in WEAK_CONTRACT_PATTERNS:
+                match = re.search(pattern, joined, re.IGNORECASE)
+                # Only report if the per-line scan did not already catch it.
+                if match and not any(
+                    re.search(pattern, l, re.IGNORECASE) for l in block
+                ):
+                    _report(
+                        block_start,
+                        f"{label}, wrapped across comment lines",
+                        match.group(0),
+                    )
+            block = []
 
     # --- Direction 3: the workflow must state the real contract, in BOTH the
     # comments a maintainer reads in the file and the text emitted into the
@@ -1644,6 +1716,180 @@ def check_scope_and_ci_contract() -> list[str]:
                 f"actual guarantee ({STRONG_CONTRACT_PHRASE!r}) — the Actions log "
                 f"is the version a maintainer reads when the job fails"
             )
+    return failures
+
+
+# ---------------------------------------------------------------------------
+# Guard the guard: every mutation edit must go through mut().
+#
+# mut() raises when an edit changes nothing, which is how a mutation whose
+# anchor text has drifted gets reported instead of silently injecting nothing.
+# But mut() only protects the edits that actually call it. A raw
+# `text.replace(...)` inside a mutation body has no guard at all: if its anchor
+# moves, the edit becomes a no-op, and the only symptom is a mutation that goes
+# on "passing" for the wrong reason.
+#
+# That is not hypothetical. `readme-denies-ci` performs TWO edits; one anchor
+# moved after a sentence was rewrapped, and because the OTHER edit still fired,
+# the mutation kept failing its check and nothing complained. Comparing the
+# whole before/after cannot see that — each edit has to be guarded on its own.
+#
+# So this check reads this file's own source, finds every mutation body (an
+# `if broken(...)` block, not an `if not broken(...)` block, which is
+# production code the mutation disables), and fails if any of them performs a
+# string replacement outside mut(). Part 1 of the fix converts today's raw
+# edits; this check is the part that stops the next one being added.
+# ---------------------------------------------------------------------------
+
+import ast  # noqa: E402  (kept beside the check that needs it)
+
+B_RAW_REPLACE_IN_MUTATION = register_break(
+    "raw-replace-in-mutation",
+    "reintroduce an unguarded .replace() inside a mutation body",
+    "mutation-guard",
+)
+
+# Calls that are themselves guarded, so a mutation body may use them directly.
+GUARDED_EDIT_CALLS = {"mut", "_inject_row"}
+# Helpers that exist only to perform mutation edits; their bodies are held to
+# the same rule as a mutation body, so the guard cannot be bypassed by moving
+# a raw replacement one function call away.
+MUTATION_HELPERS = {"_inject_row"}
+REPLACEMENT_METHODS = {"replace", "sub", "subn"}
+
+OWN_SOURCE = Path(__file__).resolve()
+
+
+def read_own_source() -> str:
+    text = OWN_SOURCE.read_text(encoding="utf-8")
+    if broken(B_RAW_REPLACE_IN_MUTATION):
+        text = mut(
+            B_RAW_REPLACE_IN_MUTATION,
+            text,
+            text.replace(
+                '        text = mut(\n'
+                '            B_EASE_POINTER_MISSING, text, '
+                'text.replace(f"({EASE_CANON})", "(README.md)")\n'
+                '        )',
+                '        text = text.replace(f"({EASE_CANON})", "(README.md)")',
+                1,
+            ),
+            "un-guard the ease-pointer mutation",
+        )
+    return text
+
+
+def _calls_broken_unnegated(test: ast.expr) -> bool:
+    """True for `if broken(X)` / `if cond and broken(X)`; False for `not broken(X)`."""
+
+    def is_broken_call(node: ast.expr) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "broken"
+        )
+
+    if isinstance(test, ast.UnaryOp) and isinstance(test.op, ast.Not):
+        return False
+    if is_broken_call(test):
+        return True
+    if isinstance(test, ast.BoolOp):
+        return any(is_broken_call(v) for v in test.values)
+    return False
+
+
+def _replacement_calls(node: ast.AST) -> list[ast.Call]:
+    return [
+        n
+        for n in ast.walk(node)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr in REPLACEMENT_METHODS
+    ]
+
+
+def _unguarded_edits(body: list[ast.stmt], where: str) -> list[str]:
+    """Statements in `body` that replace text without going through mut()."""
+    problems = []
+    for stmt in body:
+        for node in ast.walk(stmt):
+            # Returns count: `return text.replace(...)` edits text just as much
+            # as an assignment does, and skipping them left _inject_row's own
+            # replacement unpoliced by the first version of this check.
+            if not isinstance(node, (ast.Assign, ast.AugAssign, ast.Return)):
+                continue
+            value = node.value
+            if value is None or not _replacement_calls(value):
+                continue
+            outermost_is_guarded = (
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Name)
+                and value.func.id in GUARDED_EDIT_CALLS
+            )
+            if not outermost_is_guarded:
+                problems.append(
+                    f"check_pack.py:{node.lineno}: {where} performs a string "
+                    f"replacement outside mut(). An edit with no guard becomes a "
+                    f"silent no-op the moment its anchor text moves, and the "
+                    f"mutation goes on reporting success"
+                )
+    return problems
+
+
+@check("mutation-guard")
+def check_mutation_guard() -> list[str]:
+    """No mutation may edit text without mut() proving the edit landed."""
+    tree = ast.parse(read_own_source(), filename=str(OWN_SOURCE))
+    failures = []
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If) and _calls_broken_unnegated(node.test):
+            failures.extend(
+                _unguarded_edits(node.body, f"mutation body at line {node.lineno}")
+            )
+        if isinstance(node, ast.FunctionDef) and node.name in MUTATION_HELPERS:
+            failures.extend(
+                _unguarded_edits(node.body, f"mutation helper {node.name}()")
+            )
+
+    # Anti-vacuity. If the mutation-body detector ever stops matching — someone
+    # renames `broken()`, or wraps the guards differently — this check would
+    # inspect nothing and report clean, which is the exact failure it exists to
+    # prevent, one level up. So: every mut() call in the file must be one this
+    # walk actually reached. A detector that goes blind drops that count to
+    # zero while the calls are still plainly there.
+    all_mut_calls = [
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Name)
+        and n.func.id == "mut"
+    ]
+    reached: set[int] = set()
+    for node in ast.walk(tree):
+        in_scope = (
+            isinstance(node, ast.If) and _calls_broken_unnegated(node.test)
+        ) or (isinstance(node, ast.FunctionDef) and node.name in MUTATION_HELPERS)
+        if not in_scope:
+            continue
+        for stmt in node.body:
+            for inner in ast.walk(stmt):
+                if (
+                    isinstance(inner, ast.Call)
+                    and isinstance(inner.func, ast.Name)
+                    and inner.func.id == "mut"
+                ):
+                    reached.add(inner.lineno)
+
+    unreached = [c.lineno for c in all_mut_calls if c.lineno not in reached]
+    if unreached:
+        failures.append(
+            f"{len(unreached)} of {len(all_mut_calls)} mut() call(s) sit outside "
+            f"any mutation body this check can see (lines "
+            f"{', '.join(str(l) for l in sorted(unreached))}). Either a guarded "
+            f"edit has escaped its `if broken(...)` block, or the detector has "
+            f"stopped recognising mutation bodies and is now policing nothing"
+        )
     return failures
 
 
@@ -1772,6 +2018,18 @@ PROCEDURES = {
 PROCEDURES["K"]["break"] = B_K_STEP_DRIFT
 PROCEDURES["S"]["break"] = B_S_STEP_DRIFT
 
+# One drift edit per procedure: the exact quoted line, and the single word to
+# change in it. Kept as data so each mutation has exactly one anchor to verify.
+DRIFT_TARGETS = {
+    "K": ("> The dialog opens and focus moves into it.", "into it", "near it"),
+    "S": (
+        '> The toast/status channel (`#toast-root[aria-live="polite"]`) '
+        "announces the success message once.",
+        "once",
+        "at least once",
+    ),
+}
+
 
 def protocol_steps(prefix: str) -> dict[str, tuple[str, str]]:
     """{'K1': (step, expected)} straight out of the protocol's own table."""
@@ -1795,14 +2053,19 @@ def pack_steps(prefix: str) -> dict[str, tuple[str | None, str | None]]:
     text = read_pack(meta["pack_file"])
     if broken(meta["break"]):
         # One word, in one expected outcome — the size of the K5/S5 inversion.
-        target = "> The dialog opens and focus moves into it." if prefix == "K" else (
-            "> The toast/status channel (`#toast-root[aria-live=\"polite\"]`) "
-            "announces the success message once."
+        #
+        # This used to run BOTH substitutions unconditionally against a single
+        # target, so exactly one of them fired per prefix and the other was a
+        # guaranteed no-op. Harmless while the live edit worked, and completely
+        # invisible if the live one ever stopped matching. One edit per prefix
+        # now, each guarded.
+        target, old_word, new_word = DRIFT_TARGETS[prefix]
+        text = mut(
+            meta["break"],
+            text,
+            text.replace(target, target.replace(old_word, new_word), 1),
+            f"reword {prefix}-step expected outcome ({old_word!r} -> {new_word!r})",
         )
-        if target not in text:
-            raise AssertionError(f"drift mutation anchor not found: {target!r}")
-        text = text.replace(target, target.replace("once", "at least once"), 1)
-        text = text.replace(target, target.replace("into it", "near it"), 1)
 
     out: dict[str, tuple[str | None, str | None]] = {}
     sections = re.split(r"(?m)^### (" + prefix + r"\d+)$", text)

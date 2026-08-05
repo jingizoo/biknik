@@ -335,6 +335,7 @@ What it covers, and why each one is executable rather than a paragraph:
 | `ease-readiness`, `ease-single-source`, `ease-preflight-gate` | a session starting on an unruled ease wording, three role sheets drifting to three different questions, or the README going back to saying nothing blocks |
 | `recording-consistency` | any pack-authored instruction, in any file, drifting back to permitting recording — or an operational file simply going quiet about it |
 | `blockquote-is-protocol-text` | pack-authored text smuggled behind a `>`, which would give it protocol authority and hide it from every check that separates the two |
+| `mutation-guard` | a mutation editing text without `mut()` proving the edit landed — an unguarded edit silently stops injecting anything the moment its anchor moves, and the mutation goes on reporting success |
 | `protocol-pin`, `pin-present` | either protocol changing by one byte while this pack goes on quoting the old text |
 | `ksr-steps-verbatim` | any of the 17 K steps or 14 S steps drifting from the protocol's own wording |
 
@@ -357,6 +358,15 @@ fixture tripped two guards so blinding one changed nothing. Both are checks
 reporting green while testing nothing, which is the failure this whole file
 exists to prevent — and neither was caught by reading the checker. One was
 caught by a mutation, the other by a human reading the runbooks end to end.
+
+**The mutations need the same treatment as the checks.** A mutation whose
+anchor text has moved injects nothing, and looks exactly like one that works.
+So every edit a mutation makes goes through `mut()`, which raises when the edit
+changes nothing, and `mutation-guard` reads this checker's own source and fails
+if any mutation body edits text outside `mut()`. Per edit, not per mutation:
+a mutation with two edits, one of whose anchors had moved, kept its check red
+on the strength of the surviving edit and reported success — which is how one
+of them sat here half-working until every edit was forced through the guard.
 
 ## Scope
 
