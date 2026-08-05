@@ -598,10 +598,15 @@ class _ScenarioContract:
         `schedule_scenario_stale` from the snapshot. Both fields are
         therefore added only when games-per-team is the operative format.
 
-        A genuine pre-#375 record is reconstructed by deleting the new key
-        from ALL THREE places the old code never wrote it — `request_input`,
-        `proposal`, and `generation_snapshot.planner_input` — and re-deriving
-        the two fingerprints over the stripped halves. Then it is COMMITTED,
+        A genuine pre-#375 record is reconstructed across ALL THREE places
+        the old code never wrote the new key. Two of them are DELETED from
+        (`request_input` and `proposal`); the third,
+        `generation_snapshot.planner_input`, is ASSERTED ABSENT instead,
+        because `material_input_snapshot` already omits the key when
+        games-per-team is not the operative format — there is nothing to
+        strip, and that omission is itself half of what is under test. The
+        two fingerprints are then re-derived over the stripped halves. Then
+        it is COMMITTED,
         so the assertion runs through `_guard_material_inputs` and the
         fingerprint gate rather than stopping at the replay resolver.
 

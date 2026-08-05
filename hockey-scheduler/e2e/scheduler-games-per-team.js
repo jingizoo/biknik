@@ -555,7 +555,7 @@ async function main() {
     for (const viewport of VIEWPORTS) await checkViewport(browser, viewport);
     console.log("Scheduler games-per-team browser journey passed.");
   } catch (error) {
-    console.error("Scheduler meetings-format browser journey FAILED.");
+    console.error("Scheduler games-per-team browser journey FAILED.");
     console.error(error && error.message ? error.message : error);
     process.exitCode = 1;
   } finally {

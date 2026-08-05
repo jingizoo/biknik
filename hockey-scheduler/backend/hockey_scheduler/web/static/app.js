@@ -8989,13 +8989,30 @@ function renderScheduler(ov) {
           // refusal already names the nearest achievable counts, so an
           // operator who picks an impossible one is told what to pick
           // instead rather than never being allowed to ask.
-          [{ value: "rr", label: "Single round-robin (play everyone once)" }]
-            .concat(SCHED_GAMES_OPTIONS
-              .map((n) => ({ value: String(n), label: `${n} guaranteed game${n === 1 ? "" : "s"} per team` })))
-            .map((opt) => `<option value="${opt.value}"${
-              opt.value === (schedulerState.gamesPerTeam === null
-                ? "rr" : String(schedulerState.gamesPerTeam)) ? " selected" : ""
-            }>${opt.label}</option>`).join("")
+          // The two kinds of option are separated into labelled GROUPS
+          // because the control's accessible name is only true of one of
+          // them (#375 review). A screen-reader user hears "Guaranteed
+          // games per team" and then, on the first option, something that
+          // is not a games-per-team value at all. The name is the one the
+          // owner directed and is right for every numeric option, so the
+          // group label carries the distinction instead of the name moving:
+          // "Round-robin formats" is announced with the round-robin option,
+          // and nothing about the numeric options changes.
+          (() => {
+            const selected = schedulerState.gamesPerTeam === null
+              ? "rr" : String(schedulerState.gamesPerTeam);
+            const opt = (value, label) => `<option value="${value}"${
+              value === selected ? " selected" : ""}>${label}</option>`;
+            return `<optgroup label="Round-robin formats">${
+              opt("rr", "Single round-robin (play everyone once)")
+            }</optgroup><optgroup label="Guaranteed games per team">${
+              SCHED_GAMES_OPTIONS
+                .map((n) => opt(
+                  String(n),
+                  `${n} guaranteed game${n === 1 ? "" : "s"} per team`))
+                .join("")
+            }</optgroup>`;
+          })()
         }</select>
         <label class="sr-only" for="sched-turnaround">Minimum turnaround between a team's games</label>
         <select id="sched-turnaround" title="Minimum turnaround between a team's games">${
