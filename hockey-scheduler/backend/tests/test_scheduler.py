@@ -38,7 +38,10 @@ from hockey_scheduler.domain import (
     Team,
     Venue,
 )
-from hockey_scheduler.domain.errors import ScheduleConflictError
+from hockey_scheduler.domain.errors import (
+    ScheduleConflictError,
+    ValidationError,
+)
 from hockey_scheduler.store import InMemoryStore, SqlStore
 from hockey_scheduler.services import (
     draft_schedule,
@@ -46,6 +49,7 @@ from hockey_scheduler.services import (
     round_robin_pairings,
 )
 from hockey_scheduler.services.scheduler import (
+    MAX_GAMES_PER_TEAM,
     MAX_MEETINGS_PER_OPPONENT,
     _draft_fingerprint,
 )
@@ -2589,6 +2593,341 @@ class SchedulerContract:
             self.assertEqual(res.get("error", {}).get("code"),
                              "validation_error", f"{bad!r}: {res!r}")
 
+    # -- GUARANTEED GAMES PER TEAM (#375) ---------------------------------
+    # The operator-facing inversion. `meetings_per_opponent` above says how
+    # many times a team plays each opponent and lets games-per-team fall out
+    # as N x (T-1); `games_per_team` says how many games the operator's own
+    # team is guaranteed and derives the per-opponent count. The pairing
+    # generator's own properties are proved exhaustively in
+    # test_scheduler_games_per_team.py; what these assert is the CONTRACT --
+    # that the number survives the draft path, the fingerprint, and both
+    # commit paths intact.
+
+    def _per_team_counts(self, res):
+        """``{team_id: games}`` over a proposal's PLACED rows — the
+        guarantee as the operator experiences it, not as the generator
+        states it."""
+        counts = {}
+        for d in res["draft_games"]:
+            for tid in (d["home_team_id"], d["away_team_id"]):
+                counts[tid] = counts.get(tid, 0) + 1
+        return counts
+
+    def test_owner_example_two_teams_twenty_games(self):
+        # T=2, G=20 -> the two teams meet 20 times; 20 games total.
+        self._division_fixture(2, 20)
+        res = self.api.draft_season_schedule(
+            division_id="div1", games_per_team=20)
+        self.assertEqual(res["unscheduled"], [], repr(res))
+        self.assertEqual(len(res["draft_games"]), 20)
+        self.assertEqual(set(self._per_team_counts(res).values()), {20})
+        self.assertEqual(set(self._meeting_counts(res).values()), {20})
+
+    def test_owner_example_five_teams_twenty_games(self):
+        # T=5, G=20 -> 20 // 4 = 5, rem 0; every pair meets 5x; 50 total.
+        self._division_fixture(5, 50)
+        res = self.api.draft_season_schedule(
+            division_id="div1", games_per_team=20)
+        self.assertEqual(res["unscheduled"], [], repr(res))
+        self.assertEqual(len(res["draft_games"]), 50)
+        self.assertEqual(set(self._per_team_counts(res).values()), {20})
+        self.assertEqual(set(self._meeting_counts(res).values()), {5})
+
+    def test_owner_example_twenty_teams_twenty_games(self):
+        # T=20, G=20 -> 20 // 19 = 1, rem 1; everyone meets once (19 games)
+        # plus one extra each (10 more games); 200 games total.
+        self._division_fixture(20, 200)
+        res = self.api.draft_season_schedule(
+            division_id="div1", games_per_team=20)
+        self.assertEqual(res["unscheduled"], [], repr(res))
+        self.assertEqual(len(res["draft_games"]), 200)
+        self.assertEqual(set(self._per_team_counts(res).values()), {20})
+        # 190 pairs meet once, 10 meet twice -- the rem=1 perfect matching.
+        counts = self._meeting_counts(res)
+        self.assertEqual(len(counts), 190)  # C(20,2)
+        self.assertEqual(sorted(counts.values()).count(2), 10)
+
+    def test_the_guarantee_survives_a_shortfall_of_ice(self):
+        # #375's guarantee is over the PAIRING LIST, not over placement.
+        # With too little ice the missing rows land in `unscheduled` with
+        # reasons (#379) -- they are not silently dropped, and the two
+        # buckets together still honour the guarantee. Making PLACEMENT
+        # guaranteed would be new planner policy and is out of scope (#206).
+        self._division_fixture(4, 6)  # T=4, G=6 needs 12 rows, 6 slots exist
+        res = self.api.draft_season_schedule(
+            division_id="div1", games_per_team=6)
+        self.assertEqual(len(res["draft_games"]), 6)
+        self.assertEqual(len(res["unscheduled"]), 6)
+        counts = {}
+        for row in res["draft_games"] + res["unscheduled"]:
+            for tid in (row["home_team_id"], row["away_team_id"]):
+                counts[tid] = counts.get(tid, 0) + 1
+        self.assertEqual(set(counts.values()), {6})
+        for row in res["unscheduled"]:
+            self.assertTrue(row.get("reason"), repr(row))
+
+    def test_odd_teams_and_odd_games_is_refused_naming_the_neighbours(self):
+        # The mathematical heart: every game contributes 2 to the league-wide
+        # count, so T x G must be even. Refused rather than delivered uneven
+        # under a control labelled "guaranteed".
+        self._division_fixture(5, 60)
+        res = self.api.draft_season_schedule(
+            division_id="div1", games_per_team=21)
+        details = res.get("error", {}).get("details", {})
+        self.assertEqual(details.get("reason"), "games_per_team_infeasible",
+                         repr(res))
+        self.assertEqual(details.get("nearest_achievable"), [20, 22])
+        self.assertIn("20 or 22", res["error"]["message"])
+        self.assertEqual(self.store.all_games(), [])
+
+    def test_even_team_count_accepts_every_odd_request(self):
+        # Anti-vacuity control for the refusal above: the parity rule is
+        # about T x G, not about G being odd. An even Division takes 21.
+        self._division_fixture(4, 42)
+        res = self.api.draft_season_schedule(
+            division_id="div1", games_per_team=21)
+        self.assertNotIn("error", res, repr(res))
+        self.assertEqual(set(self._per_team_counts(res).values()), {21})
+
+    def test_sending_both_formats_is_refused_not_reconciled(self):
+        self._division_fixture(4, 24)
+        res = self.api.draft_season_schedule(
+            division_id="div1", games_per_team=6, meetings_per_opponent=2)
+        self.assertEqual(
+            res.get("error", {}).get("details", {}).get("reason"),
+            "schedule_format_conflict", repr(res))
+        # Even when the two AGREE arithmetically for this Division (T=4:
+        # 2 meetings x 3 opponents = 6 games), because they stop agreeing
+        # the moment a League's Divisions differ in size.
+        self.assertEqual(self.store.all_games(), [])
+
+    def test_invalid_games_per_team_is_a_structured_error(self):
+        self._division_fixture(4, 6)
+        for bad in (0, -1, True, 1.5, "3", MAX_GAMES_PER_TEAM + 1):
+            res = self.api.draft_season_schedule(
+                division_id="div1", games_per_team=bad)
+            self.assertEqual(res.get("error", {}).get("code"),
+                             "validation_error", f"{bad!r}: {res!r}")
+
+    def test_proposal_echoes_exactly_one_operative_format(self):
+        # The two fields are alternatives, never both — the commit path and
+        # the scenario record both read them back off the proposal, so an
+        # echoed derived value would be a second source of truth.
+        self._division_fixture(4, 24)
+        games = self.api.draft_season_schedule(
+            division_id="div1", games_per_team=6)
+        self.assertEqual(games["games_per_team"], 6)
+        self.assertIsNone(games["meetings_per_opponent"])
+        legacy = self.api.draft_season_schedule(
+            division_id="div1", meetings_per_opponent=2)
+        self.assertEqual(legacy["meetings_per_opponent"], 2)
+        self.assertIsNone(legacy["games_per_team"])
+        default = self.api.draft_season_schedule(division_id="div1")
+        self.assertEqual(default["meetings_per_opponent"], 1)
+        self.assertIsNone(default["games_per_team"])
+
+    def test_games_per_team_changes_the_draft_fingerprint(self):
+        # Bound directly, not merely inferred from the row lists: the two
+        # requests below place a DIFFERENT number of rows, but the point is
+        # that the format itself is part of what was reviewed.
+        self._division_fixture(4, 24)
+        six = self.api.draft_season_schedule(
+            division_id="div1", games_per_team=6)
+        nine = self.api.draft_season_schedule(
+            division_id="div1", games_per_team=9)
+        self.assertNotEqual(six["draft_fingerprint"],
+                            nine["draft_fingerprint"])
+
+    def test_games_per_team_and_the_equivalent_legacy_format_differ(self):
+        # T=4: games_per_team=6 and meetings_per_opponent=2 produce the SAME
+        # 12 pairings. Their fingerprints must still differ, because what the
+        # operator asked for differs and the commit must be refused if the
+        # request shape changed between preview and commit.
+        self._division_fixture(4, 24)
+        games = self.api.draft_season_schedule(
+            division_id="div1", games_per_team=6)
+        legacy = self.api.draft_season_schedule(
+            division_id="div1", meetings_per_opponent=2)
+        self.assertEqual(len(games["draft_games"]),
+                         len(legacy["draft_games"]))
+        self.assertNotEqual(games["draft_fingerprint"],
+                            legacy["draft_fingerprint"])
+
+    def _commit_refuses_format_swap(self, api_cls):
+        """Preview under one format, commit under another — refused.
+
+        Run against BOTH facades on purpose. `api/league_scoped_service.py`
+        SHADOWS `api/service.py` at runtime (MRO: hierarchy_import ->
+        league_scoped -> service) and reimplements the whole commit body, so
+        a format bound in only one of them is either dead code or an
+        unenforced parameter. This repo has shipped exactly that mistake
+        before (#390's turnaround, #382's format).
+        """
+        self._division_fixture(4, 24)
+        api = api_cls(self.store)
+        preview = api.draft_season_schedule(
+            division_id="div1", games_per_team=6)
+        res = api.commit_draft_schedule(
+            division_id="div1",
+            draft_fingerprint=preview["draft_fingerprint"],
+            games_per_team=9)
+        self.assertEqual(res.get("error", {}).get("details", {}).get("reason"),
+                         "preview_stale", repr(res))
+        self.assertEqual(self.store.all_games(), [])
+
+    def test_league_scoped_commit_refuses_a_games_per_team_swap(self):
+        self._commit_refuses_format_swap(ApiService)
+
+    def test_base_facade_commit_refuses_a_games_per_team_swap(self):
+        self._commit_refuses_format_swap(BaseApiService)
+
+    def _commit_refuses_dropping_games_per_team(self, api_cls):
+        """Dropping the format at commit is the SAME defect as changing it:
+        the commit's own regeneration would fall back to a single
+        round-robin and persist a quarter of the reviewed batch."""
+        self._division_fixture(4, 24)
+        api = api_cls(self.store)
+        preview = api.draft_season_schedule(
+            division_id="div1", games_per_team=6)
+        res = api.commit_draft_schedule(
+            division_id="div1",
+            draft_fingerprint=preview["draft_fingerprint"])
+        self.assertEqual(res.get("error", {}).get("details", {}).get("reason"),
+                         "preview_stale", repr(res))
+        self.assertEqual(self.store.all_games(), [])
+
+    def test_league_scoped_commit_refuses_dropping_games_per_team(self):
+        self._commit_refuses_dropping_games_per_team(ApiService)
+
+    def test_base_facade_commit_refuses_dropping_games_per_team(self):
+        self._commit_refuses_dropping_games_per_team(BaseApiService)
+
+    def _commits_the_guaranteed_batch(self, api_cls):
+        self._division_fixture(4, 24)
+        api = api_cls(self.store)
+        res = commit_fresh_draft(api, "div1", games_per_team=6)
+        self.assertNotIn("error", res, repr(res))
+        self.assertEqual(len(res["created"]), 12)  # 4 x 6 / 2
+        counts = {}
+        for game in self.store.all_games():
+            for tid in (game.home_team_id, game.away_team_id):
+                counts[tid] = counts.get(tid, 0) + 1
+        self.assertEqual(set(counts.values()), {6})
+
+    def test_league_scoped_commit_persists_the_guaranteed_batch(self):
+        self._commits_the_guaranteed_batch(ApiService)
+
+    def test_base_facade_commit_persists_the_guaranteed_batch(self):
+        self._commits_the_guaranteed_batch(BaseApiService)
+
+    def test_regenerating_after_a_partial_commit_is_a_no_op(self):
+        # Existing Regular Games count toward the guarantee, exactly as they
+        # do for the legacy format, so a second Generate proposes nothing.
+        self._division_fixture(4, 24)
+        first = commit_fresh_draft(self.api, "div1", games_per_team=6)
+        self.assertEqual(len(first["created"]), 12)
+        again = self.api.draft_season_schedule(
+            division_id="div1", games_per_team=6)
+        self.assertEqual(again["draft_games"], [])
+        self.assertEqual(again["unscheduled"], [])
+        self.assertEqual(len(again["already_scheduled"]), 12)
+
+    def test_league_wide_draft_derives_per_division_team_count(self):
+        # The point of the control: 4 Gold teams and 2 Silver teams asked
+        # for the same 6 guaranteed games derive DIFFERENT per-opponent
+        # counts (2 meetings vs 6), and still never pair across Divisions.
+        self._base()
+        self.store.add_league(League(id="lg1", program_id="prog1",
+                                     name="League"))
+        self.store.add_league_season(LeagueSeason(
+            id="ls_lg1_se1", league_id="lg1", season_id="se1"))
+        self.store.add_division(Division(
+            id="gold", league_season_id="ls_lg1_se1", name="Gold"))
+        self.store.add_division(Division(
+            id="silver", league_season_id="ls_lg1_se1", name="Silver"))
+        for i in range(4):
+            self.store.add_team(Team(id=f"g{i}", name=f"Gold {i}",
+                                     program_id="prog1", league_id="lg1"))
+            self.store.add_season_team_registration(SeasonTeamRegistration(
+                id=f"streg_g{i}", league_season_id="ls_lg1_se1",
+                team_id=f"g{i}", division_id="gold", active=True))
+        for i in range(2):
+            self.store.add_team(Team(id=f"s{i}", name=f"Silver {i}",
+                                     program_id="prog1", league_id="lg1"))
+            self.store.add_season_team_registration(SeasonTeamRegistration(
+                id=f"streg_s{i}", league_season_id="ls_lg1_se1",
+                team_id=f"s{i}", division_id="silver", active=True))
+        self._slots(40)
+        res = draft_schedule_for_league(
+            self.store, "se1", "lg1", games_per_team=6)
+        self.assertEqual(res["unscheduled"], [], repr(res))
+        # Gold: 4 x 6 / 2 = 12 rows. Silver: 2 x 6 / 2 = 6 rows.
+        self.assertEqual(len(res["draft_games"]), 18)
+        counts = self._per_team_counts(res)
+        self.assertEqual(set(counts.values()), {6})
+        for d in res["draft_games"]:
+            pair = {d["home_team_id"], d["away_team_id"]}
+            self.assertTrue(
+                pair <= {"g0", "g1", "g2", "g3"} or pair <= {"s0", "s1"},
+                f"league-wide games-per-team draft paired across Divisions: "
+                f"{pair}")
+        meetings = self._meeting_counts(res)
+        gold = {k: v for k, v in meetings.items()
+                if next(iter(k)).startswith("g")}
+        silver = {k: v for k, v in meetings.items()
+                  if next(iter(k)).startswith("s")}
+        self.assertEqual(set(gold.values()), {2})   # 6 // 3 opponents
+        self.assertEqual(set(silver.values()), {6})  # 6 // 1 opponent
+
+    def test_league_wide_draft_refuses_when_one_division_cannot_honour_it(self):
+        # A guarantee honoured in one Division and not the other is not a
+        # guarantee. The refusal NAMES the Division so the operator knows
+        # which one to change.
+        self._league_two_divisions_fixture(per_division=3, n_slots=40)
+        # The raw service function raises; the facade below serializes the
+        # same refusal. Both are asserted, because the facade is what the
+        # HTTP route returns and the raise is what stops generation.
+        with self.assertRaises(ValidationError) as caught:
+            draft_schedule_for_league(
+                self.store, "se1", "lg1", games_per_team=5)
+        self.assertEqual(caught.exception.details["reason"],
+                         "games_per_team_infeasible")
+        self.assertIn("Gold", str(caught.exception))
+        self.assertEqual(caught.exception.details["nearest_achievable"],
+                         [4, 6])
+        res = self.api.draft_season_schedule(
+            season_id="se1", league_id="lg1", games_per_team=5)
+        self.assertEqual(
+            res.get("error", {}).get("details", {}).get("reason"),
+            "games_per_team_infeasible", repr(res))
+        self.assertEqual(self.store.all_games(), [])
+
+    def test_legacy_meetings_fingerprints_are_byte_identical_to_before(self):
+        """#381 persists whole proposals — including `draft_fingerprint` —
+        inside named scenarios, and the commit gate recomputes that hash and
+        refuses any difference. So adding the games-per-team field to the
+        fingerprint payload had to leave every LEGACY payload untouched, or
+        every scenario stored before this change would commit as
+        `preview_stale`: the same breakage as deleting the legacy field,
+        only harder to attribute.
+
+        These four hexes were captured from origin/main BEFORE the field
+        existed. They are hard-coded on purpose — a recomputed expectation
+        would move in lockstep with the code and prove nothing.
+        """
+        for meetings, expected in ((1, "ebe5a7f6d7f772bb"),
+                                   (2, "889304d9403bb119"),
+                                   (3, "d846c12971824579")):
+            self.assertEqual(
+                _draft_fingerprint("ls1", ["t0", "t1", "t2", "t3"], [], [],
+                                   [], [], meetings,
+                                   min_turnaround_minutes=0.0),
+                expected, f"legacy meetings={meetings} fingerprint moved")
+        self.assertEqual(
+            _draft_fingerprint("ls1", ["t0", "t1"], [], [], [], [],
+                               min_turnaround_minutes=0.0),
+            "d0f0c783babf79e0", "legacy default fingerprint moved")
+
 
 class MemorySchedulerTest(SchedulerContract, unittest.TestCase):
     def make_store(self):
@@ -2707,15 +3046,18 @@ class SchedulerHttpTest(unittest.TestCase):
 
     # -- draft_fingerprint IS a breaking change to the Commit request
     # contract, over real HTTP (#328 review round 9) ------------------------
-    def _build_committable_division(self, c, n_slots=1):
-        """A small Division with two Teams and ``n_slots`` open ice slots,
+    def _build_committable_division(self, c, n_slots=1, n_teams=2):
+        """A small Division with ``n_teams`` Teams and ``n_slots`` open ice slots,
         built entirely through real setup HTTP calls (not direct store
         writes) -- every id these routes hand back is freshly sequential, so
         repeated calls across tests in this class never collide.
 
         ``n_slots`` (#375) exists because a multi-meeting format needs one
         slot per meeting; it defaults to the single slot every pre-#375
-        caller in this class already relies on."""
+        caller in this class already relies on. ``n_teams`` (#375) exists
+        because the games-per-team parity refusal needs an ODD team count to
+        be reachable at all; it defaults to the two teams every earlier
+        caller relies on."""
         def post(path, body):
             status, resp = self._req(c, "POST", path, body)
             self.assertEqual(status, 200, repr(resp))
@@ -2743,11 +3085,10 @@ class SchedulerHttpTest(unittest.TestCase):
         # the legacy-vocabulary PROGRAM created above -- /api/setup/league.)
         post("/api/context",
              {"program_id": league["id"], "season_id": season["id"]})
-        t0 = post("/api/v2/setup/team",
-                  {"club_id": club["id"], "league_id": level["id"], "name": "HCC A"})
-        t1 = post("/api/v2/setup/team",
-                  {"club_id": club["id"], "league_id": level["id"], "name": "HCC B"})
-        for team in (t0, t1):
+        for index in range(n_teams):
+            team = post("/api/v2/setup/team", {
+                "club_id": club["id"], "league_id": level["id"],
+                "name": f"HCC {chr(ord('A') + index)}"})
             post(f"/api/setup/seasons/{season['id']}/team-registrations",
                  {"team_id": team["id"], "division_id": division["id"]})
         venue = post("/api/setup/venue",
@@ -2881,6 +3222,101 @@ class SchedulerHttpTest(unittest.TestCase):
             body["error"]["details"]["reason"], "preview_stale", repr(body))
         self.assertEqual(
             len(srv.STATE.api.store.all_games()), games_before, repr(body))
+
+    def test_games_per_team_round_trips_over_http(self):
+        """#375 -- the OPERATOR-FACING format survives the REAL transport on
+        BOTH routes. `_build_committable_division` builds a 2-team Division,
+        so `games_per_team: 3` means the pair meets 3 times -- the same three
+        rows the legacy `meetings_per_opponent: 3` produces here, which is
+        exactly why the Commit assertion below matters: the two requests are
+        DIFFERENT formats with different fingerprints even when they place
+        identical rows, so a Commit that forwarded the wrong one (or none)
+        could not match and would fail preview_stale instead of creating
+        three Games."""
+        c = self._client()
+        self._req(c, "POST", "/api/auth/login",
+                  {"username": "admin", "password": "demo"})
+        div = self._build_committable_division(c, n_slots=3)
+        status, preview = self._req(c, "POST", "/api/scheduler/draft", {
+            "division_id": div, "games_per_team": 3})
+        self.assertEqual(status, 200, repr(preview))
+        self.assertEqual(preview["games_per_team"], 3, repr(preview))
+        self.assertIsNone(preview["meetings_per_opponent"], repr(preview))
+        self.assertEqual(len(preview["draft_games"]), 3, repr(preview))
+        counts = {}
+        for d in preview["draft_games"]:
+            for tid in (d["home_team_id"], d["away_team_id"]):
+                counts[tid] = counts.get(tid, 0) + 1
+        self.assertEqual(set(counts.values()), {3}, repr(preview))
+
+        status, body = self._req(c, "POST", "/api/scheduler/commit", {
+            "division_id": div, "games_per_team": 3,
+            "draft_fingerprint": preview["draft_fingerprint"]})
+        self.assertEqual(status, 200, repr(body))
+        self.assertEqual(len(body["created"]), 3, repr(body))
+
+    def test_committing_a_games_per_team_preview_as_legacy_is_refused(self):
+        """The two spellings are not interchangeable at Commit even when
+        they place the same rows: the reviewed REQUEST is part of the
+        fingerprint, so swapping spelling between Generate and Commit is
+        refused rather than silently accepted."""
+        c = self._client()
+        self._req(c, "POST", "/api/auth/login",
+                  {"username": "admin", "password": "demo"})
+        div = self._build_committable_division(c, n_slots=3)
+        status, preview = self._req(c, "POST", "/api/scheduler/draft", {
+            "division_id": div, "games_per_team": 3})
+        self.assertEqual(status, 200, repr(preview))
+        games_before = len(srv.STATE.api.store.all_games())
+        status, body = self._req(c, "POST", "/api/scheduler/commit", {
+            "division_id": div, "meetings_per_opponent": 3,
+            "draft_fingerprint": preview["draft_fingerprint"]})
+        self.assertEqual(status, 409, repr(body))
+        self.assertEqual(body["error"]["details"]["reason"], "preview_stale",
+                         repr(body))
+        self.assertEqual(len(srv.STATE.api.store.all_games()), games_before)
+
+    def test_sending_both_formats_over_http_is_refused(self):
+        c = self._client()
+        self._req(c, "POST", "/api/auth/login",
+                  {"username": "admin", "password": "demo"})
+        div = srv.STATE.api.store.all_divisions()[0].id
+        self._select_division_context(c, div)
+        status, body = self._req(c, "POST", "/api/scheduler/draft", {
+            "division_id": div, "games_per_team": 4,
+            "meetings_per_opponent": 4})
+        self.assertEqual(status, 400, repr(body))
+        self.assertEqual(body["error"]["details"]["reason"],
+                         "schedule_format_conflict", repr(body))
+
+    def test_infeasible_games_per_team_is_refused_over_http(self):
+        """The parity refusal reaches the operator as a 400 naming the two
+        nearest achievable counts, not as a silently uneven schedule."""
+        c = self._client()
+        self._req(c, "POST", "/api/auth/login",
+                  {"username": "admin", "password": "demo"})
+        div = self._build_committable_division(c, n_slots=3, n_teams=3)
+        status, body = self._req(c, "POST", "/api/scheduler/draft", {
+            "division_id": div, "games_per_team": 5})
+        self.assertEqual(status, 400, repr(body))
+        self.assertEqual(body["error"]["details"]["reason"],
+                         "games_per_team_infeasible", repr(body))
+        self.assertEqual(body["error"]["details"]["nearest_achievable"],
+                         [4, 6], repr(body))
+        self.assertIn("4 or 6", body["error"]["message"])
+
+    def test_invalid_games_per_team_is_rejected_over_http(self):
+        c = self._client()
+        self._req(c, "POST", "/api/auth/login",
+                  {"username": "admin", "password": "demo"})
+        div = srv.STATE.api.store.all_divisions()[0].id
+        self._select_division_context(c, div)
+        for bad in (0, -2, "many", 2.5, True, MAX_GAMES_PER_TEAM + 1):
+            status, body = self._req(c, "POST", "/api/scheduler/draft", {
+                "division_id": div, "games_per_team": bad})
+            self.assertEqual(status, 400, f"{bad!r}: {body!r}")
+            self.assertEqual(body["error"]["code"], "validation_error",
+                             f"{bad!r}: {body!r}")
 
     def test_invalid_meetings_per_opponent_is_rejected_over_http(self):
         c = self._client()
