@@ -269,6 +269,23 @@ def read_pack(name: str) -> str:
             "that?\n```\n",
             "append a local copy of the ease wording",
         )
+    if name == EASE_CANON and broken(B_EASE_RULING_STALE_PROSE):
+        # Injected into "## The ruling", NOT into the historical rationale
+        # section. The check exempts headings marked historical, so a mutation
+        # landing there would prove nothing — it would be testing an exempt
+        # surface. The live defect is pending prose in the section a reader
+        # acts on, which is what actually shipped.
+        text = mut(
+            B_EASE_RULING_STALE_PROSE,
+            text,
+            text.replace(
+                "**To CHANGE an already-ratified wording**",
+                "To rule: replace the contents of both fenced blocks above with "
+                "the exact words to be spoken, and fill in the table.\n\n"
+                "**To CHANGE an already-ratified wording**",
+                1,
+            ),
+        )
     if name == "08-task-prompts-coach.md" and broken(B_EASE_POINTER_MISSING):
         text = mut(
             B_EASE_POINTER_MISSING, text, text.replace(f"({EASE_CANON})", "(README.md)")
@@ -1003,6 +1020,12 @@ B_EASE_LOCAL_COPY = register_break(
     "give the Arena Manager prompt sheet its own copy of the ease wording again",
     "ease-single-source",
 )
+B_EASE_RULING_STALE_PROSE = register_break(
+    "ease-ruling-stale-prose",
+    "restore the pre-ruling claim that no wording is ratified, as live prose",
+    "ease-readiness",
+)
+
 B_EASE_POINTER_MISSING = register_break(
     "ease-pointer-missing",
     "drop the Coach prompt sheet's reference to the canonical ease wording",
@@ -1206,7 +1229,53 @@ def check_ease_readiness() -> list[str]:
                 f"readiness fixture {label!r}: refused the session without saying "
                 f"why — a gate with no reason cannot be cleared"
             )
+    failures.extend(_ease_prose_agrees_with_ruling())
     return failures
+
+
+# Pending-state prose. Each of these is TRUE before the wording is ruled and
+# FALSE after. Left live in a ruled document they contradict the ruling three
+# lines away — which is exactly what shipped in the first ratification commit
+# and had to be caught by a human reading the file end to end.
+_EASE_PENDING_PROSE = (
+    "has ratified no wording",
+    "no wording is ratified",
+    "To rule:",
+    "Fill in every field",
+    "is a **proposal**",
+    "for the owner to accept or replace",
+    "It has no force until it is copied",
+)
+
+
+def _ease_prose_agrees_with_ruling() -> list[str]:
+    """Once the ruling is populated, no pending-state prose may remain live.
+
+    A section counts as historical only if its own `##` heading says so. That
+    is deliberately a heading-level marker rather than a per-sentence one: a
+    reader skimming for what to do reads headings, and a disclaimer buried
+    mid-paragraph does not stop them acting on the instruction beneath it.
+    """
+    text = read_pack(EASE_CANON)
+    if UNRULED_SENTINEL in text:
+        return []                      # not ruled yet; pending prose is correct
+    problems, heading, historical = [], "(top)", False
+    for i, line in enumerate(text.split("\n"), 1):
+        if line.startswith("## "):
+            heading = line[3:].strip()
+            historical = "historical" in heading.lower()
+        if historical:
+            continue
+        for pat in _EASE_PENDING_PROSE:
+            if pat in line:
+                problems.append(
+                    f"{EASE_CANON}:{i}: the ruling is populated, but this line "
+                    f"still states the pre-ruling case ({pat!r}) outside a "
+                    f"section whose heading marks it historical — the document "
+                    f"tells a reader both that the wording is ruled and that "
+                    f"they must rule it\n      under heading: {heading!r}"
+                )
+    return problems
 
 
 @check("ease-single-source")
