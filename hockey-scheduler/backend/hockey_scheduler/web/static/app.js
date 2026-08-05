@@ -107,6 +107,17 @@ let schedulerState = {
   // state would make "both set" representable on the client, which is the
   // drift the refusal exists to prevent.
   gamesPerTeam: null,
+  // #375 residual blocker — the backend's structured refusal of the CURRENT
+  // format request (`games_per_team_infeasible` and its two residual
+  // siblings), held so the guidance renders next to the control that caused
+  // it instead of only in a toast. Cleared by any successful Generate.
+  //
+  // It exists because the option list no longer pre-filters feasibility:
+  // whether a G works depends on the selected Division's team count and on
+  // the Games it already has, and this screen knows neither before Generate
+  // runs. Refusing to offer the value was the old answer, and it cost every
+  // even-team Division its odd formats.
+  formatRefusal: null,
   // #390 — the configurable turnaround, in MINUTES, measured from the
   // previous game's end. 0 is exactly the pre-#390 behaviour, so an operator
   // who never touches the control gets the historical proposal; the field
@@ -8759,6 +8770,57 @@ function schedDraftRow(g) {
     <span class="pill gray">Draft</span>${delBtn("game", g.game_id,
       g.home_team_name + " vs " + g.away_team_name, "Delete draft")}</div>`;
 }
+// #375 residual blocker — the guaranteed-games values the picker offers.
+// EVERY entry is inside the range the backend's own `_normalize_games_per_team`
+// accepts (1..MAX_GAMES_PER_TEAM = 120), and the ODD ones are the point: odd G
+// is feasible for every even team count, and the previous even-only list made
+// a 4-team Division's perfectly valid 5-game season unreachable through the
+// product. Feasibility for the SELECTED Division is the backend's answer, not
+// this list's — see `schedFormatRefusalBlock`.
+//
+// 1..30 covers every real regular season one value at a time; the sparser tail
+// keeps the very long formats reachable without a hundred-entry menu.
+const SCHED_GAMES_OPTIONS = Array.from({ length: 30 }, (_, i) => i + 1)
+  .concat([32, 34, 36, 38, 40, 44, 48, 52, 56, 60, 70, 80, 90, 100, 110, 120]);
+
+// The format refusals this screen explains in place rather than only in a
+// toast. All three are the same operator decision — the requested number of
+// guaranteed games cannot be honoured by THIS Division as it stands — and all
+// three carry a number to ask for instead.
+const SCHED_FORMAT_REFUSALS = [
+  "games_per_team_infeasible",
+  "games_per_team_over_scheduled",
+  "games_per_team_residual_infeasible",
+];
+
+function schedFormatRefusalBlock() {
+  const refusal = schedulerState.formatRefusal;
+  if (!refusal) return "";
+  const details = refusal.details || {};
+  // `games_per_team_infeasible` names both parity neighbours; the residual
+  // refusals name the single smallest count the existing Games can still be
+  // completed to. Normalised to one list so the guidance reads the same way
+  // whichever condition failed.
+  const nearest = (Array.isArray(details.nearest_achievable)
+    ? details.nearest_achievable
+    : (details.nearest_achievable == null ? [] : [details.nearest_achievable]))
+    .filter((n) => typeof n === "number");
+  const advice = nearest.length
+    ? `<p class="li-sub">Achievable instead: <strong>${
+      nearest.map((n) => esc(String(n))).join(" or ")}</strong>.</p>`
+    : "";
+  return `<div id="sched-format-refusal" class="card sched-empty"
+      role="status" data-reason="${esc(details.reason || "")}"
+      data-nearest="${esc(nearest.join(","))}">
+    <div class="sched-empty-lead">This Division cannot play ${
+      esc(String(details.games_per_team == null ? "" : details.games_per_team))
+    } guaranteed games per team.</div>
+    <p>${esc(refusal.message || "")}</p>
+    ${advice}
+    <p class="li-sub">Pick a different number of guaranteed games and Generate again.</p>
+  </div>`;
+}
+
 function renderScheduler(ov) {
   if (!hasPerm("manage_schedule")) {
     return `<div class="banner neutral"><h2>Operators only</h2>
@@ -8906,16 +8968,30 @@ function renderScheduler(ov) {
           // per Division, so no fixed games-per-team value expresses it.
           // Dropping it would remove a capability the screen has today.
           //
-          // Every games-per-team option is EVEN, and that is a correctness
-          // property rather than a style choice. The backend refuses a
-          // request when `teams x games` is odd — no construction can give
-          // every team exactly G games when both are odd — and the screen
-          // cannot know a Division's team count before Generate runs. An
-          // even G makes `teams x games` even for EVERY team count, so this
-          // list can never offer a value the backend would refuse.
+          // ODD VALUES ARE OFFERED, and that is the fix rather than a
+          // relaxation. The list used to be even-only so that no option
+          // could ever be refused: `teams x games` must be even, and an even
+          // G satisfies that for every team count. But odd G is FULLY
+          // FEASIBLE for every EVEN team count — a 4-team Division can
+          // validly play 5 games each (10 games) — so a globally even list
+          // did not prevent a refusal, it deleted a supported, common format
+          // from the product for the Divisions that can honour it. Trading
+          // away real capability to make a static list unconditionally safe
+          // is the wrong trade.
+          //
+          // What replaces it is not a smarter list but the right division of
+          // labour: the picker offers every value the backend ACCEPTS
+          // (`_normalize_games_per_team`, 1..MAX_GAMES_PER_TEAM), and
+          // feasibility — which depends on the selected Division's live team
+          // count and on the Games it already has, neither of which this
+          // screen can know before Generate runs — is answered by the
+          // backend and SURFACED (see `schedFormatRefusalBlock`). The
+          // refusal already names the nearest achievable counts, so an
+          // operator who picks an impossible one is told what to pick
+          // instead rather than never being allowed to ask.
           [{ value: "rr", label: "Single round-robin (play everyone once)" }]
-            .concat([2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 24, 28, 32, 36, 40]
-              .map((n) => ({ value: String(n), label: `${n} guaranteed games per team` })))
+            .concat(SCHED_GAMES_OPTIONS
+              .map((n) => ({ value: String(n), label: `${n} guaranteed game${n === 1 ? "" : "s"} per team` })))
             .map((opt) => `<option value="${opt.value}"${
               opt.value === (schedulerState.gamesPerTeam === null
                 ? "rr" : String(schedulerState.gamesPerTeam)) ? " selected" : ""
@@ -8929,7 +9005,7 @@ function renderScheduler(ov) {
         }</select>
         <button class="act" data-sched-generate>Generate</button>
       </div></div>
-    ${previewBlock}${summaryBlock}${draftBlock}`;
+    ${schedFormatRefusalBlock()}${previewBlock}${summaryBlock}${draftBlock}`;
 }
 
 /* ---------- Pilot onboarding import wizard (#96/#99) ----------
@@ -11417,6 +11493,18 @@ async function render() {
       constraints: { min_turnaround_minutes: schedulerState.turnaround },
     });
     schedulerState.preview = (res && !res.error) ? res : null;
+    // #375 residual blocker — keep the format refusal on screen, next to the
+    // control that caused it. post() puts error.message in a toast, but the
+    // toast is one line with no room for the achievable counts and is
+    // dismissible, and this is a decision the operator has to act on: the
+    // picker now offers every value the backend ACCEPTS, so learning which
+    // of them THIS Division can honour is the whole replacement for the old
+    // even-only list. A successful Generate clears it.
+    const failure = (res && res.error && res.error.details) || null;
+    schedulerState.formatRefusal =
+      (failure && SCHED_FORMAT_REFUSALS.indexOf(failure.reason) !== -1)
+        ? { message: res.error.message, details: failure }
+        : null;
     await render();
   };
   const schedCommit = c.querySelector("[data-sched-commit]");
