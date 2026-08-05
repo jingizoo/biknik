@@ -1477,6 +1477,14 @@ def verify_breaks(verbose: bool = False) -> int:
 
 
 def run(selected: str | None = None) -> int:
+    known = [fn.check_name for fn in CHECKS]
+    if selected and selected not in known:
+        # Running zero checks and exiting 0 is a vacuous pass — the same shape
+        # as a mutation that stops biting. Refuse instead.
+        print(f"unknown check: {selected}", file=sys.stderr)
+        print(f"known checks: {', '.join(known)}", file=sys.stderr)
+        return 2
+
     failures: list[str] = []
     ran = 0
     for fn in CHECKS:
