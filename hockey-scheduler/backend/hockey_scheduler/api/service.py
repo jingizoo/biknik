@@ -4981,6 +4981,7 @@ class ApiService:
                               season_id: str = None, league_id: str = None,
                               slot_ids=None, constraints=None,
                               meetings_per_opponent=None,
+                              games_per_team=None,
                               user_id=None, role=None, scope=None) -> dict:
         """Generate a draft round-robin schedule for a Division, or for a
         whole League within a Season optionally narrowed to one Division
@@ -4995,12 +4996,21 @@ class ApiService:
         ``division_id`` then optionally narrows that League-wide draft to one
         Division rather than switching to the Division-only entry point.
 
-        ``meetings_per_opponent`` (#375) is the configurable regular-season
-        format: how many times each team plays every other. Omitted (or
-        ``None``) keeps the historical single round-robin. Existing
-        non-cancelled REGULAR Games count toward the requirement — cancelled
+        ``games_per_team`` (#375) is the OPERATOR-FACING regular-season
+        format: the number of games each team is GUARANTEED to play, from
+        which the per-opponent count is derived (`base = G // (T-1)` games
+        against everyone, with `rem = G % (T-1)` opponents played once
+        more). It is refused when `teams x games` is odd, because no
+        construction can then give every team exactly that many games.
+
+        ``meetings_per_opponent`` is the LEGACY spelling of the same
+        setting — how many times each team plays every other — still
+        accepted so that named scenarios stored under it (#381) keep
+        replaying. Sending BOTH is refused rather than reconciled. Omitting
+        both keeps the historical single round-robin. Existing non-cancelled
+        REGULAR Games count toward the requirement either way — cancelled
         and exhibition games do not — so regenerating after a partial
-        schedule proposes only the meetings still missing.
+        schedule proposes only the games still missing.
 
         `(user_id, role, scope)` is the caller's PRINCIPAL (#386), and the
         requested hierarchy must equal its persisted active tuple — see
@@ -5012,7 +5022,8 @@ class ApiService:
             return draft_schedule_for_league(
                 self.store, season_id, league_id, division_id=division_id,
                 slot_ids=slot_ids, constraints=constraints,
-                meetings_per_opponent=meetings_per_opponent)
+                meetings_per_opponent=meetings_per_opponent,
+                games_per_team=games_per_team)
         if not division_id:
             raise ValidationError(
                 "A division_id, or a season_id and league_id, is required.")
@@ -5020,7 +5031,8 @@ class ApiService:
             raise NotFoundError("Division not found.")
         return draft_schedule(self.store, division_id, slot_ids=slot_ids,
                               constraints=constraints,
-                              meetings_per_opponent=meetings_per_opponent)
+                              meetings_per_opponent=meetings_per_opponent,
+                              games_per_team=games_per_team)
 
     # -- immutable named schedule scenarios (#206/#378) ------------------
     #
@@ -5156,7 +5168,8 @@ class ApiService:
                                  season_id: str = None,
                                  league_id: str = None, slot_ids=None,
                                  constraints=None,
-                                 meetings_per_opponent=None, actor_id=None,
+                                 meetings_per_opponent=None,
+                                 games_per_team=None, actor_id=None,
                                  user_id=None, role=None, scope=None) -> dict:
         """Generate and persist review evidence without writing any Game.
 
@@ -5179,11 +5192,14 @@ class ApiService:
         capability alone let an operator active in Program B generate and store
         a Program A scenario from B's own session.
 
-        `meetings_per_opponent` (#375/#382) is the regular-season format this
-        generation ran under. It is read back OFF the proposal rather than off
-        the request, so the scenario records the N the generator actually
-        applied, and `commit_schedule_scenario` replays that same N — see
-        `_scenario_replay_meetings`.
+        `games_per_team`/`meetings_per_opponent` (#375/#382) are the two
+        spellings of the regular-season format this generation ran under
+        (exactly one of them, never both). BOTH are read back OFF the
+        proposal rather than off the request, so the scenario records the
+        format the generator actually applied — including the explicit
+        `None` for the spelling that was not used — and
+        `commit_schedule_scenario` replays that same format. See
+        `_scenario_replay_format`.
         """
         if not isinstance(name, str) or not name.strip():
             raise ValidationError(
@@ -5210,8 +5226,14 @@ class ApiService:
             "slot_ids": copy.deepcopy(list(slot_ids))
             if slot_ids is not None else None,
             "constraints": copy.deepcopy(constraints),
-            # Overwritten below with the value the generator actually applied.
+            # Both overwritten below with the values the generator actually
+            # applied. #375 — the games-per-team spelling is recorded
+            # alongside the legacy one rather than instead of it: a scenario
+            # stored before this field existed has no key for it, and
+            # `_scenario_replay_format` must be able to tell that absence
+            # from an explicit "this ran under no games-per-team".
             "meetings_per_opponent": None,
+            "games_per_team": None,
         }
         isolation = "REPEATABLE READ" if role is None else "SERIALIZABLE"
         with self.store.transaction(isolation=isolation):
@@ -5266,7 +5288,8 @@ class ApiService:
                 division_id=division_id, season_id=season_id,
                 league_id=league_id, slot_ids=request_input["slot_ids"],
                 constraints=request_input["constraints"],
-                meetings_per_opponent=meetings_per_opponent)
+                meetings_per_opponent=meetings_per_opponent,
+                games_per_team=games_per_team)
             if isinstance(proposal, dict) and proposal.get("error"):
                 return proposal
             # The N the GENERATOR resolved, never the raw request: an omitted
@@ -5275,6 +5298,7 @@ class ApiService:
             # re-derive.
             request_input["meetings_per_opponent"] = proposal.get(
                 "meetings_per_opponent")
+            request_input["games_per_team"] = proposal.get("games_per_team")
             snapshot = material_input_snapshot(
                 self.store, hierarchy, request_input,
                 planner_version=SCENARIO_PLANNER_VERSION)
@@ -5353,27 +5377,47 @@ class ApiService:
                               for value in scenarios]}
 
     @staticmethod
-    def _scenario_replay_meetings(scenario):
-        """The regular-season format this scenario must REPLAY under (#382).
+    def _scenario_replay_format(scenario):
+        """The regular-season format this scenario must REPLAY under (#382,
+        widened for the games-per-team spelling in #375).
 
         Returned from the stored `request_input`, which
         `create_schedule_scenario` fills from the generator's own answer — so
-        an omitted request format is stored as the explicit 1 it ran under and
-        a stored N replays as N. The alternative, letting the commit pass
-        `None` and having `_normalize_meetings` default it to 1, silently
-        commits a single round-robin's worth of a double round-robin scenario
-        (in practice: `preview_stale`, because the locked regeneration no
-        longer matches the reviewed `draft_fingerprint`).
+        an omitted request format is stored as the explicit value it ran
+        under and replays as that value. The alternative, letting the commit
+        pass `None` and having the normalizers default it, silently commits
+        a single round-robin's worth of a double round-robin scenario (in
+        practice: `preview_stale`, because the locked regeneration no longer
+        matches the reviewed `draft_fingerprint`).
 
-        Returns `(value, integrity_ok)`. `integrity_ok` is False when the
-        stored format is missing or disagrees with the format the persisted
-        PROPOSAL was generated under — two independently fingerprinted fields
-        that must agree, so a rewritten record cannot quietly change the size
-        of the schedule a reviewed scenario commits.
+        Returns `(meetings, games, bad_fields)`. EXACTLY ONE of the two
+        spellings is operative in any valid record; `bad_fields` names the
+        ones whose two independently fingerprinted halves — the stored
+        `request_input` and the persisted `proposal` — disagree, so a
+        rewritten record cannot quietly change the size of the schedule a
+        reviewed scenario commits.
+
+        A scenario stored BEFORE `games_per_team` existed has no such key on
+        either half, so both `.get()`s return `None`, the halves agree, and
+        it replays under its legacy meetings value exactly as before. That
+        is the whole reason the field is added beside the legacy one instead
+        of replacing it.
         """
-        stored = scenario.request_input.get("meetings_per_opponent")
-        generated = scenario.proposal.get("meetings_per_opponent")
-        return stored, stored is not None and stored == generated
+        stored_meetings = scenario.request_input.get("meetings_per_opponent")
+        made_meetings = scenario.proposal.get("meetings_per_opponent")
+        stored_games = scenario.request_input.get("games_per_team")
+        made_games = scenario.proposal.get("games_per_team")
+        bad = []
+        if stored_meetings != made_meetings:
+            bad.append("meetings_per_opponent")
+        if stored_games != made_games:
+            bad.append("games_per_team")
+        if not bad and (stored_games is None) == (stored_meetings is None):
+            # Neither spelling operative, or both at once. Neither shape can
+            # be produced by `create_schedule_scenario`, so the record was
+            # rewritten; refuse rather than guess which one meant it.
+            bad.append("meetings_per_opponent")
+        return stored_meetings, stored_games, bad
 
     def _commit_schedule_scenario_attempt(self, scenario_id, actor_id=None,
                                           user_id=None, role=None, scope=None):
@@ -5432,10 +5476,9 @@ class ApiService:
             if (canonical_fingerprint(scenario.proposal)
                     != scenario.proposal_fingerprint):
                 integrity_fields.append("proposal")
-            replay_meetings, meetings_ok = self._scenario_replay_meetings(
-                scenario)
-            if not meetings_ok:
-                integrity_fields.append("meetings_per_opponent")
+            replay_meetings, replay_games, bad_format_fields = (
+                self._scenario_replay_format(scenario))
+            integrity_fields.extend(bad_format_fields)
             if integrity_fields:
                 raise ValidationError(
                     "This schedule scenario failed its immutable-record "
@@ -5510,6 +5553,11 @@ class ApiService:
                 # value; omitting it re-derives the historical single
                 # round-robin and refuses a reviewed N > 1 batch as stale.
                 meetings_per_opponent=replay_meetings,
+                # #375 — the games-per-team spelling replays for exactly the
+                # same reason: the under-lock regeneration inside the commit
+                # gate takes this value, and omitting it would regenerate a
+                # DIFFERENT schedule and refuse the reviewed batch as stale.
+                games_per_team=replay_games,
                 actor_id=actor_id,
                 reviewed_proposal=scenario.proposal,
                 scenario_guard=_guard_material_inputs,
@@ -5672,6 +5720,7 @@ class ApiService:
                               slot_ids=None, constraints=None,
                               draft_fingerprint: str = None,
                               meetings_per_opponent=None,
+                              games_per_team=None,
                               actor_id=None, user_id=None, role=None,
                               scope=None) -> dict:
         """Retry shell (#318): ``placement_raced`` marks the batch's
@@ -5683,10 +5732,12 @@ class ApiService:
         league-scoped facade overrides the attempt and inherits this
         shell.
 
-        ``meetings_per_opponent`` (#375) must be the SAME format the
-        reviewed preview was generated with — it is bound into
-        ``draft_fingerprint``, so a mismatch is refused as ``preview_stale``
-        rather than silently committing a different-sized schedule.
+        ``games_per_team``/``meetings_per_opponent`` (#375) must be the
+        SAME format the reviewed preview was generated with — whichever one
+        it used is bound into ``draft_fingerprint``, so a mismatch is
+        refused as ``preview_stale`` rather than silently committing a
+        different-sized schedule. Both are carried through the retry loop
+        because the commit regenerates the proposal on every attempt.
 
         ``draft_fingerprint`` (#328 review round 5) must be the
         ``draft_fingerprint`` returned by the ``draft_season_schedule`` call
@@ -5715,6 +5766,7 @@ class ApiService:
                     constraints=constraints,
                     draft_fingerprint=draft_fingerprint,
                     meetings_per_opponent=meetings_per_opponent,
+                    games_per_team=games_per_team,
                     actor_id=actor_id, user_id=user_id, role=role,
                     scope=scope)
             except ConcurrencyConflictError as exc:
@@ -5818,6 +5870,7 @@ class ApiService:
                                        slot_ids=None, constraints=None,
                                        draft_fingerprint: str = None,
                                        meetings_per_opponent=None,
+                                       games_per_team=None,
                                        actor_id=None,
                                        reviewed_proposal=None,
                                        scenario_guard=None,
@@ -5877,6 +5930,7 @@ class ApiService:
                         league_id=league_id, slot_ids=slot_ids,
                         constraints=constraints,
                         meetings_per_opponent=meetings_per_opponent,
+                        games_per_team=games_per_team,
                         # #386 — the PREFLIGHT half of the tuple binding. It
                         # runs before `preview_required`/`preview_stale` and
                         # before any lock, so a foreign target never even
@@ -6155,7 +6209,8 @@ class ApiService:
                 division_id=division_id, season_id=season_id,
                 league_id=league_id, slot_ids=slot_ids,
                 constraints=constraints,
-                meetings_per_opponent=meetings_per_opponent)
+                meetings_per_opponent=meetings_per_opponent,
+                games_per_team=games_per_team)
             if _locked_proposal.get("draft_fingerprint") != draft_fingerprint:
                 # #328 review round 12 finding 1 -- a mismatch here can be
                 # fully explained by a winning exact-pairing race: one of

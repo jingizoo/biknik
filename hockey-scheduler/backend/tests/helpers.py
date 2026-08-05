@@ -172,7 +172,8 @@ def cookie_from_set_cookie(set_cookie_header, name):
 
 def commit_fresh_draft(api, division_id=None, *, season_id=None,
                        league_id=None, slot_ids=None, constraints=None,
-                       meetings_per_opponent=None, actor_id=None):
+                       meetings_per_opponent=None, games_per_team=None,
+                       actor_id=None):
     """Preview-then-commit convenience for tests that don't care about
     staleness detection (#328 review round 5 made ``draft_fingerprint`` a
     required, server-validated preview-binding token on
@@ -184,15 +185,16 @@ def commit_fresh_draft(api, division_id=None, *, season_id=None,
     specifically exercise a stale or mismatched fingerprint call
     ``commit_draft_schedule`` directly instead.
 
-    ``meetings_per_opponent`` (#375) is passed to BOTH calls, which is the
-    contract the real Scheduler UI has to honour too: the format is bound
-    into ``draft_fingerprint``, so previewing one format and committing
-    another is refused as ``preview_stale`` rather than silently
-    committing a differently-sized schedule."""
+    ``games_per_team``/``meetings_per_opponent`` (#375) are passed to BOTH
+    calls, which is the contract the real Scheduler UI has to honour too:
+    the format is bound into ``draft_fingerprint``, so previewing one format
+    and committing another is refused as ``preview_stale`` rather than
+    silently committing a differently-sized schedule."""
     proposal = api.draft_season_schedule(
         division_id=division_id, season_id=season_id, league_id=league_id,
         slot_ids=slot_ids, constraints=constraints,
-        meetings_per_opponent=meetings_per_opponent)
+        meetings_per_opponent=meetings_per_opponent,
+        games_per_team=games_per_team)
     if isinstance(proposal, dict) and proposal.get("error"):
         return proposal
     return api.commit_draft_schedule(
@@ -200,6 +202,7 @@ def commit_fresh_draft(api, division_id=None, *, season_id=None,
         slot_ids=slot_ids, constraints=constraints,
         draft_fingerprint=proposal.get("draft_fingerprint"),
         meetings_per_opponent=meetings_per_opponent,
+        games_per_team=games_per_team,
         actor_id=actor_id)
 
 from hockey_scheduler.domain import Game, Player, Position, Team  # noqa: E402

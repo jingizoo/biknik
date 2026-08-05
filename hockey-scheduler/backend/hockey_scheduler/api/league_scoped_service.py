@@ -62,6 +62,7 @@ class ApiService(_BaseApiService):
                                        slot_ids=None, constraints=None,
                                        draft_fingerprint: str = None,
                                        meetings_per_opponent=None,
+                                       games_per_team=None,
                                        actor_id=None,
                                        reviewed_proposal=None,
                                        scenario_guard=None,
@@ -111,6 +112,14 @@ class ApiService(_BaseApiService):
                         league_id=league_id, slot_ids=slot_ids,
                         constraints=constraints,
                         meetings_per_opponent=meetings_per_opponent,
+                        # #375 -- THIS is the copy that runs (see the
+                        # docstring's MRO note), so the games-per-team format
+                        # has to be carried here as well as in the base
+                        # facade. Dropping it on this path alone would
+                        # regenerate a single round-robin, mismatch the
+                        # reviewed fingerprint, and refuse every real
+                        # games-per-team commit as `preview_stale`.
+                        games_per_team=games_per_team,
                         # #386 -- the PREFLIGHT half of the tuple binding,
                         # before `preview_required`/`preview_stale` and before
                         # any lock.
@@ -375,7 +384,8 @@ class ApiService(_BaseApiService):
                 division_id=division_id, season_id=season_id,
                 league_id=league_id, slot_ids=slot_ids,
                 constraints=constraints,
-                meetings_per_opponent=meetings_per_opponent)
+                meetings_per_opponent=meetings_per_opponent,
+                games_per_team=games_per_team)
             if _locked_proposal.get("draft_fingerprint") != draft_fingerprint:
                 # #328 review round 12 finding 1 -- a mismatch here can be
                 # fully explained by a winning exact-pairing race: one of

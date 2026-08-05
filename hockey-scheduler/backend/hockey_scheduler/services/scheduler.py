@@ -200,6 +200,71 @@ def _normalize_games_per_team(value, field="games_per_team"):
     return value
 
 
+def _resolve_schedule_format(meetings_per_opponent, games_per_team):
+    """Pick the ONE regular-season format this draft runs under (#375).
+
+    Returns ``(meetings, games)`` with exactly one of them set:
+
+    * ``games`` set — the operator-facing control. They asked for a number
+      of games THEIR OWN TEAM is guaranteed; the per-opponent count is
+      derived (see :func:`games_per_team_pairings`).
+    * ``meetings`` set — the LEGACY control, kept accepted. It is bound into
+      ``_draft_fingerprint`` and stored inside named scenarios (#381), so
+      dropping it would invalidate every scenario already on disk. Omitting
+      both keeps the historical single round-robin exactly.
+
+    SUPPLYING BOTH IS REFUSED rather than resolved. They are not always two
+    spellings of one thing: ``meetings_per_opponent=3`` means three meetings
+    in every Division regardless of size, while ``games_per_team=G`` derives
+    a different per-opponent count in each Division of a League-wide draft,
+    so "do they agree?" has no answer that survives a heterogeneous League.
+    Picking a winner would make the losing field a silent no-op — the exact
+    way two controls for one setting drift apart — so the caller is told to
+    send one.
+    """
+    games = _normalize_games_per_team(games_per_team)
+    if games is not None and meetings_per_opponent is not None:
+        raise ValidationError(
+            "Send either 'games_per_team' (guaranteed games each team "
+            "plays) or the legacy 'meetings_per_opponent' (games against "
+            "every opponent), not both — they set the same schedule format "
+            "two different ways and cannot be reconciled when a League's "
+            "Divisions have different team counts.",
+            {"reason": "schedule_format_conflict",
+             "games_per_team": games_per_team,
+             "meetings_per_opponent": meetings_per_opponent})
+    if games is not None:
+        return None, games
+    return _normalize_meetings(meetings_per_opponent), None
+
+
+def _format_pairings(store, team_ids, meetings, games, division_id=None):
+    """The pairing list for whichever format :func:`_resolve_schedule_format`
+    chose, with the games-per-team feasibility refusal applied first.
+
+    The refusal must happen HERE, per team group, because that is the first
+    point where the team count is known — and for a League-wide draft it is
+    known separately for every Division. One infeasible Division refuses the
+    whole request rather than quietly delivering it an uneven schedule: the
+    control is labelled "guaranteed", and a guarantee honoured in three
+    Divisions out of four is not one.
+    """
+    if games is None:
+        return round_robin_pairings(team_ids, meetings)
+    _require_feasible_games_per_team(
+        len(team_ids), games, label=_division_label(store, division_id))
+    return games_per_team_pairings(team_ids, games)
+
+
+def _division_label(store, division_id):
+    """Human name for the group an infeasible request was asked of, so a
+    League-wide refusal says WHICH Division cannot honour it."""
+    if not division_id:
+        return None
+    division = store.get_division(division_id) if store else None
+    return division.name if division is not None else division_id
+
+
 def _require_feasible_games_per_team(team_count, games, label=None):
     """Refuse an arithmetically impossible guarantee (#375), actionably.
 
@@ -1489,7 +1554,8 @@ def _canonical_sort_key(row):
 
 def _draft_fingerprint(league_season_id, team_ids, draft_games, unscheduled,
                         unschedulable_teams, already_scheduled,
-                        meetings_per_opponent=1, *, min_turnaround_minutes):
+                        meetings_per_opponent=1, *, min_turnaround_minutes,
+                        games_per_team=None):
     """Deterministic identity of exactly what this proposal reviewed — #328
     review round 5, widened rounds 7, 10, 11, 12, 15, and 16. Bound into the response
     so the commit path can prove, right before writing, that this fact
@@ -1692,13 +1758,32 @@ def _draft_fingerprint(league_season_id, team_ids, draft_games, unscheduled,
         # rather than failing loudly.
         "min_turnaround_minutes": min_turnaround_minutes,
     }
+    # #375 — the GUARANTEED-GAMES-PER-TEAM format, bound for exactly the
+    # reason `meetings_per_opponent` above is: it is part of what the
+    # operator reviewed, so previewing one format and committing another
+    # must be a guaranteed mismatch rather than one that happens to fall
+    # out of the row lists.
+    #
+    # Added CONDITIONALLY, and this is deliberate rather than sloppy. A key
+    # present with a `None` value would change the hashed payload of every
+    # legacy proposal ever made, and #381 persists whole proposals —
+    # including their `draft_fingerprint` — inside named scenarios. A
+    # scenario stored before this change and committed after it would
+    # regenerate a different fingerprint and be refused as `preview_stale`,
+    # which is the same breakage as dropping the legacy field outright, just
+    # slower to notice. Absent means "this proposal came from the legacy
+    # meetings-shaped request", whose fingerprint must not move; and the two
+    # fields can never both be operative, because `_resolve_schedule_format`
+    # refuses that combination before either reaches here.
+    if games_per_team is not None:
+        payload["games_per_team"] = games_per_team
     return hashlib.sha256(json.dumps(
         payload, sort_keys=True, separators=(",", ":"), default=str
     ).encode()).hexdigest()[:16]
 
 
 def draft_schedule(store, division_id, slot_ids=None, constraints=None,
-                   meetings_per_opponent=None):
+                   meetings_per_opponent=None, games_per_team=None):
     """Generate a draft round-robin schedule for a division (#84/#85).
 
     Returns ``{division_id, team_count, draft_games, unscheduled,
@@ -1713,20 +1798,27 @@ def draft_schedule(store, division_id, slot_ids=None, constraints=None,
     split AND each missing pairing's placement (slot, time) so a later
     commit can detect drift in either. Nothing is persisted.
 
-    ``meetings_per_opponent`` (#375) configures how many times each team
-    plays every other; ``None`` keeps the historical single round-robin.
-    Existing Regular Games count toward the requirement, so a regeneration
-    proposes only the meetings still missing.
+    ``games_per_team`` (#375) is the OPERATOR-FACING regular-season format:
+    the number of games each team is guaranteed, with the per-opponent count
+    derived from it. ``meetings_per_opponent`` is the legacy spelling — how
+    many times each team plays every other — still accepted; ``None`` for
+    both keeps the historical single round-robin. Sending both is refused
+    (:func:`_resolve_schedule_format`). Existing Regular Games count toward
+    the requirement either way, so a regeneration proposes only the games
+    still missing.
     """
-    meetings = _normalize_meetings(meetings_per_opponent)
+    meetings, games = _resolve_schedule_format(
+        meetings_per_opponent, games_per_team)
     # A division's teams are those validly registered in it this season (#180),
     # via the shared resolver — active rows whose Team exists and whose league
     # matches, so an orphaned or cross-league registration row can never enter a
     # draft (#199/#200 review). Same source of truth game creation, moves,
     # publishing, and standings use.
     teams = sorted(registered_team_ids_in_division(store, division_id))
-    all_pairings = [(h, a, division_id)
-                    for h, a in round_robin_pairings(teams, meetings)]
+    all_pairings = [
+        (h, a, division_id)
+        for h, a in _format_pairings(
+            store, teams, meetings, games, division_id)]
     # #328 review — scope the exclusion by this Division's own LeagueSeason,
     # not division_id alone (see _existing_pairing_games).
     division = store.get_division(division_id) if division_id else None
@@ -1757,7 +1849,15 @@ def draft_schedule(store, division_id, slot_ids=None, constraints=None,
     turnaround = turnaround_minutes(constraints)
     return {
         "division_id": division_id, "team_count": len(teams),
+        # #375 — exactly ONE of these two is the format this proposal ran
+        # under; the other is None. Echoing a derived value into the unused
+        # one would be a lie the commit path then has to reconcile: a
+        # games-per-team draft has no single meetings-per-opponent number
+        # (that is the whole point of the `rem` remainder), and a legacy
+        # draft has no single games-per-team number across a League whose
+        # Divisions differ in size.
         "meetings_per_opponent": meetings,
+        "games_per_team": games,
         # #390 — echo the NORMALIZED turnaround the proposal was generated
         # under, exactly as ``meetings_per_opponent`` above echoes the
         # format. The Scheduler UI must send the same value back at Commit
@@ -1773,13 +1873,13 @@ def draft_schedule(store, division_id, slot_ids=None, constraints=None,
         "draft_fingerprint": _draft_fingerprint(
             ls_id, teams, draft_games, unscheduled, unschedulable_teams,
             already_scheduled, meetings,
-            min_turnaround_minutes=turnaround),
+            min_turnaround_minutes=turnaround, games_per_team=games),
     }
 
 
 def draft_schedule_for_league(store, season_id, league_id, division_id=None,
                               slot_ids=None, constraints=None,
-                              meetings_per_opponent=None):
+                              meetings_per_opponent=None, games_per_team=None):
     """Generate a draft schedule for a whole League within a Season, optionally
     narrowed to one Division (#233 Slice G).
 
@@ -1790,21 +1890,44 @@ def draft_schedule_for_league(store, season_id, league_id, division_id=None,
     because they share a League; each Division's teams get their own
     round-robin, all sharing the same season-scoped ice pool for assignment.
 
-    ``meetings_per_opponent`` (#375) applies to every Division group alike:
-    each group's own round-robin is repeated N times, so a team plays every
-    opponent IN ITS OWN DIVISION N times and still never meets one from
-    another Division.
+    Either regular-season format (#375) applies to every Division group
+    alike, and neither ever pairs across Divisions. ``meetings_per_opponent``
+    repeats each group's own round-robin N times, so a team plays every
+    opponent IN ITS OWN DIVISION N times. ``games_per_team`` guarantees each
+    team that many games INSIDE ITS OWN DIVISION, so the derived
+    per-opponent count differs between a 6-team and a 10-team Division of
+    the same League — which is the point of the control, and the reason
+    feasibility is judged per group below rather than once for the League.
     """
-    meetings = _normalize_meetings(meetings_per_opponent)
+    meetings, games = _resolve_schedule_format(
+        meetings_per_opponent, games_per_team)
     groups = registered_teams_by_division_in_league(
         store, season_id, league_id, division_id)
+    # #375 — feasibility is judged for EVERY group before any group is
+    # built, in sorted order. Two reasons it is a separate pass rather than
+    # a check inside the loop below:
+    #
+    #  * WHICH Division gets named must not depend on `groups`' own
+    #    insertion order (registration order, and therefore store-backend
+    #    dependent) — the same request must produce the same refusal text on
+    #    Memory, SQLite and PostgreSQL alike.
+    #  * The loop below must keep iterating `groups` in its ORIGINAL order:
+    #    that order decides the order pairings are offered ice, so sorting
+    #    it would silently re-place every existing League-wide draft and
+    #    change fingerprints that have nothing to do with this change.
+    if games is not None:
+        for div_id in sorted(groups, key=lambda v: (v is None, v or "")):
+            _require_feasible_games_per_team(
+                len(groups[div_id]), games,
+                label=_division_label(store, div_id))
     all_pairings = []
     all_teams = set()
     for div_id, team_ids in groups.items():
         all_teams |= team_ids
         all_pairings.extend(
             (h, a, div_id)
-            for h, a in round_robin_pairings(sorted(team_ids), meetings))
+            for h, a in _format_pairings(
+                store, sorted(team_ids), meetings, games, div_id))
     # #328 review — scope the exclusion by THIS League+Season's own
     # LeagueSeason, not division_id alone (see _existing_pairing_games):
     # the "no Division" group's div_id is None for every League, so
@@ -1837,7 +1960,10 @@ def draft_schedule_for_league(store, season_id, league_id, division_id=None,
     return {
         "season_id": season_id, "league_id": league_id,
         "division_id": division_id, "team_count": len(all_teams),
+        # #375 — exactly one of these is operative; see the Division-only
+        # entry point above.
         "meetings_per_opponent": meetings,
+        "games_per_team": games,
         "min_turnaround_minutes": turnaround,
         "draft_games": draft_games, "unscheduled": unscheduled,
         "already_scheduled": already_scheduled,
@@ -1845,5 +1971,5 @@ def draft_schedule_for_league(store, season_id, league_id, division_id=None,
         "draft_fingerprint": _draft_fingerprint(
             ls_id, all_teams, draft_games, unscheduled, unschedulable_teams,
             already_scheduled, meetings,
-            min_turnaround_minutes=turnaround),
+            min_turnaround_minutes=turnaround, games_per_team=games),
     }

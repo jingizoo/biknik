@@ -2603,9 +2603,14 @@ class Handler(BaseHTTPRequestHandler):
         # round-robin proposal for a Division, or for a whole League within a
         # Season optionally narrowed to one Division. Returns a preview only —
         # nothing is created or published.
-        # #375 — meetings_per_opponent is the configurable regular-season
-        # format (how many times each team plays every other). Omitted keeps
-        # the historical single round-robin; the facade validates it.
+        # #375 — games_per_team is the OPERATOR-FACING regular-season
+        # format: the number of games each team is guaranteed, from which the
+        # per-opponent count is derived. meetings_per_opponent is the legacy
+        # spelling (how many times each team plays every other), still
+        # accepted so stored scenarios keep replaying. Sending both is
+        # refused; omitting both keeps the historical single round-robin.
+        # The facade validates all of it, including the parity refusal that
+        # needs the team count.
         # #386 — the body's scope ids say WHICH hierarchy to draft; the session
         # says whether this caller may. Both go to the facade, and only the
         # second one is authority. MANAGE_SCHEDULE (the gate above) is held by
@@ -2619,6 +2624,7 @@ class Handler(BaseHTTPRequestHandler):
                 slot_ids=body.get("slot_ids"),
                 constraints=body.get("constraints"),
                 meetings_per_opponent=body.get("meetings_per_opponent"),
+                games_per_team=body.get("games_per_team"),
                 user_id=user_id, role=role, scope=scope))
         if path == "/api/scheduler/scenarios":
             try:
@@ -2626,7 +2632,7 @@ class Handler(BaseHTTPRequestHandler):
                     body,
                     allowed={"name", "division_id", "season_id", "league_id",
                              "slot_ids", "constraints",
-                             "meetings_per_opponent"},
+                             "meetings_per_opponent", "games_per_team"},
                     required=("name",),
                     types={"name": str,
                            "division_id": (str, type(None)),
@@ -2634,7 +2640,8 @@ class Handler(BaseHTTPRequestHandler):
                            "league_id": (str, type(None)),
                            "slot_ids": (list, type(None)),
                            "constraints": (dict, type(None)),
-                           "meetings_per_opponent": (int, type(None))})
+                           "meetings_per_opponent": (int, type(None)),
+                           "games_per_team": (int, type(None))})
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
             if user_id is None:
@@ -2651,6 +2658,7 @@ class Handler(BaseHTTPRequestHandler):
                 slot_ids=body.get("slot_ids"),
                 constraints=body.get("constraints"),
                 meetings_per_opponent=body.get("meetings_per_opponent"),
+                games_per_team=body.get("games_per_team"),
                 actor_id=user_id, user_id=user_id, role=role, scope=scope))
         scenario_commit = re.match(
             r"^/api/scheduler/scenarios/([^/]+)/commit$", path)
@@ -2678,10 +2686,11 @@ class Handler(BaseHTTPRequestHandler):
                 constraints=body.get("constraints"),
                 draft_fingerprint=body.get("draft_fingerprint"),
                 # #375 — must match the format the reviewed preview used;
-                # it is bound into draft_fingerprint, so a mismatch is
-                # refused as preview_stale rather than silently committing
-                # a differently-sized schedule.
+                # whichever spelling it used is bound into draft_fingerprint,
+                # so a mismatch is refused as preview_stale rather than
+                # silently committing a differently-sized schedule.
                 meetings_per_opponent=body.get("meetings_per_opponent"),
+                games_per_team=body.get("games_per_team"),
                 # #386 — the same sibling omission as /api/scheduler/draft,
                 # behind a verb that WRITES: this route takes the identical
                 # caller-supplied Division-only or Season+League target, so
