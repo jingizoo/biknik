@@ -200,24 +200,181 @@ def _normalize_games_per_team(value, field="games_per_team"):
     return value
 
 
-def games_per_team_pairings(team_ids, games_per_team):
-    """PLACEHOLDER — deliberately wrong, replaced by the real construction.
+def _require_feasible_games_per_team(team_count, games, label=None):
+    """Refuse an arithmetically impossible guarantee (#375), actionably.
 
-    This is the naive implementation, committed first so the property tests
-    in ``tests/test_scheduler_games_per_team.py`` can be shown FAILING
-    against it: take ``ceil(G / opponents)`` whole round-robins and truncate
-    the flat list to the right TOTAL number of pairings. It gets the total
-    exactly right and the per-team guarantee wrong whenever ``G`` is not a
-    multiple of ``opponents``, because truncating a flat round-robin list
-    cuts mid-round and leaves the teams of the severed rounds uneven.
+    Every game is played by two teams, so it contributes 2 to the
+    league-wide game count: the total ``T x G`` MUST be even. When ``T`` and
+    ``G`` are both odd it is not, and no amount of scheduling cleverness
+    fixes it — some team will always end up one game short. The owner's
+    ruling is to REFUSE rather than quietly deliver an uneven schedule under
+    a control the operator reads as "guaranteed".
+
+    The single parity condition suffices for the whole construction, not
+    just the total: ``T x (T-1)`` is always even (one of two consecutive
+    integers is), so ``T x G`` even is equivalent to ``T x rem`` even, which
+    is exactly the precondition :func:`_extra_pairs` needs — odd ``T``
+    requires an even ``rem`` to build its symmetric chords.
+
+    The message NAMES THE NEAREST ACHIEVABLE COUNTS (``G-1`` and ``G+1``,
+    both of which flip the parity) rather than merely reporting failure: an
+    operator told "20 is impossible" has to guess, while one told "ask for
+    19 or 21" can act. A neighbour that falls outside the accepted range is
+    dropped rather than suggested — ``G-1`` is not offered when it is 0, and
+    ``G+1`` is not offered past the ceiling.
+
+    ``label`` names the team group when a League-wide draft has several
+    Divisions with different team counts, so the operator learns WHICH one
+    cannot honour the request instead of just that something could not.
+    """
+    if team_count < 2 or (team_count * games) % 2 == 0:
+        return
+    nearest = [value for value in (games - 1, games + 1)
+               if 1 <= value <= MAX_GAMES_PER_TEAM]
+    where = f" in {label}" if label else ""
+    advice = (f" Ask for {' or '.join(str(v) for v in nearest)} games "
+              f"instead." if nearest else "")
+    raise ValidationError(
+        f"{games} guaranteed games per team is impossible with "
+        f"{team_count} teams{where}: every game is played by two teams, so "
+        f"the league-wide total ({team_count} x {games} = "
+        f"{team_count * games}) would have to be an odd number of team "
+        f"appearances and one team would always finish a game short."
+        f"{advice}",
+        {"reason": "games_per_team_infeasible",
+         "team_count": team_count,
+         "games_per_team": games,
+         "nearest_achievable": nearest})
+
+
+def _extra_pairs(teams, rem):
+    """A ``rem``-REGULAR multigraph on ``teams`` — the heart of #375.
+
+    "rem-regular" means every single team gains exactly ``rem`` extra games.
+    That is the whole correctness burden of the remainder: the ``base``
+    complete round-robins below already give everyone ``base x (T-1)``, so
+    if this function is rem-regular the total is exactly ``G`` for every
+    team, and if it is off by one anywhere the guarantee is a lie for that
+    team. Returned as UNORDERED pairs; orientation is decided by the caller.
+
+    Two constructions, because one shape does not cover both parities:
+
+    EVEN T — the circle method's rounds. With an even number of teams each
+    of the ``T-1`` rotation rounds is a PERFECT MATCHING (every team appears
+    in exactly one pair of that round), so taking the first ``rem`` rounds
+    gives every team exactly ``rem`` extra games. There are always enough
+    rounds: ``rem < T-1`` by construction, since it is a remainder mod
+    ``T-1``. Rounds of a round-robin are edge-disjoint, so no PAIR gains
+    more than one — which is what keeps the per-opponent spread at 1.
+
+    ODD T — a circulant. Odd ``T`` has no perfect matching at all (a
+    matching covers an even number of vertices), so the round trick cannot
+    work. But odd ``T`` also forces ``rem`` to be EVEN: feasibility requires
+    ``T x G`` even, so odd ``T`` forces ``G`` even; ``T-1`` is then even
+    too; and ``rem = G - base x (T-1)`` is even minus even. So the extras
+    can be built from symmetric chords: for each ``k`` in ``1..rem/2``, join
+    team ``i`` to team ``(i+k) mod T`` for every ``i``. Each ``k`` adds
+    exactly 2 to every team's degree (its ``+k`` chord and its ``-k`` one),
+    so the total is ``2 x rem/2 = rem`` — rem-regular. The chords are
+    distinct and non-degenerate because ``k < T/2``: ``rem <= T-2`` gives
+    ``rem/2 <= (T-2)/2 < T/2``, so ``k`` and ``T-k`` never collide and no
+    chord doubles back on itself. Different ``k`` touch disjoint pairs, so
+    again no pair gains more than one.
+
+    Both are pure functions of the SORTED team list — no RNG, no clock, no
+    set or dict iteration order, no store state — which is the determinism
+    contract ``round_robin_pairings`` already holds and ``_draft_fingerprint``
+    depends on.
+    """
+    if rem <= 0:
+        return []
+    n = len(teams)
+    if n % 2 == 0:
+        # Replay the same rotation `round_robin_pairings` uses, keeping only
+        # the first `rem` rounds. Written out rather than sliced off that
+        # function's flat output because the flat list carries orientation
+        # and round boundaries are exactly what a naive slice loses.
+        pairs = []
+        fixed, rot = teams[0], list(teams[1:])
+        for _round in range(rem):
+            arrangement = [fixed] + rot
+            for i in range(n // 2):
+                pairs.append((arrangement[i], arrangement[n - 1 - i]))
+            rot = [rot[-1]] + rot[:-1]
+        return pairs
+    # Odd T: `rem` is guaranteed even here (see the docstring), so this
+    # halving is exact. `_require_feasible_games_per_team` is what makes
+    # that guarantee true before the generator is ever reached.
+    return [(teams[i], teams[(i + k) % n])
+            for k in range(1, rem // 2 + 1)
+            for i in range(n)]
+
+
+def games_per_team_pairings(team_ids, games_per_team):
+    """Pairings giving EVERY team exactly ``games_per_team`` games (#375).
+
+    The operator-facing inversion: instead of asking for N meetings against
+    every opponent and letting games-per-team fall out as ``N x (T-1)``, the
+    operator asks for the number of games their own team is guaranteed and
+    the per-opponent count is derived:
+
+        opponents = T - 1
+        base      = G // opponents   # games against EVERY opponent
+        rem       = G %  opponents   # this many opponents are played once more
+
+    So the output is ``base`` complete round-robins (the existing circle-method
+    generator, reused unchanged) plus a ``rem``-regular extras multigraph
+    (:func:`_extra_pairs`). Every team plays ``base x opponents + rem == G``
+    games, and no opponent is played more than one time more than any other.
+
+    Worked examples from the issue, all of which the property tests pin:
+    T=2/G=20 -> the two teams meet 20 times (20 games); T=5/G=20 -> base 5,
+    rem 0, every pair meets 5x (50 games); T=20/G=20 -> base 1, rem 1,
+    everyone meets once (19 games) plus one extra each (10 more) = 200.
+
+    FEASIBILITY is the caller's job, not this function's: ``T x G`` must be
+    even or no construction can give every team exactly G (see
+    :func:`_require_feasible_games_per_team`, which refuses with an
+    actionable message). Reaching here with an infeasible pair would
+    silently produce an odd ``rem`` on odd ``T`` and lose a game, so the
+    assertion of that precondition lives at the entry points where the team
+    count is known and a refusal can still be reported to the operator.
+
+    Fewer than two teams yields no pairings — the same answer
+    :func:`round_robin_pairings` already gives, and what keeps the ``T-1``
+    denominator away from zero.
+
+    HOME/AWAY is balanced within one game per pair and decided
+    deterministically from the sorted team ids alone. The base cycles
+    inherit :func:`round_robin_pairings`'s own alternation (meeting *m*
+    reuses the base orientation when *m* is even, reverses it when odd), and
+    the extras are oriented as if they were meeting number ``base`` — the
+    NEXT meeting in that same alternation. That is what keeps the guarantee
+    exact rather than approximately right: an extra game blindly added in
+    the base orientation would push a pair that had already hosted one more
+    (odd ``base``) to a two-game imbalance. Following the alternation
+    instead means an even ``base`` becomes a one-game difference and an odd
+    ``base`` comes out exactly level.
     """
     teams = sorted(team_ids)
     if len(teams) < 2:
         return []
     opponents = len(teams) - 1
-    cycles = -(-games_per_team // opponents)
-    return round_robin_pairings(teams, cycles)[
-        :(len(teams) * games_per_team) // 2]
+    base, rem = divmod(games_per_team, opponents)
+    pairings = round_robin_pairings(teams, base)
+    if rem <= 0:
+        return pairings
+    # The canonical orientation of every pair, read off meeting 0 of the
+    # base round-robin, so the extras alternate against the SAME reference
+    # the base cycles do. Built even when `base` is 0 (no cycles emitted):
+    # the reference is the circle method's own answer, not a count of what
+    # was emitted.
+    canonical = {frozenset(pair): pair
+                 for pair in round_robin_pairings(teams, 1)}
+    for pair in _extra_pairs(teams, rem):
+        home, away = canonical[frozenset(pair)]
+        pairings.append((home, away) if base % 2 == 0 else (away, home))
+    return pairings
 
 
 def _available_game_slots(store, slot_ids=None):

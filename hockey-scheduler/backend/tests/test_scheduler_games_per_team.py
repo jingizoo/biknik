@@ -51,6 +51,7 @@ from hockey_scheduler.domain.errors import ValidationError
 from hockey_scheduler.services.scheduler import (
     MAX_GAMES_PER_TEAM,
     _normalize_games_per_team,
+    _require_feasible_games_per_team,
     games_per_team_pairings,
 )
 
@@ -402,6 +403,81 @@ class GamesPerTeamValidationTest(unittest.TestCase):
             _normalize_games_per_team(MAX_GAMES_PER_TEAM + 1)
         self.assertEqual(_normalize_games_per_team(MAX_GAMES_PER_TEAM),
                          MAX_GAMES_PER_TEAM)
+
+
+class GamesPerTeamFeasibilityTest(unittest.TestCase):
+    """`T x G` must be even, and the refusal has to be actionable."""
+
+    def test_every_feasible_combination_is_accepted(self):
+        # Anti-vacuity control for the refusals below: the guard must be
+        # silent on everything the generator can actually build, or a
+        # "refuses the impossible" test would also be satisfied by a
+        # function that refuses everything.
+        for team_count in TEAM_COUNTS:
+            for games in GAME_COUNTS:
+                if not feasible(team_count, games):
+                    continue
+                with self.subTest(teams=team_count, games=games):
+                    _require_feasible_games_per_team(team_count, games)
+
+    def test_both_odd_is_refused(self):
+        refused = 0
+        for team_count in TEAM_COUNTS:
+            for games in GAME_COUNTS:
+                if feasible(team_count, games):
+                    continue
+                with self.subTest(teams=team_count, games=games):
+                    with self.assertRaises(ValidationError):
+                        _require_feasible_games_per_team(team_count, games)
+                refused += 1
+        self.assertEqual(refused, 9 * 15)  # 9 odd T in 2..20, 15 odd G in 1..30
+
+    def test_refusal_names_the_nearest_achievable_counts(self):
+        with self.assertRaises(ValidationError) as caught:
+            _require_feasible_games_per_team(5, 21)
+        self.assertEqual(caught.exception.details["reason"],
+                         "games_per_team_infeasible")
+        self.assertEqual(caught.exception.details["nearest_achievable"],
+                         [20, 22])
+        self.assertIn("20 or 22", str(caught.exception))
+        # And it says WHY, not just that it failed.
+        self.assertIn("5 x 21 = 105", str(caught.exception))
+
+    def test_nearest_achievable_never_suggests_a_refused_value(self):
+        # G-1 = 0 is below the floor and G+1 is past the ceiling; neither
+        # may be offered as advice the backend would then reject.
+        low = None
+        try:
+            _require_feasible_games_per_team(3, 1)
+        except ValidationError as exc:
+            low = exc.details["nearest_achievable"]
+        self.assertEqual(low, [2])
+        high = None
+        try:
+            _require_feasible_games_per_team(3, MAX_GAMES_PER_TEAM)
+        except ValidationError as exc:
+            high = exc.details["nearest_achievable"]
+        # MAX is even in this build, so pick the odd one below it.
+        if MAX_GAMES_PER_TEAM % 2 == 0:
+            self.assertIsNone(high)
+            try:
+                _require_feasible_games_per_team(3, MAX_GAMES_PER_TEAM - 1)
+            except ValidationError as exc:
+                high = exc.details["nearest_achievable"]
+        self.assertEqual(high, [MAX_GAMES_PER_TEAM - 2, MAX_GAMES_PER_TEAM])
+
+    def test_a_group_too_small_to_play_is_not_refused(self):
+        # A Division with 0 or 1 teams produces no pairings at all (the
+        # pre-existing `round_robin_pairings` answer). Refusing it on parity
+        # would make one empty Division veto a whole League-wide draft.
+        for team_count in (0, 1):
+            for games in (1, 3, 21):
+                _require_feasible_games_per_team(team_count, games)
+
+    def test_refusal_can_name_the_group_that_cannot_honour_it(self):
+        with self.assertRaises(ValidationError) as caught:
+            _require_feasible_games_per_team(5, 21, label="Gold")
+        self.assertIn("in Gold", str(caught.exception))
 
 
 if __name__ == "__main__":
