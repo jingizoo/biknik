@@ -304,6 +304,39 @@ protocols:
   one persona does not set it for another. Each environment sheet sets its own,
   signed in as its own persona.
 
+## The checker
+
+[`check_pack.py`](check_pack.py) is plain `python3`, standard library only, no
+third-party dependencies, and it writes to nothing.
+
+```bash
+python3 check_pack.py                     # is the pack built correctly?
+python3 check_pack.py --session-readiness # may a session start today?
+python3 check_pack.py --verify-breaks     # can every check still fail?
+python3 check_pack.py --list-breaks
+```
+
+The first two answer different questions and give different answers today: the
+pack is correctly built (green), and a session may **not** start (non-zero,
+because the ease-rating wording is unruled). That is the gate working.
+
+What it covers, and why each one is executable rather than a paragraph:
+
+| Check | What it would catch |
+| --- | --- |
+| `pii-fields`, `pii-rules`, `pii-supersession-note` | an identity, full-name, contact-detail or employer field returning to a sheet that gets attached to the public issue; any of the four privacy rules being dropped |
+| `pii-export` | the issue-ready export leaking a name, email, phone, employer, account identifier or an unrelated personal disclosure, run against a synthetic record that contains all of them |
+| `primary-action-rubric`, `primary-action-text` | a correct prediction about a *secondary* control being transcribed as the canonical primary-action match |
+| `ease-readiness`, `ease-single-source`, `ease-preflight-gate` | a session starting on an unruled ease wording, three role sheets drifting to three different questions, or the README going back to saying nothing blocks |
+| `protocol-pin`, `pin-present` | either protocol changing by one byte while this pack goes on quoting the old text |
+| `ksr-steps-verbatim` | any of the 17 K steps or 14 S steps drifting from the protocol's own wording |
+
+Every check has at least one `--break` mutation that injects the exact defect it
+targets, and `--verify-breaks` runs all of them and requires each to fail. CI
+runs both halves on every push. That second half is not ceremony: a check whose
+target text has drifted away reports green while testing nothing, which has
+happened twice in this repository's tooling, and nothing except this notices.
+
 ## Scope
 
 This pack adds no application code, tests, CI configuration, or product

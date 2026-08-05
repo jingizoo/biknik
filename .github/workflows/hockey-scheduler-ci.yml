@@ -35,6 +35,40 @@ jobs:
           node hockey-scheduler/e2e/ci-classify.test.js
           node hockey-scheduler/e2e/ci-classify.integration.test.js
 
+  # The #345 human-validation facilitator pack checker. Deliberately UNGATED by
+  # the classifier, unlike every job below it. The pack is markdown, so the
+  # fail-closed classifier routes it to "docs" and contributes no heavy job —
+  # static-checks included. But this checker's whole purpose is to notice the
+  # two validation PROTOCOLS drifting away from the pack that quotes them
+  # verbatim, and those protocols are markdown under hockey-scheduler/docs/
+  # too. Gating it on the classifier would mean the one change it exists to
+  # catch is exactly the change that never starts it.
+  #
+  # Pure python3, stdlib only, no install step, a few hundred milliseconds.
+  human-validation-pack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # Two halves, and the second is the one that matters on a quiet week.
+      #   (a) the checks must pass;
+      #   (b) EVERY --break mutation must still make at least one check fail.
+      # A check whose target text has drifted away reports green while testing
+      # nothing — that has happened twice in this repository's tooling. Part (b)
+      # re-proves falsifiability on every run and names the mutation that
+      # stopped biting, instead of letting it pass silently forever.
+      - name: Human-validation facilitator pack — checks, then falsify each one (#345)
+        run: |
+          set -euo pipefail
+          CHECKER=hockey-scheduler/docs/product/345-human-validation/check_pack.py
+          echo "--- (a) the pack's checks must pass"
+          python3 "$CHECKER"
+          echo "--- (b) every injected defect must still make a check fail"
+          python3 "$CHECKER" --verify-breaks
+
   # Change-based routing, FAIL-CLOSED. Diffs the PR against its base with plain
   # git (no third-party action) and pipes the file list through the tested
   # classifier (hockey-scheduler/e2e/ci-classify.js), which fails closed:

@@ -1218,6 +1218,145 @@ def check_pin_present() -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# The 17 K steps and the 14 S steps, byte-exact against the pinned protocol.
+#
+# protocol-pin proves the SOURCE has not moved. This proves the COPY still
+# matches it. Both are needed: a pack whose quotations drift from an unchanged
+# protocol fails just as badly as a pack pinned to a protocol that changed, and
+# the pre-#394 K5/S5 inversion was one word's difference in an expected outcome.
+# ---------------------------------------------------------------------------
+
+B_K_STEP_DRIFT = register_break(
+    "k-step-drift",
+    "reword one K step's expected outcome in the keyboard script",
+)
+B_S_STEP_DRIFT = register_break(
+    "s-step-drift",
+    "reword one S step's expected announcement in the screen-reader script",
+)
+
+PROCEDURES = {
+    "K": {
+        "count": 17,
+        "protocol": KSR_PROTOCOL,
+        "section": "§3",
+        "pack_file": "04-keyboard-script.md",
+        "expected_label": "Expected outcome",
+        "break": None,  # filled below
+    },
+    "S": {
+        "count": 14,
+        "protocol": KSR_PROTOCOL,
+        "section": "§4",
+        "pack_file": "05-screen-reader-script.md",
+        "expected_label": "Expected announcement",
+        "break": None,
+    },
+}
+PROCEDURES["K"]["break"] = B_K_STEP_DRIFT
+PROCEDURES["S"]["break"] = B_S_STEP_DRIFT
+
+
+def protocol_steps(prefix: str) -> dict[str, tuple[str, str]]:
+    """{'K1': (step, expected)} straight out of the protocol's own table."""
+    text = read_protocol(PROCEDURES[prefix]["protocol"]).decode("utf-8")
+    steps: dict[str, tuple[str, str]] = {}
+    for line in text.splitlines():
+        if not re.match(r"^\|\s*" + prefix + r"\d+\s*\|", line):
+            continue
+        parts = line.split("|")
+        if len(parts) != 5:
+            raise AssertionError(
+                f"protocol row does not have exactly 3 cells, so the parser "
+                f"cannot be trusted: {line[:80]!r}"
+            )
+        steps[parts[1].strip()] = (parts[2].strip(), parts[3].strip())
+    return steps
+
+
+def pack_steps(prefix: str) -> dict[str, tuple[str | None, str | None]]:
+    meta = PROCEDURES[prefix]
+    text = read_pack(meta["pack_file"])
+    if broken(meta["break"]):
+        # One word, in one expected outcome — the size of the K5/S5 inversion.
+        target = "> The dialog opens and focus moves into it." if prefix == "K" else (
+            "> The toast/status channel (`#toast-root[aria-live=\"polite\"]`) "
+            "announces the success message once."
+        )
+        if target not in text:
+            raise AssertionError(f"drift mutation anchor not found: {target!r}")
+        text = text.replace(target, target.replace("once", "at least once"), 1)
+        text = text.replace(target, target.replace("into it", "near it"), 1)
+
+    out: dict[str, tuple[str | None, str | None]] = {}
+    sections = re.split(r"(?m)^### (" + prefix + r"\d+)$", text)
+    # sections = [preamble, id, body, id, body, ...]
+    for i in range(1, len(sections), 2):
+        step_id = sections[i]
+        body = sections[i + 1]
+
+        def quoted_after(label: str) -> str | None:
+            marker = re.search(
+                r"\*\*" + re.escape(label) + r" \(protocol [^)]*\):\*\*\n\n> (.*)",
+                body,
+            )
+            return marker.group(1).strip() if marker else None
+
+        out[step_id] = (
+            quoted_after("Step"),
+            quoted_after(meta["expected_label"]),
+        )
+    return out
+
+
+@check("ksr-steps-verbatim")
+def check_ksr_steps_verbatim() -> list[str]:
+    """All 17 K steps and all 14 S steps, byte-exact against the protocol."""
+    failures = []
+    for prefix, meta in PROCEDURES.items():
+        source = protocol_steps(prefix)
+        copy = pack_steps(prefix)
+
+        expected_ids = [f"{prefix}{n}" for n in range(1, meta["count"] + 1)]
+        if sorted(source) != sorted(expected_ids):
+            failures.append(
+                f"protocol {meta['section']} has {sorted(source)}, expected "
+                f"{meta['count']} steps {expected_ids[0]}–{expected_ids[-1]}"
+            )
+        missing = [i for i in expected_ids if i not in copy]
+        if missing:
+            failures.append(
+                f"{meta['pack_file']}: missing step section(s) {', '.join(missing)}"
+            )
+
+        for step_id in expected_ids:
+            if step_id not in source or step_id not in copy:
+                continue
+            src_step, src_expected = source[step_id]
+            got_step, got_expected = copy[step_id]
+            if got_step is None:
+                failures.append(f"{meta['pack_file']}: {step_id} quotes no step text")
+            elif got_step != src_step:
+                failures.append(
+                    f"{meta['pack_file']}: {step_id} step text is not verbatim.\n"
+                    f"           protocol: {src_step}\n"
+                    f"           pack:     {got_step}"
+                )
+            if got_expected is None:
+                failures.append(
+                    f"{meta['pack_file']}: {step_id} quotes no expected outcome"
+                )
+            elif got_expected != src_expected:
+                failures.append(
+                    f"{meta['pack_file']}: {step_id} expected outcome is not "
+                    f"verbatim.\n"
+                    f"           protocol: {src_expected}\n"
+                    f"           pack:     {got_expected}"
+                )
+    return failures
+
+
+# ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
 
