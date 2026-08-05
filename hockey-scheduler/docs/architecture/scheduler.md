@@ -10,7 +10,8 @@ proposal only; nothing is persisted until the separate commit step.
 `round_robin_pairings` (the circle method) takes a Division's — or a
 League-wide draft's per-Division group's — registered team ids, sorted for
 determinism, and returns every unordered pair `meetings_per_opponent` times
-(an odd team count gets a bye each round). Two entry points share the same
+(an odd team count gets a bye each round). `games_per_team_pairings` wraps it
+for the operator-facing control below. Two entry points share the same
 pairing/ice-assignment core:
 
 * `draft_schedule(store, division_id, ...)` — one Division.
@@ -20,37 +21,149 @@ pairing/ice-assignment core:
   each group gets its own round-robin — a league-wide draft never pairs
   teams across different Divisions of that League.
 
-## Configurable regular-season format (#375)
+## Regular-season format: guaranteed games per team (#375)
+
+The operator-facing control is **`games_per_team`** — the number of games
+each team is GUARANTEED to play. An operator signs up for a number of games
+their own team plays, not for a number of times they meet each opponent, so
+the per-opponent count is derived rather than asked for:
+
+```
+opponents = T - 1
+base      = G // opponents   # games against EVERY opponent
+rem       = G %  opponents   # this many opponents are played once more
+```
+
+| Teams | G  | Derivation                | Total games |
+|-------|----|---------------------------|-------------|
+| 2     | 20 | base 20, rem 0            | 20          |
+| 5     | 20 | base 5, rem 0             | 50          |
+| 20    | 20 | base 1, rem 1             | 200         |
+
+In a League-wide draft the derivation is **per Division**: `games_per_team`
+guarantees each team that many games inside its own group, so a 6-team and a
+10-team Division of the same League derive different per-opponent counts.
+That is the point of the control, and the reason feasibility is judged per
+group.
+
+### Feasibility: `T × G` must be even, and odd × odd is REFUSED
+
+Every game is played by two teams, so it contributes 2 to the league-wide
+game count: the total `T × G` must be even. When `T` and `G` are both odd it
+is not, and no scheduling cleverness fixes it — some team always finishes a
+game short. **Owner ruling: refuse**, rather than quietly deliver an uneven
+schedule under a control the operator reads as "guaranteed".
+
+The single parity condition covers the whole construction, not just the
+total: `T × (T-1)` is always even, so `T × G` even ⟺ `T × rem` even, which is
+exactly what the remainder construction below needs.
+
+The refusal (`games_per_team_infeasible`) **names the nearest achievable
+counts**, `G-1` and `G+1`, because an operator told "20 is impossible" has to
+guess while one told "ask for 19 or 21" can act. A neighbour outside the
+accepted range is dropped rather than suggested, so the advice can never name
+a value the backend would itself reject. League-wide, the message also names
+the Division that cannot honour the request. A group with fewer than two
+teams is exempt: it has no opponents and produces no pairings at all (the
+pre-existing answer), so one empty Division cannot veto a whole League draft.
+
+### Construction: `base` round-robins plus a `rem`-regular extras multigraph
+
+`games_per_team_pairings` emits `base` complete round-robins — the existing
+circle-method generator, reused unchanged — plus an extras multigraph in
+which **every team gains exactly `rem` games**. Two shapes, because one does
+not cover both parities:
+
+* **Even `T`** — each of the `T-1` circle-rotation rounds is a *perfect
+  matching*, so the first `rem` rounds give every team exactly `rem`. There
+  are always enough rounds, since `rem < T-1` by construction. Rounds are
+  edge-disjoint, so no *pair* gains more than one.
+* **Odd `T`** — odd `T` has no perfect matching at all. But odd `T` forces
+  `rem` EVEN (`T × G` even forces `G` even; `T-1` is even; `rem = G - base ×
+  (T-1)` is even minus even), so the extras are a *circulant*: for each `k`
+  in `1..rem/2`, join team `i` to team `(i+k) mod T`. Each `k` adds exactly 2
+  to every team's degree (its `+k` chord and its `−k` one), totalling `rem`.
+  Since `rem ≤ T-2`, `k < T/2`, so no chord collides with its mirror and
+  distinct `k` touch disjoint pairs.
+
+Both give per-opponent counts of `base` or `base+1` — the spread stays at 1.
+Regularity is **asserted, not assumed**: `GamesPerTeamRegularityTest` strips
+the base cycles off the output and checks every team gains exactly `rem`,
+across `T` 2..20 × `G` 1..30.
+
+`games_per_team` is validated as an integer in `1..MAX_GAMES_PER_TEAM` (120)
+— `bool` is rejected explicitly, since `True` would otherwise silently mean 1
+— and a bad value raises a structured `ValidationError` rather than letting a
+raw `TypeError` cross the facade boundary. The ceiling is an **allocation**
+bound: the pairing list materialized before any ice is consulted is exactly
+`T × G / 2` rows.
+
+### `meetings_per_opponent` — legacy, still accepted
 
 `meetings_per_opponent` (optional on `draft_season_schedule` and
-`commit_draft_schedule`, and on both HTTP routes; `None`/omitted means 1)
-is how many times each team plays every other. 6 teams × 3 meetings is
-C(6,2) × 3 = 45 fixtures, i.e. **15 games per team**. It is validated as an
-integer in `1..MAX_MEETINGS_PER_OPPONENT` (20) — `bool` is rejected
-explicitly, since `True` would otherwise silently mean 1 — and a bad value
-raises a structured `ValidationError` rather than letting a raw `TypeError`
-cross the facade boundary. The ceiling exists because the materialized
-pairing list grows as `meetings × C(teams, 2)`.
+`commit_draft_schedule`, and on both HTTP routes; `None`/omitted means 1) is
+how many times each team plays every other. 6 teams × 3 meetings is
+C(6,2) × 3 = 45 fixtures, i.e. 15 games per team. Validated as an integer in
+`1..MAX_MEETINGS_PER_OPPONENT` (20).
+
+It is **kept, not deprecated away**: it is bound into `draft_fingerprint` and
+stored inside named scenarios (#381), so dropping it would invalidate every
+scenario already on disk. It is also the only way to express "play everyone
+once" without knowing a Division's size — that is `T-1` games, which differs
+per Division.
+
+**Sending BOTH is refused** (`schedule_format_conflict`), not reconciled.
+They are not two spellings of one number: a League-wide
+`meetings_per_opponent=3` means three meetings in every Division, while
+`games_per_team=G` derives a different per-opponent count in each, so "do
+they agree?" has no answer that survives a heterogeneous League. Picking a
+winner would make the losing field a silent no-op — exactly how two controls
+for one setting drift apart.
+
+A proposal echoes **exactly one** of the two, with `None` for the other.
+Echoing a derived value into the unused field would be a second source of
+truth the commit path then has to reconcile.
 
 **Home/away is deterministic, not arbitrary.** Meeting *m* (0-indexed)
 reuses the base round-robin's orientation when *m* is even and reverses it
-when *m* is odd. Two properties follow:
+when *m* is odd. The `rem` extras are oriented as if they were meeting number
+`base` — the next step in that same alternation. That is what keeps the
+guarantee exact: an extra game added blindly in the base orientation would
+push an odd-`base` pair to a TWO-game imbalance, while following the
+alternation makes even `base` differ by one and odd `base` come out level.
+Two properties follow:
 
-* every pair's split is balanced to within one game — exactly even for even
-  `meetings`, base-orientation-plus-one for odd;
-* the decision reads only the sorted team ids and `meetings`. No RNG, no
+* every pair's split is balanced to within one game — exactly even whenever
+  the pair meets an even number of times;
+* the decision reads only the sorted team ids and the format. No RNG, no
   clock, no dict/set iteration order, no store state — so the same inputs
   reproduce the same split in another process, on another store backend,
-  and regardless of the order teams were registered in.
+  and regardless of the order teams were registered in. A dedicated property
+  test re-runs the generator in a FRESH INTERPRETER, because within one
+  process a set- or dict-ordered construction produces the same wrong answer
+  twice and the two agree.
 
 Cycles are emitted whole (all of meeting 0, then meeting 1, …), which is
 both what a real league schedule looks like and what keeps the
 `meetings=1` output byte-identical to pre-#375.
 
-`meetings_per_opponent` is bound into `draft_fingerprint` directly, not
-merely implied by the row lists it changes, so previewing one format and
-committing another is a guaranteed `preview_stale` refusal rather than one
-that happens to fall out of the buckets differing.
+Both fields are bound into `draft_fingerprint` directly, not merely implied
+by the row lists they change, so previewing one format and committing another
+is a guaranteed `preview_stale` refusal rather than one that happens to fall
+out of the buckets differing. `games_per_team` is added to the hashed payload
+**only when it is the operative format**, and that conditional is load-bearing
+rather than sloppy: #381 persists whole proposals including their
+fingerprint, so a key present with a `None` value would change the hash of
+every legacy proposal and refuse every scenario stored before #375 as
+`preview_stale`. A regression test pins four legacy fingerprint hexes
+captured from before the field existed.
+
+### The guarantee is over the PAIRING LIST, not over placement
+
+`games_per_team` guarantees the fixture list. If there is not enough ice, the
+balance lands in `unscheduled[]` with the bounded explanations #379 already
+provides — it is never silently dropped. Making PLACEMENT itself guaranteed
+would be new planner policy and is out of scope (#206).
 
 `_assign_ice` greedily assigns each pairing (in round-robin order) the
 earliest still-free candidate slot that satisfies every constraint
@@ -101,7 +214,7 @@ reading occupancy at all, so the historical proposal — `draft_fingerprint`
 included — is byte-identical.
 
 `draft_season_schedule` echoes the normalized `min_turnaround_minutes`
-back on the proposal, exactly as it echoes `meetings_per_opponent`, so the
+back on the proposal, exactly as it echoes the regular-season format, so the
 Scheduler UI sends the value the PREVIEW was generated with at Commit
 rather than whatever the live control currently reads.
 
@@ -109,7 +222,7 @@ rather than whatever the live control currently reads.
 
 Echoing it and trusting the caller to send it back is not enforcement.
 `_draft_fingerprint` hashes the normalized `min_turnaround_minutes`
-directly, alongside `meetings_per_opponent` and for exactly the same
+directly, alongside the regular-season format and for exactly the same
 reason — and it is the third time this repo has had to learn it (#382
 bound the format; #381 had to persist and replay it).
 
@@ -1362,30 +1475,46 @@ transaction.
 
 This layer does not interpret or reshape unplaced explanations and does not add
 format knobs. Explanation fields/order/caps remain the generator's contract;
-configurable meetings and deterministic home/away remain #375's contract.
+the guaranteed-games-per-team format and deterministic home/away remain
+#375's contract.
 
 ### The format a scenario replays under (#382)
 
 A scenario is generated under one regular-season format and must **commit under
-that same one**. `meetings_per_opponent` is therefore persisted, not re-derived:
+that same one**. Both spellings are therefore persisted, not re-derived:
 
 - create passes the caller's requested value to the generator and then stores
-  **the generator's own resolved answer** (`proposal["meetings_per_opponent"]`)
-  in `request_input`, so an omitted format is recorded as the explicit `1` it
-  really ran under rather than left absent;
-- it is also part of the material snapshot's `planner_input`, because the same
-  registrations and the same ice produce a different fixture list under a
-  different N — the format is a material input, not a request detail;
-- commit passes that stored value into the draft-commit gate, where the
-  under-lock regeneration uses it. Omitting it re-derives the historical single
-  round-robin, whose `draft_fingerprint` no longer matches the reviewed one, so
-  a double round-robin would be refused as `preview_stale` instead of
-  committing its 2 × C(n,2) fixtures;
+  **the generator's own resolved answers** (`proposal["meetings_per_opponent"]`
+  and `proposal["games_per_team"]`) in `request_input`, so an omitted format is
+  recorded as the explicit value it really ran under — including the `None` for
+  the spelling that was not used — rather than left absent;
+- the operative one is also part of the material snapshot's `planner_input`,
+  because the same registrations and the same ice produce a different fixture
+  list under a different format — the format is a material input, not a request
+  detail;
+- commit passes the stored values into the draft-commit gate, where the
+  under-lock regeneration uses them. Omitting them re-derives the historical
+  single round-robin, whose `draft_fingerprint` no longer matches the reviewed
+  one, so a larger batch would be refused as `preview_stale` instead of
+  committing its fixtures;
 - the stored format and the persisted proposal's format are covered by two
   **independent** fingerprints, so their agreement is checked explicitly at
-  commit. A disagreement is `schedule_scenario_integrity_error` with
-  `fields: ["meetings_per_opponent"]` — a rewritten record cannot quietly
-  change the size of the schedule a reviewed scenario commits.
+  commit by `_scenario_replay_format`. A disagreement is
+  `schedule_scenario_integrity_error` naming the field(s) that disagree — a
+  rewritten record cannot quietly change the size of the schedule a reviewed
+  scenario commits. A record with neither spelling operative, or both at once,
+  is likewise refused: neither shape can be produced by
+  `create_schedule_scenario`.
+
+**Scenarios stored before #375 still commit.** `games_per_team` is written into
+`planner_input` only when it is the operative format, for the same reason it is
+added to `draft_fingerprint` conditionally: `planner_input` is hashed into
+`input_fingerprint` and re-derived at commit from the scenario's own stored
+`request_input`, so an unconditional key — even one holding `None` — would make
+every pre-#375 record fail its stale check (`schedule_scenario_stale`). A
+regression test reconstructs a genuine pre-#375 record and commits it, and both
+conditionals are verified falsifiable: removing either makes exactly the
+matching tests fail.
 
 ### Authorization is not part of this layer's staleness contract
 

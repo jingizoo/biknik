@@ -309,10 +309,16 @@ overlap: scenario persistence treats generated explanation payloads as opaque,
 and neither parallel slice owns meeting-count or home/away generation behavior.
 
 Clarified after #375 merged as PR #382: "does not own" means does not decide.
-A named scenario still **records and replays** the `meetings_per_opponent` it
+A named scenario still **records and replays** the regular-season format it
 was generated under, because a scenario that re-derived the format at commit
 would commit a different-sized schedule from the one reviewed. The value is
 #375's to compute; it is #378's to preserve.
+
+Updated when #375 inverted the control: the operator-facing field is now
+`games_per_team` (guaranteed games each team plays), from which the
+per-opponent count is derived. `meetings_per_opponent` remains accepted as
+the legacy spelling precisely so scenarios stored under it keep replaying;
+both are recorded and replayed by the same rule above.
 
 Done since this section was last accurate: #267 (login security, PR #286);
 #277 (turnover/curfew policy, PR #318/#319); #313/#315 (recurring ice
