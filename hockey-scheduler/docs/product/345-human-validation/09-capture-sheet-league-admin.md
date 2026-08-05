@@ -9,6 +9,24 @@ Script: `docs/product/moderated-operator-validation-protocol.md` §2, read at
 Environment and pre-flight: [01-environment-league-admin.md](01-environment-league-admin.md).
 Prompts to read: [06-task-prompts-league-admin.md](06-task-prompts-league-admin.md).
 
+**Source pin.** Everything this sheet quotes or references from a protocol was
+read at `origin/main` = `36195faadb5c97936022d8f3706af51181a6b64d`, at these
+exact document versions:
+
+| Canonical document (current path) | git blob SHA-1 at the pinned commit |
+| --- | --- |
+| `docs/product/moderated-operator-validation-protocol.md` | `c99935885b3de9141cad9b575a43a3d4fd62e0b3` |
+| `docs/product/manual-keyboard-screenreader-validation-protocol.md` | `738e6c096e5d95d671b211e3f3df21bf975d17cc` |
+
+A protocol quotation is not like a code citation. If the protocol is corrected
+and this pack is not, the pack goes on instructing a human to perform a step the
+protocol has since fixed, and nothing can see it — which is precisely what the
+pre-#394 K5/S5 inversion did for a week. So the blob SHA-1 is the enforcement
+and the prose is not: `check_pack.py`'s `protocol-pin` check recomputes both
+blobs and fails the moment either document changes by a single byte. When it
+fails, re-verify every quotation in this pack against the new text *before*
+advancing the pin.
+
 ---
 
 ## Session blanks — fill in before the participant arrives
@@ -33,7 +51,7 @@ Protocol §6 on empty fields:
 | Browser + version | |
 | Viewport / device (desktop, 390x844, or named device — exact px if neither) | |
 | Assistive technology in use + version (screen reader / keyboard-only / voice control / none) | |
-| Participant identity (see the privacy rule below) | |
+| Participant code (anonymous — `LA-01`, `LA-02`, … ; see the privacy rules below) | |
 | Participant's experience level with this app (New / some exposure / regular user) | |
 | Participant's real-world familiarity with the role | |
 | Consent obtained (see below) — how, and at what time | |
@@ -56,9 +74,63 @@ Protocol §1.2, verbatim:
 
 > | Assistive technology in use, if any | Screen reader (name + version) / keyboard-only / voice control / none *(fill in — required for any session standing in as the manual keyboard-only or screen-reader evidence #345 also requires; note if this session is not intended to satisfy that evidence)* |
 
-### The participant-identity field — protocol §1.6 governs, and nothing here overrides it
+### The participant code — and why this sheet has no identity field
 
-This pack invents no privacy rule. Protocol §1.6, verbatim:
+Protocol §6's evidence template has no participant-identity field at all. Its
+**Participant** block is three lines — role under test, experience level with
+this app, real-world familiarity with the role — and §1.6 says a name "is not
+needed" in as many words. This sheet is the working copy of that template, and
+the running order sends the transcribed result to the **public** #345 issue. A
+blank labelled "participant identity" on a sheet with that destination is not a
+neutral field; it is an instruction to write a real name into a public artifact,
+and a conscientious facilitator would have filled it in.
+
+So the participant is identified here by an anonymous code and nothing else:
+`LA-01` for the first League Admin participant, `LA-02` for the second, and so
+on. That code is the only participant identifier permitted on this sheet, in the
+transcribed §6 evidence, or in anything attached to #345.
+
+**Never write a name, contact detail, employer, job title, or account identifier
+on this sheet.** That includes initials, a club or rink name that identifies one
+person, a job title specific enough to name them, and the login of any real
+account. §1.6 allows exactly what is needed to interpret the result — "an Arena
+Manager with ~2 years' rink-scheduling experience" is its own worked example —
+and the two experience rows above are where that goes.
+
+**The consent-to-code mapping lives outside this repository, with access
+restricted to the moderator.** Someone has to be able to honour a withdrawal of
+consent, so the join from `LA-01` to a person does exist; it simply never enters
+version control, this pack, or the issue. Keep it wherever consent records are
+already kept, not in a working file beside these sheets.
+
+**Redaction check before attachment: re-read every quote and strike anything
+that identifies the participant or anyone else.** Participants name their own
+rinks, clubs, colleagues and employers inside otherwise on-task sentences, so
+§1.6's rule about unrelated disclosures only bites if someone actually looks.
+Strike the identifying span, mark the strike, and keep the on-task remainder —
+the finding is in the remainder. `check_pack.py`'s `pii-export` check runs that
+exact case against a synthetic record and fails if any of it survives.
+
+**No recordings.** These sessions run without audio or video recording. This is
+a decided rule, not a pending question: the repository owner ruled on 2026-08-05
+that written anonymized notes satisfy the evidence need, and that recording
+stays prohibited for this pack until a separate, owner-approved protocol change
+defines access, retention, deletion and consent handling. §1.6 permits recording
+at the moderator's choice and requires only that it be stored outside version
+control — it sets no retention period, no access list and no deletion rule, so
+"optional per the moderator" would leave a facilitator deciding alone how long a
+participant's voice is kept and who may hear it. That gap is real and still sits
+in the canonical protocol; it is raised for the owner in
+[README, "Raised for the owner, not fixed here"](README.md#raised-for-the-owner-not-fixed-here)
+and must not be patched by editing the protocol from this pack.
+
+**Supersedes the earlier requirement for an explicit blank for participant
+identity.** An earlier revision of this pack's brief asked for exactly that
+blank, and this sheet carried one. The participant-code rule replaces it
+deliberately — the field was removed, not forgotten — because the blank fed a
+public artifact and the canonical §6 template never had it.
+
+Protocol §1.6, which governs and which nothing here overrides, verbatim:
 
 > - Obtain the participant's verbal or written consent before starting,
 >   covering: that the session is being observed/recorded (per the

@@ -65,9 +65,26 @@ source. If you find any statement in this pack that conflicts with a protocol,
 the protocol wins and the pack is wrong; raise it rather than reconciling it
 locally.
 
-The protocols were read at `origin/main` =
-`36195faadb5c97936022d8f3706af51181a6b64d` (merge of #394). Every application
-behaviour this pack describes was observed at that same SHA on 2026-08-05.
+Every application behaviour this pack describes was observed on 2026-08-05 at
+the same pinned commit the protocols were read at (merge of #394), below.
+
+**Source pin.** Everything this sheet quotes or references from a protocol was
+read at `origin/main` = `36195faadb5c97936022d8f3706af51181a6b64d`, at these
+exact document versions:
+
+| Canonical document (current path) | git blob SHA-1 at the pinned commit |
+| --- | --- |
+| `docs/product/moderated-operator-validation-protocol.md` | `c99935885b3de9141cad9b575a43a3d4fd62e0b3` |
+| `docs/product/manual-keyboard-screenreader-validation-protocol.md` | `738e6c096e5d95d671b211e3f3df21bf975d17cc` |
+
+A protocol quotation is not like a code citation. If the protocol is corrected
+and this pack is not, the pack goes on instructing a human to perform a step the
+protocol has since fixed, and nothing can see it — which is precisely what the
+pre-#394 K5/S5 inversion did for a week. So the blob SHA-1 is the enforcement
+and the prose is not: `check_pack.py`'s `protocol-pin` check recomputes both
+blobs and fails the moment either document changes by a single byte. When it
+fails, re-verify every quotation in this pack against the new text *before*
+advancing the pin.
 
 ## The files
 
@@ -129,6 +146,71 @@ question, because the protocol supplies the 1–5 scale and its anchors but no
 wording for asking, and something has to be said nine times across three
 sessions. It is marked as this pack's wording wherever it appears, and it is
 item 4 below.
+
+## Participants are recorded by code, and nothing else
+
+The capture sheets are working copies of the moderated protocol's §6 evidence
+template, and the running order above sends the transcribed result to the
+**public** #345 issue. §6's **Participant** block is three lines — role under
+test, experience level with this app, real-world familiarity with the role — and
+it has no identity field. §1.6 says a name "is not needed". So:
+
+- **The participant is identified by an anonymous code**: `LA-01`, `LA-02`, … on
+  the League Admin sheet, `AM-nn` on the Arena Manager sheet, `C-nn` on the
+  Coach sheet. That code is the only participant identifier permitted on a
+  sheet, in the transcribed evidence, or in anything attached to #345.
+- **Never write a name, contact detail, employer, job title, or account
+  identifier on a capture sheet.**
+- **The consent-to-code mapping lives outside this repository, with access
+  restricted to the moderator.** Withdrawal of consent has to be honourable, so
+  the join exists — it just never enters version control or the issue.
+- **Redaction check before attachment: re-read every quote and strike anything
+  that identifies the participant or anyone else.** Strike the identifying span,
+  mark the strike, keep the on-task remainder.
+- **No recordings.** These sessions run without audio or video recording.
+
+**Supersedes the earlier requirement for an explicit blank for participant
+identity.** An earlier revision of this pack's brief asked for that blank and
+the three sheets carried one. The participant-code rule replaces it
+deliberately: the field was removed, not forgotten. A blank labelled
+"participant identity" on a sheet whose destination is a public issue is an
+instruction to publish a real name, and the canonical §6 template never had such
+a field to begin with.
+
+Each rule above is repeated in full, with its reasoning, on all three capture
+sheets, and `check_pack.py` fails if any of them is dropped or if an identity,
+full-name, contact-detail or employer field ever returns to one of the sheets.
+
+### Why no recordings — this is decided, not pending
+
+The repository owner ruled on 2026-08-05 that these sessions run **without**
+audio or video recording, that written anonymized notes satisfy the evidence
+need, and that recording stays prohibited for this pack until a separate,
+owner-approved protocol change defines access, retention, deletion and consent
+handling.
+
+The reasoning, so a later reader does not reopen it as an oversight: protocol
+§1.6 makes recording optional at the moderator's choice and requires only that
+any recording be stored outside version control and outside this repository. It
+sets no retention period, no access list, and no deletion rule. "Optional per
+the moderator" therefore leaves a facilitator deciding alone how long a
+participant's voice is kept and who may hear it, on material that a participant
+consented to only in the abstract. Not recording removes the question instead of
+answering it badly, and costs nothing this pack needs: every measurement the
+protocol asks for — completion, time, interventions, ease, verbatim quotes — is
+captured in writing on the sheets, live, during the session.
+
+## Raised for the owner, not fixed here
+
+**The canonical moderated protocol still has no retention, access or deletion
+rule for optional recordings.** §1.6 permits recording and says where not to
+store it; it does not say for how long it may be kept, who may access it, or
+when it is destroyed. This pack cannot fix that — it modifies neither protocol,
+and a facilitator pack is the wrong place for a data-handling rule that binds
+every future session. The pack's own position (no recordings) closes the
+exposure for these three sessions only. Closing it properly needs an
+owner-approved change to the protocol itself, which is a separate piece of work
+and is not attempted here.
 
 ## Open questions for the owner
 

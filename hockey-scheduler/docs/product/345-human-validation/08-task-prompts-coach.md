@@ -9,6 +9,24 @@ Script source: `docs/product/moderated-operator-validation-protocol.md` §4, rea
 at `origin/main` = `36195faadb5c97936022d8f3706af51181a6b64d`. Environment and
 pre-flight: [03-environment-coach.md](03-environment-coach.md).
 
+**Source pin.** Everything this sheet quotes or references from a protocol was
+read at `origin/main` = `36195faadb5c97936022d8f3706af51181a6b64d`, at these
+exact document versions:
+
+| Canonical document (current path) | git blob SHA-1 at the pinned commit |
+| --- | --- |
+| `docs/product/moderated-operator-validation-protocol.md` | `c99935885b3de9141cad9b575a43a3d4fd62e0b3` |
+| `docs/product/manual-keyboard-screenreader-validation-protocol.md` | `738e6c096e5d95d671b211e3f3df21bf975d17cc` |
+
+A protocol quotation is not like a code citation. If the protocol is corrected
+and this pack is not, the pack goes on instructing a human to perform a step the
+protocol has since fixed, and nothing can see it — which is precisely what the
+pre-#394 K5/S5 inversion did for a week. So the blob SHA-1 is the enforcement
+and the prose is not: `check_pack.py`'s `protocol-pin` check recomputes both
+blobs and fails the moment either document changes by a single byte. When it
+fails, re-verify every quotation in this pack against the new text *before*
+advancing the pin.
+
 ---
 
 ## Before you read anything aloud
