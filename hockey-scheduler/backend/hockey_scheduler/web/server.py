@@ -12,6 +12,7 @@ import os
 import re
 import ssl
 import sys
+import traceback
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -572,6 +573,76 @@ class Handler(BaseHTTPRequestHandler):
     # Quieter logging.
     def log_message(self, *args):  # noqa: D401
         pass
+
+    # -- error boundary (#302) --------------------------------------------
+    #
+    # Every request gets an ANSWER. `api/service.py`'s ``catch()`` converts
+    # only ``DomainError``; anything else — a driver error `db_errors` does
+    # not recognise (its ``_classify`` deliberately returns None for those), a
+    # lost database connection, a plain bug — used to unwind out of ``do_*``,
+    # and ``ThreadingMixIn`` then closed the socket in its ``finally`` with
+    # ZERO bytes written. There was no 500 path at all in that shape: the
+    # client saw a dropped connection and a reverse proxy in front of it
+    # reported 502 Bad Gateway. That is the delivery mechanism behind #302
+    # ("several ice slots added successfully, then a later create returns
+    # 502") and behind every other unhandled error in the whole request path.
+    #
+    # It lives on ``handle_one_request`` — the ONE point through which
+    # ``BaseHTTPRequestHandler`` dispatches every verb — rather than as a
+    # try/except inside each ``do_*``. Seven copies would drift, and a verb
+    # added later would silently land outside the guarantee.
+
+    def _response_started(self) -> bool:
+        """Whether any status line has been buffered or sent for this request.
+
+        The boundary must never answer twice: a handler that failed AFTER
+        starting a response has already committed a status code, and a second
+        status line would corrupt the stream. ``send_response_only`` appends
+        to ``_headers_buffer``, so its presence (or an already-flushed buffer,
+        which sets ``_headers_sent``) is the signal.
+        """
+        return bool(getattr(self, "_headers_buffer", None)
+                    or getattr(self, "_boundary_headers_sent", False))
+
+    def send_response_only(self, code, message=None):
+        self._boundary_headers_sent = True
+        super().send_response_only(code, message)
+
+    def handle_one_request(self):
+        self._boundary_headers_sent = False
+        try:
+            super().handle_one_request()
+        except Exception as exc:      # noqa: BLE001 — deliberate catch-all
+            # A client that has already gone away cannot be answered; writing
+            # would raise again. Mirrors ``Server.handle_error``'s exemption.
+            if isinstance(exc, (BrokenPipeError, ConnectionResetError,
+                                ConnectionAbortedError)):
+                self.close_connection = True
+                return
+            # A real bug must stay diagnosable: the traceback still goes to
+            # stderr exactly as before, so nothing is silently swallowed. Only
+            # the WIRE behaviour changes.
+            traceback.print_exc()
+            self.close_connection = True
+            if self._response_started():
+                return          # already committed a status; do not answer twice
+            try:
+                # A DomainError reaching here means a layering slip (the facade
+                # normally converts it), but it is client-facing by
+                # construction and carries its own status — render it properly
+                # rather than flattening a 404 into a 500.
+                if isinstance(exc, DomainError):
+                    self._send_api(exc.to_dict())
+                else:
+                    self._send_json({"error": {
+                        "code": "internal_error",
+                        "message": ("The server could not complete this "
+                                    "request. Please try again.")}}, 500)
+                self.wfile.flush()
+            except Exception:       # noqa: BLE001
+                # The socket died while answering — nothing further to do, and
+                # this must not mask the original traceback printed above.
+                pass
 
     # -- helpers -----------------------------------------------------------
     def _security_headers(self) -> None:
