@@ -29,7 +29,11 @@ advancing the pin.
 
 ---
 
-## Why this is a gate and not a default
+## Why this was a gate and not a default — historical rationale
+
+**This section explains why the wording below was gated before it was ruled. It
+is history. The ruling is recorded in "The ruling" below and
+`python3 check_pack.py --session-readiness` exits 0.**
 
 The ease question is the most-repeated participant-facing utterance in the whole
 pack: three tasks × three sessions = **nine askings**. The three-session evidence
@@ -38,64 +42,69 @@ was identical every time. Settle the wording after session one and the set is
 not comparable — session one asked a different question, and there is no way to
 recover it short of re-running that session.
 
-That is why this is not something the pack may decide. The owner has ratified no
-wording. Picking one on their behalf and printing it as though it were settled
-would be the same class of defect as scoring a secondary control as a
-primary-action match: the instrumentation quietly deciding something a person was
-supposed to decide, in a way nothing downstream could see.
+That is why this was not something the pack could decide. Until the owner
+ruled, no wording was ratified, and picking one on their behalf and printing it
+as though it were settled would have been the same class of defect as scoring a
+secondary control as a primary-action match: the instrumentation quietly
+deciding something a person was supposed to decide, in a way nothing downstream
+could see.
 
-So: **no session starts until the ruling block below is filled in.** The three
+So no session could start until the ruling block below was filled in. The three
 environment sheets carry it as a hard pre-flight line, and
-`python3 check_pack.py --session-readiness` exits non-zero while it is blank.
+`python3 check_pack.py --session-readiness` exited non-zero while it was blank.
+**It is filled in now, and that command exits 0.**
 
 ---
 
 ## The ruling
 
-Fill in every field. The wording inside the fenced blocks is what gets said out
-loud, verbatim, in all three sessions.
+**Ruled.** The wording inside the fenced blocks is what gets said out loud,
+verbatim, in all three sessions. Do not improvise around it and do not
+paraphrase it between sessions — the comparison depends on all nine askings
+being identical.
 
 | Field | Value |
 | --- | --- |
-| Ruled by (repository owner) | |
-| Date ruled | |
-| Where the ruling was recorded (issue comment, PR review, etc.) | |
+| Ruled by (repository owner) | Repository owner (`jingizoo`) |
+| Date ruled | 2026-08-05 |
+| Where the ruling was recorded (issue comment, PR review, etc.) | [PR #396](https://github.com/jingizoo/biknik/pull/396) — the owner ratified the pack's proposed wording as-is, unchanged. See the PR body for the instruction as given. |
 
 <!-- ease-ruling:start -->
 
 **Ratified wording — first line**, asked immediately after each task:
 
 ```text
-NOT YET RULED — no wording is ratified, and no session may start.
+On a scale of one to five, where one is very difficult and five is very easy,
+how easy was that?
 ```
 
 **Ratified wording — second line**, asked once they have given a number:
 
 ```text
-NOT YET RULED — no wording is ratified, and no session may start.
+Which of these descriptions fits the number you gave?
 ```
 
 <!-- ease-ruling:end -->
 
-To rule: replace the contents of both fenced blocks above with the exact words
-to be spoken, and fill in the table. Do not add a third line, and do not leave
-a variant in a comment — this block is what all three role sheets resolve to,
-and `check_pack.py`'s `ease-single-source` check fails if any role sheet starts
-carrying its own copy again.
+**To CHANGE an already-ratified wording** — which only the owner may do, and
+only before the first session, since changing it after session one makes the
+three-session set incomparable: replace the contents of both fenced blocks and
+update the table with the new ruler, date and record. Do not add a third line,
+and do not leave a variant in a comment — this block is what all three role
+sheets resolve to, and `check_pack.py`'s `ease-single-source` check fails if any
+role sheet starts carrying its own copy again.
 
 ---
 
-## What the pack proposes, for the owner to accept or replace
+## Why this wording — the rationale the owner accepted
 
-This is a **proposal**, not the ruling. It has no force until it is copied into
-the ruling block above. It is recorded here so the owner has something concrete
-to accept or reject rather than a blank page.
+The wording ruled above was proposed by the pack and **ratified by the owner
+as-is, unchanged**. The reasoning is kept because it is the argument for keeping
+the wording stable, not merely for having picked it.
 
 It is deliberately **not** shown as a `>` blockquote. Everywhere else in this
-pack a blockquote means verbatim protocol text, and dressing an unratified
-proposal in that marker would give it exactly the authority it does not have —
-a facilitator skimming for what to say would find quoted-looking text and read
-it out. `check_pack.py`'s `blockquote-is-protocol-text` check enforces the
+pack a blockquote means verbatim protocol text, and this wording is the pack's
+own — not the protocol's — so marking it as quoted text would misattribute it. `check_pack.py`'s `blockquote-is-protocol-text` check enforces the
 convention by proving every blockquote in the pack appears verbatim in one of
 the two pinned protocols.
 
