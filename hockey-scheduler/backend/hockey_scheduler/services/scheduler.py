@@ -1554,7 +1554,25 @@ def _resolve_division_season_id(store, division_id):
     return ls.season_id if ls is not None else None
 
 
-def _in_scope_game_ids(pairs, scope):
+def _plays_in_league(store, game, league_id):
+    """Whether either participant of a league-LESS ``game`` belongs to
+    ``league_id`` — #367's "validates into that League" test.
+
+    Resolved from ``Team.league_id``, the Team's permanent competition League
+    (#283 rule 7), which is the same field the Dashboard's own predicate
+    reads. Fails CLOSED on a missing Team: an unresolvable participant is
+    never counted as validating into anything.
+    """
+    for team_id in (game.home_team_id, game.away_team_id):
+        if not team_id:
+            continue
+        team = store.get_team(team_id)
+        if team is not None and team.league_id == league_id:
+            return True
+    return False
+
+
+def _in_scope_game_ids(store, pairs, scope):
     """The Games in ``pairs`` that lie inside the explanation's own context.
 
     #386/#388 bound the whole draft surface to the caller's persisted active
@@ -1571,19 +1589,47 @@ def _in_scope_game_ids(pairs, scope):
     ``SeasonVenueAccess`` is for, so a neighbouring Season's Game routinely
     collides with in-context ice.
 
-    Deriving the set from the run's shared snapshot keeps this free of extra
-    store reads and guarantees it covers every id the observer can encounter:
-    the policy advisory and the team-occupancy seed both read that same list.
-    Fail-closed — an unresolved Season/League scope yields the empty set, so a
-    dangling or legacy target withholds every id rather than defaulting open.
+    Season is a hard conjunct for every Game. The LEAGUE half splits on what
+    the Game actually carries (#399):
+
+      * a Game with an owning League is in scope when that League matches;
+      * a league-LESS Game — an EXHIBITION, which carries no owning League at
+        all by design (#283 Slice D) — is in scope when at least one
+        participating Team validates into the caller's League.
+
+    The second branch is #367's owner ruling, applied here so the Scheduler
+    answers this question exactly the way the Dashboard's
+    ``_game_matches_active`` already does. Comparing an exhibition's ``None``
+    league id for equality is not a privacy boundary doing its job: it is a
+    comparison that cannot succeed, so a friendly played by the caller's OWN
+    team, on the caller's OWN ice, in the caller's OWN Season, blocked a
+    placement whose explanation then refused to name it. The ruling's other
+    half is what keeps this a correction rather than an opening — an
+    exhibition between two sibling-League teams is concretely that League's
+    fixture and stays withheld.
+
+    Deriving the set from the run's shared snapshot guarantees it covers every
+    id the observer can encounter: the policy advisory and the team-occupancy
+    seed both read that same list. ``store`` is read only for league-less
+    Games, so a draft over a snapshot with no exhibitions in it does no extra
+    reads at all. Fail-closed — an unresolved Season/League scope yields the
+    empty set, so a dangling or legacy target withholds every id rather than
+    defaulting open.
     """
     season_id = (scope or {}).get("season_id")
     league_id = (scope or {}).get("league_id")
     if not season_id or not league_id:
         return frozenset()
-    return frozenset(
-        game.id for game, _slot in pairs
-        if game.season_id == season_id and game.league_id == league_id)
+    in_scope = set()
+    for game, _slot in pairs:
+        if game.season_id != season_id:
+            continue
+        if game.league_id is not None:
+            if game.league_id == league_id:
+                in_scope.add(game.id)
+        elif _plays_in_league(store, game, league_id):
+            in_scope.add(game.id)
+    return frozenset(in_scope)
 
 
 def _candidate_explanation_record(store, slot, home, away, *, used, con,
@@ -1692,8 +1738,11 @@ def _assign_ice(store, pairings, slots, constraints, policy_check=None,
     explanation_context = dict(explanation_context or {})
     # Computed ONCE per run, from the same shared snapshot the policy advisory
     # and the team-occupancy seed read, so every Game id the observer can
-    # encounter is covered by one membership test and no extra store reads.
-    in_scope_game_ids = _in_scope_game_ids(active_pairs, explanation_context)
+    # encounter is covered by one membership test. The snapshot decides every
+    # league-CARRYING Game on its own; only a league-less one (an exhibition,
+    # #399) costs a Team read, and only once per run.
+    in_scope_game_ids = _in_scope_game_ids(
+        store, active_pairs, explanation_context)
     used = set()
     team_slots = {}  # team_id -> [assigned start_time]
     rink_spans = {}  # rink_id -> [(slot_id, start, end)] picked this run (#277)

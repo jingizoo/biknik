@@ -125,6 +125,29 @@ def _explanation(preview, index=0):
     return preview["unscheduled"][index]["explanation"]
 
 
+def _sibling_league(store):
+    """A SECOND League in the caller's OWN Program and Season (#388's other
+    near miss), with two teams registered in it.
+
+    Same Season, same Venue, different League — so a Game of this League
+    collides with in-context ice while sitting outside the caller's tuple,
+    and an EXHIBITION between its two teams is league-LESS while still being
+    concretely this League's fixture (#367).
+    """
+    store.add_league(League(id="lg_x", program_id="pg", name="Sibling League"))
+    store.add_league_season(LeagueSeason(
+        id="ls_x", league_id="lg_x", season_id="se"))
+    store.add_division(Division(
+        id="d_x", league_season_id="ls_x", name="DX"))
+    for index in range(2):
+        store.add_team(Team(
+            id=f"t_x{index}", name=f"Sibling {index}", program_id="pg",
+            league_id="lg_x"))
+        store.add_season_team_registration(SeasonTeamRegistration(
+            id=f"reg_x{index}", league_season_id="ls_x",
+            team_id=f"t_x{index}", division_id="d_x", active=True))
+
+
 def _neighbouring_season(store, venue_id="v1"):
     """A SECOND Season of the same Program holding access to the same Venue.
 
@@ -561,6 +584,154 @@ class _ExplanationContract:
                     "reschedule_conflicting_game",
                     {a["action_code"] for a in explanation["alternatives"]})
 
+    def test_an_active_season_exhibition_blocker_is_named(self):
+        """#399: an EXHIBITION carries no owning League at all (#283 Slice D),
+        so a ``season AND league`` filter can never admit one -- not because
+        the Game is foreign, but because the field it is compared on is
+        ``None`` by design.
+
+        The operator was therefore told a slot was taken while the
+        explanation withheld the one Game they could act on, on their own
+        ice, in their own Season, involving their own team.
+
+        The rule restored here is #367's owner ruling verbatim -- a
+        league-less Exhibition belongs to a selected League when at least one
+        participating Team validates into it -- so the Scheduler answers this
+        question exactly the way the Dashboard already does.
+        """
+        api = _seed(self.store)
+        _sibling_league(self.store)
+        # One team of the CALLER's League (registered in this LeagueSeason,
+        # in a Division of its own so it is not itself in the draft) plays a
+        # friendly against a sibling League's team. Neither is a pairing this
+        # draft proposes, so the collision is purely physical ice.
+        self.store.add_division(Division(
+            id="friendly_div", league_season_id="ls", name="Friendly"))
+        self.store.add_team(Team(
+            id="t_friend", name="Friendly", program_id="pg", league_id="lg"))
+        self.store.add_season_team_registration(SeasonTeamRegistration(
+            id="reg_friend", league_season_id="ls", team_id="t_friend",
+            division_id="friendly_div", active=True))
+        _slot(self.store, "exh_slot", "r1", BASE)
+        exhibition = api.create_game(
+            "se", None, "t_friend", "t_x0", "exh_slot",
+            game_type="exhibition", actor_id="admin")
+        self.assertNotIn("error", exhibition, exhibition)
+        # ANTI-VACUITY, and the whole point: this Game really does carry no
+        # League, and really is in the caller's Season. A filter comparing
+        # league ids has nothing true to compare.
+        stored = self.store.get_game(exhibition["id"])
+        self.assertIsNone(stored.league_id)
+        self.assertEqual(stored.season_id, "se")
+        mine = _slot(self.store, "mine", "r1", BASE + timedelta(minutes=30))
+
+        preview = api.draft_season_schedule("d", slot_ids=[mine])
+        self.assertNotIn("error", preview, preview)
+        explanation = _explanation(preview)
+        overlap = next(
+            rejection
+            for candidate in explanation["candidate_windows"]
+            for rejection in candidate["rejections"]
+            if rejection["code"] == "slot_overlap_conflict")
+        self.assertEqual(
+            overlap["details"].get("conflict_game_id"), exhibition["id"],
+            "the exhibition blocking this ice was not named")
+        self.assertIn(
+            "reschedule_conflicting_game",
+            {a["action_code"] for a in explanation["alternatives"]},
+            "an unnameable blocker leaves the operator no action to take")
+
+    def test_a_sibling_leagues_own_exhibition_is_still_withheld(self):
+        """The other half of #367's ruling, which is what keeps this a scope
+        CORRECTION rather than an opening.
+
+        An exhibition played between two sibling-League teams is concretely
+        that League's fixture. It has no ``league_id`` to disagree with, so
+        admitting every league-less Game would hand the caller both team
+        names, the venue and the time -- the exact leak #367 closed on the
+        Dashboard. The collision is still reported; only the id is withheld.
+        """
+        api = _seed(self.store)
+        _sibling_league(self.store)
+        _slot(self.store, "exh_slot", "r1", BASE)
+        exhibition = api.create_game(
+            "se", None, "t_x0", "t_x1", "exh_slot",
+            game_type="exhibition", actor_id="admin")
+        self.assertNotIn("error", exhibition, exhibition)
+        # ANTI-VACUITY: same Season, same Venue, genuinely league-less -- so
+        # only the participants can be doing the work here.
+        stored = self.store.get_game(exhibition["id"])
+        self.assertIsNone(stored.league_id)
+        self.assertEqual(stored.season_id, "se")
+        mine = _slot(self.store, "mine", "r1", BASE + timedelta(minutes=30))
+
+        preview = api.draft_season_schedule("d", slot_ids=[mine])
+        self.assertNotIn("error", preview, preview)
+        explanation = _explanation(preview)
+        overlap = next(
+            rejection
+            for candidate in explanation["candidate_windows"]
+            for rejection in candidate["rejections"]
+            if rejection["code"] == "slot_overlap_conflict")
+        # The collision IS reported -- the caller's own ice is named.
+        self.assertEqual(overlap["details"]["conflict_slot_id"], "exh_slot")
+        self.assertNotIn("conflict_game_id", overlap["details"])
+        blob = json.dumps(explanation, sort_keys=True)
+        self.assertNotIn(
+            exhibition["id"], blob,
+            "candidate evidence named a sibling League's own exhibition")
+        for secret in ("t_x0", "t_x1", "Sibling 0", "Sibling 1"):
+            self.assertNotIn(secret, blob)
+
+    def test_a_neighbouring_seasons_exhibition_is_withheld_too(self):
+        """Season stays a hard axis for league-less Games.
+
+        A rule that admitted an exhibition on the strength of its
+        participants alone would reach across Seasons, because a permanent
+        Team keeps its League from one Season to the next -- so the caller's
+        own team playing a friendly in NEXT Season would be nameable from
+        THIS one. The Season conjunct is asserted independently of the
+        League one for exactly that reason.
+        """
+        api = _seed(self.store)
+        _neighbouring_season(self.store)
+        # The caller's OWN League also runs in the neighbouring Season (one
+        # League, two Seasons -- the ordinary case), and the caller's OWN
+        # team is registered there. Rules 7-9 hold: the registration sits in
+        # the Team's own permanent League. So the participant test passes on
+        # this Game and ONLY the Season conjunct can refuse it.
+        self.store.add_league_season(LeagueSeason(
+            id="ls_lg_nb", league_id="lg", season_id="se_nb"))
+        self.store.add_division(Division(
+            id="d_lg_nb", league_season_id="ls_lg_nb", name="Mine Next"))
+        self.store.add_season_team_registration(SeasonTeamRegistration(
+            id="reg_nb_mine", league_season_id="ls_lg_nb", team_id="t0",
+            division_id="d_lg_nb", active=True))
+        _slot(self.store, "exh_slot", "r1", BASE)
+        exhibition = api.create_game(
+            "se_nb", None, "t0", "t_nb0", "exh_slot",
+            game_type="exhibition", actor_id="admin")
+        self.assertNotIn("error", exhibition, exhibition)
+        stored = self.store.get_game(exhibition["id"])
+        self.assertIsNone(stored.league_id)
+        self.assertEqual(stored.season_id, "se_nb")
+        self.assertEqual(self.store.get_team("t0").league_id, "lg")
+        mine = _slot(self.store, "mine", "r1", BASE + timedelta(minutes=30))
+
+        preview = api.draft_season_schedule("d", slot_ids=[mine])
+        self.assertNotIn("error", preview, preview)
+        explanation = _explanation(preview)
+        overlap = next(
+            rejection
+            for candidate in explanation["candidate_windows"]
+            for rejection in candidate["rejections"]
+            if rejection["code"] == "slot_overlap_conflict")
+        self.assertEqual(overlap["details"]["conflict_slot_id"], "exh_slot")
+        self.assertNotIn("conflict_game_id", overlap["details"])
+        self.assertNotIn(
+            exhibition["id"], json.dumps(explanation, sort_keys=True),
+            "candidate evidence named a neighbouring Season's exhibition")
+
     def test_turnover_curfew_and_playable_time_use_shared_policy_codes(self):
         api = _seed(self.store)
         self.store.add_division(Division(
@@ -710,25 +881,77 @@ class InScopeGameIdTest(unittest.TestCase):
     legacy or half-resolved target discloses, so it is pinned here.
     """
 
+    def setUp(self):
+        self.store = InMemoryStore()
+        # ``t0``/``t1`` are the default participants below and belong to NO
+        # League here, so every league-carrying case is decided purely by the
+        # Game's own league_id -- the participant branch cannot leak into it.
+        for team_id, league_id in (("mine", "lg"), ("theirs", "lg2"),
+                                   ("t0", None), ("t1", None)):
+            self.store.add_team(Team(
+                id=team_id, name=team_id, program_id="pg",
+                league_id=league_id))
+
     def _pairs(self, *specs):
-        return [
-            (Game(id=game_id, home_team_id="t0", away_team_id="t1",
-                  ice_slot_id="s", season_id=season_id, league_id=league_id,
-                  start_time=BASE, end_time=BASE + timedelta(hours=1)),
-             object())
-            for game_id, season_id, league_id in specs]
+        """``(game_id, season_id, league_id)``, optionally followed by the two
+        participating team ids (which only a league-LESS Game consults)."""
+        pairs = []
+        for spec in specs:
+            game_id, season_id, league_id = spec[:3]
+            home, away = spec[3:5] if len(spec) >= 5 else ("t0", "t1")
+            pairs.append((
+                Game(id=game_id, home_team_id=home, away_team_id=away,
+                     ice_slot_id="s", season_id=season_id,
+                     league_id=league_id, start_time=BASE,
+                     end_time=BASE + timedelta(hours=1)),
+                object()))
+        return pairs
+
+    def _resolve(self, pairs, season_id="se", league_id="lg"):
+        return sched._in_scope_game_ids(
+            self.store, pairs,
+            {"season_id": season_id, "league_id": league_id})
 
     def test_only_the_exact_season_and_league_pair_is_in_scope(self):
+        """A Game that CARRIES a League is decided by that League alone."""
         pairs = self._pairs(
             ("g_match", "se", "lg"),
             ("g_other_season", "se2", "lg"),
             ("g_other_league", "se", "lg2"),
             ("g_other_both", "se2", "lg2"),
         )
+        self.assertEqual(self._resolve(pairs), {"g_match"})
+
+    def test_a_league_less_game_is_in_scope_only_via_a_participant(self):
+        """#399 / #367's ruling, driven directly.
+
+        Every row here is in the caller's Season and carries NO league_id, so
+        the old ``season AND league`` conjunct returned the empty set for all
+        four — which is the defect. The participant test is what separates
+        them, and it is asserted in both directions on the SAME call so a
+        rule that simply admitted every league-less Game fails just as loudly
+        as the one that admitted none.
+        """
+        pairs = self._pairs(
+            ("g_home_is_mine", "se", None, "mine", "theirs"),
+            ("g_away_is_mine", "se", None, "theirs", "mine"),
+            ("g_theirs_only", "se", None, "theirs", "theirs"),
+            ("g_unknown_teams", "se", None, "ghost_a", "ghost_b"),
+        )
         self.assertEqual(
-            sched._in_scope_game_ids(
-                pairs, {"season_id": "se", "league_id": "lg"}),
-            {"g_match"})
+            self._resolve(pairs), {"g_home_is_mine", "g_away_is_mine"},
+            "a league-less Game is in scope exactly when a participant "
+            "validates into the caller's League -- on either side")
+
+    def test_a_league_less_game_still_obeys_the_season_conjunct(self):
+        """A permanent Team keeps its League across Seasons, so the
+        participant test alone would reach into a neighbouring Season. Same
+        participants, same League, different Season — refused."""
+        pairs = self._pairs(
+            ("g_this_season", "se", None, "mine", "theirs"),
+            ("g_next_season", "se2", None, "mine", "theirs"),
+        )
+        self.assertEqual(self._resolve(pairs), {"g_this_season"})
 
     def test_an_unresolved_scope_withholds_every_id(self):
         """Fail-closed: a missing half of the tuple is not a wildcard.
@@ -739,12 +962,17 @@ class InScopeGameIdTest(unittest.TestCase):
         them the guard could be deleted and every assertion here would still
         pass on an empty result, which is the shape of vacuity this file has
         to avoid.
+
+        ``g_no_league`` is now doubly load-bearing: it is also a league-LESS
+        row whose participants DO validate into ``lg``, so an unresolved
+        scope that fell through to the participant branch instead of failing
+        closed would surface it.
         """
         pairs = self._pairs(
             ("g_match", "se", "lg"),
             ("g_no_season", None, "lg"),
-            ("g_no_league", "se", None),
-            ("g_legacy", None, None),
+            ("g_no_league", "se", None, "mine", "theirs"),
+            ("g_legacy", None, None, "mine", "theirs"),
         )
         for label, scope in (
                 ("no season", {"season_id": None, "league_id": "lg"}),
@@ -753,14 +981,12 @@ class InScopeGameIdTest(unittest.TestCase):
                 ("no scope at all", None)):
             with self.subTest(scope=label):
                 self.assertEqual(
-                    sched._in_scope_game_ids(pairs, scope), frozenset(),
+                    sched._in_scope_game_ids(self.store, pairs, scope),
+                    frozenset(),
                     "an unresolved scope defaulted OPEN")
-        # ...and the control: the same pairs really do yield an id when the
+        # ...and the control: the same pairs really do yield ids when the
         # scope resolves, so the assertions above are not empty-in/empty-out.
-        self.assertEqual(
-            sched._in_scope_game_ids(
-                pairs, {"season_id": "se", "league_id": "lg"}),
-            {"g_match"})
+        self.assertEqual(self._resolve(pairs), {"g_match", "g_no_league"})
 
 
 class ExplanationFormatterContractTest(unittest.TestCase):
