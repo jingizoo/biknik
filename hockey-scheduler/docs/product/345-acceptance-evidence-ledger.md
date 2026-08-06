@@ -50,6 +50,13 @@ refuses to run the busy handler for. **Not #345 work**, and cited here only
 because criterion 9 is a statement about `main`'s greenness. Round 5 pinned
 deliberately behind the tip for this reason; **this round does not need to.**
 
+**Green-tip history, for a reader checking whether that red was an isolated
+event or a pattern.** Every `main` tip since the fix has completed green:
+`57cd84dc` (#392, the fix itself) → `36195faa` (#394) → `3a1720d0` (#395) →
+`46402840` (#398) → `34c9167e` (#396, this snapshot's base). Five consecutive
+green tips, each verified by its own completed run rather than inferred from
+the next one being green.
+
 **#345's issue checklist and current GitHub state remain authoritative for
 later merge readiness.** This document is a reading of the repository at one
 instant. If any of the following occur after this snapshot, its status values
@@ -135,7 +142,7 @@ calling them merge commits. Both resolve; they are not the same object.
 | [#395](https://github.com/jingizoo/biknik/pull/395) | #345 | Human-validation facilitator pack, its checker, and a dedicated CI job | `16865e97e5b6d7a49c63a47e0b298f77819f74b6` | `3a1720d0` | 2026-08-05T12:29:20Z |
 | [#396](https://github.com/jingizoo/biknik/pull/396) | #345 | Ratify the ease-rating wording; open the last non-human session gate | `f126d822c0e6ed4d068eb277acc70c336aea41b3` | `34c9167e` | 2026-08-06T02:57Z |
 
-**Two #345 PRs have merged since Round 4's base (`71bad79f`): #394 and #395.**
+**Three #345 PRs have merged since Round 4's base (`71bad79f`): #394, #395 and #396.**
 #395 added the human-validation facilitator pack — blank instrumentation for
 criterion 7's two manual passes and criterion 8's three moderated sessions,
 with its own checker and a `human-validation-pack` CI job. It contains no
@@ -264,7 +271,7 @@ two rows are blocked on nothing but the passes being performed.
 | | |
 | --- | --- |
 | Required boundary/evidence | The full backend matrix (Memory/SQLite/PostgreSQL), authenticated HTTP where relevant, and all required browser CI green at the inspected head. |
-| Evidence merged to `main` | **`main` at `34c9167e` — its current tip — is green.** Workflow run [31067094378](https://github.com/jingizoo/biknik/actions/runs/31067094378), push to `main`, concluded `success` at `2026-08-06T03:13:15Z`, all ten jobs green: `changes`, `classifier-test`, `frontend-check`, `test` (Memory/SQLite), `postgres`, and browser-smoke shards 1–4 covering **57 registered journeys** (`hockey-scheduler-ci.yml:318`–`324`). Authenticated-HTTP coverage sits inside the `test`/`postgres` jobs: `test_players_http_scope.py` (real `ThreadingHTTPServer`, real `Handler`, real session cookies, raw-response assertions), `test_context_league_http.py`, `test_league_context_http.py`, `test_server_authz.py`. Every merged batch in the table above was green on its own exact head at merge time. |
+| Evidence merged to `main` | **`main` at `34c9167e` — its current tip — is green.** Workflow run [31067094378](https://github.com/jingizoo/biknik/actions/runs/31067094378), push to `main`, concluded `success` at `2026-08-06T03:13:15Z`, all ten jobs green: `changes`, `classifier-test`, `frontend-check`, `test` (Memory/SQLite), `postgres`, `human-validation-pack` (added by #395 — it runs the facilitator pack's checks and every one of its mutations on each push), and browser-smoke shards 1–4 covering **57 registered journeys** (`hockey-scheduler-ci.yml:318`–`324`). Authenticated-HTTP coverage sits inside the `test`/`postgres` jobs: `test_players_http_scope.py` (real `ThreadingHTTPServer`, real `Handler`, real session cookies, raw-response assertions), `test_context_league_http.py`, `test_league_context_http.py`, `test_server_authz.py`. Every merged batch in the table above was green on its own exact head at merge time. |
 | Remaining gap | **This box is satisfied for the merged #345 work at this SHA only.** It is not a statement that #345 may merge: #345's Done condition additionally requires *every* box to have evidence and the moderated sessions to be documented, and criteria 7 and 8 do not. This remains the most perishable row in the document — a claim about a moving branch. It was false for roughly six hours during Round 5's window, which is why Round 5 pinned behind the tip; it has now been true across two consecutive tips (`57cd84dc`, `36195faa`). |
 | **Status** | **`Verified on main`** — at `34c9167e`, `main`'s tip, with no carve-out needed this round. Recorded reasoning: under this document's own vocabulary `Missing` means "no implementation and no pending PR addresses it", which is plainly false — a completed green CI run on the recorded SHA is exactly the evidence this box asks for. |
 
