@@ -20,7 +20,7 @@ this document merges — the ledger records the gap, it does not fill it.
 accurate for the stated `main` SHA and UTC timestamp below, and for nothing
 else.
 
-- **Snapshot taken**: `2026-08-05T19:22Z` — **read from the system clock, not composed.**
+- **Snapshot taken**: `2026-08-06T03:16Z` — **read from the system clock, not composed.**
   See §3.11: Rounds 5 and 6 both stated a time that had not yet happened.
   Every SHA, PR state, issue state,
   CI result, repository path, symbol, and test/journey name below was
@@ -28,11 +28,11 @@ else.
   the recorded SHA and by querying live GitHub state — not carried over from
   an earlier revision of this document.
 - **Inspected base**: `main` at
-  `46402840` (merge of PR #398), which is `main`'s **tip** at snapshot time.
+  `34c9167e` (merge of PR #396), which is `main`'s **tip** at snapshot time.
 - **`main` CI at that SHA: GREEN.** Workflow run
-  [31037572412](https://github.com/jingizoo/biknik/actions/runs/31037572412)
+  [31067094378](https://github.com/jingizoo/biknik/actions/runs/31067094378)
   ("Hockey Scheduler Backend CI", push to `main`), started
-  `2026-08-05T19:02:31Z`, **completed `success` at `2026-08-05T19:16:26Z`**,
+  `2026-08-06T02:58:02Z`, **completed `success` at `2026-08-06T03:13:15Z`**,
   all **ten** jobs green: `changes`, `classifier-test`, `frontend-check`,
   `test` (Memory/SQLite), `postgres`, `human-validation-pack` — added by #395,
   which runs the facilitator pack's checks and every one of its mutations on
@@ -59,7 +59,7 @@ become stale and must not be relied on:
 - **#357 advances** — the only open #345 child.
 - #345's nine acceptance boxes are edited.
 - Any cited merge commit is reverted.
-- `main` moves past `46402840` **in a way that touches a cited file**.
+- `main` moves past `34c9167e` **in a way that touches a cited file**.
 
 **Deliberately NOT staleness triggers**, corrected this round: activity on
 #393, #376, #206 or #287. Round 6 listed "the tracked open issues in §4" as a
@@ -84,10 +84,10 @@ Exactly four values are used. No others.
   journey name that resolves in that tree, plus the merge PR and commit)
   covers the *entire* criterion, not a subset of it.
 - **`Pending active PR`** — real evidence exists, cited at an exact head SHA,
-  but has not merged. **Non-authoritative** for #345's merge gate. *(No
-  criterion carries this value at this snapshot. Round 6 used it for PR #394,
-  which has since merged as `36195faa`; the value is retained because it is
-  part of the required vocabulary.)*
+  but has not merged. **Non-authoritative** for #345's merge gate. *(No criterion
+  carries this value at this snapshot. Round 8 used it for criterion 8's
+  ease-rating wording, which has since merged as `34c9167e`; the value is
+  retained because it is part of the required vocabulary.)*
 - **`Missing`** — no implementation and no pending PR addresses it.
 - **`Human-only / unperformed`** — the *procedure* to produce this evidence
   may be merged, but the evidence itself can only come from an actual human
@@ -133,6 +133,7 @@ calling them merge commits. Both resolve; they are not the same object.
 | [#377](https://github.com/jingizoo/biknik/pull/377) | #365 | Home and Setup per-card state matrix (model + browser matrix) | `c2666b8b4defd00d78bd6c3a8970e49f5849e652` | `71bad79fc991b49a8136ef98eef14a493b4fa78b` | 2026-08-02T11:38:30Z |
 | [#394](https://github.com/jingizoo/biknik/pull/394) | #345 | Context caption truth; K5/S5 protocol correction; cross-view regression | `26f9d679c87b6c8c2cc9251d8f35108a714f621e` | `36195faa` | 2026-08-04T12:05:09Z |
 | [#395](https://github.com/jingizoo/biknik/pull/395) | #345 | Human-validation facilitator pack, its checker, and a dedicated CI job | `16865e97e5b6d7a49c63a47e0b298f77819f74b6` | `3a1720d0` | 2026-08-05T12:29:20Z |
+| [#396](https://github.com/jingizoo/biknik/pull/396) | #345 | Ratify the ease-rating wording; open the last non-human session gate | `f126d822c0e6ed4d068eb277acc70c336aea41b3` | `34c9167e` | 2026-08-06T02:57Z |
 
 **Two #345 PRs have merged since Round 4's base (`71bad79f`): #394 and #395.**
 #395 added the human-validation facilitator pack — blank instrumentation for
@@ -143,11 +144,12 @@ evidence and closes no box; what it changes is that those passes are now
 #206 scheduling-format work, merged under an owner-granted roadmap exception
 recorded in its merge commit, because `ROADMAP.md` otherwise holds #206
 behind open #345. Noted so a reader finding it ahead of #345 learns the
-exception was granted rather than overlooked. Nine other PRs merged in the same window — #382, #384, #385,
-#381, #388, #380, #389, #391 and #392 — and **all nine are #206/#375/#379/#387/#390
-scheduling work or the #392 SQLite lock fix, not #345.** They are named only
+exception was granted rather than overlooked. Nine FURTHER PRs merged in the same window — #382, #384,
+#385, #381, #388, #380, #389, #391 and #392 — which with #398 makes ten
+non-#345 merges in it, and **all ten are #206/#375/#379/#387/#390 scheduling
+work or the #392 SQLite lock fix, not #345.** They are named only
 so a reader can see why every `app.js` and `service.py` line number moved
-without any acceptance status changing. None of the nine is cited as evidence
+without any acceptance status changing. None of the ten is cited as evidence
 for any box.
 
 **Other sources read in full for this refresh**: issue
@@ -164,7 +166,7 @@ programmatically — see §3.8), and the merged trees of every PR above.
 
 ## 1. Acceptance-criterion ledger
 
-All line numbers below are as of `46402840`. Symbol names are given alongside
+All line numbers below are as of `34c9167e`. Symbol names are given alongside
 so a future line shift does not invalidate the citation.
 
 ### Criterion 1 — "A first-time League Admin can identify and open the correct next incomplete setup step from one primary action."
@@ -208,7 +210,7 @@ so a future line shift does not invalidate the citation.
 | | |
 | --- | --- |
 | Required boundary/evidence | Per `operator-ux-requirements.md` §5, the full states matrix applies to Home/Tasks **and each of the six Setup workflows**, at desktop and 390×844, including keyboard activation and exact focus after retry, confirmation and completion. |
-| Evidence merged to `main` | **PR #377 (issue #365), merge `71bad79fc991b49a8136ef98eef14a493b4fa78b`.**<br><br>**The state model.** `CARD_STATE` (`app.js:660`) — `loading \| ready \| empty \| stale \| error \| confirm \| pending \| success`; `CARD_STATUS` (`app.js:678`) — `done \| todo \| optional \| unknown`, backend-owned; `CARD_READ` (`app.js:693`). Card identity is workflow/card id + exact `(program, season, league)` tuple + request generation, enforced by `cardIdentityCurrent()` (`app.js:1116`) and `cardTupleCurrent()` (`app.js:1150`), with `beginCardRequest()` (`app.js:1058`), `commitCardState()` (`app.js:1162`) and `readCardState()` (`app.js:1218`). Setup-side: `buildSetupWorkflowCardModel()` (`app.js:5327`), `setupHubRollup()` (`app.js:5454`), `setupCardBodyHtml()` (`app.js:5564`), `retrySetupWorkflowCard()` (`app.js:5830`), `resolveSetupCardConfirm()` (`app.js:5949`), `SETUP_SEASON_REOPEN_ACTION` (`app.js:5107`). Backend prerequisite authority: `_workflow_prerequisite_rows()` (`service.py:2124`).<br><br>**Home/Tasks EMPTY is a real rendered state.** The `!program_id` test lives in `buildTasksCardModel()` (`app.js:1394`), returning `CARD_STATE.EMPTY` with `reason: "no_program"` (`app.js:1410`) or `"nothing_actionable"` (`app.js:1438`); the renderer branches on the named reason at `app.js:1627`–`1650`, painting a heading and status sentence for both, and gating `Start Initial Setup` on `canBootstrap = hasPerm("manage_setup")` (`app.js:1646`).<br><br>**The browser matrix.** `e2e/home-tasks-state-matrix.js` (2,207 lines) and `e2e/setup-state-matrix.js` (2,722 lines), both at desktop and 390×844, both driving real production entry points with the *transport* forced by route interception. Supporting journeys: `e2e/setup-card-write-identity.js` (4,628 lines), `e2e/setup-prerequisite-floors.js` (748 lines). Backend: `test_setup_progress.py` grew by 607 lines. **All six journey files remain byte-identical at `46402840` to their state at `71bad79f`** (verified by diff), so every leg line number in §2 resolves unchanged.<br><br>**CI registration**: `setup-state-matrix` shard 1 (line 318), `home-tasks-state-matrix` shard 3 (line 322), `setup-prerequisite-floors` and `setup-card-write-identity` shard 4 (line 324). |
+| Evidence merged to `main` | **PR #377 (issue #365), merge `71bad79fc991b49a8136ef98eef14a493b4fa78b`.**<br><br>**The state model.** `CARD_STATE` (`app.js:660`) — `loading \| ready \| empty \| stale \| error \| confirm \| pending \| success`; `CARD_STATUS` (`app.js:678`) — `done \| todo \| optional \| unknown`, backend-owned; `CARD_READ` (`app.js:693`). Card identity is workflow/card id + exact `(program, season, league)` tuple + request generation, enforced by `cardIdentityCurrent()` (`app.js:1116`) and `cardTupleCurrent()` (`app.js:1150`), with `beginCardRequest()` (`app.js:1058`), `commitCardState()` (`app.js:1162`) and `readCardState()` (`app.js:1218`). Setup-side: `buildSetupWorkflowCardModel()` (`app.js:5327`), `setupHubRollup()` (`app.js:5454`), `setupCardBodyHtml()` (`app.js:5564`), `retrySetupWorkflowCard()` (`app.js:5830`), `resolveSetupCardConfirm()` (`app.js:5949`), `SETUP_SEASON_REOPEN_ACTION` (`app.js:5107`). Backend prerequisite authority: `_workflow_prerequisite_rows()` (`service.py:2124`).<br><br>**Home/Tasks EMPTY is a real rendered state.** The `!program_id` test lives in `buildTasksCardModel()` (`app.js:1394`), returning `CARD_STATE.EMPTY` with `reason: "no_program"` (`app.js:1410`) or `"nothing_actionable"` (`app.js:1438`); the renderer branches on the named reason at `app.js:1627`–`1650`, painting a heading and status sentence for both, and gating `Start Initial Setup` on `canBootstrap = hasPerm("manage_setup")` (`app.js:1646`).<br><br>**The browser matrix.** `e2e/home-tasks-state-matrix.js` (2,207 lines) and `e2e/setup-state-matrix.js` (2,722 lines), both at desktop and 390×844, both driving real production entry points with the *transport* forced by route interception. Supporting journeys: `e2e/setup-card-write-identity.js` (4,628 lines), `e2e/setup-prerequisite-floors.js` (748 lines). Backend: `test_setup_progress.py` grew by 607 lines. **All six journey files remain byte-identical at `34c9167e` to their state at `71bad79f`** (verified by diff), so every leg line number in §2 resolves unchanged.<br><br>**CI registration**: `setup-state-matrix` shard 1 (line 318), `home-tasks-state-matrix` shard 3 (line 322), `setup-prerequisite-floors` and `setup-card-write-identity` shard 4 (line 324). |
 | Remaining gap | One bound, taken verbatim from the merged journey's own header (`e2e/setup-state-matrix.js:120`–`135`): Workflow 6's confirmation completes by navigating, so the live region is populated and emptied inside one task before paint. `legConfirmImport()` asserts the sentence was **written exactly once** and asserts nothing about whether it survived to be spoken. A bound on one announcement, not an unimplemented state. |
 | **Status** | **`Verified on main`** |
 
@@ -226,11 +228,11 @@ so a future line shift does not invalidate the citation.
 | Sub-item | Evidence merged to `main` | Sub-item stage |
 | --- | --- | --- |
 | Desktop + 390×844 | Standing convention across every merged browser journey (viewport pairs `1440×900` / `390×844`). Both #365 matrix journeys run both (`VIEWPORTS`, `e2e/setup-state-matrix.js:188`, `e2e/home-tasks-state-matrix.js:167`), as does `e2e/seven-area-navigation.js`. | **Merged** |
-| Breakpoint-boundary (480/720/880/1040) | **Merged.** PR #351 (`49d662a`) fixed `styles.css`'s two out-of-contract widths; **PR #354 (merge `d190a6f6`) closed the remaining two.** Re-verified at `46402840`: every `@media` width feature across all four production stylesheets is one of 480/720/880/1040 (`styles.css` 402, 861, 965, 979, 1030, 1148, 1229; `web.css` 327, 331, 370; `onboarding.css` 315; `setup.css` 135) — the only other `@media` rules are `prefers-reduced-motion` (`web.css:30`) and `print` (`styles.css:403`). `e2e/breakpoint-contract.js` **discovers** the stylesheet set from every `<link rel="stylesheet">` in `index.html` and `setup.html`, so a newly linked stylesheet is under contract immediately. `e2e/breakpoint-boundaries.js` proves the **browser** collapses and restores one pixel each side of all four tokens using the real stylesheets and the real `<nav class="side-nav">`. Registered at `hockey-scheduler-ci.yml:278` (standalone) and shard 1 (line 318). | **Merged** |
-| Keyboard-only (manual pass) | `docs/product/manual-keyboard-screenreader-validation-protocol.md` (PR #350, merge `e8c7d96d`) — a **protocol and blank evidence template only**, whose own Status section states no validation has been performed under it. Re-verified at `46402840`: no filled-in artifact exists under `docs/`. **The K5/S5 defect that blocked this pass is fixed** by #394 (§3.9, resolved), so the pass is now runnable and waits only on a human. | **Human-only, unperformed** |
+| Breakpoint-boundary (480/720/880/1040) | **Merged.** PR #351 (`49d662a`) fixed `styles.css`'s two out-of-contract widths; **PR #354 (merge `d190a6f6`) closed the remaining two.** Re-verified at `34c9167e`: every `@media` width feature across all four production stylesheets is one of 480/720/880/1040 (`styles.css` 402, 861, 965, 979, 1030, 1148, 1229; `web.css` 327, 331, 370; `onboarding.css` 315; `setup.css` 135) — the only other `@media` rules are `prefers-reduced-motion` (`web.css:30`) and `print` (`styles.css:403`). `e2e/breakpoint-contract.js` **discovers** the stylesheet set from every `<link rel="stylesheet">` in `index.html` and `setup.html`, so a newly linked stylesheet is under contract immediately. `e2e/breakpoint-boundaries.js` proves the **browser** collapses and restores one pixel each side of all four tokens using the real stylesheets and the real `<nav class="side-nav">`. Registered at `hockey-scheduler-ci.yml:278` (standalone) and shard 1 (line 318). | **Merged** |
+| Keyboard-only (manual pass) | `docs/product/manual-keyboard-screenreader-validation-protocol.md` (PR #350, merge `e8c7d96d`) — a **protocol and blank evidence template only**, whose own Status section states no validation has been performed under it. Re-verified at `34c9167e`: no filled-in artifact exists under `docs/`. **The K5/S5 defect that blocked this pass is fixed** by #394 (§3.9, resolved), so the pass is now runnable and waits only on a human. | **Human-only, unperformed** |
 | Screen-reader (manual pass) | Same protocol, same disclaimer, same absence. `e2e/setup-state-matrix.js:136`–`139` states its own boundary: *"This journey drives a real browser with real keyboard events. It is NOT a screen-reader session and NOT a moderated human session."* #394 additionally added an S5 step asking the validator to record **how a non-sighted operator learns the content re-filtered** — the repaint is silent today, and that gap was deliberately left to be logged by the session rather than papered over with an unvalidated live-region announcement. | **Human-only, unperformed** |
 | WCAG 2.2 AA — **automated repository accessibility** | **Merged.** `axe-core@^4.12.1` is a declared `devDependency` (`e2e/package.json:64`), called by exactly three journeys: `e2e/setup-accessibility-axe-gate.js:161`, `e2e/shell-accessibility-coverage.js:189`, `e2e/home-tasks-hub.js:183`. **PR #362 (issue #359), merge `9eadfb85`**, added the always-run gate reaching **twelve** surfaces through real clicks/navigation — signed-out login, anonymous public schedule, authenticated Home/Tasks, the Setup hub, **each of the six Setup workflow landings**, a forced 502, and an Official's restricted early-return — requiring zero serious/critical axe violations, zero console/page errors, no dangling skip-link target, no stale page title, no hidden focused control, at both viewports. Registered shard 4 (line 324). **This is automated repository accessibility. It is not, and is not evidence for, the two manual rows above.** | **Merged** |
-| Zero-console-error | **Re-derived at `46402840`** (see §3.8 for the derivation rule and why these counts must never be copied forward). `e2e/` contains **64** `*.js` files. **57** are real Playwright journeys. **56 of those 57** install both `page.on("pageerror", …)` and `page.on("console", …)`. The single exception is `e2e/api-error-resilience.js`, which installs `pageerror` (line 49) only, by design — it deliberately provokes 401/403/502. The seven non-journey files (`breakpoint-contract.js`, `check-pr-body.js`, `check-v1-route-contract.js`, `ci-classify.js`, `ci-classify.test.js`, `ci-classify.integration.test.js`, `season-fmt-unit.js`) are static/unit checks. **The durable invariant holds again: the 57 Playwright journeys and the 57 names registered across the four browser-smoke shards are the same set exactly** — no orphan journey CI never runs, no registered name without a file. Both #365 matrix journeys additionally run a **delivery reconciler** (`reconcileDeliveries()`, `e2e/home-tasks-state-matrix.js:303`) keyed to (method, URL, status), consumed at most once, with unmatched responses failing the run. | **Merged** |
+| Zero-console-error | **Re-derived at `34c9167e`** (see §3.8 for the derivation rule and why these counts must never be copied forward). `e2e/` contains **64** `*.js` files. **57** are real Playwright journeys. **56 of those 57** install both `page.on("pageerror", …)` and `page.on("console", …)`. The single exception is `e2e/api-error-resilience.js`, which installs `pageerror` (line 49) only, by design — it deliberately provokes 401/403/502. The seven non-journey files (`breakpoint-contract.js`, `check-pr-body.js`, `check-v1-route-contract.js`, `ci-classify.js`, `ci-classify.test.js`, `ci-classify.integration.test.js`, `season-fmt-unit.js`) are static/unit checks. **The durable invariant holds again: the 57 Playwright journeys and the 57 names registered across the four browser-smoke shards are the same set exactly** — no orphan journey CI never runs, no registered name without a file. Both #365 matrix journeys additionally run a **delivery reconciler** (`reconcileDeliveries()`, `e2e/home-tasks-state-matrix.js:303`) keyed to (method, URL, status), consumed at most once, with unmatched responses failing the run. | **Merged** |
 
 **The instrumentation now exists on `main`.** PR #395 merged the facilitator
 pack: seeded environments per role with verifying pre-flights, K1–K17 and
@@ -253,8 +255,8 @@ two rows are blocked on nothing but the passes being performed.
 | | |
 | --- | --- |
 | Required boundary/evidence | Three real moderated sessions (League Admin, Arena Manager, Coach) — commissioned, run, and documented with completion, timing, interventions, ease rating, and confusion quotes. Not waived, not simulated. |
-| Evidence merged to `main` | `docs/product/moderated-operator-validation-protocol.md` (PR #349, merge `9d090fe6`) — a protocol and blank evidence-template document whose own Status section states verbatim: *"Protocol and evidence templates only. No moderated session has been run under this document."* A full listing of `docs/` at `46402840` shows that **blank capture sheets now exist and are still blank**: PR #395 added `docs/product/345-human-validation/09`–`11-capture-sheet-*.md`, one per role. Every result field, timing, intervention count, ease rating, quote and sign-off in them is empty. A reader listing `docs/` will now find session-shaped files where previously there were none — they are instrumentation, not evidence, and **no filled-in session artifact exists**. |
-| Remaining gap | The three sessions themselves — **human-only** work no code change can satisfy — and, before them, one thing that is not: the facilitator pack's ease-rating wording is **not yet ruled on `main`**. The ruling sits in open PR [#396](https://github.com/jingizoo/biknik/pull/396), so `check_pack.py --session-readiness` exits non-zero at this snapshot's SHA and the pack's own pre-flight refuses to start a moderated session. That gate is deliberate: the question is asked nine times across the three sessions, and settling its wording after session one would make the set incomparable. `Pending active PR` therefore describes the wording, while the sessions themselves stay human-only. |
+| Evidence merged to `main` | `docs/product/moderated-operator-validation-protocol.md` (PR #349, merge `9d090fe6`) — a protocol and blank evidence-template document whose own Status section states verbatim: *"Protocol and evidence templates only. No moderated session has been run under this document."* A full listing of `docs/` at `34c9167e` shows that **blank capture sheets now exist and are still blank**: PR #395 added `docs/product/345-human-validation/09`–`11-capture-sheet-*.md`, one per role. Every result field, timing, intervention count, ease rating, quote and sign-off in them is empty. A reader listing `docs/` will now find session-shaped files where previously there were none — they are instrumentation, not evidence, and **no filled-in session artifact exists**. |
+| Remaining gap | **The three sessions themselves, and nothing else.** Round 8 recorded a second, non-human gate — the facilitator pack's ease-rating wording was unruled, so `check_pack.py --session-readiness` refused to start a moderated session. **PR [#396](https://github.com/jingizoo/biknik/pull/396) merged as `34c9167e` and discharged it**: the wording is ratified, `--session-readiness` exits 0 at this snapshot's SHA, and the pack's pre-flight no longer blocks. What remains is **human-only** work no code change can satisfy. |
 | **Status** | **`Human-only / unperformed`**. **Publishing the protocol (#349) is not performing it.** |
 
 ### Criterion 9 — "Memory, SQLite, PostgreSQL, authenticated HTTP where relevant, and all required browser CI are green."
@@ -262,9 +264,9 @@ two rows are blocked on nothing but the passes being performed.
 | | |
 | --- | --- |
 | Required boundary/evidence | The full backend matrix (Memory/SQLite/PostgreSQL), authenticated HTTP where relevant, and all required browser CI green at the inspected head. |
-| Evidence merged to `main` | **`main` at `46402840` — its current tip — is green.** Workflow run [30907548648](https://github.com/jingizoo/biknik/actions/runs/30907548648), push to `main`, concluded `success` at `2026-08-05T19:16:26Z`, all ten jobs green: `changes`, `classifier-test`, `frontend-check`, `test` (Memory/SQLite), `postgres`, and browser-smoke shards 1–4 covering **57 registered journeys** (`hockey-scheduler-ci.yml:318`–`324`). Authenticated-HTTP coverage sits inside the `test`/`postgres` jobs: `test_players_http_scope.py` (real `ThreadingHTTPServer`, real `Handler`, real session cookies, raw-response assertions), `test_context_league_http.py`, `test_league_context_http.py`, `test_server_authz.py`. Every merged batch in the table above was green on its own exact head at merge time. |
+| Evidence merged to `main` | **`main` at `34c9167e` — its current tip — is green.** Workflow run [31067094378](https://github.com/jingizoo/biknik/actions/runs/31067094378), push to `main`, concluded `success` at `2026-08-06T03:13:15Z`, all ten jobs green: `changes`, `classifier-test`, `frontend-check`, `test` (Memory/SQLite), `postgres`, and browser-smoke shards 1–4 covering **57 registered journeys** (`hockey-scheduler-ci.yml:318`–`324`). Authenticated-HTTP coverage sits inside the `test`/`postgres` jobs: `test_players_http_scope.py` (real `ThreadingHTTPServer`, real `Handler`, real session cookies, raw-response assertions), `test_context_league_http.py`, `test_league_context_http.py`, `test_server_authz.py`. Every merged batch in the table above was green on its own exact head at merge time. |
 | Remaining gap | **This box is satisfied for the merged #345 work at this SHA only.** It is not a statement that #345 may merge: #345's Done condition additionally requires *every* box to have evidence and the moderated sessions to be documented, and criteria 7 and 8 do not. This remains the most perishable row in the document — a claim about a moving branch. It was false for roughly six hours during Round 5's window, which is why Round 5 pinned behind the tip; it has now been true across two consecutive tips (`57cd84dc`, `36195faa`). |
-| **Status** | **`Verified on main`** — at `46402840`, `main`'s tip, with no carve-out needed this round. Recorded reasoning: under this document's own vocabulary `Missing` means "no implementation and no pending PR addresses it", which is plainly false — a completed green CI run on the recorded SHA is exactly the evidence this box asks for. |
+| **Status** | **`Verified on main`** — at `34c9167e`, `main`'s tip, with no carve-out needed this round. Recorded reasoning: under this document's own vocabulary `Missing` means "no implementation and no pending PR addresses it", which is plainly false — a completed green CI run on the recorded SHA is exactly the evidence this box asks for. |
 
 ---
 
@@ -394,7 +396,7 @@ conflicting draft. Accurate then, superseded now (merge `d190a6f6`,
 stylesheet set **discovered** from the production HTML rather than declared.
 
 **6. `ROADMAP.md` still describes #345 as one undifferentiated deliverable.**
-Re-verified at `46402840`: its "Currently active sequencing" section
+Re-verified at `34c9167e`: its "Currently active sequencing" section
 (`ROADMAP.md:276` onward, #345 at 290, 297, 301) does not reflect the batch
 split across fourteen-plus merged pieces. Flagged for the owner; out of scope
 for this PR.
@@ -408,8 +410,9 @@ eight hours. A child PR must use `Part of #<epic>`, never a closing keyword.
 
 **8. The zero-console-error inventory held still this round while its
 MEMBERSHIP changed — which is the clearest argument yet for the invariant over
-the counts.** It drifted in four consecutive rounds — 35/34, then 59/53/52, then 62/55/54, then 63/56/55, now
-63/56/55, then 64/57/56 — and this round it is **64/57/56 again**, byte-for-byte
+the counts.** It drifted in four consecutive rounds — 35/34, then 59/53/52, then
+62/55/54, then 63/56/55, then 64/57/56 — and this round it is **64/57/56
+again**, byte-for-byte
 the same triple, because #398 RENAMED a journey (`scheduler-meetings-format.js`
 → `scheduler-games-per-team.js`) rather than adding one. A check on the counts
 alone would have seen nothing at all while the registered set changed under it.
@@ -499,7 +502,6 @@ immune to.
 | Item | State at snapshot | Scope |
 | --- | --- | --- |
 | [#357](https://github.com/jingizoo/biknik/issues/357) | **OPEN** | Refresh this ledger as a current-`main` snapshot — this task |
-| [PR #396](https://github.com/jingizoo/biknik/pull/396) | **OPEN (draft)** | `Part of #345` — ratifies the facilitator pack's ease-rating wording. **`Pending active PR`**: until it merges, `--session-readiness` refuses to start a moderated session on `main`. Nothing in §1 rests on it |
 | [#393](https://github.com/jingizoo/biknik/issues/393) | **OPEN** | Schedule/Facilities operator journey. Sequenced **after** #345 closes; **not #345 work**, and explicitly not a staleness trigger for this document |
 | [#376](https://github.com/jingizoo/biknik/issues/376) | **OPEN** | Child of #31 — playoff bracket. **Not #345 work** |
 | [#206](https://github.com/jingizoo/biknik/issues/206) | **OPEN** (reopened 2026-08-03) | Epic — scheduling planner v2. **Not #345 work.** Its children drove every merge since Round 4 |
@@ -576,20 +578,28 @@ the reason #345 remains open regardless of how much of §1 reads
   base-consistency, single-inventory, no-present-tense-in-RESOLVED, and a
   non-future timestamp.
 
-- **Round 8** (`2026-08-05T19:22Z`, this revision, per issue
+- **Round 8** (`2026-08-05T19:21Z`): pinned to `46402840`; #395 entered the base
+  table; criterion 8 gained a second, non-human gate. Its pushed head carried
+  four contradictions a reviewer found and its checkers did not: criterion 9
+  cited a CI run belonging to the PREVIOUS base, the vocabulary note denied a
+  value two rows carried, §3.8's drift sequence listed one triple twice, and
+  the window count said nine where ten had merged.
+
+- **Round 9** (`2026-08-06T03:16Z`, this revision, per issue
   [#357](https://github.com/jingizoo/biknik/issues/357)): re-pinned to
-  **`46402840`**, `main`'s tip, green across all ten jobs. **#395 enters the
-  base table** — the human-validation facilitator pack, the first #345 work to
-  merge since #394 — and criterion 7 records that the instrumentation for its
-  two manual passes now exists while remaining blank. **Criterion 8 gains a
-  second, non-human gate**: the pack's ease-rating wording is unruled on
-  `main`, the ruling sits in open PR #396, and `--session-readiness` refuses a
-  moderated session until it lands — the first time `Pending active PR` and
-  `Human-only / unperformed` describe different portions of one criterion.
-  #398 also merged in this window and is recorded as **not** #345 work, under
-  an owner-granted roadmap exception.<br><br>72 citations re-resolved.
-  §3.8 is rewritten: the console inventory came out at **64/57/56 for the
-  second round running**, byte-identical, because #398 renamed a journey rather
-  than adding one — so the counts a reader might have trusted saw nothing while
-  the registered set changed underneath them. The set-equality invariant held
-  at 57 = 57 for the fifth consecutive round.
+  **`34c9167e`**, `main`'s tip, green across all ten jobs, and fixed all four
+  of Round 8's contradictions.<br><br>**The first re-pin in nine rounds that
+  moved no citation at all.** #396 touched only the human-validation pack,
+  which this document does not cite by line, so `app.js` and `service.py` are
+  byte-identical between the two tips and every one of the 115 citations held.
+  Every previous round spent most of its effort on drift; this one spent none.
+  <br><br>**Criterion 8's second gate is discharged.** #396 ratified the
+  ease-rating wording, so `--session-readiness` exits 0 at this SHA and the
+  facilitator pack's pre-flight no longer refuses a moderated session.
+  `Pending active PR` returns to unused, and **criteria 7 and 8 are now
+  blocked on people and nothing else** — the first time in this document's
+  history that no portion of either is waiting on a PR.<br><br>Two checks were
+  added, each falsified before being trusted: a cited CI run must have executed
+  on the pinned SHA — Round 8 certified `46402840` while citing a run of
+  `36195faa`, every fact true of something and the conjunction false — and the
+  status vocabulary may not deny a value the document uses.
