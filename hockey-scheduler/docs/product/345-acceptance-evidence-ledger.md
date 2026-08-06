@@ -272,7 +272,10 @@ two rows are blocked on nothing but the passes being performed.
 | --- | --- |
 | Required boundary/evidence | The full backend matrix (Memory/SQLite/PostgreSQL), authenticated HTTP where relevant, and all required browser CI green at the inspected head. |
 | Evidence merged to `main` | **`main` at `34c9167e` — its current tip — is green.** Workflow run [31067094378](https://github.com/jingizoo/biknik/actions/runs/31067094378), push to `main`, concluded `success` at `2026-08-06T03:13:15Z`, all ten jobs green: `changes`, `classifier-test`, `frontend-check`, `test` (Memory/SQLite), `postgres`, `human-validation-pack` (added by #395 — it runs the facilitator pack's checks and every one of its mutations on each push), and browser-smoke shards 1–4 covering **57 registered journeys** (`hockey-scheduler-ci.yml:318`–`324`). Authenticated-HTTP coverage sits inside the `test`/`postgres` jobs: `test_players_http_scope.py` (real `ThreadingHTTPServer`, real `Handler`, real session cookies, raw-response assertions), `test_context_league_http.py`, `test_league_context_http.py`, `test_server_authz.py`. Every merged batch in the table above was green on its own exact head at merge time. |
-| Remaining gap | **This box is satisfied for the merged #345 work at this SHA only.** It is not a statement that #345 may merge: #345's Done condition additionally requires *every* box to have evidence and the moderated sessions to be documented, and criteria 7 and 8 do not. This remains the most perishable row in the document — a claim about a moving branch. It was false for roughly six hours during Round 5's window, which is why Round 5 pinned behind the tip; it has now been true across two consecutive tips (`57cd84dc`, `36195faa`). |
+| Remaining gap | **This box is satisfied for the merged #345 work at this SHA only.** It is not a statement that #345 may merge: #345's Done condition additionally requires *every* box to have evidence and the moderated sessions to be documented, and criteria 7 and 8 do not. This remains the most perishable row in the document — a claim about a moving branch. It was false for roughly six hours during Round 5's window, which is why Round 5 pinned behind the tip; it has held on every `main` tip since — the sequence is recorded once, in
+§"Snapshot semantics" above, and deliberately not restated here: two copies of
+the same provenance fact are two things to keep in sync, and the stale copy is
+the one a reader happens to open. |
 | **Status** | **`Verified on main`** — at `34c9167e`, `main`'s tip, with no carve-out needed this round. Recorded reasoning: under this document's own vocabulary `Missing` means "no implementation and no pending PR addresses it", which is plainly false — a completed green CI run on the recorded SHA is exactly the evidence this box asks for. |
 
 ---
@@ -514,8 +517,11 @@ immune to.
 | [#206](https://github.com/jingizoo/biknik/issues/206) | **OPEN** (reopened 2026-08-03) | Epic — scheduling planner v2. **Not #345 work.** Its children drove every merge since Round 4 |
 | [#287](https://github.com/jingizoo/biknik/issues/287) | **OPEN** | Epic — substitute matching engine. Sequenced after #345 and #393 |
 
-**Merged since Round 6**: PR #394 (`36195faa`) — **#345 work**, cited in §1
-criterion 4 and retiring §3.1/§3.9/§3.10.
+**Merged since Round 6**, all three **#345 work**: PR #394 (`36195faa`),
+cited in §1 criterion 4 and retiring §3.1/§3.9/§3.10; PR #395 (`3a1720d0`),
+the human-validation facilitator pack and the `human-validation-pack` CI job;
+and PR #396 (`34c9167e`), which ratified the ease-rating wording and
+discharged criterion 8's second gate.
 
 **Closed since Round 4, none of it #345 work**: #375, #379, #383 (duplicate of
 #375), #386, #387, #390 — all #206 children — plus PR #392, the SQLite lock
