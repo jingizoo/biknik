@@ -251,7 +251,7 @@ the suite green before its test existed.
 | Restore the pre-`#399` `season AND league` conjunct for every Game | `test_an_active_season_exhibition_blocker_is_named`, `test_a_league_less_game_is_in_scope_only_via_a_participant` |
 | Admit every league-less Game in the Season | `test_a_sibling_leagues_own_exhibition_is_still_withheld`, `test_a_league_less_game_is_in_scope_only_via_a_participant` |
 | Skip the Season conjunct for league-less Games | `test_a_neighbouring_seasons_exhibition_is_withheld_too`, `test_a_league_less_game_still_obeys_the_season_conjunct` |
-| Let `_plays_in_league` fail OPEN on a missing Team | `test_a_league_less_game_is_in_scope_only_via_a_participant`, `test_a_sibling_leagues_own_exhibition_is_still_withheld` |
+| Let `_plays_in_league` fail OPEN on a missing Team | `test_a_dangling_participant_never_validates_into_the_league`, `test_a_league_less_game_is_in_scope_only_via_a_participant` |
 | Keep the policy `conflict_game_id` unconditionally | `test_a_neighbouring_seasons_game_is_never_named_in_evidence` |
 | Keep the `team_overlap` `conflict_game_id` unconditionally | `test_a_teams_other_season_game_is_named_only_inside_the_tuple` |
 | Stop seeding the scope from the Division entry point | `test_an_in_scope_conflicting_game_is_still_named` (`shape='division'`) |

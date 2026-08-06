@@ -683,6 +683,53 @@ class _ExplanationContract:
         for secret in ("t_x0", "t_x1", "Sibling 0", "Sibling 1"):
             self.assertNotIn(secret, blob)
 
+    def test_a_dangling_participant_never_validates_into_the_league(self):
+        """Fail-CLOSED on an unresolvable participant.
+
+        For a league-less Game the participant test is the ONLY thing between
+        it and disclosure, so what that test does with a Team it cannot
+        resolve is a privacy property, not a robustness nicety. A rule
+        reading "cannot resolve" as "matches" would hand out an id on the
+        strength of a row that no longer exists.
+
+        Both participants are sibling-League teams, so the Game is withheld
+        to begin with; then one of them is DELETED, leaving a dangling
+        reference of the kind a partial delete or legacy import can still
+        produce. The verdict must not change.
+        """
+        api = _seed(self.store)
+        _sibling_league(self.store)
+        _slot(self.store, "exh_slot", "r1", BASE)
+        exhibition = api.create_game(
+            "se", None, "t_x0", "t_x1", "exh_slot",
+            game_type="exhibition", actor_id="admin")
+        self.assertNotIn("error", exhibition, exhibition)
+        self.store.delete_team("t_x1")
+        # ANTI-VACUITY: the reference really is dangling, and the surviving
+        # participant really is foreign -- so "withheld" cannot be coming
+        # from a Game that quietly vanished from the snapshot.
+        self.assertIsNone(self.store.get_team("t_x1"))
+        self.assertEqual(self.store.get_team("t_x0").league_id, "lg_x")
+        self.assertIsNotNone(self.store.get_game(exhibition["id"]))
+        mine = _slot(self.store, "mine", "r1", BASE + timedelta(minutes=30))
+
+        preview = api.draft_season_schedule("d", slot_ids=[mine])
+        self.assertNotIn("error", preview, preview)
+        explanation = _explanation(preview)
+        overlap = next(
+            rejection
+            for candidate in explanation["candidate_windows"]
+            for rejection in candidate["rejections"]
+            if rejection["code"] == "slot_overlap_conflict")
+        # The collision is still reported; only the id is withheld.
+        self.assertEqual(overlap["details"]["conflict_slot_id"], "exh_slot")
+        self.assertNotIn(
+            "conflict_game_id", overlap["details"],
+            "an unresolvable participant was treated as validating into the "
+            "caller's League")
+        self.assertNotIn(
+            exhibition["id"], json.dumps(explanation, sort_keys=True))
+
     def test_a_neighbouring_seasons_exhibition_is_withheld_too(self):
         """Season stays a hard axis for league-less Games.
 
