@@ -1154,12 +1154,16 @@ class TurnaroundHttpTest(unittest.TestCase):
 
         The pair is asked for TWO meetings (#375), which is what leaves a
         round-robin obligation outstanding behind a REGULAR game that already
-        satisfies the first one. A REGULAR fixture rather than an exhibition
-        deliberately: an EXHIBITION has no owning League by design (#283
-        Slice D), so it can never be inside #379's in-scope-game-id set and
-        its id is correctly withheld from the explanation — which would make
-        "the refusal names the blocking game" unassertable here for a reason
-        that has nothing to do with the turnaround.
+        satisfies the first one. A REGULAR fixture keeps this test's subject
+        the TURNAROUND alone: an EXHIBITION carries no owning League by design
+        (#283 Slice D), so whether its id reaches the explanation turns on the
+        participant test #399 restored, and a failure here would no longer
+        say anything specific about the turnaround rule.
+
+        (An earlier revision of this docstring justified the choice by saying
+        an exhibition "can never be inside #379's in-scope-game-id set and its
+        id is correctly withheld". That was true of the code and false as a
+        contract — it was the #399 defect, stated as a design intention.)
         """
         def post(path, body):
             status, resp = self._req(c, "POST", path, body)

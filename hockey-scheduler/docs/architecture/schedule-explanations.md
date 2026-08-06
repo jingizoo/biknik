@@ -166,11 +166,30 @@ reached the payload through three codes: `slot_overlap_conflict`,
 `turnover_buffer_conflict` (via the rink) and `team_overlap` (via the team).
 
 `_in_scope_game_ids` is therefore computed once per run from that same shared
-snapshot and every conflicting Game id is checked against it. Both halves of
-the tuple must match — the two corners `#388` names, same Program/different
-Season and same Season/different League, are each refused a proposal and each
-would slip through a one-sided comparison. An unresolved Season/League scope
-withholds every id rather than defaulting open.
+snapshot and every conflicting Game id is checked against it. Season is a hard
+conjunct for every Game. The League half depends on what the Game carries:
+
+- a Game with an **owning League** is in scope only when that League matches —
+  the two corners `#388` names, same Program/different Season and same
+  Season/different League, are each refused a proposal and each would slip
+  through a one-sided comparison;
+- a **league-less** Game — an EXHIBITION, which carries no owning League at
+  all by design (`#283` Slice D) — is in scope when at least one participating
+  Team validates into the caller's League, per `#367`'s owner ruling.
+
+That second branch is `#399`. Comparing an exhibition's `None` league id for
+equality is not a boundary doing its job; it is a comparison that cannot
+succeed, so a friendly played by the caller's own team, on the caller's own
+ice, in the caller's own Season, blocked a placement whose explanation then
+refused to name it — the operator was told the slot was taken and given no
+Game to act on. The ruling's other half is what keeps this a correction rather
+than an opening: an exhibition between two sibling-League teams is concretely
+that League's fixture and stays withheld, names and all.
+
+The Scheduler now answers this question exactly the way the Dashboard's
+`_game_matches_active` does. An unresolved Season/League scope still withholds
+every id rather than defaulting open, and an unresolvable participant is never
+counted as validating into anything.
 
 `conflict_slot_id` is NOT withheld. The candidate's Rink is in-context ice, so
 a slot on that Rink is the caller's own inventory and the operator still
@@ -229,6 +248,10 @@ the suite green before its test existed.
 | Remove `_in_scope_game_ids`' fail-closed branch | `test_an_unresolved_scope_withholds_every_id` |
 | Compare only the League, not the Season | `test_a_teams_other_season_game_is_named_only_inside_the_tuple`, `test_only_the_exact_season_and_league_pair_is_in_scope` |
 | Compare only the Season, not the League | `test_a_sibling_leagues_game_in_this_season_is_withheld_too`, `test_only_the_exact_season_and_league_pair_is_in_scope` |
+| Restore the pre-`#399` `season AND league` conjunct for every Game | `test_an_active_season_exhibition_blocker_is_named`, `test_a_league_less_game_is_in_scope_only_via_a_participant` |
+| Admit every league-less Game in the Season | `test_a_sibling_leagues_own_exhibition_is_still_withheld`, `test_a_league_less_game_is_in_scope_only_via_a_participant` |
+| Skip the Season conjunct for league-less Games | `test_a_neighbouring_seasons_exhibition_is_withheld_too`, `test_a_league_less_game_still_obeys_the_season_conjunct` |
+| Let `_plays_in_league` fail OPEN on a missing Team | `test_a_dangling_participant_never_validates_into_the_league`, `test_a_league_less_game_is_in_scope_only_via_a_participant` |
 | Keep the policy `conflict_game_id` unconditionally | `test_a_neighbouring_seasons_game_is_never_named_in_evidence` |
 | Keep the `team_overlap` `conflict_game_id` unconditionally | `test_a_teams_other_season_game_is_named_only_inside_the_tuple` |
 | Stop seeding the scope from the Division entry point | `test_an_in_scope_conflicting_game_is_still_named` (`shape='division'`) |
