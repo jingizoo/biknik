@@ -592,24 +592,21 @@ class Handler(BaseHTTPRequestHandler):
     # try/except inside each ``do_*``. Seven copies would drift, and a verb
     # added later would silently land outside the guarantee.
 
-    def _response_started(self) -> bool:
-        """Whether any status line has been buffered or sent for this request.
+    def flush_headers(self):
+        """The single moment a response stops being editable.
 
-        The boundary must never answer twice: a handler that failed AFTER
-        starting a response has already committed a status code, and a second
-        status line would corrupt the stream. ``send_response_only`` appends
-        to ``_headers_buffer``, so its presence (or an already-flushed buffer,
-        which sets ``_headers_sent``) is the signal.
+        ``send_response`` only APPENDS to ``_headers_buffer``; CPython puts
+        nothing on the socket until ``end_headers`` calls this. That
+        distinction is the whole of the recovery rule below: a buffered
+        response can still be discarded and replaced, a flushed one cannot.
+        Treating "buffered" as "committed" is what left the pre-flush window
+        answering zero bytes — the very 502 this boundary exists to remove.
         """
-        return bool(getattr(self, "_headers_buffer", None)
-                    or getattr(self, "_boundary_headers_sent", False))
-
-    def send_response_only(self, code, message=None):
-        self._boundary_headers_sent = True
-        super().send_response_only(code, message)
+        self._boundary_wire_written = True
+        super().flush_headers()
 
     def handle_one_request(self):
-        self._boundary_headers_sent = False
+        self._boundary_wire_written = False
         try:
             super().handle_one_request()
         except Exception as exc:      # noqa: BLE001 — deliberate catch-all
@@ -624,9 +621,16 @@ class Handler(BaseHTTPRequestHandler):
             # the WIRE behaviour changes.
             traceback.print_exc()
             self.close_connection = True
-            if self._response_started():
-                return          # already committed a status; do not answer twice
+            if self._boundary_wire_written:
+                # Bytes are already on the wire. A second status line would
+                # splice a second HTTP message onto the first, which is worse
+                # than the truncation the client will see anyway.
+                return
             try:
+                # Nothing has reached the socket, so a half-BUILT response is
+                # not a response — drop it, or its status line would be
+                # emitted ahead of the recovery's.
+                self._headers_buffer = []
                 # A DomainError reaching here means a layering slip (the facade
                 # normally converts it), but it is client-facing by
                 # construction and carries its own status — render it properly

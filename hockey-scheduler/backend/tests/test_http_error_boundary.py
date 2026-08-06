@@ -272,35 +272,34 @@ class _ErrorBoundaryContract:
             "a DomainError raised past the facade was converted to 500")
         self.assertNotEqual(payload["error"]["code"], "internal_error")
 
-    def test_a_failure_after_the_response_started_does_not_answer_twice(self):
-        """The boundary must not append a SECOND status line to a response the
-        handler already committed.
+    def test_a_failure_before_the_headers_flush_still_gets_one_structured_500(self):
+        """A response that was only BUILT is not a response that was SENT.
 
-        Forced by making ``_security_headers`` raise: ``_send_json`` calls
-        ``send_response`` first, so a status line is already buffered by then.
-        A boundary that answered anyway would call ``send_response`` again on
-        the same ``_headers_buffer``, and both status lines would flush — one
-        HTTP message containing two.
+        ``send_response`` appends the status line to ``_headers_buffer``;
+        CPython does not put a single byte on the socket until ``end_headers``
+        calls ``flush_headers``. A boundary that treats "buffered" as
+        "committed" therefore stays silent for every failure in that window —
+        zero bytes, which is exactly the 502 this whole change exists to
+        remove.
 
-        Asserted on RAW BYTES on purpose. ``urllib`` parses the first status
-        line and treats the rest as body, so it reports a perfectly ordinary
-        200 either way — an earlier version of this test used it and could not
-        tell the two apart, passing while the branch was unguarded.
+        Forced by making ``_security_headers`` raise: ``_send_json`` calls it
+        AFTER ``send_response`` and BEFORE ``end_headers``, so the status line
+        is buffered and nothing is flushed. The partially built response must
+        be discarded and replaced by exactly ONE structured 500.
         """
         cookie = self._raw_login()
         original = web.Handler._security_headers
 
         # Raises EXACTLY ONCE. A fault that fired on every call would also
-        # break the boundary's own recovery write, so no second status line
-        # could ever be emitted and this test would pass against a boundary
-        # with the double-answer guard removed — which is precisely what an
-        # earlier version of it did.
+        # break the boundary's own recovery write, so no answer could ever be
+        # emitted and this test would pass against a boundary that never
+        # recovers — which is what an earlier version of it did.
         fired = []
 
         def boom(self_):
             if not fired:
                 fired.append(True)
-                raise RuntimeError("after the status line")
+                raise RuntimeError("before the headers flush")
             return original(self_)
         web.Handler._security_headers = boom
         buf, real = io.StringIO(), sys.stderr
@@ -311,17 +310,61 @@ class _ErrorBoundaryContract:
             sys.stderr = real
             web.Handler._security_headers = original
 
-        starts = raw.count(b"HTTP/1.")
-        self.assertLessEqual(
-            starts, 1,
-            f"{starts} status lines in ONE response — the boundary answered a "
-            f"request that had already started replying: {raw[:200]!r}")
-        # The failure is still reported, never silently dropped.
+        self.assertNotEqual(
+            raw, b"",
+            "zero bytes: the buffered-but-unflushed failure path still drops "
+            "the response, which a reverse proxy renders as 502")
+        self.assertEqual(
+            raw.count(b"HTTP/1."), 1,
+            f"expected exactly one status line, got {raw.count(b'HTTP/1.')}: "
+            f"{raw[:200]!r}")
+        head, _, body = raw.partition(b"\r\n\r\n")
+        self.assertIn(b"500", head.split(b"\r\n", 1)[0], head[:120])
+        self.assertIn(b"internal_error", body, body[:200])
         self.assertIn("RuntimeError", buf.getvalue())
-        # ...and the server is still serving.
+
         c = self._client()
         again, _ = self._req(c, "GET", "/api/setup/hierarchy")
-        self.assertEqual(again, 200)
+        self.assertEqual(again, 200, "server did not survive")
+
+    def test_a_failure_after_the_response_flushed_does_not_answer_twice(self):
+        """The other side of the same boundary.
+
+        Once ``end_headers`` has flushed, bytes are on the wire and a second
+        status line would splice a second HTTP message onto the first. Here a
+        COMPLETE response is sent and only then does the handler raise, so
+        recovery must stay silent.
+
+        Asserted on raw bytes on purpose: ``urllib`` parses the first status
+        line and calls everything after it body, so it cannot tell one reply
+        from two.
+        """
+        cookie = self._raw_login()
+        original = web.Handler._send_json
+        fired = []
+
+        def after(self_, payload, code=200, extra_headers=None):
+            original(self_, payload, code, extra_headers)
+            if not fired:
+                fired.append(True)
+                raise RuntimeError("after the response was flushed")
+        web.Handler._send_json = after
+        buf, real = io.StringIO(), sys.stderr
+        sys.stderr = buf
+        try:
+            raw = self._raw_request(cookie, "GET", "/api/setup/hierarchy")
+        finally:
+            sys.stderr = real
+            web.Handler._send_json = original
+
+        self.assertEqual(
+            raw.count(b"HTTP/1."), 1,
+            f"{raw.count(b'HTTP/1.')} status lines spliced into one response: "
+            f"{raw[:200]!r}")
+        # ANTI-VACUITY: the first response really did get through, so "one
+        # status line" is not just the failure path being silent.
+        self.assertIn(b"200", raw.split(b"\r\n", 1)[0], raw[:120])
+        self.assertIn("RuntimeError", buf.getvalue())
 
     def test_the_raw_probe_sees_a_normal_response(self):
         """Anti-vacuity for the raw probe above: on a healthy request it really
