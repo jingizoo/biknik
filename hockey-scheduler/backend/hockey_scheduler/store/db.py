@@ -40,7 +40,23 @@ def connect(url: str) -> Tuple[object, Dialect, Optional[str]]:
         import psycopg  # imported lazily; only needed for the Postgres target
         from psycopg.rows import dict_row
 
-        conn = psycopg.connect(url, autocommit=True, row_factory=dict_row)
+        # client_encoding is DECLARED, never inherited (#405). On a SQL_ASCII
+        # database the server performs no encoding conversion, so without this
+        # psycopg cannot decode TEXT and returns `bytes` for every text column.
+        # The first symptom is that the app CANNOT RESTART: migrate() compares
+        # a str version against a set holding b'001_initial', concludes nothing
+        # is applied, re-runs every migration and dies on
+        # schema_migrations_pkey — while the ledger is perfectly intact. The
+        # first deploy succeeds and every restart afterwards fails, which reads
+        # as database corruption rather than an encoding mismatch.
+        #
+        # Fixing it at the connection, not in migrate(), is deliberate: ids,
+        # names and audit actions are TEXT too, so decoding just the version
+        # set would move the failures somewhere less obvious instead of
+        # removing them. SQL_ASCII is what `initdb` produces under LC_ALL=C,
+        # a very common way to script a cluster.
+        conn = psycopg.connect(url, autocommit=True, row_factory=dict_row,
+                               client_encoding="UTF8")
         return conn, Dialect("pyformat", "postgres"), None
 
     if url.startswith("sqlite:///"):
