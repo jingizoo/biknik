@@ -342,7 +342,10 @@ against GitHub on 2026-08-07, not carried forward from the previous text:
 
 - #267 (login security, PR #286); #277 (turnover/curfew policy, PR #318/#319);
   #313/#315 (recurring ice templates + month view, which closed #158).
-- **Release 0's #160/#271 security gate is CLOSED**, as is #201.
+- **#160, #271 and #201 are closed** — the implementation issues behind
+  Release 0's security gate. Whether that behavioural gate is *met* on the
+  deployed system is a separate, unresolved product-owner determination; see
+  Release 0.
 - **Release 1 is COMPLETE**: #269, #268, #270, #272 all closed.
 - #324 and #330 (the #204 requirements package and the bounded Home/Tasks
   first slice, PR #331) are closed.
