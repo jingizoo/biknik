@@ -797,9 +797,17 @@ class SqlStore:
         it would leak a connection and hand out a live handle to something the
         caller has finished with. That is a different event from a connection
         the DATABASE killed, and only the latter is recoverable.
+
+        Holds ``_lock`` so it serializes with :meth:`_reconnect_if_lost`. A
+        reconnect already inside its critical section must finish before this
+        latch is set, and any reconnect starting afterwards sees ``_closed``
+        and declines — otherwise a request in flight during a demo reset could
+        assign a fresh connection to the store the reset just discarded, and
+        nothing would ever close it.
         """
-        self._closed = True
-        self.conn.close()
+        with self._lock:
+            self._closed = True
+            self.conn.close()
 
     # -- operational health (#90) ------------------------------------------
     def db_reachable(self) -> bool:
@@ -974,12 +982,21 @@ class SqlStore:
         A store closed deliberately via :meth:`close` is excluded too — see
         there for why that is a different event.
         """
-        if self.backend != "postgres" or self._closed:
+        if self.backend != "postgres":
             return
         with self._lock:                       # RLock: safe to re-acquire
-            # Re-checked under the lock: a concurrent caller may have healed
-            # it already, and reconnecting twice would strand a live socket.
-            if self._txn_depth > 0 or not getattr(self.conn, "closed", False):
+            # EVERY precondition is read under the lock, `_closed` included.
+            # Reading it before acquiring would be a race, not an
+            # optimisation: a reset could latch it and close the connection in
+            # the window between that read and this one, and the assignment
+            # below would then resurrect a deliberately closed store and leak
+            # its new connection. `close()` takes this same lock, so the two
+            # are serialized and close always wins.
+            # The other two are re-read for the same reason: a concurrent
+            # caller may have healed it already, and reconnecting twice would
+            # strand a live socket.
+            if (self._closed or self._txn_depth > 0
+                    or not getattr(self.conn, "closed", False)):
                 return
             self.conn, self.dialect, _ = connect(self._url)
 

@@ -152,6 +152,124 @@ class PostgresConnectionRecoveryTest(unittest.TestCase):
         self.assertNotIn("org_txn", ids)
         self.assertNotIn("org_txn2", ids)
 
+    def test_close_during_an_in_flight_reconnect_wins(self):
+        """The close/reconnect race (#404 review).
+
+        The sequential reset tests cannot falsify this: they close a store
+        nobody is touching. The dangerous interleaving is a request already
+        INSIDE the reconnect critical section when a reset closes the store.
+        If the two are not serialized on one lock, the request assigns a fresh
+        connection to a store that was deliberately closed — resurrecting a
+        superseded demo store, and leaking a PostgreSQL connection that
+        nothing will ever close.
+
+        ``connect`` is barriered so the reconnect is provably parked inside
+        its critical section when ``close()`` is called. There is no sleep and
+        no timing assumption: the events make the interleaving exact.
+        """
+        import hockey_scheduler.store.sql_store as ss
+
+        real_connect = ss.connect
+        inside = threading.Event()     # reconnect is in its critical section
+        release = threading.Event()    # let it finish
+        made = []
+
+        def barriered_connect(url):
+            inside.set()
+            release.wait(10)
+            result = real_connect(url)
+            made.append(result[0])
+            return result
+
+        # Arm: kill the backend and burn the one unavoidable failure, so the
+        # next call takes the reconnect path.
+        self._kill_my_backend()
+        with self.assertRaises(Exception):
+            self.store.all_teams()
+        self.assertTrue(self.store.conn.closed, "setup did not arm")
+
+        ss.connect = barriered_connect
+        try:
+            reconnect_done = threading.Event()
+            close_returned = threading.Event()
+
+            def do_query():
+                try:
+                    self.store.all_teams()
+                except Exception:
+                    pass
+                reconnect_done.set()
+
+            def do_close():
+                self.store.close()
+                close_returned.set()
+
+            a = threading.Thread(target=do_query, daemon=True)
+            a.start()
+            self.assertTrue(inside.wait(10), "reconnect never entered connect()")
+
+            b = threading.Thread(target=do_close, daemon=True)
+            b.start()
+            # close() must BLOCK: the reconnect holds the lock. If it returns
+            # here, the two are not serialized and the assignment below will
+            # land on an already-closed store.
+            self.assertFalse(
+                close_returned.wait(1.0),
+                "close() returned while a reconnect was inside its critical "
+                "section — they are not serialized on the same lock")
+
+            release.set()
+            a.join(10)
+            b.join(10)
+            self.assertTrue(close_returned.is_set(), "close() never returned")
+        finally:
+            ss.connect = real_connect
+            release.set()
+
+        # Close wins, whichever order the lock granted.
+        self.assertTrue(self.store._closed, "the store is not marked closed")
+        self.assertTrue(self.store.conn.closed,
+                        "a live connection survived close()")
+        for conn in made:
+            self.assertTrue(
+                conn.closed,
+                "a connection created by the racing reconnect is still live "
+                "— that is the leak")
+        # ...and it stays closed: no later query may resurrect it.
+        with self.assertRaises(Exception):
+            self.store.all_teams()
+        self.assertTrue(self.store.conn.closed)
+
+    def test_a_closed_store_never_reconnects_on_a_later_query(self):
+        """The sequential half of the same contract.
+
+        Guards the under-lock ``_closed`` recheck specifically: with it gone,
+        a query after ``close()`` sees a closed connection, reconnects, and
+        the store silently serves again.
+        """
+        import hockey_scheduler.store.sql_store as ss
+
+        real_connect = ss.connect
+        made = []
+
+        def counting_connect(url):
+            result = real_connect(url)
+            made.append(result[0])
+            return result
+
+        self.store.close()
+        ss.connect = counting_connect
+        try:
+            for _ in range(3):
+                with self.assertRaises(Exception):
+                    self.store.all_teams()
+        finally:
+            ss.connect = real_connect
+        self.assertEqual(
+            made, [],
+            "a closed store opened a new connection — close() was undone")
+        self.assertTrue(self.store.conn.closed)
+
     def test_an_ordinary_sql_error_never_reconnects(self):
         """The discriminator. A failing query is not a failing connection.
 
