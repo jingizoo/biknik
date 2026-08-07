@@ -624,6 +624,21 @@ class SqlStore:
                 finally:
                     self._txn_depth -= 1
                 return
+            # #404: recover HERE, not only in _exec. Every mutating service
+            # method runs under @_transactional, and this opens
+            # ``self.conn.transaction()`` before any _exec — so a write on a
+            # dead connection raised while ENTERING the driver transaction and
+            # never reached the _exec heal. Repeated writes stayed broken
+            # forever unless an unrelated read or health probe happened to heal
+            # the store first, which is precisely the reported #302 shape: an
+            # operator adding ice slot after ice slot and doing nothing else.
+            #
+            # Placement is exact. Depth is still 0 and the nested-join branch
+            # above has already returned, so this can only ever run at the
+            # OUTERMOST boundary — a reconnect inside an open or nested
+            # transaction remains impossible (_reconnect_if_lost re-checks
+            # _txn_depth under the same lock, which this frame already holds).
+            self._reconnect_if_lost()
             self._txn_depth = 1
             self._txn_isolation = isolation
             try:

@@ -112,6 +112,58 @@ class PostgresConnectionRecoveryTest(unittest.TestCase):
         self.assertEqual(
             [o.id for o in self.store.all_organizations()], ["org_recov"])
 
+    def test_consecutive_transactional_service_writes_recover(self):
+        """Recovery must reach the path real writes actually take (#404 review).
+
+        Every mutating ``SetupService`` method goes through ``@_transactional``
+        -> ``SqlStore.transaction()``, which enters ``self.conn.transaction()``
+        BEFORE any ``_exec``. Healing only inside ``_exec`` therefore never
+        fires for a write: the driver raises while opening the transaction, so
+        repeated writes stayed permanently broken unless some unrelated read or
+        health probe happened to heal the store first.
+
+        That is exactly the reported #302 shape — an operator adding ice slot
+        after ice slot, doing nothing else.
+
+        ``test_writes_work_after_recovery`` cannot falsify this: it calls
+        ``store.add_organization`` directly, which reaches ``_exec`` and heals.
+        This drives the REAL service path and does NO read, health call, or
+        other query between the two writes — any of those would hide the bug.
+        """
+        api = ApiService(self.store)
+        before = self.store.conn.info.backend_pid
+        self._kill_my_backend()
+
+        # Write 1: meets the dead socket. Fails by contract — not retried.
+        # It RAISES rather than returning a structured error: the driver error
+        # escapes `catch()`, which converts only DomainError. That is the
+        # unhandled path #403 renders as a structured 500 over HTTP.
+        with self.assertRaises(Exception):
+            api.create_club("Recovery Club A", actor_id="admin")
+
+        # Write 2: immediately after, with NOTHING in between.
+        second = api.create_club("Recovery Club B", actor_id="admin")
+        self.assertNotIn(
+            "error", second,
+            "a second transactional write still failed — recovery never "
+            "reaches the transaction entry point, so real service writes "
+            "stay broken forever")
+
+        after = self.store.conn.info.backend_pid
+        self.assertNotEqual(
+            before, after, "same backend pid — no reconnect happened")
+
+        # Exactly one domain row, and exactly one audit row naming it. The
+        # failed write must leave neither.
+        clubs = self.store.all_clubs()
+        self.assertEqual(
+            [c.name for c in clubs], ["Recovery Club B"],
+            f"expected only the successful club, got {[c.name for c in clubs]}")
+        audits = [a for a in self.store.all_setup_audit()
+                  if a.action == "club_created"]
+        self.assertEqual(len(audits), 1, f"expected one audit row, got {audits}")
+        self.assertEqual(audits[0].entity_id, clubs[0].id)
+
     def test_no_reconnect_inside_a_transaction(self):
         """Atomicity outranks availability.
 
