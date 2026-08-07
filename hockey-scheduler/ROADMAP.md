@@ -6,8 +6,12 @@ they differ, treat the newer of the two as correct and reconcile the other.
 
 ## Baselines
 
-- **Current `main`:** `bf85403` — Epic #283 (competition-hierarchy reset,
-  Slices A–E) merged via PR #284.
+- **Current `main`:** `5aa84da` — #404 database-connection recovery and
+  health-status reporting, merged via PR #406.
+- **Previously recorded here:** `bf85403` (Epic #283 competition-hierarchy
+  reset, Slices A–E, via PR #284). That baseline was **428 commits stale** when
+  this file was reconciled on 2026-08-07; the hierarchy sections below still
+  describe the model #283 established, which is current.
 - **Historical expert-review baseline:** `8cbe003` — the 16 July 2026 hands-on
   review of `main`. Findings from that review still drive Releases 0–4 below,
   but the code baseline they were written against has since advanced: read the
@@ -93,16 +97,23 @@ Completed issues are removed from the pending tracks below.
 
 ## Release 0 — production security gate
 
-**Do not add more production users until this gate passes.** (#266 and #267 are
-done.)
+**Do not add more production users until this gate passes.**
 
-1. **#160** — canonical Player account scope: private-Game reads work from
-   `player_id`, with `team_id` derived or guaranteed (they still depend on an
-   optional `scope.team_id`).
-2. **#271** — strict write schemas: unknown-field rejection, malformed-JSON
-   handling, and JSON `405` responses with `Allow`.
-3. **Bounded #201/#202** — only the transaction, concurrency, authorization, and
-   route-contract work required to close the paths above.
+**Status — verified against GitHub on 2026-08-07:** every numbered item below
+is closed except the **#202** half of item 3. #266 and #267 are closed too.
+
+1. **#160** — **CLOSED.** Canonical Player account scope: private-Game reads
+   work from `player_id`, with `team_id` derived or guaranteed.
+2. **#271** — **CLOSED.** Strict write schemas: unknown-field rejection,
+   malformed-JSON handling, and JSON `405` responses with `Allow`.
+3. **Bounded #201/#202** — **#201 CLOSED; #202 still OPEN.** Only the
+   transaction, concurrency, authorization, and route-contract work required
+   to close the paths above. The remaining work is #202's route-contract and
+   authorization half.
+
+Whether the exit gate below is now *met* is a product-owner determination, not
+one this file makes: the items are closed, and the gate is a behavioural claim
+about the deployed system.
 
 **Exit gate:** credential guessing is throttled without a username oracle; weak
 new credentials are rejected; Player/Coach scope fails closed; unknown fields and
@@ -110,6 +121,11 @@ malformed JSON never reach business logic; known unsupported methods return JSON
 `405` with `Allow`; Memory/SQLite/PostgreSQL/HTTP security matrices pass.
 
 ## Release 1 — correctable Player records
+
+**Status — verified against GitHub on 2026-08-07: COMPLETE.** All four items
+are closed (#269, #268, #270, #272). The list and exit gate are kept because
+the exit gate remains the standing non-regression contract, not because work
+is outstanding.
 
 1. **#269** — jersey range `1..98` and active-Team uniqueness on
    create/edit/import/reactivate/reassignment, backed by DB constraints.
@@ -193,9 +209,10 @@ publish-gated and privacy-safe.
    moves and generated schedules. **All six acceptance criteria satisfied**
    (PR #318, closing bounded child #320; PR #319, closing bounded child
    #321; both merged) — see #277 for the criterion-by-criterion evidence.
-   **#277 itself remains open**: merging those PRs closed their own bounded
-   children, not the parent epic; closing #277 is a pending product-owner
-   decision, not automatic.
+   **#277 is now CLOSED** (2026-07-24). The text here previously said it
+   "remains open" and described closing it as a pending product-owner
+   decision — that decision has since been taken. Merging those PRs closed
+   their own bounded children; the parent was closed separately.
 2. **#158** — recurring ice templates, conflict preview and month view.
    **Done and closed** (#313, closing #315, plus #277's policy integration
    via #318/#319 — closed per @jingizoo's sign-off on the #204 requirements
@@ -320,14 +337,43 @@ per-opponent count is derived. `meetings_per_opponent` remains accepted as
 the legacy spelling precisely so scenarios stored under it keep replaying;
 both are recorded and replayed by the same rule above.
 
-Done since this section was last accurate: #267 (login security, PR #286);
-#277 (turnover/curfew policy, PR #318/#319); #313/#315 (recurring ice
-templates + month view, closing #158). Release 0's #160/#271 security gate
-and Release 1–2's Player-identity track (#269/#268/#270/#272/#159/#124/
-#273/#205) remain queued per their Release sections above — their relative
-priority against the now-active Release 4 UX-first thread is a product-
-owner call to make explicitly when that work resumes, not implied by this
-file.
+**Done since this section was last accurate** — every state below verified
+against GitHub on 2026-08-07, not carried forward from the previous text:
+
+- #267 (login security, PR #286); #277 (turnover/curfew policy, PR #318/#319);
+  #313/#315 (recurring ice templates + month view, which closed #158).
+- **#160, #271 and #201 are closed** — the implementation issues behind
+  Release 0's security gate. Whether that behavioural gate is *met* on the
+  deployed system is a separate, unresolved product-owner determination; see
+  Release 0.
+- **Release 1 is COMPLETE**: #269, #268, #270, #272 all closed.
+- #324 and #330 (the #204 requirements package and the bounded Home/Tasks
+  first slice, PR #331) are closed.
+- #375 and #378 are closed.
+- Operational reliability landed after those: #399 (an exhibition blocking ice
+  is now nameable in a preview explanation, PR #402); #302's delivery
+  mechanism — every request now gets a structured answer instead of a dropped
+  connection, PR #403; and #404 (database-connection recovery plus a health
+  status that can report ill-health, PR #406).
+
+> **Correction.** The previous version of this paragraph asserted that
+> "#269/#268/#270/#272/#159/#124/#273/#205 remain queued". Six of those eight
+> were already closed. The genuinely queued Release 2 items are **#159, #124,
+> #273 and #205** — their relative priority against the active Release 4
+> thread is a product-owner call to make explicitly when that work resumes,
+> not implied by this file.
+
+**Still open and genuinely queued**, for the avoidance of the same drift:
+#202 (Release 0 remainder), #159/#124/#273/#205 (Release 2), #287, #206,
+#146, and the epics #203/#207/#208/#209/#210/#211/#212.
+
+> **Needs an owner ruling — not decided here.** The 2026-08-02 parallel
+> exception above is written in the present tense about #375 ("while #375
+> implements only…") and names #378, and **both are now closed**. Whether that
+> exception lapsed with them or still authorises bounded #206 preview-
+> explainability children is a product-owner determination. It is left exactly
+> as written until ruled on, because it is the clause that authorised #399 and
+> misreading it once already produced a false authorization claim on PR #402.
 
 ## Delivery rules
 
