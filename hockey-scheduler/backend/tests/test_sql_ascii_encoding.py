@@ -28,11 +28,26 @@ names, audit actions — so the failures would simply move somewhere less
 obvious. Declaring the encoding fixes the whole connection at its source.
 
 These tests build their own SQL_ASCII database, so they run against CI's
-stock UTF8 ``postgres:16`` image with no special setup.
+stock UTF8 ``postgres:16`` image with no image or cluster changes.
+
+FIXTURE SAFETY. Creating a database is a cluster-global act, so the fixture is
+built to be safe on a cluster that is NOT disposable:
+
+  * the name is unique per run (``uuid4``), never a fixed shared one — two
+    concurrent workers cannot collide, and no pre-existing database can share
+    it;
+  * nothing is ever dropped that this fixture did not create. There is no
+    ``DROP DATABASE IF EXISTS`` on a well-known name, which on a developer or
+    staging cluster could destroy real data that merely shares a name;
+  * ``CREATEDB`` is a privilege the connected role may not have. CI's
+    ``POSTGRES_USER`` happens to be a superuser, but a least-privileged
+    application role is not, so the tests SKIP with a precise reason rather
+    than erroring.
 """
 
 import os
 import unittest
+import uuid
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
@@ -40,12 +55,17 @@ from hockey_scheduler.store import SqlStore
 
 
 PG = os.environ.get("TEST_DATABASE_URL")
-ASCII_DB = "hs_sql_ascii_probe"
+# Unique per run: this database is CREATED and DROPPED, so a fixed name would
+# be both a collision risk between workers and a data-loss risk on any cluster
+# where something else happens to own that name.
+ASCII_DB = f"hs_ascii_probe_{uuid.uuid4().hex[:16]}"
 
 
 @unittest.skipUnless(PG, "PostgreSQL required (set TEST_DATABASE_URL)")
 class SqlAsciiEncodingTest(unittest.TestCase):
     """A SQL_ASCII database must behave like any other."""
+
+    created = False
 
     @classmethod
     def setUpClass(cls):
@@ -55,17 +75,33 @@ class SqlAsciiEncodingTest(unittest.TestCase):
         cls.admin_url = base
         cls.ascii_url = base.rsplit("/", 1)[0] + "/" + ASCII_DB
         with psycopg.connect(base, autocommit=True) as c:
-            c.execute(f'DROP DATABASE IF EXISTS "{ASCII_DB}"')
+            row = c.execute(
+                "SELECT rolsuper OR rolcreatedb AS may_create FROM pg_roles "
+                "WHERE rolname = current_user").fetchone()
+            may_create = bool(row and (row[0] if not isinstance(row, dict)
+                                       else row["may_create"]))
+            if not may_create:
+                raise unittest.SkipTest(
+                    "the test role lacks CREATEDB, so a SQL_ASCII database "
+                    "cannot be provisioned; run this suite as a role with "
+                    "CREATEDB to cover #405")
+            # No DROP first: the name is unique, so a collision would mean
+            # something is badly wrong and must surface, never be dropped.
             c.execute(f'CREATE DATABASE "{ASCII_DB}" ENCODING \'SQL_ASCII\' '
                       "LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0")
+            cls.created = True
 
     @classmethod
     def tearDownClass(cls):
+        # Drop ONLY what this fixture created.
+        if not cls.created:
+            return
         with cls.psycopg.connect(cls.admin_url, autocommit=True) as c:
             c.execute(
                 "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
                 "WHERE datname = %s AND pid <> pg_backend_pid()", (ASCII_DB,))
             c.execute(f'DROP DATABASE IF EXISTS "{ASCII_DB}"')
+            cls.created = False
 
     def test_the_probe_database_really_is_sql_ascii(self):
         """ANTI-VACUITY. Every assertion below is about SQL_ASCII behaviour;
