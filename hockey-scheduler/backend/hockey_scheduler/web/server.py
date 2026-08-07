@@ -1540,7 +1540,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(status)
         if path == "/api/health":
             # Liveness + dependency snapshot (#90). Public, non-sensitive.
-            return self._send_json(api.get_health())
+            # The STATUS CODE carries the verdict (#404): a platform health
+            # check reads it, not the body, so an unreachable database must
+            # answer 503 or a bricked instance is never restarted. The payload
+            # is unchanged and still public.
+            health = api.get_health()
+            return self._send_json(
+                health, 200 if health.get("status") == "ok" else 503)
         if path == "/api/readiness":
             # Deployment readiness (#90). The cookie-hardening check must exercise
             # the *real* Secure-cookie decision (`_cookie_is_secure`, #76) rather
