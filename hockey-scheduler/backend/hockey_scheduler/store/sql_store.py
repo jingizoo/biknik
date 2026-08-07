@@ -531,6 +531,12 @@ def _utcnow() -> datetime:
 class SqlStore:
     def __init__(self, url: str = ":memory:"):
         self.conn, self.dialect, resolved_path = connect(url)
+        # Kept so a connection the DATABASE closed can be re-established
+        # (#404); see _reconnect_if_lost. Never logged or exposed — it can
+        # carry credentials.
+        self._url = url
+        # Latched by close(): a deliberately closed store never reconnects.
+        self._closed = False
         # Store kind for the runtime status endpoint (#72): psycopg uses the
         # "pyformat" paramstyle, sqlite3 uses "qmark".
         self.backend = "postgres" if self.dialect.paramstyle == "pyformat" else "sqlite"
@@ -783,11 +789,31 @@ class SqlStore:
         self._dependent_conflict_resolver(conflict)
 
     def close(self) -> None:
+        """Release the connection for good.
+
+        Latches ``_closed`` so #404 recovery can never resurrect this store.
+        A store closed on PURPOSE — the superseded one after a demo reset, a
+        half-built one after a failed reset — must stay closed; reconnecting
+        it would leak a connection and hand out a live handle to something the
+        caller has finished with. That is a different event from a connection
+        the DATABASE killed, and only the latter is recoverable.
+        """
+        self._closed = True
         self.conn.close()
 
     # -- operational health (#90) ------------------------------------------
     def db_reachable(self) -> bool:
+        """Whether the database can actually be reached RIGHT NOW.
+
+        Attempts the #404 recovery first, deliberately: this is what a
+        platform health check polls, so a connection the database closed but
+        which can be re-established should report reachable and let the
+        instance keep serving. Only a database that is genuinely gone — where
+        ``connect()`` itself fails — reports False, which is exactly when a
+        restart is the right response.
+        """
         try:
+            self._reconnect_if_lost()
             with self._lock:
                 cur = self.conn.cursor()
                 cur.execute("SELECT 1")
@@ -919,7 +945,46 @@ class SqlStore:
                     cur.execute("PRAGMA foreign_keys = ON")
 
     # -- low-level ---------------------------------------------------------
+    def _reconnect_if_lost(self):
+        """Re-establish a connection the DATABASE closed (#404).
+
+        The process holds exactly one connection with no pool. When it dies —
+        a managed-Postgres restart, failover, maintenance window, idle reaper,
+        network blip — every store-touching request failed PERMANENTLY until
+        someone restarted the process, while ``/api/health`` kept answering
+        200 so nothing did.
+
+        Three deliberate limits:
+
+        * ``conn.closed`` is the oracle, never a string match on driver text.
+          psycopg sets it for a dead connection and leaves it False for an
+          ordinary SQL error — so a failing QUERY never reconnects, which
+          would otherwise mask real bugs and silently drop session state.
+        * Never inside a transaction. Swapping the connection there would
+          discard the writes already made in it and let the rest commit on a
+          fresh one, turning an outage into corruption. The transaction fails,
+          as it must; the NEXT request outside one recovers.
+        * The failed statement is NOT retried here. In autocommit a write may
+          have committed server-side just before the socket died, so a silent
+          retry could double-apply it. One request pays for the outage (#403
+          renders it as a structured 500) and the rest are served.
+
+        SQLite is excluded: it has no ``closed`` attribute and a local file
+        connection does not die this way. There is nothing to recover from.
+        A store closed deliberately via :meth:`close` is excluded too — see
+        there for why that is a different event.
+        """
+        if self.backend != "postgres" or self._closed:
+            return
+        with self._lock:                       # RLock: safe to re-acquire
+            # Re-checked under the lock: a concurrent caller may have healed
+            # it already, and reconnecting twice would strand a live socket.
+            if self._txn_depth > 0 or not getattr(self.conn, "closed", False):
+                return
+            self.conn, self.dialect, _ = connect(self._url)
+
     def _exec(self, query, params=()):
+        self._reconnect_if_lost()
         cur = self.conn.cursor()
         cur.execute(self.dialect.sql(query), params)
         return cur

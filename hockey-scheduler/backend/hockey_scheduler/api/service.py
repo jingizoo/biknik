@@ -2949,11 +2949,20 @@ class ApiService:
 
     def get_health(self) -> dict:
         """Liveness + dependency snapshot (#90). Public and non-sensitive: no
-        accounts, secrets, connection strings, or env values — only posture."""
+        accounts, secrets, connection strings, or env values — only posture.
+
+        ``status`` reflects database reachability (#404). It used to be the
+        literal ``"ok"`` regardless, with reachability demoted to a field
+        below it — so an instance whose only database connection had died
+        kept reporting healthy, the platform never restarted it, and the
+        outage lasted until a human noticed. A health endpoint that cannot
+        report ill-health is not a health check.
+        """
+        reachable = self.store.db_reachable()
         return {
-            "status": "ok",
+            "status": "ok" if reachable else "unhealthy",
             "store": getattr(self.store, "backend", "memory"),
-            "database_reachable": self.store.db_reachable(),
+            "database_reachable": reachable,
             "migrations": self.store.migration_status(),
             "delivery": {
                 "email_mode": self.delivery.email_transport.mode,
