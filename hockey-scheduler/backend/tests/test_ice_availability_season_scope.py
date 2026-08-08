@@ -600,6 +600,62 @@ class IceAvailabilitySeasonScopeTest(unittest.TestCase):
         self.assertEqual(status, 400, raw)
         self.assertIn("season_archived", raw)
 
+    def test_a_selection_lost_after_preflight_is_still_a_409(self):
+        """The no-active-tuple refusal must be 409 wherever it is DECIDED.
+
+        The route preflight and the LOCKED commit can disagree about the
+        world: a selection can vanish between them. Before this, the preflight
+        sent an explicit 409 while the locked path returned
+        `active_context_required` with no `ERROR_HTTP_STATUS` entry, so
+        `_send_api` defaulted to 400 — the same state answering 409 or 400
+        purely on race timing.
+
+        The selection is cleared here AFTER the preflight has passed, by
+        instrumenting the facade's own predicate.
+        """
+        home, _foreign = self._two_programs("LateCtx")
+        c = self._login("arena")
+        self._use(c, home["program_id"], home["season_id"])
+        self._positive_control(c, home)          # ANTI-VACUITY
+
+        api = self.srv.STATE.api
+        store = api.store
+        real = api.has_active_program_season
+
+        def pass_then_clear(user_id, role, scope):
+            allowed = real(user_id, role, scope)
+            if allowed:
+                # Preflight said yes; now the selection disappears, exactly
+                # the window the locked decision exists to catch.
+                saved = store.get_active_context(user_id)
+                if saved is not None:
+                    store.set_active_context(ActiveContext(
+                        id=saved.id, program_id=saved.program_id,
+                        season_id="season_gone_after_preflight",
+                        updated_at=saved.updated_at,
+                        league_id=saved.league_id))
+            return allowed
+        api.has_active_program_season = pass_then_clear
+
+        before_slots = self._slots(home["rink_id"])
+        before_audit = self._audit_count()
+        try:
+            status, raw, _ = self._req(
+                c, "POST", COMMIT,
+                _template(home["season_id"], home["rink_id"]))
+        finally:
+            api.has_active_program_season = real
+
+        self.assertEqual(
+            status, 409,
+            f"a selection lost after the preflight answered {status}, not the "
+            f"ruled 409 — the same state depends on race timing: {raw}")
+        self.assertIn("active_context_required", raw)
+        self.assertEqual(self._slots(home["rink_id"]), before_slots,
+                         "the late no-context refusal still wrote ice")
+        self.assertEqual(self._audit_count(), before_audit,
+                         "the late no-context refusal still wrote an audit row")
+
     # -- the CONTROL: the gate exists and works one route over ---------------
     def test_gated_sibling_route_refuses_the_same_foreign_season(self):
         """`/api/v2/setup/seasons/<id>/archive` names a Season exactly the way

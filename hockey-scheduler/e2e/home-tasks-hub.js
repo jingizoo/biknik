@@ -3150,8 +3150,19 @@ async function checkRoleScenarios(browser, viewport) {
     await page.waitForSelector("[data-ib-commit]", { timeout: 10000 });
     let releaseCommitK4;
     const commitHoldK4 = new Promise((resolve) => { releaseCommitK4 = resolve; });
+    // FETCH FIRST, HOLD ONLY DELIVERY — same reason as the Preview above.
+    // `await hold; route.continue()` sends the Commit to the server only
+    // AFTER the switch to K5, so #393 PR A's tuple gate answers 404: K4's ice
+    // is never written and this leg silently becomes "the client discards a
+    // late FAILURE", when its whole purpose is a late SUCCESS whose slots
+    // really did land. The commit is executed while K4 is still selected;
+    // only its delivery waits for K5.
+    let k4CommitStatus = null;
     await page.route("**/api/setup/ice-availability/commit", async (route) => {
-      await commitHoldK4; await route.continue();
+      const response = await route.fetch();
+      k4CommitStatus = response.status();
+      await commitHoldK4;
+      try { await route.fulfill({ response }); } catch (e) { /* page moved on */ }
     });
     await page.click("[data-ib-commit]");
     await new Promise((r) => setTimeout(r, 200));  // let the stale Commit request actually leave
@@ -3166,6 +3177,20 @@ async function checkRoleScenarios(browser, viewport) {
       absentSelectors: [".ib-preview", "[data-ib-commit]"],
     });
     releaseCommitK4();
+    // The held Commit must have SUCCEEDED under K4, and its ice must really
+    // exist — otherwise "the client discarded it" is indistinguishable from
+    // "there was nothing to discard".
+    if (k4CommitStatus !== 200) {
+      fail(`(K3) the held K4 Commit was ${k4CommitStatus}, not 200 — this leg `
+        + `must discard a late SUCCESSFUL commit, not a late failure`);
+    }
+    const k4Overview = await apiGet(page, "/api/v2/setup/overview");
+    const k4Slots = (k4Overview.body.ice_slots || [])
+      .filter((sl) => sl.rink_id === k.rinkK4);
+    if (!k4Slots.length) {
+      fail("(K3) the held K4 Commit reported 200 but wrote no ice slots, so "
+        + "the stale-response discard below proves nothing");
+    }
     await page.unroute("**/api/setup/ice-availability/commit");
     await new Promise((r) => setTimeout(r, 300));  // let the stale response's own (discarded) handler run
     if (!(await page.$(".ib-form"))) {

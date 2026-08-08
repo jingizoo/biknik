@@ -127,6 +127,11 @@ CONTENT_TYPES = {
 
 # Maps structured domain-error codes to HTTP status codes (per api-contract.md).
 ERROR_HTTP_STATUS = {
+    # #393 PR A: the no-active-tuple refusal is 409 wherever it is
+    # decided. Without this the route preflight sent 409 and the LOCKED
+    # commit fell through to _send_api's 400 default, so the same state
+    # returned a different status purely on race timing.
+    "active_context_required": 409,
     "not_found": 404,
     "validation_error": 400,
     "roster_locked": 409,
@@ -2639,10 +2644,13 @@ class Handler(BaseHTTPRequestHandler):
             # would weaken the workflow-target boundary and make API behaviour
             # depend on changing account inventory.
             if not api.has_active_program_season(user_id, role, scope):
-                return self._send_json({"error": {
+                # Sent through _send_api, the SAME contract the locked commit
+                # uses, so the status comes from one ERROR_HTTP_STATUS entry
+                # rather than a literal here and a default there.
+                return self._send_api({"error": {
                     "code": "active_context_required",
                     "message": ("Select a Program and Season before building "
-                                "ice availability.")}}, 409)
+                                "ice availability.")}})
             if path.endswith("/preview"):
                 # A read: it writes nothing, so the cheap preflight IS the
                 # whole gate. There is no check/use window to close because
