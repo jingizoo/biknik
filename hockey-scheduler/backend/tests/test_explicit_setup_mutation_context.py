@@ -28,6 +28,12 @@ THE THREE STATES, per guarded surface:
   2. STALE saved selection — the row names a Season that no longer exists.
      Reached ONLY through the proven, operator-visible API recipe below; a
      direct ``store`` mutation would prove nothing about reachability. Refuse.
+     The premise is asserted before the refusal is judged
+     (``_assert_state_is_stale``): the saved row SURVIVED its Season, still
+     names it, and the resolve now DIVERGES from it. Without that, a future
+     in which Season deletion cleans up the saved row would quietly turn
+     this state into a second copy of state 1 — still green, no longer about
+     staleness at all.
   3. EXPLICIT correct selection — the POSITIVE CONTROL. Must succeed, and must
      keep succeeding after the fix. Without it every refusal above is vacuous:
      a route that refuses everything would satisfy states 1 and 2 perfectly.
@@ -292,6 +298,60 @@ class _ContextHarness:
                           "the Season survived its own delete — the saved "
                           "selection is not stale and this proves nothing")
 
+    def _assert_state_is_stale(self, c, uid, program_b, season_b):
+        """THE PREMISE of state 2, asserted before the second mutation is sent.
+
+        "Stale" is a THREE-part claim and every part has to be checked here,
+        because each one can fail independently and each failure would turn
+        the case that follows into a different, weaker test:
+
+          1. the saved row SURVIVED its Season. Season deletion does not touch
+             ``user_active_context`` today, but nothing in the schema forces
+             that — no FK, no cascade — and a later slice that cleaned the row
+             up on delete would leave this operator with NO saved selection at
+             all. The case below would then be a duplicate of the
+             ``no_selection`` case one screen up: still refused, still green,
+             and no longer exercising staleness at all. Asserting the row is
+             present, and that it still NAMES (B, SB), is what keeps this case
+             about a DANGLING selection rather than an absent one.
+          2. the Season it names is really GONE, so the row genuinely dangles.
+          3. the resolve DIVERGES from it — the operator's saved (B, SB) is
+             silently replaced by Home A, a Program they never chose.
+
+        Part 3 is the whole defect: saved != resolved is the definition of a
+        stale context, and the fix is the comparison of those two values. It
+        is asserted as an inequality against the SAVED row and not only as an
+        equality against the Home-A fixture, so a future where the resolve
+        starts echoing the dangling selection back is caught here rather than
+        silently satisfying "the mutation was refused" for the wrong reason.
+        """
+        saved = self.store.get_active_context(uid)
+        self.assertIsNotNone(
+            saved,
+            "the operator's SAVED selection disappeared when their Season was "
+            "deleted, so there is no stale row left to test: this case would "
+            "silently degrade into a duplicate of the no-selection case")
+        saved_tuple = (saved.program_id, saved.season_id)
+        self.assertEqual(
+            saved_tuple, (program_b, season_b),
+            "the saved row no longer names the deleted (B, SB) — it was "
+            "rewritten, so what follows is not a stale-selection test")
+
+        self.assertIsNone(
+            self.store.get_season(season_b),
+            "the Season the saved row names still exists, so the row is not "
+            "dangling and this case proves nothing")
+
+        resolved = self._fallback_tuple(c)
+        self.assertEqual(
+            resolved, (self.world["program_id"], self.world["season_id"]),
+            "the stale saved row did not fall back onto Home A, so this case "
+            "is not exercising the silent retarget it is about")
+        self.assertNotEqual(
+            resolved, saved_tuple,
+            "the resolve still returns the operator's own saved tuple, so "
+            "saved and resolved AGREE and the context is not stale")
+
     # -- shared assertions --------------------------------------------------
     def _assert_refused(self, label, status, raw, *, before_audit,
                         division_must_exist=None, season_must_be=None):
@@ -375,7 +435,7 @@ class _GuardedSetupContextMixin(_ContextHarness):
         row now dangles, `_fallback()` silently hands them Home A, and the
         BYTE-IDENTICAL request is accepted.
         """
-        c, _uid = self._operator()
+        c, uid = self._operator()
         route = DELETE.format(id=self.world["division_id"])
 
         # -- half 1: the gate WORKS while the selection is real ------------
@@ -393,11 +453,7 @@ class _GuardedSetupContextMixin(_ContextHarness):
 
         # -- half 2: destroy the operator's own Season, change nothing else -
         self._destroy_own_season(c, season_b)
-        self.assertEqual(
-            self._fallback_tuple(c),
-            (self.world["program_id"], self.world["season_id"]),
-            "the stale saved row did not fall back onto Home A, so this case "
-            "is not exercising the silent retarget it is about")
+        self._assert_state_is_stale(c, uid, program_b, season_b)
 
         before = self._audit()
         status, raw, _ = self._req(c, "POST", route, {})
@@ -413,7 +469,7 @@ class _GuardedSetupContextMixin(_ContextHarness):
         404 ``not_found`` while (B, SB) is real, then 200 with the Season
         ARCHIVED once SB is deleted.
         """
-        c, _uid = self._operator()
+        c, uid = self._operator()
         route = ARCHIVE.format(id=self.world["season_id"])
 
         program_b, season_b = self._select_own_fresh_season(c)
@@ -429,10 +485,7 @@ class _GuardedSetupContextMixin(_ContextHarness):
                          "the refused archive wrote an audit row")
 
         self._destroy_own_season(c, season_b)
-        self.assertEqual(
-            self._fallback_tuple(c),
-            (self.world["program_id"], self.world["season_id"]),
-            "the stale saved row did not fall back onto Home A")
+        self._assert_state_is_stale(c, uid, program_b, season_b)
 
         before = self._audit()
         status, raw, _ = self._req(c, "POST", route, {})

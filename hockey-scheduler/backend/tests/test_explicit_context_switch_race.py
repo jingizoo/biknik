@@ -59,28 +59,49 @@ WHAT IS PROVEN HERE:
     the identical interleaving with B switching a DIFFERENT user's context
     completes immediately while A is still paused (``..._does_not_block``).
 
-WHICH BOUNDARY "AFTER A's MUTATION COMPLETES" MEANS. A's mutation unit is
-``_active_context_mutex`` (session advisory lock) wrapped around a
-SERIALIZABLE ``transaction()`` (transaction advisory lock). A stops excluding
-B at ``COMMIT`` + ``pg_advisory_unlock`` — and only THEN does the request go
-on to build a response, serialize it and put it on a socket for a client to
-decode. Those are two different instants, and the ordering assertions here use
-the FIRST one: ``_install_commit_boundary_probe`` wraps the live
-``SqlStore.active_context_mutex`` on connection A's store and timestamps the
-COMMIT and the advisory unlock as A's own connection reaches them.
+WHICH BOUNDARY "AFTER A's MUTATION COMPLETES" MEANS — AND WHY IT IS A's
+COMMIT. A's mutation unit is ``active_context_mutex`` (session advisory lock)
+wrapped around a SERIALIZABLE ``transaction()`` (transaction advisory lock).
+Reaching the end of that unit is not ONE instant but a sequence, and A's own
+process observes each member of it strictly later than PostgreSQL performs it:
 
-An earlier revision of this file compared B against A's HTTP RESPONSE instead.
-That was a comparison between UNLIKE boundaries: B could commit correctly,
-after A's database unit had ended, and still be recorded as "before A" because
-A's client had not finished reading yet — a failure with no violation behind
-it. Runs recorded here show that response tail is real (B returning ~1 ms
-after A's lock release but before A's response). ``test_the_ordering_boundary_
-is_a_s_commit_not_a_s_response_delivery`` pins the corrected measurement by
-deliberately holding A's response for two seconds AFTER its unit has ended:
-the ordering assertion stays green, while the response-delivery comparison the
-file used to make is asserted to be FALSE on that very run. With both advisory
-locks neutered at runtime that same case goes RED on the ordering assertion,
-so the correction did not make it vacuous.
+    COMMIT returns to A          <- `committed_at` stamped here, by A's thread,
+                                    while A STILL HOLDS the session lock
+    A sends `pg_advisory_unlock` |
+    SERVER frees the key        <-- B can be granted from HERE
+    result travels back to A     |
+    A's thread is scheduled      |
+    A stamps `released_at`      <-- strictly, unboundedly LATER than the free
+    ... build response, serialize, socket, client decodes -> `http_finished_at`
+
+This file has now made the unlike-boundary mistake twice — first comparing B
+against A's decoded HTTP RESPONSE, then against ``released_at`` — and both
+times in the same direction: an anchor recorded LATER than the instant B
+actually became free, so a perfectly-behaved B could be reported as a
+violation. The rule this file now follows is to pick the boundary that is
+PROVABLY EARLIEST-SAFE rather than merely earlier than the last mistake.
+
+That boundary is ``committed_at``. B was observed with an UNGRANTED request on
+A's key while A held it GRANTED (``pg_locks``, asserted, with a dwell), and
+A's thread stamps ``committed_at`` BEFORE it issues the unlock at all — so on
+A's own connection, in a real happens-before chain, ``committed_at`` precedes
+every instant at which B could possibly have been granted the key. B's COMMIT
+therefore cannot precede it, and the ordering assertion can be STRICT without
+ever being able to report a violation that did not happen.
+
+``released_at`` and ``http_finished_at`` are still recorded, and are still
+useful for showing how wide the tail is, but they are DIAGNOSTIC ONLY: no
+assertion in this file orders B against either of them.
+``test_the_ordering_boundary_is_a_s_commit_not_a_s_response_delivery`` pins
+the response half by holding A's response for two seconds AFTER its unit ended
+(the ordering assertion stays green; the response-delivery comparison this
+file used to make is asserted FALSE on that very run), and
+``test_the_ordering_boundary_survives_a_delayed_unlock_acknowledgement`` pins
+the unlock half by letting A's real ``pg_advisory_unlock`` COMPLETE and then
+pausing A before it returns, so B is granted the freed key and COMMITS inside
+that client-side gap — green on ``committed_at``, and asserted to be RED
+against ``released_at`` on the same run. With both advisory locks neutered at
+runtime both cases still go RED, so neither correction made them vacuous.
 
 WHAT THIS FILE DOES **NOT** PROVE, stated plainly rather than implied:
 
@@ -90,23 +111,34 @@ WHAT THIS FILE DOES **NOT** PROVE, stated plainly rather than implied:
      ``_lock_active_context_mutex``) use the SAME key, and PostgreSQL collapses
      both into ONE ``pg_locks`` row with no column distinguishing them —
      measured by ``test_pg_locks_cannot_distinguish_...``, not assumed. The
-     limitation was then confirmed by experiment rather than left as a caveat:
-     with ``SqlStore.active_context_mutex`` replaced by a no-op at runtime and
-     the transaction-scoped lock left in place, **all ten tests in this file
-     still pass** — re-measured against the tightened fallback gate below, not
-     carried over from when this file had eight.
-     So every blocking result here attributes the ordering to the
-     advisory mutex AS A PAIR, and this file would not notice the session half
-     being deleted. Separating them needs a production edit, which this branch
-     forbids. Named here so the guard is never read as stronger than it is —
-     the same shape of unfalsifiability this repo has recorded before.
+     limitation was then confirmed by experiment rather than left as a caveat,
+     and RE-MEASURED after the ``committed_at`` correction: with
+     ``SqlStore.active_context_mutex`` replaced by a bare ``yield`` at runtime
+     and the transaction-scoped lock left in place, **ten of the eleven tests
+     in this file still pass**. Every ORDERING result here therefore still
+     attributes the exclusion to the advisory mutex AS A PAIR; no assertion
+     about ordering can tell which half did it, and separating them needs a
+     production edit this branch forbids.
+
+     The ELEVENTH is the one thing that DOES now notice the session half being
+     deleted, and it is honest about why: ``test_the_ordering_boundary_
+     survives_a_delayed_unlock_acknowledgement`` requires that A actually
+     EXECUTED a session-scoped ``pg_advisory_unlock`` (it wraps that statement
+     in order to widen the gap after it), and with
+     ``active_context_mutex`` gone there is no such statement to wrap, so it
+     fails on that precondition. Read exactly: that is a check on the SEAM's
+     premise, not an ordering result — the file still cannot say which lock
+     ordered A and B. It does mean deleting the session mutex can no longer
+     leave this file entirely green.
 
      What the same experiment DOES establish, on the other side: with BOTH
-     locks neutered, connection B's switch commits at ~6 ms while A is still
-     parked, A resumes and discards the six drafts of the tuple it resolved
-     BEFORE the switch, and the saved row by then names a different Program.
-     The interleaving is real and reachable; the mutex is what removes it. So
-     the passing assertions below are measuring a guard, not an impossibility.
+     locks neutered, connection B's switch commits within a few ms while A is
+     still parked (measured at 0.086s against A's COMMIT at 3.111s on the run
+     recorded for this revision), A resumes and discards the six drafts of the
+     tuple it resolved BEFORE the switch, and the saved row by then names a
+     different Program. The interleaving is real and reachable; the mutex is
+     what removes it. So the passing assertions below are measuring a guard,
+     not an impossibility.
   2. B's side does not traverse the HTTP layer. ``POST /api/context`` is a thin
      wrapper — authenticate, ``check_body``, then
      ``ApiService.set_active_context`` — and B calls that same method on its own
@@ -233,6 +265,13 @@ PAUSE_TIMEOUT = 30.0
 # milliseconds on every run recorded here), so B lands inside the hold and the
 # response-delivery ordering is INVERTED beyond any doubt about timer accuracy.
 RESPONSE_HOLD_SECONDS = 2.0
+# How long A is deliberately paused INSIDE its advisory-unlock call, AFTER the
+# real `pg_advisory_unlock` has completed on the server and its result has come
+# back — i.e. squarely inside the client/scheduling gap during which the key is
+# already free but A has not yet stamped `released_at`. Sized the same way as
+# the response hold: orders of magnitude more than B needs to be granted the
+# key, write one row and COMMIT, so B lands inside the gap on every run.
+UNLOCK_HOLD_SECONDS = 2.0
 
 # Verbatim, timestamped record of what each run actually saw. Printed per test
 # so a PostgreSQL run leaves the evidence in the log even when it is green.
@@ -323,6 +362,7 @@ class PostgresContextSwitchRaceTest(unittest.TestCase):
         # shadowing bound methods; drop them so the objects go back to their
         # class behaviour even though STATE.reset() below rebuilds them anyway.
         self.store.__dict__.pop("active_context_mutex", None)
+        self.store.__dict__.pop("_exec", None)
         for name in ("discard_draft_games", "publish_draft_games"):
             self.api.__dict__.pop(name, None)
         if self._prev_db is None:
@@ -453,11 +493,11 @@ class PostgresContextSwitchRaceTest(unittest.TestCase):
     def _install_commit_boundary_probe(self):
         """Timestamp the instant A's DATABASE unit actually ends.
 
-        WHY THIS EXISTS, and why the obvious timestamp was WRONG. The ordering
-        claim in this file is "B's context switch commits strictly after A's
-        mutation completes". An earlier revision compared B against the moment
-        A's HTTP client had received and DECODED its response — which is a
-        LATER, UNLIKE boundary. A's mutation unit is
+        WHY THIS EXISTS, and why BOTH obvious timestamps were WRONG. The
+        ordering claim in this file is "B's context switch commits strictly
+        after A's mutation completes". An earlier revision compared B against
+        the moment A's HTTP client had received and DECODED its response —
+        which is a LATER, UNLIKE boundary. A's mutation unit is
 
             with _active_context_mutex(...):        # session advisory lock
                 with store.transaction(SERIALIZABLE):   # xact advisory lock
@@ -476,20 +516,41 @@ class PostgresContextSwitchRaceTest(unittest.TestCase):
         WHAT IS RECORDED INSTEAD. This wraps the LIVE
         ``SqlStore.active_context_mutex`` on connection A's store — the same
         kind of live-wrapper seam that parks A, and again with no file under
-        ``hockey_scheduler/`` modified — and takes two timestamps at the two
-        real database boundaries, in the order PostgreSQL reaches them:
+        ``hockey_scheduler/`` modified — and takes two timestamps, both on A's
+        own connection at statement granularity and both ahead of any response
+        work:
 
           * ``committed_at``: the inner ``with`` (the SERIALIZABLE
-            transaction) has exited, i.e. ``COMMIT`` has returned;
-          * ``released_at``: ``pg_advisory_unlock`` has returned, so A holds
-            NOTHING on the key any more. This is the boundary B is queued
-            behind and the one the ordering assertion uses.
+            transaction) has exited, i.e. ``COMMIT`` (or ``ROLLBACK``) has
+            returned. **This is the boundary the ordering assertions use.** It
+            is stamped by A's own thread while A is still inside
+            ``active_context_mutex``, i.e. BEFORE A has so much as sent
+            ``pg_advisory_unlock``, so it is provably earlier than any instant
+            at which B could have been granted the key;
+          * ``released_at``: ``pg_advisory_unlock`` has returned to A.
+            **DIAGNOSTIC ONLY — never compared against B.**
 
-        Both are taken on A's own connection at statement granularity, ahead
-        of any response work. ``released_at`` is measured when the unlock's
-        acknowledgement reaches the client, so it is if anything a hair LATER
-        than the server-side release — which makes the assertion built on it
-        conservative (harder to pass), never lenient.
+        WHY ``released_at`` MAY NOT ANCHOR AN ORDERING ASSERTION, even though
+        it looks like the tightest boundary. PostgreSQL frees the advisory key
+        when the SERVER EXECUTES that statement. Everything after that —
+        writing the result, the network hop back, A's thread being scheduled,
+        A's thread finally calling ``time.monotonic()`` — happens while the
+        key is ALREADY FREE and B is ALREADY RUNNABLE. B can be granted the
+        key, insert ``user_active_context`` and COMMIT entirely inside that
+        gap; ``set_active_context`` is a single small write and measured runs
+        here show it completing under a millisecond after A's release. An
+        assertion of the form ``released_at < b.finished_at`` would then report
+        a violation on a run where B did exactly the right thing.
+
+        The earlier note here claimed that being "a hair LATER than the
+        server-side release" made such an assertion "conservative (harder to
+        pass), never lenient". That was the error, stated backwards: harder to
+        pass means it fails runs that were CORRECT. Lateness in the anchor is
+        precisely what manufactures false violations, which is the same defect
+        as comparing against the HTTP response, one layer down.
+        ``test_the_ordering_boundary_survives_a_delayed_unlock_acknowledgement``
+        widens that gap deliberately and requires the ``released_at``
+        comparison to be FALSE on a run the ``committed_at`` comparison passes.
 
         Every entry is kept, with the ``user_id`` whose key was held, so the
         race body can prove the boundary it compares against belongs to the
@@ -508,11 +569,17 @@ class PostgresContextSwitchRaceTest(unittest.TestCase):
                         yield
                     finally:
                         # The mutation's transaction has exited: COMMIT (or
-                        # ROLLBACK) has already returned on this connection.
+                        # ROLLBACK) has already returned on this connection,
+                        # and A is STILL inside `real_mutex`, still holding the
+                        # session advisory lock, with the unlock not yet sent.
+                        # THIS is the boundary the ordering assertions use.
                         mark["committed_at"] = time.monotonic()
             finally:
-                # `real_mutex`'s own `finally` has run pg_advisory_unlock, so
-                # A now holds nothing on this key. This is A's unit boundary.
+                # `real_mutex`'s own `finally` has run pg_advisory_unlock and
+                # its result has come back. DIAGNOSTIC ONLY: the server freed
+                # the key some unbounded interval BEFORE this line runs, so B
+                # may legitimately have finished already. Never compared
+                # against B — see this method's docstring.
                 mark["released_at"] = time.monotonic()
                 self._mutex_marks.append(mark)
 
@@ -542,6 +609,52 @@ class PostgresContextSwitchRaceTest(unittest.TestCase):
             return result
 
         setattr(self.api, method_name, held)
+
+    def _hold_advisory_unlock(self, seconds):
+        """Let A's real ``pg_advisory_unlock`` COMPLETE, then pause A inside
+        the unlock call before it returns.
+
+        WHAT THIS SIMULATES, and why it is not a contrivance. Between the
+        server executing ``pg_advisory_unlock`` and A's thread recording that
+        it happened there is a real, unbounded interval: the result has to be
+        written, cross the socket, be parsed by psycopg, and A's thread has to
+        be scheduled again. The key is FREE and B is RUNNABLE for that whole
+        interval. On this machine it is under a millisecond; under load, in
+        CI, or on a busy GIL it is not bounded by anything.
+
+        This seam widens exactly that interval and nothing else. It wraps A's
+        store ``_exec`` (a live-wrapper seam, no file under
+        ``hockey_scheduler/`` modified), lets the REAL unlock statement run to
+        completion on A's connection — so PostgreSQL really has freed the key
+        and B really is granted it — and only THEN sleeps before handing
+        control back to ``active_context_mutex``. A's ``released_at`` is
+        therefore stamped ``seconds`` after the key was free.
+
+        It is the falsifier for anchoring on ``committed_at``: B commits well
+        inside the pause, so an assertion built on ``released_at`` MUST go red
+        while the corrected one built on ``committed_at`` MUST stay green.
+        Only the unlock of the ACTIVE-CONTEXT key is held, and only once per
+        arming, so no other statement on A's connection is affected.
+        """
+        real_exec = self.store._exec
+        self.unlock_hold_armed = threading.Event()
+        self.unlock_hold_armed.set()
+        self._unlock_holds = []
+
+        def held_exec(query, params=()):
+            cursor = real_exec(query, params)
+            if ("pg_advisory_unlock" in query
+                    and self.unlock_hold_armed.is_set()):
+                self.unlock_hold_armed.clear()
+                self._unlock_holds.append(time.monotonic())
+                self._stamp(
+                    "A's real pg_advisory_unlock COMPLETED (the key is free "
+                    "and B is runnable); HOLDING A for %.1fs before it returns "
+                    "from the unlock and stamps released_at" % seconds)
+                time.sleep(seconds)
+            return cursor
+
+        self.store._exec = held_exec
 
     # -- HTTP --------------------------------------------------------------
     def _client(self):
@@ -676,17 +789,21 @@ class PostgresContextSwitchRaceTest(unittest.TestCase):
         """Park A mid-mutation, run B's switch on the second connection, and
         record exactly what each side did and when.
 
-        TWO of A's timestamps come back, and they are NOT interchangeable:
+        THREE of A's timestamps come back, and they are NOT interchangeable —
+        exactly ONE of them may anchor an ordering assertion:
 
-          * ``unit_ended_at`` / ``committed_at`` — A's real DATABASE
-            boundaries, taken on A's own connection by
-            ``_install_commit_boundary_probe``. ``unit_ended_at`` is the
-            instant A stopped holding the advisory key, i.e. the earliest
-            instant B could possibly proceed. THIS is what the ordering
-            assertions compare against;
-          * ``http_finished_at`` — when A's HTTP client had received and
-            decoded the response. Strictly later, for reasons that have
-            nothing to do with the lock, and therefore evidence only.
+          * ``committed_at`` — A's COMMIT has returned and A is still holding
+            the session advisory lock, having not yet sent the unlock. B was
+            proved queued and UNGRANTED on that key, so B cannot possibly have
+            been granted it at or before this instant. **THIS, and only this,
+            is what the ordering assertions compare against.**
+          * ``unit_ended_at`` (== the probe's ``released_at``) — A's client
+            has received the unlock's acknowledgement. The SERVER freed the
+            key earlier, so B may correctly have finished before this.
+            DIAGNOSTIC ONLY.
+          * ``http_finished_at`` — A's HTTP client has decoded the response.
+            Later again, for reasons that have nothing to do with the lock.
+            DIAGNOSTIC ONLY.
         """
         path = f"/api/scheduler/drafts/{verb}"
         a_result, b_result = {}, {}
@@ -798,14 +915,19 @@ class PostgresContextSwitchRaceTest(unittest.TestCase):
             "released, which cannot happen if the probe is on the connection "
             "that ran the mutation: %r" % (boundary,))
         a_result["committed_at"] = boundary["committed_at"]
+        # DIAGNOSTIC ONLY. Kept under its historical name so the observations
+        # stay readable, but no assertion orders B against it: see
+        # `_install_commit_boundary_probe`.
         a_result["unit_ended_at"] = boundary["released_at"]
         a_result["holds_during_race"] = len(marks)
         self._stamp(
-            "A's DATABASE unit: COMMIT returned at %.3fs, advisory lock "
-            "RELEASED at %.3fs; A's HTTP response only decoded at %.3fs "
-            "(%.1f ms of response tail that is NOT part of the lock window)"
+            "A's boundaries: COMMIT returned at %.3fs (THE ANCHOR); unlock "
+            "acknowledged to A's client at %.3fs (+%.1f ms, diagnostic); HTTP "
+            "response decoded at %.3fs (+%.1f ms, diagnostic). Only the first "
+            "is ordered against B."
             % (boundary["committed_at"] - self._t0,
                boundary["released_at"] - self._t0,
+               (boundary["released_at"] - boundary["committed_at"]) * 1000,
                a_result["http_finished_at"] - self._t0,
                (a_result["http_finished_at"] - boundary["released_at"]) * 1000))
 
@@ -853,24 +975,50 @@ class PostgresContextSwitchRaceTest(unittest.TestCase):
             [(row[2], row[3]) for row in waiting], [("Lock", "advisory")],
             "B is not reported as waiting on an advisory lock, so its delay is "
             "not provably a lock wait: %r" % (waiting,))
-        # THE ORDERING CLAIM, against A's DATABASE boundary.
+        # THE ORDERING CLAIM, anchored to A's COMMIT.
         #
-        # `unit_ended_at` is the return of A's `pg_advisory_unlock`, so it is
-        # the first instant at which B could possibly be granted the key. B
-        # must then still acquire it, write `user_active_context` and COMMIT
-        # before `finished_at`, which is why this can be STRICT. Comparing
-        # against A's HTTP response instead — as this file once did — compared
-        # A's response DELIVERY with B's COMMIT: two unlike boundaries
-        # separated by A's whole response tail, during which A holds no lock
-        # and B is legitimately free to finish. That comparison could fail on
-        # a run where the protected interleaving never happened.
+        # The chain, every link of which is established above rather than
+        # assumed:
+        #
+        #   1. B's request on A's key was recorded GRANTED = false in pg_locks
+        #      while A's was recorded GRANTED = true on the same (classid,
+        #      objid) — and it was STILL ungranted after a dwell;
+        #   2. PostgreSQL therefore cannot grant B that key until A's SESSION
+        #      advisory lock is released, which A does with
+        #      `pg_advisory_unlock` inside `active_context_mutex`;
+        #   3. `committed_at` is stamped by A's OWN THREAD in the transaction's
+        #      `finally`, i.e. strictly before A even SENDS that unlock;
+        #   4. so `committed_at` happens-before the server frees the key, which
+        #      happens-before B is granted it, which happens-before B's INSERT,
+        #      its COMMIT and `finished_at`.
+        #
+        # Every link is a real happens-before on A's own connection, so this
+        # can be STRICT and still cannot manufacture a violation.
+        #
+        # THE TWO ANCHORS THIS FILE USED BEFORE, and why both were wrong in the
+        # SAME direction — each recorded LATER than the instant B actually
+        # became free, so a correct B could be reported as a violation:
+        #
+        #   * A's decoded HTTP RESPONSE: later by the whole response tail
+        #     (build, serialize, socket, client decode). Measured at ~2000 ms
+        #     when deliberately held, and at a few ms otherwise.
+        #   * A's `released_at` (== `unit_ended_at`): later by the round trip
+        #     of the unlock's RESULT plus A's thread being rescheduled. The
+        #     server frees the key when it EXECUTES the statement; B has been
+        #     measured returning ~0.8 ms after that stamp on an idle machine,
+        #     which is well inside the width of that gap.
+        #
+        # `unit_ended_at` is still recorded and printed, but ordering B against
+        # it is exactly the mistake `test_the_ordering_boundary_survives_a_
+        # delayed_unlock_acknowledgement` now forbids by demonstration.
         self.assertLess(
-            race["a"]["unit_ended_at"], race["b"]["finished_at"],
-            "B's context switch completed BEFORE A's database unit ended — "
-            "A committed and released the per-user advisory key at %.6f and "
-            "B returned at %.6f, so the switch landed INSIDE the window the "
-            "mutex is supposed to own"
-            % (race["a"]["unit_ended_at"], race["b"]["finished_at"]))
+            race["a"]["committed_at"], race["b"]["finished_at"],
+            "B's context switch completed BEFORE A's mutation COMMITTED — A's "
+            "COMMIT returned at %.6f (with A still holding the session "
+            "advisory key, having not yet sent the unlock) and B returned at "
+            "%.6f, so the switch landed INSIDE the window the mutex is "
+            "supposed to own"
+            % (race["a"]["committed_at"], race["b"]["finished_at"]))
         self.assertIsInstance(
             race["b"]["response"], dict,
             "B's switch did not complete normally after A released: %r"
@@ -1212,10 +1360,14 @@ class PostgresContextSwitchRaceTest(unittest.TestCase):
 
         AND IT IS NOT VACUOUS. Run with ``SqlStore.active_context_mutex``
         reduced to a bare ``yield`` and ``_lock_active_context_mutex`` to a
-        no-op — both advisory locks gone — this case goes RED on exactly the
-        ordering assertion: B commits its switch while A is still parked, and
-        A's unit ends about three seconds LATER. So the hold buys tolerance of
-        a late response, not tolerance of a lost mutex.
+        no-op — both advisory locks gone — this case goes RED. Stated exactly,
+        because the earlier wording here was not: it fails FIRST on the
+        precondition that A holds a granted advisory lock while parked (there
+        is none left to hold). Bypassing that precondition and keeping only
+        the ordering comparison, it then fails on the ordering assertion
+        itself — B commits its switch at ~0.09s while A stays parked until
+        ~3.1s. So the hold buys tolerance of a late response, not tolerance of
+        a lost mutex.
 
         WHY THIS CASE USES THE NO-SAVED-SELECTION SHAPE, and not the
         explicitly-selected one. Measured, in the same mutation run: with both
@@ -1265,10 +1417,10 @@ class PostgresContextSwitchRaceTest(unittest.TestCase):
             race["a"]["http_finished_at"] - race["b"]["finished_at"], 0.0,
             "sanity: B must land inside the hold window")
         self._stamp(
-            "boundary separation: B returned %.1f ms AFTER A's lock release "
-            "and %.1f ms BEFORE A's HTTP response — the old assertion would "
-            "have called this a violation"
-            % ((race["b"]["finished_at"] - race["a"]["unit_ended_at"]) * 1000,
+            "boundary separation: B returned %.1f ms after A's COMMIT (the "
+            "anchor) and %.1f ms BEFORE A's HTTP response — the response "
+            "anchor would have called this correct run a violation"
+            % ((race["b"]["finished_at"] - race["a"]["committed_at"]) * 1000,
                (race["a"]["http_finished_at"]
                 - race["b"]["finished_at"]) * 1000))
 
@@ -1278,6 +1430,120 @@ class PostgresContextSwitchRaceTest(unittest.TestCase):
         self._assert_a_answered_exactly_one_of_the_two_admissible_ways(
             race, before)
         saved = self.store.get_active_context(OPERATOR_ID)
+        self.assertEqual(
+            (saved.program_id, saved.season_id),
+            (self.other["program"], self.other["season"]),
+            "B's switch did not end up persisted, so the race never happened")
+
+    def test_the_ordering_boundary_survives_a_delayed_unlock_acknowledgement(
+            self):
+        """The ordering assertion must survive A learning LATE that it
+        unlocked.
+
+        WHAT WAS WRONG BEFORE — one layer below the HTTP mistake. Having moved
+        the anchor off A's decoded HTTP response, this file then anchored on
+        ``released_at``: the moment A's client got back the result of
+        ``SELECT pg_advisory_unlock(...)``. That is still an UNLIKE boundary.
+        PostgreSQL frees the key when the SERVER EXECUTES the statement; the
+        result then has to be written, cross a socket, be parsed, and A's
+        thread has to be rescheduled before it can call ``time.monotonic()``.
+        For that whole interval the key is free and B is runnable. B can be
+        granted it, INSERT ``user_active_context`` and COMMIT inside the gap —
+        entirely correct behaviour — and an assertion of the form
+        ``released_at < b.finished_at`` would call it a violation. On idle
+        hardware the recorded margin was ~0.8 ms, i.e. the same order as the
+        gap itself.
+
+        WHAT THIS PROVES. Same race, same locks, one addition:
+        ``_hold_advisory_unlock`` lets A's REAL ``pg_advisory_unlock`` run to
+        completion — the key genuinely is freed by PostgreSQL — and only then
+        pauses A for ``UNLOCK_HOLD_SECONDS`` before it returns from that call
+        and stamps ``released_at``. Nothing about A's transaction, its COMMIT
+        or the lock protocol changes; only A's knowledge of the unlock is
+        delayed, exactly as a slow socket or a busy GIL would delay it. So:
+
+          * the ORDERING assertion still passes, because it is anchored to
+            ``committed_at`` — stamped before A ever sent the unlock;
+          * and the ``released_at`` anchor is shown to be wrong on this very
+            run, by asserting that B finished BEFORE it. A file still using it
+            would fail here while nothing was ever violated;
+          * B's own success is checked, so "B finished early" is a real commit
+            and not an error return that happens to be fast.
+
+        AND IT IS NOT VACUOUS, in three separate directions:
+
+          * with both advisory locks neutered at runtime this case goes RED —
+            first on the "A holds a granted advisory lock while parked"
+            precondition, and, with that precondition bypassed so the run
+            reaches the comparison, on the ordering assertion itself (B
+            commits at ~0.09s, A's COMMIT lands at ~3.1s);
+          * with only ``active_context_mutex`` neutered — the shape the rest
+            of this file cannot detect — it goes RED on the assertion below
+            that A really did execute a session-scoped ``pg_advisory_unlock``,
+            because there is no longer any such statement to hold;
+          * and with the ordering assertion put back on ``released_at`` it
+            goes RED on a run where nothing was violated, which is the whole
+            reason this case exists.
+
+        WHY THE NO-SAVED-SELECTION SHAPE, again. As in the response-delivery
+        case, an absent ``user_active_context`` row cannot be row-locked, so
+        the advisory pair is the ONLY thing that can order the two connections
+        — which is what makes neutering it a genuine falsifier. A's own answer
+        is held to the same two-outcome gate for the same reason.
+        """
+        client = self._login(OPERATOR)
+        self.assertIsNone(
+            self.store.get_active_context(OPERATOR_ID),
+            "this account was supposed to have no saved context row, which is "
+            "what makes the advisory pair the only possible orderer here")
+        before = self._effects()
+        self._hold_advisory_unlock(UNLOCK_HOLD_SECONDS)
+
+        race = self._run_switch_race(client, "discard", OPERATOR_ID)
+        self._assert_b_was_blocked_and_ordered_after_a(race)
+
+        # The hold really happened, on the ACTIVE-CONTEXT unlock of the unit
+        # that gated B, and it really did delay `released_at`. Without this the
+        # run would be an ordinary race with extra prose.
+        self.assertTrue(
+            self._unlock_holds,
+            "A's advisory unlock was never intercepted, so no gap was widened "
+            "and this test did not exercise the separation it exists to prove")
+        gap = race["a"]["unit_ended_at"] - race["a"]["committed_at"]
+        self.assertGreaterEqual(
+            gap, UNLOCK_HOLD_SECONDS,
+            "A's unlock acknowledgement was not actually delayed after its "
+            "COMMIT (gap %.3fs < %.1fs)" % (gap, UNLOCK_HOLD_SECONDS))
+
+        # THE POINT. The `released_at` anchor, evaluated explicitly and
+        # REQUIRED TO BE FALSE on this run: B is correct and finished first.
+        self.assertLess(
+            race["b"]["finished_at"], race["a"]["unit_ended_at"],
+            "B did not finish inside the unlock gap, so this run does not "
+            "distinguish A's COMMIT from A's unlock acknowledgement at all "
+            "(B %.6f, A's released_at %.6f)"
+            % (race["b"]["finished_at"], race["a"]["unit_ended_at"]))
+        self.assertNotIn(
+            "error", race["b"]["response"],
+            "B finished early by FAILING, so its early finish is not the "
+            "successful commit this case needs: %r" % (race["b"]["response"],))
+        saved = self.store.get_active_context(OPERATOR_ID)
+        self.assertIsNotNone(
+            saved,
+            "B reported success inside the unlock gap but persisted no row "
+            "visible to A's connection, so nothing was actually committed")
+        self._stamp(
+            "boundary separation: B COMMITTED %.1f ms after A's COMMIT and "
+            "%.1f ms BEFORE A even learned its own unlock had happened — the "
+            "released_at anchor would have called this correct run a violation"
+            % ((race["b"]["finished_at"] - race["a"]["committed_at"]) * 1000,
+               (race["a"]["unit_ended_at"] - race["b"]["finished_at"]) * 1000))
+
+        # A's own work is untouched by the hold: same two-outcome gate as the
+        # unheld fallback case, so a delayed unlock cannot buy a pass for a
+        # half-done mutation or a crash either.
+        self._assert_a_answered_exactly_one_of_the_two_admissible_ways(
+            race, before)
         self.assertEqual(
             (saved.program_id, saved.season_id),
             (self.other["program"], self.other["season"]),
