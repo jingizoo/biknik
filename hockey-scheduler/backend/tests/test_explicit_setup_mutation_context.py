@@ -315,7 +315,8 @@ class _ContextHarness:
             status, 200,
             f"the mutation was accepted.{report}")
 
-        # (2) The WIRE CONTRACT, following merged precedent PR #410: a
+        # (2) The WIRE CONTRACT, matching PR #410's shape (#410 is NOT merged;
+        #     it is held behind #345). Asserted as a contract, not imported: a
         # structured 409 decided BEFORE any target lookup, so the refusal is
         # about the caller's context and never an existence oracle.
         self.assertEqual(

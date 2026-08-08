@@ -65,7 +65,8 @@ was written), for an operator standing in their own Program:
     Games to non-draft + published, leaving their slots ALLOCATED and writing
     six ``game_published`` audit rows.
 
-SHAPE OF THE EXPECTED REFUSAL — PR #410's already-merged precedent, followed
+SHAPE OF THE EXPECTED REFUSAL — PR #410's precedent (NOT YET MERGED; it is
+ready for review and held behind #345), followed
 rather than reinvented: ``ApiService._selection_is_explicit`` compares the
 RESOLVED tuple against the SAVED ``ActiveContext`` row, and the route answers a
 structured ``409 active_context_required`` BEFORE any target lookup. Both cases
@@ -130,7 +131,10 @@ ICE_BASE = datetime(2026, 9, 7, 18, tzinfo=timezone.utc)
 TEAMS = 4
 EXPECTED_DRAFTS = 6
 
-# The refusal the owner's contract requires, in PR #410's already-merged shape.
+# The refusal the owner's contract requires, in PR #410's shape. #410 is NOT
+# merged — it is held behind #345 — so this base has no such helper yet. These
+# tests assert the WIRE CONTRACT only; they must not re-implement it here, and
+# production work waits on #410 merging or an owner sequencing ruling.
 EXPECTED_STATUS = 409
 EXPECTED_CODE = "active_context_required"
 
