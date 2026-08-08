@@ -59,6 +59,29 @@ WHAT IS PROVEN HERE:
     the identical interleaving with B switching a DIFFERENT user's context
     completes immediately while A is still paused (``..._does_not_block``).
 
+WHICH BOUNDARY "AFTER A's MUTATION COMPLETES" MEANS. A's mutation unit is
+``_active_context_mutex`` (session advisory lock) wrapped around a
+SERIALIZABLE ``transaction()`` (transaction advisory lock). A stops excluding
+B at ``COMMIT`` + ``pg_advisory_unlock`` — and only THEN does the request go
+on to build a response, serialize it and put it on a socket for a client to
+decode. Those are two different instants, and the ordering assertions here use
+the FIRST one: ``_install_commit_boundary_probe`` wraps the live
+``SqlStore.active_context_mutex`` on connection A's store and timestamps the
+COMMIT and the advisory unlock as A's own connection reaches them.
+
+An earlier revision of this file compared B against A's HTTP RESPONSE instead.
+That was a comparison between UNLIKE boundaries: B could commit correctly,
+after A's database unit had ended, and still be recorded as "before A" because
+A's client had not finished reading yet — a failure with no violation behind
+it. Runs recorded here show that response tail is real (B returning ~1 ms
+after A's lock release but before A's response). ``test_the_ordering_boundary_
+is_a_s_commit_not_a_s_response_delivery`` pins the corrected measurement by
+deliberately holding A's response for two seconds AFTER its unit has ended:
+the ordering assertion stays green, while the response-delivery comparison the
+file used to make is asserted to be FALSE on that very run. With both advisory
+locks neutered at runtime that same case goes RED on the ordering assertion,
+so the correction did not make it vacuous.
+
 WHAT THIS FILE DOES **NOT** PROVE, stated plainly rather than implied:
 
   1. WHICH of the two advisory locks does the blocking is UNFALSIFIABLE from
@@ -69,8 +92,10 @@ WHAT THIS FILE DOES **NOT** PROVE, stated plainly rather than implied:
      measured by ``test_pg_locks_cannot_distinguish_...``, not assumed. The
      limitation was then confirmed by experiment rather than left as a caveat:
      with ``SqlStore.active_context_mutex`` replaced by a no-op at runtime and
-     the transaction-scoped lock left in place, **all eight tests in this file
-     still pass**. So every blocking result here attributes the ordering to the
+     the transaction-scoped lock left in place, **all ten tests in this file
+     still pass** — re-measured against the tightened fallback gate below, not
+     carried over from when this file had eight.
+     So every blocking result here attributes the ordering to the
      advisory mutex AS A PAIR, and this file would not notice the session half
      being deleted. Separating them needs a production edit, which this branch
      forbids. Named here so the guard is never read as stronger than it is —
@@ -90,13 +115,30 @@ WHAT THIS FILE DOES **NOT** PROVE, stated plainly rather than implied:
      _same_row`` pins that equivalence on real HTTP rather than asserting it in
      prose.
   3. Nothing here says the resolved tuple was CHOSEN. Ordering is all the mutex
-     provides: in ``..._with_no_saved_selection`` A still mutates the FALLBACK
-     Program, and B's first-ever selection merely lands afterwards. That
-     un-chosen mutation is #409's defect and is owned by the RED oracle in
+     provides: in ``test_a_first_ever_selection_cannot_land_inside_a_fallback
+     _mutation`` A still mutates the FALLBACK Program, and B's first-ever
+     selection merely lands afterwards. That un-chosen mutation is #409's
+     defect and is owned by the RED oracle in
      ``test_explicit_mutation_context.py``; this file deliberately does not
-     re-assert it, and its race cases accept EITHER outcome for A's response so
-     they stay green on both sides of that fix — the observed response is
-     recorded in ``OBSERVATIONS`` and printed on every run instead.
+     re-assert it. To stay green on both sides of that fix, that ONE case
+     admits exactly TWO answers from A and NOTHING else:
+
+       (a) ``200 {"discarded": 6}`` together with the COMPLETE persisted
+           effects of a real discard — the six Games gone, their six ice slots
+           back to AVAILABLE, and exactly six ``draft_game_discarded``
+           setup-audit rows naming those six Games; or
+       (b) the stable ``409 active_context_required`` refusal, matched on
+           SHAPE (``error.code`` exactly, and a well-formed error body), with
+           ZERO change to Games, ice slots or audit rows.
+
+     A 500, a 404, an unrelated authorization failure or a malformed body is
+     NOT a third acceptable future — it is a defect, and it FAILS this test.
+     That distinction is what stops a crash from satisfying the very case
+     meant to separate today's successful fallback mutation from #409's
+     fail-closed contract; it is enforced by ``_assert_a_answered_exactly_one
+     _of_the_two_admissible_ways`` and falsified by forcing a 500 and a 404
+     at the same live-wrapper seam. Which of the two A actually gave is
+     recorded in ``OBSERVATIONS`` and printed on every run.
 
 A SKIP IS NOT A PASS. Without ``TEST_DATABASE_URL`` (or without ``psycopg``)
 nothing in this file is exercised at all: there is no second connection, no
@@ -113,6 +155,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from http.cookiejar import CookieJar
 from http.server import ThreadingHTTPServer
@@ -152,6 +195,27 @@ ICE_BASE = datetime(2026, 9, 7, 18, tzinfo=timezone.utc)
 TEAMS = 4
 EXPECTED_DRAFTS = 6
 
+# The fail-closed refusal #409/#410 specify, in PR #410's shape. #410 is NOT
+# merged and this branch may not touch production code, so this is asserted as
+# a WIRE CONTRACT and never imported from a helper that does not exist yet.
+# Kept identical to `test_explicit_mutation_context.EXPECTED_STATUS/CODE`;
+# `test_the_two_admissible_answers_are_the_ones_the_409_oracle_names` pins
+# that agreement so the two files cannot drift apart silently.
+REFUSAL_STATUS = 409
+REFUSAL_CODE = "active_context_required"
+# The only keys a structured error body may carry (`server._send_api` renders
+# `DomainError.to_dict()`); `code` and `message` are required, `details`
+# optional. Used to reject a MALFORMED refusal rather than accept anything
+# that merely happens to be a 409.
+ERROR_REQUIRED_KEYS = {"code", "message"}
+ERROR_ALLOWED_KEYS = ERROR_REQUIRED_KEYS | {"details"}
+
+# The setup-audit row `discard_draft_games` writes for each destroyed draft,
+# so "six drafts were really discarded" is checked against the audit trail and
+# not only against the count A reported.
+DISCARD_AUDIT_ACTION = "draft_game_discarded"
+DISCARD_AUDIT_ENTITY = "game"
+
 # How long B is given to prove it is stuck. Long enough that a merely slow
 # commit would have finished; the assertion that matters is the pg_locks
 # `granted = false` row, not this number.
@@ -162,6 +226,13 @@ DWELL_SECONDS = 0.5
 # Bounded waits, so a seam that stopped firing FAILS the suite instead of
 # hanging it.
 PAUSE_TIMEOUT = 30.0
+# How long A's HTTP RESPONSE is deliberately held back AFTER its database unit
+# has fully ended, in the test that proves the ordering assertion measures the
+# commit/lock-release boundary and not the round trip. Orders of magnitude more
+# than B needs to acquire the freed key, write one row and commit (single-digit
+# milliseconds on every run recorded here), so B lands inside the hold and the
+# response-delivery ordering is INVERTED beyond any doubt about timer accuracy.
+RESPONSE_HOLD_SECONDS = 2.0
 
 # Verbatim, timestamped record of what each run actually saw. Printed per test
 # so a PostgreSQL run leaves the evidence in the log even when it is green.
@@ -209,6 +280,7 @@ class PostgresContextSwitchRaceTest(unittest.TestCase):
         self._build_switch_target()
         self._create_accounts()
         self._install_pause_seam()
+        self._install_commit_boundary_probe()
 
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.Handler)
         self.port = self.httpd.server_address[1]
@@ -247,6 +319,12 @@ class PostgresContextSwitchRaceTest(unittest.TestCase):
 
     def _restore_environment(self):
         self.api.context.resolve_with_league = self._real_resolve
+        # The boundary probe and the response hold are INSTANCE attributes
+        # shadowing bound methods; drop them so the objects go back to their
+        # class behaviour even though STATE.reset() below rebuilds them anyway.
+        self.store.__dict__.pop("active_context_mutex", None)
+        for name in ("discard_draft_games", "publish_draft_games"):
+            self.api.__dict__.pop(name, None)
         if self._prev_db is None:
             os.environ.pop("DATABASE_URL", None)
         else:
@@ -370,6 +448,100 @@ class PostgresContextSwitchRaceTest(unittest.TestCase):
             return resolved
 
         self.api.context.resolve_with_league = paused_resolve
+
+    # -- A's DATABASE boundary (not its HTTP round trip) -------------------
+    def _install_commit_boundary_probe(self):
+        """Timestamp the instant A's DATABASE unit actually ends.
+
+        WHY THIS EXISTS, and why the obvious timestamp was WRONG. The ordering
+        claim in this file is "B's context switch commits strictly after A's
+        mutation completes". An earlier revision compared B against the moment
+        A's HTTP client had received and DECODED its response — which is a
+        LATER, UNLIKE boundary. A's mutation unit is
+
+            with _active_context_mutex(...):        # session advisory lock
+                with store.transaction(SERIALIZABLE):   # xact advisory lock
+                    ... decide and write ...
+                                                    # COMMIT here
+                                                    # pg_advisory_unlock here
+            ... build response, serialize, write socket, client decodes ...
+
+        so A releases BOTH advisory locks — and therefore stops excluding B —
+        while the last line is still running. B is free from that instant, and
+        a B that correctly commits *after* A's unit but *before* A's client
+        thread returned would have FAILED an assertion about a property it
+        never violated. The ~1 ms A-released/B-returned gap the reviewer saw
+        is exactly the width of that HTTP tail.
+
+        WHAT IS RECORDED INSTEAD. This wraps the LIVE
+        ``SqlStore.active_context_mutex`` on connection A's store — the same
+        kind of live-wrapper seam that parks A, and again with no file under
+        ``hockey_scheduler/`` modified — and takes two timestamps at the two
+        real database boundaries, in the order PostgreSQL reaches them:
+
+          * ``committed_at``: the inner ``with`` (the SERIALIZABLE
+            transaction) has exited, i.e. ``COMMIT`` has returned;
+          * ``released_at``: ``pg_advisory_unlock`` has returned, so A holds
+            NOTHING on the key any more. This is the boundary B is queued
+            behind and the one the ordering assertion uses.
+
+        Both are taken on A's own connection at statement granularity, ahead
+        of any response work. ``released_at`` is measured when the unlock's
+        acknowledgement reaches the client, so it is if anything a hair LATER
+        than the server-side release — which makes the assertion built on it
+        conservative (harder to pass), never lenient.
+
+        Every entry is kept, with the ``user_id`` whose key was held, so the
+        race body can prove the boundary it compares against belongs to the
+        parked unit rather than to some earlier mutex hold.
+        """
+        real_mutex = self.store.active_context_mutex
+        self._mutex_marks = []
+
+        @contextmanager
+        def timed_mutex(user_id):
+            mark = {"user_id": user_id, "entered_at": time.monotonic(),
+                    "committed_at": None, "released_at": None}
+            try:
+                with real_mutex(user_id):
+                    try:
+                        yield
+                    finally:
+                        # The mutation's transaction has exited: COMMIT (or
+                        # ROLLBACK) has already returned on this connection.
+                        mark["committed_at"] = time.monotonic()
+            finally:
+                # `real_mutex`'s own `finally` has run pg_advisory_unlock, so
+                # A now holds nothing on this key. This is A's unit boundary.
+                mark["released_at"] = time.monotonic()
+                self._mutex_marks.append(mark)
+
+        self.store.active_context_mutex = timed_mutex
+
+    def _hold_response_delivery(self, method_name, seconds):
+        """Delay A's RESPONSE after its database unit has fully ended.
+
+        Wraps the LIVE ``ApiService`` method the route calls, and sleeps AFTER
+        the real call returns — which is after COMMIT and after the advisory
+        unlock, because both happen inside that call. Nothing about the
+        database unit moves; only the moment A's client sees an answer does.
+
+        This is the falsifier for the correction above: with it installed, the
+        response-delivery ordering is deliberately INVERTED (B answers long
+        before A's client does) while the database ordering is untouched. A
+        test that stays green under it is measuring the commit boundary; a
+        test that goes red under it was measuring the HTTP round trip.
+        """
+        real = getattr(self.api, method_name)
+
+        def held(*args, **kwargs):
+            result = real(*args, **kwargs)
+            self._stamp("A's database unit is over; HOLDING its HTTP response "
+                        "for %.1fs before delivery" % seconds)
+            time.sleep(seconds)
+            return result
+
+        setattr(self.api, method_name, held)
 
     # -- HTTP --------------------------------------------------------------
     def _client(self):
@@ -502,15 +674,29 @@ class PostgresContextSwitchRaceTest(unittest.TestCase):
     # -- the shared race body ----------------------------------------------
     def _run_switch_race(self, client, verb, switch_user_id):
         """Park A mid-mutation, run B's switch on the second connection, and
-        record exactly what each side did and when."""
+        record exactly what each side did and when.
+
+        TWO of A's timestamps come back, and they are NOT interchangeable:
+
+          * ``unit_ended_at`` / ``committed_at`` — A's real DATABASE
+            boundaries, taken on A's own connection by
+            ``_install_commit_boundary_probe``. ``unit_ended_at`` is the
+            instant A stopped holding the advisory key, i.e. the earliest
+            instant B could possibly proceed. THIS is what the ordering
+            assertions compare against;
+          * ``http_finished_at`` — when A's HTTP client had received and
+            decoded the response. Strictly later, for reasons that have
+            nothing to do with the lock, and therefore evidence only.
+        """
         path = f"/api/scheduler/drafts/{verb}"
         a_result, b_result = {}, {}
+        race_started = time.monotonic()
 
         def connection_a():
             self._stamp("A: POST %s {\"all\": true}" % path)
             a_result["response"] = self._req(client, "POST", path,
                                              {"all": True})
-            a_result["finished_at"] = time.monotonic()
+            a_result["http_finished_at"] = time.monotonic()
             self._stamp("A: response %r" % (a_result["response"],))
 
         def connection_b():
@@ -570,12 +756,58 @@ class PostgresContextSwitchRaceTest(unittest.TestCase):
         thread_b.join(PAUSE_TIMEOUT)
         self.assertFalse(thread_a.is_alive(), "connection A never finished")
         self.assertFalse(thread_b.is_alive(), "connection B never finished")
+        self._attach_a_database_boundary(a_result, race_started)
         return {"a": a_result, "b": b_result, "a_pid": a_pid,
                 "a_lock": a_lock, "waiter": waiter,
                 "still_waiting": still_waiting,
                 "b_alive_during_pause": b_alive_during_pause,
                 "activity_during_pause": activity_during_pause,
                 "locks_during_pause": locks_during_pause}
+
+    def _attach_a_database_boundary(self, a_result, race_started):
+        """Resolve A's recorded mutex holds down to the ONE that gated B.
+
+        A's request may in principle hold the per-user mutex more than once
+        (``_retry_on_plan_race`` re-enters the whole unit, mutex included), so
+        this does not guess: it takes every hold entered after the race began
+        and uses the LAST one, which is the unit that actually completed and
+        the release that actually freed B. Empty is a hard failure — a race
+        with no recorded database boundary has nothing legitimate to compare.
+        """
+        marks = [m for m in self._mutex_marks
+                 if m["entered_at"] >= race_started]
+        self.assertTrue(
+            marks,
+            "A's mutation never entered SqlStore.active_context_mutex during "
+            "this race, so no database boundary was recorded and the ordering "
+            "claim below would have nothing to stand on. All marks: %r"
+            % (self._mutex_marks,))
+        boundary = marks[-1]
+        self.assertEqual(
+            boundary["user_id"], OPERATOR_ID,
+            "the recorded boundary is a hold of a DIFFERENT user's mutex than "
+            "the one A's mutation takes, so it is not the release that frees "
+            "B: %r" % (boundary,))
+        self.assertLessEqual(
+            boundary["committed_at"], boundary["released_at"],
+            "A's advisory unlock is recorded BEFORE its COMMIT, so the probe "
+            "is not observing the boundaries it claims: %r" % (boundary,))
+        self.assertLessEqual(
+            boundary["released_at"], a_result["http_finished_at"],
+            "A's HTTP response was decoded BEFORE its advisory lock was "
+            "released, which cannot happen if the probe is on the connection "
+            "that ran the mutation: %r" % (boundary,))
+        a_result["committed_at"] = boundary["committed_at"]
+        a_result["unit_ended_at"] = boundary["released_at"]
+        a_result["holds_during_race"] = len(marks)
+        self._stamp(
+            "A's DATABASE unit: COMMIT returned at %.3fs, advisory lock "
+            "RELEASED at %.3fs; A's HTTP response only decoded at %.3fs "
+            "(%.1f ms of response tail that is NOT part of the lock window)"
+            % (boundary["committed_at"] - self._t0,
+               boundary["released_at"] - self._t0,
+               a_result["http_finished_at"] - self._t0,
+               (a_result["http_finished_at"] - boundary["released_at"]) * 1000))
 
     def _assert_b_was_blocked_and_ordered_after_a(self, race):
         """The whole point: B could not commit inside A's window."""
@@ -621,15 +853,184 @@ class PostgresContextSwitchRaceTest(unittest.TestCase):
             [(row[2], row[3]) for row in waiting], [("Lock", "advisory")],
             "B is not reported as waiting on an advisory lock, so its delay is "
             "not provably a lock wait: %r" % (waiting,))
-        self.assertLessEqual(
-            race["a"]["finished_at"], race["b"]["finished_at"],
-            "B's context switch committed BEFORE A's mutation finished")
+        # THE ORDERING CLAIM, against A's DATABASE boundary.
+        #
+        # `unit_ended_at` is the return of A's `pg_advisory_unlock`, so it is
+        # the first instant at which B could possibly be granted the key. B
+        # must then still acquire it, write `user_active_context` and COMMIT
+        # before `finished_at`, which is why this can be STRICT. Comparing
+        # against A's HTTP response instead — as this file once did — compared
+        # A's response DELIVERY with B's COMMIT: two unlike boundaries
+        # separated by A's whole response tail, during which A holds no lock
+        # and B is legitimately free to finish. That comparison could fail on
+        # a run where the protected interleaving never happened.
+        self.assertLess(
+            race["a"]["unit_ended_at"], race["b"]["finished_at"],
+            "B's context switch completed BEFORE A's database unit ended — "
+            "A committed and released the per-user advisory key at %.6f and "
+            "B returned at %.6f, so the switch landed INSIDE the window the "
+            "mutex is supposed to own"
+            % (race["a"]["unit_ended_at"], race["b"]["finished_at"]))
         self.assertIsInstance(
             race["b"]["response"], dict,
             "B's switch did not complete normally after A released: %r"
             % (race["b"]["response"],))
         self.assertNotIn("error", race["b"]["response"],
                          race["b"]["response"])
+
+    # -- the two-answer gate for the fallback case -------------------------
+    def _effects(self):
+        """Every persisted effect a discard can have, as one comparable value.
+
+        Games, ice-slot statuses and setup-audit rows together: a discard
+        deletes the Game, releases its slot to AVAILABLE (#277) and writes one
+        ``draft_game_discarded`` row, so a refusal that truly did nothing and a
+        success that truly did everything are BOTH decidable from this — and a
+        half-done mutation matches neither.
+
+        Reads ``self.store``, so it may only be called OUTSIDE the pause
+        window (see the module docstring): while A is parked, its request
+        thread holds that store's RLock.
+        """
+        return {
+            "games": sorted((g.id, bool(g.is_draft), bool(g.published))
+                            for g in self.store.all_games()),
+            "slots": sorted((s.id, s.status.value)
+                            for s in self.store.all_ice_slots()),
+            "audit": sorted((a.id, a.action, a.entity_type, a.entity_id)
+                            for a in self.store.all_setup_audit()),
+        }
+
+    def _assert_nothing_changed(self, before, after, why):
+        for key in ("games", "slots", "audit"):
+            self.assertEqual(
+                after[key], before[key],
+                "%s, yet the persisted %s changed. before=%r after=%r"
+                % (why, key, before[key], after[key]))
+
+    def _assert_the_complete_discard_landed(self, before, after):
+        """Not "six drafts are gone" — the WHOLE effect, nothing more.
+
+        Computed from the pre-race ledger rather than hard-coded, so it also
+        catches a batch that destroyed something it was never planning to.
+        """
+        draft_ids = [gid for gid, is_draft, _pub in before["games"] if is_draft]
+        self.assertEqual(
+            len(draft_ids), EXPECTED_DRAFTS,
+            "the pre-race ledger does not hold the six drafts every branch "
+            "below is stated in terms of: %r" % (before["games"],))
+        allocated = sorted(
+            sid for sid, status in before["slots"] if status == "allocated")
+        self.assertEqual(
+            len(allocated), EXPECTED_DRAFTS,
+            "the six committed drafts did not hold six ALLOCATED slots, so "
+            "'the ice came back' would be unobservable: %r" % (before["slots"],))
+
+        # (1) exactly the six drafts are gone; every other Game is untouched.
+        self.assertEqual(
+            after["games"],
+            [row for row in before["games"] if not row[1]],
+            "a 200 {\"discarded\": %d} did not delete exactly the six drafts "
+            "and nothing else. before=%r after=%r"
+            % (EXPECTED_DRAFTS, before["games"], after["games"]))
+
+        # (2) exactly those six slots came back to AVAILABLE; no other slot
+        #     moved. A discard that reported six but stranded the ice is a
+        #     different bug and must not pass here (#277).
+        self.assertEqual(
+            after["slots"],
+            sorted((sid, "available" if sid in set(allocated) else status)
+                   for sid, status in before["slots"]),
+            "the discarded drafts' ice was not returned to AVAILABLE exactly. "
+            "before=%r after=%r" % (before["slots"], after["slots"]))
+
+        # (3) exactly six new audit rows, one per destroyed Game, and every
+        #     pre-existing row still intact.
+        before_ids = {row[0] for row in before["audit"]}
+        kept = [row for row in after["audit"] if row[0] in before_ids]
+        new = [row for row in after["audit"] if row[0] not in before_ids]
+        self.assertEqual(
+            kept, before["audit"],
+            "the mutation rewrote or dropped existing setup-audit rows: "
+            "before=%r after=%r" % (before["audit"], after["audit"]))
+        self.assertEqual(
+            sorted((row[1], row[2], row[3]) for row in new),
+            sorted((DISCARD_AUDIT_ACTION, DISCARD_AUDIT_ENTITY, gid)
+                   for gid in draft_ids),
+            "the audit trail does not record exactly one %r row per discarded "
+            "draft, so the six deletions are not attributable: %r"
+            % (DISCARD_AUDIT_ACTION, new))
+
+    def _assert_is_the_fail_closed_refusal(self, status, body):
+        """#409's refusal, matched on SHAPE — never merely on "not 200".
+
+        Every clause here exists to stop something that is not that refusal
+        from passing for it: a 500 from a crash, a 404 from a wrong lookup, a
+        403 from an unrelated authorization failure, or a 409 whose body is
+        malformed or carries some other code.
+        """
+        self.assertEqual(
+            status, REFUSAL_STATUS,
+            "A neither performed the fallback mutation nor gave #409's "
+            "refusal — it answered %r %r. That is a defect, not a third "
+            "acceptable future: this case exists to tell those two apart, so "
+            "a crash, a wrong lookup or an unrelated refusal must fail here."
+            % (status, body))
+        self.assertIsInstance(
+            body, dict, "the refusal body is not a JSON object: %r" % (body,))
+        self.assertEqual(
+            sorted(body), ["error"],
+            "the refusal body is not a bare structured error envelope: %r"
+            % (body,))
+        error = body["error"]
+        self.assertIsInstance(
+            error, dict, "`error` is not an object: %r" % (body,))
+        self.assertEqual(
+            error.get("code"), REFUSAL_CODE,
+            "a %d was returned with code %r, not %r — some OTHER conflict is "
+            "being mistaken for #409's fail-closed refusal: %r"
+            % (REFUSAL_STATUS, error.get("code"), REFUSAL_CODE, body))
+        missing = ERROR_REQUIRED_KEYS - set(error)
+        self.assertEqual(
+            missing, set(),
+            "the refusal body is malformed — missing %r: %r" % (missing, body))
+        extra = set(error) - ERROR_ALLOWED_KEYS
+        self.assertEqual(
+            extra, set(),
+            "the refusal body carries unexpected keys %r: %r" % (extra, body))
+        self.assertIsInstance(
+            error["message"], str,
+            "the refusal message is not a string: %r" % (body,))
+        self.assertTrue(
+            error["message"].strip(),
+            "the refusal carries an empty message, so it is not the operator-"
+            "facing contract #410 specifies: %r" % (body,))
+
+    def _assert_a_answered_exactly_one_of_the_two_admissible_ways(
+            self, race, before):
+        """THE gate. Exactly two outcomes are legal; everything else fails.
+
+        Called only after the pause window has closed, so reading
+        ``self.store`` here is safe.
+        """
+        status, body = race["a"]["response"]
+        after = self._effects()
+        if status == 200:
+            self._stamp("RECORDED (no saved selection): A PERFORMED the "
+                        "fallback mutation: %s %r" % (status, body))
+            self.assertEqual(
+                body, {"discarded": EXPECTED_DRAFTS},
+                "A answered 200 with something other than the full batch of "
+                "its own PRE-SWITCH tuple: %r" % (body,))
+            self._assert_the_complete_discard_landed(before, after)
+            return "mutated"
+        self._assert_is_the_fail_closed_refusal(status, body)
+        self._stamp("RECORDED (no saved selection): A REFUSED fail-closed: "
+                    "%s %r" % (status, body))
+        self._assert_nothing_changed(
+            before, after,
+            "A refused with #409's %r" % (REFUSAL_CODE,))
+        return "refused"
 
     # -- case 1: an EXPLICIT pre-switch selection ---------------------------
     def test_a_context_switch_cannot_land_inside_a_discard(self):
@@ -697,38 +1098,42 @@ class PostgresContextSwitchRaceTest(unittest.TestCase):
         is not a lock; the advisory lock can, because it exists before the row
         does. Here that claim meets two real backends.
 
-        A's RESPONSE is deliberately not pinned. Today the un-chosen mutation
-        succeeds (#409's defect, owned by the RED oracle in
+        A's response is not FROZEN, but it is not left open either. Today the
+        un-chosen mutation succeeds (#409's defect, owned by the RED oracle in
         ``test_explicit_mutation_context.py``); once that fix lands it will be
-        refused. Either way the ORDERING property asserted here is the same,
-        and the response actually observed is recorded in the timeline rather
-        than frozen into an assertion this file would have to fight.
+        refused. Those are the only two answers this case admits, each with
+        its complete persisted consequences:
+
+          * ``200 {"discarded": 6}`` with the six Games deleted, their six ice
+            slots back to AVAILABLE and six ``draft_game_discarded`` audit
+            rows; or
+          * ``409 active_context_required``, matched on shape, having changed
+            no Game, no slot and no audit row.
+
+        Anything else FAILS. Before this gate existed the branch accepted every
+        non-200, so a 500 from a crash — or a 404, or an unrelated
+        authorization refusal — passed as long as the six drafts happened to
+        survive, and a crash could satisfy the very case written to separate
+        today's mutation from #409's fail-closed contract. Both of those
+        substitutions are now exercised as falsifying mutations at the
+        live-wrapper seam and both turn this test RED.
         """
         client = self._login(OPERATOR)
         self.assertIsNone(
             self.store.get_active_context(OPERATOR_ID),
             "this account was supposed to have no saved context row")
+        # The ledger both branches are stated against, read while touching
+        # `self.store` is still safe (A is not parked yet).
+        before = self._effects()
 
         race = self._run_switch_race(client, "discard", OPERATOR_ID)
         self._assert_b_was_blocked_and_ordered_after_a(race)
 
-        status, body = race["a"]["response"]
-        self._stamp("RECORDED (no saved selection): A answered %s %r"
-                    % (status, body))
         # Whatever A did, it can only have been against the tuple it resolved
-        # BEFORE the switch. B's target owns no drafts, so acting on it is
-        # indistinguishable from acting on nothing — assert on the games.
-        remaining = [g for g in self.store.all_games() if g.is_draft]
-        if status == 200:
-            self.assertEqual(
-                body, {"discarded": EXPECTED_DRAFTS},
-                "A acted on a partial or foreign batch: %r" % (body,))
-            self.assertEqual(remaining, [],
-                             "A reported six discards but drafts survived")
-        else:
-            self.assertEqual(
-                len(remaining), EXPECTED_DRAFTS,
-                "A refused but still destroyed drafts: %r" % (body,))
+        # BEFORE the switch: B's target owns no drafts, so a batch of six can
+        # only be the pre-switch tuple's.
+        self._assert_a_answered_exactly_one_of_the_two_admissible_ways(
+            race, before)
         saved = self.store.get_active_context(OPERATOR_ID)
         self.assertEqual(
             (saved.program_id, saved.season_id),
@@ -761,15 +1166,122 @@ class PostgresContextSwitchRaceTest(unittest.TestCase):
             "the earlier blocking result is not attributable to the key")
         self.assertIsInstance(race["b"]["response"], dict)
         self.assertNotIn("error", race["b"]["response"], race["b"]["response"])
+        # Against A's DATABASE boundary, not its HTTP response — and here that
+        # makes the control STRICTLY STRONGER rather than merely correct: the
+        # bystander did not just beat A's client, it committed before A's
+        # transaction did, while A still held the key for its own user.
         self.assertLess(
-            race["b"]["finished_at"], race["a"]["finished_at"],
-            "the bystander's switch did not commit inside A's window")
+            race["b"]["finished_at"], race["a"]["committed_at"],
+            "the bystander's switch did not commit inside A's window: it "
+            "returned at %.6f but A's own COMMIT was already at %.6f"
+            % (race["b"]["finished_at"], race["a"]["committed_at"]))
         saved = self.store.get_active_context(BYSTANDER_ID)
         self.assertEqual((saved.program_id, saved.season_id),
                          (self.other["program"], self.other["season"]))
         # A still did its own work, unaffected.
         self.assertEqual(race["a"]["response"],
                          (200, {"discarded": EXPECTED_DRAFTS}))
+
+    # -- the boundary is the COMMIT, not the response ----------------------
+    def test_the_ordering_boundary_is_a_s_commit_not_a_s_response_delivery(
+            self):
+        """The ordering assertion must survive A answering its client LATE.
+
+        WHAT WAS WRONG BEFORE. This file used to compare B's return against
+        the moment A's HTTP client had decoded A's response. A releases its
+        transaction and its advisory lock strictly EARLIER than that — the
+        response is still being built, serialized and read off a socket after
+        the key is free — so a B that behaved perfectly, waiting for the lock
+        and committing only after A's unit ended, could still be recorded as
+        "finishing before A" and fail. The ~1 ms margin observed on real runs
+        was that response tail, not a lock violation.
+
+        WHAT THIS PROVES. Same race, same locks, one addition: A's response is
+        deliberately held for ``RESPONSE_HOLD_SECONDS`` AFTER its database
+        unit is completely over (``_hold_response_delivery`` wraps the live
+        ``ApiService`` method the route calls and sleeps only once it has
+        returned, i.e. after COMMIT and after ``pg_advisory_unlock``). Nothing
+        about the protected window changes; only the round trip does. So:
+
+          * the ORDERING assertion still passes, because it is now anchored to
+            A's lock release — that is the corrected measurement working;
+          * and the OLD anchor is shown to be wrong on this very run, by
+            asserting the response-delivery comparison it used is now FALSE:
+            B returns well before A's client does. A file still using it would
+            fail here while nothing was ever violated.
+
+        AND IT IS NOT VACUOUS. Run with ``SqlStore.active_context_mutex``
+        reduced to a bare ``yield`` and ``_lock_active_context_mutex`` to a
+        no-op — both advisory locks gone — this case goes RED on exactly the
+        ordering assertion: B commits its switch while A is still parked, and
+        A's unit ends about three seconds LATER. So the hold buys tolerance of
+        a late response, not tolerance of a lost mutex.
+
+        WHY THIS CASE USES THE NO-SAVED-SELECTION SHAPE, and not the
+        explicitly-selected one. Measured, in the same mutation run: with both
+        advisory locks neutered the explicitly-selected cases STILL order
+        correctly, because ``resolve_with_league(lock=True)`` row-locks the
+        caller's saved ``user_active_context`` row via
+        ``get_active_context_for_update`` and a competing
+        ``set_active_context`` blocks on THAT. An absent row cannot be
+        row-locked, so the first-ever-selection shape is the one where the
+        advisory pair is the only thing that can order the two connections —
+        which makes it the only shape in which neutering that pair is a
+        genuine falsifier for the assertion under repair.
+
+        A's own ANSWER is therefore held to the same two-outcome gate as
+        ``test_a_first_ever_selection_cannot_land_inside_a_fallback_mutation``
+        (#409's fix flips it from the fallback mutation to the fail-closed
+        refusal); the boundary property asserted here is identical either way.
+        """
+        client = self._login(OPERATOR)
+        self.assertIsNone(
+            self.store.get_active_context(OPERATOR_ID),
+            "this account was supposed to have no saved context row, which is "
+            "what makes the advisory pair the only possible orderer here")
+        before = self._effects()
+        self._hold_response_delivery("discard_draft_games",
+                                     RESPONSE_HOLD_SECONDS)
+
+        race = self._run_switch_race(client, "discard", OPERATOR_ID)
+        self._assert_b_was_blocked_and_ordered_after_a(race)
+
+        # The hold really happened, and it happened AFTER the unit ended: this
+        # is what makes the run a genuine test of the boundary rather than a
+        # rerun of the ordinary case with extra prose.
+        tail = race["a"]["http_finished_at"] - race["a"]["unit_ended_at"]
+        self.assertGreaterEqual(
+            tail, RESPONSE_HOLD_SECONDS,
+            "A's response was not actually held after its database unit "
+            "ended (tail %.3fs < %.1fs), so this test did not exercise the "
+            "very separation it exists to prove" % (tail, RESPONSE_HOLD_SECONDS))
+        # The OLD comparison, evaluated explicitly and required to be FALSE.
+        self.assertLess(
+            race["b"]["finished_at"], race["a"]["http_finished_at"],
+            "B did not return before A's HTTP response, so the response-"
+            "delivery ordering was NOT inverted and this run does not "
+            "distinguish the two boundaries at all")
+        self.assertGreater(
+            race["a"]["http_finished_at"] - race["b"]["finished_at"], 0.0,
+            "sanity: B must land inside the hold window")
+        self._stamp(
+            "boundary separation: B returned %.1f ms AFTER A's lock release "
+            "and %.1f ms BEFORE A's HTTP response — the old assertion would "
+            "have called this a violation"
+            % ((race["b"]["finished_at"] - race["a"]["unit_ended_at"]) * 1000,
+               (race["a"]["http_finished_at"]
+                - race["b"]["finished_at"]) * 1000))
+
+        # And A's own work is untouched by the hold: the same two-outcome gate
+        # the unheld fallback case uses, so holding the response cannot buy a
+        # pass for a half-done mutation or a crash either.
+        self._assert_a_answered_exactly_one_of_the_two_admissible_ways(
+            race, before)
+        saved = self.store.get_active_context(OPERATOR_ID)
+        self.assertEqual(
+            (saved.program_id, saved.season_id),
+            (self.other["program"], self.other["season"]),
+            "B's switch did not end up persisted, so the race never happened")
 
     # -- positive control: the same mutation with NO concurrent switch -----
     def test_positive_control_the_same_discard_succeeds_unraced(self):
@@ -883,6 +1395,27 @@ class PostgresContextSwitchRaceTest(unittest.TestCase):
             "fails, the unfalsifiability recorded throughout this file no "
             "longer applies and the blocking assertions can be sharpened to "
             "name which mechanism ordered the two connections")
+
+
+class RefusalContractAgreementTest(unittest.TestCase):
+    """The two-answer gate above is only as good as the refusal it names.
+
+    NOT skipped without PostgreSQL, deliberately: this asserts nothing about
+    the race, only that the ``409 active_context_required`` this file will
+    accept is the SAME one the #409 RED oracle demands. If that oracle is ever
+    re-pointed at a different status or code, the race file would go on
+    accepting a refusal nothing else in the repo expects, and its "exactly two
+    outcomes" claim would quietly become "one outcome and a fiction".
+    """
+
+    def test_the_two_admissible_answers_are_the_ones_the_409_oracle_names(self):
+        import test_explicit_mutation_context as oracle
+        self.assertEqual(
+            (REFUSAL_STATUS, REFUSAL_CODE),
+            (oracle.EXPECTED_STATUS, oracle.EXPECTED_CODE),
+            "the refusal this file accepts has drifted from the one "
+            "test_explicit_mutation_context.py requires, so the fallback "
+            "race case would admit a refusal no other test expects")
 
 
 if __name__ == "__main__":
