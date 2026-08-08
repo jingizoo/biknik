@@ -549,17 +549,24 @@ class IceAvailabilitySeasonScopeTest(unittest.TestCase):
           * the refusals that remain become 404, NOT 200: they come from the
             `season.id != season_id` gate, a DIFFERENT rule from the one
             under test;
-          * an audit row is written for the retargeted attempt.
+          * the preview for the fallback target SUCCEEDS, and its matching
+            fingerprinted commit WRITES 6 slots into a Season the operator
+            never chose — measured, with the earlier assertions suppressed:
+            `AssertionError: 69 != 63`.
 
-        WHAT IS *NOT* CLAIMED. With the earlier assertions suppressed so only
-        the persisted-state ones remain, the mutation is caught by the
-        AUDIT-ROW count, not by any slot count — no ice reaches the store on
-        this path even when the gate is removed. The slot assertions below are
-        therefore a BACKSTOP against a write landing somewhere, not the proof
-        that the gate works. Saying otherwise would be the exact defect this
-        file exists to prevent: an argued value standing in for an asserted
-        one. An earlier revision of this docstring did claim a 200-with-a-
-        write here; it was wrong.
+        That last line is the whole point, and getting it to be true took two
+        corrections. The commit must carry the fingerprint the preview
+        returned — without it `commit_ice_availability` stops at
+        `preview_required`, an unrelated gate, so no write could occur and the
+        slot assertion was unfalsifiable no matter what the context gate did.
+        And the fallback target must use a FRESH, EMPTY rink granted to that
+        Season — reusing seeded inventory lets duplicate/conflicting slots
+        swallow the write for a reason that has nothing to do with scope.
+
+        Both are the defect this file exists to prevent: an earlier revision
+        claimed preview-first alone made the write observable, and claimed the
+        rink choice left "only" the context gate in the way. Neither was true
+        until the fingerprint was threaded through.
         """
         home, _foreign = self._two_programs("Stale")
         c = self._login("arena")
@@ -602,14 +609,15 @@ class IceAvailabilitySeasonScopeTest(unittest.TestCase):
         # context gate, so no ice moves and the write assertion below never
         # bites — measured: with home's rink the mutation is caught only by
         # the audit-row count, never by a slot count.
-        store_ = self.srv.STATE.api.store
-        fb_venues = {a.venue_id for a in
-                     store_.season_venue_access_for_season(fallback_season.id)}
-        fb_rink = next((r.id for r in store_.all_rinks()
-                        if r.venue_id in fb_venues), None)
-        self.assertIsNotNone(
-            fb_rink, "no rink is reachable for the fallback Season, so a "
-                     "retargeted write could not be observed here")
+        # A FRESH, EMPTY rink granted to the fallback Season. Reusing seeded
+        # inventory would let duplicate/conflicting slots swallow the write
+        # and make the assertion inert for a reason unrelated to the gate.
+        svc = self.srv.STATE.api.setup
+        fb_venue = svc.create_venue("Fallback Probe Venue",
+                                    league_id=fallback_season.program_id)
+        svc.grant_season_venue_access(fallback_season.id, fb_venue.id)
+        fb_rink = svc.create_rink(fb_venue.id, "Fallback Probe Sheet").id
+        self.assertEqual(self._slots(fb_rink), 0, "probe rink is not empty")
 
         before_home = self._slots(home["rink_id"])
         before_audit = self._audit_count()
@@ -632,11 +640,19 @@ class IceAvailabilitySeasonScopeTest(unittest.TestCase):
             # requires a fingerprint from a matching preview, so running
             # commit first makes any retargeted write impossible and the
             # write assertion below inert no matter what the gate does.
-            p_status, _p_raw, _ = self._req(
+            p_status, _p_raw, pv = self._req(
                 c, "POST", PREVIEW, _template(target, rink))
             previews[label] = p_status
-            status, raw, _ = self._req(
-                c, "POST", COMMIT, _template(target, rink))
+            # Carry the preview's OWN fingerprint into the commit. Without it
+            # `commit_ice_availability` stops at `preview_required` — an
+            # unrelated gate — so no write could ever occur and the slot
+            # assertions below would be unfalsifiable no matter what the
+            # context gate did.
+            body = _template(target, rink)
+            fp = (pv or {}).get("template_fingerprint")
+            if fp:
+                body["template_fingerprint"] = fp
+            status, raw, _ = self._req(c, "POST", COMMIT, body)
             seen[label] = (status, raw.replace(target, "<S>"))
 
         # Collected first, asserted after: a per-iteration assert stops at the
