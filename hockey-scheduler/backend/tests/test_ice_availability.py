@@ -1621,6 +1621,25 @@ class IceAvailabilityHttpAuthzTest(unittest.TestCase):
         return self._req(opener, "POST", "/api/auth/login",
                          {"username": username, "password": "demo"})
 
+    def _use(self, opener, program_id, season_id):
+        """SELECT the Program/Season this case targets.
+
+        #393 PR A made an explicit active tuple a precondition for ice
+        preview/commit: with nothing selected the route answers a stable
+        `409 active_context_required` that does not depend on `season_id`, so
+        the refusal cannot be used to probe which Seasons exist. The browser
+        does exactly this through the context bar before the Ice Builder is
+        reachable.
+
+        Each case selects the Season it actually builds into — deliberately
+        NOT a blanket default in `_login`, which would silently retarget the
+        cases that seed their own Program and make their real Season foreign.
+        """
+        status, body = self._req(opener, "POST", "/api/context",
+                                 {"program_id": program_id,
+                                  "season_id": season_id})
+        self.assertEqual(status, 200, body)
+
     def test_coach_forbidden(self):
         for path in ("/api/setup/ice-availability/preview",
                      "/api/setup/ice-availability/commit"):
@@ -1641,6 +1660,10 @@ class IceAvailabilityHttpAuthzTest(unittest.TestCase):
         # bogus season it gets a domain error (not 403), proving it was routed.
         c = self._client()
         self._login(c, "arena")
+        # A real selection, so the refusal below is about the BOGUS target and
+        # not about a missing context (which is its own 409, tested separately
+        # in test_ice_availability_season_scope.py).
+        self._use(c, "league_1", "season_1")
         status, body = self._req(
             c, "POST", "/api/setup/ice-availability/preview",
             _template(season_id="does-not-exist"))
@@ -1653,6 +1676,9 @@ class IceAvailabilityHttpAuthzTest(unittest.TestCase):
         # a routing proof without needing seeded inventory.
         c = self._client()
         self._login(c, "arena")
+        # A real selection, so this stays a ROUTING proof about the `windows`
+        # field rather than a context refusal.
+        self._use(c, "league_1", "season_1")
         body = {
             "season_id": "does-not-exist", "rink_ids": ["r"],
             "playable_minutes": 60, "turnover_minutes": 15,
@@ -1686,6 +1712,7 @@ class IceAvailabilityHttpAuthzTest(unittest.TestCase):
 
         c = self._client()
         self._login(c, "arena")
+        self._use(c, prog.id, season.id)
         _, pv = self._req(
             c, "POST", "/api/setup/ice-availability/preview", template)
         fp = pv["template_fingerprint"]
@@ -1727,6 +1754,7 @@ class IceAvailabilityHttpAuthzTest(unittest.TestCase):
 
         c = self._client()
         self._login(c, "arena")
+        self._use(c, prog.id, season.id)
         _, pv = self._req(c, "POST", "/api/setup/ice-availability/preview", base)
         _, pv2 = self._req(c, "POST", "/api/setup/ice-availability/preview", edited)
         # Same generated tuples, moved fingerprint — the exact gap the tuple-only
@@ -1795,6 +1823,7 @@ class IceAvailabilityHttpAuthzTest(unittest.TestCase):
 
         c = self._client()
         self._login(c, "arena")
+        self._use(c, prog.id, season.id)
         _, pv = self._req(c, "POST", "/api/setup/ice-availability/preview", template)
         fp = pv["template_fingerprint"]
         self.assertEqual(pv["totals"]["new"], 6)
@@ -1849,6 +1878,7 @@ class IceAvailabilityHttpAuthzTest(unittest.TestCase):
             "playable_minutes": 60, "turnover_minutes": 0}
         c = self._client()
         self._login(c, "arena")
+        self._use(c, prog.id, season.id)
         _, pv = self._req(c, "POST", "/api/setup/ice-availability/preview", template)
         fp = pv["template_fingerprint"]
         self.assertEqual(pv["totals"]["new"], 1)
@@ -1894,6 +1924,7 @@ class IceAvailabilityHttpAuthzTest(unittest.TestCase):
             "playable_minutes": 60, "turnover_minutes": 0}
         c = self._client()
         self._login(c, "arena")
+        self._use(c, prog.id, season.id)
         _, pv = self._req(c, "POST", "/api/setup/ice-availability/preview", template)
         fp = pv["template_fingerprint"]
         clash = next(s for s in pv["slots"] if s["status"] == "conflict")
@@ -1935,6 +1966,7 @@ class IceAvailabilityHttpAuthzTest(unittest.TestCase):
 
         c = self._client()
         self._login(c, "arena")
+        self._use(c, prog.id, season.id)
         self._req(c, "POST", "/api/setup/ice-availability/preview", template)
         status, res = self._req(
             c, "POST", "/api/setup/ice-availability/commit", template)  # no token
@@ -1967,6 +1999,7 @@ class IceAvailabilityHttpAuthzTest(unittest.TestCase):
 
         arena = self._client()
         self._login(arena, "arena")
+        self._use(arena, prog.id, season.id)
         _, pv = self._req(
             arena, "POST", "/api/setup/ice-availability/preview", template)
         fp = pv["template_fingerprint"]
@@ -1975,6 +2008,9 @@ class IceAvailabilityHttpAuthzTest(unittest.TestCase):
         # A DIFFERENT MANAGE_ARENA operator (admin) replays arena's token.
         admin = self._client()
         self._login(admin, "admin")
+        # The replayer selects the SAME Season, so the refusal below is proven
+        # to be about the token's owner and not about a missing selection.
+        self._use(admin, prog.id, season.id)
         status, res = self._req(
             admin, "POST", "/api/setup/ice-availability/commit",
             dict(template, template_fingerprint=fp))
@@ -2011,6 +2047,7 @@ class IceAvailabilityHttpAuthzTest(unittest.TestCase):
             "playable_minutes": 60, "turnover_minutes": 15}
         c = self._client()
         self._login(c, "arena")
+        self._use(c, prog.id, season.id)
         _, pv = self._req(
             c, "POST", "/api/setup/ice-availability/preview", template)
         fp = pv["template_fingerprint"]
@@ -2055,6 +2092,7 @@ class IceAvailabilityHttpAuthzTest(unittest.TestCase):
             "playable_minutes": 60, "turnover_minutes": 0}
         c = self._client()
         self._login(c, "arena")
+        self._use(c, prog.id, season.id)
         _, pv = self._req(
             c, "POST", "/api/setup/ice-availability/preview", template)
         collision = next(s for s in pv["slots"]
@@ -2099,6 +2137,7 @@ class IceAvailabilityHttpAuthzTest(unittest.TestCase):
         # real (non-anonymous) authenticated user id, with the result totals.
         c = self._client()
         self._login(c, "arena")
+        self._use(c, prog.id, season.id)
         self._req(c, "POST", "/api/setup/ice-availability/preview", template)
         audits = preview_audits()
         self.assertEqual(len(audits), 1)
@@ -2133,6 +2172,7 @@ class IceAvailabilityHttpAuthzTest(unittest.TestCase):
 
         c = self._client()
         self._login(c, "arena")
+        self._use(c, prog.id, season.id)
         _, pv = self._req(c, "POST", "/api/setup/ice-availability/preview", template)
         self.assertEqual(pv["totals"]["new"], created)
         self.assertEqual(pv["totals"]["reserved_minutes"], reserved)

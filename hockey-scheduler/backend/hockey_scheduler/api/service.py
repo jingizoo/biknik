@@ -1072,6 +1072,82 @@ class ApiService:
         league = self.store.get_league(league_id) if league_id else None
         return league is not None and league.program_id == program.id
 
+    def has_active_program_season(self, user_id, role, scope) -> bool:
+        """Whether the caller has BOTH an active Program and an active Season
+        selected (#393 PR A owner ruling).
+
+        Deliberately answers only yes/no and takes no target id: the ruling
+        requires the no-context refusal to be INDEPENDENT of the supplied
+        ``season_id``, so this is decided before any Season is looked up. A
+        real, a foreign and a nonexistent id therefore produce byte-identical
+        responses when no tuple is selected — the caller learns nothing about
+        which Seasons exist.
+
+        The ruling also forbids inferring a sole authorized Program: doing so
+        would weaken the workflow-target boundary and make API behaviour depend
+        on changing account inventory, so an operator with exactly one Program
+        and none selected is refused exactly like an operator with ten.
+        """
+        if role is None:
+            return False
+        # Deliberately keyed on the EXPLICITLY PERSISTED selection, not on
+        # `resolve_with_league` alone. `ContextService._resolve_locked` falls
+        # back to `_fallback()`, which deterministically auto-selects a Program
+        # and Season when nothing is saved — so the resolver essentially never
+        # reports "no tuple" for an operator with any authorized Program. That
+        # app-wide convenience is exactly the inference this ruling forbids at
+        # this boundary: it would make the workflow target depend on account
+        # inventory rather than on a choice the operator made.
+        #
+        # The saved selection must ALSO still be valid, which is why the
+        # resolved tuple has to agree with it: if the chosen Season was deleted
+        # or de-authorized, the resolver silently lands somewhere else, and
+        # honouring that would silently retarget the operator's work.
+        saved = self.store.get_active_context(user_id) if user_id else None
+        if saved is None or not saved.program_id or not saved.season_id:
+            return False
+        program, season, _league = self.context.resolve_with_league(
+            user_id, role, scope)
+        return (program is not None and season is not None
+                and program.id == saved.program_id
+                and season.id == saved.season_id)
+
+    def setup_season_is_active(self, season_id, user_id, role, scope):
+        """#393 PR A: is ``season_id`` the caller's EXACTLY selected Season?
+        True / False / None (no identity — do not gate).
+
+        The Season analogue of :meth:`setup_league_in_active_program`, and it
+        exists for the same reason. ``_GLOBAL_ROLES`` (League Admin, Arena
+        Manager, Viewer) are authorized for EVERY Program, so
+        ``setup_target_accessible`` returns True for any Season in the
+        installation — an authorization-only check cannot refuse an operator
+        standing in Program A who builds ice into Program B's Season. The probe
+        on `36195faa` measured exactly that: HTTP 200 on preview AND commit,
+        foreign rink slot count 0 -> 6.
+
+        So this binds to the ACTIVE tuple, both halves. The Season must be the
+        selected one, and its Program must be the selected Program — a Season
+        whose ``program_id`` has drifted away from the active Program is
+        refused even if its id still matches, because the tuple is the unit.
+
+        It is a WORKFLOW-TARGET boundary, not account authorization (#393
+        prerequisite 1): these operators can legitimately switch context and
+        perform the same write. Nothing is reachable through this gate that is
+        not reachable another way, which is why the ruling calls it
+        cross-context consistency and privacy rather than privilege escalation.
+        """
+        if role is None:
+            return None
+        program, season, _league = self.context.resolve_with_league(
+            user_id, role, scope)
+        if program is None or season is None:
+            return False
+        # Both halves of the tuple, and the target must BE the active Season —
+        # not merely some Season in the active Program (#393 prerequisite 2).
+        return (bool(season_id)
+                and season.id == season_id
+                and season.program_id == program.id)
+
     def _setup_target_created_by(self, kind, record_id, user_id) -> bool:
         """True when ``user_id`` is the recorded CREATOR of this record.
 
@@ -1287,6 +1363,9 @@ class ApiService:
         * ``rule="active_program_league"`` → #367's create-side rule
           (``setup_league_in_active_program``), for a League id supplied in a
           CREATE body;
+        * ``rule="active_season"`` → #393 PR A's exact-tuple rule
+          (``setup_season_is_active``), for a Season id naming the workflow
+          target of an ice-availability preview or commit;
         * ``rule="writable_parent"`` → #369 review's WRITE-side parent rule
           (``setup_parent_writable``), for a destination parent id supplied in
           a reassign body;
@@ -1324,6 +1403,9 @@ class ApiService:
             return self.setup_venue_grantable(record_id, user_id, role, scope)
         if rule == "active_program_league":
             return self.setup_league_in_active_program(
+                record_id, user_id, role, scope)
+        if rule == "active_season":
+            return self.setup_season_is_active(
                 record_id, user_id, role, scope)
         return self.setup_target_accessible(
             normalized, record_id, user_id, role, scope)
@@ -1512,6 +1594,13 @@ class ApiService:
                     record_id, user_id, role, scope)
             elif rule == "active_program_league":
                 allowed = self.setup_league_in_active_program(
+                    record_id, user_id, role, scope)
+            elif rule == "active_season":
+                # Re-decided HERE, under the Season's lock and inside the same
+                # transaction as the commit it guards. The preflight's answer
+                # is already stale: between it and the write the active context
+                # can change, or the Season's Program can move.
+                allowed = self.setup_season_is_active(
                     record_id, user_id, role, scope)
             elif rule == "writable_parent":
                 # #369 review's write-side parent rule, re-decided HERE under

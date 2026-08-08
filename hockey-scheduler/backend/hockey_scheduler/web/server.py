@@ -2601,12 +2601,70 @@ class Handler(BaseHTTPRequestHandler):
                       "end_local", "start_date", "end_date", "playable_minutes",
                       "turnover_minutes", "exclusion_dates", "windows")
             kwargs = {k: body.get(k) for k in fields}
+            # #393 PR A — the named Season must be the caller's EXACTLY
+            # selected one. Without this the route was both a cross-context
+            # WRITE (an operator in Program A committed AVAILABLE ice into
+            # Program B's Season: 200, foreign slot count 0 -> 6) and an
+            # EXISTENCE ORACLE WITH A PAYLOAD (a foreign Season echoed the
+            # other Program's Season/Venue/Rink names and its whole slot
+            # inventory at 200, while a nonexistent one returned 404).
+            #
+            # `rule="active_season"`, not the generic ceiling: League Admin and
+            # Arena Manager are _GLOBAL_ROLES, authorized for every Program, so
+            # an authorization-only check refuses neither. This is a
+            # workflow-target boundary — they may switch context and do the
+            # same write legitimately.
+            #
+            # The model is the sibling that already gets this right:
+            # /api/v2/setup/seasons/<id>/archive names a Season the same way,
+            # routes through _guarded_mutation, and returns byte-identical 404s
+            # for foreign and nonexistent with no name leak.
+            season_id = kwargs.get("season_id")
+            # Owner ruling — THREE distinct states, in this order:
+            #
+            #   1. no active tuple      -> 409 active_context_required
+            #   2. active tuple, target foreign / sibling-Season / nonexistent
+            #                           -> byte-identical generic 404
+            #   3. target IS the active Season -> proceed
+            #
+            # State 1 is decided FIRST and without touching `season_id`, so a
+            # real, a foreign and a nonexistent id are indistinguishable when
+            # nothing is selected — the refusal cannot be used to probe which
+            # Seasons exist. It is a distinct code from state 2 on purpose:
+            # "you have not chosen where to work" is a different, recoverable
+            # condition from "that is not your target", and PR B renders it as
+            # a "Select a Program and Season" state rather than an error.
+            #
+            # A sole authorized Program is deliberately NOT inferred: that
+            # would weaken the workflow-target boundary and make API behaviour
+            # depend on changing account inventory.
+            if not api.has_active_program_season(user_id, role, scope):
+                return self._send_json({"error": {
+                    "code": "active_context_required",
+                    "message": ("Select a Program and Season before building "
+                                "ice availability.")}}, 409)
             if path.endswith("/preview"):
+                # A read: it writes nothing, so the cheap preflight IS the
+                # whole gate. There is no check/use window to close because
+                # there is no use.
+                if self._reject_target_outside_scope(
+                        "season", season_id, user_id, role, scope,
+                        "active_season"):
+                    return
                 return self._send_api(
                     api.preview_ice_availability(actor_id=user_id, **kwargs))
-            return self._send_api(api.commit_ice_availability(
-                actor_id=user_id,
-                template_fingerprint=body.get("template_fingerprint"), **kwargs))
+            # A write: the decision has to be atomic with it. _guarded_mutation
+            # re-decides under the Season's row lock inside the commit's own
+            # transaction, so a context switch or a Season reparent landing
+            # between check and write cannot leave the commit authorized
+            # against a world that no longer exists.
+            return self._guarded_mutation(
+                [("season", season_id, "active_season")],
+                lambda: api.commit_ice_availability(
+                    actor_id=user_id,
+                    template_fingerprint=body.get("template_fingerprint"),
+                    **kwargs),
+                user_id, role, scope)
 
         # Scheduling policy (#277 Slice B): upsert/clear one Program/Season/
         # Rink scope's turnover + curfew knobs. Checked BEFORE the generic
