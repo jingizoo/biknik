@@ -3099,11 +3099,43 @@ async function checkRoleScenarios(browser, viewport) {
     await page.check(`.ib-rink[value="${k.rinkK3}"]`);
     let releasePreviewK3;
     const previewHoldK3 = new Promise((resolve) => { releasePreviewK3 = resolve; });
+    // Same correction as the K4 Commit below: FETCH while K3 is still
+    // selected, hold only DELIVERY. `await hold; route.continue()` sends the
+    // Preview only after the switch back to K1, so the active-Season gate
+    // answers 404 and this leg proves the client ignores a late FAILURE —
+    // when its purpose is a late SUCCESSFUL preview.
+    //
+    // FALSIFIED: restoring the `await previewHoldK3; route.continue()` form
+    // reproduces run 1019's shard-4 failure verbatim, on desktop, at
+    // checkRoleScenarios — "[console] Failed to load resource: the server
+    // responded with a status of 404 (Not Found)". The corrected form passes
+    // on desktop AND 390px.
+    let k3PreviewStatus = null;
+    let k3PreviewBody = null;
+    let markK3Fetched;
+    const k3Fetched = new Promise((resolve) => { markK3Fetched = resolve; });
     await page.route("**/api/setup/ice-availability/preview", async (route) => {
-      await previewHoldK3; await route.continue();
+      const response = await route.fetch();
+      k3PreviewStatus = response.status();
+      try { k3PreviewBody = await response.json(); } catch (e) { k3PreviewBody = null; }
+      markK3Fetched();
+      await previewHoldK3;
+      try { await route.fulfill({ response }); } catch (e) { /* page moved on */ }
     });
     await page.click("[data-ib-preview]");
-    await new Promise((r) => setTimeout(r, 200));  // let the stale Preview request actually leave
+    // Await the real fetch rather than sleeping: a sleep lets the switch race
+    // the in-flight preview, and this leg depends on it having SUCCEEDED
+    // under K3.
+    await k3Fetched;
+    if (k3PreviewStatus !== 200) {
+      fail(`(K2) the held K3 Preview was ${k3PreviewStatus}, not 200 — this `
+        + `leg must discard a late SUCCESSFUL preview, not a late failure`);
+    }
+    if (!k3PreviewBody || !Array.isArray(k3PreviewBody.slots)
+        || !k3PreviewBody.slots.length) {
+      fail("(K2) the held K3 Preview returned 200 but no real preview rows, "
+        + "so discarding it below proves nothing");
+    }
     const switchToK1Again = `${k.progK1}|${k.seasonK1}`;
     await selectContextAndWaitForStableView(page, base, {
       contextValue: switchToK1Again,
