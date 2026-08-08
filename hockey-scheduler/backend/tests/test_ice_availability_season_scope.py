@@ -539,6 +539,27 @@ class IceAvailabilitySeasonScopeTest(unittest.TestCase):
         more useful `season_archived` refusal naming what to reopen. That is
         correct and is asserted separately below. Here the saved Season is
         DELETED, which is what actually triggers the fallback.
+
+        MEASURED, so the claims below are not argued ones. With the saved row
+        dangling and `_selection_is_explicit` reduced to a plain
+        `program is not None and season is not None`:
+
+          * preview stops failing closed — that is the assertion that fires
+            first and the one that carries this test;
+          * the refusals that remain become 404, NOT 200: they come from the
+            `season.id != season_id` gate, a DIFFERENT rule from the one
+            under test;
+          * an audit row is written for the retargeted attempt.
+
+        WHAT IS *NOT* CLAIMED. With the earlier assertions suppressed so only
+        the persisted-state ones remain, the mutation is caught by the
+        AUDIT-ROW count, not by any slot count — no ice reaches the store on
+        this path even when the gate is removed. The slot assertions below are
+        therefore a BACKSTOP against a write landing somewhere, not the proof
+        that the gate works. Saying otherwise would be the exact defect this
+        file exists to prevent: an argued value standing in for an asserted
+        one. An earlier revision of this docstring did claim a 200-with-a-
+        write here; it was wrong.
         """
         home, _foreign = self._two_programs("Stale")
         c = self._login("arena")
@@ -557,16 +578,73 @@ class IceAvailabilitySeasonScopeTest(unittest.TestCase):
             season_id="season_vanished", updated_at=saved.updated_at,
             league_id=saved.league_id))
 
+        # ASK the resolver where the fallback actually goes; never assume it.
+        # An earlier version of this test labelled `home` as "what fallback
+        # would pick" and asserted no ice landed on HOME's rink. Both were
+        # wrong. `_fallback()` sorts EVERY authorized Program by id and takes
+        # the first one holding an authorized active Season — and Arena
+        # Manager is a `_GLOBAL_ROLE`, authorized for all of them — so it
+        # lands on the demo seed, never on `home`. The retarget hazard is
+        # real but it points somewhere this test was not looking, which made
+        # the write assertion inert: under the mutation it names, `home`'s
+        # rink is untouched and the test passed that line for free.
+        _program, fallback_season, _league = (
+            self.srv.STATE.api.context.resolve_with_league(
+                "user_arena", Role.ARENA_MANAGER, None))
+        self.assertIsNotNone(fallback_season, "fallback resolved nothing")
+        self.assertNotEqual(
+            fallback_season.id, home["season_id"],
+            "fixture no longer exercises retargeting: the fallback now picks "
+            "the operator's own Season, so honouring it would be harmless")
+
+        # A rink the FALLBACK Season can really use. Sending home's rink for
+        # that target makes the commit fail on venue access rather than on the
+        # context gate, so no ice moves and the write assertion below never
+        # bites — measured: with home's rink the mutation is caught only by
+        # the audit-row count, never by a slot count.
+        store_ = self.srv.STATE.api.store
+        fb_venues = {a.venue_id for a in
+                     store_.season_venue_access_for_season(fallback_season.id)}
+        fb_rink = next((r.id for r in store_.all_rinks()
+                        if r.venue_id in fb_venues), None)
+        self.assertIsNotNone(
+            fb_rink, "no rink is reachable for the fallback Season, so a "
+                     "retargeted write could not be observed here")
+
         before_home = self._slots(home["rink_id"])
         before_audit = self._audit_count()
+        # Total, not per-rink: a silent retarget writes into the FALLBACK's
+        # Season, whose rink this test has no reason to know. Counting every
+        # slot in the store catches the write wherever it lands.
+        before_total = len(self.srv.STATE.api.store.all_ice_slots())
         seen = {}
-        for label, target in (("the dangling selection", "season_vanished"),
-                              ("what fallback would pick", home["season_id"]),
-                              ("nonexistent", NONEXISTENT_SEASON)):
+        previews = {}
+        for label, target, rink in (
+                ("the dangling selection", "season_vanished", home["rink_id"]),
+                ("the operator's own Season", home["season_id"],
+                 home["rink_id"]),
+                # Its OWN rink, so the only thing that can stop the write is
+                # the context gate under test.
+                ("WHAT FALLBACK ACTUALLY PICKS", fallback_season.id, fb_rink),
+                ("nonexistent", NONEXISTENT_SEASON, home["rink_id"])):
+            # PREVIEW FIRST, then commit — the real client order, and the only
+            # order under which this test can observe a write at all. Commit
+            # requires a fingerprint from a matching preview, so running
+            # commit first makes any retargeted write impossible and the
+            # write assertion below inert no matter what the gate does.
+            p_status, _p_raw, _ = self._req(
+                c, "POST", PREVIEW, _template(target, rink))
+            previews[label] = p_status
             status, raw, _ = self._req(
-                c, "POST", COMMIT, _template(target, home["rink_id"]))
+                c, "POST", COMMIT, _template(target, rink))
             seen[label] = (status, raw.replace(target, "<S>"))
 
+        # Collected first, asserted after: a per-iteration assert stops at the
+        # first deviation, which hides what the remaining targets did — and
+        # the fallback target is the last and most important of them.
+        self.assertEqual(
+            set(previews.values()), {409},
+            f"preview did not fail closed on every target: {previews}")
         self.assertEqual(
             {s for s, _ in seen.values()}, {409},
             f"a stale selection did not fail closed: {seen}")
@@ -574,11 +652,15 @@ class IceAvailabilitySeasonScopeTest(unittest.TestCase):
             len({b for _, b in seen.values()}), 1,
             f"the stale-selection refusal is target-DEPENDENT, so it leaks "
             f"which Seasons exist: {seen}")
-        # The decisive one: the fallback's own pick is refused too. Without
-        # the saved-vs-resolved equality check this would have committed 200.
+        # The decisive one, now pointed at the Season the fallback would
+        # really have retargeted to.
+        self.assertEqual(
+            len(self.srv.STATE.api.store.all_ice_slots()), before_total,
+            "a stale selection wrote ice SOMEWHERE — the fallback silently "
+            "retargeted the operator's work to a Season they never chose")
         self.assertEqual(self._slots(home["rink_id"]), before_home,
-                         "a stale selection wrote ice into the Season the "
-                         "fallback silently retargeted to")
+                         "a stale selection wrote ice into the operator's "
+                         "own Season without an explicit selection")
         self.assertEqual(self._audit_count(), before_audit,
                          "a stale selection still wrote an audit row")
 
