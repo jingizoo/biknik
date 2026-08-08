@@ -66,6 +66,7 @@ exactly these global roles.
 import json
 import os
 import threading
+import time
 import unittest
 import uuid
 import urllib.error
@@ -75,8 +76,11 @@ from http.server import ThreadingHTTPServer
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
+from datetime import datetime, timezone
+
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.domain import Role
+from hockey_scheduler.domain.setup_models import ActiveContext
 from hockey_scheduler.store import InMemoryStore, SqlStore
 
 TZ = "America/Toronto"
@@ -519,6 +523,83 @@ class IceAvailabilitySeasonScopeTest(unittest.TestCase):
         self.assertEqual(self._audit_count(), before_audit,
                          "the no-context refusal still wrote an audit row")
 
+    # -- a STALE persisted selection must fail closed ------------------------
+    def test_a_stale_saved_selection_fails_closed(self):
+        """The PR body claims a stale selection fails closed rather than
+        silently retargeting. Nothing asserted it until now.
+
+        The danger is specific: when the saved Season can no longer be
+        resolved, `ContextService._resolve_locked` falls through to
+        `_fallback()`, which AUTO-SELECTS a different one. Honouring that would
+        move the operator's work to a Season they never chose — silently, and
+        with a 200.
+
+        STALE means UNRESOLVABLE, which archiving does not produce: an archived
+        Season stays authorized and still resolves, so the operator gets the
+        more useful `season_archived` refusal naming what to reopen. That is
+        correct and is asserted separately below. Here the saved Season is
+        DELETED, which is what actually triggers the fallback.
+        """
+        home, _foreign = self._two_programs("Stale")
+        c = self._login("arena")
+        self._use(c, home["program_id"], home["season_id"])
+        self._positive_control(c, home)               # ANTI-VACUITY
+
+        # Make the SAVED ROW itself dangle, keeping the row present. Deleting
+        # the Season instead also clears the context row, so `saved` becomes
+        # None and the refusal comes from an earlier branch — the equality
+        # check would never be exercised and the test would be vacuous. It
+        # was, until a mutation proved it.
+        store = self.srv.STATE.api.store
+        saved = store.get_active_context("user_arena")
+        store.set_active_context(ActiveContext(
+            id=saved.id, program_id=saved.program_id,
+            season_id="season_vanished", updated_at=saved.updated_at,
+            league_id=saved.league_id))
+
+        before_home = self._slots(home["rink_id"])
+        before_audit = self._audit_count()
+        seen = {}
+        for label, target in (("the dangling selection", "season_vanished"),
+                              ("what fallback would pick", home["season_id"]),
+                              ("nonexistent", NONEXISTENT_SEASON)):
+            status, raw, _ = self._req(
+                c, "POST", COMMIT, _template(target, home["rink_id"]))
+            seen[label] = (status, raw.replace(target, "<S>"))
+
+        self.assertEqual(
+            {s for s, _ in seen.values()}, {409},
+            f"a stale selection did not fail closed: {seen}")
+        self.assertEqual(
+            len({b for _, b in seen.values()}), 1,
+            f"the stale-selection refusal is target-DEPENDENT, so it leaks "
+            f"which Seasons exist: {seen}")
+        # The decisive one: the fallback's own pick is refused too. Without
+        # the saved-vs-resolved equality check this would have committed 200.
+        self.assertEqual(self._slots(home["rink_id"]), before_home,
+                         "a stale selection wrote ice into the Season the "
+                         "fallback silently retargeted to")
+        self.assertEqual(self._audit_count(), before_audit,
+                         "a stale selection still wrote an audit row")
+
+    def test_an_archived_selection_says_so_rather_than_404ing(self):
+        """The other half, and the reason the test above deletes rather than
+        archives: an archived Season is still the operator's OWN valid
+        selection, so flattening it into the generic 404 would hide an
+        actionable message behind a privacy refusal."""
+        home, _foreign = self._two_programs("Arch")
+        c = self._login("arena")
+        self._use(c, home["program_id"], home["season_id"])
+        self._positive_control(c, home)
+        self.srv.STATE.api.setup.archive_season(
+            home["season_id"], reason="arch-test", actor_id="admin")
+
+        status, raw, _ = self._req(
+            c, "POST", COMMIT,
+            _template(home["season_id"], home["rink_id"]))
+        self.assertEqual(status, 400, raw)
+        self.assertIn("season_archived", raw)
+
     # -- the CONTROL: the gate exists and works one route over ---------------
     def test_gated_sibling_route_refuses_the_same_foreign_season(self):
         """`/api/v2/setup/seasons/<id>/archive` names a Season exactly the way
@@ -624,4 +705,227 @@ class SeasonScopeRuleTriStoreTest(unittest.TestCase):
         self.assertIn("memory", seen)
         self.assertIn("sqlite", seen)
         self.assertGreaterEqual(len(seen), 2, f"backends exercised: {seen}")
+
+
+# -- prerequisite 4b: the PostgreSQL context-switch RACE -------------------
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class IceCommitContextRacePgTest(unittest.TestCase):
+    """The ice commit must be atomic against a CONCURRENT CONTEXT SWITCH, on
+    two real PostgreSQL connections.
+
+    The earlier revision routed this through `_guarded_mutation`, which locks
+    the SEASON and resolves the tuple unlocked. Nothing contended with the
+    caller's ActiveContext row, so `POST /api/context` could commit tuple B
+    between the A-tuple decision and A's write and BOTH transactions
+    succeeded. A Season lock cannot serialize a write to a different table.
+
+    Proof here is not timing-based: `pg_stat_activity` is polled until the
+    switching backend is genuinely `active` and waiting on `Lock`.
+    """
+
+    _TS = datetime(2027, 1, 1, tzinfo=timezone.utc)
+
+    def setUp(self):
+        self.url = os.environ["TEST_DATABASE_URL"]
+        SqlStore(self.url).clear_all_data()
+
+    def _world(self, store):
+        api = ApiService(store)
+        svc = api.setup
+        pa = svc.create_program("Race A", timezone_name=TZ)
+        sa = svc.create_season(pa.id, "Race A S1")
+        va = svc.create_venue("Race A Arena", league_id=pa.id)
+        svc.grant_season_venue_access(sa.id, va.id)
+        ra = svc.create_rink(va.id, "Race A Sheet")
+        pb = svc.create_program("Race B", timezone_name=TZ)
+        sb = svc.create_season(pb.id, "Race B S1")
+        api.accounts.create_account("racer", "demo", Role.ARENA_MANAGER)
+        api.set_active_context("racer", Role.ARENA_MANAGER, None, pa.id, sa.id)
+        return api, pa.id, sa.id, ra.id, pb.id, sb.id
+
+    def _backend_pid(self, store):
+        with store.conn.cursor() as cur:
+            cur.execute("SELECT pg_backend_pid() AS pid")
+            return cur.fetchone()["pid"]
+
+    def _wait_blocked_on_lock(self, pid, timeout=10.0):
+        import psycopg
+        deadline = time.monotonic() + timeout
+        with psycopg.connect(self.url, autocommit=True) as mon:
+            while time.monotonic() < deadline:
+                with mon.cursor() as cur:
+                    cur.execute("SELECT state, wait_event_type FROM "
+                                "pg_stat_activity WHERE pid = %s", (pid,))
+                    row = cur.fetchone()
+                    if row and row[0] == "active" and row[1] == "Lock":
+                        return True
+                time.sleep(0.02)
+        return False
+
+    def _template(self, season_id, rink_id):
+        return dict(season_id=season_id, rink_ids=[rink_id], weekdays=[1, 3],
+                    start_local="18:00", end_local="22:00",
+                    start_date="2026-09-01", end_date="2026-09-07",
+                    playable_minutes=60, turnover_minutes=15)
+
+    def test_a_context_switch_cannot_commit_mid_flight(self):
+        seed = SqlStore(self.url)
+        api_seed, pa, sa, ra, pb, sb = self._world(seed)
+
+        writer = SqlStore(self.url)      # A: commits ice into its own Season
+        switcher = SqlStore(self.url)    # B: tries to switch context underneath
+        api_a, api_b = ApiService(writer), ApiService(switcher)
+
+        # A legitimate preview first: commit refuses an un-previewed template
+        # (`preview_required`), and this test is about the RACE, not that gate.
+        pv = api_a.preview_ice_availability(
+            actor_id="racer", **self._template(sa, ra))
+        fingerprint = pv.get("template_fingerprint")
+        self.assertTrue(fingerprint, f"preview gave no fingerprint: {pv}")
+
+        paused = threading.Event()
+        release = threading.Event()
+        orig = writer._exec
+
+        def instrumented(query, params=()):
+            result = orig(query, params)
+            # Pause once the ActiveContext row is LOCKED and the tuple
+            # authorized — the exact window the switch must not slip through.
+            if "user_active_context" in query and "FOR UPDATE" in query.upper():
+                paused.set()
+                release.wait(20)
+            return result
+        writer._exec = instrumented
+
+        out = {}
+        def do_commit():
+            out["a"] = api_a.commit_ice_availability_in_active_season(
+                "racer", Role.ARENA_MANAGER, None,
+                template_fingerprint=fingerprint, **self._template(sa, ra))
+        def do_switch():
+            out["b"] = api_b.set_active_context(
+                "racer", Role.ARENA_MANAGER, None, pb, sb)
+
+        # Capture B's backend pid BEFORE it is busy: once the switch is
+        # blocked, that connection cannot answer a pid query — asking then
+        # contends with the very statement being observed.
+        switcher_pid = self._backend_pid(switcher)
+
+        ta = threading.Thread(target=do_commit, daemon=True); ta.start()
+        self.assertTrue(paused.wait(20), "A never reached the locked window")
+
+        tb = threading.Thread(target=do_switch, daemon=True); tb.start()
+        blocked = self._wait_blocked_on_lock(switcher_pid)
+        self.assertTrue(
+            blocked,
+            "the context switch was NOT blocked by the commit's ActiveContext "
+            "lock — a switch can land mid-flight and the commit is not atomic")
+
+        release.set(); ta.join(20); tb.join(20)
+        writer._exec = orig
+
+        self.assertNotIn("error", out.get("a", {}), f"A failed: {out.get('a')}")
+        slots = sum(1 for s in seed.all_ice_slots() if s.rink_id == ra)
+        self.assertEqual(slots, 6, f"A's ice did not land: {out.get('a')}")
+        for s in (seed, writer, switcher):
+            s.close()
+
+    def test_the_context_advisory_lock_is_held_during_the_unit(self):
+        """An advisory lock on this user's context key is held for the whole
+        commit unit, so no context write can proceed concurrently.
+
+        KNOWN LIMIT, stated rather than papered over. This does NOT
+        discriminate the SESSION-scoped `active_context_mutex` from the
+        TRANSACTION-scoped `pg_advisory_xact_lock` that
+        `resolve_with_league(lock=True)` takes: both use the same key
+        (`_ACTIVE_CONTEXT_LOCK_NAMESPACE` + `hashtext(user_id)`), and
+        `pg_locks` reports one row per key per backend, so the two grants
+        collapse into a single row. Measured both ways — with and without the
+        mutex — the observed count is 1.
+
+        Removing the mutex therefore leaves this test and the race above
+        GREEN. What the mutex protects is an ordering property the current
+        shape does not exhibit: PostgreSQL fixes a SERIALIZABLE view at the
+        FIRST query, so a unit that blocks on a lock INSIDE its transaction
+        keeps the snapshot taken before the competing write committed. Here
+        the lock acquisition IS the first statement, so the hazard does not
+        arise and nothing observable changes.
+
+        The mutex is retained because it is the repository's established #386
+        protocol and the hazard returns the moment any query precedes it — but
+        it is currently an UNFALSIFIED guard, and this docstring says so
+        instead of implying coverage that does not exist.
+        """
+        import psycopg
+        seed = SqlStore(self.url)
+        api_seed, pa, sa, ra, pb, sb = self._world(seed)
+        writer = SqlStore(self.url)
+        api_a = ApiService(writer)
+        pv = api_a.preview_ice_availability(
+            actor_id="racer", **self._template(sa, ra))
+        fingerprint = pv.get("template_fingerprint")
+
+        # Scoped to THIS backend: counting advisory locks cluster-wide passes
+        # on somebody else's lock, which made an earlier version of this
+        # assertion survive removing the mutex entirely.
+        writer_pid = self._backend_pid(writer)
+
+        paused, release = threading.Event(), threading.Event()
+        orig = writer._exec
+
+        def instrumented(query, params=()):
+            result = orig(query, params)
+            if "user_active_context" in query and "FOR UPDATE" in query.upper():
+                paused.set()
+                release.wait(20)
+            return result
+        writer._exec = instrumented
+
+        def do_commit():
+            api_a.commit_ice_availability_in_active_season(
+                "racer", Role.ARENA_MANAGER, None,
+                template_fingerprint=fingerprint, **self._template(sa, ra))
+
+        th = threading.Thread(target=do_commit, daemon=True); th.start()
+        self.assertTrue(paused.wait(20), "never reached the locked window")
+        try:
+            with psycopg.connect(self.url, autocommit=True) as mon:
+                with mon.cursor() as cur:
+                    cur.execute(
+                        "SELECT count(*) FROM pg_locks WHERE locktype = "
+                        "'advisory' AND granted AND pid = %s", (writer_pid,))
+                    held = cur.fetchone()[0]
+        finally:
+            release.set(); th.join(20); writer._exec = orig
+
+        self.assertGreaterEqual(
+            held, 1,
+            "no advisory lock is held during the commit unit — the per-user "
+            "context mutex is not being taken, so a selection landing before "
+            "BEGIN cannot be ordered against this unit")
+        for s in (seed, writer):
+            s.close()
+
+    def test_a_switch_that_wins_makes_the_stale_commit_a_generic_404(self):
+        """The reverse winner. B switches first, so A's target is no longer the
+        selected Season: generic 404, zero ice, zero audit."""
+        store = SqlStore(self.url)
+        api, pa, sa, ra, pb, sb = self._world(store)
+        api.set_active_context("racer", Role.ARENA_MANAGER, None, pb, sb)
+
+        before_slots = sum(1 for s in store.all_ice_slots() if s.rink_id == ra)
+        before_audit = len(store.all_setup_audit())
+        result = api.commit_ice_availability_in_active_season(
+            "racer", Role.ARENA_MANAGER, None,
+            template_fingerprint="any-token", **self._template(sa, ra))
+
+        self.assertIn("error", result, result)
+        self.assertEqual(result["error"]["code"], "not_found", result)
+        self.assertEqual(
+            sum(1 for s in store.all_ice_slots() if s.rink_id == ra),
+            before_slots, "a stale commit still wrote ice")
+        self.assertEqual(len(store.all_setup_audit()), before_audit,
+                         "a stale commit still wrote an audit row")
+        store.close()
 

@@ -1103,11 +1103,28 @@ class ApiService:
         # resolved tuple has to agree with it: if the chosen Season was deleted
         # or de-authorized, the resolver silently lands somewhere else, and
         # honouring that would silently retarget the operator's work.
+        program, season, _league = self.context.resolve_with_league(
+            user_id, role, scope)
+        return self._selection_is_explicit(user_id, program, season)
+
+    def _selection_is_explicit(self, user_id, program, season) -> bool:
+        """THE one rule: is the resolved tuple the operator's own explicit,
+        still-valid choice?
+
+        Both callers share this deliberately. It previously existed twice —
+        here and inside the locked commit — and a mutation proved the
+        duplicate was dead weight: breaking one copy changed nothing, because
+        the other answered first. Two copies of a rule drift; this is the same
+        lesson `_game_matches_active` records for #367.
+
+        A saved row that no longer resolves to itself means the chosen Season
+        was deleted or de-authorized and `_fallback()` has silently picked a
+        different one. That is a STALE selection and must fail closed, never
+        retarget the operator's work.
+        """
         saved = self.store.get_active_context(user_id) if user_id else None
         if saved is None or not saved.program_id or not saved.season_id:
             return False
-        program, season, _league = self.context.resolve_with_league(
-            user_id, role, scope)
         return (program is not None and season is not None
                 and program.id == saved.program_id
                 and season.id == saved.season_id)
@@ -9500,6 +9517,58 @@ class ApiService:
             start_date=start_date, end_date=end_date,
             playable_minutes=playable_minutes, turnover_minutes=turnover_minutes,
             exclusion_dates=exclusion_dates, windows=windows, actor_id=actor_id)
+
+    @catch
+    @catch
+    def commit_ice_availability_in_active_season(
+            self, user_id, role, scope, *, season_id=None, **template):
+        """Commit ice ONLY into the caller's exactly-selected Season (#393 PR A),
+        atomically against a concurrent context switch.
+
+        THE ORDER IS THE POINT (#386 protocol):
+
+          1. the per-user ``active_context_mutex``, taken OUTSIDE the unit's
+             transaction, so a competing ``set_active_context`` finishes its
+             wait BEFORE this SERIALIZABLE snapshot is created — a mutex taken
+             inside the transaction is acquired by a statement that has already
+             fixed the snapshot, so winning it conveys nothing;
+          2. the caller's ActiveContext ROW (``resolve_with_league(lock=True)``)
+             — BEFORE any Program/Season/Rink row. ``set_active_context`` takes
+             the same lock, so a switch either orders wholly before this
+             authorization or waits for the write it authorized to commit;
+          3. only then the Season decision and the commit itself.
+
+        An earlier revision routed this through ``_guarded_mutation``, which
+        locks the SEASON first and left the resolve unlocked. Nothing contended
+        with the ActiveContext row, so a concurrent ``POST /api/context`` could
+        commit tuple B between the A-tuple decision and A's write and BOTH
+        transactions succeeded — the atomicity this method claims was simply
+        absent. Adding the context lock AFTER the Season lock would fix nothing
+        and introduce an ABBA deadlock against every scheduler mutation, which
+        all take ActiveContext -> ... -> Season in that order.
+        """
+        with self._active_context_mutex(user_id, role), \
+                self.store.transaction(
+                    isolation=None if role is None else "SERIALIZABLE"):
+            # (2) ActiveContext first, and LOCKED for the rest of this unit.
+            program, season, _league = self.context.resolve_with_league(
+                user_id, role, scope, lock=True)
+            # Same rule as the preflight, re-decided here under the
+            # ActiveContext LOCK rather than re-implemented.
+            if not self._selection_is_explicit(user_id, program, season):
+                return {"error": {
+                    "code": "active_context_required",
+                    "message": ("Select a Program and Season before building "
+                                "ice availability.")}}
+            if not season_id or season.id != season_id \
+                    or season.program_id != program.id:
+                # Byte-identical to a nonexistent target: never an oracle.
+                return {"error": {"code": "not_found",
+                                  "message": f"Season {season_id} not found."}}
+            # (3) The commit runs inside this SAME transaction, so the tuple it
+            # was authorized against cannot change under it.
+            return _serialize(self.setup.commit_ice_availability(
+                season_id=season_id, actor_id=user_id, **template))
 
     @catch
     def commit_ice_availability(self, season_id: str = None, rink_ids=None,

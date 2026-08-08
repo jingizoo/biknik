@@ -706,8 +706,19 @@ async function checkViewport(browser, viewport) {
     await page.fill("#ib-to", "2026-12-31");
     let releaseFacilitiesPreview;
     const holdFacilitiesPreview = new Promise((resolve) => { releaseFacilitiesPreview = resolve; });
+    // FETCH FIRST, HOLD ONLY DELIVERY. `await hold; route.continue()` sends
+    // the request to the server only AFTER the context switch, so under
+    // #393 PR A's tuple gate the server answers 404 and this test would
+    // silently change subject: it would prove the client discards a late
+    // FAILURE, when its whole purpose is to prove it discards a late
+    // SUCCESS. The response is captured while the original context is still
+    // active, then delivered after the switch.
+    let facilitiesPreviewStatus = null;
     await page.route("**/api/setup/ice-availability/preview", async (route) => {
-      await holdFacilitiesPreview; await route.continue();
+      const response = await route.fetch();
+      facilitiesPreviewStatus = response.status();
+      await holdFacilitiesPreview;
+      try { await route.fulfill({ response }); } catch (e) { /* page moved on */ }
     });
     await page.click("[data-ib-preview]");
     await new Promise((r) => setTimeout(r, 200));  // let the request actually leave
@@ -718,6 +729,12 @@ async function checkViewport(browser, viewport) {
     await page.waitForFunction(() => document.body.dataset.view === "calendar", null, { timeout: 10000 });
     await page.waitForSelector(".ib-wrap", { timeout: 10000 });
     releaseFacilitiesPreview();
+    // The held response must be a genuine SUCCESS, or the discard below
+    // proves nothing about late successes.
+    if (facilitiesPreviewStatus !== 200) {
+      fail(`the held Preview was ${facilitiesPreviewStatus}, not 200 — this `
+        + `leg must discard a late SUCCESSFUL response, not a late failure`);
+    }
     await page.unroute("**/api/setup/ice-availability/preview");
     await new Promise((r) => setTimeout(r, 300));  // let the stale response's own (discarded) handler run
     if (await page.$(".ib-preview")) {

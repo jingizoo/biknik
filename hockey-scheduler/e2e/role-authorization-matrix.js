@@ -745,6 +745,29 @@ async function checkViewport(browser, viewport) {
     // Recurring ice creation, reached and driven entirely by real keyboard
     // Tab traversal: nav to Calendar, activate "Build ice", preview, commit
     // -- a REAL authorized mutation, not just a reachability check.
+    // #393 PR A: ice preview/commit now require an EXPLICIT active
+    // Program/Season. Without one the preview answers 409
+    // `active_context_required` and [data-ib-commit] never enables, so this
+    // whole keyboard leg would fail for a reason unrelated to authorization.
+    // The browser does exactly this through the context bar before the Ice
+    // Builder is usable.
+    //
+    // The read-back is asserted, not assumed: a selection that silently fell
+    // back to inferred context would leave this test passing on the very
+    // behaviour PR A removes.
+    const ctxSet = await apiPost(page, "/api/context",
+      { program_id: program.body.id, season_id: season.id });
+    if (ctxSet.status !== 200) {
+      fail(`Arena Manager: could not select the fixture context: `
+        + `${ctxSet.status} ${JSON.stringify(ctxSet.body)}`);
+    }
+    const ctxRead = await apiGet(page, "/api/context");
+    if (ctxRead.body.program_id !== program.body.id
+        || ctxRead.body.season_id !== season.id) {
+      fail(`Arena Manager: active context did not read back as the explicit `
+        + `selection -- got program=${ctxRead.body.program_id} `
+        + `season=${ctxRead.body.season_id}`);
+    }
     await tabToAndActivate(page, '.tab[data-tab="calendar"]', "Arena Manager reach Calendar");
     await page.waitForSelector("[data-ice-builder-open]", { timeout: 10000 });
     await tabToAndActivate(page, "[data-ice-builder-open]", "Arena Manager open Build ice");

@@ -2653,18 +2653,20 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 return self._send_api(
                     api.preview_ice_availability(actor_id=user_id, **kwargs))
-            # A write: the decision has to be atomic with it. _guarded_mutation
-            # re-decides under the Season's row lock inside the commit's own
-            # transaction, so a context switch or a Season reparent landing
-            # between check and write cannot leave the commit authorized
-            # against a world that no longer exists.
-            return self._guarded_mutation(
-                [("season", season_id, "active_season")],
-                lambda: api.commit_ice_availability(
-                    actor_id=user_id,
+            # A write: the decision has to be atomic with it, and against a
+            # concurrent CONTEXT SWITCH as well as a Season reparent.
+            # _guarded_mutation alone is not enough — it locks the Season, and
+            # nothing there contends with the caller's ActiveContext row, so a
+            # `POST /api/context` could commit tuple B between the A-tuple
+            # decision and A's write. The facade below follows the #386
+            # protocol: per-user mutex outside the unit, ActiveContext locked
+            # BEFORE any Season row, then decide and commit in one transaction.
+            commit_kwargs = {k: v for k, v in kwargs.items() if k != "season_id"}
+            return self._send_api(
+                api.commit_ice_availability_in_active_season(
+                    user_id, role, scope, season_id=season_id,
                     template_fingerprint=body.get("template_fingerprint"),
-                    **kwargs),
-                user_id, role, scope)
+                    **commit_kwargs))
 
         # Scheduling policy (#277 Slice B): upsert/clear one Program/Season/
         # Rink scope's turnover + curfew knobs. Checked BEFORE the generic
