@@ -3158,14 +3158,39 @@ async function checkRoleScenarios(browser, viewport) {
     // really did land. The commit is executed while K4 is still selected;
     // only its delivery waits for K5.
     let k4CommitStatus = null;
+    let markK4Fetched;
+    // Resolves only once route.fetch() has actually returned. A sleep cannot
+    // prove that: it would let the switch race the in-flight commit, and the
+    // whole leg depends on the write having happened under K4.
+    const k4Fetched = new Promise((resolve) => { markK4Fetched = resolve; });
     await page.route("**/api/setup/ice-availability/commit", async (route) => {
       const response = await route.fetch();
       k4CommitStatus = response.status();
+      markK4Fetched();
       await commitHoldK4;
       try { await route.fulfill({ response }); } catch (e) { /* page moved on */ }
     });
     await page.click("[data-ib-commit]");
-    await new Promise((r) => setTimeout(r, 200));  // let the stale Commit request actually leave
+
+    // -- assert the WRITE while K4 is still the active context --------------
+    // /api/v2/setup/overview is active-context scoped by design, so asking it
+    // for K4's rink AFTER switching to K5 finds nothing even when the commit
+    // succeeded — indistinguishable from a missing write. The scope boundary
+    // is correct and must not be widened; the QUERY has to happen here.
+    await k4Fetched;
+    if (k4CommitStatus !== 200) {
+      fail(`(K3) the held K4 Commit was ${k4CommitStatus}, not 200 — this leg `
+        + `must discard a late SUCCESSFUL commit, not a late failure`);
+    }
+    // NOTE the shape: this file's apiGet() returns the PARSED BODY directly,
+    // unlike role-authorization-matrix.js's, which returns {status, body}.
+    const k4Overview = await apiGet(page, "/api/v2/setup/overview");
+    const k4Slots = (k4Overview.ice_slots || [])
+      .filter((sl) => sl.rink_id === k.rinkK4);
+    if (!k4Slots.length) {
+      fail("(K3) the held K4 Commit reported 200 but K4's own context shows "
+        + "no ice slots, so the stale-response discard below proves nothing");
+    }
     const switchToK5 = `${k.progK5}|${k.seasonK5}`;
     await selectContextAndWaitForStableView(page, base, {
       contextValue: switchToK5,
@@ -3176,24 +3201,8 @@ async function checkRoleScenarios(browser, viewport) {
       requiredSelectors: [".ib-form"],
       absentSelectors: [".ib-preview", "[data-ib-commit]"],
     });
+    // Delivery was held across the switch; release it now, under K5.
     releaseCommitK4();
-    // The held Commit must have SUCCEEDED under K4, and its ice must really
-    // exist — otherwise "the client discarded it" is indistinguishable from
-    // "there was nothing to discard".
-    if (k4CommitStatus !== 200) {
-      fail(`(K3) the held K4 Commit was ${k4CommitStatus}, not 200 — this leg `
-        + `must discard a late SUCCESSFUL commit, not a late failure`);
-    }
-    // NOTE the shape: this file's apiGet() returns the PARSED BODY directly,
-    // unlike role-authorization-matrix.js's, which returns {status, body}.
-    // Reading `.body.ice_slots` here throws before any K5 assertion runs.
-    const k4Overview = await apiGet(page, "/api/v2/setup/overview");
-    const k4Slots = (k4Overview.ice_slots || [])
-      .filter((sl) => sl.rink_id === k.rinkK4);
-    if (!k4Slots.length) {
-      fail("(K3) the held K4 Commit reported 200 but wrote no ice slots, so "
-        + "the stale-response discard below proves nothing");
-    }
     await page.unroute("**/api/setup/ice-availability/commit");
     await new Promise((r) => setTimeout(r, 300));  // let the stale response's own (discarded) handler run
     if (!(await page.$(".ib-form"))) {

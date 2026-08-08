@@ -2767,6 +2767,27 @@ class Handler(BaseHTTPRequestHandler):
         # so without the principal an operator working in Program B received
         # Program A's whole proposal — pairings, team names and ice slots.
         if path == "/api/scheduler/draft":
+            # STRICT schema (#271's contract, #393 PR A). Without it an
+            # unknown field — a typo, a stale client sending a removed knob,
+            # or `meetings_per_oponent` — was silently DROPPED and the draft
+            # was generated under different rules than the caller asked for.
+            # The sibling /api/scheduler/scenarios route has always been
+            # strict; draft and commit were the gap.
+            try:
+                check_body(
+                    body,
+                    allowed={"division_id", "season_id", "league_id",
+                             "slot_ids", "constraints",
+                             "meetings_per_opponent", "games_per_team"},
+                    types={"division_id": (str, type(None)),
+                           "season_id": (str, type(None)),
+                           "league_id": (str, type(None)),
+                           "slot_ids": (list, type(None)),
+                           "constraints": (dict, type(None)),
+                           "meetings_per_opponent": (int, type(None)),
+                           "games_per_team": (int, type(None))})
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
             return self._send_api(api.draft_season_schedule(
                 division_id=body.get("division_id"),
                 season_id=body.get("season_id"), league_id=body.get("league_id"),
@@ -2828,6 +2849,25 @@ class Handler(BaseHTTPRequestHandler):
         # Attribute draft commit/publish/discard to the signed-in user resolved
         # server-side (#86 audit trail), never a client-supplied actor_id.
         if path == "/api/scheduler/commit":
+            # Same strict schema as draft. It matters more here: commit is the
+            # WRITE, and a dropped field means committing a differently-shaped
+            # schedule than the one reviewed.
+            try:
+                check_body(
+                    body,
+                    allowed={"division_id", "season_id", "league_id",
+                             "slot_ids", "constraints", "draft_fingerprint",
+                             "meetings_per_opponent", "games_per_team"},
+                    types={"division_id": (str, type(None)),
+                           "season_id": (str, type(None)),
+                           "league_id": (str, type(None)),
+                           "slot_ids": (list, type(None)),
+                           "constraints": (dict, type(None)),
+                           "meetings_per_opponent": (int, type(None)),
+                           "games_per_team": (int, type(None)),
+                           "draft_fingerprint": (str, type(None))})
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
             return self._send_api(api.commit_draft_schedule(
                 division_id=body.get("division_id"),
                 season_id=body.get("season_id"), league_id=body.get("league_id"),
