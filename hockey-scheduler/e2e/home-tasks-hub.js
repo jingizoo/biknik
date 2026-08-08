@@ -3184,8 +3184,11 @@ async function checkRoleScenarios(browser, viewport) {
       fail(`(K3) the held K4 Commit was ${k4CommitStatus}, not 200 — this leg `
         + `must discard a late SUCCESSFUL commit, not a late failure`);
     }
+    // NOTE the shape: this file's apiGet() returns the PARSED BODY directly,
+    // unlike role-authorization-matrix.js's, which returns {status, body}.
+    // Reading `.body.ice_slots` here throws before any K5 assertion runs.
     const k4Overview = await apiGet(page, "/api/v2/setup/overview");
-    const k4Slots = (k4Overview.body.ice_slots || [])
+    const k4Slots = (k4Overview.ice_slots || [])
       .filter((sl) => sl.rink_id === k.rinkK4);
     if (!k4Slots.length) {
       fail("(K3) the held K4 Commit reported 200 but wrote no ice slots, so "
