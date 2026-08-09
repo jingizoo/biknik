@@ -237,13 +237,35 @@ class AvailabilityHttpAccessTest(unittest.TestCase):
             c, "POST", f"/api/officials/{self.ref}/availability",
             {"start_time": "2027-02-01T18:00:00Z",
              "end_time": "2027-02-01T20:00:00Z",
-             "status": "unavailable", "actor_id": "attacker"})
+             "status": "unavailable"})
         self.assertEqual(status, 200)
         entry = self._last_audit("official_availability_set")
         self.assertIsNotNone(entry)
         self.assertEqual(entry.entity_id, created["id"])
         self.assertEqual(entry.actor_id, official_uid)
         self.assertNotEqual(entry.actor_id, "attacker")
+
+    def test_forged_actor_id_in_body_is_now_refused_outright(self):
+        # Stronger than the accepted-and-ignored behaviour this route used to
+        # have (#202): with the strict write schema, a body ``actor_id`` is an
+        # unknown field, so the request is refused with zero writes rather than
+        # succeeding at 200 and quietly attributing the audit elsewhere. The
+        # caller can therefore never believe the forged actor was honoured.
+        c = self._client()
+        self._req(c, "POST", "/api/auth/login",
+                  {"username": "official", "password": "demo"})
+        before = len(self.srv.STATE.api.store.availability_for_official(self.ref))
+        status, body = self._req(
+            c, "POST", f"/api/officials/{self.ref}/availability",
+            {"start_time": "2027-02-02T18:00:00Z",
+             "end_time": "2027-02-02T20:00:00Z",
+             "status": "unavailable", "actor_id": "attacker"})
+        self.assertEqual(status, 400, body)
+        self.assertEqual(body["error"]["details"]["reason"], "unknown_field")
+        self.assertIn("actor_id", body["error"]["details"]["fields"])
+        self.assertEqual(
+            len(self.srv.STATE.api.store.availability_for_official(self.ref)),
+            before)
 
     def test_delete_availability_attributes_signed_in_operator_not_body(self):
         # An operator deleting a window is audited against the operator's
