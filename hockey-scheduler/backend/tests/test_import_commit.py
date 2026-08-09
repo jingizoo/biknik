@@ -1236,8 +1236,20 @@ class ImportCommitHttpTest(unittest.TestCase):
             return e.code, json.loads(e.read() or b"{}")
 
     def _login(self, opener, username):
-        return self._req(opener, "POST", "/api/auth/login",
-                         {"username": username, "password": "demo"})
+        result = self._req(opener, "POST", "/api/auth/login",
+                           {"username": username, "password": "demo"})
+        # #409: the teams/players import COMMIT bulk-creates Divisions into
+        # the Season its body names, and a Division is SEASON-OWNED — so the
+        # unit needs a context the operator CHOSE. Persist byte-for-byte the
+        # SEEDED Season the payload names -- this class shares one store, so
+        # an earlier test's Season-B selection would otherwise carry over.
+        season_id = self.srv.STATE.ids.get("season_id")
+        season = self.srv.STATE.api.store.get_season(season_id) if season_id else None
+        if season is not None:
+            self._req(opener, "POST", "/api/context",
+                      {"program_id": season.program_id,
+                       "season_id": season.id})
+        return result
 
     def _payload(self):
         season_id = self.srv.STATE.ids["season_id"]
@@ -1270,6 +1282,11 @@ class ImportCommitHttpTest(unittest.TestCase):
         program_id = store.get_season(self.srv.STATE.ids["season_id"]).program_id
         season_b = setup.create_season(program_id, "Season B", actor_id="admin")
         setup.create_league(season_b.id, "League B", actor_id="admin")
+        # #409: the second commit targets Season B, so the operator moves
+        # there -- switching Season is the context bar's job, and the import
+        # commit lands where the operator is standing.
+        self._req(c, "POST", "/api/context",
+                  {"program_id": program_id, "season_id": season_b.id})
         body2 = {"season_id": season_b.id,
                 "teams_csv": "team_code,team_name,division_name\nT1,Team One,NewDiv\n"}
         status2, resp2 = self._req(c, "POST", "/api/import/commit/teams-players", body2)
@@ -1299,6 +1316,11 @@ class ImportCommitHttpTest(unittest.TestCase):
         program_id = store.get_season(self.srv.STATE.ids["season_id"]).program_id
         season_b = setup.create_season(program_id, "Season B", actor_id="admin")
         setup.create_league(season_b.id, "League B", actor_id="admin")
+        # #409: the second commit targets Season B, so the operator moves
+        # there -- switching Season is the context bar's job, and the import
+        # commit lands where the operator is standing.
+        self._req(c, "POST", "/api/context",
+                  {"program_id": program_id, "season_id": season_b.id})
         body2 = {"season_id": season_b.id, "teams_csv": (
             "team_code,team_name,division_name\n"
             "HTTPNEW,HTTP New Team,SharedDiv\n"

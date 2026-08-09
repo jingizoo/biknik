@@ -627,6 +627,18 @@ class PendingLinkOwnershipHttpTest(unittest.TestCase):
         self.assertEqual(status, 200, resp)
         return c
 
+    def _select_active_context(self, c):
+        """Persist the tuple ``GET /api/context`` already resolves for this
+        session (#409). Read-only navigation keeps the deterministic fallback;
+        a mutation must be aimed at a context the operator CHOSE."""
+        status, ctx = self._req(c, "GET", "/api/context")
+        self.assertEqual(status, 200, ctx)
+        status, saved = self._req(c, "POST", "/api/context",
+                                  {"program_id": ctx.get("program_id"),
+                                   "season_id": ctx.get("season_id"),
+                                   "league_id": ctx.get("league_id")})
+        self.assertEqual(status, 200, saved)
+
     def _post(self, c, entity, body):
         status, resp = self._req(c, "POST", f"/api/v2/setup/{entity}", body)
         self.assertEqual(status, 200, (entity, resp))
@@ -694,6 +706,10 @@ class PendingLinkOwnershipHttpTest(unittest.TestCase):
         ctx = self._overview(admin)
         season_ids = [s["id"] for s in ctx["seasons"]]
         self.assertTrue(season_ids, ctx)
+        # #409: the grant is a guarded MUTATION, so it needs an EXPLICITLY
+        # persisted Program/Season. Persist the tuple this session already
+        # resolves — the Season granted to is the same one either way.
+        self._select_active_context(admin)
         self._post(admin, f"seasons/{season_ids[0]}/venue-access",
                    {"venue_id": venue["id"]})
         linked = self._overview(admin)

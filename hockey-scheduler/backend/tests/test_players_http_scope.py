@@ -113,7 +113,7 @@ class PlayersHttpScopeTest(unittest.TestCase):
                   {"username": "admin", "password": "demo"})
         return c
 
-    def _use(self, c, program_id, season_id):
+    def _use(self, c, program_id, season_id=None):
         """Switch the session's active Program/Season.
 
         The v2 Team create binds `league_id` to the ACTIVE Program (#367
@@ -171,8 +171,14 @@ class PlayersHttpScopeTest(unittest.TestCase):
         program = self._v2(c, "program",
                           {"name": "PS Program",
                            "operator_organization_id": org["id"]})
+        # #409: a Season create is PROGRAM-AXIS and a League create is
+        # SEASON-OWNED, so select each axis the moment it exists -- the same
+        # `_use` selection this fixture already makes before the Team creates,
+        # moved earlier so it also covers the Season/League creates.
+        self._use(c, program["id"])
         season = self._v2(c, "season",
                          {"program_id": program["id"], "name": "PS Season"})
+        self._use(c, program["id"], season["id"])
         league_a = self._v2(c, "league",
                            {"season_id": season["id"], "name": "PS League A",
                             "sort_order": 1})
@@ -216,12 +222,15 @@ class PlayersHttpScopeTest(unittest.TestCase):
         program2 = self._v2(c, "program",
                            {"name": "PS Foreign Program",
                             "operator_organization_id": org2["id"]})
+        # #409: same rule for the foreign Program -- move there before
+        # building into it, then down to its Season.
+        self._use(c, program2["id"])
         season2 = self._v2(c, "season",
                           {"program_id": program2["id"], "name": "PS Foreign S"})
+        self._use(c, program2["id"], season2["id"])
         league_f = self._v2(c, "league",
                            {"season_id": season2["id"], "name": "PS Foreign L"})
         club2 = self._v2(c, "club", {"name": "PS Foreign Club"})
-        self._use(c, program2["id"], season2["id"])
         team_foreign = self._v2(c, "team",
                                {"league_id": league_f["id"], "club_id": club2["id"],
                                 "name": "PS Foreign Team"})

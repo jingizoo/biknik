@@ -1838,7 +1838,8 @@ class SetupService:
 
     @_transactional
     def transfer_team_to_league(self, team_id: str, new_league_id: str,
-                                actor_id: Optional[str] = None) -> Team:
+                                actor_id: Optional[str] = None,
+                                season_axis_guard=None) -> Team:
         """Move a Team to a different permanent League — promotion/relegation or
         transfer (#283 rule 10).
 
@@ -1856,14 +1857,27 @@ class SetupService:
         write — the operator must resolve those games first. All checks run
         before any mutation, so a rejected transfer changes nothing (zero
         Team/registration/audit mutation).
+
+        ``season_axis_guard`` (#409) is an optional
+        ``callable(season_ids) -> None`` handed in by the caller. It is invoked
+        UNDER the locks, with the Seasons whose registration rows this transfer
+        is about to rewrite, and raises to refuse. See
+        ``ApiService._season_axis_guard``: this operation's context-axis class
+        is Program-only by its named targets and only BECOMES Season-owned once
+        those registrations are discovered, which cannot happen before the
+        locks. ``None`` — the internal and import callers — is ungated, exactly
+        as every other #409 gate treats an identity-less caller.
         """
         team = self.store.get_team_for_update(team_id)
         if team is None:
             raise NotFoundError(f"Team {team_id} not found.")
-        return self._transfer_team_to_league_inner(team, new_league_id, actor_id)
+        return self._transfer_team_to_league_inner(
+            team, new_league_id, actor_id,
+            season_axis_guard=season_axis_guard)
 
     def _transfer_team_to_league_inner(self, team, new_league_id: str,
-                                       actor_id: Optional[str] = None) -> Team:
+                                       actor_id: Optional[str] = None,
+                                       season_axis_guard=None) -> Team:
         """Body of :meth:`transfer_team_to_league`, without its own transaction
         or Team fetch — so the import path (#283 Slice E) can route a permanent-
         League change through the same lifecycle guards inside its own commit
@@ -1928,6 +1942,32 @@ class SetupService:
             if self._registration_league_id(current) == new_league_id:
                 continue
             fresh_candidates.append(current)
+        # #409 — the AXIS CHANGE, enforced at the instant it happens. Up to
+        # here this transfer has consumed only the PROGRAM axis: a Team and a
+        # League are both records that outlive any one Season, which is why the
+        # pre-disclosure phase classifies it Program-only and why that phase
+        # can honestly read no store row at all. THIS line is where it learns
+        # otherwise — every surviving candidate is an active
+        # SeasonTeamRegistration, a Season-OWNED bridge row, and the writes
+        # below rewrite it onto the target League's LeagueSeason for that same
+        # Season. So the two-axis rule applies from here, and it is applied
+        # under the locks already held (the Team row, the target League row,
+        # and every affected Season row) so the tuple cannot change between
+        # this decision and those writes.
+        #
+        # Placed BEFORE the classification loop rather than after it, so a
+        # refusal never discloses the `team_transfer_strands_games`
+        # `affected_game_ids` of a Season the caller never chose: "you have not
+        # chosen a context" is answered ahead of anything about the records,
+        # which is the same ordering `_refuse_unchosen_context` keeps at the
+        # transport. A Team with NO such registrations consumes no Season and
+        # is deliberately left on the Program-axis rule — demanding a Season
+        # there would refuse a legitimate move rather than merely tighten it.
+        if season_axis_guard is not None:
+            season_axis_guard({
+                self._season_of_league_season(reg.league_season_id)
+                for reg in fresh_candidates
+                if self._season_of_league_season(reg.league_season_id)})
         to_move = []          # (reg, season_id) pairs eligible to move
         blocked = []          # {registration_id, season_id, affected_game_ids}
         for reg in fresh_candidates:

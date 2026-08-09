@@ -151,6 +151,20 @@ class DemoAddIceSlotTest(unittest.TestCase):
                 for uname, uid in _CALLERS:
                     op, s = _login(uname)
                     self.assertEqual(s, 200, (label, uname, "login"))
+                    # #409: the demo add-ice-slot route mints a real IceSlot
+                    # and a real audit row, so it is now gated like the setup
+                    # route it shadows. Persist byte-for-byte the tuple this
+                    # session already resolves — the Rink and the Program are
+                    # exactly the ones this test always used.
+                    s, ctx = _request("GET", "/api/context", opener=op)
+                    self.assertEqual(s, 200, (label, uname, ctx))
+                    if ctx.get("program_id"):
+                        s, sel = _request("POST", "/api/context",
+                                          {"program_id": ctx.get("program_id"),
+                                           "season_id": ctx.get("season_id"),
+                                           "league_id": ctx.get("league_id")},
+                                          opener=op)
+                        self.assertEqual(s, 200, (label, uname, sel))
                     s, body = _request("POST", "/api/demo/add-ice-slot",
                                        {"date": "2027-03-01"}, opener=op)
                     self.assertEqual(s, 200, (label, uname, body))

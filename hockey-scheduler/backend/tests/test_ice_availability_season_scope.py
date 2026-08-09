@@ -541,7 +541,7 @@ class IceAvailabilitySeasonScopeTest(unittest.TestCase):
         DELETED, which is what actually triggers the fallback.
 
         MEASURED, so the claims below are not argued ones. With the saved row
-        dangling and `_selection_is_explicit` reduced to a plain
+        dangling and `_explicit_selection` reduced to a plain
         `program is not None and season is not None`:
 
           * preview stops failing closed — that is the assertion that fires

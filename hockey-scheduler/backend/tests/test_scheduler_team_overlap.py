@@ -673,6 +673,17 @@ class SchedulerTeamOverlapHttpTest(unittest.TestCase):
             urllib.request.HTTPCookieProcessor(CookieJar()))
         self._req(opener, "POST", "/api/auth/login",
                   {"username": "admin", "password": "demo"})
+        # #409 -- the fixture now SELECTS. `/api/scheduler/commit` is a
+        # MUTATION, so it requires an EXPLICITLY persisted Program/Season: a
+        # fallback never authorizes a write. The tuple persisted here is
+        # byte-for-byte the one `GET /api/context` was already handing this
+        # session, so every assertion below is about the SAME hierarchy it
+        # always was -- only the choice is now the operator's own.
+        _s, ctx = self._req(opener, "GET", "/api/context")
+        self._req(opener, "POST", "/api/context",
+                  {"program_id": ctx.get("program_id"),
+                   "season_id": ctx.get("season_id"),
+                   "league_id": ctx.get("league_id")})
         return opener
 
     def test_preview_reports_the_team_conflict_over_http(self):

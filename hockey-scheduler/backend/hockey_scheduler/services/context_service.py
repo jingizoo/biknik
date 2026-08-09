@@ -301,6 +301,76 @@ class ContextService:
             return _detached(program), _detached(season), _detached(league)
         return self._snapshot(work)
 
+    def resolve_saved_with_league(self, user_id: Optional[str], role, scope,
+                                  lock=False):
+        """``(saved_row, program, season, league)`` derived ONLY from the
+        PERSISTED ``ActiveContext`` row — ``_fallback()`` is NEVER called (#409).
+
+        THE AUTHORIZATION SOURCE for every mutation gate. :meth:`resolve` and
+        :meth:`resolve_with_league` answer "what context should this caller be
+        shown", and their answer may be one ``_fallback()`` INVENTED; that is
+        the owner's ruling for landing and navigation and it is untouched here.
+        This answers the different question a WRITE has to ask: "what did the
+        operator themselves CHOOSE, and is it still valid?".
+
+        The distinction is not cosmetic and it cannot be recovered by comparing
+        values afterwards. ``_fallback()`` may well pick the very Program the
+        row names — it walks the caller's authorized Programs in id order, and
+        with one Program in the installation it picks that one every time. A
+        resolved value that merely EQUALS the saved one is not evidence that it
+        CAME from it, so a predicate built on the resolve is only accidentally
+        right, and stops being right the moment the inventory changes. Reading
+        the row and validating IT is the only form of the check that cannot be
+        satisfied by coincidence.
+
+        Each axis is validated exactly as ``_resolve_locked`` validates it, so
+        an honoured saved selection is BYTE-FOR-BYTE the tuple that method
+        already returns for the same row; the only difference is what happens
+        when an axis does not validate. Here the axis is simply dropped:
+
+        * saved row absent, or naming no Program -> ``(row, None, None, None)``;
+        * Program deleted or no longer authorized -> ``(row, None, None, None)``
+          — the Program axis is the root, so nothing below it can stand;
+        * Season deleted or no longer authorized -> the Program is KEPT and the
+          Season becomes ``None``, which is exactly the shape a deliberate
+          Program-only selection already has. A caller whose Season went stale
+          is therefore refused by a two-axis gate and admitted by a
+          Program-axis one, which is the #409 rule;
+        * the League axis reuses :meth:`_resolve_league_locked` unchanged.
+
+        ``lock=True`` takes the caller's ActiveContext ROW LOCK
+        (``get_active_context_for_update``, #386) and holds it for the rest of
+        the SURROUNDING transaction, which the caller must own — and, unlike
+        :meth:`resolve_with_league`, the locked read's RESULT is what is
+        judged, rather than a lock taken beside a separate unlocked read.
+        """
+        def work():
+            saved = None
+            if user_id:
+                saved = (self.store.get_active_context_for_update(user_id)
+                         if lock else self.store.get_active_context(user_id))
+            if saved is None or not saved.program_id:
+                return _detached(saved), None, None, None
+            programs = context_scope.authorized_program_ids(
+                self.store, role, scope, user_id)
+            if saved.program_id not in programs:
+                return _detached(saved), None, None, None
+            program = self.store.get_program(saved.program_id)
+            if program is None:
+                return _detached(saved), None, None, None
+            season = None
+            if saved.season_id is not None:
+                candidate = self.store.get_season(saved.season_id)
+                seasons = context_scope.authorized_season_ids(
+                    self.store, role, scope, saved.program_id, user_id)
+                if candidate is not None and saved.season_id in seasons:
+                    season = candidate
+            league = self._resolve_league_locked(
+                user_id, role, scope, program, season)
+            return (_detached(saved), _detached(program), _detached(season),
+                    _detached(league))
+        return self._snapshot(work)
+
     def options_with_league(self, user_id: Optional[str], role, scope):
         """``(programs, selected_program, selected_season, selected_league)``
         where ``programs`` is ``[(program, [season, ...], [league, ...]), ...]``

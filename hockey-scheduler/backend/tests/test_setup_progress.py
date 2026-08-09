@@ -1464,6 +1464,14 @@ class SetupProgressHttpTest(unittest.TestCase):
         status, program = self._req(admin, "POST", "/api/v2/setup/program",
                                     {"name": "Round1F1 HTTP Prog", "country": "US"})
         self.assertEqual(status, 200, program)
+        # #409: a Season CREATE is PROGRAM-AXIS -- it is judged against the
+        # Program the operator CHOSE, and this class shares one store, so the
+        # selection can still point at a Program an earlier test built. Move
+        # to the brand-new Program the moment it exists; every record below is
+        # the one this fixture always built.
+        self.assertEqual(
+            self._req(admin, "POST", "/api/context",
+                      {"program_id": program["id"]})[0], 200)
         status, season = self._req(admin, "POST", "/api/v2/setup/season",
                                    {"program_id": program["id"], "name": "Fall"})
         self.assertEqual(status, 200, season)
@@ -1550,9 +1558,23 @@ class SetupProgressHttpTest(unittest.TestCase):
         status, program = self._req(admin, "POST", "/api/v2/setup/program",
                                     {"name": "Round4F1 HTTP Prog", "country": "US"})
         self.assertEqual(status, 200, program)
+        # #409: a Season CREATE is PROGRAM-AXIS -- it is judged against the
+        # Program the operator CHOSE, and this class shares one store, so the
+        # selection can still point at a Program an earlier test built. Move
+        # to the brand-new Program the moment it exists; every record below is
+        # the one this fixture always built.
+        self.assertEqual(
+            self._req(admin, "POST", "/api/context",
+                      {"program_id": program["id"]})[0], 200)
         status, season = self._req(admin, "POST", "/api/v2/setup/season",
                                    {"program_id": program["id"], "name": "Fall"})
         self.assertEqual(status, 200, season)
+        # #409: a League CREATE is SEASON-OWNED (it mints the LeagueSeason
+        # too), so the Season it binds into must be the operator's own choice.
+        self.assertEqual(
+            self._req(admin, "POST", "/api/context",
+                      {"program_id": program["id"],
+                       "season_id": season["id"]})[0], 200)
         status, league = self._req(admin, "POST", "/api/v2/setup/league",
                                    {"season_id": season["id"], "name": "Adult League"})
         self.assertEqual(status, 200, league)
@@ -1593,6 +1615,14 @@ class SetupProgressHttpTest(unittest.TestCase):
         status, program = self._req(admin, "POST", "/api/v2/setup/program",
                                     {"name": "Round5F1 HTTP Prog", "country": "US"})
         self.assertEqual(status, 200, program)
+        # #409: a Season CREATE is PROGRAM-AXIS -- it is judged against the
+        # Program the operator CHOSE, and this class shares one store, so the
+        # selection can still point at a Program an earlier test built. Move
+        # to the brand-new Program the moment it exists; every record below is
+        # the one this fixture always built.
+        self.assertEqual(
+            self._req(admin, "POST", "/api/context",
+                      {"program_id": program["id"]})[0], 200)
         status, season = self._req(admin, "POST", "/api/v2/setup/season",
                                    {"program_id": program["id"], "name": "Fall"})
         self.assertEqual(status, 200, season)
@@ -1637,9 +1667,23 @@ class SetupProgressHttpTest(unittest.TestCase):
         status, program = self._req(admin, "POST", "/api/v2/setup/program",
                                     {"name": "Round5F2 HTTP Prog", "country": "US"})
         self.assertEqual(status, 200, program)
+        # #409: a Season CREATE is PROGRAM-AXIS -- it is judged against the
+        # Program the operator CHOSE, and this class shares one store, so the
+        # selection can still point at a Program an earlier test built. Move
+        # to the brand-new Program the moment it exists; every record below is
+        # the one this fixture always built.
+        self.assertEqual(
+            self._req(admin, "POST", "/api/context",
+                      {"program_id": program["id"]})[0], 200)
         status, season_a = self._req(admin, "POST", "/api/v2/setup/season",
                                      {"program_id": program["id"], "name": "Season A"})
         self.assertEqual(status, 200, season_a)
+        # #409: a League CREATE is SEASON-OWNED (it mints the LeagueSeason
+        # too), so the Season it binds into must be the operator's own choice.
+        self.assertEqual(
+            self._req(admin, "POST", "/api/context",
+                      {"program_id": program["id"],
+                       "season_id": season_a["id"]})[0], 200)
         status, league_a = self._req(admin, "POST", "/api/v2/setup/league",
                                      {"season_id": season_a["id"], "name": "League A"})
         self.assertEqual(status, 200, league_a)
@@ -1665,12 +1709,15 @@ class SetupProgressHttpTest(unittest.TestCase):
         status, season_b = self._req(admin, "POST", "/api/v2/setup/season",
                                      {"program_id": program["id"], "name": "Season B"})
         self.assertEqual(status, 200, season_b)
-        status, league_b = self._req(admin, "POST", "/api/v2/setup/league",
-                                     {"season_id": season_b["id"], "name": "League B"})
-        self.assertEqual(status, 200, league_b)
+        # #409: League B is bound into Season B, so select Season B BEFORE
+        # creating it rather than after -- the selection this test always made,
+        # one step earlier.
         status, _ = self._req(admin, "POST", "/api/context",
                               {"program_id": program["id"], "season_id": season_b["id"]})
         self.assertEqual(status, 200)
+        status, league_b = self._req(admin, "POST", "/api/v2/setup/league",
+                                     {"season_id": season_b["id"], "name": "League B"})
+        self.assertEqual(status, 200, league_b)
 
         status, progress = self._req(admin, "GET", "/api/v2/setup/progress")
         self.assertEqual(status, 200, progress)
@@ -1706,6 +1753,14 @@ class SetupProgressHttpTest(unittest.TestCase):
         status, program = self._req(admin, "POST", "/api/v2/setup/program",
                                     {"name": "R3 Archived HTTP Prog", "country": "US"})
         self.assertEqual(status, 200, program)
+        # #409: a Season CREATE is PROGRAM-AXIS -- it is judged against the
+        # Program the operator CHOSE, and this class shares one store, so the
+        # selection can still point at a Program an earlier test built. Move
+        # to the brand-new Program the moment it exists; every record below is
+        # the one this fixture always built.
+        self.assertEqual(
+            self._req(admin, "POST", "/api/context",
+                      {"program_id": program["id"]})[0], 200)
         status, season = self._req(admin, "POST", "/api/v2/setup/season",
                                    {"program_id": program["id"], "name": "R3 Fall"})
         self.assertEqual(status, 200, season)
@@ -1775,6 +1830,14 @@ class SetupProgressHttpTest(unittest.TestCase):
         status, program = self._req(admin, "POST", "/api/v2/setup/program",
                                     {"name": "R3 Reopen Authz Prog", "country": "US"})
         self.assertEqual(status, 200, program)
+        # #409: a Season CREATE is PROGRAM-AXIS -- it is judged against the
+        # Program the operator CHOSE, and this class shares one store, so the
+        # selection can still point at a Program an earlier test built. Move
+        # to the brand-new Program the moment it exists; every record below is
+        # the one this fixture always built.
+        self.assertEqual(
+            self._req(admin, "POST", "/api/context",
+                      {"program_id": program["id"]})[0], 200)
         status, season = self._req(admin, "POST", "/api/v2/setup/season",
                                    {"program_id": program["id"], "name": "R3 Authz"})
         self.assertEqual(status, 200, season)
@@ -1811,9 +1874,23 @@ class SetupProgressHttpTest(unittest.TestCase):
         status, program = self._req(admin, "POST", "/api/v2/setup/program",
                                     {"name": "R3 Part HTTP Prog", "country": "US"})
         self.assertEqual(status, 200, program)
+        # #409: a Season CREATE is PROGRAM-AXIS -- it is judged against the
+        # Program the operator CHOSE, and this class shares one store, so the
+        # selection can still point at a Program an earlier test built. Move
+        # to the brand-new Program the moment it exists; every record below is
+        # the one this fixture always built.
+        self.assertEqual(
+            self._req(admin, "POST", "/api/context",
+                      {"program_id": program["id"]})[0], 200)
         status, season = self._req(admin, "POST", "/api/v2/setup/season",
                                    {"program_id": program["id"], "name": "R3 Part"})
         self.assertEqual(status, 200, season)
+        # #409: a League CREATE is SEASON-OWNED (it mints the LeagueSeason
+        # too), so the Season it binds into must be the operator's own choice.
+        self.assertEqual(
+            self._req(admin, "POST", "/api/context",
+                      {"program_id": program["id"],
+                       "season_id": season["id"]})[0], 200)
         status, league = self._req(admin, "POST", "/api/v2/setup/league",
                                    {"season_id": season["id"], "name": "R3 League"})
         self.assertEqual(status, 200, league)

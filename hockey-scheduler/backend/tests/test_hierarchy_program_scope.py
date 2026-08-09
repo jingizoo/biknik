@@ -407,8 +407,16 @@ class HierarchyWriteScopeHttpTest(unittest.TestCase):
 
     def _fixture(self, c, tag):
         program = self._v2(c, "program", {"name": f"WS {tag} Prog"})
+        # #409: a Season CREATE is PROGRAM-AXIS and a League CREATE is
+        # SEASON-OWNED, so each is judged against the axis the operator CHOSE.
+        # This class shares one store, so the selection can still point at a
+        # Program an earlier fixture built; move to the one being built here,
+        # then to its Season, exactly as an operator would.
+        self._req(c, "POST", "/api/context", {"program_id": program["id"]})
         season = self._v2(c, "season",
                           {"program_id": program["id"], "name": f"WS {tag} S"})
+        self._req(c, "POST", "/api/context",
+                  {"program_id": program["id"], "season_id": season["id"]})
         league = self._v2(c, "league",
                           {"season_id": season["id"], "name": f"WS {tag} L"})
         return {"program": program, "season": season, "league": league}

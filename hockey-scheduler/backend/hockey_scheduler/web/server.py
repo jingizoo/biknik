@@ -1049,6 +1049,31 @@ class Handler(BaseHTTPRequestHandler):
         self._refuse_target(kind, record_id, rule)
         return True
 
+    def _refuse_unchosen_context(self, targets, user_id, role, scope) -> bool:
+        """#409 PREFLIGHT: send the structured 409 and return True when this
+        mutation's axes are not the operator's own EXPLICIT choice.
+
+        Runs AHEAD of `_reject_target_outside_scope` on every guarded surface,
+        so "you have not chosen a context" is answered before "that record is
+        not in your context". The order is the point: a caller who has chosen
+        nothing must not be handed a not-found about records they were never
+        told they may not see, and the refusal must not depend on which target
+        id was supplied. `ApiService.setup_mutation_context_error` therefore
+        reads NO target row — it classifies by KIND (see the axis table there)
+        and compares the caller's saved selection to their own resolve.
+
+        NOT the boundary: `setup_guarded_mutation` re-decides the identical
+        rule under the ActiveContext ROW LOCK, inside the transaction that
+        performs the write. This exists so the refusal is cheap and is decided
+        before any lookup; that one is what makes it true at commit.
+        """
+        refusal = STATE.api.setup_mutation_context_error(
+            list(targets), user_id, role, scope)
+        if refusal is None:
+            return False
+        self._send_api(refusal)          # 409 via ERROR_HTTP_STATUS
+        return True
+
     def _guarded_mutation(self, targets, mutation, user_id, role, scope):
         """THE gate every setup mutation on an EXISTING record goes through:
         run ``mutation`` with its authorization, its row locks, its write and
@@ -1075,6 +1100,8 @@ class Handler(BaseHTTPRequestHandler):
         row's parent) left the original request authorized against a world that
         no longer existed. It returned 200 and wrote to the new owner's row.
         """
+        if self._refuse_unchosen_context(targets, user_id, role, scope):
+            return
         for target in targets:
             if self._reject_target_outside_scope(
                     target[0], target[1], user_id, role, scope,
@@ -1088,6 +1115,59 @@ class Handler(BaseHTTPRequestHandler):
             return self._refuse_target(
                 target[0].replace("-", "_"), target[1],
                 target[2] if len(target) > 2 else "scope")
+        return self._send_api(payload)
+
+    def _guarded_create(self, kind, parents, mutation, user_id, role, scope):
+        """THE gate every setup CREATE goes through (#409 create family).
+
+        ``kind`` is the canonical kind being MINTED (v1 aliases translated by
+        the caller — "league" is a Program and "level" is a competition League,
+        and guessing between the two meanings is the vocabulary trap that
+        produced this whole class of defect). ``parents`` is the request's own
+        ``(parent_kind, parent_id)`` list in the caller's order; a falsy id is
+        skipped, so an optional parent that was not supplied is not a target.
+
+        THREE gates, in this order, and the order is the contract:
+
+        1. #369's parent-visibility gate on every parent kind it covers, which
+           refuses a foreign or nonexistent parent with the generic
+           ``"<Label> <id> not found."``. It runs FIRST here — the reverse of
+           ``_guarded_mutation``, where #409 leads — because a create's #409
+           decision needs a store read to know whether the parent carries a
+           Program at all. Answering 409 before that gate would separate "that
+           id exists and is linked" from "nonexistent or foreign" for a caller
+           who has chosen nothing, which is a new existence oracle over records
+           they may not see. Past this gate the caller provably CAN already see
+           the parent, so the 409 below discloses nothing new. See
+           ``ApiService._create_context_error`` for the full argument.
+        2. #409's PREFLIGHT: the 409 for an unchosen or stale axis, or the
+           generic not-found for a parent outside the caller's saved axes.
+           Cheap, lock-free, and decided before the facade is called at all.
+        3. ``setup_guarded_create``, which re-decides exactly the same rule
+           under the ActiveContext row lock and the parent row locks and runs
+           the insert, any relationship row and the audit inside that one
+           transaction. THAT is the boundary; 2 is only an early answer whose
+           snapshot is already stale by the time the caller acts on it.
+
+        A refusal at any of the three writes no entity, no relationship, no
+        audit row and serializes no lookup-derived field.
+        """
+        for parent in parents:
+            if (parent[0] in _SETUP_PARENT_LISTS
+                    and self._reject_parent_outside_scope(
+                        parent[0], parent[1], role, scope, user_id)):
+                return
+        refusal, index = STATE.api.setup_create_context_error(
+            kind, parents, user_id, role, scope)
+        if refusal is not None:
+            return self._send_api(refusal)      # 409 via ERROR_HTTP_STATUS
+        if index is not None:
+            return self._refuse_target(parents[index][0], parents[index][1])
+        payload, refused = STATE.api.setup_guarded_create(
+            kind, parents, mutation, user_id, role, scope)
+        if refused is not None:
+            return self._refuse_target(
+                parents[refused][0], parents[refused][1])
         return self._send_api(payload)
 
     def _require_player_scope(self):
@@ -2580,9 +2660,17 @@ class Handler(BaseHTTPRequestHandler):
             # operator. The synthetic "arena_mgr" actor is only the non-production
             # demo header fallback (user_id is None) — impossible in production,
             # which is gated out above.
-            return self._send_api(api.create_ice_slot(
-                rink_id, start.isoformat(), end.isoformat(),
-                body.get("slot_type", "game"), actor_id=user_id or "arena_mgr"))
+            # #409: an ice-slot CREATE is PROGRAM-AXIS whichever route mints
+            # it. This one accepts a caller-supplied `rink_id`, so leaving it
+            # ungated would be a demo-labelled bypass of the setup route's own
+            # gate -- and it writes a real row and a real audit entry.
+            return self._guarded_create(
+                "ice_slot", [("rink", rink_id)],
+                lambda: api.create_ice_slot(
+                    rink_id, start.isoformat(), end.isoformat(),
+                    body.get("slot_type", "game"),
+                    actor_id=user_id or "arena_mgr"),
+                user_id, role, scope)
 
         # Canonical v2 setup writes (#233 Slice C2). Same operator authz as v1
         # (enforced above), but canonical request bodies and canonical
@@ -2731,8 +2819,17 @@ class Handler(BaseHTTPRequestHandler):
             # player/import_batch), so attribution must come from the
             # already-authenticated session, matching the notification-
             # preference/official-availability/calendar-feed precedent.
-            return self._send_api(api.commit_teams_players_import(
-                body.get("season_id"), body, actor_id=user_id))
+            # #409: this is a BULK create of clubs/divisions/teams/players
+            # into the Season the BODY names, and a Division is SEASON-OWNED,
+            # so the whole unit is judged by the two-axis rule against that
+            # Season. The other two import commits (officials/availability,
+            # rinks/ice-slots) name no parent id at all -- they create facility
+            # and person rows by NAME, which carry no axis to compare.
+            return self._guarded_create(
+                "division", [("season", body.get("season_id") or None)],
+                lambda: api.commit_teams_players_import(
+                    body.get("season_id"), body, actor_id=user_id),
+                user_id, role, scope)
 
         # Pilot onboarding import COMMIT — officials + availability (#94).
         # Server-resolved actor, not the forgeable body field — same fix
@@ -3239,7 +3336,11 @@ class Handler(BaseHTTPRequestHandler):
         # The preflight runs here rather than only inside `_guarded_mutation`
         # so an unauthorized target is still refused AHEAD of the unknown-combo
         # 404 below, exactly as before: a caller is never told a route shape is
-        # wrong about a record it may not see.
+        # wrong about a record it may not see. #409 leads it, for the same
+        # reason one rung up: an un-chosen context is answered before anything
+        # about the records is.
+        if self._refuse_unchosen_context(targets, actor_id, role, scope):
+            return
         for target in targets:
             if self._reject_target_outside_scope(
                     target[0], target[1], actor_id, role, scope,
@@ -3328,6 +3429,30 @@ class Handler(BaseHTTPRequestHandler):
         creator-owned source above carries the whole bootstrap chain, and a
         SECOND setup-capable account on that same empty install is still
         correctly refused.
+
+        #409 DELIBERATELY DOES NOT LEAD THIS GATE, and the reason is measured
+        rather than assumed. Classifying the family is easy — a parent-gated
+        create is classified by the PARENT's axis, and all five parent kinds
+        (``organization``/``program``/``venue``/``rink``/``club``) are
+        PROGRAM-AXIS — so the Program-only rule would apply. Adding it here was
+        tried and REVERTED: on a ZERO-PROGRAM install there is no Program in
+        existence for the caller to select, so ``_explicit_program``
+        can never be satisfied and the whole bootstrap flow this docstring
+        describes ("create an Organization, then its first Venue", as an Arena
+        Manager who cannot create a Program at all) becomes UNSATISFIABLE
+        rather than merely strict — the exact failure mode
+        ``ApiService._explicit_program`` records one axis up.
+        ``tests/test_zero_program_bootstrap_scoping.py`` fails on precisely
+        that flow.
+
+        The obvious carve-out — gate only when the installation HAS a Program
+        the caller could have selected — is the inference
+        ``ApiService.has_active_program_season`` records the owner as having
+        already FORBIDDEN: it makes API behaviour depend on changing account
+        inventory. So the choice here is a product ruling (accept the
+        bootstrap break, or accept an inventory-dependent carve-out, or leave
+        the family ungated) and not a mechanical one. It is left ungated and
+        recorded, not silently defaulted.
         """
         if not parent_id:
             return False
@@ -3385,10 +3510,20 @@ class Handler(BaseHTTPRequestHandler):
                                   "division_id": (str, type(None))})
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
-            return self._send_api(_v1.registration_to_v1(
-                api.register_team_for_season(
-                    mr.group(1), b.get("team_id"), b.get("division_id") or None,
-                    actor_id)))
+            # SEASON-OWNED (#409): a SeasonTeamRegistration is a BRIDGE row
+            # judged by its LeagueSeason, which is Season-owned by
+            # construction. This was the ONE bridge create with no guard at
+            # all, while every registration EDIT (assign-division,
+            # assign-league, remove, delete) was already gated.
+            return self._guarded_create(
+                "registration", [("season", mr.group(1)),
+                                 ("team", b.get("team_id") or None),
+                                 ("division", b.get("division_id") or None)],
+                lambda: _v1.registration_to_v1(
+                    api.register_team_for_season(
+                        mr.group(1), b.get("team_id"),
+                        b.get("division_id") or None, actor_id)),
+                actor_id, role, scope)
         ma = re.match(r"^season-team-registration/([^/]+)/assign-division$", entity)
         if ma:
             # division_id is nullable (null clears): must be PRESENT but may be
@@ -3490,105 +3625,184 @@ class Handler(BaseHTTPRequestHandler):
         # season and an optional per-team target-division selection.
         mrf = re.match(r"^seasons/([^/]+)/roll-forward$", entity)
         if mrf:
-            rolled = api.roll_forward_registrations(
-                b.get("from_season_id"), mrf.group(1), b.get("selections"),
-                actor_id)
-            # v1 boundary (#233 C1b): each rolled-forward registration carries the
-            # canonical competition league_id — drop it from every one so the v1
-            # registration shape is unchanged. An error envelope passes through.
-            if isinstance(rolled, dict) and "registrations" in rolled:
-                rolled = {**rolled, "registrations": [
-                    _v1.registration_to_v1(r) for r in rolled["registrations"]]}
-            return self._send_api(rolled)
+            # SEASON-OWNED (#409), and the ONE create that names TWO Seasons.
+            # The rows are WRITTEN into the path Season, so that is the one the
+            # saved Season must be; `from_season_id` is READ (and its
+            # registrations are serialized into the response), so it is bounded
+            # by the saved PROGRAM — see `_create_context_error` for why
+            # neither "target only" nor "both must be the saved Season" is
+            # correct here.
+            def _roll_forward_v1():
+                rolled = api.roll_forward_registrations(
+                    b.get("from_season_id"), mrf.group(1), b.get("selections"),
+                    actor_id)
+                # v1 boundary (#233 C1b): each rolled-forward registration
+                # carries the canonical competition league_id — drop it from
+                # every one so the v1 registration shape is unchanged. An error
+                # envelope passes through.
+                if isinstance(rolled, dict) and "registrations" in rolled:
+                    rolled = {**rolled, "registrations": [
+                        _v1.registration_to_v1(r)
+                        for r in rolled["registrations"]]}
+                return rolled
+            return self._guarded_create(
+                "registration",
+                [("season", mrf.group(1)),
+                 ("season", b.get("from_season_id") or None, "program")],
+                _roll_forward_v1, actor_id, role, scope)
         # v1 boundary (#233 C1b): legacy request keys (organization_id, season
         # league_id, division level_id, team league_id) are read here and passed
         # to the canonical facade; canonical results are mapped back to legacy v1
         # response keys via _v1 so the v1 contract keeps the same JSON
         # keys/shape and values.
         if entity == "league":
-            return self._send_api(_v1.program_to_v1(api.create_program(
-                b.get("name"), b.get("country", ""), b.get("timezone", "UTC"),
-                b.get("organization_id") or None, actor_id)))
+            # ZERO-AXIS ROOT (#409): v1 "league" IS today's Program, whose own
+            # edge is `{(itself, None, None)}` — creating it is the act that
+            # would establish a context, so nothing is compared and no context
+            # is read. `_guarded_create` short-circuits before any resolve.
+            return self._guarded_create(
+                "program", [],
+                lambda: _v1.program_to_v1(api.create_program(
+                    b.get("name"), b.get("country", ""),
+                    b.get("timezone", "UTC"),
+                    b.get("organization_id") or None, actor_id)),
+                actor_id, role, scope)
         if entity == "season":
-            return self._send_api(_v1.season_to_v1(api.create_season(
-                b.get("league_id"), b.get("name"),
-                b.get("start_date"), b.get("end_date"), actor_id)))
+            # PROGRAM-AXIS (#409): the Season axis is MINTED here, not
+            # consumed, so only the parent Program (v1 body key `league_id`) is
+            # compared — see `ApiService._CREATE_CONSUMED_AXES`.
+            return self._guarded_create(
+                "season", [("program", b.get("league_id") or None)],
+                lambda: _v1.season_to_v1(api.create_season(
+                    b.get("league_id"), b.get("name"),
+                    b.get("start_date"), b.get("end_date"), actor_id)),
+                actor_id, role, scope)
         if entity == "level":
             try:
                 sort_order = int(b.get("sort_order") or 0)
             except (TypeError, ValueError):
                 sort_order = 0
-            return self._send_api(api.create_league(
-                b.get("season_id"), b.get("name"), sort_order, actor_id))
+            # SEASON-OWNED (#409): a League record is Program-axis, but the
+            # create also mints the LeagueSeason (`_link_league_season`) and so
+            # consumes the Season named by `season_id`.
+            return self._guarded_create(
+                "league", [("season", b.get("season_id") or None)],
+                lambda: api.create_league(
+                    b.get("season_id"), b.get("name"), sort_order, actor_id),
+                actor_id, role, scope)
         if entity == "division":
-            return self._send_api(_v1.division_to_v1(api.create_division(
-                b.get("season_id"), b.get("name"), b.get("age_group", ""),
-                b.get("level_id") or None, actor_id)))
+            # SEASON-OWNED (#409): a Division delegates VERBATIM to its
+            # LeagueSeason, so it inherits that Season.
+            return self._guarded_create(
+                "division", [("season", b.get("season_id") or None),
+                             ("league", b.get("level_id") or None)],
+                lambda: _v1.division_to_v1(api.create_division(
+                    b.get("season_id"), b.get("name"), b.get("age_group", ""),
+                    b.get("level_id") or None, actor_id)),
+                actor_id, role, scope)
         if entity == "club":
-            return self._send_api(api.create_club(
-                b.get("name"), b.get("country", ""), actor_id))
+            # ZERO-AXIS ROOT (#409): no parent FK, and a Club's edges are its
+            # Teams' edges — a fresh one carries none.
+            return self._guarded_create(
+                "club", [],
+                lambda: api.create_club(
+                    b.get("name"), b.get("country", ""), actor_id),
+                actor_id, role, scope)
         if entity == "team":
             # #180/#233: a team is created under a program (v1 body key
             # league_id); division_id is the legacy/import path that derives it.
-            return self._send_api(_v1.team_to_v1(api.create_team(
-                b.get("club_id"), b.get("division_id") or None, b.get("name"),
-                actor_id, program_id=b.get("league_id") or None)))
+            # PROGRAM-AXIS (#409). This route was the ungated bypass of the
+            # rule v2's create already enforces through `_guarded_mutation`
+            # (`active_program_league`): every parent it can reach by id is
+            # compared here, `division_id` included — it is read only to derive
+            # the League, but reading it is still how the Program is chosen.
+            return self._guarded_create(
+                "team", [("program", b.get("league_id") or None),
+                         ("club", b.get("club_id") or None),
+                         ("division", b.get("division_id") or None)],
+                lambda: _v1.team_to_v1(api.create_team(
+                    b.get("club_id"), b.get("division_id") or None,
+                    b.get("name"), actor_id,
+                    program_id=b.get("league_id") or None)),
+                actor_id, role, scope)
         if entity == "organization":
-            return self._send_api(api.create_organization(
-                b.get("name"), b.get("short_name", ""), actor_id))
+            # ZERO-AXIS ROOT (#409): no parent FK at all; its edges are derived
+            # DOWNWARD from the Programs it operates and its Venues.
+            return self._guarded_create(
+                "organization", [],
+                lambda: api.create_organization(
+                    b.get("name"), b.get("short_name", ""), actor_id),
+                actor_id, role, scope)
         if entity == "venue":
             # #369 review: the caller-supplied parent must be one this caller
             # can already see, or the create is refused exactly as if the id
             # did not exist (see _reject_parent_outside_scope). Same gate on
-            # both API versions — v1 is not a bypass.
-            if self._reject_parent_outside_scope(
-                    "organization", b.get("organization_id"),
-                    role, scope, actor_id):
-                return
-            # ...and `league_id` is a SECOND parent on this same route (the
-            # legacy v1-only Venue→Program link; that field stores a PROGRAM
-            # id despite its name). Gating only organization_id left the
-            # identical attachment reachable one field over: create_venue
-            # resolves the Program's operator and OVERWRITES organization_id
-            # with it (setup_service.create_venue), so a caller refused at
-            # `organization_id: org_N` one line above could pass
-            # `league_id: <the Program org_N operates>` and land a Venue
-            # carrying org_N anyway — with 200-vs-404 as an existence oracle
-            # over Program ids on top. Same gate, same generic refusal.
-            if self._reject_parent_outside_scope(
-                    "program", b.get("league_id"), role, scope, actor_id):
-                return
-            return self._send_api(api.create_venue(
-                b.get("name"), b.get("address", ""), b.get("timezone", "UTC"),
-                b.get("organization_id") or None, b.get("league_id") or None, actor_id))
+            # both API versions — v1 is not a bypass. `_guarded_create` runs
+            # that gate FIRST, then #409's PROGRAM-AXIS comparison.
+            #
+            # `league_id` is a SECOND parent on this same route (the legacy
+            # v1-only Venue→Program link; that field stores a PROGRAM id
+            # despite its name). Gating only organization_id left the identical
+            # attachment reachable one field over: create_venue resolves the
+            # Program's operator and OVERWRITES organization_id with it
+            # (setup_service.create_venue), so a caller refused at
+            # `organization_id: org_N` could pass `league_id: <the Program
+            # org_N operates>` and land a Venue carrying org_N anyway — with
+            # 200-vs-404 as an existence oracle over Program ids on top. Same
+            # gate, same generic refusal, and on v1 the #409 comparison is
+            # literal: the body's `league_id` IS the parent Program.
+            return self._guarded_create(
+                "venue", [("organization", b.get("organization_id") or None),
+                          ("program", b.get("league_id") or None)],
+                lambda: api.create_venue(
+                    b.get("name"), b.get("address", ""),
+                    b.get("timezone", "UTC"),
+                    b.get("organization_id") or None,
+                    b.get("league_id") or None, actor_id),
+                actor_id, role, scope)
         if entity == "rink":
-            if self._reject_parent_outside_scope(
-                    "venue", b.get("venue_id"), role, scope, actor_id):
-                return
-            return self._send_api(api.create_rink(
-                b.get("venue_id"), b.get("name"), actor_id))
+            return self._guarded_create(
+                "rink", [("venue", b.get("venue_id") or None)],
+                lambda: api.create_rink(
+                    b.get("venue_id"), b.get("name"), actor_id),
+                actor_id, role, scope)
         if entity == "ice-slot":
-            if self._reject_parent_outside_scope(
-                    "rink", b.get("rink_id"), role, scope, actor_id):
-                return
-            return self._send_api(api.create_ice_slot(
-                b.get("rink_id"), b.get("start_time"), b.get("end_time"),
-                b.get("slot_type", "game"), actor_id))
+            return self._guarded_create(
+                "ice_slot", [("rink", b.get("rink_id") or None)],
+                lambda: api.create_ice_slot(
+                    b.get("rink_id"), b.get("start_time"), b.get("end_time"),
+                    b.get("slot_type", "game"), actor_id),
+                actor_id, role, scope)
         if entity == "game":
             # v1 boundary (#233 C1b): a game result carries the canonical
             # competition league_id, which the v1 API never exposed — drop it via
             # _v1.game_to_v1 so the v1 game shape is unchanged.
-            return self._send_api(_v1.game_to_v1(api.create_game(
-                b.get("season_id"), b.get("division_id"), b.get("home_team_id"),
-                b.get("away_team_id"), b.get("ice_slot_id"),
-                allow_division_override=bool(b.get("allow_division_override")),
-                actor_id=actor_id)))
+            # SEASON-OWNED (#409): a Game hangs on the one Season its parents
+            # share (#372), so both axes are compared against every parent that
+            # names one.
+            return self._guarded_create(
+                "game", [("season", b.get("season_id") or None),
+                         ("division", b.get("division_id") or None)],
+                lambda: _v1.game_to_v1(api.create_game(
+                    b.get("season_id"), b.get("division_id"),
+                    b.get("home_team_id"), b.get("away_team_id"),
+                    b.get("ice_slot_id"),
+                    allow_division_override=bool(
+                        b.get("allow_division_override")),
+                    actor_id=actor_id)),
+                actor_id, role, scope)
         if entity == "official":
-            if self._reject_parent_outside_scope(
-                    "club", b.get("home_club_id"), role, scope, actor_id):
-                return
-            return self._send_api(api.create_official(
-                b.get("name"), b.get("home_club_id"), actor_id))
+            # PROGRAM-AXIS (#409): an Official's home Club gives Program +
+            # League and no Season — the person outlives every Season they
+            # work. THIS is the measured falsification: before the gate, a
+            # signed-in League Admin with NO saved ActiveContext row created an
+            # Official homed at a Program-A Club and got 200, authorized by the
+            # one `_fallback` call `setup_parent_writable` makes.
+            return self._guarded_create(
+                "official", [("club", b.get("home_club_id") or None)],
+                lambda: api.create_official(
+                    b.get("name"), b.get("home_club_id"), actor_id),
+                actor_id, role, scope)
         if entity == "player":
             # Strict schema (#271): name the missing required field (team_id /
             # name / position), reject unknown keys, and type-check each field
@@ -3604,10 +3818,15 @@ class Handler(BaseHTTPRequestHandler):
                                   "shoots": (str, type(None))})
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
-            return self._send_api(api.create_player(
-                b.get("team_id"), b.get("name"), b.get("position"),
-                jersey_number=b.get("jersey_number"), email=b.get("email"),
-                shoots=b.get("shoots"), actor_id=actor_id))
+            # PROGRAM-AXIS (#409): a Player carries its Team's edges verbatim,
+            # and a Team is PERMANENT — the Season lives on its registration.
+            return self._guarded_create(
+                "player", [("team", b.get("team_id") or None)],
+                lambda: api.create_player(
+                    b.get("team_id"), b.get("name"), b.get("position"),
+                    jersey_number=b.get("jersey_number"), email=b.get("email"),
+                    shoots=b.get("shoots"), actor_id=actor_id),
+                actor_id, role, scope)
         return self._send_json({"error": {"code": "not_found",
                                           "message": "Unknown setup entity."}}, 404)
 
@@ -3703,7 +3922,10 @@ class Handler(BaseHTTPRequestHandler):
         # unauthorized target is still refused AHEAD of both the ("team",
         # "league") body check and the unknown-combo 404 below, exactly as
         # before: a caller is never told a body or route shape is wrong about a
-        # record it may not see.
+        # record it may not see. #409 leads it: an un-chosen context is
+        # answered before anything about the records is.
+        if self._refuse_unchosen_context(targets, actor_id, role, scope):
+            return
         for target in targets:
             if self._reject_target_outside_scope(
                     target[0], target[1], actor_id, role, scope,
@@ -3730,8 +3952,13 @@ class Handler(BaseHTTPRequestHandler):
             # club_id unassigns the team's Club.
             ("team", "club"): lambda: api.assign_team_club(
                 record_id, b.get("club_id") or None, actor_id),
+            # #409 — the PRINCIPAL is passed because this reassign is the one
+            # whose axis class changes mid-transaction: its targets are
+            # Program-axis, but under its locks it may rewrite Season-owned
+            # registration rows (`ApiService._season_axis_guard`).
             ("team", "league"): lambda: api.transfer_team_to_league(
-                record_id, b.get("league_id"), actor_id),
+                record_id, b.get("league_id"), actor_id,
+                user_id=actor_id, role=role, scope=scope),
             ("player", "team"): lambda: api.assign_player_team(
                 record_id, b.get("team_id"), actor_id),
             ("rink", "venue"): lambda: api.assign_rink_venue(
@@ -3851,9 +4078,17 @@ class Handler(BaseHTTPRequestHandler):
                                   "division_id": (str, type(None))})
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
-            return self._send_api(api.register_team_for_season(
-                mr.group(1), b.get("team_id"), b.get("division_id") or None,
-                actor_id, league_id=b.get("league_id") or None))
+            # SEASON-OWNED (#409) — see the v1 twin.
+            return self._guarded_create(
+                "registration", [("season", mr.group(1)),
+                                 ("team", b.get("team_id") or None),
+                                 ("league", b.get("league_id") or None),
+                                 ("division", b.get("division_id") or None)],
+                lambda: api.register_team_for_season(
+                    mr.group(1), b.get("team_id"),
+                    b.get("division_id") or None, actor_id,
+                    league_id=b.get("league_id") or None),
+                actor_id, role, scope)
         ml = re.match(r"^season-team-registration/([^/]+)/assign-league$", entity)
         if ml:
             # A registration's League is mandatory (non-nullable): required+str.
@@ -3985,9 +4220,15 @@ class Handler(BaseHTTPRequestHandler):
         # league_id, honored verbatim on the resulting registration.
         mrf = re.match(r"^seasons/([^/]+)/roll-forward$", entity)
         if mrf:
-            return self._send_api(api.roll_forward_registrations_v2(
-                b.get("from_season_id"), mrf.group(1), b.get("selections"),
-                actor_id))
+            # SEASON-OWNED (#409) — see the v1 twin for the two-Season rule.
+            return self._guarded_create(
+                "registration",
+                [("season", mrf.group(1)),
+                 ("season", b.get("from_season_id") or None, "program")],
+                lambda: api.roll_forward_registrations_v2(
+                    b.get("from_season_id"), mrf.group(1),
+                    b.get("selections"), actor_id),
+                actor_id, role, scope)
         # Season lifecycle (#159): archive → read-only historical; reopen →
         # active (requires a reason). Only ``reason`` is accepted in the body.
         mar = re.match(r"^seasons/([^/]+)/(archive|reopen)$", entity)
@@ -4048,32 +4289,58 @@ class Handler(BaseHTTPRequestHandler):
 
         # Entity create — canonical bodies, canonical responses.
         if entity == "program":
-            return self._send_api(api.create_program(
-                b.get("name"), b.get("country", ""), b.get("timezone", "UTC"),
-                b.get("operator_organization_id") or None, actor_id))
+            # ZERO-AXIS ROOT (#409) — see the v1 twin above.
+            return self._guarded_create(
+                "program", [],
+                lambda: api.create_program(
+                    b.get("name"), b.get("country", ""),
+                    b.get("timezone", "UTC"),
+                    b.get("operator_organization_id") or None, actor_id),
+                actor_id, role, scope)
         if entity == "season":
-            return self._send_api(api.create_season(
-                b.get("program_id"), b.get("name"),
-                b.get("start_date"), b.get("end_date"), actor_id))
+            # PROGRAM-AXIS (#409): the Season axis is MINTED, not consumed.
+            return self._guarded_create(
+                "season", [("program", b.get("program_id") or None)],
+                lambda: api.create_season(
+                    b.get("program_id"), b.get("name"),
+                    b.get("start_date"), b.get("end_date"), actor_id),
+                actor_id, role, scope)
         if entity == "league":
             try:
                 sort_order = int(b.get("sort_order") or 0)
             except (TypeError, ValueError):
                 sort_order = 0
-            return self._send_api(api.create_league(
-                b.get("season_id"), b.get("name"), sort_order, actor_id))
+            # SEASON-OWNED (#409): the create also mints the LeagueSeason.
+            return self._guarded_create(
+                "league", [("season", b.get("season_id") or None)],
+                lambda: api.create_league(
+                    b.get("season_id"), b.get("name"), sort_order, actor_id),
+                actor_id, role, scope)
         if entity == "division":
             # v2: parented by a League (REQUIRED); season derived from it, or
             # (#345) resolved EXACTLY from the optional season_id when the
             # League participates in more than one Season.
             if not (b.get("league_id") or None):
                 return _required_error("A league_id is required.")
-            return self._send_api(api.create_division_v2(
-                b.get("league_id"), b.get("name"), b.get("age_group", ""),
-                actor_id, season_id=b.get("season_id") or None))
+            # SEASON-OWNED (#409). `create_division_v2` resolves an EXISTING
+            # LeagueSeason exactly and never creates one, so the Season it
+            # lands in is either the explicit `season_id` (compared here) or
+            # the League's sole binding; either way the two-axis rule applies
+            # and an operator with no chosen Season is refused.
+            return self._guarded_create(
+                "division", [("league", b.get("league_id") or None),
+                             ("season", b.get("season_id") or None)],
+                lambda: api.create_division_v2(
+                    b.get("league_id"), b.get("name"), b.get("age_group", ""),
+                    actor_id, season_id=b.get("season_id") or None),
+                actor_id, role, scope)
         if entity == "club":
-            return self._send_api(api.create_club(
-                b.get("name"), b.get("country", ""), actor_id))
+            # ZERO-AXIS ROOT (#409) — see the v1 twin above.
+            return self._guarded_create(
+                "club", [],
+                lambda: api.create_club(
+                    b.get("name"), b.get("country", ""), actor_id),
+                actor_id, role, scope)
         if entity == "team":
             # v2 canonical (#283 Slice E): a Team is created under its PERMANENT
             # League (league_id REQUIRED); the service derives Program from it.
@@ -4100,35 +4367,39 @@ class Handler(BaseHTTPRequestHandler):
                     league_id=b.get("league_id") or None),
                 actor_id, role, scope)
         if entity == "organization":
-            return self._send_api(api.create_organization(
-                b.get("name"), b.get("short_name", ""), actor_id))
+            # ZERO-AXIS ROOT (#409) — see the v1 twin above.
+            return self._guarded_create(
+                "organization", [],
+                lambda: api.create_organization(
+                    b.get("name"), b.get("short_name", ""), actor_id),
+                actor_id, role, scope)
         if entity == "venue":
             # v2 omits league_id — venue↔program is a legacy v1-only relation
             # (Slice E decouples it); the v2 route never accepts it in the request
             # and strips it from the response (canonical Venue is org-owned only).
             # #369 review: the caller-supplied parent must be one this caller can
             # already see, or the create is refused exactly as if the id did not
-            # exist (see _reject_parent_outside_scope).
-            if self._reject_parent_outside_scope(
-                    "organization", b.get("organization_id"),
-                    role, scope, actor_id):
-                return
-            return self._send_api(_v2p.venue_to_v2(api.create_venue(
-                b.get("name"), b.get("address", ""), b.get("timezone", "UTC"),
-                b.get("organization_id") or None, None, actor_id)))
+            # exist (see _reject_parent_outside_scope). PROGRAM-AXIS for #409.
+            return self._guarded_create(
+                "venue", [("organization", b.get("organization_id") or None)],
+                lambda: _v2p.venue_to_v2(api.create_venue(
+                    b.get("name"), b.get("address", ""),
+                    b.get("timezone", "UTC"),
+                    b.get("organization_id") or None, None, actor_id)),
+                actor_id, role, scope)
         if entity == "rink":
-            if self._reject_parent_outside_scope(
-                    "venue", b.get("venue_id"), role, scope, actor_id):
-                return
-            return self._send_api(api.create_rink(
-                b.get("venue_id"), b.get("name"), actor_id))
+            return self._guarded_create(
+                "rink", [("venue", b.get("venue_id") or None)],
+                lambda: api.create_rink(
+                    b.get("venue_id"), b.get("name"), actor_id),
+                actor_id, role, scope)
         if entity == "ice-slot":
-            if self._reject_parent_outside_scope(
-                    "rink", b.get("rink_id"), role, scope, actor_id):
-                return
-            return self._send_api(api.create_ice_slot(
-                b.get("rink_id"), b.get("start_time"), b.get("end_time"),
-                b.get("slot_type", "game"), actor_id))
+            return self._guarded_create(
+                "ice_slot", [("rink", b.get("rink_id") or None)],
+                lambda: api.create_ice_slot(
+                    b.get("rink_id"), b.get("start_time"), b.get("end_time"),
+                    b.get("slot_type", "game"), actor_id),
+                actor_id, role, scope)
         if entity == "game":
             # #283 Slice D: an EXHIBITION game is a cross-League-allowed friendly
             # with no owning League — so league_id is NOT required for it (and is
@@ -4137,19 +4408,30 @@ class Handler(BaseHTTPRequestHandler):
             game_type = (b.get("game_type") or "regular")
             if game_type == "regular" and not (b.get("league_id") or None):
                 return _required_error("A league_id is required.")
-            return self._send_api(api.create_game(
-                b.get("season_id"), b.get("division_id") or None,
-                b.get("home_team_id"), b.get("away_team_id"),
-                b.get("ice_slot_id"),
-                allow_division_override=bool(b.get("allow_division_override")),
-                actor_id=actor_id, league_id=b.get("league_id") or None,
-                game_type=game_type))
+            # SEASON-OWNED (#409) — see the v1 twin. An EXHIBITION game may
+            # name no League and (Slice D) no Season, in which case there is
+            # simply no axis-bearing parent to compare and the create proceeds
+            # on its own terms.
+            return self._guarded_create(
+                "game", [("season", b.get("season_id") or None),
+                         ("league", b.get("league_id") or None),
+                         ("division", b.get("division_id") or None)],
+                lambda: api.create_game(
+                    b.get("season_id"), b.get("division_id") or None,
+                    b.get("home_team_id"), b.get("away_team_id"),
+                    b.get("ice_slot_id"),
+                    allow_division_override=bool(
+                        b.get("allow_division_override")),
+                    actor_id=actor_id, league_id=b.get("league_id") or None,
+                    game_type=game_type),
+                actor_id, role, scope)
         if entity == "official":
-            if self._reject_parent_outside_scope(
-                    "club", b.get("home_club_id"), role, scope, actor_id):
-                return
-            return self._send_api(api.create_official(
-                b.get("name"), b.get("home_club_id"), actor_id))
+            # PROGRAM-AXIS (#409) — see the v1 twin.
+            return self._guarded_create(
+                "official", [("club", b.get("home_club_id") or None)],
+                lambda: api.create_official(
+                    b.get("name"), b.get("home_club_id"), actor_id),
+                actor_id, role, scope)
         if entity == "player":
             # Strict schema (#271), same as the v1 route: required fields named,
             # unknown keys rejected, fields type-checked (bool jersey_number
@@ -4163,10 +4445,14 @@ class Handler(BaseHTTPRequestHandler):
                                   "shoots": (str, type(None))})
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
-            return self._send_api(api.create_player(
-                b.get("team_id"), b.get("name"), b.get("position"),
-                jersey_number=b.get("jersey_number"), email=b.get("email"),
-                shoots=b.get("shoots"), actor_id=actor_id))
+            # PROGRAM-AXIS (#409) — see the v1 twin.
+            return self._guarded_create(
+                "player", [("team", b.get("team_id") or None)],
+                lambda: api.create_player(
+                    b.get("team_id"), b.get("name"), b.get("position"),
+                    jersey_number=b.get("jersey_number"), email=b.get("email"),
+                    shoots=b.get("shoots"), actor_id=actor_id),
+                actor_id, role, scope)
         return self._send_json({"error": {"code": "not_found",
                                           "message": "Unknown setup entity."}}, 404)
 

@@ -106,6 +106,18 @@ class SetupParentWriteScopeHttpTest(unittest.TestCase):
         status, resp = self._req(c, "POST", "/api/auth/login",
                                  {"username": username, "password": password})
         self.assertEqual(status, 200, resp)
+        # #409 -- the fixture now SELECTS. `assign-<target>` is a GUARDED
+        # mutation, so it requires an EXPLICITLY persisted Program: a fallback
+        # never authorizes a write, and without a choice the reassign probes
+        # below stop at `active_context_required` and never reach the
+        # cross-owner gate this module exists to pin. Each account simply
+        # persists the tuple the resolve was already handing it, so every
+        # probe is aimed at exactly the hierarchy it always was.
+        ctx = self._req(c, "GET", "/api/context")[1]
+        if ctx.get("program_id"):
+            status, sel = self._req(c, "POST", "/api/context",
+                                    {"program_id": ctx["program_id"]})
+            self.assertEqual(status, 200, sel)
         return c
 
     def _post(self, c, entity, body, api="v2"):
@@ -394,7 +406,12 @@ class SetupParentWriteScopeHttpTest(unittest.TestCase):
             f"{ghost}")
 
         # Positive control: the creator's OWN Program still accepts it, so
-        # the legacy v1 link is gated rather than disabled.
+        # the legacy v1 link is gated rather than disabled. #409: the v1
+        # `league_id` IS the parent Program, so the operator must be standing
+        # in it -- select it, which is what "the creator's OWN Program" means.
+        status, sel = self._req(admin, "POST", "/api/context",
+                                {"program_id": program["id"]})
+        self.assertEqual(status, 200, sel)
         self._post(admin, "venue", {"name": "own-legacy-link",
                                     "league_id": program["id"]}, api="v1")
 

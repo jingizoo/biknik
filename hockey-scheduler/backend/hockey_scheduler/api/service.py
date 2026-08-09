@@ -41,6 +41,7 @@ from ..domain import (
     intervals_overlap,
 )
 from ..domain.errors import (
+    ActiveContextRequiredError,
     ConcurrencyConflictError,
     DomainError,
     NotAuthorizedError,
@@ -1021,7 +1022,10 @@ class ApiService:
         """
         if role is None:
             return None
-        program, _season, _league = self.context.resolve_with_league(
+        # #409: the SAME tuple the mutation's own explicitness gate judged, so
+        # a Venue is never measured against a Program the fallback picked
+        # after abandoning the operator's own (`_setup_gate_tuple`).
+        program, _season, _league = self._setup_gate_tuple(
             user_id, role, scope)
         if program is None:
             return False
@@ -1065,7 +1069,9 @@ class ApiService:
         another is the very check/use gap that was the blocker."""
         if role is None:
             return None
-        program, _season, _league = self.context.resolve_with_league(
+        # #409: judged against `_setup_gate_tuple`, not a bare resolve — see
+        # `setup_target_accessible` rule 2.
+        program, _season, _league = self._setup_gate_tuple(
             user_id, role, scope)
         if program is None:
             return False
@@ -1103,31 +1109,244 @@ class ApiService:
         # resolved tuple has to agree with it: if the chosen Season was deleted
         # or de-authorized, the resolver silently lands somewhere else, and
         # honouring that would silently retarget the operator's work.
-        program, season, _league = self.context.resolve_with_league(
-            user_id, role, scope)
-        return self._selection_is_explicit(user_id, program, season)
+        program, season = self._explicit_selection(user_id, role, scope)
+        return program is not None and season is not None
 
-    def _selection_is_explicit(self, user_id, program, season) -> bool:
-        """THE one rule: is the resolved tuple the operator's own explicit,
-        still-valid choice?
+    def _explicit_selection(self, user_id, role, scope, lock=False):
+        """THE one rule, in its only correct form: the ``(program, season)``
+        the operator THEMSELVES chose and that are STILL valid, read off the
+        PERSISTED ``ActiveContext`` row — or ``(None, None)`` (#409).
 
-        Both callers share this deliberately. It previously existed twice —
-        here and inside the locked commit — and a mutation proved the
-        duplicate was dead weight: breaking one copy changed nothing, because
-        the other answered first. Two copies of a rule drift; this is the same
-        lesson `_game_matches_active` records for #367.
+        AUTHORITY IS THE SAVED ROW, NEVER THE RESOLVER. This used to be a
+        comparison: resolve the tuple, read the saved row, and accept when the
+        two agreed. That is not the same check, and the difference is the whole
+        point of the owner's tightening. ``ContextService._fallback()`` may
+        return the very Program the row names — it walks the caller's
+        authorized Programs in id order, so on a single-Program installation it
+        returns that Program every single time — and a value that merely EQUALS
+        the saved one is not evidence it CAME from it. The comparison was
+        therefore satisfiable by COINCIDENCE, and a coincidence that holds in
+        the fixture stops holding the moment the inventory changes. Reading the
+        row and validating IT is the only form that cannot be faked.
 
-        A saved row that no longer resolves to itself means the chosen Season
-        was deleted or de-authorized and `_fallback()` has silently picked a
-        different one. That is a STALE selection and must fail closed, never
-        retarget the operator's work.
+        ``ContextService.resolve_saved_with_league`` validates each axis with
+        the same rules ``_resolve_locked`` uses, so an honoured selection is
+        the identical tuple; it simply never falls back. A stale SEASON leaves
+        the Program standing and the Season ``None``, which is what makes the
+        Program-axis rule below expressible at all.
+
+        ``lock=True`` is the mutating form: the row is read through
+        ``get_active_context_for_update`` and THAT read's result is what is
+        judged, so the phase-2 re-read is a locked read of the authorization
+        source rather than a lock taken beside an unlocked one.
         """
-        saved = self.store.get_active_context(user_id) if user_id else None
-        if saved is None or not saved.program_id or not saved.season_id:
-            return False
-        return (program is not None and season is not None
-                and program.id == saved.program_id
-                and season.id == saved.season_id)
+        _saved, program, season, _league = \
+            self.context.resolve_saved_with_league(
+                user_id, role, scope, lock=lock)
+        return program, season
+
+    def _explicit_program(self, user_id, role, scope, lock=False):
+        """The PROGRAM-AXIS-ONLY form of :meth:`_explicit_selection` (#409):
+        the Program the operator explicitly chose and that still exists and is
+        still authorized, or ``None``. The SEASON axis is deliberately not
+        consulted, because a mutation that does not consume it must not be
+        refused for the state of one.
+
+        That is not a softening, it is the axis table. Derived from
+        ``_setup_target_edges``: a Program-axis record's link triple names no
+        Season of its own (a League is PERMANENT across Seasons — its
+        per-Season participation is the separate LeagueSeason row; a Team's
+        Season lives on its registration; a Venue's Seasons are access GRANTS
+        rather than ownership). Demanding a Season there would make two
+        legitimate operations UNSATISFIABLE rather than merely strict:
+
+        * a Program whose LAST Season was just deleted has no Season left to
+          select, so it could never be deleted again;
+        * a brand-new Program has no Season yet, so it could never be linked
+          to the Organization that operates it.
+
+        Both are ordinary operator work, and neither consumes a Season. The
+        same saved-row authority applies: the Program returned here is the row's
+        own ``program_id``, fetched from the store, never a resolver's pick.
+        """
+        program, _season = self._explicit_selection(
+            user_id, role, scope, lock=lock)
+        return program
+
+    def _setup_gate_tuple(self, user_id, role, scope, lock=False):
+        """The ``(program, season, league)`` every SETUP-TARGET gate and every
+        #409 explicitness predicate is judged against.
+
+        THE SAVED ROW FIRST, the resolver only as the residual. When the
+        operator's explicitly saved Program is still present and still
+        authorized, this returns the tuple derived from THAT ROW
+        (``resolve_saved_with_league``) and the resolver is never called at
+        all. Only when there is no such choice left to honour — no row, or a
+        Program that was deleted or de-authorized — does
+        ``resolve_with_league`` answer, and every #409 predicate then refuses
+        against it.
+
+        The difference this makes to a WRITE: ``_resolve_locked`` falls through
+        to ``_fallback()`` the moment the saved SEASON stops resolving, and
+        ``_fallback()`` picks a Program of its own. Here the Program axis the
+        operator chose is KEPT and the Season/League axes are dropped, which is
+        exactly the shape a deliberate Program-only selection already has.
+        Another Program is never invented in its place.
+
+        Why this is not a change to the read side: ``context.resolve()`` keeps
+        the deterministic fallback for landing and navigation (the owner's
+        ruling; ``GET /api/context`` and ``GET /api/v2/setup/overview`` are
+        pinned on it and must keep answering). Nothing here is called from a
+        read. This exists so a WRITE is never silently retargeted into a
+        Program the operator never chose — the same rule
+        ``_explicit_selection`` already states for the Season axis, applied
+        to the axis above it.
+
+        Without it, deleting a Program the operator explicitly selected
+        becomes IMPOSSIBLE the moment its last Season is deleted: the resolve
+        hands them a different Program and #369's target gate answers a
+        generic not-found for their own. Measured on this branch before the
+        fix, in one session: create Program P, create its only Season S,
+        select (P, S), delete S -> 200, then
+        ``POST /api/v2/setup/program/P/delete`` -> ``404 not_found``.
+
+        ``lock=True`` is passed straight through, so a mutation takes the
+        ActiveContext row lock here exactly as ``_require_explicit_selection``
+        documents.
+
+        THE ORDERING IS LOAD-BEARING, not an optimisation. Asking the resolver
+        first and correcting its answer afterwards produces the same VALUES and
+        would still CALL ``_fallback()`` — and ``_fallback()`` running at all
+        during a mutation is the thing #409 is about, because afterwards its
+        result cannot be told apart from an honoured choice that happens to
+        match. Trying the row first means that on the whole write path of an
+        operator who HAS chosen a context the fallback is never consulted, and
+        that is a claim a test can MEASURE (a spy on ``_fallback`` asserting
+        zero calls) rather than infer from a returned value.
+        """
+        _saved, program, season, league = \
+            self.context.resolve_saved_with_league(
+                user_id, role, scope, lock=lock)
+        if program is not None:
+            return program, season, league
+        # No explicit choice left to honour — absent, deleted or de-authorized.
+        # The read-side fallback still answers here so #369's target gate keeps
+        # its existing shape for the ungated surfaces, and every #409 predicate
+        # refuses against it: they read the row, and the row did not validate.
+        return self.context.resolve_with_league(user_id, role, scope, lock=lock)
+
+    def _require_explicit_selection(self, user_id, role, scope, message):
+        """Resolve the caller's tuple AT A MUTATION'S LOCKED COMMIT BOUNDARY
+        and refuse unless it is their own explicit, still-valid choice (#409).
+
+        MUST be called inside the transaction that performs the write, as its
+        FIRST statement. Three things happen here in one step and none of them
+        is separable:
+
+        * ``resolve_with_league(lock=True)`` takes the caller's ActiveContext
+          ROW LOCK and holds it to commit, so a concurrent ``POST /api/context``
+          either orders wholly before this decision or waits for the write it
+          authorized. Locking FIRST also establishes the transaction's snapshot
+          on a locking statement, so a selection committed before the lock IS
+          visible below. This call is the LOCK, and only the lock — its
+          returned tuple authorizes nothing, because it may be one
+          ``_fallback()`` invented;
+        * the saved axis is then RE-READ from the store, under that same lock,
+          through ``resolve_saved_with_league``. That is the authority, and the
+          re-read is deliberate: phase 1's preflight snapshot is already stale
+          by the time the caller acts on it, so phase 2 reads the row itself
+          rather than trusting what phase 1 saw. A resolved tuple is not a
+          chosen one — ``_fallback()`` auto-selects for every ``_GLOBAL_ROLES``
+          caller, so "program is not None" proves only that the installation
+          HAS a Program, and a resolved value that EQUALS the saved one is
+          still not one that CAME from it. On the authorized path the two
+          agree by construction (``_resolve_locked`` honours a row that
+          validates), so the only work the resolve above does that the row read
+          does not is take the lock;
+        * the refusal is RAISED, not returned, so the surrounding transaction
+          ROLLS BACK and the mutation leaves zero domain and zero audit
+          effects. A returned dict would let a half-applied unit commit under
+          an error response — the same lesson ``_SetupMutationRefused``
+          records.
+
+        ActiveContext is locked BEFORE any Program/Team/Rink/Season/Game row,
+        which is the repo's canonical order. Taking it afterwards would both
+        fail to close the check/use window and introduce an ABBA deadlock
+        against every other mutation that already takes it first.
+
+        ``message`` is the operator-facing sentence for this surface; the CODE
+        is ``ActiveContextRequiredError``'s, defined exactly once.
+
+        This is the TWO-AXIS form, for a mutation that consumes a Season. The
+        Program-axis-only form is ``_mutation_context_error``'s other branch;
+        both read the same saved row through the same two predicates.
+        """
+        # (1) THE LOCK. #386's barrier, taken on the same locking statement
+        #     every other active-tuple mutation takes it on, so the ordering
+        #     guarantee against a concurrent `POST /api/context` is one
+        #     mechanism rather than two that must agree.
+        self.context.resolve_with_league(user_id, role, scope, lock=True)
+        # (2) THE AUTHORITY, re-read from the store under that lock. Never the
+        #     tuple above: see the docstring.
+        _saved, program, season, league = \
+            self.context.resolve_saved_with_league(
+                user_id, role, scope, lock=True)
+        if program is None or season is None:
+            raise ActiveContextRequiredError(message)
+        return program, season, league
+
+    def _season_axis_guard(self, user_id, role, scope, message):
+        """A callable a mutation invokes the moment it DISCOVERS, under its own
+        locks, that it is about to consume the SEASON axis (#409).
+
+        For the one operation whose axis class CHANGES mid-transaction.
+        ``transfer_team_to_league`` is a Program-axis move by its targets — a
+        Team and a League, both records that outlive any one Season — and the
+        pre-disclosure phase can see nothing else, because
+        ``_mutation_axis_targets`` reads no store row at all (that is what
+        makes phase 1 safe to answer before any lookup). Only AFTER the Team
+        row, the target League row and every affected Season row are locked
+        does the operation learn whether the Team has ACTIVE
+        SeasonTeamRegistrations to rewrite. Those are Season-owned bridge rows,
+        so at that instant the mutation becomes CROSS-AXIS and the two-axis
+        rule applies to it.
+
+        Neither predicate alone is correct, and the asymmetry is load-bearing
+        in BOTH directions:
+
+        * demanding the two-axis rule at phase 1 would refuse the perfectly
+          legitimate transfer of a Team with ZERO active registrations — which
+          consumes no Season — and would force phase 1 to read the store,
+          destroying the property that a refusal cannot be an existence oracle;
+        * accepting the Program-axis rule at phase 2 would let a caller whose
+          saved Season is STALE rewrite registrations in a Season they never
+          chose, which is the exact defect #409 exists to close.
+
+        So the guard is handed IN rather than applied at the boundary: only the
+        mutation knows which Seasons it touched, and it knows it only under the
+        locks. ``season_ids`` empty means the Season axis was never consumed
+        and nothing further is required.
+
+        Returns ``None`` for an identity-less internal caller (``role is
+        None``), matching every other #409 gate, so the seeds, the import path
+        and the acceptance harnesses stay completely untouched and take no
+        context read.
+        """
+        if role is None:
+            return None
+
+        def guard(season_ids):
+            if not season_ids:
+                return
+            # `_require_explicit_selection`, not a second comparison: the
+            # ActiveContext row lock is already held by the guarded
+            # transaction's own phase-2 check, so this re-reads the SAME locked
+            # row through the SAME predicate. RAISED, so the whole transfer
+            # rolls back — zero registration rewrites, zero Team change, zero
+            # audit rows.
+            self._require_explicit_selection(user_id, role, scope, message)
+
+        return guard
 
     def setup_season_is_active(self, season_id, user_id, role, scope):
         """#393 PR A: is ``season_id`` the caller's EXACTLY selected Season?
@@ -1155,7 +1374,11 @@ class ApiService:
         """
         if role is None:
             return None
-        program, season, _league = self.context.resolve_with_league(
+        # #409: judged against `_setup_gate_tuple`, not a bare resolve — see
+        # `setup_target_accessible` rule 2. A stale saved Season resolves to a
+        # Program-only tuple here, which fails closed below exactly as an
+        # explicit Program-only selection does.
+        program, season, _league = self._setup_gate_tuple(
             user_id, role, scope)
         if program is None or season is None:
             return False
@@ -1280,7 +1503,12 @@ class ApiService:
             return False                     # untranslated/unknown → fail closed
 
         # -- rule 2: the persisted active context, failing closed ----------
-        program, season, league = self.context.resolve_with_league(
+        # `_setup_gate_tuple`, not a bare resolve (#409): when the operator's
+        # explicitly chosen Program is still valid but its Season is gone, the
+        # fallback would retarget this gate into a Program they never chose —
+        # and then answer a generic not-found for their OWN records. The
+        # read-only fallback is untouched; this is the write side only.
+        program, season, league = self._setup_gate_tuple(
             user_id, role, scope)
         if program is None:
             return False
@@ -1546,9 +1774,215 @@ class ApiService:
         raise AssertionError("guarded mutation retry loop exited without a "
                              "result")
 
+    # ---- #409: WHICH AXES does a guarded setup mutation CONSUME? ----------
+    #
+    # Read straight off `_setup_target_edges`'s per-kind axis table rather than
+    # guessed, because the whole point of the rule is that the axes a mutation
+    # VALIDATES must be exactly the axes it CONSUMES. A kind is SEASON-OWNED
+    # when the link triple it carries names a Season of its own — the table's
+    # "Season: ITSELF / its Season" column:
+    #
+    #   season              -> {(program_id, ITSELF, None)}: the record IS a
+    #                          Season, so the Season axis is its identity;
+    #   league_season       -> {(season.program_id, season.id, league_id)}: the
+    #                          per-Season participation row, Season by
+    #                          construction;
+    #   division            -> delegates VERBATIM to its LeagueSeason, so it
+    #                          inherits that Season (and that verdict);
+    #   game                -> every non-null parent's Season, which must AGREE
+    #                          (#372); a Game hangs on the one Season its
+    #                          parents share;
+    #   registration        -> BRIDGE. Carries no chain of its own and is
+    #                          judged by its LeagueSeason, which is Season-owned;
+    #   season_venue_access -> BRIDGE. Judged by its Season, which IS the axis.
+    #
+    # and PROGRAM-AXIS-ONLY when the table shows an em dash in the Season
+    # column — the record outlives any one Season, so a mutation on it does not
+    # consume that axis and a missing or stale Season is IRRELEVANT to it:
+    #
+    #   program      -> {(itself, None, None)};
+    #   league       -> {(program_id, None, league_id)} — "PERMANENT across
+    #                   Seasons"; its per-Season participation is the SEPARATE
+    #                   league_season row above;
+    #   team         -> `_team_edges`: own/League Program + Team.league_id,
+    #                   "permanent; the Season lives on its registration";
+    #   player       -> its Team's edges verbatim ("as Team");
+    #   club         -> its Teams' edges, edge by edge ("as Teams");
+    #   official     -> its home Club's edges (Program + League). It also
+    #                   collects the Seasons of Games it officiates, but those
+    #                   are ASSIGNMENTS, not ownership: the person outlives
+    #                   every Season they work, and no Season deletion should
+    #                   strand their record;
+    #   venue        -> the facility tree. Its legacy Program link names no
+    #                   Season, and its Season edges are ACCESS GRANTS rather
+    #                   than ownership — `setup_venue_grantable` is the owner's
+    #                   ruling that a Venue is shared ACROSS Programs, let
+    #                   alone across Seasons;
+    #   rink         -> "as its Venue";
+    #   ice_slot     -> "as its Rink", i.e. as its Venue;
+    #   organization -> the Programs it OPERATES are a whole-Program link that
+    #                   names no Season.
+    #
+    # Together these are exactly `_SETUP_TARGET_KINDS`, so every guarded kind
+    # is classified and none is silently ungated; the assertion below is what
+    # keeps that true when a kind is added.
+    _SEASON_OWNED_TARGET_KINDS = frozenset({
+        "season", "league_season", "division", "game"})
+    _PROGRAM_AXIS_TARGET_KINDS = frozenset({
+        "program", "league", "team", "player", "club", "official",
+        "venue", "rink", "ice_slot", "organization"})
+    # TOTALITY, checked at import rather than trusted to review: a kind added
+    # to `_SETUP_TARGET_KINDS` without an axis would fall into the fail-closed
+    # branch below and start refusing a working surface with no explanation.
+    # This makes that a startup error naming the kind instead.
+    assert (_SEASON_OWNED_TARGET_KINDS | _PROGRAM_AXIS_TARGET_KINDS
+            == _SETUP_TARGET_KINDS), (
+        "#409: every guarded setup kind needs an AXIS classification; "
+        "unclassified: "
+        f"{sorted(_SETUP_TARGET_KINDS - _SEASON_OWNED_TARGET_KINDS - _PROGRAM_AXIS_TARGET_KINDS)}")
+
+    def _mutation_axis_targets(self, targets):
+        """``[(kind, record_id)]`` — the guarded targets that carry an axis.
+
+        Hyphens folded; a falsy or non-string id dropped (that is the facade's
+        own validation error and never this gate's business); a BRIDGE
+        pseudo-kind folded to the parent KIND it is judged by, exactly as
+        ``_authorize_setup_targets`` folds it.
+
+        A folded bridge's id is dropped with it, because the id that survives
+        is the PARENT's and the bridge row's own id is not one. Nothing here
+        reads the store at all, which is the property that lets this run before
+        any target row is looked up — so a refusal can never become an
+        existence oracle for records the caller may not see.
+        """
+        axis_targets = []
+        for target in targets:
+            kind, record_id = target[0], target[1]
+            if not isinstance(record_id, str) or not record_id:
+                continue
+            kind = (kind or "").replace("-", "_")
+            bridge = self._SETUP_BRIDGE_TARGETS.get(kind)
+            if bridge is not None:
+                kind, record_id = bridge[3], None
+            axis_targets.append((kind, record_id))
+        return axis_targets
+
+    def _mutation_context_error(self, targets, user_id, role, scope,
+                                lock=False):
+        """The #409 refusal for this guarded mutation, or None.
+
+        THE RULE, in the owner's words: *a fallback NEVER authorizes a
+        mutation.* Which explicitness is required depends on which axes the
+        mutation consumes, and is decided from the table above:
+
+        * SEASON-OWNED (and therefore CROSS-AXIS, since a Season names its
+          Program) — an explicit persisted Program AND Season, both still
+          present and still authorized (``_explicit_selection``);
+        * PROGRAM-ONLY — an explicit persisted Program, still present and still
+          authorized (``_explicit_program``). The Season axis is not consulted,
+          because the mutation does not consume it;
+        * a mutation naming BOTH is judged by the stricter two-axis rule: the
+          Season predicate compares the Program too, so every axis the unit
+          affects is validated, which is the cross-axis requirement;
+        * an UNKNOWN kind is judged by the stricter rule as well. Fail closed;
+          an unclassified kind must never be the ungated one.
+
+        THE PROGRAM COMPARED IS THE ROW'S OWN. Both branches take their
+        ``program``/``season`` from ``resolve_saved_with_league``, i.e. from the
+        PERSISTED ``ActiveContext`` row, fetched from the store and validated —
+        never from ``resolve_with_league``. That is the owner's tightening and
+        it is not equivalent to the comparison it replaces: ``_fallback()`` can
+        return a Program EQUAL to the saved one (it walks the caller's
+        authorized Programs in id order), and an equal value is not a derived
+        one. Everything downstream — #369's target gate included — is then
+        judged against a tuple that came from the operator's own choice.
+
+        WHAT THIS DELIBERATELY DOES NOT DO is compare that Program to the
+        TARGET's Program. It is tempting for a ``program`` target, where the
+        comparison would need no store read at all — and it would answer 409
+        for a caller who explicitly selected some OTHER Program. It is wrong:
+        #369's contract is that a record outside the caller's context is
+        BYTE-IDENTICAL to one that does not exist (the generic 404 not-found,
+        pinned by ``test_setup_target_authorization``'s five-case matrix), and
+        a code that varies with which Program the target belongs to is a
+        second answer for the same question. "You have not CHOSEN a context"
+        and "that record is not IN your context" stay two different
+        conditions, decided in that order, with two different codes.
+
+        ``lock=True`` is the authoritative form, called as the FIRST statement
+        of the transaction that performs the write (see
+        ``_require_explicit_selection`` for why the lock must come first).
+        ``lock=False`` is the transport PREFLIGHT: it exists so the refusal is
+        decided before any target lookup, and it is explicitly NOT the
+        boundary — its answer is already stale when the caller acts on it.
+
+        ``role is None`` — the legacy identity-less internal callers, the
+        demo/full seeds, the acceptance harnesses — is completely ungated and
+        takes no context read at all, matching ``setup_target_accessible``
+        rule 1 and ``setup_guarded_mutation``.
+        """
+        if role is None:
+            return None
+        axis_targets = self._mutation_axis_targets(targets)
+        if not axis_targets:
+            return None
+        # The KINDS decide which rule applies, and they are read off the route
+        # shape alone — no store row, so this branch (and therefore the refusal
+        # WORDING) cannot vary with which target id was supplied.
+        kinds = {kind for kind, _record_id in axis_targets}
+        program, season = self._explicit_selection(
+            user_id, role, scope, lock=lock)
+        if (kinds - self._PROGRAM_AXIS_TARGET_KINDS):
+            if program is None or season is None:
+                return ActiveContextRequiredError(
+                    "Select a Program and Season before changing this "
+                    "Season's setup records.")
+        elif program is None:
+            return ActiveContextRequiredError(
+                "Select a Program before changing its setup records.")
+        return None
+
+    def setup_mutation_context_error(self, targets, user_id, role, scope):
+        """PREFLIGHT ONLY: the #409 refusal dict for ``targets``, or None.
+
+        ``targets`` is the transport's own ``(kind, record_id[, rule])`` list,
+        in the caller's order. The transport sends this BEFORE
+        ``_reject_target_outside_scope``, so "you have not chosen a context"
+        is decided ahead of "that record is not in your context" — otherwise
+        an operator who has chosen nothing gets a not-found about a record
+        they were never told they may not see, which reverses the two
+        questions and reads as an existence answer.
+
+        It is NOT the security boundary: ``setup_guarded_mutation`` re-decides
+        it under the ActiveContext ROW LOCK, inside the transaction that
+        performs the write.
+        """
+        error = self._mutation_context_error(targets, user_id, role, scope)
+        return None if error is None else error.to_dict()
+
     def _guarded_attempt(self, checks, mutation, user_id, role, scope):
         """One all-or-nothing attempt. See ``setup_guarded_mutation``."""
         with self.store.transaction(isolation="SERIALIZABLE"):
+            # #409, and FIRST — before any target row is even looked up, so a
+            # caller who has chosen nothing learns nothing about which records
+            # exist, and before any setup row is LOCKED, so ActiveContext keeps
+            # its place at the head of the repo's canonical lock order.
+            #
+            # `setup_target_accessible` judges targets against the RESOLVED
+            # tuple, and `_fallback()` resolves one for every `_GLOBAL_ROLES`
+            # caller. So the #369 gate that correctly refuses a cross-Program
+            # delete happily authorized the same delete the moment the resolve
+            # fell back — the target now sat inside the Program the fallback
+            # had just picked on the operator's behalf.
+            #
+            # RAISED, not returned: the transaction rolls back, so a refusal
+            # costs zero domain rows and zero audit rows.
+            error = self._mutation_context_error(
+                [(kind, record_id) for _index, kind, record_id, _rule
+                 in checks],
+                user_id, role, scope, lock=True)
+            if error is not None:
+                raise error
             refused = self._authorize_setup_targets(
                 checks, user_id, role, scope)
             if refused is not None:
@@ -1648,6 +2082,381 @@ class ApiService:
         getter = self._SETUP_TARGET_LOCKS.get(kind)
         if getter is not None:
             getattr(self.store, getter)(record_id)
+
+    # ---- #409, THE CREATE FAMILY: which axes does a CREATE consume? -------
+    #
+    # A create is not a mutation on a target, and the target table above does
+    # not answer for it. `_mutation_axis_targets` classifies the record a
+    # request NAMES; a create names no such record, because the record is what
+    # it is about to mint. What it names instead is its PARENTS, and the
+    # owner's ruling is that a create is judged by the axes it CONSUMES FROM
+    # THOSE PARENTS:
+    #
+    #  * ZERO-AXIS ROOT — `organization`, `program`, `club`. A root with no
+    #    parent to compare against. `create_organization(name, short_name)` and
+    #    `create_club(name, country)` take no parent FK at all, and both kinds'
+    #    `_setup_target_edges` entries derive DOWNWARD from children (the
+    #    Programs an Organization operates and its Venues' edges; a Club's
+    #    Teams' edges, "a Club with no Team is genuinely unlinked"), so a
+    #    freshly created one carries zero edges by construction. `program`'s own
+    #    edge is `{(itself, None, None)}` — the record IS the Program axis, so
+    #    creating it is the very act that would establish a context to be
+    #    explicit about, and its only upward FK
+    #    (`operator_organization_id`) points at a kind that carries no axis of
+    #    its own. These three are judged by NOTHING and, crucially, read NO
+    #    CONTEXT AT ALL: the entry points below return before
+    #    `_explicit_selection` is even called, which is what makes "zero
+    #    `ContextService._fallback` calls on this path" a property a spy can
+    #    MEASURE rather than a claim about a status code.
+    #
+    #  * PROGRAM-AXIS — `venue`, `rink`, `ice_slot`, `official`, `team`,
+    #    `player`, and `season`. The saved Program is compared against the
+    #    PARENT's Program; the Season axis is not consulted, because none of
+    #    these records owns one (the facility tree's Season edges are ACCESS
+    #    GRANTS, a Team is "PERMANENT", a Player is judged "as Team", an
+    #    Official outlives every Season they work).
+    #
+    #    `season` is in this class and that is the ruling's zero-axis
+    #    rationale applied to ONE axis rather than to a whole record. A Season
+    #    record IS the Season axis (`{(program_id, ITSELF, None)}`), so a
+    #    Season CREATE mints that axis instead of consuming it — there is
+    #    nothing to compare it to. Demanding a saved Season here would make the
+    #    FIRST Season of a Program uncreatable (no Season exists to select, and
+    #    creating one is the act that would make one selectable), which is the
+    #    same unsatisfiability `_explicit_program` records one axis up and
+    #    which the bootstrap the owner's ruling protects runs straight into.
+    #    Its PARENT — the Program — is compared in full.
+    #
+    #  * SEASON-OWNED — `league`, `league_season`, `division`, `game`,
+    #    `registration`, `season_venue_access`. Two-axis: an explicit saved
+    #    Program AND Season, both compared against the parents. A `league`
+    #    create is here even though a League record is Program-axis, because
+    #    the unit also mints the `LeagueSeason` (`_link_league_season`) and so
+    #    CONSUMES the Season named by its `season_id` parent — per the rule
+    #    already stated for mutations, a unit naming both axes is judged by the
+    #    stricter one.
+    _CREATE_ZERO_AXIS = frozenset()
+    _CREATE_PROGRAM_AXIS = frozenset({"program"})
+    _CREATE_TWO_AXIS = frozenset({"program", "season"})
+    _CREATE_CONSUMED_AXES = {
+        # ZERO-AXIS ROOT — no parent, nothing to be explicit about.
+        "organization": _CREATE_ZERO_AXIS,
+        "program": _CREATE_ZERO_AXIS,
+        "club": _CREATE_ZERO_AXIS,
+        # PROGRAM-AXIS — compare the saved Program against the parent's.
+        "season": _CREATE_PROGRAM_AXIS,
+        "venue": _CREATE_PROGRAM_AXIS,
+        "rink": _CREATE_PROGRAM_AXIS,
+        "ice_slot": _CREATE_PROGRAM_AXIS,
+        "official": _CREATE_PROGRAM_AXIS,
+        "team": _CREATE_PROGRAM_AXIS,
+        "player": _CREATE_PROGRAM_AXIS,
+        # SEASON-OWNED — two-axis.
+        "league": _CREATE_TWO_AXIS,
+        "league_season": _CREATE_TWO_AXIS,
+        "division": _CREATE_TWO_AXIS,
+        "game": _CREATE_TWO_AXIS,
+        "registration": _CREATE_TWO_AXIS,
+        "season_venue_access": _CREATE_TWO_AXIS,
+    }
+    # TOTALITY, checked at import exactly as the mutation table above is: every
+    # guarded setup kind plus the two BRIDGE rows a create can mint must carry
+    # a create-side axis class. A kind added without one would take the
+    # fail-closed two-axis branch and start refusing a working surface with no
+    # explanation; this makes that a startup error naming the kind instead.
+    assert (set(_CREATE_CONSUMED_AXES)
+            == _SETUP_TARGET_KINDS | {"registration", "season_venue_access"}), (
+        "#409: every create kind needs an AXIS classification; unclassified: "
+        f"{sorted((_SETUP_TARGET_KINDS | {'registration', 'season_venue_access'}) - set(_CREATE_CONSUMED_AXES))}")
+
+    # Parent kinds whose axes a NEW child does NOT inherit, and which
+    # therefore contribute NOTHING to a create's comparison.
+    #
+    # Only `organization`, and it is read straight off `_setup_target_edges`
+    # rather than chosen: an Organization's edges are derived DOWNWARD from
+    # its children (the Programs it OPERATES, plus its existing Venues' edges
+    # — service.py's `organization` branch). A Venue created under it inherits
+    # none of them: `create_venue` takes its Program link from the legacy v1
+    # `league_id` field alone and never from the Organization, so a Venue made
+    # under an Organization that happens to operate Program P is born
+    # genuinely UNLINKED — a creator-owned pending row, not a row inside P.
+    # Comparing the saved Program against P would therefore refuse a write
+    # that lands in no Program at all, and it would refuse exactly the flow
+    # `writable_setup_parent_ids`'s creator-owned source exists to keep
+    # working ("create an Organization, create a Program it OPERATES, then add
+    # that Organization's first Venue"), which
+    # `test_setup_parent_write_scope` pins over real HTTP.
+    #
+    # The same reasoning is why `program` is a ZERO-AXIS ROOT create even
+    # though it accepts an `operator_organization_id`: a Program's own edge is
+    # its identity, never anything the Organization carries. What guards an
+    # Organization parent is #369's `_reject_parent_outside_scope`, which runs
+    # first and answers the only question there is about it — may this caller
+    # attach a child here.
+    _CREATE_PARENT_NO_INHERIT = frozenset({"organization"})
+
+    _CREATE_PROGRAM_MESSAGE = (
+        "Select a Program before creating records in it.")
+    _CREATE_SEASON_MESSAGE = (
+        "Select a Program and Season before creating records in them.")
+
+    def _create_context_error(self, kind, parents, user_id, role, scope,
+                              lock=False):
+        """``(error, refused_parent_index)`` — the #409 CREATE refusal, or
+        ``(None, None)``.
+
+        ``parents`` is the request's own ``(parent_kind, parent_id)`` list, in
+        the order the caller supplied them, so a refusal names the FIRST parent
+        that disagrees rather than whichever happened to sort first. A parent
+        may carry a third element, ``"program"``, narrowing THAT parent to the
+        Program comparison while the create as a whole stays two-axis. Exactly
+        one surface needs it: the two-Season roll-forward, whose registrations
+        are WRITTEN into ``to_season_id`` but READ out of ``from_season_id``.
+        The saved Season must be the one written to; the one read from is
+        bounded by the saved PROGRAM, because requiring it to equal the saved
+        Season as well would make roll-forward — whose entire purpose is to
+        span two Seasons — impossible. Leaving the source Season unbounded
+        instead would leave a cross-Season READ leak inside a write route,
+        since the response carries the source Season's registrations.
+
+        TWO refusals, and they answer two different questions in this order:
+
+        * ``error`` — an ``ActiveContextRequiredError`` (409). "You have not
+          CHOSEN a context." It is decided from the KIND and from whether the
+          named parents carry an axis at all, never from WHICH Program they
+          carry, so it is stable across every parent id whose axis-bearing-ness
+          is the same;
+        * ``refused_parent_index`` — "that parent is not IN your context." The
+          transport renders the generic ``"<Label> <id> not found."`` for it,
+          BYTE-IDENTICAL to a parent that never existed, so a mismatch can
+          never become an existence oracle.
+
+        THE COMPARISON IS THE ENFORCEMENT, and a parent that carries NO axis
+        has nothing to compare, so the create proceeds. That is not a
+        softening; it is what the ruling's PROGRAM-AXIS clause literally says
+        ("compare the SAVED Program against the PARENT's Program"), and it is
+        the only reading the pre-existing bootstrap assertions survive:
+        ``tests/test_zero_program_bootstrap_scoping.py`` drives
+        organization → venue → rink → ice-slot → official over TWO real Arena
+        Manager HTTP sessions on a Program-LESS install and asserts 200 on
+        every one. An Arena Manager cannot create a Program, so on that install
+        no Program exists for them to select and an unconditional requirement
+        would make those five UNSATISFIABLE rather than merely strict — the
+        revert recorded at ``Handler._reject_parent_outside_scope``. Context
+        becomes genuinely REQUIRED the instant the named parent carries a
+        Program edge, which is a property of the id the CALLER themselves
+        supplied and not of the installation's inventory (the
+        inventory-dependent carve-out ``has_active_program_season`` records the
+        owner as having forbidden).
+
+        ORDERING, and why the transport runs #369's parent-visibility gate
+        BEFORE this one rather than after. Deciding "does this parent carry a
+        Program" needs a store read, so unlike ``_mutation_context_error`` this
+        refusal is not lookup-free and a 409-before-404 order would let a
+        caller with no saved row separate "that id exists and is linked" (409)
+        from "nonexistent or foreign" (404) — a NEW existence oracle over
+        records they may not see. Running ``_reject_parent_outside_scope``
+        first removes it at the source: past that gate the caller provably can
+        already see the parent, so the 409 discloses nothing they did not
+        already have. The lookup-free property that ``_mutation_axis_targets``
+        guarantees for the mutation family is preserved as the property that
+        actually matters — a refusal is never an existence answer — by
+        ordering rather than by lookup avoidance, because for a create there is
+        no lookup-free formulation that also keeps the bootstrap satisfiable.
+
+        LOCK ORDER, when ``lock=True``: ActiveContext FIRST, then the parent
+        rows in canonical order, and only then the edges are read and compared
+        — so the create + audit that follows in the same transaction takes its
+        locks in the repo's canonical order and cannot ABBA-deadlock against
+        ``setup_guarded_mutation``, which takes exactly the same two in exactly
+        the same order.
+
+        ``role is None`` — the identity-less internal callers, the demo/full
+        seeds, the import and acceptance harnesses — is completely ungated and
+        takes no context read, matching every other #409 gate.
+        """
+        if role is None:
+            return None, None
+        normalized = (kind or "").replace("-", "_")
+        # An unknown kind fails CLOSED into the strictest rule rather than
+        # skipping the gate; the import-time totality assert above is what
+        # keeps this branch unreachable in practice.
+        axes = self._CREATE_CONSUMED_AXES.get(normalized, self._CREATE_TWO_AXIS)
+        if not axes:
+            # ZERO-AXIS ROOT. Return before ANY context read — this is the line
+            # the fallback spy measures.
+            return None, None
+        named = [((parent[0] or "").replace("-", "_"), parent[1])
+                 for parent in parents
+                 if isinstance(parent[1], str) and parent[1]]
+        # (1) THE ACTIVE CONTEXT, and its lock, FIRST. The authority is the
+        #     PERSISTED row (`resolve_saved_with_league` inside
+        #     `_explicit_selection`), never `resolve_with_league` — a resolver
+        #     that FELL BACK can return a Program equal to the saved one, and an
+        #     equal value is not a derived one.
+        program, season = self._explicit_selection(
+            user_id, role, scope, lock=lock)
+        # (2) the parent rows, in canonical (kind, id) order, under the same
+        #     transaction, so the edges read below cannot move under us.
+        if lock:
+            for parent_kind, parent_id in sorted(set(named)):
+                self._lock_setup_row(parent_kind, parent_id)
+        # (3) the parents' axes, read under those locks.
+        axis_parents, any_axis, unchosen_axis = [], False, False
+        for index, parent in enumerate(parents):
+            parent_kind, parent_id = parent[0], parent[1]
+            if not isinstance(parent_id, str) or not parent_id:
+                continue
+            parent_kind = (parent_kind or "").replace("-", "_")
+            if parent_kind in self._CREATE_PARENT_NO_INHERIT:
+                continue                    # the child inherits none of it
+            # A per-parent narrowing can only ever REMOVE an axis from the
+            # create's own set, never add one.
+            parent_axes = (axes if len(parent) < 3
+                           else axes & frozenset({parent[2]}))
+            record = self._setup_target_record(parent_kind, parent_id)
+            if record is None:
+                # Not this gate's business: a nonexistent parent is the
+                # facade's own byte-identical not-found a step later, and
+                # #369's visibility gate has already refused a foreign one.
+                continue
+            edges, _saw_link = self._setup_target_edges(parent_kind, record)
+            programs = {edge[0] for edge in edges if edge[0]}
+            seasons = {edge[1] for edge in edges if edge[1]}
+            if programs or seasons:
+                any_axis = True
+                # THE BOOTSTRAP CONTINUATION, and the ONE case where an
+                # axis-bearing parent still requires no chosen context. A
+                # Program's only edge is its OWN identity
+                # (`{(itself, None, None)}`), so "compare the saved Program
+                # against the parent's Program" degenerates, for a Program
+                # parent, into "you must already have selected the very
+                # Program you are naming". For a Program this caller JUST
+                # CREATED that is unsatisfiable in the same way a ZERO-AXIS
+                # ROOT create is: creating the Program and giving it its first
+                # Season (or its first Venue, through the legacy v1
+                # Venue→Program field) are two halves of one act, and the
+                # ruling's own rationale — "creating the root is the act that
+                # would establish context" — does not stop at the root row.
+                #
+                # This is NOT the inventory-dependent carve-out the owner
+                # forbade: it keys on CREATOR OWNERSHIP of the id the caller
+                # themselves named, the same authenticated, unforgeable signal
+                # `writable_setup_parent_ids` already rests on, and it is
+                # strictly narrower than authorization (a global role is
+                # authorized for every Program but has still created only its
+                # own). It also does not rescue the falsified path: an
+                # Official's home Club carries Program A as an edge to a record
+                # that is NOT the Club, so no self-edge exists and no amount of
+                # creator ownership of the Club makes A a Program the operator
+                # chose.
+                if not (parent_kind == "program"
+                        and self._setup_target_created_by(
+                            "program", parent_id, user_id)):
+                    unchosen_axis = True
+            axis_parents.append((index, parent_axes, programs, seasons))
+        if not any_axis:
+            # Every named parent is an unlinked, creator-owned draft (or there
+            # is no parent at all). Nothing to compare — the bootstrap chain.
+            return None, None
+        if program is None:
+            if not unchosen_axis:
+                return None, None           # bootstrap continuation, see above
+            return ActiveContextRequiredError(
+                self._CREATE_SEASON_MESSAGE if "season" in axes
+                else self._CREATE_PROGRAM_MESSAGE), None
+        if "season" in axes and season is None:
+            return ActiveContextRequiredError(self._CREATE_SEASON_MESSAGE), None
+        for index, parent_axes, programs, seasons in axis_parents:
+            if "program" in parent_axes and programs and program.id not in programs:
+                return None, index
+            if ("season" in parent_axes and seasons
+                    and season is not None and season.id not in seasons):
+                return None, index
+        return None, None
+
+    def setup_create_context_error(self, kind, parents, user_id, role, scope):
+        """PREFLIGHT ONLY: ``(refusal_dict_or_None, refused_parent_index)``.
+
+        The cheap, lock-free half of the create gate, so a refusal is decided
+        before the facade is called at all. It is NOT the security boundary:
+        ``setup_guarded_create`` re-decides the identical rule under the
+        ActiveContext ROW LOCK and the parent row locks, inside the transaction
+        that performs the create and its audit."""
+        error, index = self._create_context_error(
+            kind, parents, user_id, role, scope)
+        return (None if error is None else error.to_dict()), index
+
+    def _guarded_create_attempt(self, kind, parents, mutation, user_id, role,
+                                scope):
+        """One all-or-nothing attempt. See ``setup_guarded_create``."""
+        with self.store.transaction(isolation="SERIALIZABLE"):
+            error, index = self._create_context_error(
+                kind, parents, user_id, role, scope, lock=True)
+            # RAISED, not returned, so the transaction rolls back and the
+            # refusal provably costs zero entity rows, zero relationship rows
+            # and zero audit rows.
+            if error is not None:
+                raise error
+            if index is not None:
+                raise _SetupTargetRefused(index)
+            payload = mutation()
+            if isinstance(payload, dict) and "error" in payload:
+                raise _SetupMutationRefused(payload)
+            return payload, None
+
+    def setup_guarded_create(self, kind, parents, mutation, user_id, role,
+                             scope):
+        """THE boundary for a CREATE: re-decide #409's axis comparison under
+        the ActiveContext row lock and the parent row locks, and run
+        ``mutation`` — the insert, any relationship row it mints, and its audit
+        — inside that same transaction (#409).
+
+        Returns ``(payload, refused_parent_index)`` on exactly the same
+        contract as ``setup_guarded_mutation``:
+
+        * ``(payload, None)`` — the create ran and COMMITTED;
+        * ``(None, i)`` — parent ``i`` is outside the caller's saved axes.
+          NOTHING ran: no entity, no relationship, no audit row, no
+          lookup-derived field serialized. The transport renders its own
+          generic not-found for ``parents[i]``, so the refusal stays
+          byte-identical to a nonexistent parent;
+        * ``(error_dict, None)`` — either the #409 409 itself or a domain error
+          the mutation raised. Rolled back first, for the same reason
+          ``_SetupMutationRefused`` records.
+
+        ``role is None``, and a ZERO-AXIS ROOT kind, are completely untouched:
+        no transaction is opened, no lock is taken and no context row is read,
+        so the seeds, the import harnesses and the bootstrap creates neither
+        wait on anything nor consult a context that does not exist yet."""
+        normalized = (kind or "").replace("-", "_")
+        axes = self._CREATE_CONSUMED_AXES.get(normalized, self._CREATE_TWO_AXIS)
+        if role is None or not axes:
+            return mutation(), None
+        try:
+            for attempt in range(self._GUARDED_MUTATION_RETRIES):
+                try:
+                    return self._guarded_create_attempt(
+                        normalized, parents, mutation, user_id, role, scope)
+                except _SetupTargetRefused as exc:
+                    return None, exc.index      # rolled back: nothing happened
+                except _SetupMutationRefused as exc:
+                    return exc.payload, None    # rolled back: nothing happened
+                except ConcurrencyConflictError:
+                    # A named row (or the ActiveContext row) moved under us. A
+                    # fresh attempt re-reads a snapshot that INCLUDES the
+                    # winner and either authorizes against the new truth or
+                    # refuses. Bounded, exactly like `setup_guarded_mutation`.
+                    if attempt == self._GUARDED_MUTATION_RETRIES - 1:
+                        raise
+        except DomainError as exc:
+            # Covers the #409 refusal itself (`ActiveContextRequiredError`,
+            # raised so the transaction rolls back) and any domain error the
+            # transaction boundary raises after the facade's own @catch, which
+            # sits INSIDE this transaction.
+            return exc.to_dict(), None
+        raise AssertionError("guarded create retry loop exited without a "
+                             "result")
 
     # The permission each Setup workflow's own primary action needs (#330
     # review round 1 finding 1). Facilities is MANAGE_ARENA — the one
@@ -5050,8 +5859,24 @@ class ApiService:
             # exists, so it is left exactly where it is.
             return
 
-        program, season, league = self.context.resolve_with_league(
-            user_id, role, scope, lock=lock)
+        if lock:
+            # #409 — the MUTATING form only, and the transaction's FIRST
+            # statement. `commit_draft_schedule` reaches here after the
+            # Program/Team/Rink/Season locks are held and before the first
+            # Game INSERT; a caller with no explicit selection (or a stale
+            # one) would otherwise have their reviewed proposal committed into
+            # the Program `_fallback()` picked for them. A Season-owned batch,
+            # so the two-axis rule. The refusal RAISES, so the whole unit rolls
+            # back: zero Games, zero ice-slot allocations, zero audit rows.
+            # The pure PREFLIGHT (`lock=False`) is left alone — it is a
+            # generation, not a mutation, and read-only work keeps the
+            # fallback.
+            program, season, league = self._require_explicit_selection(
+                user_id, role, scope,
+                "Select a Program and Season before committing a schedule.")
+        else:
+            program, season, league = self.context.resolve_with_league(
+                user_id, role, scope, lock=lock)
         judged = False
 
         def _edge_allows(edge):
@@ -5362,8 +6187,17 @@ class ApiService:
             # point each request shape knows its whole edge — see `_edge_allows`
             # below. `role is None` takes no context read at all, exactly as
             # before.
-            active = (self.context.resolve_with_league(user_id, role, scope)
-                      if role is not None else None)
+            # #409 — an identified caller must have CHOSEN the tuple this
+            # scenario is generated and PERSISTED under; a scenario row is a
+            # Season-owned record (it stores program_id/season_id/league_id),
+            # so the two-axis rule applies. Taken as this transaction's first
+            # statement, under the ActiveContext lock, and RAISED so a refusal
+            # leaves no scenario row behind. `role is None` still takes no
+            # context read at all.
+            active = (self._require_explicit_selection(
+                user_id, role, scope,
+                "Select a Program and Season before generating a schedule "
+                "scenario.") if role is not None else None)
 
             def _edge_allows(edge):
                 """The ONE tuple check, as a raise-to-refuse callback.
@@ -5569,6 +6403,17 @@ class ApiService:
         with self._active_context_mutex(user_id, role), \
                 self.store.transaction(
                 isolation=None if role is None else "SERIALIZABLE"):
+            # #409 — FIRST, before the scenario row is even read, so a caller
+            # who has chosen nothing learns nothing about which scenarios
+            # exist. Committing a scenario writes its Games into the tuple the
+            # scenario names, and `_scenario_in_active_tuple` judges that
+            # against the RESOLVED tuple — which `_fallback()` supplies for
+            # every `_GLOBAL_ROLES` caller. A Season-owned batch: two-axis.
+            if role is not None:
+                self._require_explicit_selection(
+                    user_id, role, scope,
+                    "Select a Program and Season before committing a "
+                    "schedule scenario.")
             scenario = self.store.get_schedule_scenario_for_update(scenario_id)
             # Locked first, then judged: a foreign scenario and a nonexistent
             # one leave through the ONE raise site, so commit is no more of an
@@ -5872,7 +6717,30 @@ class ApiService:
         makes: the pre-lock regeneration is the preflight, and the LOCKED
         regeneration re-authorizes under the Program/Team/Rink/Season locks
         inside the same transaction as the Game INSERTs — #381's
-        lock-then-decide-then-mutate shape, for the same reason (#372)."""
+        lock-then-decide-then-mutate shape, for the same reason (#372).
+
+        #409 PHASE 1, and it has to be HERE rather than one layer down. This
+        was the one mutation family where the stable ``active_context_required``
+        409 was answered only AFTER target disclosure: the attempt's PRE-LOCK
+        regeneration reaches ``_authorize_schedule_target`` with ``lock=False``,
+        which resolves through the raw ``resolve_with_league`` FALLBACK, so a
+        caller who had chosen nothing (or whose choice had gone stale) could
+        already be told ``preview_stale``, ``division_missing``,
+        ``league_season_missing`` or ``pairing_already_scheduled`` about a
+        hierarchy they never selected. The refusal below is decided before the
+        first regeneration runs, so it names nothing and depends on no
+        caller-supplied id — the same shape, and the same reused predicate, as
+        the ice-availability commit's own preflight.
+
+        It is NOT the boundary: the post-lock ``_authorize_schedule_target(
+        lock=True)`` inside the writing transaction re-decides the identical
+        rule under the ActiveContext row lock. Both phases, because this one is
+        already stale when the caller acts on it and that one cannot be reached
+        without disclosing the regeneration's diagnostics first."""
+        if role is not None and not self.has_active_program_season(
+                user_id, role, scope):
+            raise ActiveContextRequiredError(
+                "Select a Program and Season before committing a schedule.")
         for _attempt in range(3):
             try:
                 return self._commit_draft_schedule_attempt(
@@ -6828,10 +7696,18 @@ class ApiService:
         # whatever the batch goes on to read is at least as new as the tuple
         # it authorized against.
         if role is not None:
-            program, season, league = self.context.resolve_with_league(
-                user_id, role, scope, lock=True)
-            if program is None:
-                return []
+            # #409: the locked resolve AND the explicit-selection rule are one
+            # step, taken together as this transaction's first statement. The
+            # earlier `if program is None: return []` accepted every fallback
+            # tuple — an un-chosen or STALE selection published and discarded
+            # the auto-selected Program's drafts and reported a 200 count for
+            # them. A resolved tuple is not a chosen one; refusing here rolls
+            # the whole unit back, so the refusal costs zero Games, zero ice
+            # slots and zero audit rows.
+            program, season, league = self._require_explicit_selection(
+                user_id, role, scope,
+                "Select a Program and Season before publishing or discarding "
+                "draft games.")
         drafts = [g for g in self.store.all_games() if g.is_draft]
         if role is None:
             # Ungated: no context read, no context lock, no re-read. The
@@ -9449,14 +10325,26 @@ class ApiService:
 
     @catch
     def transfer_team_to_league(self, team_id: str, league_id: str,
-                                actor_id: Optional[str] = None) -> dict:
+                                actor_id: Optional[str] = None,
+                                user_id=None, role=None, scope=None) -> dict:
         """#283 Slice B: move a Team to a different permanent League
         (promotion/relegation/transfer, rule 10). History is untouched.
 
         The raw competition ``Team.league_id`` is dropped from the response —
-        the shared team shape never exposes it (see ``create_team``)."""
+        the shared team shape never exposes it (see ``create_team``).
+
+        `(user_id, role, scope)` is the caller's PRINCIPAL, and this is the ONE
+        setup mutation whose #409 axis class changes mid-transaction: its
+        targets are Program-axis, but under its locks it may rewrite
+        Season-owned registration rows. ``_season_axis_guard`` carries the
+        two-axis rule down to the instant that becomes true — see it for why
+        neither predicate alone is correct at either end."""
         team = _serialize(self.setup.transfer_team_to_league(
-            team_id, league_id, actor_id))
+            team_id, league_id, actor_id,
+            season_axis_guard=self._season_axis_guard(
+                user_id, role, scope,
+                "Select a Program and Season before moving a team that has "
+                "active season registrations.")))
         team.pop("league_id", None)
         return team
 
@@ -9551,15 +10439,15 @@ class ApiService:
                 self.store.transaction(
                     isolation=None if role is None else "SERIALIZABLE"):
             # (2) ActiveContext first, and LOCKED for the rest of this unit.
-            program, season, _league = self.context.resolve_with_league(
-                user_id, role, scope, lock=True)
             # Same rule as the preflight, re-decided here under the
-            # ActiveContext LOCK rather than re-implemented.
-            if not self._selection_is_explicit(user_id, program, season):
-                return {"error": {
-                    "code": "active_context_required",
-                    "message": ("Select a Program and Season before building "
-                                "ice availability.")}}
+            # ActiveContext LOCK rather than re-implemented — and through the
+            # SAME `_require_explicit_selection` boundary the scheduler
+            # batches and the guarded setup mutations use (#409), so one rule
+            # and one wire code serve every mutation that has this gate.
+            program, season, _league = self._require_explicit_selection(
+                user_id, role, scope,
+                "Select a Program and Season before building ice "
+                "availability.")
             if not season_id or season.id != season_id \
                     or season.program_id != program.id:
                 # Byte-identical to a nonexistent target: never an oracle.

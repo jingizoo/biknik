@@ -1173,6 +1173,11 @@ class TurnaroundHttpTest(unittest.TestCase):
         post("/api/context", {"program_id": program["id"]})
         season = post("/api/setup/season",
                       {"league_id": program["id"], "name": "TA Season"})
+        # #409: the Level/Division creates are SEASON-OWNED — select the
+        # Season this fixture just made, which is the tuple the fallback was
+        # already handing this session.
+        post("/api/context",
+             {"program_id": program["id"], "season_id": season["id"]})
         level = post("/api/setup/level",
                      {"season_id": season["id"], "name": "TA Level"})
         division = post("/api/setup/division", {
@@ -1264,6 +1269,11 @@ class TurnaroundHttpTest(unittest.TestCase):
         post("/api/context", {"program_id": program["id"]})
         season = post("/api/setup/season",
                       {"league_id": program["id"], "name": "FP Season"})
+        # #409: the Level/Division creates are SEASON-OWNED, so the Season
+        # this fixture just built has to be the operator's own EXPLICIT
+        # choice — the same tuple the fallback was already handing it.
+        post("/api/context",
+             {"program_id": program["id"], "season_id": season["id"]})
         level = post("/api/setup/level",
                      {"season_id": season["id"], "name": "FP Level"})
         division = post("/api/setup/division", {

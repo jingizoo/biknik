@@ -838,10 +838,16 @@ class SeasonLifecycleHttpTest(unittest.TestCase):
     def _admin_holding(self, sid):
         """A signed-in League Admin whose PERSISTED context is Season ``sid``.
 
-        REOPEN is a Season-bound mutation, so #369's target gate judges it
-        against the ACTIVE SEASON and a Program-only context fails closed. The
-        identity-less ``X-Demo-Role`` requests the rest of this class uses can
-        persist no context at all, and the deterministic fallback deliberately
+        Every GUARDED SETUP MUTATION in this class needs one (#409): a
+        mutation now requires an EXPLICITLY PERSISTED Program/Season, and an
+        identity-less ``X-Demo-Role`` caller has no account to persist a
+        selection against, so it can no longer drive archive / reopen /
+        league-delete / league-season-unbind at all. Reads and authorization
+        refusals still go through the header path unchanged.
+
+        REOPEN is additionally a Season-bound mutation, so #369's target gate
+        judges it against the ACTIVE SEASON and a Program-only context fails
+        closed. The deterministic fallback deliberately
         never enters an ARCHIVED Season on its own (``ContextService._fallback``
         — an archived Season is honored when EXPLICITLY chosen, never something
         the system moves you into). So the reopen legs sign in and select the
@@ -922,9 +928,10 @@ class SeasonLifecycleHttpTest(unittest.TestCase):
                          SeasonStatus.ACTIVE)
 
     def test_archive_unknown_season_404(self):
-        self._seed_season()
+        sid = self._seed_season()
+        admin = self._admin_holding(sid)                # #409
         st, body = self._req("POST", "/api/v2/setup/seasons/missing/archive",
-                             {"reason": "x"})
+                             {"reason": "x"}, role=None, opener=admin)
         self.assertEqual(st, 404, body)
 
     def test_archive_rejects_nonstring_reason_over_http(self):
@@ -932,8 +939,9 @@ class SeasonLifecycleHttpTest(unittest.TestCase):
         # stable field, and the Season is untouched (no 500, no silent archive).
         for bad in (True, False, 5, 0, 1.5, ["x"], [], {"k": "v"}, {}):
             sid = self._seed_season()
+            admin = self._admin_holding(sid)            # #409
             st, body = self._req("POST", f"/api/v2/setup/seasons/{sid}/archive",
-                                 {"reason": bad})
+                                 {"reason": bad}, role=None, opener=admin)
             self.assertEqual(st, 400, (bad, body))
             self.assertEqual(body["error"]["details"]["reason"],
                              "invalid_reason", (bad, body))
@@ -944,8 +952,9 @@ class SeasonLifecycleHttpTest(unittest.TestCase):
 
     def test_archive_accepts_null_reason_over_http(self):
         sid = self._seed_season()
+        admin = self._admin_holding(sid)                # #409
         st, body = self._req("POST", f"/api/v2/setup/seasons/{sid}/archive",
-                             {"reason": None})
+                             {"reason": None}, role=None, opener=admin)
         self.assertEqual(st, 200, body)
         self.assertEqual(body["status"], "archived")
         aud = [a for a in STATE.api.store.all_setup_audit()
@@ -985,7 +994,9 @@ class SeasonLifecycleHttpTest(unittest.TestCase):
         lid = STATE.api.create_league(sid, "Gold")["id"]  # binds a LeagueSeason
         STATE.api.setup.archive_season(sid, actor_id="admin", reason="done")
         bindings0 = {ls.id for ls in store.all_league_seasons()}
-        st, body = self._req("POST", f"/api/v2/setup/league/{lid}/delete")
+        admin = self._admin_holding(sid)                # #409
+        st, body = self._req("POST", f"/api/v2/setup/league/{lid}/delete",
+                             role=None, opener=admin)
         self.assertEqual(st, 400, body)
         self.assertEqual(body["error"]["details"]["reason"], "season_archived")
         self.assertIsNotNone(store.get_league(lid))  # zero mutation
@@ -997,15 +1008,18 @@ class SeasonLifecycleHttpTest(unittest.TestCase):
         sid = self._seed_season()
         lid = STATE.api.create_league(sid, "Gold")["id"]
         ls_id = STATE.api.store.league_seasons_for_league(lid)[0].id
+        admin = self._admin_holding(sid)                # #409
         st, _ = self._req("POST", f"/api/v2/setup/league-season/{ls_id}/delete",
                           role="coach")
         self.assertEqual(st, 403)  # non-admin refused
         self.assertIsNotNone(STATE.api.store.get_league_season(ls_id))
         st, body = self._req("POST",
-                             f"/api/v2/setup/league-season/{ls_id}/delete")
+                             f"/api/v2/setup/league-season/{ls_id}/delete",
+                             role=None, opener=admin)
         self.assertEqual(st, 200, body)
         self.assertIsNone(STATE.api.store.get_league_season(ls_id))
-        st, body = self._req("POST", f"/api/v2/setup/league/{lid}/delete")
+        st, body = self._req("POST", f"/api/v2/setup/league/{lid}/delete",
+                             role=None, opener=admin)          # #409
         self.assertEqual(st, 200, body)
         self.assertIsNone(STATE.api.store.get_league(lid))
 
@@ -1018,13 +1032,16 @@ class SeasonLifecycleHttpTest(unittest.TestCase):
         sid = self._seed_season()
         lid = STATE.api.create_league(sid, "Gold")["id"]
         ls_id = STATE.api.store.league_seasons_for_league(lid)[0].id
+        admin = self._admin_holding(sid)                # #409
         st, body = self._req("POST",
-                             f"/api/v2/setup/league-season/{ls_id}/delete")
+                             f"/api/v2/setup/league-season/{ls_id}/delete",
+                             role=None, opener=admin)
         self.assertEqual(st, 200, body)
         self.assertIsNone(STATE.api.store.get_league_season(ls_id))
         # Second unbind of the now-gone binding → 404, zero mutation.
         st, body = self._req("POST",
-                             f"/api/v2/setup/league-season/{ls_id}/delete")
+                             f"/api/v2/setup/league-season/{ls_id}/delete",
+                             role=None, opener=admin)
         self.assertEqual(st, 404, body)
         self.assertEqual(body["error"]["code"], "not_found", body)
         audits = [a for a in STATE.api.store.all_setup_audit()
@@ -1037,7 +1054,9 @@ class SeasonLifecycleHttpTest(unittest.TestCase):
         club = STATE.api.create_club("Club")["id"]
         STATE.api.create_team(club_id=club, name="Alpha", league_id=lid)
         teams0 = len(STATE.api.store.all_teams())
-        st, body = self._req("POST", f"/api/v2/setup/league/{lid}/delete")
+        admin = self._admin_holding(sid)                # #409
+        st, body = self._req("POST", f"/api/v2/setup/league/{lid}/delete",
+                             role=None, opener=admin)
         self.assertEqual(st, 409, body)
         self.assertEqual(body["error"]["code"], "has_dependencies")
         types = {g["type"] for g in body["error"]["details"]["dependencies"]}
@@ -1052,9 +1071,14 @@ class SeasonLifecycleHttpTest(unittest.TestCase):
         # needed — the guard fires before any copy).
         store.add_season(Season(id="s2", program_id="p", name="To",
                                 status=SeasonStatus.ARCHIVED))
+        # #409: roll-forward is a guarded CREATE whose rows land in the PATH
+        # Season, so the operator must be standing in s2 -- an archived Season
+        # is honored when EXPLICITLY chosen (see `_admin_holding`). The header
+        # caller has no account to persist that choice against.
+        admin = self._admin_holding("s2")
         st, body = self._req(
             "POST", "/api/v2/setup/seasons/s2/roll-forward",
-            {"from_season_id": sid})
+            {"from_season_id": sid}, role=None, opener=admin)
         self.assertEqual(st, 400, body)
         self.assertEqual(body["error"]["details"]["reason"], "season_archived")
 

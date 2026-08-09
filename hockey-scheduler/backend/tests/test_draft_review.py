@@ -455,6 +455,16 @@ class DraftReviewHttpTest(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read() or b"{}")
 
+    def _select_active_context(self, opener):
+        """Persist the tuple ``GET /api/context`` already resolves for this
+        session (#409). Read-only navigation keeps the deterministic fallback;
+        a mutation must be aimed at a context the operator CHOSE."""
+        _s, ctx = self._req(opener, "GET", "/api/context")
+        self._req(opener, "POST", "/api/context",
+                  {"program_id": ctx.get("program_id"),
+                   "season_id": ctx.get("season_id"),
+                   "league_id": ctx.get("league_id")})
+
     def _clear_schedule(self):
         """#277: draft commit now runs the SAME final conflict check as manual
         moves, team-overlap included. The demo seeds a full schedule, so
@@ -503,6 +513,7 @@ class DraftReviewHttpTest(unittest.TestCase):
         c = self._client()
         self._req(c, "POST", "/api/auth/login",
                   {"username": "admin", "password": "demo"})
+        self._select_active_context(c)                          # #409
         self._clear_schedule()     # isolate the TEAM conflict from slot reuse
         api = srv.STATE.api
         store = api.store
@@ -568,6 +579,7 @@ class DraftReviewHttpTest(unittest.TestCase):
         c = self._client()
         self._req(c, "POST", "/api/auth/login",
                   {"username": "admin", "password": "demo"})
+        self._select_active_context(c)                          # #409
         self._clear_schedule()          # isolate the SLOT conflict from team-overlap
         api = srv.STATE.api
         store = api.store
@@ -607,6 +619,11 @@ class DraftReviewHttpTest(unittest.TestCase):
     def test_operator_commit_and_discard_roundtrip(self):
         c = self._client()
         self._req(c, "POST", "/api/auth/login", {"username": "admin", "password": "demo"})
+        # #409: /drafts/discard is a MUTATION, so it now requires an
+        # EXPLICITLY persisted Program/Season rather than the read-only
+        # fallback. Persist the very tuple this session already resolves, so
+        # the batch this case discards is byte-for-byte the one it always was.
+        self._select_active_context(c)
         self._clear_schedule()
         _, preview = self._req(c, "POST", "/api/scheduler/draft",
                                {"division_id": self.div})

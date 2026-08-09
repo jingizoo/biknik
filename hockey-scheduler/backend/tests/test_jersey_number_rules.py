@@ -280,6 +280,15 @@ class HttpJerseyTest(unittest.TestCase):
         self._req(c, "POST", "/api/auth/login",
                   {"username": "admin", "password": "demo"})
         self._req(c, "POST", "/api/demo/load", {})
+        # #409: the Player CREATE is guarded, so persist byte-for-byte the
+        # tuple this session already resolves -- the seeded Program/Season
+        # these jersey tests have always written into.
+        status, ctx = self._req(c, "GET", "/api/context")
+        if status == 200 and ctx.get("program_id"):
+            self._req(c, "POST", "/api/context",
+                      {"program_id": ctx.get("program_id"),
+                       "season_id": ctx.get("season_id"),
+                       "league_id": ctx.get("league_id")})
         return c
 
     def _req(self, opener, method, path, body=None):
