@@ -127,6 +127,11 @@ CONTENT_TYPES = {
 
 # Maps structured domain-error codes to HTTP status codes (per api-contract.md).
 ERROR_HTTP_STATUS = {
+    # #393 PR A: the no-active-tuple refusal is 409 wherever it is
+    # decided. Without this the route preflight sent 409 and the LOCKED
+    # commit fell through to _send_api's 400 default, so the same state
+    # returned a different status purely on race timing.
+    "active_context_required": 409,
     "not_found": 404,
     "validation_error": 400,
     "roster_locked": 409,
@@ -2601,12 +2606,75 @@ class Handler(BaseHTTPRequestHandler):
                       "end_local", "start_date", "end_date", "playable_minutes",
                       "turnover_minutes", "exclusion_dates", "windows")
             kwargs = {k: body.get(k) for k in fields}
+            # #393 PR A — the named Season must be the caller's EXACTLY
+            # selected one. Without this the route was both a cross-context
+            # WRITE (an operator in Program A committed AVAILABLE ice into
+            # Program B's Season: 200, foreign slot count 0 -> 6) and an
+            # EXISTENCE ORACLE WITH A PAYLOAD (a foreign Season echoed the
+            # other Program's Season/Venue/Rink names and its whole slot
+            # inventory at 200, while a nonexistent one returned 404).
+            #
+            # `rule="active_season"`, not the generic ceiling: League Admin and
+            # Arena Manager are _GLOBAL_ROLES, authorized for every Program, so
+            # an authorization-only check refuses neither. This is a
+            # workflow-target boundary — they may switch context and do the
+            # same write legitimately.
+            #
+            # The model is the sibling that already gets this right:
+            # /api/v2/setup/seasons/<id>/archive names a Season the same way,
+            # routes through _guarded_mutation, and returns byte-identical 404s
+            # for foreign and nonexistent with no name leak.
+            season_id = kwargs.get("season_id")
+            # Owner ruling — THREE distinct states, in this order:
+            #
+            #   1. no active tuple      -> 409 active_context_required
+            #   2. active tuple, target foreign / sibling-Season / nonexistent
+            #                           -> byte-identical generic 404
+            #   3. target IS the active Season -> proceed
+            #
+            # State 1 is decided FIRST and without touching `season_id`, so a
+            # real, a foreign and a nonexistent id are indistinguishable when
+            # nothing is selected — the refusal cannot be used to probe which
+            # Seasons exist. It is a distinct code from state 2 on purpose:
+            # "you have not chosen where to work" is a different, recoverable
+            # condition from "that is not your target", and PR B renders it as
+            # a "Select a Program and Season" state rather than an error.
+            #
+            # A sole authorized Program is deliberately NOT inferred: that
+            # would weaken the workflow-target boundary and make API behaviour
+            # depend on changing account inventory.
+            if not api.has_active_program_season(user_id, role, scope):
+                # Sent through _send_api, the SAME contract the locked commit
+                # uses, so the status comes from one ERROR_HTTP_STATUS entry
+                # rather than a literal here and a default there.
+                return self._send_api({"error": {
+                    "code": "active_context_required",
+                    "message": ("Select a Program and Season before building "
+                                "ice availability.")}})
             if path.endswith("/preview"):
+                # A read: it writes nothing, so the cheap preflight IS the
+                # whole gate. There is no check/use window to close because
+                # there is no use.
+                if self._reject_target_outside_scope(
+                        "season", season_id, user_id, role, scope,
+                        "active_season"):
+                    return
                 return self._send_api(
                     api.preview_ice_availability(actor_id=user_id, **kwargs))
-            return self._send_api(api.commit_ice_availability(
-                actor_id=user_id,
-                template_fingerprint=body.get("template_fingerprint"), **kwargs))
+            # A write: the decision has to be atomic with it, and against a
+            # concurrent CONTEXT SWITCH as well as a Season reparent.
+            # _guarded_mutation alone is not enough — it locks the Season, and
+            # nothing there contends with the caller's ActiveContext row, so a
+            # `POST /api/context` could commit tuple B between the A-tuple
+            # decision and A's write. The facade below follows the #386
+            # protocol: per-user mutex outside the unit, ActiveContext locked
+            # BEFORE any Season row, then decide and commit in one transaction.
+            commit_kwargs = {k: v for k, v in kwargs.items() if k != "season_id"}
+            return self._send_api(
+                api.commit_ice_availability_in_active_season(
+                    user_id, role, scope, season_id=season_id,
+                    template_fingerprint=body.get("template_fingerprint"),
+                    **commit_kwargs))
 
         # Scheduling policy (#277 Slice B): upsert/clear one Program/Season/
         # Rink scope's turnover + curfew knobs. Checked BEFORE the generic
@@ -2699,6 +2767,27 @@ class Handler(BaseHTTPRequestHandler):
         # so without the principal an operator working in Program B received
         # Program A's whole proposal — pairings, team names and ice slots.
         if path == "/api/scheduler/draft":
+            # STRICT schema (#271's contract, #393 PR A). Without it an
+            # unknown field — a typo, a stale client sending a removed knob,
+            # or `meetings_per_oponent` — was silently DROPPED and the draft
+            # was generated under different rules than the caller asked for.
+            # The sibling /api/scheduler/scenarios route has always been
+            # strict; draft and commit were the gap.
+            try:
+                check_body(
+                    body,
+                    allowed={"division_id", "season_id", "league_id",
+                             "slot_ids", "constraints",
+                             "meetings_per_opponent", "games_per_team"},
+                    types={"division_id": (str, type(None)),
+                           "season_id": (str, type(None)),
+                           "league_id": (str, type(None)),
+                           "slot_ids": (list, type(None)),
+                           "constraints": (dict, type(None)),
+                           "meetings_per_opponent": (int, type(None)),
+                           "games_per_team": (int, type(None))})
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
             return self._send_api(api.draft_season_schedule(
                 division_id=body.get("division_id"),
                 season_id=body.get("season_id"), league_id=body.get("league_id"),
@@ -2760,6 +2849,25 @@ class Handler(BaseHTTPRequestHandler):
         # Attribute draft commit/publish/discard to the signed-in user resolved
         # server-side (#86 audit trail), never a client-supplied actor_id.
         if path == "/api/scheduler/commit":
+            # Same strict schema as draft. It matters more here: commit is the
+            # WRITE, and a dropped field means committing a differently-shaped
+            # schedule than the one reviewed.
+            try:
+                check_body(
+                    body,
+                    allowed={"division_id", "season_id", "league_id",
+                             "slot_ids", "constraints", "draft_fingerprint",
+                             "meetings_per_opponent", "games_per_team"},
+                    types={"division_id": (str, type(None)),
+                           "season_id": (str, type(None)),
+                           "league_id": (str, type(None)),
+                           "slot_ids": (list, type(None)),
+                           "constraints": (dict, type(None)),
+                           "meetings_per_opponent": (int, type(None)),
+                           "games_per_team": (int, type(None)),
+                           "draft_fingerprint": (str, type(None))})
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
             return self._send_api(api.commit_draft_schedule(
                 division_id=body.get("division_id"),
                 season_id=body.get("season_id"), league_id=body.get("league_id"),

@@ -706,8 +706,19 @@ async function checkViewport(browser, viewport) {
     await page.fill("#ib-to", "2026-12-31");
     let releaseFacilitiesPreview;
     const holdFacilitiesPreview = new Promise((resolve) => { releaseFacilitiesPreview = resolve; });
+    // FETCH FIRST, HOLD ONLY DELIVERY. `await hold; route.continue()` sends
+    // the request to the server only AFTER the context switch, so under
+    // #393 PR A's tuple gate the server answers 404 and this test would
+    // silently change subject: it would prove the client discards a late
+    // FAILURE, when its whole purpose is to prove it discards a late
+    // SUCCESS. The response is captured while the original context is still
+    // active, then delivered after the switch.
+    let facilitiesPreviewStatus = null;
     await page.route("**/api/setup/ice-availability/preview", async (route) => {
-      await holdFacilitiesPreview; await route.continue();
+      const response = await route.fetch();
+      facilitiesPreviewStatus = response.status();
+      await holdFacilitiesPreview;
+      try { await route.fulfill({ response }); } catch (e) { /* page moved on */ }
     });
     await page.click("[data-ib-preview]");
     await new Promise((r) => setTimeout(r, 200));  // let the request actually leave
@@ -718,6 +729,12 @@ async function checkViewport(browser, viewport) {
     await page.waitForFunction(() => document.body.dataset.view === "calendar", null, { timeout: 10000 });
     await page.waitForSelector(".ib-wrap", { timeout: 10000 });
     releaseFacilitiesPreview();
+    // The held response must be a genuine SUCCESS, or the discard below
+    // proves nothing about late successes.
+    if (facilitiesPreviewStatus !== 200) {
+      fail(`the held Preview was ${facilitiesPreviewStatus}, not 200 — this `
+        + `leg must discard a late SUCCESSFUL response, not a late failure`);
+    }
     await page.unroute("**/api/setup/ice-availability/preview");
     await new Promise((r) => setTimeout(r, 300));  // let the stale response's own (discarded) handler run
     if (await page.$(".ib-preview")) {
@@ -3082,11 +3099,43 @@ async function checkRoleScenarios(browser, viewport) {
     await page.check(`.ib-rink[value="${k.rinkK3}"]`);
     let releasePreviewK3;
     const previewHoldK3 = new Promise((resolve) => { releasePreviewK3 = resolve; });
+    // Same correction as the K4 Commit below: FETCH while K3 is still
+    // selected, hold only DELIVERY. `await hold; route.continue()` sends the
+    // Preview only after the switch back to K1, so the active-Season gate
+    // answers 404 and this leg proves the client ignores a late FAILURE —
+    // when its purpose is a late SUCCESSFUL preview.
+    //
+    // FALSIFIED: restoring the `await previewHoldK3; route.continue()` form
+    // reproduces run 1019's shard-4 failure verbatim, on desktop, at
+    // checkRoleScenarios — "[console] Failed to load resource: the server
+    // responded with a status of 404 (Not Found)". The corrected form passes
+    // on desktop AND 390px.
+    let k3PreviewStatus = null;
+    let k3PreviewBody = null;
+    let markK3Fetched;
+    const k3Fetched = new Promise((resolve) => { markK3Fetched = resolve; });
     await page.route("**/api/setup/ice-availability/preview", async (route) => {
-      await previewHoldK3; await route.continue();
+      const response = await route.fetch();
+      k3PreviewStatus = response.status();
+      try { k3PreviewBody = await response.json(); } catch (e) { k3PreviewBody = null; }
+      markK3Fetched();
+      await previewHoldK3;
+      try { await route.fulfill({ response }); } catch (e) { /* page moved on */ }
     });
     await page.click("[data-ib-preview]");
-    await new Promise((r) => setTimeout(r, 200));  // let the stale Preview request actually leave
+    // Await the real fetch rather than sleeping: a sleep lets the switch race
+    // the in-flight preview, and this leg depends on it having SUCCEEDED
+    // under K3.
+    await k3Fetched;
+    if (k3PreviewStatus !== 200) {
+      fail(`(K2) the held K3 Preview was ${k3PreviewStatus}, not 200 — this `
+        + `leg must discard a late SUCCESSFUL preview, not a late failure`);
+    }
+    if (!k3PreviewBody || !Array.isArray(k3PreviewBody.slots)
+        || !k3PreviewBody.slots.length) {
+      fail("(K2) the held K3 Preview returned 200 but no real preview rows, "
+        + "so discarding it below proves nothing");
+    }
     const switchToK1Again = `${k.progK1}|${k.seasonK1}`;
     await selectContextAndWaitForStableView(page, base, {
       contextValue: switchToK1Again,
@@ -3133,11 +3182,47 @@ async function checkRoleScenarios(browser, viewport) {
     await page.waitForSelector("[data-ib-commit]", { timeout: 10000 });
     let releaseCommitK4;
     const commitHoldK4 = new Promise((resolve) => { releaseCommitK4 = resolve; });
+    // FETCH FIRST, HOLD ONLY DELIVERY — same reason as the Preview above.
+    // `await hold; route.continue()` sends the Commit to the server only
+    // AFTER the switch to K5, so #393 PR A's tuple gate answers 404: K4's ice
+    // is never written and this leg silently becomes "the client discards a
+    // late FAILURE", when its whole purpose is a late SUCCESS whose slots
+    // really did land. The commit is executed while K4 is still selected;
+    // only its delivery waits for K5.
+    let k4CommitStatus = null;
+    let markK4Fetched;
+    // Resolves only once route.fetch() has actually returned. A sleep cannot
+    // prove that: it would let the switch race the in-flight commit, and the
+    // whole leg depends on the write having happened under K4.
+    const k4Fetched = new Promise((resolve) => { markK4Fetched = resolve; });
     await page.route("**/api/setup/ice-availability/commit", async (route) => {
-      await commitHoldK4; await route.continue();
+      const response = await route.fetch();
+      k4CommitStatus = response.status();
+      markK4Fetched();
+      await commitHoldK4;
+      try { await route.fulfill({ response }); } catch (e) { /* page moved on */ }
     });
     await page.click("[data-ib-commit]");
-    await new Promise((r) => setTimeout(r, 200));  // let the stale Commit request actually leave
+
+    // -- assert the WRITE while K4 is still the active context --------------
+    // /api/v2/setup/overview is active-context scoped by design, so asking it
+    // for K4's rink AFTER switching to K5 finds nothing even when the commit
+    // succeeded — indistinguishable from a missing write. The scope boundary
+    // is correct and must not be widened; the QUERY has to happen here.
+    await k4Fetched;
+    if (k4CommitStatus !== 200) {
+      fail(`(K3) the held K4 Commit was ${k4CommitStatus}, not 200 — this leg `
+        + `must discard a late SUCCESSFUL commit, not a late failure`);
+    }
+    // NOTE the shape: this file's apiGet() returns the PARSED BODY directly,
+    // unlike role-authorization-matrix.js's, which returns {status, body}.
+    const k4Overview = await apiGet(page, "/api/v2/setup/overview");
+    const k4Slots = (k4Overview.ice_slots || [])
+      .filter((sl) => sl.rink_id === k.rinkK4);
+    if (!k4Slots.length) {
+      fail("(K3) the held K4 Commit reported 200 but K4's own context shows "
+        + "no ice slots, so the stale-response discard below proves nothing");
+    }
     const switchToK5 = `${k.progK5}|${k.seasonK5}`;
     await selectContextAndWaitForStableView(page, base, {
       contextValue: switchToK5,
@@ -3148,6 +3233,7 @@ async function checkRoleScenarios(browser, viewport) {
       requiredSelectors: [".ib-form"],
       absentSelectors: [".ib-preview", "[data-ib-commit]"],
     });
+    // Delivery was held across the switch; release it now, under K5.
     releaseCommitK4();
     await page.unroute("**/api/setup/ice-availability/commit");
     await new Promise((r) => setTimeout(r, 300));  // let the stale response's own (discarded) handler run
