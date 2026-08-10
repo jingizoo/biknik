@@ -530,6 +530,17 @@ async function checkArenaManager(browser, viewport) {
     // in the header switcher this drives. The Program is taken from the
     // switcher's own options rather than hard-coded, so the fixture selects
     // something the operator is genuinely offered.
+    // WAIT for the switcher to be POPULATED before reading it. `#ctx-select`
+    // fills in only after GET /api/context/options resolves, so a synchronous
+    // page.evaluate() races that fetch: it wins locally and loses on a slower
+    // CI runner, where it returned null and this leg failed with
+    // "offered the Arena Manager no Program to select". The options are the
+    // subject of the assertion, so waiting for them is the assertion — not a
+    // retry papering over a product defect.
+    await page.waitForFunction(() => {
+      const sel = document.getElementById("ctx-select");
+      return !!(sel && [...sel.options].some((o) => o.value));
+    }, null, { timeout: 15000 }).catch(() => {});
     const arenaProgram = await page.evaluate(() => {
       const sel = document.getElementById("ctx-select");
       const opt = sel && [...sel.options].find((o) => o.value);
