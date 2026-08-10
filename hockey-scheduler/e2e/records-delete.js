@@ -39,6 +39,9 @@ const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
+const {
+  installContextFixture, selectProgram, selectProgramSeason,
+} = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -102,13 +105,34 @@ async function checkViewport(browser, viewport) {
     const resp = page.waitForResponse((r) =>
       r.url() === `${base}${expectedUrl}` && r.request().method() === "POST");
     await page.click(`[data-drawer-submit="${key}"]`);
-    const body = await (await resp).json();
-    if (body.error) {
-      throw new Error(`[${viewport.label}] ${key} create failed: ${JSON.stringify(body.error)}`);
+    const settled = await resp;
+    // #409 diagnosis fix: ASSERT THE STATUS at this call, and print the
+    // server's own body with it. This helper used to decode the body and
+    // throw the status away, checking only `body.error` -- so a refusal that
+    // answers a well-formed error object still returned an id-LESS row, which
+    // the next drawer then fed into a parent <select> that had no such option.
+    // The run died on that instead, hundreds of lines below the create that
+    // was actually refused.
+    const body = await settled.json().catch(() => null);
+    if (settled.status() !== 200 || !body || body.error || !body.id) {
+      throw new Error(`[${viewport.label}] ${key} create (POST ${expectedUrl}) `
+        + `failed: ${settled.status()} ${JSON.stringify(body)}`);
     }
     await page.waitForFunction(
       () => !document.querySelector(".drawer[role=dialog]"), null, { timeout: 10000 });
     return body;
+  };
+
+  // A context switch re-renders the shell, so re-establish Setup > Records
+  // before the next drawer click rather than assuming the sub-view survived.
+  const ensureRecordsView = async () => {
+    if (await page.evaluate(() => document.body.dataset.view !== "setup")) {
+      await page.click('.tab[data-tab="setup"]');
+    }
+    if (!(await page.$(".setup-card"))) {
+      await page.click('[data-setup-view="records"]');
+    }
+    await page.waitForSelector(".setup-card", { timeout: 10000 });
   };
 
   // Clicks a row's delete control and, if `expectBlocked`, treats the
@@ -134,17 +158,41 @@ async function checkViewport(browser, viewport) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
     await page.click('.tab[data-tab="setup"]');
     await page.click('[data-setup-view="records"]');
     await page.waitForSelector(".setup-card", { timeout: 10000 });
 
     // (1) One full chain, entirely through the real Records drawers.
+    //
+    // #409 EXPLICIT SELECTION. The chain below crosses two axis boundaries
+    // (ApiService._CREATE_CONSUMED_AXES): `season`/`team`/`venue`/`rink`/
+    // `ice_slot`/`official`/`player` are PROGRAM-AXIS and need the saved
+    // Program; `league`/`division` are SEASON-OWNED and need the saved
+    // Program AND the Season they are written into. `organization` and
+    // `club` are zero-axis roots and need neither.
+    //
+    // RECORDED TRADE (see ./context-fixture.js's header): the FIRST
+    // Program-only selection below is one the shipped UI cannot issue in this
+    // exact state -- one Program, zero Seasons -- because renderContextSwitcher
+    // collapses a single context entry to a non-interactive chip and
+    // setActiveContext is wired only to the hidden select's onchange. That is
+    // a PRODUCT defect, witnessed deliberately (and left failing) by
+    // ./season-dates.js; this journey is about Records DELETE contracts, not
+    // about the bootstrap, so it selects explicitly and asserts the selection
+    // persisted rather than leaning on the fallback resolver.
     const org = await createViaDrawer("organization",
       { "f-org": "Records Delete Org" }, "/api/v2/setup/organization");
     const program = await createViaDrawer("league",
       { "f-league": "Records Delete Program", "f-league-org": org.id }, "/api/v2/setup/program");
+    await selectProgram(page, "Program-axis creates under Records Delete Program",
+      program.id);
+    await ensureRecordsView();
     const season = await createViaDrawer("season",
       { "f-season-league": program.id, "f-season": "2026-27" }, "/api/v2/setup/season");
+    await selectProgramSeason(page,
+      "Season-owned League/Division creates into 2026-27", program.id, season.id);
+    await ensureRecordsView();
     const league = await createViaDrawer("level",
       { "f-level-season": season.id, "f-level": "Adult League" }, "/api/v2/setup/league");
     const division = await createViaDrawer("division",

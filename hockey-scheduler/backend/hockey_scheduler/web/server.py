@@ -1127,40 +1127,47 @@ class Handler(BaseHTTPRequestHandler):
         ``(parent_kind, parent_id)`` list in the caller's order; a falsy id is
         skipped, so an optional parent that was not supplied is not a target.
 
-        THREE gates, in this order, and the order is the contract:
+        THREE gates, in this order, and THE ORDER IS THE CONTRACT — it was
+        wrong in the first cut and the reversal is the fix (review round: the
+        create refusals disclosed parent existence):
 
-        1. #369's parent-visibility gate on every parent kind it covers, which
+        1. #409's PREFLIGHT 409 for an unchosen or stale axis, decided from the
+           OPERATION SHAPE and returned BEFORE anything is confirmed or denied
+           about a parent. #369 used to lead here, and that produced an
+           existence oracle: with no saved selection, a real visible parent
+           answered 409 while a nonexistent one answered 404, so the status
+           alone told an unselected caller which ids exist. Now every parent a
+           given shape can name — visible, foreign or invented — answers the
+           SAME bytes. Cheap, lock-free, and decided before the facade is
+           called at all. See ``ApiService._create_context_error``.
+        2. #369's parent-visibility gate on every parent kind it covers, which
            refuses a foreign or nonexistent parent with the generic
-           ``"<Label> <id> not found."``. It runs FIRST here — the reverse of
-           ``_guarded_mutation``, where #409 leads — because a create's #409
-           decision needs a store read to know whether the parent carries a
-           Program at all. Answering 409 before that gate would separate "that
-           id exists and is linked" from "nonexistent or foreign" for a caller
-           who has chosen nothing, which is a new existence oracle over records
-           they may not see. Past this gate the caller provably CAN already see
-           the parent, so the 409 below discloses nothing new. See
-           ``ApiService._create_context_error`` for the full argument.
-        2. #409's PREFLIGHT: the 409 for an unchosen or stale axis, or the
-           generic not-found for a parent outside the caller's saved axes.
-           Cheap, lock-free, and decided before the facade is called at all.
+           ``"<Label> <id> not found."`` — and, immediately after it, #409's
+           own cross-axis refusal for a parent outside the caller's saved axes,
+           rendered through the same generic not-found. Both are reachable only
+           once gate 1 has passed, i.e. only for a caller whose explicit axes
+           are valid, so the pair flattens FOREIGN and NONEXISTENT into one
+           answer without ever splitting on existence.
         3. ``setup_guarded_create``, which re-decides exactly the same rule
            under the ActiveContext row lock and the parent row locks and runs
            the insert, any relationship row and the audit inside that one
-           transaction. THAT is the boundary; 2 is only an early answer whose
-           snapshot is already stale by the time the caller acts on it.
+           transaction. THAT is the boundary; 1 and 2 are only an early answer
+           whose snapshot is already stale by the time the caller acts on it.
 
         A refusal at any of the three writes no entity, no relationship, no
         audit row and serializes no lookup-derived field.
         """
+        refusal, index = STATE.api.setup_create_context_error(
+            kind, parents, user_id, role, scope)
+        if refusal is not None:
+            # PRE-DISCLOSURE. Nothing about any parent has been confirmed or
+            # denied at this point, and the body carries no id at all.
+            return self._send_api(refusal)      # 409 via ERROR_HTTP_STATUS
         for parent in parents:
             if (parent[0] in _SETUP_PARENT_LISTS
                     and self._reject_parent_outside_scope(
                         parent[0], parent[1], role, scope, user_id)):
                 return
-        refusal, index = STATE.api.setup_create_context_error(
-            kind, parents, user_id, role, scope)
-        if refusal is not None:
-            return self._send_api(refusal)      # 409 via ERROR_HTTP_STATUS
         if index is not None:
             return self._refuse_target(parents[index][0], parents[index][1])
         payload, refused = STATE.api.setup_guarded_create(
@@ -3430,18 +3437,27 @@ class Handler(BaseHTTPRequestHandler):
         SECOND setup-capable account on that same empty install is still
         correctly refused.
 
-        #409 DELIBERATELY DOES NOT LEAD THIS GATE, and the reason is measured
+        #409 NOW RUNS BEFORE THIS GATE, and this gate still applies no axis
+        rule of its own. ``_guarded_create`` calls
+        ``ApiService.setup_create_context_error`` FIRST and returns its 409
+        without touching a parent id, so by the time this runs the caller's
+        explicit axes are already valid. That ordering is what stops the pair
+        from splitting on existence: an unselected caller never reaches this
+        404 at all, and a selected one gets the same 404 for a foreign parent
+        and for one that never existed.
+
+        The axis rule is NOT re-derived here, and the reason is measured
         rather than assumed. Classifying the family is easy — a parent-gated
         create is classified by the PARENT's axis, and all five parent kinds
         (``organization``/``program``/``venue``/``rink``/``club``) are
-        PROGRAM-AXIS — so the Program-only rule would apply. Adding it here was
-        tried and REVERTED: on a ZERO-PROGRAM install there is no Program in
-        existence for the caller to select, so ``_explicit_program``
-        can never be satisfied and the whole bootstrap flow this docstring
-        describes ("create an Organization, then its first Venue", as an Arena
-        Manager who cannot create a Program at all) becomes UNSATISFIABLE
-        rather than merely strict — the exact failure mode
-        ``ApiService._explicit_program`` records one axis up.
+        PROGRAM-AXIS — so a Program-only rule applied unconditionally *here*
+        would look right. Adding it here was tried and REVERTED: on a
+        ZERO-PROGRAM install there is no Program in existence for the caller to
+        select, so ``_explicit_program`` can never be satisfied and the whole
+        bootstrap flow this docstring describes ("create an Organization, then
+        its first Venue", as an Arena Manager who cannot create a Program at
+        all) becomes UNSATISFIABLE rather than merely strict — the exact
+        failure mode ``ApiService._explicit_program`` records one axis up.
         ``tests/test_zero_program_bootstrap_scoping.py`` fails on precisely
         that flow.
 
@@ -3449,10 +3465,11 @@ class Handler(BaseHTTPRequestHandler):
         the caller could have selected — is the inference
         ``ApiService.has_active_program_season`` records the owner as having
         already FORBIDDEN: it makes API behaviour depend on changing account
-        inventory. So the choice here is a product ruling (accept the
-        bootstrap break, or accept an inventory-dependent carve-out, or leave
-        the family ungated) and not a mechanical one. It is left ungated and
-        recorded, not silently defaulted.
+        inventory. What ``_create_context_error`` does instead is keyed on the
+        REQUEST, not the inventory: a parent is exempt only when it is one this
+        caller can already see AND it binds the new row to no axis at all
+        (``_create_parent_is_axis_free``), which is exactly the Program-less
+        bootstrap's own shape and nothing wider.
         """
         if not parent_id:
             return False

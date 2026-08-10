@@ -77,6 +77,7 @@ const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
+const { installContextFixture } = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -243,45 +244,49 @@ const PROGRAM_B = {
 // shell, regardless of anything #369 changed.
 async function buildFixture(page) {
   return page.evaluate(async () => {
-    const post = async (p, b) => {
-      const r = await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      });
-      const j = await r.json().catch(() => ({}));
-      if (j && j.error) throw new Error(`${p} -> ${JSON.stringify(j.error)}`);
-      return j;
-    };
+    const F = window.hsFixture;
     // A Program's own arena side: Organization -> Venue -> Rink -> ice slot,
     // with the Venue granted to THIS Program's Season. That grant is the only
     // thing that puts the Venue (and, by cascade, the Rink/slot, and by
     // ownership the Organization) inside this Program's derived-join scope.
     const buildProgram = async (tag) => {
-      const org = await post("/api/v2/setup/organization", { name: `${tag}-Org` });
-      const program = await post("/api/v2/setup/program",
+      const org = await F.create(`${tag} organization`, "/api/v2/setup/organization",
+        { name: `${tag}-Org` });
+      const program = await F.create(`${tag} program`, "/api/v2/setup/program",
         { name: `${tag}-Program`, operator_organization_id: org.id });
-      const season = await post("/api/v2/setup/season",
+      // #409 EXPLICIT SELECTION, boundary 1. The Season create below is
+      // PROGRAM-AXIS: minting the Program above does not select it, and this
+      // fixture builds TWO Programs in one session, so the saved row may
+      // still point at the other one. Persist the Program-only choice here,
+      // through the app's own switch pipeline, and prove it took.
+      await F.selectProgram(`${tag} Program-only bootstrap`, program.id);
+      const season = await F.create(`${tag} season`, "/api/v2/setup/season",
         { program_id: program.id, name: `${tag}-Season` });
-      const club = await post("/api/v2/setup/club", { name: `${tag}-Club` });
-      const venue = await post("/api/v2/setup/venue",
+      const club = await F.create(`${tag} club`, "/api/v2/setup/club",
+        { name: `${tag}-Club` });
+      const venue = await F.create(`${tag} venue`, "/api/v2/setup/venue",
         { name: `${tag}-Venue`, organization_id: org.id });
-      // The grant names an EXISTING Season, so its Season end is ceilinged on
-      // the ACTIVE Season (#369 target authorization) -- with more than one
-      // Season in the install, a grant made while another one is selected is
-      // refused. Select this Program's own Season first, exactly as the
-      // context bar does; the journey re-selects through the real UI later.
-      await post("/api/context",
-        { program_id: program.id, season_id: season.id });
-      await post(`/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
-      const rink = await post("/api/v2/setup/rink", { venue_id: venue.id, name: `${tag}-Rink` });
-      await post("/api/v2/setup/ice-slot", {
+      // BOUNDARY 2. The grant is SEASON-OWNED and names an EXISTING Season,
+      // so its Season end is ceilinged on the ACTIVE Season (#369 target
+      // authorization) -- with more than one Season in the install, a grant
+      // made while another one is selected is refused. Select this Program's
+      // own Season, exactly as the context bar does; the journey re-selects
+      // through the real UI later. This replaces a raw `POST /api/context`,
+      // which moved the SERVER while the client went on believing the old
+      // tuple and dropped the status besides.
+      await F.selectProgramSeason(`${tag} Program+Season`, program.id, season.id);
+      await F.call(`${tag} season venue-access grant`,
+        `/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
+      const rink = await F.create(`${tag} rink`, "/api/v2/setup/rink",
+        { venue_id: venue.id, name: `${tag}-Rink` });
+      await F.create(`${tag} ice slot`, "/api/v2/setup/ice-slot", {
         rink_id: rink.id, start_time: "2026-09-05T18:00:00+00:00",
         end_time: "2026-09-05T19:30:00+00:00", slot_type: "game",
       });
       // home_club_id is what puts this Official in its Program's scope --
       // and, because that Club DOES have Teams, what keeps it out of
       // `unassigned_officials` and therefore out of the other Program's view.
-      await post("/api/v2/setup/official",
+      await F.create(`${tag} official`, "/api/v2/setup/official",
         { name: `${tag}-Official`, home_club_id: club.id });
       return { org, program, season, club, venue, rink };
     };
@@ -293,22 +298,27 @@ async function buildFixture(page) {
     // prerequisite, PR #371), so building structure in a Program means
     // working IN it. The journey switches context per Program rather than
     // being exempted from the guard it is partly here to exercise.
+    // The two-axis selection this fixture keeps returning to. Asserted, and
+    // driven through `setActiveContext` rather than a raw `POST /api/context`
+    // (#409) — every consumer below goes on to drive real Setup UI on this
+    // same page, so the client must move with the server.
     const useProgram = async (base) => {
-      await post("/api/context",
-        { program_id: base.program.id, season_id: base.season.id });
+      await F.selectProgramSeason("switch to the Program being populated",
+        base.program.id, base.season.id);
     };
 
     const buildLeague = async (base, tag, suffix) => {
       await useProgram(base);
-      const league = await post("/api/v2/setup/league",
+      const league = await F.create(`${tag}-League-${suffix}`, "/api/v2/setup/league",
         { season_id: base.season.id, name: `${tag}-League-${suffix}` });
-      const division = await post("/api/v2/setup/division",
+      const division = await F.create(`${tag}-Division-${suffix}`, "/api/v2/setup/division",
         { league_id: league.id, name: `${tag}-Division-${suffix}` });
-      const team = await post("/api/v2/setup/team",
+      const team = await F.create(`${tag}-Team-${suffix}`, "/api/v2/setup/team",
         { club_id: base.club.id, league_id: league.id, name: `${tag}-Team-${suffix}` });
-      await post(`/api/v2/setup/seasons/${base.season.id}/team-registrations`,
+      await F.call(`${tag}-Team-${suffix} registration`,
+        `/api/v2/setup/seasons/${base.season.id}/team-registrations`,
         { team_id: team.id, league_id: league.id, division_id: division.id });
-      await post("/api/v2/setup/player",
+      await F.create(`${tag}-Player-${suffix}`, "/api/v2/setup/player",
         { team_id: team.id, name: `${tag}-Player-${suffix}`, position: "forward" });
       return league.id;
     };
@@ -327,30 +337,36 @@ async function buildFixture(page) {
     // INSTALLATION-WIDE readiness check redirects the session into the
     // Initial Setup wizard.
     await useProgram(a);
-    const seasonA2 = await post("/api/v2/setup/season",
+    const seasonA2 = await F.create("PROGA-Autumn season", "/api/v2/setup/season",
       { program_id: a.program.id, name: "PROGA-Autumn" });
-    const leagueA3 = await post("/api/v2/setup/league",
+    // #409: the League and Division below are SEASON-OWNED and write into
+    // PROGA-Autumn, NOT into the Season `useProgram(a)` just selected. The
+    // saved Season must be the one written into, so move to it before them
+    // rather than after — the old order created them against whatever was
+    // still selected and left the match to inference.
+    await F.selectProgramSeason("Program A + PROGA-Autumn",
+      a.program.id, seasonA2.id);
+    const leagueA3 = await F.create("PROGA-League-A3", "/api/v2/setup/league",
       { season_id: seasonA2.id, name: "PROGA-League-A3" });
-    await post("/api/v2/setup/division",
+    await F.create("PROGA-Division-A3", "/api/v2/setup/division",
       { league_id: leagueA3.id, name: "PROGA-Division-A3" });
-    const venueA2 = await post("/api/v2/setup/venue",
+    const venueA2 = await F.create("PROGA-Icehouse venue", "/api/v2/setup/venue",
       { name: "PROGA-Icehouse", organization_id: a.org.id });
     // Same rule as in buildProgram: the grant's Season end is the ACTIVE
-    // Season, so select PROGA-Autumn for it, then put the context back on
-    // Program A's first Season where the rest of the fixture left it.
-    await post("/api/context",
-      { program_id: a.program.id, season_id: seasonA2.id });
-    await post(`/api/v2/setup/seasons/${seasonA2.id}/venue-access`,
+    // Season, which PROGA-Autumn already is here. Afterwards put the context
+    // back on Program A's first Season, where the rest of the fixture left it.
+    await F.call("PROGA-Autumn venue-access grant",
+      `/api/v2/setup/seasons/${seasonA2.id}/venue-access`,
       { venue_id: venueA2.id });
-    await post("/api/v2/setup/rink",
+    await F.create("PROGA-Padtwo rink", "/api/v2/setup/rink",
       { venue_id: venueA2.id, name: "PROGA-Padtwo" });
     await useProgram(a);
 
     // The never-linked bootstrap pair (#369's `unassigned_*` contract): a
     // Club with no Team and an owner-less Venue with no Season grant. Neither
     // has a chain into ANY Program, so both must stay visible from BOTH.
-    await post("/api/v2/setup/club", { name: "FREE-Club" });
-    await post("/api/v2/setup/venue", { name: "FREE-Venue" });
+    await F.create("FREE-Club", "/api/v2/setup/club", { name: "FREE-Club" });
+    await F.create("FREE-Venue", "/api/v2/setup/venue", { name: "FREE-Venue" });
 
     return {
       programA: a.program.id, seasonA: a.season.id,
@@ -831,6 +847,8 @@ async function checkViewport(browser, viewport) {
     if ((await loginAs(page, "admin")).status !== 200) {
       throw new Error(`[${L}] admin login failed`);
     }
+    await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
     const f = await buildFixture(page);
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });

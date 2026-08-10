@@ -37,6 +37,7 @@ const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
+const { installContextFixture } = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -141,6 +142,7 @@ async function checkViewport(browser, viewport) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
     // This journey never navigates the calendar, so its day only has to be
     // strictly in the FUTURE — step (5) deletes the leftover open slots, and
     // `delete_ice_slot` refuses anything at or before its clock ("past slots
@@ -153,18 +155,24 @@ async function checkViewport(browser, viewport) {
     // Build one League with two Divisions: a 4-team "Mixed" (six round-robin
     // pairings) and a 2-team "AllDone" (exactly one pairing).
     const ids = await page.evaluate(async (day) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const league = await post("/api/setup/league", { name: "Already-Scheduled Program" });
-      const season = await post("/api/setup/season", { league_id: league.id, name: "Fall 2026" });
-      const level = await post("/api/setup/level", { season_id: season.id, name: "Silver League" });
-      const dMixed = await post("/api/setup/division", { season_id: season.id, level_id: level.id, name: "SilverMixed" });
-      const dAllDone = await post("/api/setup/division", { season_id: season.id, level_id: level.id, name: "SilverAllDone" });
-      const club = await post("/api/setup/club", { name: "Club" });
+      const F = window.hsFixture;
+      // #409 EXPLICIT SELECTION on the V1 SURFACE. `POST /api/setup/league`
+      // mints the PROGRAM (v1 calls it "league") and `POST /api/setup/season`
+      // is a PROGRAM-AXIS create comparing the body's `league_id`
+      // (server.py:3686), behind the same `setup_create_context_error`
+      // preflight v2 uses (server.py:1160). Minting is not selecting.
+      const league = await F.create("v1 league (the Program)", "/api/setup/league", { name: "Already-Scheduled Program" });
+      await F.selectProgram("Program-only bootstrap", league.id);
+      const season = await F.create("season", "/api/setup/season", { league_id: league.id, name: "Fall 2026" });
+      // The v1 "level" IS the v2 League; it, the Divisions, the registrations
+      // and the venue-access grant are SEASON-OWNED and land in THIS Season.
+      await F.selectProgramSeason("Program+Season", league.id, season.id);
+      const level = await F.create("level (the v2 League)", "/api/setup/level", { season_id: season.id, name: "Silver League" });
+      const dMixed = await F.create("dMixed", "/api/setup/division", { season_id: season.id, level_id: level.id, name: "SilverMixed" });
+      const dAllDone = await F.create("dAllDone", "/api/setup/division", { season_id: season.id, level_id: level.id, name: "SilverAllDone" });
+      const club = await F.create("club", "/api/setup/club", { name: "Club" });
       const team = async (n) =>
-        (await post("/api/v2/setup/team", { club_id: club.id, league_id: level.id, name: n })).id;
+        (await F.create("team", "/api/v2/setup/team", { club_id: club.id, league_id: level.id, name: n })).id;
       const m0 = await team("Mixed 0"), m1 = await team("Mixed 1");
       const m2 = await team("Mixed 2"), m3 = await team("Mixed 3");
       const a0 = await team("AllDone 0"), a1 = await team("AllDone 1");
@@ -175,11 +183,11 @@ async function checkViewport(browser, viewport) {
       await register(m2, dMixed.id); await register(m3, dMixed.id);
       await register(a0, dAllDone.id); await register(a1, dAllDone.id);
 
-      const venue = await post("/api/setup/venue", { name: "Arena", league_id: league.id });
-      await post(`/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
-      const rink = await post("/api/setup/rink", { venue_id: venue.id, name: "Rink 1" });
+      const venue = await F.create("venue", "/api/setup/venue", { name: "Arena", league_id: league.id });
+      await F.call("season venue-access grant", `/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
+      const rink = await F.create("rink", "/api/setup/rink", { venue_id: venue.id, name: "Rink 1" });
       const pad = (n) => String(n).padStart(2, "0");
-      const slot = async (h) => (await post("/api/setup/ice-slot", {
+      const slot = async (h) => (await F.create("ice-slot", "/api/setup/ice-slot", {
         rink_id: rink.id, start_time: `${day}T${pad(h)}:00:00+00:00`,
         end_time: `${day}T${pad(h + 1)}:00:00+00:00`, slot_type: "game",
       })).id;
@@ -191,12 +199,16 @@ async function checkViewport(browser, viewport) {
       // seeded pairing's names + Game id (#328 review) so the caller can
       // assert the EXACT already-scheduled rows the preview renders, not
       // just their count.
-      const bare = await post("/api/scheduler/draft", { division_id: dMixed.id });
+      // A draft PREVIEW returns no id — it is a computed response, not a
+      // created record — so it is asserted with `F.call` (success, no id)
+      // rather than `F.create` (#409).
+      const bare = await F.call("scheduler draft preview", "/api/scheduler/draft",
+        { division_id: dMixed.id });
       const toSeed = bare.unscheduled.slice(0, 2);
       const seededMixed = [];
       for (const pairing of toSeed) {
         const seedSlot = await slot(6 + toSeed.indexOf(pairing));
-        const g = await post("/api/setup/game", {
+        const g = await F.create("g", "/api/setup/game", {
           season_id: season.id, division_id: dMixed.id,
           home_team_id: pairing.home_team_id, away_team_id: pairing.away_team_id,
           ice_slot_id: seedSlot,
@@ -216,7 +228,7 @@ async function checkViewport(browser, viewport) {
       // AllDone's one pairing already has a real Game — no ice slot is
       // even needed for it to be picked up as already-scheduled.
       const allDoneSlot = await slot(20);
-      const allDoneGame = await post("/api/setup/game", {
+      const allDoneGame = await F.create("allDoneGame", "/api/setup/game", {
         season_id: season.id, division_id: dAllDone.id,
         home_team_id: a0, away_team_id: a1, ice_slot_id: allDoneSlot,
       });
@@ -491,16 +503,18 @@ async function checkViewport(browser, viewport) {
     //   and the late third team specifically to land that crossing exactly
     //   where the new team needs to sort first.
     const elig = await page.evaluate(async ({ seasonId, levelId, leagueId, day, openSlotIds }) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
+      const F = window.hsFixture;
       for (const id of openSlotIds) {
-        await post(`/api/setup/ice-slot/${id}/delete`, {});
+        await F.call("delete", `/api/setup/ice-slot/${id}/delete`, {});
       }
-      const division = await post("/api/setup/division",
+      // #409: the Division, the two registrations and the venue-access grant
+      // are SEASON-OWNED in this Season, and real UI work has intervened
+      // since the bootstrap — state the tuple rather than assume it stands.
+      await F.selectProgramSeason("Program+Season for the eligibility fixture",
+        leagueId, seasonId);
+      const division = await F.create("division", "/api/setup/division",
         { season_id: seasonId, level_id: levelId, name: "TeamEligibility" });
-      const club = await post("/api/setup/club", { name: "Eligibility Club" });
+      const club = await F.create("club", "/api/setup/club", { name: "Eligibility Club" });
       const team = async (n) => (await post("/api/v2/setup/team",
         { club_id: club.id, league_id: levelId, name: n })).id;
       const e0 = await team("Eligibility 0");
@@ -510,13 +524,13 @@ async function checkViewport(browser, viewport) {
         { team_id: teamId, division_id: division.id });
       await register(e0);
       await register(e1);
-      const venue = await post("/api/setup/venue",
+      const venue = await F.create("venue", "/api/setup/venue",
         { name: "Eligibility Arena", league_id: leagueId });
-      await post(`/api/v2/setup/seasons/${seasonId}/venue-access`,
+      await F.call("season venue-access grant", `/api/v2/setup/seasons/${seasonId}/venue-access`,
         { venue_id: venue.id });
-      const rink = await post("/api/setup/rink",
+      const rink = await F.create("rink", "/api/setup/rink",
         { venue_id: venue.id, name: "Eligibility Rink" });
-      await post("/api/setup/ice-slot", {
+      await F.call("ice-slot", "/api/setup/ice-slot", {
         rink_id: rink.id, start_time: `${day}T23:00:00+00:00`,
         end_time: `${day}T23:59:00+00:00`, slot_type: "game",
       });
@@ -551,20 +565,20 @@ async function checkViewport(browser, viewport) {
     // a third team that registers in the SAME division after Generate --
     // no stub, no interception, just a real backend write in the gap
     // between the operator's preview and clicking Commit.
-    await page.evaluate(async ({ seasonId, divisionId, clubId, levelId }) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      await post("/api/v2/setup/team",
+    await page.evaluate(async ({ seasonId, divisionId, clubId, levelId, leagueId }) => {
+      const F = window.hsFixture;
+      // #409: the late registration below is SEASON-OWNED in this Season.
+      await F.selectProgramSeason("Program+Season for the late registration",
+        leagueId, seasonId);
+      await F.call("decoy team", "/api/v2/setup/team",
         { club_id: clubId, league_id: levelId, name: "(decoy)" });
-      const e2 = await post("/api/v2/setup/team",
+      const e2 = await F.create("late team Eligibility 2", "/api/v2/setup/team",
         { club_id: clubId, league_id: levelId, name: "Eligibility 2 (late)" });
-      await post(`/api/setup/seasons/${seasonId}/team-registrations`,
+      await F.call("team registration", `/api/setup/seasons/${seasonId}/team-registrations`,
         { team_id: e2.id, division_id: divisionId });
     }, {
       seasonId: ids.seasonId, divisionId: elig.divisionId,
-      clubId: elig.clubId, levelId: ids.levelId,
+      clubId: elig.clubId, levelId: ids.levelId, leagueId: ids.leagueId,
     });
 
     await page.click("[data-sched-commit]");

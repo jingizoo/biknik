@@ -59,24 +59,43 @@ and every refusal writes NO entity, NO relationship, NO audit row — asserted b
 snapshotting every table plus the audit count around each probe, so a refusal
 that left counter-visible residue fails here rather than in production.
 
-ORDERING. #369's parent-visibility gate runs BEFORE #409's on this family, the
-reverse of the mutation family. Deciding "does this parent carry a Program"
-needs a store read, so unlike ``_mutation_axis_targets`` the create refusal is
-not lookup-free; answering 409 first would let a caller who has chosen nothing
-separate "that id exists and is linked" (409) from "nonexistent or foreign"
-(404), which is a new existence oracle. Past the visibility gate the caller
-provably CAN already see the parent, so the 409 discloses nothing new.
-``RefusalIsNotAnExistenceOracleTest`` pins the byte-identity that makes it so.
+ORDERING, corrected in the review round that reported this file's own oracle
+test as encoding the defect. #409's axis gate now runs BEFORE #369's
+parent-visibility gate on this family, matching the mutation family. The first
+cut had them the other way round, on the theory that a create's axis decision
+needs a store read and so cannot be answered first — and that produced exactly
+the leak the ordering was supposed to prevent: with NOTHING selected, a real
+visible parent answered 409 and a nonexistent one answered 404, so the status
+alone told an unselected caller which ids exist. ``_OracleMixin`` used to
+ASSERT that split as correct. It now asserts its absence: for every
+Program-axis and two-axis create shape, a VISIBLE, a FOREIGN and a NONEXISTENT
+parent all answer the SAME BYTES, and the 409 body carries no id at all.
 
-BOOTSTRAP is the constraint that shapes the whole rule. A parent that carries
-NO axis has nothing to compare, so the create proceeds — that is what the
-ruling's PROGRAM-AXIS clause literally says ("compare the SAVED Program against
-the PARENT's Program"), and it is the only reading under which
-``tests/test_zero_program_bootstrap_scoping.py`` (organization -> venue -> rink
--> ice-slot -> official over two real Arena Manager sessions on a Program-LESS
-install, 200 on every one) still holds. ``BootstrapTest`` here pins the other
-half: create Program -> explicit Program-ONLY selection -> the Program-owned
-creates and links succeed before any Season exists.
+The read the ordering was supposed to avoid is still taken — it just cannot
+change the ANSWER any more. ``_create_parent_is_axis_free`` fails CLOSED twice
+over: an id that does not resolve is treated as axis-bearing, and so is one the
+caller may not already attach to. So 409-vs-404 is decided only over rows whose
+existence the caller already knew.
+
+BOOTSTRAP is the constraint that shapes the whole rule. A parent the caller can
+ALREADY SEE that carries NO axis has nothing to compare, so the create proceeds
+— that is what the ruling's PROGRAM-AXIS clause literally says ("compare the
+SAVED Program against the PARENT's Program"), and it is the only reading under
+which ``tests/test_zero_program_bootstrap_scoping.py`` (organization -> venue ->
+rink -> ice-slot -> official over two real Arena Manager sessions on a
+Program-LESS install, 200 on every one) still holds. ``BootstrapTest`` here pins
+the other half: create Program -> explicit Program-ONLY selection -> the
+Program-owned creates and links succeed before any Season exists.
+
+NO CREATOR-OWNERSHIP CONTINUATION, removed in the same round. The gate used to
+admit one more case: an axis-bearing PROGRAM parent this caller had themselves
+created, so ``create P`` -> ``create Season under P`` succeeded with no
+``POST /api/context`` at all. That is creator-derived identity substituting for
+the persisted CHOICE, and it is gone. ``_CreatorOwnershipMixin`` pins the
+lifecycle in both directions: without the explicit save both the Season and the
+legacy Program-linked Venue are refused with a stable 409 and zero rows, and
+with it they succeed — and a Season-OWNED create still needs the Season saved
+too.
 
 THREE STORES. ``InMemoryStore``, SQLite and PostgreSQL. The decision reads an
 ``ActiveContext`` row under a lock and compares it to link triples walked out
@@ -819,36 +838,278 @@ class _BootstrapMixin(_CreateHarness):
 # 5. The refusal is not an existence oracle.
 # ---------------------------------------------------------------------------
 class _OracleMixin(_CreateHarness):
-    """#369's parent-visibility gate runs FIRST on this family, so the 409 is
-    only ever reachable for a parent the caller can already see. This pins the
-    consequence: a caller with NO selection cannot use the 409-vs-404 split to
-    learn which parent ids exist."""
+    """THE CORRECTED TEST. A caller whose required axes are missing or stale
+    learns NOTHING about which parent ids exist.
+
+    WHAT THIS USED TO ASSERT, and why that was the defect rather than the
+    contract. The previous body of
+    ``test_an_unselected_caller_learns_nothing_from_the_refusal_code`` sent one
+    ``official`` create naming a REAL Club and asserted 409, then sent the same
+    create naming ``club_never_existed`` and asserted 404 plus the facade's
+    ``"Club club_never_existed not found."``. It was named for a property it
+    disproved: 409-for-real / 404-for-absent IS the existence oracle, readable
+    off the status line by anyone with a session and no selection, over records
+    they were never shown. It has been replaced, not adjusted.
+
+    WHAT IT ASSERTS NOW, over every Program-axis and two-axis create shape in
+    ``_cases()`` and both unchosen states (no row at all, and a saved row whose
+    Program was deleted under it):
+
+    * a VISIBLE parent, a FOREIGN one and a NONEXISTENT one produce
+      BYTE-IDENTICAL 409s — same status, same bytes, and no id anywhere in
+      them, so there is nothing to correlate with the id probed;
+    * each of those refusals writes zero entity, relationship and audit rows;
+    * and once the axes ARE explicitly chosen, foreign and nonexistent collapse
+      onto one another again at the OTHER status: the same generic 404, still
+      byte-identical after masking the caller's own echoed id. That half is
+      what keeps this from being satisfiable by a route that simply refuses
+      everything with one code.
+
+    FALSIFIABILITY. Move ``setup_create_context_error`` back below the
+    ``_reject_parent_outside_scope`` loop in ``Handler._guarded_create`` and
+    the first two cases fail immediately: the nonexistent parent goes back to
+    404 while the visible one stays 409. Make ``_create_parent_is_axis_free``
+    return True for an unresolvable row and the nonexistent case fails the same
+    way, with no ordering change at all.
+    """
+
+    _VISIBLE, _FOREIGN, _GHOST = "visible", "foreign", "nonexistent"
+
+    def _probe(self, c, build, label, parent_kind, parent_key, state):
+        """One create, aimed at the named parent STATE. Returns
+        ``(status, blinded_raw)`` with every id the caller itself supplied
+        masked out, which is the only thing two refusals may differ in."""
+        half = "b" if state is self._FOREIGN else "a"
+        method, path, body = build(half, self._next(label))
+        real_id = self.w[half][parent_key]
+        subject = (f"{parent_kind}_never_existed" if state is self._GHOST
+                   else real_id)
+        path = path.replace(real_id, subject)
+        body = {k: (subject if v == real_id else v) for k, v in body.items()}
+        status, raw, resp = self._req(c, method, path, body)
+        # The SUBJECT parent is always masked to the same token, whichever
+        # state produced it, so two refusals compare equal exactly when they
+        # differ in nothing but the id the caller itself supplied. Remaining
+        # supplied ids follow in a stable order.
+        others = sorted({v for v in body.values()
+                         if isinstance(v, str) and v != subject})
+        blinded = self._blind(raw, subject, *others)
+        return status, blinded, raw, resp
+
+    def _assert_identical_409s(self, why, make_caller):
+        """For every axis-bearing create shape: the three parent states answer
+        the SAME 409 bytes and leave no residue."""
+        for label, axis, build, (parent_kind, parent_key), _sole in \
+                self._cases():
+            with self.subTest(create=label, axis=axis, state=why):
+                c = make_caller()
+                answers = {}
+                for state in (self._VISIBLE, self._FOREIGN, self._GHOST):
+                    before = self._snapshot()
+                    status, blinded, raw, resp = self._probe(
+                        c, build, label, parent_kind, parent_key, state)
+                    self.assertEqual(
+                        status, 409,
+                        f"`{label}` with {why}, naming a {state} parent, "
+                        f"answered {status} instead of the stable axis "
+                        f"refusal: {raw}")
+                    self.assertEqual(resp["error"]["code"],
+                                     "active_context_required", raw)
+                    self._assert_no_residue(before, f"{label} / {why} / {state}")
+                    # Nothing the caller was not already told: no id at all,
+                    # not even the one they sent.
+                    for secret in (self.w["a"]["program"], self.w["a"]["season"],
+                                   self.w["a"]["league"], self.w["b"]["program"],
+                                   self.w["b"]["season"], self.w["b"]["league"]):
+                        self.assertNotIn(
+                            secret, raw,
+                            f"the 409 body names {secret}, which this caller "
+                            "was never told they may see")
+                    answers[state] = (status, blinded)
+                self.assertEqual(
+                    len(set(answers.values())), 1,
+                    f"`{label}` with {why}: the refusal is distinguishable "
+                    f"across parent states, which is an existence oracle — "
+                    f"{answers}")
 
     def test_an_unselected_caller_learns_nothing_from_the_refusal_code(self):
+        """NO saved row at all."""
+        def caller():
+            c, user_id = self._operator()
+            self.assertIsNone(
+                self.store.get_active_context(user_id),
+                "the probe account already has a selection, so 'unselected' "
+                "would be vacuous")
+            return c
+        self._assert_identical_409s("NO chosen context", caller)
+
+    def test_a_stale_caller_learns_nothing_from_the_refusal_code(self):
+        """A saved row whose Program was deleted under it — the other unchosen
+        state, and the one a fallback would quietly paper over."""
+        def caller():
+            c, user_id = self._operator()
+            stale = self._make_stale_program(c)
+            self._assert_saved_row_still_names(user_id, stale)
+            return c
+        self._assert_identical_409s("a STALE saved Program", caller)
+
+    def test_a_valid_selection_flattens_foreign_and_absent_onto_one_404(self):
+        """The other half, without which "refuse everything with one code"
+        would satisfy the two cases above.
+
+        With Program A and Season A explicitly saved, a parent belonging to
+        Program B and a parent that never existed answer the SAME 404 — and the
+        facade's own generic message is still what a genuinely missing parent
+        gets, which is the assertion the deleted version of this test made for
+        an UNSELECTED caller and which belongs here instead.
+        """
+        for label, axis, build, (parent_kind, parent_key), sole in self._cases():
+            with self.subTest(create=label, axis=axis):
+                c, _user_id = self._operator()
+                self._select(c, self.w["a"]["program"], self.w["a"]["season"])
+                answers = {}
+                for state in (self._FOREIGN, self._GHOST):
+                    before = self._snapshot()
+                    status, blinded, raw, resp = self._probe(
+                        c, build, label, parent_kind, parent_key, state)
+                    self.assertEqual(
+                        status, 404,
+                        f"`{label}` with A selected, naming a {state} parent, "
+                        f"answered {status} rather than the generic "
+                        f"not-found: {raw}")
+                    self.assertEqual(resp["error"]["code"], "not_found", raw)
+                    self._assert_no_residue(before, f"{label} / selected / {state}")
+                    answers[state] = (status, blinded)
+                if sole:
+                    self.assertEqual(
+                        len(set(answers.values())), 1,
+                        f"`{label}`: an inaccessible parent and a nonexistent "
+                        f"one answer differently under a VALID selection — "
+                        f"{answers}")
+        # ...and the facade's own noun is still what a missing Club produces.
         c, _user_id = self._operator()
-        # A parent that exists and is visible (the fallback's own Program is
-        # what makes it visible — which is exactly the authorization #409
-        # removes) answers 409...
-        status_real, raw_real, _ = self._req(
-            c, "POST", "/api/v2/setup/official",
-            {"name": "probe", "home_club_id": self.w["a"]["club"]})
-        self.assertEqual(status_real, 409, raw_real)
-        # ...and a nonexistent one answers the generic 404 the facade itself
-        # emits for a missing Club, with no new information in it.
-        status_ghost, raw_ghost, ghost = self._req(
+        self._select(c, self.w["a"]["program"], self.w["a"]["season"])
+        status, raw, ghost = self._req(
             c, "POST", "/api/v2/setup/official",
             {"name": "probe", "home_club_id": "club_never_existed"})
-        self.assertEqual(status_ghost, 404, raw_ghost)
+        self.assertEqual(status, 404, raw)
         self.assertEqual(ghost["error"]["message"],
-                         "Club club_never_existed not found.", raw_ghost)
-        # The 409 body must not name the Program, Season or Club it refused
-        # against — it is decided from the KIND and from whether the parent
-        # carries an axis, never from WHICH axis it carries.
-        for secret in (self.w["a"]["program"], self.w["a"]["season"],
-                       self.w["a"]["league"]):
-            self.assertNotIn(secret, raw_real,
-                             f"the 409 body names {secret}, which the caller "
-                             "was never told they may see")
+                         "Club club_never_existed not found.", raw)
+
+
+# ---------------------------------------------------------------------------
+# 5b. Creating a Program is not choosing it.
+# ---------------------------------------------------------------------------
+class _CreatorOwnershipMixin(_CreateHarness):
+    """The removed CREATOR-OWNERSHIP continuation, pinned closed.
+
+    The gate used to exempt an axis-bearing PROGRAM parent that this caller had
+    themselves created, so ``create P`` -> ``create Season under P`` succeeded
+    with no ``POST /api/context`` at all. Creator-derived identity is not the
+    operator's persisted CHOICE, and the owner's bootstrap contract asks for
+    the choice.
+
+    The lifecycle below is one session, in order, and every explicit-selection
+    step is load-bearing: delete the Program-only save and the Season and Venue
+    creates go red; delete the Program+Season save and the League create goes
+    red. Nothing here is satisfied by ownership.
+    """
+
+    def test_creating_a_program_does_not_authorize_creates_inside_it(self):
+        c, user_id = self._operator()
+        status, raw, program = self._req(
+            c, "POST", "/api/v2/setup/program",
+            {"name": self._next("Owned"), "timezone": TZ})
+        self.assertEqual(status, 200, raw)
+        self.assertIsNone(
+            self.store.get_active_context(user_id),
+            "minting a Program persisted a selection, so every 'without an "
+            "explicit save' assertion below would be vacuous")
+        self.assertTrue(
+            srv.STATE.api._setup_target_created_by(
+                "program", program["id"], user_id),
+            "the audit trail does not record this caller as the Program's "
+            "creator, so the exemption being closed is not even reachable "
+            "here and this test proves nothing")
+
+        # -- 1. PROGRAM-AXIS creates naming the caller's OWN brand-new
+        #       Program: refused, identically, with nothing written. ---------
+        program_axis = (
+            ("season", "POST", "/api/v2/setup/season",
+             {"program_id": program["id"], "name": self._next("Owned Season")}),
+            # The legacy v1 Venue->Program field, the other half of the
+            # continuation the previous rule admitted.
+            ("venue(v1 league_id)", "POST", "/api/setup/venue",
+             {"name": self._next("Owned Venue"), "league_id": program["id"]}),
+        )
+        for label, method, path, body in program_axis:
+            before = self._snapshot()
+            status, raw, resp = self._req(c, method, path, body)
+            self.assertEqual(
+                status, 409,
+                f"`{label}` was created inside a Program the operator MADE but "
+                f"never CHOSE — creator ownership is standing in for the "
+                f"persisted selection: {raw}")
+            self.assertEqual(resp["error"]["code"], "active_context_required",
+                             raw)
+            self.assertEqual(
+                resp["error"]["message"],
+                "Select a Program before creating records in it.", raw)
+            self._assert_no_residue(before, f"{label} / own unchosen Program")
+            self.assertIsNone(
+                self.store.get_active_context(user_id),
+                f"the refused `{label}` persisted a selection as a side effect")
+
+        # -- 2. THE EXPLICIT PROGRAM-ONLY SAVE, and the same two succeed. ----
+        self._select(c, program["id"])
+        saved = self.store.get_active_context(user_id)
+        self.assertEqual((saved.program_id, saved.season_id),
+                         (program["id"], None),
+                         "the fixture did not achieve a Program-ONLY row")
+        created = {}
+        for label, method, path, body in program_axis:
+            status, raw, resp = self._req(c, method, path, body)
+            self.assertEqual(
+                status, 200,
+                f"`{label}` was refused under an EXPLICIT Program-only "
+                f"selection of its own Program: {raw}")
+            created[label] = resp["id"]
+        season_id = created["season"]
+        self.assertEqual(self.store.get_season(season_id).program_id,
+                         program["id"], created)
+
+        # -- 3. A SEASON-OWNED create still needs the Season saved too. -----
+        league_body = {"season_id": season_id, "name": self._next("Owned Lg")}
+        before = self._snapshot()
+        status, raw, resp = self._req(
+            c, "POST", "/api/v2/setup/league", league_body)
+        self.assertEqual(
+            status, 409,
+            "a SEASON-OWNED create was accepted with only the Program saved, "
+            f"against a Season this caller had just created: {raw}")
+        self.assertEqual(resp["error"]["code"], "active_context_required", raw)
+        self.assertEqual(resp["error"]["message"],
+                         "Select a Program and Season before creating records "
+                         "in them.", raw)
+        self._assert_no_residue(before, "league / own unchosen Season")
+
+        # -- 4. ...and succeeds once BOTH axes are explicitly saved. --------
+        self._select(c, program["id"], season_id)
+        status, raw, league = self._req(
+            c, "POST", "/api/v2/setup/league", league_body)
+        self.assertEqual(
+            status, 200,
+            f"the League was refused under its own exact saved axes: {raw}")
+        # A League is PERMANENT across Seasons, so its tie to the Season named
+        # in the request is the LeagueSeason participation row, not a field.
+        self.assertEqual(self.store.get_league(league["id"]).program_id,
+                         program["id"], raw)
+        self.assertIn(
+            (league["id"], season_id),
+            {(ls.league_id, ls.season_id)
+             for ls in self.store.all_league_seasons()},
+            "the League was created but not joined to the Season the request "
+            f"named: {raw}")
 
 
 # ---------------------------------------------------------------------------
@@ -938,6 +1199,24 @@ class OracleSqliteTest(_OracleMixin, unittest.TestCase):
 
 
 class OraclePostgresTest(_OracleMixin, unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.DATABASE_URL = _postgres_url()
+        if not cls.DATABASE_URL:
+            raise unittest.SkipTest(_PG_SKIP)
+
+
+class CreatorOwnershipMemoryTest(_CreatorOwnershipMixin, unittest.TestCase):
+    DATABASE_URL = None
+
+
+class CreatorOwnershipSqliteTest(_CreatorOwnershipMixin, unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.DATABASE_URL = _sqlite_url()
+
+
+class CreatorOwnershipPostgresTest(_CreatorOwnershipMixin, unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.DATABASE_URL = _postgres_url()

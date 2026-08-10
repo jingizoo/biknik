@@ -39,6 +39,7 @@ const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
+const { installContextFixture } = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -95,6 +96,20 @@ for line in sys.stdin:
     team_id, league_id, season_id = line.split(",")
     store = srv.STATE.api.store
     ls = store.league_season_for(league_id, season_id)
+    # SAY WHAT WENT WRONG (#409). None here means the League/Season being
+    # injected under was never created -- i.e. the create that should have
+    # made it was REFUSED. Falling through raised "AttributeError: 'NoneType'
+    # object has no attribute 'id'" inside the launcher, which the journey
+    # reported as "launcher process exited unexpectedly" without ever
+    # mentioning context. Name the real cause instead.
+    if ls is None:
+        print(
+            "INJECT_FAILED: no LeagueSeason for league_id=%s season_id=%s -- "
+            "the League/Season this injection targets does not exist, so the "
+            "create that should have made it was refused (check the explicit "
+            "context selection) " % (league_id, season_id),
+            flush=True)
+        continue
     reg_id = store.next_id("streg")
     store.add_season_team_registration(SeasonTeamRegistration(
         id=reg_id, league_season_id=ls.id, team_id=team_id,
@@ -120,6 +135,8 @@ function startInjectableServer(port) {
       buffer = buffer.slice(idx + 1);
       if (line.startsWith("INJECTED:") && pending.length) {
         pending.shift().resolve(line.slice("INJECTED:".length));
+      } else if (line.startsWith("INJECT_FAILED:") && pending.length) {
+        pending.shift().reject(new Error(line.slice("INJECT_FAILED:".length).trim()));
       }
     }
   });
@@ -165,6 +182,7 @@ async function checkViewport(browser, viewport) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
 
     // Re-clicks the Setup tab (its onclick calls render() unconditionally)
     // so a raw fetch or store injection that mutated server state outside
@@ -180,23 +198,31 @@ async function checkViewport(browser, viewport) {
     // SECOND registration at each fixture's exact target is ever injected
     // directly (the corrupted half no live write path can produce).
     const buildFixture = (label) => page.evaluate(async (i) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const program = await post("/api/v2/setup/program", { name: `Twin Program ${i.label}` });
-      const season = await post("/api/v2/setup/season", { program_id: program.id, name: "2026-27" });
-      const lg = await post("/api/v2/setup/league", { season_id: season.id, name: `Twin League ${i.label}` });
-      const club = await post("/api/v2/setup/club", { name: `Twin Club ${i.label}` });
-      // #367 prerequisite: a Team's League must belong to the ACTIVE Program.
-      // This journey builds several Programs in one session, so the context
-      // can still point at an earlier fixture's Program -- move to the one
-      // being populated before creating into it.
-      await post("/api/context",
-        { program_id: program.id, season_id: season.id });
-      const team = await post("/api/v2/setup/team",
+      const F = window.hsFixture;
+      const program = await F.create(`program ${i.label}`, "/api/v2/setup/program",
+        { name: `Twin Program ${i.label}` });
+      // #409 EXPLICIT SELECTION, and the reason it MOVED. This journey builds
+      // several Programs in one session, so the saved row can still point at
+      // an earlier fixture's Program. The selection used to be a raw
+      // `POST /api/context` placed AFTER the Season and League creates --
+      // which is both too late (the Season create is PROGRAM-AXIS and the
+      // League is SEASON-OWNED, so both were already relying on inference)
+      // and unasserted (the raw post dropped the status, so a refused switch
+      // was invisible). Both axes are now persisted at the point the axis
+      // table requires them, through the app's own switch pipeline, and read
+      // back before anything is created into them.
+      await F.selectProgram(`Program-only bootstrap ${i.label}`, program.id);
+      const season = await F.create(`season ${i.label}`, "/api/v2/setup/season",
+        { program_id: program.id, name: "2026-27" });
+      await F.selectProgramSeason(`Program+Season ${i.label}`, program.id, season.id);
+      const lg = await F.create(`league ${i.label}`, "/api/v2/setup/league",
+        { season_id: season.id, name: `Twin League ${i.label}` });
+      const club = await F.create(`club ${i.label}`, "/api/v2/setup/club",
+        { name: `Twin Club ${i.label}` });
+      const team = await F.create(`team ${i.label}`, "/api/v2/setup/team",
         { league_id: lg.id, club_id: club.id, name: `Twin Team ${i.label}` });
-      const reg1 = await post(`/api/v2/setup/seasons/${season.id}/team-registrations`,
+      const reg1 = await F.create(`first registration ${i.label}`,
+        `/api/v2/setup/seasons/${season.id}/team-registrations`,
         { team_id: team.id, league_id: lg.id, division_id: null });
       return { season: season.id, lg: lg.id, team: team.id, reg1: reg1.id };
     }, { label });

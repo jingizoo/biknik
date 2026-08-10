@@ -23,6 +23,7 @@ const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
+const { installContextFixture } = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -80,6 +81,7 @@ async function checkViewport(browser, viewport) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
 
     // Fixture prerequisites — proven elsewhere, built via raw fetch so this
     // journey's UI interactions stay focused on the new inactive-registration
@@ -87,24 +89,30 @@ async function checkViewport(browser, viewport) {
     // cleanup scenario) and `leagueGame` (a separate, game-backed scenario)
     // so deleting leagueClean is never blocked by leagueGame's registrations.
     const fx = await page.evaluate(async (d) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const org = await post("/api/v2/setup/organization", { name: "Reg Cleanup Org" });
-      const program = await post("/api/v2/setup/program",
+      const F = window.hsFixture;
+      const org = await F.create("organization", "/api/v2/setup/organization", { name: "Reg Cleanup Org" });
+      const program = await F.create("program", "/api/v2/setup/program",
         { name: "Reg Cleanup Program", operator_organization_id: org.id });
-      const season = await post("/api/v2/setup/season", { program_id: program.id, name: "2027-28" });
-      const leagueClean = await post("/api/v2/setup/league", { season_id: season.id, name: "Clean League" });
-      const leagueGame = await post("/api/v2/setup/league", { season_id: season.id, name: "Game League" });
-      const division = await post("/api/v2/setup/division",
+      // #409 EXPLICIT SELECTION. Season is PROGRAM-AXIS, so the Program-only
+      // choice has to be PERSISTED before it — minting the Program above is
+      // not a selection. The two Leagues, the Division, the venue-access
+      // grant, the two registrations and the Game below are all SEASON-OWNED
+      // and all write into THIS Season, so both axes are persisted before
+      // them. ./context-fixture.js carries the axis table and proves each
+      // selection by the server's own write echo.
+      await F.selectProgram("Program-only bootstrap", program.id);
+      const season = await F.create("season", "/api/v2/setup/season", { program_id: program.id, name: "2027-28" });
+      await F.selectProgramSeason("Program+Season", program.id, season.id);
+      const leagueClean = await F.create("leagueClean", "/api/v2/setup/league", { season_id: season.id, name: "Clean League" });
+      const leagueGame = await F.create("leagueGame", "/api/v2/setup/league", { season_id: season.id, name: "Game League" });
+      const division = await F.create("division", "/api/v2/setup/division",
         { league_id: leagueClean.id, name: "Clean Division" });
-      const club = await post("/api/v2/setup/club", { name: "Reg Cleanup Club" });
+      const club = await F.create("club", "/api/v2/setup/club", { name: "Reg Cleanup Club" });
       // A Team is created under its PERMANENT League (rule 7): teamA/teamB
       // register into leagueClean, teamGameHome/teamGameAway into leagueGame,
       // so each is created under the league it later registers into.
       const team = async (name, leagueId) =>
-        (await post("/api/v2/setup/team", { league_id: leagueId, club_id: club.id, name })).id;
+        (await F.create(`team ${name}`, "/api/v2/setup/team", { league_id: leagueId, club_id: club.id, name })).id;
       const teamA = await team("Cleanup Team A", leagueClean.id);
       const teamB = await team("Cleanup Team B", leagueClean.id);
       const teamGameHome = await team("Game Home", leagueGame.id);
@@ -113,26 +121,26 @@ async function checkViewport(browser, viewport) {
       // Fixture for scenario (4): a cancelled Game under leagueGame, both its
       // teams then removed from the season (a Game still blocks even with
       // zero active registrations left, and there is no available action).
-      const venue = await post("/api/v2/setup/venue", { name: "V", organization_id: org.id });
+      const venue = await F.create("venue", "/api/v2/setup/venue", { name: "V", organization_id: org.id });
       // Game ice eligibility (#233 Slice E) requires the ice slot's venue to
       // hold an active SeasonVenueAccess grant for this Season. Out of this
       // journey's scope (proven elsewhere).
-      await post(`/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
-      const rink = await post("/api/v2/setup/rink", { venue_id: venue.id, name: "R" });
-      const slot = await post("/api/v2/setup/ice-slot", {
+      await F.call("season venue-access grant", `/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
+      const rink = await F.create("rink", "/api/v2/setup/rink", { venue_id: venue.id, name: "R" });
+      const slot = await F.create("slot", "/api/v2/setup/ice-slot", {
         rink_id: rink.id, start_time: `${d}T18:00:00+00:00`, end_time: `${d}T19:00:00+00:00`,
         slot_type: "game",
       });
-      const regGameHome = await post(`/api/v2/setup/seasons/${season.id}/team-registrations`,
+      const regGameHome = await F.create("regGameHome", `/api/v2/setup/seasons/${season.id}/team-registrations`,
         { team_id: teamGameHome, league_id: leagueGame.id });
-      const regGameAway = await post(`/api/v2/setup/seasons/${season.id}/team-registrations`,
+      const regGameAway = await F.create("regGameAway", `/api/v2/setup/seasons/${season.id}/team-registrations`,
         { team_id: teamGameAway, league_id: leagueGame.id });
-      const game = await post("/api/v2/setup/game", {
+      const game = await F.create("game", "/api/v2/setup/game", {
         season_id: season.id, league_id: leagueGame.id,
         home_team_id: teamGameHome, away_team_id: teamGameAway, ice_slot_id: slot.id,
       });
-      await post(`/api/games/${game.id}/cancel`, {});
-      await post(`/api/v2/setup/season-team-registration/${regGameHome.id}/remove`, {});
+      await F.call("game cancel", `/api/games/${game.id}/cancel`, {});
+      await F.call("remove Game Home registration", `/api/v2/setup/season-team-registration/${regGameHome.id}/remove`, {});
 
       return {
         program: program.id, season: season.id, leagueClean: leagueClean.id,

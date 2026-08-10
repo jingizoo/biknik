@@ -1014,6 +1014,11 @@ details.tn > .tn-sum:hover { background: #f6f7fb; }
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .ctx-static[hidden] { display: none; }
+.ctx-static:focus-visible { outline: none; box-shadow: 0 0 0 2px rgba(0,0,0,.12); }
+/* The explicit single-Program selection (#411). It stands where the <select>
+   would be, so the one state with no dropdown still has a real control. */
+.ctx-confirm { white-space: nowrap; font-size: 13px; }
+.ctx-confirm[hidden] { display: none; }
 .ctx-ro {
   font-size: 10px; padding: 1px 6px; border-radius: 999px;
   background: #fff0d6; color: #8a5a00; text-transform: uppercase; letter-spacing: .03em;
@@ -1029,6 +1034,12 @@ details.tn > .tn-sum:hover { background: #f6f7fb; }
    note stays visible (it is the whole point of this slice). */
 @media (max-width: 480px) {
   .ctx-select, .ctx-static { max-width: 150px; font-size: 16px; }
+  /* Same phone cap as the chip beside it: a long Program name must ellipsize,
+     never widen the topbar into a horizontal scroll (#411). */
+  .ctx-confirm {
+    max-width: 150px; font-size: 16px;
+    overflow: hidden; text-overflow: ellipsis;
+  }
   .ctx-caption { display: none; }
 }
 

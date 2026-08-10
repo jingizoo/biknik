@@ -31,6 +31,7 @@ const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
+const { installContextFixture } = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -112,36 +113,46 @@ function fail(msg) { throw new Error(msg); }
 // Program, so #ctx-select actually renders as a selectable dropdown here.
 async function buildFixture(page) {
   return page.evaluate(async () => {
-    const post = async (p, b) => (await fetch(p, {
-      method: "POST", credentials: "same-origin",
-      headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-    })).json();
-    const org = await post("/api/v2/setup/organization", { name: "LF Org" });
-    const program = await post("/api/v2/setup/program",
+    const F = window.hsFixture;
+    const org = await F.create("organization", "/api/v2/setup/organization", { name: "LF Org" });
+    const program = await F.create("program", "/api/v2/setup/program",
       { name: "LF Program", operator_organization_id: org.id });
-    const season = await post("/api/v2/setup/season",
+    // #409 EXPLICIT SELECTION. This fixture builds TWO Programs, so every
+    // create names which one it is writing into and the saved row is moved to
+    // match FIRST. Season is PROGRAM-AXIS (a persisted Program is enough);
+    // League, Division, registration and the venue-access grant are
+    // SEASON-OWNED and need the Season they write into to be the saved one.
+    await F.selectProgram("Program-only bootstrap (LF Program)", program.id);
+    const season = await F.create("season", "/api/v2/setup/season",
       { program_id: program.id, name: "LF Season" });
-    const distractor = await post("/api/v2/setup/program", { name: "LF Distractor" });
-    const distractorSeason = await post("/api/v2/setup/season",
+    const distractor = await F.create("distractor program", "/api/v2/setup/program",
+      { name: "LF Distractor" });
+    await F.selectProgram("Program-only bootstrap (LF Distractor)", distractor.id);
+    const distractorSeason = await F.create("distractor season", "/api/v2/setup/season",
       { program_id: distractor.id, name: "Distractor Season" });
+    await F.selectProgramSeason("distractor Program+Season",
+      distractor.id, distractorSeason.id);
     // get_onboarding_status_v2's "every Season needs a League" check is
     // INSTALLATION-WIDE, not Program-scoped -- the distractor Season above
     // (created only so #ctx-select has more than one entry and renders as a
     // real dropdown) would otherwise trip a global blocking onboarding
     // requirement and redirect a fresh League Admin session to the Initial
     // Setup wizard instead of the normal shell.
-    await post("/api/v2/setup/league",
+    await F.call("distractor league", "/api/v2/setup/league",
       { season_id: distractorSeason.id, name: "Distractor League" });
-    const leagueX = await post("/api/v2/setup/league",
+    // Back to the Program under test: everything from here writes into LF
+    // Season, so that is the tuple that has to be saved.
+    await F.selectProgramSeason("LF Program+Season", program.id, season.id);
+    const leagueX = await F.create("leagueX", "/api/v2/setup/league",
       { season_id: season.id, name: "League X" });
-    const leagueY = await post("/api/v2/setup/league",
+    const leagueY = await F.create("leagueY", "/api/v2/setup/league",
       { season_id: season.id, name: "League Y" });
-    const club = await post("/api/v2/setup/club", { name: "LF Club" });
-    const teamX1 = await post("/api/v2/setup/team",
+    const club = await F.create("club", "/api/v2/setup/club", { name: "LF Club" });
+    const teamX1 = await F.create("teamX1", "/api/v2/setup/team",
       { club_id: club.id, name: "X1", league_id: leagueX.id });
-    const teamX2 = await post("/api/v2/setup/team",
+    const teamX2 = await F.create("teamX2", "/api/v2/setup/team",
       { club_id: club.id, name: "X2", league_id: leagueX.id });
-    const teamY1 = await post("/api/v2/setup/team",
+    const teamY1 = await F.create("teamY1", "/api/v2/setup/team",
       { club_id: club.id, name: "Y1", league_id: leagueY.id });
     // One Division per League -- get_demo_overview's `ov.divisions` is
     // server-side League-scoped (unlike get_setup_overview_v2's `sv`, which
@@ -151,17 +162,17 @@ async function buildFixture(page) {
     // server-side variance, since a client-side-only filter (like the Setup
     // hub's Teams/Roster narrowing) always reads live, current state
     // regardless of which response happens to land last.
-    const divisionX = await post("/api/v2/setup/division",
+    const divisionX = await F.create("divisionX", "/api/v2/setup/division",
       { league_id: leagueX.id, name: "Division X" });
-    const divisionY = await post("/api/v2/setup/division",
+    const divisionY = await F.create("divisionY", "/api/v2/setup/division",
       { league_id: leagueY.id, name: "Division Y" });
-    await post("/api/v2/setup/player",
+    await F.call("player", "/api/v2/setup/player",
       { team_id: teamX1.id, name: "X1 Player A", position: "forward" });
-    await post("/api/v2/setup/player",
+    await F.call("player", "/api/v2/setup/player",
       { team_id: teamX1.id, name: "X1 Player B", position: "forward" });
-    await post("/api/v2/setup/player",
+    await F.call("player", "/api/v2/setup/player",
       { team_id: teamX2.id, name: "X2 Player A", position: "forward" });
-    await post("/api/v2/setup/player",
+    await F.call("player", "/api/v2/setup/player",
       { team_id: teamY1.id, name: "Y1 Player A", position: "forward" });
     // At least one real registration AND at least one granted venue are
     // required for the server's ready_to_schedule check
@@ -169,16 +180,16 @@ async function buildFixture(page) {
     // Admin session's one-time route decision (onboarding.js) lands on the
     // Initial Setup wizard instead of the normal dashboard/Setup shell,
     // regardless of anything #367 changed.
-    await post(`/api/v2/setup/seasons/${season.id}/team-registrations`,
+    await F.call("team registration", `/api/v2/setup/seasons/${season.id}/team-registrations`,
       { team_id: teamX1.id, league_id: leagueX.id, division_id: divisionX.id });
-    await post(`/api/v2/setup/seasons/${season.id}/team-registrations`,
+    await F.call("team registration", `/api/v2/setup/seasons/${season.id}/team-registrations`,
       { team_id: teamY1.id, league_id: leagueY.id, division_id: divisionY.id });
-    const venue = await post("/api/v2/setup/venue",
+    const venue = await F.create("venue", "/api/v2/setup/venue",
       { name: "LF Venue", organization_id: org.id });
-    await post(`/api/v2/setup/seasons/${season.id}/venue-access`,
+    await F.call("season venue-access grant", `/api/v2/setup/seasons/${season.id}/venue-access`,
       { venue_id: venue.id });
-    const rink = await post("/api/v2/setup/rink", { venue_id: venue.id, name: "LF Rink" });
-    await post("/api/v2/setup/ice-slot", {
+    const rink = await F.create("rink", "/api/v2/setup/rink", { venue_id: venue.id, name: "LF Rink" });
+    await F.call("ice-slot", "/api/v2/setup/ice-slot", {
       rink_id: rink.id, start_time: "2026-09-01T18:30:00+00:00",
       end_time: "2026-09-01T20:00:00+00:00",
     });
@@ -250,6 +261,8 @@ async function checkCore(browser, viewport) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     if ((await loginAs(page, "admin")).status !== 200) throw new Error(`[${L}] admin login failed`);
+    await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
     const f = await buildFixture(page);
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
@@ -404,6 +417,8 @@ async function checkRaceGuard(browser) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     if ((await loginAs(page, "admin")).status !== 200) throw new Error("admin login failed");
+    await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
     const f = await buildFixture(page);
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
@@ -516,6 +531,8 @@ async function checkPlayerListRaceGuard(browser) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     if ((await loginAs(page, "admin")).status !== 200) throw new Error("admin login failed");
+    await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
     const f = await buildFixture(page);
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });

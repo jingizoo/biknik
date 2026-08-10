@@ -122,71 +122,130 @@ async function checkViewport(browser, viewport) {
     // policy of 5m warm-up + 10m resurfacing (required gap 15 > actual 10).
     const ids = await page.evaluate(async ({ s1s, s1e, s2s, s2e, s3s, s3e,
                                              s4s, s4e }) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const league = await post("/api/setup/league", { name: "Policy League" });
-      const season = await post("/api/setup/season", { league_id: league.id, name: "Policy Season" });
-      const level = await post("/api/setup/level", { season_id: season.id, name: "Level" });
-      const division = await post("/api/setup/division", { season_id: season.id, level_id: level.id, name: "Div P" });
-      const club = await post("/api/setup/club", { name: "Club P" });
-      const teamA = await post("/api/v2/setup/team", { club_id: club.id, league_id: level.id, name: "Aurora" });
-      const teamB = await post("/api/v2/setup/team", { club_id: club.id, league_id: level.id, name: "Borealis" });
-      const teamC = await post("/api/v2/setup/team", { club_id: club.id, league_id: level.id, name: "Cyclone" });
-      const teamD = await post("/api/v2/setup/team", { club_id: club.id, league_id: level.id, name: "Drift" });
-      const register = (teamId) => post(
+      const post = async (p, b) => {
+        const r = await fetch(p, {
+          method: "POST", credentials: "same-origin",
+          headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+        });
+        return { status: r.status, body: await r.json() };
+      };
+      // ASSERT EVERY CREATE BEFORE ITS ID IS USED (#409 review round). This
+      // fixture used to decode each body and throw the status away, carrying
+      // only three hand-picked `*Error` fields out to the caller. So a refused
+      // Season produced an id-less body whose `undefined` id was threaded into
+      // ~18 downstream creates, and the first thing to notice was the GAME
+      // error check — which reported `Season None not found`, blaming the game
+      // for a Season that had simply never been allowed to exist. Each create
+      // now fails at its own line, naming itself. (The three `*Error` fields
+      // and their outer `fail()` checks are gone because this is strictly
+      // stronger: every create is checked now, not three, and on status as
+      // well as body.)
+      const create = async (what, p, b) => {
+        const { status, body } = await post(p, b);
+        if (status !== 200 || !body || body.error || !body.id) {
+          throw new Error(`${what} create failed: ${status} ${JSON.stringify(body)}`);
+        }
+        return body;
+      };
+      // THE EXPLICIT SELECTION (#409 review round). A create no longer inherits
+      // its axes from the parent it names, nor from the account that minted
+      // that parent. The legacy v1 "league" IS a v2 Program under the shim
+      // (server.py's POST /api/setup/league routes straight to
+      // api.create_program(), and /api/setup/season passes its own league_id
+      // through as create_season()'s program_id), so "Policy League" is the
+      // Program axis and "Policy Season" the Season axis.
+      //
+      // A raw fetch is correct HERE, unlike in a journey that keeps driving the
+      // same page: this whole fixture is followed by a reload (see below), which
+      // re-runs the boot sequence's own loadContextOptions() and resynchronises
+      // the client with the server. The read-back is still ASSERTED, not
+      // assumed: a selection that silently fell back to inferred context would
+      // leave this fixture standing on exactly the behaviour #409 removes.
+      const selectContext = async (what, programId, seasonId) => {
+        const sel = await post("/api/context",
+          { program_id: programId, season_id: seasonId || null });
+        if (sel.status !== 200 || !sel.body || sel.body.error) {
+          throw new Error(`could not select ${what}: ${sel.status} ${JSON.stringify(sel.body)}`);
+        }
+        const read = await (await fetch("/api/context",
+          { credentials: "same-origin" })).json();
+        if (read.program_id !== programId
+            || (read.season_id || null) !== (seasonId || null)) {
+          throw new Error(`${what} did not read back as the explicit selection: `
+            + `${JSON.stringify(read)}`);
+        }
+      };
+      const league = await create("Program", "/api/setup/league", { name: "Policy League" });
+      // BOUNDARY 1 — the Program-only bootstrap selection. The Season below is
+      // a Program-axis create; minting the Program does not select it.
+      await selectContext("the Program-only bootstrap", league.id, null);
+      const season = await create("Season", "/api/setup/season",
+        { league_id: league.id, name: "Policy Season" });
+      // BOUNDARY 2 — the Program+Season selection. Everything below is either
+      // Program-axis (Team, Venue, Rink, Ice-slot) or Season-owned two-axis
+      // (League, Division, registration, venue-access, Game), and every one of
+      // them writes into THIS Season. It is also the selection the reload below
+      // needs, so defaultIceForm() resolves this Season instead of failing
+      // closed (#331 review round 8 removed its global-first fallback).
+      await selectContext("the Program+Season selection", league.id, season.id);
+      const level = await create("League", "/api/setup/level", { season_id: season.id, name: "Level" });
+      const division = await create("Division", "/api/setup/division", { season_id: season.id, level_id: level.id, name: "Div P" });
+      const club = await create("Club", "/api/setup/club", { name: "Club P" });
+      const teamA = await create("Team Aurora", "/api/v2/setup/team", { club_id: club.id, league_id: level.id, name: "Aurora" });
+      const teamB = await create("Team Borealis", "/api/v2/setup/team", { club_id: club.id, league_id: level.id, name: "Borealis" });
+      const teamC = await create("Team Cyclone", "/api/v2/setup/team", { club_id: club.id, league_id: level.id, name: "Cyclone" });
+      const teamD = await create("Team Drift", "/api/v2/setup/team", { club_id: club.id, league_id: level.id, name: "Drift" });
+      const register = (teamId, name) => create(
+        `registration for ${name}`,
         `/api/setup/seasons/${season.id}/team-registrations`,
         { team_id: teamId, division_id: division.id });
-      await register(teamA.id);
-      await register(teamB.id);
-      await register(teamC.id);
-      await register(teamD.id);
-      const venue = await post("/api/setup/venue", { name: "Policy Arena", league_id: league.id });
-      await post(`/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
-      const rink = await post("/api/setup/rink", { venue_id: venue.id, name: "Policy Rink" });
-      const slot1 = await post("/api/setup/ice-slot", { rink_id: rink.id, start_time: s1s, end_time: s1e });
-      const slot2 = await post("/api/setup/ice-slot", { rink_id: rink.id, start_time: s2s, end_time: s2e });
-      const slot3 = await post("/api/setup/ice-slot", { rink_id: rink.id, start_time: s3s, end_time: s3e });
+      await register(teamA.id, "Aurora");
+      await register(teamB.id, "Borealis");
+      await register(teamC.id, "Cyclone");
+      await register(teamD.id, "Drift");
+      const venue = await create("Venue", "/api/setup/venue", { name: "Policy Arena", league_id: league.id });
+      await create("season venue-access", `/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
+      const rink = await create("Rink", "/api/setup/rink", { venue_id: venue.id, name: "Policy Rink" });
+      const slot1 = await create("Ice slot 1", "/api/setup/ice-slot", { rink_id: rink.id, start_time: s1s, end_time: s1e });
+      const slot2 = await create("Ice slot 2", "/api/setup/ice-slot", { rink_id: rink.id, start_time: s2s, end_time: s2e });
+      const slot3 = await create("Ice slot 3", "/api/setup/ice-slot", { rink_id: rink.id, start_time: s3s, end_time: s3e });
       // Far from every other slot (>= 50 min), so a committed draft here
       // passes the turnover gate cleanly.
-      const slot4 = await post("/api/setup/ice-slot", { rink_id: rink.id, start_time: s4s, end_time: s4e });
-      const game = await post("/api/setup/game", {
+      const slot4 = await create("Ice slot 4", "/api/setup/ice-slot", { rink_id: rink.id, start_time: s4s, end_time: s4e });
+      const game = await create("Game 1", "/api/setup/game", {
         season_id: season.id, division_id: division.id,
         home_team_id: teamA.id, away_team_id: teamB.id, ice_slot_id: slot1.id });
       // The MOVABLE game, parked far away: moving it next to game 1 must hit
       // the turnover buffer (its own old slot frees, so a lone game never
       // conflicts with itself — the backend pins that; the conflict needs a
       // SECOND game to be adjacent to).
-      const game2 = await post("/api/setup/game", {
+      const game2 = await create("Game 2", "/api/setup/game", {
         season_id: season.id, division_id: division.id,
         home_team_id: teamC.id, away_team_id: teamD.id, ice_slot_id: slot3.id });
+      // Not create()'d: this endpoint answers `{scope_type, scope_id, policy}`
+      // with no top-level `id`, so it gets the same status/error assertion
+      // without the id check — the nested policy id is what proves it landed.
       const policy = await post("/api/setup/scheduling-policy", {
         scope_type: "rink", scope_id: rink.id,
         warmup_minutes: 5, resurfacing_minutes: 10 });
-      // The legacy v1 "league" IS a v2 Program under the shim (server.py's
-      // POST /api/setup/league routes straight to api.create_program(), and
-      // /api/setup/season passes its own league_id through as
-      // create_season()'s program_id) -- select it as the active #159
-      // context so defaultIceForm() resolves this Season without needing
-      // its own now-removed global-first fallback (#331 review round 8:
-      // defaultIceForm() fails CLOSED, the same way Import's own Season
-      // select already does, when no Season is actively selected -- this
-      // fixture must actively select one, not rely on a silent global
-      // default that no longer exists).
-      await post("/api/context", { program_id: league.id, season_id: season.id });
+      if (policy.status !== 200 || !policy.body || policy.body.error
+          || !(policy.body.policy && policy.body.policy.id)) {
+        throw new Error("scheduling policy create failed: "
+          + `${policy.status} ${JSON.stringify(policy.body)}`);
+      }
       return { rink: rink.id, slot1: slot1.id, slot2: slot2.id,
                slot4: slot4.id, division: division.id,
-               game: game.id, gameError: game.error || null,
-               game2: game2.id, game2Error: game2.error || null,
-               policyError: policy.error || null };
+               game: game.id, game2: game2.id };
     }, { s1s: iso(t0), s1e: iso(plusMin(t0, 60)),
          s2s: iso(plusMin(t0, 70)), s2e: iso(plusMin(t0, 130)),
          s3s: iso(plusMin(t0, 300)), s3e: iso(plusMin(t0, 360)),
          s4s: iso(plusMin(t0, 180)), s4e: iso(plusMin(t0, 240)) });
-    if (ids.gameError) fail(`seed game failed: ${JSON.stringify(ids.gameError)}`);
-    if (ids.game2Error) fail(`seed game 2 failed: ${JSON.stringify(ids.game2Error)}`);
-    if (ids.policyError) fail(`seed policy failed: ${JSON.stringify(ids.policyError)}`);
+    // The three `seed … failed` checks that stood here are gone because the
+    // fixture's own `create()` helper now asserts EVERY create — all ~22 of
+    // them, on HTTP status as well as body, at the line that made the call —
+    // rather than these three after the fact. Strictly more is checked, and a
+    // failure now names the create that actually broke instead of the first
+    // downstream victim to notice.
     // The /api/context call above is a bare fetch, bypassing
     // setActiveContext() (the real switcher's own handler) entirely -- it
     // moves the SERVER's active context but leaves the already-loaded

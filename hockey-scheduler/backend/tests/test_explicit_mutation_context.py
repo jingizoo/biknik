@@ -330,6 +330,18 @@ class ExplicitMutationContextContract:
         status, program = self._req(client, "POST", "/api/v2/setup/program",
                                     {"name": "Operator's Own Program"})
         self.assertEqual(status, 200, program)
+        # ORACLE MIGRATION (#409, owner ruling 2026-08-10). Minting a Program no
+        # longer selects it: the persisted ActiveContext row is the sole
+        # Program-axis authority, and a `program_id` in the request body never
+        # substitutes for it. The Season create below therefore needs the
+        # explicit Program-only save first. This is a FIXTURE adaptation only —
+        # every behavioural, refusal, side-effect, race and parity assertion in
+        # this file is unchanged. The contract itself is proven independently in
+        # tests/test_explicit_create_context.py::_CreatorOwnershipMixin.
+        status, ctx = self._req(client, "POST", "/api/context",
+                                {"program_id": program["id"]})
+        self.assertEqual(status, 200, ctx)
+        self.assertEqual(ctx.get("program_id"), program["id"], ctx)
         status, season = self._req(client, "POST", "/api/v2/setup/season", {
             "program_id": program["id"], "name": "Operator's Own Season",
             "start_date": "2026-09-01", "end_date": "2027-03-31"})

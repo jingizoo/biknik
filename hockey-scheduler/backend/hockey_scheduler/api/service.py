@@ -326,9 +326,24 @@ class ApiService:
         Season is still OFFERED, because selecting it is a legitimate way to move
         to a Season+League pair. The binding requirement is enforced at selection
         time, where it can report a precise reason, rather than silently by
-        omission here."""
-        programs, sel_program, sel_season, sel_league = (
-            self.context.options_with_league(user_id, role, scope))
+        omission here.
+
+        ``saved`` (#411) is the SEPARATE, additive report of what the operator
+        has actually PERSISTED — ``resolve_saved_with_league``'s validated axes,
+        never ``_fallback()``'s. It is the same authority every mutation gate is
+        judged against, so a client can finally distinguish "this is what you
+        are being shown" (``selected``) from "this is what you have chosen"
+        (``saved``). Without it the two are indistinguishable in exactly the
+        state where they differ most consequentially — one Program, nothing
+        saved, where ``selected`` names that Program and every create is refused
+        — and any control painted from ``selected`` alone necessarily asserts a
+        selection the writes will reject. Both come from ONE snapshot
+        (``options_with_saved``), so ``saved`` can never describe a different
+        moment than the ``selected`` beside it. Its keys mirror ``selected``'s
+        and are all-null when nothing valid is persisted."""
+        (programs, sel_program, sel_season, sel_league,
+         saved_program, saved_season, saved_league) = (
+            self.context.options_with_saved(user_id, role, scope))
         return {
             "programs": [{
                 "id": _serialize(program)["id"],
@@ -342,6 +357,11 @@ class ApiService:
                 "league_id": sel_league.id if sel_league else None,
                 "read_only": (sel_season is not None
                               and sel_season.status == SeasonStatus.ARCHIVED),
+            },
+            "saved": {
+                "program_id": saved_program.id if saved_program else None,
+                "season_id": saved_season.id if saved_season else None,
+                "league_id": saved_league.id if saved_league else None,
             },
         }
 
@@ -2190,9 +2210,11 @@ class ApiService:
     # The same reasoning is why `program` is a ZERO-AXIS ROOT create even
     # though it accepts an `operator_organization_id`: a Program's own edge is
     # its identity, never anything the Organization carries. What guards an
-    # Organization parent is #369's `_reject_parent_outside_scope`, which runs
-    # first and answers the only question there is about it — may this caller
-    # attach a child here.
+    # Organization parent is #369's `_reject_parent_outside_scope`, which
+    # answers the only question there is about it — may this caller attach a
+    # child here. It runs AFTER this gate now (see `_create_context_error`),
+    # which changes nothing for an Organization: a NO-INHERIT parent never
+    # makes a create context-requiring, so gate 1 passes it through untouched.
     _CREATE_PARENT_NO_INHERIT = frozenset({"organization"})
 
     _CREATE_PROGRAM_MESSAGE = (
@@ -2219,50 +2241,73 @@ class ApiService:
         instead would leave a cross-Season READ leak inside a write route,
         since the response carries the source Season's registrations.
 
-        TWO refusals, and they answer two different questions in this order:
+        TWO refusals, and they answer two different questions IN THIS ORDER:
 
         * ``error`` — an ``ActiveContextRequiredError`` (409). "You have not
-          CHOSEN a context." It is decided from the KIND and from whether the
-          named parents carry an axis at all, never from WHICH Program they
-          carry, so it is stable across every parent id whose axis-bearing-ness
-          is the same;
+          CHOSEN a context." It is decided from the OPERATION SHAPE — the kind
+          being minted and the ``(parent_kind, parent_id)`` pairs the REQUEST
+          itself carries — and never from which Program a named parent turns
+          out to hold, so it is BYTE-IDENTICAL across every parent id a given
+          create shape can name;
         * ``refused_parent_index`` — "that parent is not IN your context." The
           transport renders the generic ``"<Label> <id> not found."`` for it,
           BYTE-IDENTICAL to a parent that never existed, so a mismatch can
           never become an existence oracle.
 
-        THE COMPARISON IS THE ENFORCEMENT, and a parent that carries NO axis
-        has nothing to compare, so the create proceeds. That is not a
-        softening; it is what the ruling's PROGRAM-AXIS clause literally says
-        ("compare the SAVED Program against the PARENT's Program"), and it is
-        the only reading the pre-existing bootstrap assertions survive:
-        ``tests/test_zero_program_bootstrap_scoping.py`` drives
-        organization → venue → rink → ice-slot → official over TWO real Arena
-        Manager HTTP sessions on a Program-LESS install and asserts 200 on
-        every one. An Arena Manager cannot create a Program, so on that install
-        no Program exists for them to select and an unconditional requirement
-        would make those five UNSATISFIABLE rather than merely strict — the
-        revert recorded at ``Handler._reject_parent_outside_scope``. Context
-        becomes genuinely REQUIRED the instant the named parent carries a
-        Program edge, which is a property of the id the CALLER themselves
-        supplied and not of the installation's inventory (the
-        inventory-dependent carve-out ``has_active_program_season`` records the
-        owner as having forbidden).
+        ORDERING IS THE CONTRACT (review round: the create refusals disclosed
+        parent existence). The 409 is decided and returned BEFORE any parent
+        is resolved for the caller's benefit and BEFORE #369's
+        parent-visibility gate runs at the transport. The previous order ran
+        #369 first, so a caller who had chosen NOTHING received 409 for a
+        parent that existed and was visible and 404 for one that did not exist
+        — a status split that is an existence oracle in exactly the direction
+        this gate exists to close. Now an unchosen or stale axis answers the
+        same 409 for a VISIBLE, a FOREIGN and a NONEXISTENT parent alike, and
+        only a caller whose explicit axes are already valid ever reaches the
+        parent comparison whose 404 flattens foreign and nonexistent together.
 
-        ORDERING, and why the transport runs #369's parent-visibility gate
-        BEFORE this one rather than after. Deciding "does this parent carry a
-        Program" needs a store read, so unlike ``_mutation_context_error`` this
-        refusal is not lookup-free and a 409-before-404 order would let a
-        caller with no saved row separate "that id exists and is linked" (409)
-        from "nonexistent or foreign" (404) — a NEW existence oracle over
-        records they may not see. Running ``_reject_parent_outside_scope``
-        first removes it at the source: past that gate the caller provably can
-        already see the parent, so the 409 discloses nothing they did not
-        already have. The lookup-free property that ``_mutation_axis_targets``
-        guarantees for the mutation family is preserved as the property that
-        actually matters — a refusal is never an existence answer — by
-        ordering rather than by lookup avoidance, because for a create there is
-        no lookup-free formulation that also keeps the bootstrap satisfiable.
+        FAIL CLOSED ON WHAT CANNOT BE SEEN. A create is refused for a missing
+        axis unless some named parent is provably axis-FREE, and "provably"
+        has two halves, both required (``_create_parent_is_axis_free``): the
+        row resolves and carries no Program/Season edge, AND the caller can
+        ALREADY see it. An id that does not resolve, or resolves to a row this
+        caller may not attach to, is treated as axis-bearing and answers the
+        stable 409 — so the 409/404 boundary is drawn only around rows whose
+        existence the caller already knew, and probing a stranger's or an
+        invented id yields exactly one answer.
+
+        THE COMPARISON IS THE ENFORCEMENT, and a parent the caller can see
+        that carries NO axis has nothing to compare, so the create proceeds.
+        That is not a softening; it is what the ruling's PROGRAM-AXIS clause
+        literally says ("compare the SAVED Program against the PARENT's
+        Program"), and it is the only reading the pre-existing bootstrap
+        assertions survive: ``tests/test_zero_program_bootstrap_scoping.py``
+        drives organization → venue → rink → ice-slot → official over TWO real
+        Arena Manager HTTP sessions on a Program-LESS install and asserts 200
+        on every one. An Arena Manager cannot create a Program, so on that
+        install no Program exists for them to select and an unconditional
+        requirement would make those five UNSATISFIABLE rather than merely
+        strict — the revert recorded at
+        ``Handler._reject_parent_outside_scope``. Context becomes genuinely
+        REQUIRED the instant the shape names a parent that is not provably
+        axis-free, which is a property of the request the CALLER themselves
+        sent and not of the installation's inventory (the inventory-dependent
+        carve-out ``has_active_program_season`` records the owner as having
+        forbidden).
+
+        NO CREATOR-OWNERSHIP CONTINUATION. This gate used to admit one more
+        case: an axis-bearing PROGRAM parent that this caller had themselves
+        created, on the theory that minting a Program and giving it its first
+        Season were two halves of one act. That let ``create P`` →
+        ``create Season under P`` succeed with no ``POST /api/context`` at
+        all, which is precisely parent-derived/creator-derived identity
+        substituting for the persisted CHOICE the bootstrap contract requires.
+        It is gone. Zero-axis roots stay resolver-free; a Program-axis create
+        requires the SAVED Program; a two-axis create requires BOTH saved
+        axes. The bootstrap is still reachable and is still one extra call:
+        create the Program, POST the Program-only selection, then populate it
+        (``tests/test_explicit_create_context.py``'s bootstrap and
+        creator-ownership lifecycles pin both halves).
 
         LOCK ORDER, when ``lock=True``: ActiveContext FIRST, then the parent
         rows in canonical order, and only then the edges are read and compared
@@ -2286,23 +2331,11 @@ class ApiService:
             # ZERO-AXIS ROOT. Return before ANY context read — this is the line
             # the fallback spy measures.
             return None, None
-        named = [((parent[0] or "").replace("-", "_"), parent[1])
-                 for parent in parents
-                 if isinstance(parent[1], str) and parent[1]]
-        # (1) THE ACTIVE CONTEXT, and its lock, FIRST. The authority is the
-        #     PERSISTED row (`resolve_saved_with_league` inside
-        #     `_explicit_selection`), never `resolve_with_league` — a resolver
-        #     that FELL BACK can return a Program equal to the saved one, and an
-        #     equal value is not a derived one.
-        program, season = self._explicit_selection(
-            user_id, role, scope, lock=lock)
-        # (2) the parent rows, in canonical (kind, id) order, under the same
-        #     transaction, so the edges read below cannot move under us.
-        if lock:
-            for parent_kind, parent_id in sorted(set(named)):
-                self._lock_setup_row(parent_kind, parent_id)
-        # (3) the parents' axes, read under those locks.
-        axis_parents, any_axis, unchosen_axis = [], False, False
+        # (1) THE SHAPE, derived from the REQUEST ALONE — no store read, no
+        #     resolution of any supplied id. A falsy id is not a target, and a
+        #     NO-INHERIT parent kind can never bind the child to an axis, so
+        #     neither can make the create context-requiring.
+        candidates = []
         for index, parent in enumerate(parents):
             parent_kind, parent_id = parent[0], parent[1]
             if not isinstance(parent_id, str) or not parent_id:
@@ -2314,66 +2347,92 @@ class ApiService:
             # create's own set, never add one.
             parent_axes = (axes if len(parent) < 3
                            else axes & frozenset({parent[2]}))
+            candidates.append((index, parent_kind, parent_id, parent_axes))
+        if not candidates:
+            # The shape names nothing that could carry an axis, so there is
+            # nothing to compare a selection against — the zero-Program
+            # bootstrap chain, decided without reading anything at all.
+            return None, None
+        # (2) THE ACTIVE CONTEXT, and its lock, FIRST. The authority is the
+        #     PERSISTED row (`resolve_saved_with_league` inside
+        #     `_explicit_selection`), never `resolve_with_league` — a resolver
+        #     that FELL BACK can return a Program equal to the saved one, and an
+        #     equal value is not a derived one.
+        program, season = self._explicit_selection(
+            user_id, role, scope, lock=lock)
+        # (3) the parent rows, in canonical (kind, id) order, under the same
+        #     transaction, so the edges read below cannot move under us.
+        if lock:
+            for parent_kind, parent_id in sorted(
+                    {(c[1], c[2]) for c in candidates}):
+                self._lock_setup_row(parent_kind, parent_id)
+        # (4) THE PRE-DISCLOSURE GATE. Before any parent identity is confirmed
+        #     or denied to the caller: are the axes this SHAPE consumes
+        #     explicitly chosen and still valid?
+        if program is None or ("season" in axes and season is None):
+            for _index, parent_kind, parent_id, _parent_axes in candidates:
+                if not self._create_parent_is_axis_free(
+                        parent_kind, parent_id, user_id, role, scope):
+                    return ActiveContextRequiredError(
+                        self._CREATE_SEASON_MESSAGE if "season" in axes
+                        else self._CREATE_PROGRAM_MESSAGE), None
+            # Every named parent is one this caller can already see and that
+            # carries no axis at all — the bootstrap chain.
+            return None, None
+        # (5) ONLY NOW, with the explicit axes valid, are the parents resolved
+        #     and compared. A nonexistent one falls through to the facade's own
+        #     generic not-found, which is byte-identical to the refusal a
+        #     foreign one gets here, so the two stay indistinguishable.
+        for index, parent_kind, parent_id, parent_axes in candidates:
             record = self._setup_target_record(parent_kind, parent_id)
             if record is None:
-                # Not this gate's business: a nonexistent parent is the
-                # facade's own byte-identical not-found a step later, and
-                # #369's visibility gate has already refused a foreign one.
                 continue
             edges, _saw_link = self._setup_target_edges(parent_kind, record)
             programs = {edge[0] for edge in edges if edge[0]}
             seasons = {edge[1] for edge in edges if edge[1]}
-            if programs or seasons:
-                any_axis = True
-                # THE BOOTSTRAP CONTINUATION, and the ONE case where an
-                # axis-bearing parent still requires no chosen context. A
-                # Program's only edge is its OWN identity
-                # (`{(itself, None, None)}`), so "compare the saved Program
-                # against the parent's Program" degenerates, for a Program
-                # parent, into "you must already have selected the very
-                # Program you are naming". For a Program this caller JUST
-                # CREATED that is unsatisfiable in the same way a ZERO-AXIS
-                # ROOT create is: creating the Program and giving it its first
-                # Season (or its first Venue, through the legacy v1
-                # Venue→Program field) are two halves of one act, and the
-                # ruling's own rationale — "creating the root is the act that
-                # would establish context" — does not stop at the root row.
-                #
-                # This is NOT the inventory-dependent carve-out the owner
-                # forbade: it keys on CREATOR OWNERSHIP of the id the caller
-                # themselves named, the same authenticated, unforgeable signal
-                # `writable_setup_parent_ids` already rests on, and it is
-                # strictly narrower than authorization (a global role is
-                # authorized for every Program but has still created only its
-                # own). It also does not rescue the falsified path: an
-                # Official's home Club carries Program A as an edge to a record
-                # that is NOT the Club, so no self-edge exists and no amount of
-                # creator ownership of the Club makes A a Program the operator
-                # chose.
-                if not (parent_kind == "program"
-                        and self._setup_target_created_by(
-                            "program", parent_id, user_id)):
-                    unchosen_axis = True
-            axis_parents.append((index, parent_axes, programs, seasons))
-        if not any_axis:
-            # Every named parent is an unlinked, creator-owned draft (or there
-            # is no parent at all). Nothing to compare — the bootstrap chain.
-            return None, None
-        if program is None:
-            if not unchosen_axis:
-                return None, None           # bootstrap continuation, see above
-            return ActiveContextRequiredError(
-                self._CREATE_SEASON_MESSAGE if "season" in axes
-                else self._CREATE_PROGRAM_MESSAGE), None
-        if "season" in axes and season is None:
-            return ActiveContextRequiredError(self._CREATE_SEASON_MESSAGE), None
-        for index, parent_axes, programs, seasons in axis_parents:
             if "program" in parent_axes and programs and program.id not in programs:
                 return None, index
             if ("season" in parent_axes and seasons
                     and season is not None and season.id not in seasons):
                 return None, index
         return None, None
+
+    def _create_parent_is_axis_free(self, kind, parent_id, user_id, role,
+                                    scope) -> bool:
+        """True only when this caller can ALREADY see ``parent_id`` AND it
+        carries no Program and no Season edge — the one shape that lets a
+        create proceed with no chosen context (#409 review round).
+
+        FAILS CLOSED on both halves, and each half closes a different leak:
+
+        * an id that does not RESOLVE returns False, so a guessed or invented
+          parent answers the same stable 409 a real one does instead of the
+          facade's not-found. Without this the 409-vs-404 split is an
+          existence oracle for a caller who has chosen nothing;
+        * a row this caller may not attach a child to returns False, so a
+          FOREIGN unlinked row answers that same 409 rather than the visibility
+          gate's 404. Without this half the oracle merely moves: 404 would come
+          to mean "exists, is unlinked, and is someone else's".
+
+        Visibility is the SAME predicate the write path already uses —
+        ``setup_parent_writable`` for the parent kinds #369's gate covers
+        (which is exactly the set the Program-less bootstrap walks: Venue,
+        Rink, Organization, Club, Program), and the generic
+        ``setup_target_accessible`` ceiling for every other parent kind. It is
+        never a substitute for the persisted selection: it can only ever admit
+        a parent that binds the new row to NO axis, so nothing it admits lands
+        inside a Program the operator did not choose."""
+        record = self._setup_target_record(kind, parent_id)
+        if record is None:
+            return False
+        edges, _saw_link = self._setup_target_edges(kind, record)
+        if any(edge[0] or edge[1] for edge in edges):
+            return False
+        if kind in self._SETUP_PARENT_KEYS:
+            return self.setup_parent_writable(
+                kind, parent_id, user_id, role, scope) is not False
+        return self.setup_target_accessible(
+            kind, parent_id, user_id, role, scope) is not False
 
     def setup_create_context_error(self, kind, parents, user_id, role, scope):
         """PREFLIGHT ONLY: ``(refusal_dict_or_None, refused_parent_index)``.

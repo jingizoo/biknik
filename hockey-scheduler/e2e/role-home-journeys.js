@@ -14,6 +14,7 @@ const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
+const { installContextFixture } = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -113,31 +114,44 @@ async function checkViewport(browser, viewport) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
     await reachDashboard(page);  // signed in as the auto-provisioned League Admin
 
     // Build one Program/Team/Player and the three scoped accounts as the
     // League Admin, all through the documented v2 setup + accounts API.
+    //
+    // #409 EXPLICIT SELECTION. Minting the Program does not select it, and
+    // the Season create below is PROGRAM-AXIS while the League is
+    // SEASON-OWNED; both selections are therefore PERSISTED here in axis
+    // order, and every create is asserted at its own line
+    // (./context-fixture.js). The Program id is read back off the overview
+    // rather than the create response, so the id fed to the selection is the
+    // one the server actually holds.
     const ids = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      await post("/api/v2/setup/program", { name: "Riverside Hockey", country: "US" });
+      const F = window.hsFixture;
+      await F.create("program", "/api/v2/setup/program",
+        { name: "Riverside Hockey", country: "US" });
       const overview = await (await fetch("/api/v2/setup/overview",
         { credentials: "same-origin" })).json();
       const program = overview.programs[0];
-      const season = await post("/api/v2/setup/season",
+      if (!program || !program.id) {
+        throw new Error("fixture: the setup overview listed no Program to select");
+      }
+      await F.selectProgram("Program-only bootstrap", program.id);
+      const season = await F.create("season", "/api/v2/setup/season",
         { program_id: program.id, name: "Fall 2026" });
-      const league = await post("/api/v2/setup/league",
+      await F.selectProgramSeason("Program+Season", program.id, season.id);
+      const league = await F.create("league", "/api/v2/setup/league",
         { season_id: season.id, name: "Adult League" });
-      const club = await post("/api/v2/setup/club", { name: "Club" });
-      const team = await post("/api/v2/setup/team",
+      const club = await F.create("club", "/api/v2/setup/club", { name: "Club" });
+      const team = await F.create("team", "/api/v2/setup/team",
         { club_id: club.id, league_id: league.id, name: "Riverside A" });
-      const player = await post("/api/v2/setup/player",
+      const player = await F.create("player Priya", "/api/v2/setup/player",
         { team_id: team.id, name: "Priya Player", position: "forward" });
-      const junior = await post("/api/v2/setup/player",
+      const junior = await F.create("player Jamie", "/api/v2/setup/player",
         { team_id: team.id, name: "Jamie Junior", position: "defense" });
-      const official = await post("/api/v2/setup/official", { name: "Ozzy Official" });
+      const official = await F.create("official", "/api/v2/setup/official",
+        { name: "Ozzy Official" });
       return { teamId: team.id, playerId: player.id, juniorId: junior.id,
         officialId: official.id };
     });

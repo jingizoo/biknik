@@ -272,8 +272,9 @@ role.
 
 - **`GET /api/context/options`** → `{programs: [{id, name, seasons: [{id, name,
   status, read_only, start_date}], leagues: [{id, name}]}], selected:
-  {program_id, season_id, league_id, read_only}}`, filtered through the **same**
-  `context_scope` rules as get/set (`ContextService.options_with_league` runs
+  {program_id, season_id, league_id, read_only}, saved: {program_id, season_id,
+  league_id}}`, filtered through the **same**
+  `context_scope` rules as get/set (`ContextService.options_with_saved` runs
   under the same one serializable snapshot). So
   the switcher only ever offers a context the caller could actually select — it
   never enumerates an unrelated Program/Season from the (unfiltered) overview.
@@ -289,6 +290,19 @@ role.
   where it can report a precise reason, rather than silently by omission here. A
   League carries no `read_only` — that is a property of the Season's lifecycle,
   not of the permanent League.
+
+  `saved` (#411) is a **different fact from `selected`**, and the two must not be
+  collapsed. `selected` is the resolved, renderable context and may have been
+  invented by `ContextService._fallback()`; `saved` is what the operator
+  themselves persisted, validated exactly as `resolve_saved_with_league`
+  validates it — the authority every #409 create/mutation gate is judged
+  against. All-null means nothing valid is persisted. On a one-Program
+  installation the two carry the **same Program id while nothing is saved at
+  all**, because the fallback walks the authorized Programs in id order, so no
+  comparison inside `selected` could ever separate them: a UI drawn from
+  `selected` alone necessarily claims a selection the next create will refuse.
+  A stale saved Season drops off while the Program survives, which is exactly
+  what the create gate grants in that state.
 - **One control, every role — a native `<select>`.** The switcher renders as a
   native `<select>` (grouped by Program via `<optgroup>` when more than one
   Program is authorized) so it gets the full keyboard / screen-reader contract —
@@ -296,7 +310,24 @@ role.
   menu-radio handling. It collapses to a **static chip** only when there is
   exactly one selectable context (a single Program with no Seasons). The
   read-only badge is a persistent reflection of the current selection, visible
-  in the closed state. It never hard-codes role logic in the browser — the
+  in the closed state.
+
+  **The collapsed state carries its own control (`#ctx-confirm`, #411).** The
+  chip is a label, and a label cannot select anything — so on a first-run
+  installation (one Program, no Seasons) there was no control on the page wired
+  to `setActiveContext`, while every Program-axis create answered 409 *"Select a
+  Program before creating records in it"*. A real `<button>` now stands where
+  the `<select>` would be, labelled with the Program (`Select <name>`), so
+  Enter/Space activate it natively and its text is its accessible name. It is
+  painted from `saved`, never from `selected`, so it appears exactly while
+  nothing is persisted and withdraws itself once something is — and it is wired
+  once, outside the render pass, because **rendering must never persist**:
+  auto-selecting on render would launder the fallback back into mutation
+  authority, which is the whole thing #409 removed. On success it hands focus to
+  the surviving chip and announces through the one sitewide live region. The
+  guided Initial Setup view paints the switcher too (`onboarding.js`), because
+  that is the surface a first-run operator is landed on and where the refusal is
+  actually raised. It never hard-codes role logic in the browser — the
   option set comes entirely from the endpoint above. A `POST` of an option the
   server rejects (a race) surfaces the same generic not-found, shown as a
   generic message (no existence oracle).

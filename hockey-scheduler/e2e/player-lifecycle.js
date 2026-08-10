@@ -19,6 +19,9 @@ const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
+const {
+  installContextFixture, selectProgram, selectProgramSeason,
+} = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -82,11 +85,32 @@ async function checkViewport(browser, viewport) {
     const resp = page.waitForResponse((r) =>
       r.url() === `${base}${url}` && r.request().method() === "POST");
     await page.click(`[data-drawer-submit="${key}"]`);
-    const body = await (await resp).json();
-    if (body.error) throw new Error(`[${L}] ${key} create failed: ${JSON.stringify(body.error)}`);
+    const settled = await resp;
+    // #409 diagnosis fix: ASSERT THE STATUS here, at the create's own line,
+    // and print the server's error body with it. Checking only `body.error`
+    // discarded the status, so a refusal came back as an id-less object that
+    // the next drawer fed into a parent <select> with no matching option --
+    // the run then failed far below the create that was actually refused.
+    const body = await settled.json().catch(() => null);
+    if (settled.status() !== 200 || !body || body.error || !body.id) {
+      throw new Error(`[${L}] ${key} create (POST ${url}) failed: `
+        + `${settled.status()} ${JSON.stringify(body)}`);
+    }
     await page.waitForFunction(() => !document.querySelector(".drawer[role=dialog]"),
       null, { timeout: 10000 });
     return body;
+  };
+
+  // setActiveContext() re-renders the shell, so re-establish Setup > Records
+  // after a selection instead of assuming the sub-view survived it.
+  const ensureRecordsView = async () => {
+    if (await page.evaluate(() => document.body.dataset.view !== "setup")) {
+      await page.click('.tab[data-tab="setup"]');
+    }
+    if (!(await page.$(".setup-card"))) {
+      await page.click('[data-setup-view="records"]');
+    }
+    await page.waitForSelector(".setup-card", { timeout: 10000 });
   };
 
   const rowText = (id) => page.evaluate((pid) => {
@@ -117,17 +141,38 @@ async function checkViewport(browser, viewport) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
     await page.click('.tab[data-tab="setup"]');
     await page.click('[data-setup-view="records"]');
     await page.waitForSelector(".setup-card", { timeout: 10000 });
 
     // Minimal chain + one Player, all through the real drawers.
+    //
+    // #409 EXPLICIT SELECTION, at the two axis boundaries this chain crosses
+    // (ApiService._CREATE_CONSUMED_AXES): `season`/`team`/`player` are
+    // PROGRAM-AXIS and need the saved Program; `league`/`division` are
+    // SEASON-OWNED and need the saved Program AND Season. `organization` is a
+    // zero-axis root. Each selection below is asserted by the shared fixture
+    // (write echo + read-back), so a create that succeeds cannot be riding on
+    // an inferred context.
+    //
+    // RECORDED TRADE (./context-fixture.js header): the first Program-only
+    // selection is one the shipped UI cannot issue in this state -- one
+    // Program, zero Seasons collapses the switcher to a non-interactive chip.
+    // That first-run dead end is a PRODUCT defect, witnessed deliberately by
+    // ./season-dates.js; this journey's subject is the Player deactivate/
+    // reactivate contract, not the bootstrap.
     const org = await createViaDrawer("organization",
       { "f-org": "Life Org" }, "/api/v2/setup/organization");
     const program = await createViaDrawer("league",
       { "f-league": "Life Program", "f-league-org": org.id }, "/api/v2/setup/program");
+    await selectProgram(page, "Program-axis creates under Life Program", program.id);
+    await ensureRecordsView();
     const season = await createViaDrawer("season",
       { "f-season-league": program.id, "f-season": "2026-27" }, "/api/v2/setup/season");
+    await selectProgramSeason(page,
+      "Season-owned League/Division creates into 2026-27", program.id, season.id);
+    await ensureRecordsView();
     const league = await createViaDrawer("level",
       { "f-level-season": season.id, "f-level": "Life League" }, "/api/v2/setup/league");
     await createViaDrawer("division",

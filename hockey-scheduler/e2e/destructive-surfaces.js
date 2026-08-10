@@ -12,6 +12,7 @@ const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
+const { installContextFixture } = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -90,43 +91,49 @@ async function checkViewport(browser, viewport) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
     // Tomorrow, by the app's own date arithmetic on the app's own calendar
     // day — see the note above CAL_DAY's retirement.
     const day = await page.evaluate(() => addDays(calendarDate, 1));
 
     const ids = await page.evaluate(async (d) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
+      const F = window.hsFixture;
       const get = async (p) => (await fetch(p, { credentials: "same-origin" })).json();
 
-      const league = await post("/api/setup/league", { name: "Surfaces League" });
-      const season = await post("/api/setup/season", { league_id: league.id, name: "S1" });
-      const dA = await post("/api/setup/division", { season_id: season.id, name: "Div A" });
-      const dB = await post("/api/setup/division", { season_id: season.id, name: "Div B" });
-      const venue = await post("/api/setup/venue", { name: "V", league_id: league.id });
+      // #409 EXPLICIT SELECTION on the V1 SURFACE. `POST /api/setup/league`
+      // mints the PROGRAM (v1 calls it "league"); `POST /api/setup/season` is
+      // PROGRAM-AXIS on the body's `league_id` (server.py:3686), behind the
+      // same preflight v2 uses (server.py:1160).
+      const league = await F.create("v1 league (the Program)", "/api/setup/league", { name: "Surfaces League" });
+      await F.selectProgram("Program-only bootstrap", league.id);
+      const season = await F.create("season", "/api/setup/season", { league_id: league.id, name: "S1" });
+      // The Divisions, the four registrations, the venue-access grant and the
+      // Games are SEASON-OWNED and land in THIS Season.
+      await F.selectProgramSeason("Program+Season", league.id, season.id);
+      const dA = await F.create("division A", "/api/setup/division", { season_id: season.id, name: "Div A" });
+      const dB = await F.create("division B", "/api/setup/division", { season_id: season.id, name: "Div B" });
+      const venue = await F.create("venue", "/api/setup/venue", { name: "V", league_id: league.id });
       // Game ice eligibility (#233 Slice E) requires the venue to hold active
       // SeasonVenueAccess for the season the game is scheduled in.
-      await post(`/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
-      const rink = await post("/api/setup/rink", { venue_id: venue.id, name: "R" });
-      const club = await post("/api/setup/club", { name: "Roster Club" });
+      await F.call("season venue-access grant", `/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
+      const rink = await F.create("rink", "/api/setup/rink", { venue_id: venue.id, name: "R" });
+      const club = await F.create("club", "/api/setup/club", { name: "Roster Club" });
       // A bare club to delete from the Records view.
-      const bareClub = await post("/api/setup/club", { name: "Empty Club" });
+      const bareClub = await F.create("bareClub", "/api/setup/club", { name: "Empty Club" });
 
       const team = async (name) =>
-        (await post("/api/setup/team", { club_id: club.id, division_id: dA.id, name })).id;
+        (await F.create("team", "/api/setup/team", { club_id: club.id, division_id: dA.id, name })).id;
       const teamA = await team("Aces");
       const teamB = await team("Bruins");
       const teamC = await team("Comets");
       const teamD = await team("Ducks");
-      await post(`/api/setup/seasons/${season.id}/team-registrations`, { team_id: teamA, division_id: dA.id });
-      await post(`/api/setup/seasons/${season.id}/team-registrations`, { team_id: teamB, division_id: dA.id });
-      await post(`/api/setup/seasons/${season.id}/team-registrations`, { team_id: teamC, division_id: dB.id });
-      await post(`/api/setup/seasons/${season.id}/team-registrations`, { team_id: teamD, division_id: dB.id });
+      await F.call("team registration", `/api/setup/seasons/${season.id}/team-registrations`, { team_id: teamA, division_id: dA.id });
+      await F.call("team registration", `/api/setup/seasons/${season.id}/team-registrations`, { team_id: teamB, division_id: dA.id });
+      await F.call("team registration", `/api/setup/seasons/${season.id}/team-registrations`, { team_id: teamC, division_id: dB.id });
+      await F.call("team registration", `/api/setup/seasons/${season.id}/team-registrations`, { team_id: teamD, division_id: dB.id });
 
       const pad = (n) => String(n).padStart(2, "0");
-      const slot = async (h) => (await post("/api/setup/ice-slot", {
+      const slot = async (h) => (await F.create("ice-slot", "/api/setup/ice-slot", {
         rink_id: rink.id,
         start_time: `${d}T${pad(h)}:00:00+00:00`,
         end_time: `${d}T${pad(h + 1)}:00:00+00:00`,
@@ -137,18 +144,18 @@ async function checkViewport(browser, viewport) {
       const slotFree = await slot(22);
 
       // A committed + published game (offers Cancel, never Delete).
-      const game = await post("/api/setup/game", {
+      const game = await F.create("game", "/api/setup/game", {
         season_id: season.id, division_id: dA.id,
         home_team_id: teamA, away_team_id: teamB, ice_slot_id: slotGame,
       });
-      await post(`/api/games/${game.id}/publish`, {});
+      await F.call("publish", `/api/games/${game.id}/publish`, {});
 
       // A real scheduler-created draft game on its own slot (offers Delete).
       // #328 review round 5: Commit is bound to the exact preview it
       // reviewed, so a direct API call must Generate first.
       const draftPreview = await post(
         "/api/scheduler/draft", { division_id: dB.id, slot_ids: [slotDraft] });
-      await post("/api/scheduler/commit", {
+      await F.call("commit", "/api/scheduler/commit", {
         division_id: dB.id, slot_ids: [slotDraft],
         draft_fingerprint: draftPreview.draft_fingerprint,
       });

@@ -39,6 +39,18 @@
 //
 // Fails on any browser console/page error.
 const { chromium } = require("playwright");
+// #409 explicit-selection contract. `hsFixture.auto` replaces the 20
+// copy-pasted `post()` helpers below: it asserts the status they discarded,
+// and routes `POST /api/context` through the app's OWN switch pipeline so a
+// selection is both REAL and read back. The `selectProgram` /
+// `selectProgramSeason` calls inserted through this file are the axis the
+// create that follows them CONSUMES -- Program-only for a PROGRAM-AXIS
+// create (Season, Venue, Rink, Ice slot, Team, Player), both axes for a
+// SEASON-OWNED one (League, Division, registration, season venue access),
+// and for those the Season selected is the one the record is WRITTEN INTO.
+// See context-fixture.js.
+const { installContextFixture, selectPersistedProgram,
+        selectPersistedProgramSeason } = require("./context-fixture");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
@@ -331,11 +343,25 @@ async function selectContextAndWaitForStableView(page, base, {
     10000);
 }
 
+// #409: the node-side sibling of the in-page `post` above, and it had the same
+// two defects — it discarded the STATUS, and it wrote `/api/context` as a raw
+// fetch that moved the SERVER while the page went on believing the old tuple.
+// Both are fixed by routing through the shared fixture: creates are asserted at
+// their own call site, and a context write becomes the app's OWN switch with
+// its selection read back.
+//
+// `/api/auth/*` is deliberately excluded — `loginAs` inspects the refusal
+// itself, and legs below drive logins and logouts whose non-200 answers are
+// the point rather than a failure.
 async function apiPost(page, p, body) {
-  return page.evaluate(async (arg) => (await fetch(arg.p, {
-    method: "POST", credentials: "same-origin",
-    headers: { "Content-Type": "application/json" }, body: JSON.stringify(arg.body),
-  })).json(), { p, body });
+  if (p.indexOf("/api/auth/") === 0) {
+    return page.evaluate(async (arg) => (await fetch(arg.p, {
+      method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/json" }, body: JSON.stringify(arg.body),
+    })).json(), { p, body });
+  }
+  return page.evaluate(
+    (arg) => window.hsFixture.auto(arg.p, arg.body), { p, body });
 }
 
 async function apiGet(page, p) {
@@ -378,9 +404,10 @@ async function checkViewport(browser, viewport) {
     viewport: { width: viewport.width, height: viewport.height },
   });
   const page = await context.newPage();
+  await installContextFixture(page);
   const errors = [];
   page.on("pageerror", (e) => errors.push(`[pageerror] ${e.message}`));
-  page.on("console", (m) => { if (m.type() === "error") errors.push(`[console] ${m.text()}`); });
+  page.on("console", (m) => { if (m.type() === "error") errors.push(`[console] ${m.text()}`) });
   // The app enforces a strict script-src 'self' CSP, which blocks
   // page.addScriptTag({path}) (it inlines the file as a <script> body) --
   // serve axe-core from a same-origin URL instead so the injected <script
@@ -447,10 +474,7 @@ async function checkViewport(browser, viewport) {
     }
 
     await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
+      const post = (p, b) => window.hsFixture.auto(p, b);
       await post("/api/v2/setup/program", { name: "Riverside Hockey", country: "US" });
     });
     await page.goto(base, { waitUntil: "domcontentloaded" });
@@ -516,15 +540,14 @@ async function checkViewport(browser, viewport) {
     // (4) Build league/season/team via the documented API and confirm the
     // card advances to "teams" done / "participation" next.
     const ids = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
+      const post = (p, b) => window.hsFixture.auto(p, b);
       const overview = await (await fetch("/api/v2/setup/overview",
         { credentials: "same-origin" })).json();
       const program = overview.programs[0];
+      await window.hsFixture.selectPersistedProgram("program-axis Season create under program", program.id);
       const season = await post("/api/v2/setup/season",
         { program_id: program.id, name: "Fall 2026" });
+      await window.hsFixture.selectPersistedProgramSeason("season-owned League create into season", program.id, season.id);
       const league = await post("/api/v2/setup/league",
         { season_id: season.id, name: "Adult League" });
       const club = await post("/api/v2/setup/club", { name: "Club" });
@@ -1060,9 +1083,25 @@ async function checkRoleScenarios(browser, viewport) {
     viewport: { width: viewport.width, height: viewport.height },
   });
   const page = await context.newPage();
+  await installContextFixture(page);
   const errors = [];
   page.on("pageerror", (e) => errors.push(`[pageerror] ${e.message}`));
-  page.on("console", (m) => { if (m.type() === "error") errors.push(`[console] ${m.text()}`); });
+  page.on("console", (m) => { if (m.type() === "error") errors.push(`[console] ${m.text()}`) });
+  // Chromium's console entry for a failed request is the bare, useless
+  // "Failed to load resource: the server responded with a status of 404 (Not
+  // Found)" -- it names neither the URL nor the method, so a stray request
+  // could not be identified at all from the failure text. Record the real
+  // responses alongside it and print them with the errors.
+  const httpFailures = [];
+  page.on("response", (r) => {
+    if (r.status() >= 400) {
+      httpFailures.push(`${r.status()} ${r.request().method()} ${r.url()}`);
+    }
+  });
+  const errorReport = () => errors.join("\n")
+    + (httpFailures.length
+      ? `\n--- non-2xx responses seen on this page ---\n${httpFailures.join("\n")}`
+      : "");
   const axeSource = fs.readFileSync(AXE_PATH, "utf8");
   await page.route("**/__axe-core__.js", (route) => route.fulfill({
     status: 200, contentType: "application/javascript", body: axeSource,
@@ -1100,13 +1139,12 @@ async function checkRoleScenarios(browser, viewport) {
     // does (register then remove), leaving BOTH Team A and Team B open in
     // s2's own "Register" row.
     const a = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
+      const post = (p, b) => window.hsFixture.auto(p, b);
       const program = await post("/api/v2/setup/program",
         { name: "Round3F2 Program", country: "US" });
+      await window.hsFixture.selectPersistedProgram("program-axis Season create under program", program.id);
       const s1 = await post("/api/v2/setup/season", { program_id: program.id, name: "S1" });
+      await window.hsFixture.selectPersistedProgramSeason("season-owned League create into s1", program.id, s1.id);
       const league = await post("/api/v2/setup/league", { season_id: s1.id, name: "Shared League" });
       const club = await post("/api/v2/setup/club", { name: "Club" });
       // #367 prereq: a Team's League must belong to the ACTIVE Program;
@@ -1118,6 +1156,7 @@ async function checkRoleScenarios(browser, viewport) {
         { league_id: league.id, club_id: club.id, name: "Team B" });
       const regA = await post(`/api/v2/setup/seasons/${s1.id}/team-registrations`,
         { team_id: teamA.id, league_id: league.id, division_id: null });
+      await window.hsFixture.selectPersistedProgram("program-axis Season create under program", program.id);
       const s2 = await post("/api/v2/setup/season", { program_id: program.id, name: "S2" });
       // The bootstrap registration lives in S2, and removing it targets a row
       // whose Season is S2 -- Season is a real authorization axis now (#369
@@ -1284,8 +1323,13 @@ async function checkRoleScenarios(browser, viewport) {
     // not handed out as an enabled "Register Team" CTA that
     // focusParticipationRegisterControl() cannot bind/focus without an
     // exact selected Season.
+    // PROGRAM-AXIS Season create under Program B: persist the Program-only
+    // choice first (#409).
+    await selectPersistedProgram(page, "B2/program", b.id);
     const b2Season = await apiPost(page, "/api/v2/setup/season",
       { program_id: b.id, name: "Fall" });
+    // SEASON-OWNED League create: both axes, written into b2Season.
+    await selectPersistedProgramSeason(page, "B2/program+season", b.id, b2Season.id);
     const b2League = await apiPost(page, "/api/v2/setup/league",
       { season_id: b2Season.id, name: "League" });
     const b2Club = await apiPost(page, "/api/v2/setup/club", { name: "Club" });
@@ -1326,14 +1370,13 @@ async function checkRoleScenarios(browser, viewport) {
     // SETUP-only surface they cannot use before this fix. Both keep the one
     // "Go to Schedule" primary action regardless of role.
     const cIds = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
+      const post = (p, b) => window.hsFixture.auto(p, b);
       const program = await post("/api/v2/setup/program",
         { name: "Round3F5 Program", country: "US" });
+      await window.hsFixture.selectPersistedProgram("program-axis Season create under program", program.id);
       const season = await post("/api/v2/setup/season",
         { program_id: program.id, name: "Fall" });
+      await window.hsFixture.selectPersistedProgramSeason("season-owned League create into season", program.id, season.id);
       const league = await post("/api/v2/setup/league",
         { season_id: season.id, name: "League" });
       const club = await post("/api/v2/setup/club", { name: "Club" });
@@ -1459,16 +1502,15 @@ async function checkRoleScenarios(browser, viewport) {
     await logout(page);
     await loginAs(page, "admin", "demo");
     const d = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
+      const post = (p, b) => window.hsFixture.auto(p, b);
       // Program A: built out fully so its League/Team/Season are all
       // plausible (and, pre-fix, actual) wrong defaults.
       const progA = await post("/api/v2/setup/program",
         { name: "Round5F4 Program A", country: "US" });
+      await window.hsFixture.selectPersistedProgram("program-axis Season create under progA", progA.id);
       const seasonA = await post("/api/v2/setup/season",
         { program_id: progA.id, name: "Season A" });
+      await window.hsFixture.selectPersistedProgramSeason("season-owned League create into seasonA", progA.id, seasonA.id);
       const leagueA = await post("/api/v2/setup/league",
         { season_id: seasonA.id, name: "League A" });
       const clubA = await post("/api/v2/setup/club", { name: "Club A" });
@@ -1617,20 +1659,21 @@ async function checkRoleScenarios(browser, viewport) {
     await logout(page);
     await loginAs(page, "admin", "demo");
     const e = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
+      const post = (p, b) => window.hsFixture.auto(p, b);
       const progE1 = await post("/api/v2/setup/program",
         { name: "Round6 Program E1", country: "US" });
+      await window.hsFixture.selectPersistedProgram("program-axis Season create under progE1", progE1.id);
       const seasonE1 = await post("/api/v2/setup/season",
         { program_id: progE1.id, name: "Season E1" });
+      await window.hsFixture.selectPersistedProgramSeason("season-owned League create into seasonE1", progE1.id, seasonE1.id);
       const leagueE1 = await post("/api/v2/setup/league",
         { season_id: seasonE1.id, name: "League E1" });
       const progE2 = await post("/api/v2/setup/program",
         { name: "Round6 Program E2", country: "US" });
+      await window.hsFixture.selectPersistedProgram("program-axis Season create under progE2", progE2.id);
       const seasonE2 = await post("/api/v2/setup/season",
         { program_id: progE2.id, name: "Season E2" });
+      await window.hsFixture.selectPersistedProgramSeason("season-owned League create into seasonE2", progE2.id, seasonE2.id);
       const leagueE2 = await post("/api/v2/setup/league",
         { season_id: seasonE2.id, name: "League E2" });
       return { progE1: progE1.id, leagueE1: leagueE1.id,
@@ -1808,14 +1851,13 @@ async function checkRoleScenarios(browser, viewport) {
       null, { timeout: 10000 });
     await freshLoad();
     const e3 = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
+      const post = (p, b) => window.hsFixture.auto(p, b);
       const progE3 = await post("/api/v2/setup/program",
         { name: "Round6 Program E3", country: "US" });
+      await window.hsFixture.selectPersistedProgram("program-axis Season create under progE3", progE3.id);
       const seasonE3 = await post("/api/v2/setup/season",
         { program_id: progE3.id, name: "Season E3" });
+      await window.hsFixture.selectPersistedProgramSeason("season-owned League create into seasonE3", progE3.id, seasonE3.id);
       const leagueE3 = await post("/api/v2/setup/league",
         { season_id: seasonE3.id, name: "League E3" });
       return { progE3: progE3.id, leagueE3: leagueE3.id };
@@ -1899,18 +1941,17 @@ async function checkRoleScenarios(browser, viewport) {
     await logout(page);
     await loginAs(page, "admin", "demo");
     const f = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
+      const post = (p, b) => window.hsFixture.auto(p, b);
       // Program F1: driven fully complete (same recipe as step C above) so
       // its Home/Tasks card genuinely offers the real complete-card
       // "Import data" action this scenario must click through, not a
       // shortcut via the separate always-on Import nav tab.
       const progF1 = await post("/api/v2/setup/program",
         { name: "Round7F1 Program", country: "US" });
+      await window.hsFixture.selectPersistedProgram("program-axis Season create under progF1", progF1.id);
       const seasonF1 = await post("/api/v2/setup/season",
         { program_id: progF1.id, name: "Season F1" });
+      await window.hsFixture.selectPersistedProgramSeason("season-owned League create into seasonF1", progF1.id, seasonF1.id);
       const leagueF1 = await post("/api/v2/setup/league",
         { season_id: seasonF1.id, name: "League F1" });
       const clubF1 = await post("/api/v2/setup/club", { name: "Club F1" });
@@ -1935,6 +1976,7 @@ async function checkRoleScenarios(browser, viewport) {
       // Program F2: just needs its own Season to import into.
       const progF2 = await post("/api/v2/setup/program",
         { name: "Round7F2 Program", country: "US" });
+      await window.hsFixture.selectPersistedProgram("program-axis Season create under progF2", progF2.id);
       const seasonF2 = await post("/api/v2/setup/season",
         { program_id: progF2.id, name: "Season F2" });
       return { progF1: progF1.id, seasonF1: seasonF1.id,
@@ -2101,10 +2143,7 @@ async function checkRoleScenarios(browser, viewport) {
     // never touched them, so a live A preview/commit could target A's
     // Season under a B context header.
     const g = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
+      const post = (p, b) => window.hsFixture.auto(p, b);
       // Explicit Season dates (#158's own generation range requirement) --
       // the builder's form leaves start_date/end_date blank, meaning to
       // fall back to the Season's own range; a Season created with no
@@ -2120,6 +2159,7 @@ async function checkRoleScenarios(browser, viewport) {
         { credentials: "same-origin" })).json();
       const progG1 = await post("/api/v2/setup/program",
         { name: "Round7G1 Program", country: "US" });
+      await window.hsFixture.selectPersistedProgram("program-axis Season create under progG1", progG1.id);
       const seasonG1 = await post("/api/v2/setup/season", { program_id: progG1.id,
         name: "Season G1", start_date: "2026-09-01", end_date: "2027-03-31" });
       const venueG1 = await post("/api/v2/setup/venue",
@@ -2139,6 +2179,7 @@ async function checkRoleScenarios(browser, viewport) {
       }
       const progG2 = await post("/api/v2/setup/program",
         { name: "Round7G2 Program", country: "US" });
+      await window.hsFixture.selectPersistedProgram("program-axis Season create under progG2", progG2.id);
       const seasonG2 = await post("/api/v2/setup/season", { program_id: progG2.id,
         name: "Season G2", start_date: "2026-09-01", end_date: "2027-03-31" });
       const venueG2 = await post("/api/v2/setup/venue",
@@ -2242,14 +2283,13 @@ async function checkRoleScenarios(browser, viewport) {
     // stale seed win. Proven with BOTH possible response orders, since
     // neither may open a drawer with H1's seed once H2 was even attempted.
     const h = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
+      const post = (p, b) => window.hsFixture.auto(p, b);
       const progH1 = await post("/api/v2/setup/program",
         { name: "Round8H1 Program", country: "US" });
+      await window.hsFixture.selectPersistedProgram("program-axis Season create under progH1", progH1.id);
       const seasonH1 = await post("/api/v2/setup/season",
         { program_id: progH1.id, name: "Season H1" });
+      await window.hsFixture.selectPersistedProgramSeason("season-owned League create into seasonH1", progH1.id, seasonH1.id);
       const leagueH1 = await post("/api/v2/setup/league",
         { season_id: seasonH1.id, name: "League H1" });
       const progH2 = await post("/api/v2/setup/program",
@@ -2379,30 +2419,32 @@ async function checkRoleScenarios(browser, viewport) {
     // selectable #ctx-select option when needed (same requirement (I)'s
     // own comment documents for H2 above).
     const j = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
+      const post = (p, b) => window.hsFixture.auto(p, b);
       const progJ1 = await post("/api/v2/setup/program",
         { name: "Round8J1 Program", country: "US" });
+      await window.hsFixture.selectPersistedProgram("program-axis Season create under progJ1", progJ1.id);
       const seasonJ1 = await post("/api/v2/setup/season",
         { program_id: progJ1.id, name: "Season J1" });
       const progJ2 = await post("/api/v2/setup/program",
         { name: "Round8J2 Program", country: "US" });
+      await window.hsFixture.selectPersistedProgram("program-axis Season create under progJ2", progJ2.id);
       const seasonJ2 = await post("/api/v2/setup/season",
         { program_id: progJ2.id, name: "Season J2" });
       const progJ3 = await post("/api/v2/setup/program",
         { name: "Round9J3 Program", country: "US" });
+      await window.hsFixture.selectPersistedProgram("program-axis Season create under progJ3", progJ3.id);
       const seasonJ3 = await post("/api/v2/setup/season",
         { program_id: progJ3.id, name: "Season J3" });
       // J4/J5 are for (J3)'s own straggling-COMMIT-response coverage
       // further down -- same pre-existence requirement as J3 above.
       const progJ4 = await post("/api/v2/setup/program",
         { name: "Round9J4 Program", country: "US" });
+      await window.hsFixture.selectPersistedProgram("program-axis Season create under progJ4", progJ4.id);
       const seasonJ4 = await post("/api/v2/setup/season",
         { program_id: progJ4.id, name: "Season J4" });
       const progJ5 = await post("/api/v2/setup/program",
         { name: "Round9J5 Program", country: "US" });
+      await window.hsFixture.selectPersistedProgram("program-axis Season create under progJ5", progJ5.id);
       const seasonJ5 = await post("/api/v2/setup/season",
         { program_id: progJ5.id, name: "Season J5" });
       return { progJ1: progJ1.id, seasonJ1: seasonJ1.id,
@@ -2550,6 +2592,9 @@ async function checkRoleScenarios(browser, viewport) {
     await page.route("**/api/import/commit/teams-players", async (route) => {
       await commitHoldJ4; await route.continue();
     });
+    const j4CommitResp = page.waitForResponse((r) =>
+      r.url() === `${base}/api/import/commit/teams-players`
+      && r.request().method() === "POST", { timeout: 20000 });
     await page.click("[data-import-commit]");
     await new Promise((r) => setTimeout(r, 200));  // let the stale Commit request actually leave
     const switchToJ5 = `${j.progJ5}|${j.seasonJ5}`;
@@ -2563,8 +2608,45 @@ async function checkRoleScenarios(browser, viewport) {
       absentSelectors: [".import-report"],
     });
     releaseCommitJ4();
+    const j4Commit = await j4CommitResp;
+    const j4CommitBody = await j4Commit.json().catch(() => null);
     await page.unroute("**/api/import/commit/teams-players");
     await new Promise((r) => setTimeout(r, 300));  // let the stale response's own (discarded) handler run
+    // #409: the SERVER now refuses this straggling commit as well, and that
+    // is the point of the gate — an Import commit is judged against the
+    // caller's PERSISTED selection at its own locked commit boundary, so a
+    // request whose Season the operator has already left no longer lands.
+    // The comment above still holds for what the CLIENT must do with the
+    // response; this asserts the write itself never happened in J4 either.
+    // Measured: 404 {"code":"not_found","message":"Season <J4> not found."} —
+    // the same generic not-found a foreign Season gets, so the refusal
+    // discloses nothing about which Seasons exist.
+    if (j4Commit.status() === 200) {
+      fail("(J3) expected the straggling Commit for the DEPARTED Season J4 "
+        + `to be refused once J5 was selected, got 200 ${JSON.stringify(j4CommitBody)}`);
+    }
+    if (!j4CommitBody || !j4CommitBody.error
+        || j4CommitBody.error.code !== "not_found"
+        || !String(j4CommitBody.error.message).includes(j.seasonJ4)) {
+      fail("(J3) expected the departed-Season Commit refusal to be the "
+        + `generic not-found naming ${j.seasonJ4}, got `
+        + `${j4Commit.status()} ${JSON.stringify(j4CommitBody)}`);
+    }
+    // That deliberate refusal logs exactly one benign Chromium resource
+    // error. Consume THAT one and leave every other error standing — the
+    // console message can lag its own response, so wait for it rather than
+    // reading the list once and racing it.
+    const j4ErrDeadline = Date.now() + 5000;
+    let j4ErrIndex = errors.findIndex((e) => /status of 404/.test(e));
+    while (j4ErrIndex === -1 && Date.now() < j4ErrDeadline) {
+      await new Promise((r) => setTimeout(r, 50));
+      j4ErrIndex = errors.findIndex((e) => /status of 404/.test(e));
+    }
+    if (j4ErrIndex === -1) {
+      fail("(J3) expected the refused straggling Commit to log one 404 "
+        + `resource error, got:\n${errorReport()}`);
+    }
+    errors.splice(j4ErrIndex, 1);
     if (await page.$(".import-report")) {
       fail("(J3) expected a Commit response straggling in after the "
         + "switch to J5 fully settled to NOT paint a result banner there");
@@ -2828,12 +2910,10 @@ async function checkRoleScenarios(browser, viewport) {
     // importSeason.onchange's own importOperationSeq bump, which the
     // single-option ceiling now makes unreachable from the UI.
     const jSeasonSwitch = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
+      const post = (p, b) => window.hsFixture.auto(p, b);
       const progJSS = await post("/api/v2/setup/program",
         { name: "Round11JSS Program", country: "US" });
+      await window.hsFixture.selectPersistedProgram("program-axis Season create under progJSS", progJSS.id);
       const seasonJSSA = await post("/api/v2/setup/season",
         { program_id: progJSS.id, name: "Season JSS-A" });
       const seasonJSSB = await post("/api/v2/setup/season",
@@ -2940,12 +3020,10 @@ async function checkRoleScenarios(browser, viewport) {
     // correctly rejected by the backend, which would read here as "no
     // [data-ib-commit]" for an unrelated reason.
     const k = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
+      const post = (p, b) => window.hsFixture.auto(p, b);
       const progK1 = await post("/api/v2/setup/program",
         { name: "Round8K1 Program", country: "US" });
+      await window.hsFixture.selectPersistedProgram("program-axis Season create under progK1", progK1.id);
       const seasonK1 = await post("/api/v2/setup/season", { program_id: progK1.id,
         name: "Season K1", start_date: "2026-09-01", end_date: "2027-03-31" });
       const venueK1 = await post("/api/v2/setup/venue",
@@ -2961,6 +3039,7 @@ async function checkRoleScenarios(browser, viewport) {
         { venue_id: venueK1.id });
       const progK2 = await post("/api/v2/setup/program",
         { name: "Round8K2 Program", country: "US" });
+      await window.hsFixture.selectPersistedProgram("program-axis Season create under progK2", progK2.id);
       const seasonK2 = await post("/api/v2/setup/season", { program_id: progK2.id,
         name: "Season K2", start_date: "2026-09-01", end_date: "2027-03-31" });
       // K3 is for (K2)'s own straggling-response coverage further down --
@@ -2969,6 +3048,7 @@ async function checkRoleScenarios(browser, viewport) {
       // requirement (I)'s own comment documents for H2 above).
       const progK3 = await post("/api/v2/setup/program",
         { name: "Round9K3 Program", country: "US" });
+      await window.hsFixture.selectPersistedProgram("program-axis Season create under progK3", progK3.id);
       const seasonK3 = await post("/api/v2/setup/season", { program_id: progK3.id,
         name: "Season K3", start_date: "2026-09-01", end_date: "2027-03-31" });
       const venueK3 = await post("/api/v2/setup/venue",
@@ -2984,6 +3064,7 @@ async function checkRoleScenarios(browser, viewport) {
       // further down -- same pre-existence requirement as K3 above.
       const progK4 = await post("/api/v2/setup/program",
         { name: "Round9K4 Program", country: "US" });
+      await window.hsFixture.selectPersistedProgram("program-axis Season create under progK4", progK4.id);
       const seasonK4 = await post("/api/v2/setup/season", { program_id: progK4.id,
         name: "Season K4", start_date: "2026-09-01", end_date: "2027-03-31" });
       const venueK4 = await post("/api/v2/setup/venue",
@@ -2997,6 +3078,7 @@ async function checkRoleScenarios(browser, viewport) {
         { venue_id: venueK4.id });
       const progK5 = await post("/api/v2/setup/program",
         { name: "Round9K5 Program", country: "US" });
+      await window.hsFixture.selectPersistedProgram("program-axis Season create under progK5", progK5.id);
       const seasonK5 = await post("/api/v2/setup/season", { program_id: progK5.id,
         name: "Season K5", start_date: "2026-09-01", end_date: "2027-03-31" });
       const venueK5 = await post("/api/v2/setup/venue",
@@ -3425,10 +3507,7 @@ async function checkRoleScenarios(browser, viewport) {
     // it would show 0 creatable slots (a permanently-disabled Commit button)
     // regardless of anything this case is actually testing.
     const kRp = await page.evaluate(async (seasonId) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
+      const post = (p, b) => window.hsFixture.auto(p, b);
       const venueKRp = await post("/api/v2/setup/venue", { name: "VKRp", organization_id: null });
       const rinkKRp = await post("/api/v2/setup/rink", { venue_id: venueKRp.id, name: "RKRp" });
       await post(`/api/v2/setup/seasons/${seasonId}/venue-access`, { venue_id: venueKRp.id });
@@ -3659,10 +3738,7 @@ async function checkRoleScenarios(browser, viewport) {
     // client-side or URL-hash artifact) -- plus a failure-convergence case
     // for when the one request that IS sent comes back rejected.
     const l = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
+      const post = (p, b) => window.hsFixture.auto(p, b);
       const progL1 = await post("/api/v2/setup/program", { name: "Round9L1 Program", country: "US" });
       const progL2 = await post("/api/v2/setup/program", { name: "Round9L2 Program", country: "US" });
       const progL3 = await post("/api/v2/setup/program", { name: "Round9L3 Program", country: "US" });
@@ -3827,10 +3903,7 @@ async function checkRoleScenarios(browser, viewport) {
     // server and hash already agree before the rejected attempt even
     // starts.
     const lh = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
+      const post = (p, b) => window.hsFixture.auto(p, b);
       const progLH1 = await post("/api/v2/setup/program", { name: "Round10LH1 Program", country: "US" });
       const progLH2 = await post("/api/v2/setup/program", { name: "Round10LH2 Program", country: "US" });
       const progLH3 = await post("/api/v2/setup/program", { name: "Round10LH3 Program", country: "US" });
@@ -3951,10 +4024,7 @@ async function checkRoleScenarios(browser, viewport) {
     // sendContextSwitch()'s own dequeue would fire it as if the NEW
     // identity had asked for it.
     const li = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
+      const post = (p, b) => window.hsFixture.auto(p, b);
       const progLI1 = await post("/api/v2/setup/program", { name: "Round9LI1 Program", country: "US" });
       const progLI2 = await post("/api/v2/setup/program", { name: "Round9LI2 Program", country: "US" });
       const progLI3 = await post("/api/v2/setup/program", { name: "Round9LI3 Program", country: "US" });
@@ -4042,12 +4112,10 @@ async function checkRoleScenarios(browser, viewport) {
     // proves resetTransientUiState() itself works, never that a role with
     // no business seeing this could not reach it some other way.
     const m = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
+      const post = (p, b) => window.hsFixture.auto(p, b);
       const progM1 = await post("/api/v2/setup/program",
         { name: "Round8M1 Program", country: "US" });
+      await window.hsFixture.selectPersistedProgram("program-axis Season create under progM1", progM1.id);
       const seasonM1 = await post("/api/v2/setup/season", { program_id: progM1.id,
         name: "Season M1", start_date: "2026-09-01", end_date: "2027-03-31" });
       const venueM1 = await post("/api/v2/setup/venue",
@@ -4256,7 +4324,7 @@ async function checkRoleScenarios(browser, viewport) {
     await loginAs(page, "admin", "demo");
 
     if (errors.length) {
-      fail(`console/page errors:\n${errors.join("\n")}`);
+      fail(`console/page errors:\n${errorReport()}`);
     }
     console.log(`[${viewport.label}] OK — Register Team stays scoped to the `
       + `focused Season even when another Season shares its League, Arena `
@@ -4306,9 +4374,10 @@ async function checkImportLeagueConflict(browser, viewport) {
     viewport: { width: viewport.width, height: viewport.height },
   });
   const page = await context.newPage();
+  await installContextFixture(page);
   const errors = [];
   page.on("pageerror", (e) => errors.push(`[pageerror] ${e.message}`));
-  page.on("console", (m) => { if (m.type() === "error") errors.push(`[console] ${m.text()}`); });
+  page.on("console", (m) => { if (m.type() === "error") errors.push(`[console] ${m.text()}`) });
 
   const fail = (msg) => { throw new Error(`[${viewport.label}] ${msg}`); };
 
@@ -4321,26 +4390,37 @@ async function checkImportLeagueConflict(browser, viewport) {
     // permanent League, then a third Season with neither League bound yet
     // -- the exact same-upload conflict shape the new backend gate rejects.
     const seed = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
+      const post = (p, b) => window.hsFixture.auto(p, b);
       const program = await post("/api/v2/setup/program",
         { name: "Import Conflict Program", country: "US" });
+      await window.hsFixture.selectPersistedProgram("program-axis Season create under program", program.id);
       const seasonX = await post("/api/v2/setup/season", { program_id: program.id,
         name: "Season X", start_date: "2026-09-01", end_date: "2027-03-31" });
+      await window.hsFixture.selectPersistedProgramSeason("season-owned League create into seasonX", program.id, seasonX.id);
       const leagueX = await post("/api/v2/setup/league",
         { season_id: seasonX.id, name: "League X" });
+      await window.hsFixture.selectPersistedProgram("program-axis Season create under program", program.id);
       const seasonY = await post("/api/v2/setup/season", { program_id: program.id,
         name: "Season Y", start_date: "2026-09-01", end_date: "2027-03-31" });
+      await window.hsFixture.selectPersistedProgramSeason("season-owned League create into seasonY", program.id, seasonY.id);
       const leagueY = await post("/api/v2/setup/league",
         { season_id: seasonY.id, name: "League Y" });
+      await window.hsFixture.selectPersistedProgramSeason("import writes into seasonX", program.id, seasonX.id);
       await post("/api/import/commit/teams-players", { season_id: seasonX.id,
         teams_csv: "team_code,team_name\nCONFX,Team X\n" });
+      await window.hsFixture.selectPersistedProgramSeason("import writes into seasonY", program.id, seasonY.id);
       await post("/api/import/commit/teams-players", { season_id: seasonY.id,
         teams_csv: "team_code,team_name\nCONFY,Team Y\n" });
+      await window.hsFixture.selectPersistedProgram("program-axis Season create under program", program.id);
       const seasonZ = await post("/api/v2/setup/season", { program_id: program.id,
         name: "Season Z", start_date: "2026-09-01", end_date: "2027-03-31" });
+      // Season Z is the Season this journey then drives the Import panel
+      // against, and that panel opens on the ACTIVE Season -- so the block
+      // must not end on the Program-only selection the Season CREATE needed.
+      // Leaving it there left `#import-season` on some other Season and the
+      // wait below timed out with nothing to say why.
+      await window.hsFixture.selectPersistedProgramSeason(
+        "the Import panel opens on seasonZ", program.id, seasonZ.id);
       return { seasonZ: seasonZ.id };
     });
 
@@ -4425,9 +4505,10 @@ async function checkImportAmbiguousDivisionRejection(browser, viewport) {
     viewport: { width: viewport.width, height: viewport.height },
   });
   const page = await context.newPage();
+  await installContextFixture(page);
   const errors = [];
   page.on("pageerror", (e) => errors.push(`[pageerror] ${e.message}`));
-  page.on("console", (m) => { if (m.type() === "error") errors.push(`[console] ${m.text()}`); });
+  page.on("console", (m) => { if (m.type() === "error") errors.push(`[console] ${m.text()}`) });
 
   const fail = (msg) => { throw new Error(`[${viewport.label}] ${msg}`); };
 
@@ -4440,14 +4521,13 @@ async function checkImportAmbiguousDivisionRejection(browser, viewport) {
     // under each -- a real, supported topology (Division creation enforces
     // no name-uniqueness constraint).
     const seed = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
+      const post = (p, b) => window.hsFixture.auto(p, b);
       const program = await post("/api/v2/setup/program",
         { name: "Ambiguous Division Program", country: "US" });
+      await window.hsFixture.selectPersistedProgram("program-axis Season create under program", program.id);
       const season = await post("/api/v2/setup/season", { program_id: program.id,
         name: "Ambiguous Season", start_date: "2026-09-01", end_date: "2027-03-31" });
+      await window.hsFixture.selectPersistedProgramSeason("season-owned League create into season", program.id, season.id);
       const leagueA = await post("/api/v2/setup/league",
         { season_id: season.id, name: "Ambiguous League A" });
       const leagueB = await post("/api/v2/setup/league",

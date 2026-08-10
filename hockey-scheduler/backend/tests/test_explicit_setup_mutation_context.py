@@ -268,6 +268,18 @@ class _ContextHarness:
         self.assertEqual(status, 200, f"create Program B: {raw}")
         program_b = body["id"]
 
+        # ORACLE MIGRATION (#409, owner ruling 2026-08-10). The persisted
+        # ActiveContext row is the sole Program-axis authority, so minting B
+        # does not select it and the Season create below is refused 409 without
+        # this explicit Program-only save. FIXTURE adaptation only — no
+        # behavioural, refusal, side-effect, race or parity assertion changed.
+        # The contract is proven separately in
+        # tests/test_explicit_create_context.py::_CreatorOwnershipMixin.
+        status, raw, body = self._req(
+            c, "POST", "/api/context", {"program_id": program_b})
+        self.assertEqual(status, 200, f"select Program-only B: {raw}")
+        self.assertEqual(body.get("program_id"), program_b, raw)
+
         status, raw, body = self._req(
             c, "POST", "/api/v2/setup/season",
             {"program_id": program_b, "name": "Operator B Season"})

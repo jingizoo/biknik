@@ -64,6 +64,9 @@ const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
+const {
+  installContextFixture, selectProgram, selectProgramSeason,
+} = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -417,6 +420,7 @@ async function checkViewport(browser, viewport) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
     await reachDashboard(page); // signed in as the auto-provisioned League Admin ("admin"/"demo")
 
     // ============================================================
@@ -464,7 +468,15 @@ async function checkViewport(browser, viewport) {
       fail(`program create failed: ${JSON.stringify(program)}`);
     }
     await page.goto(base, { waitUntil: "domcontentloaded" });
+    await installContextFixture(page);
     await reachDashboard(page);
+    // #409 EXPLICIT SELECTION. The Season this leg creates THROUGH THE REAL
+    // DRAWER is a PROGRAM-AXIS create, and minting the Program above did not
+    // select it — so without a persisted Program-only choice the drawer
+    // submit is refused and the "Done" assertion below would blame the
+    // keyboard path for a context that was never stated.
+    await selectProgram(page, "League Admin: Program-only selection",
+      program.body.id);
     await waitForCardSettled(page);
     let s = await cardState(page);
     if (!s || s.nextTitle !== "League profile and seasons" || s.primaryLabel !== "Add Season") {
@@ -481,15 +493,26 @@ async function checkViewport(browser, viewport) {
     // The drawer's own documented open behavior already auto-focused a
     // field inside it (a defined starting point) -- tab forward from there,
     // still entirely by keyboard, to reach the real submit control.
+    // ASSERT THE CREATE RESPONSE (#409). The drawer's own POST is captured and
+    // checked at the point it happens, so a refusal fails HERE, naming the
+    // status and body, instead of surfacing later as an absent row.
+    const seasonResp = page.waitForResponse((r) =>
+      r.url().endsWith("/api/v2/setup/season") && r.request().method() === "POST",
+      { timeout: 10000 });
     await tabToAndActivate(page, '[data-drawer-submit="season"]',
       "League Admin submit Season", { withinDialog: true, maxPresses: 20 });
+    const seasonCreated = await seasonResp;
+    const seasonBody = await seasonCreated.json().catch(() => null);
+    if (seasonCreated.status() !== 200 || !seasonBody || seasonBody.error || !seasonBody.id) {
+      fail(`League Admin: the keyboard-submitted Season drawer was refused: `
+        + `${seasonCreated.status()} ${JSON.stringify(seasonBody)}`);
+    }
+    if (seasonBody.program_id !== program.body.id) {
+      fail(`League Admin: the Season landed in a different Program than the one `
+        + `selected — selected ${program.body.id}, created under ${seasonBody.program_id}`);
+    }
     await page.waitForSelector(".drawer[role=dialog]", { state: "detached", timeout: 10000 });
-    // Read the real, persisted Season back through the API boundary (not
-    // just the card's own re-render) -- proves the mutation reached the
-    // server, not just client state.
-    const overview1 = await apiGet(page, "/api/v2/setup/overview");
-    const season = (overview1.body.seasons || []).find((sn) => sn.name === seasonName);
-    if (!season) fail(`League Admin: Season "${seasonName}" not found via GET /api/v2/setup/overview`);
+    const season = seasonBody;
 
     // ============================================================
     // Build the rest of the shared fixture (level/division/club/teams/
@@ -498,8 +521,31 @@ async function checkViewport(browser, viewport) {
     // already exercise. Every entity below is uniquely named per role so
     // no role's data can satisfy another role's assertion.
     // ============================================================
+    // #409 boundary 2: the v1 "level" IS the v2 League, and it plus the
+    // Division, the three registrations and the venue-access grant are all
+    // SEASON-OWNED and land in the Season the drawer just created. v1 is
+    // guarded identically (server.py:1160 runs the same preflight), so it is
+    // not a way around the rule.
+    await selectProgramSeason(page, "League Admin: Program+Season",
+      program.body.id, season.id);
+    // Read the real, persisted Season back through the API boundary (not just
+    // the drawer's own response) -- proves the mutation reached the server.
+    // It runs AFTER the Season is selected because `/api/v2/setup/overview` is
+    // ceilinged on the ACTIVE Season: under the Program-only selection the
+    // drawer submit legitimately required, the Season list is empty, so a
+    // read-back placed before the selection would report a Season that
+    // demonstrably exists as missing.
+    const overview1 = await apiGet(page, "/api/v2/setup/overview");
+    if (!(overview1.body.seasons || []).some((sn) => sn.id === season.id)) {
+      fail(`League Admin: Season "${seasonName}" not found via `
+        + `GET /api/v2/setup/overview under its own selected tuple: `
+        + `${JSON.stringify(overview1.body.seasons)}`);
+    }
     const level = await apiPost(page, "/api/setup/level",
       { season_id: season.id, name: `Matrix League ${suffix}` });
+    if (level.status !== 200 || level.body.error) {
+      fail(`level create failed: ${JSON.stringify(level)}`);
+    }
     // "League profile and seasons" is only Done once every Season of the
     // Program carries a grouping League (api/service.py's own league_done
     // rule) -- the keyboard-submitted Season alone isn't enough, matching
@@ -507,6 +553,7 @@ async function checkViewport(browser, viewport) {
     // first "Done" check). Confirms the keyboard-driven mutation combines
     // with the rest of the real setup flow, not just that it persisted.
     await page.goto(base, { waitUntil: "domcontentloaded" });
+    await installContextFixture(page);
     await reachDashboard(page);
     await waitForCardSettled(page);
     s = await cardState(page);
@@ -629,6 +676,7 @@ async function checkViewport(browser, viewport) {
     // live DOM on its own, not merely on the next fresh navigation.
     // ============================================================
     await page.goto(base, { waitUntil: "domcontentloaded" });
+    await installContextFixture(page);
     await reachDashboard(page);
     if (!(await page.$('.tab[data-tab="users"]'))) fail("setup precondition: Users tab not visible for League Admin");
     await page.evaluate(([u, p]) => signIn(u, p), [accounts.viewer.username, PW]);
@@ -692,6 +740,7 @@ async function checkViewport(browser, viewport) {
     // ============================================================
     await loginAs(page, accounts.arena_manager.username, PW);
     await page.goto(base, { waitUntil: "domcontentloaded" });
+    await installContextFixture(page);
     await reachDashboard(page);
     assertVisibleTabs(fail, "Arena Manager", await visibleTabs(page), [
       "dashboard", "activity", "calendar", "games", "scheduler", "standings",
@@ -715,6 +764,7 @@ async function checkViewport(browser, viewport) {
         + `"League admins only" guard, got "${amUsersBypass}"`);
     }
     await page.click('.tab[data-tab="dashboard"]');
+    await installContextFixture(page);
     await reachDashboard(page);
     // Setup is reachable (manage_arena), but only its arena-side Records
     // carry a "+ New" -- League-structure entities ("unrelated
@@ -741,6 +791,7 @@ async function checkViewport(browser, viewport) {
         + `("Venues"/"Rinks") to keep its "+ New", got ${JSON.stringify(amSetupCards)}`);
     }
     await page.click('.tab[data-tab="dashboard"]');
+    await installContextFixture(page);
     await reachDashboard(page);
     // Recurring ice creation, reached and driven entirely by real keyboard
     // Tab traversal: nav to Calendar, activate "Build ice", preview, commit
@@ -805,6 +856,7 @@ async function checkViewport(browser, viewport) {
     // ============================================================
     await loginAs(page, accounts.coach.username, PW);
     await page.goto(base, { waitUntil: "domcontentloaded" });
+    await installContextFixture(page);
     await reachDashboard(page);
     assertVisibleTabs(fail, "Coach", await visibleTabs(page), [
       "dashboard", "activity", "calendar", "games", "standings", "sheet",
@@ -834,6 +886,7 @@ async function checkViewport(browser, viewport) {
         + `controls at all, found ${coachSetupNew}`);
     }
     await page.click('.tab[data-tab="dashboard"]');
+    await installContextFixture(page);
     await reachDashboard(page);
     await assertForbiddenNoChange(page, reader, tracker, fail, "Coach",
       "/api/v2/setup/venue", { name: "Should Not Exist (coach)", organization_id: null },

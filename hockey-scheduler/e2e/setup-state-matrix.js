@@ -178,6 +178,7 @@ const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
+const { installContextFixture } = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -2414,52 +2415,60 @@ async function legConfirmReopen(page, L, fx) {
 //     League), and the completion leg would stop being about completion.
 async function seedFixtures(page, L) {
   const fx = await page.evaluate(async () => {
-    const post = async (p, b) => (await fetch(p, {
-      method: "POST", credentials: "same-origin",
-      headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-    })).json();
-    const org = await post("/api/v2/setup/organization", { name: "SM Org" });
+    const F = window.hsFixture;
+    const org = await F.create("org", "/api/v2/setup/organization", { name: "SM Org" });
 
-    const p1 = await post("/api/v2/setup/program", { name: "SM Program One", country: "US" });
-    const s1 = await post("/api/v2/setup/season", { program_id: p1.id, name: "SM Season One" });
-    // Everything after this is created from INSIDE the target Program's own
-    // context: the v2 setup writes are judged against the caller's ACTIVE
-    // Program (#367).
-    await post("/api/context", { program_id: p1.id, season_id: s1.id });
-    const l1 = await post("/api/v2/setup/league", { season_id: s1.id, name: "SM League One" });
-    const t1 = await post("/api/v2/setup/team", { league_id: l1.id, name: "SM Team One" });
-    await post("/api/v2/setup/division",
+    const p1 = await F.create("p1", "/api/v2/setup/program", { name: "SM Program One", country: "US" });
+    // #409 EXPLICIT SELECTION, boundary 1: the Season create is PROGRAM-AXIS,
+    // so the Program-only choice has to be PERSISTED BEFORE it — not after,
+    // where the raw context POST used to sit.
+    await F.selectProgram("P1 Program-only bootstrap", p1.id);
+    const s1 = await F.create("s1", "/api/v2/setup/season", { program_id: p1.id, name: "SM Season One" });
+    // BOUNDARY 2. Everything after this is created from INSIDE the target
+    // Program's own context: the v2 setup writes are judged against the
+    // caller's ACTIVE Program (#367) and, for the SEASON-OWNED ones (League,
+    // Division, registration, venue-access grant), against the saved Season
+    // too (#409).
+    await F.selectProgramSeason("P1 + Season One", p1.id, s1.id);
+    const l1 = await F.create("l1", "/api/v2/setup/league", { season_id: s1.id, name: "SM League One" });
+    const t1 = await F.create("t1", "/api/v2/setup/team", { league_id: l1.id, name: "SM Team One" });
+    await F.call("division", "/api/v2/setup/division",
       { league_id: l1.id, season_id: s1.id, name: "SM Division One" });
-    await post(`/api/v2/setup/seasons/${s1.id}/team-registrations`,
+    await F.call("team-registrations", `/api/v2/setup/seasons/${s1.id}/team-registrations`,
       { team_id: t1.id, league_id: l1.id, division_id: null });
-    await post("/api/v2/setup/player",
+    await F.call("player", "/api/v2/setup/player",
       { team_id: t1.id, name: "SM Player One", position: "forward" });
-    const v1 = await post("/api/v2/setup/venue",
+    const v1 = await F.create("v1", "/api/v2/setup/venue",
       { name: "SM Venue One", organization_id: org.id });
-    const r1 = await post("/api/v2/setup/rink", { venue_id: v1.id, name: "SM Rink One" });
-    await post(`/api/v2/setup/seasons/${s1.id}/venue-access`, { venue_id: v1.id });
-    const slot = await post("/api/v2/setup/ice-slot", { rink_id: r1.id,
+    const r1 = await F.create("r1", "/api/v2/setup/rink", { venue_id: v1.id, name: "SM Rink One" });
+    await F.call("venue-access", `/api/v2/setup/seasons/${s1.id}/venue-access`, { venue_id: v1.id });
+    const slot = await F.create("slot", "/api/v2/setup/ice-slot", { rink_id: r1.id,
       start_time: "2026-09-01T18:30:00+00:00",
       end_time: "2026-09-01T20:00:00+00:00", slot_type: "game" });
 
-    const p2 = await post("/api/v2/setup/program", { name: "SM Program Two", country: "US" });
-    const s2 = await post("/api/v2/setup/season", { program_id: p2.id, name: "SM Season Two" });
+    const p2 = await F.create("p2", "/api/v2/setup/program", { name: "SM Program Two", country: "US" });
+    // P2's Season is PROGRAM-AXIS against P2, so the saved Program moves to
+    // P2 first. P2 is deliberately left otherwise empty.
+    await F.selectProgram("P2 Program-only bootstrap", p2.id);
+    const s2 = await F.create("s2", "/api/v2/setup/season", { program_id: p2.id, name: "SM Season Two" });
 
-    const p3 = await post("/api/v2/setup/program", { name: "SM Program Three", country: "US" });
-    const s3 = await post("/api/v2/setup/season", { program_id: p3.id, name: "SM Season Three" });
-    await post("/api/context", { program_id: p3.id, season_id: s3.id });
-    const l3 = await post("/api/v2/setup/league", { season_id: s3.id, name: "SM League Three" });
-    await post("/api/v2/setup/team", { league_id: l3.id, name: "SM Team Three" });
-    await post("/api/v2/setup/division",
+    const p3 = await F.create("p3", "/api/v2/setup/program", { name: "SM Program Three", country: "US" });
+    await F.selectProgram("P3 Program-only bootstrap", p3.id);
+    const s3 = await F.create("s3", "/api/v2/setup/season", { program_id: p3.id, name: "SM Season Three" });
+    await F.selectProgramSeason("P3 + Season Three", p3.id, s3.id);
+    const l3 = await F.create("l3", "/api/v2/setup/league", { season_id: s3.id, name: "SM League Three" });
+    await F.call("team", "/api/v2/setup/team", { league_id: l3.id, name: "SM Team Three" });
+    await F.call("division", "/api/v2/setup/division",
       { league_id: l3.id, season_id: s3.id, name: "SM Division Three" });
-    const v3 = await post("/api/v2/setup/venue",
+    const v3 = await F.create("v3", "/api/v2/setup/venue",
       { name: "SM Venue Three", organization_id: org.id });
-    await post("/api/v2/setup/rink", { venue_id: v3.id, name: "SM Rink Three" });
-    await post(`/api/v2/setup/seasons/${s3.id}/venue-access`, { venue_id: v3.id });
-    const archived = await post(`/api/v2/setup/seasons/${s3.id}/archive`,
+    await F.call("rink", "/api/v2/setup/rink", { venue_id: v3.id, name: "SM Rink Three" });
+    await F.call("venue-access", `/api/v2/setup/seasons/${s3.id}/venue-access`, { venue_id: v3.id });
+    const archived = await F.create("archived", `/api/v2/setup/seasons/${s3.id}/archive`,
       { reason: "setup state matrix fixture" });
 
-    await post("/api/context", { program_id: p1.id, season_id: s1.id });
+    // Leave the fixture where the matrix below expects to start.
+    await F.selectProgramSeason("back to P1 + Season One", p1.id, s1.id);
     return { org: org.id, p1: p1.id, s1: s1.id, l1: l1.id, v1: v1.id, r1: r1.id,
              slot: slot && slot.id, p2: p2.id, s2: s2.id,
              p3: p3.id, s3: s3.id, archived: !!archived && !archived.error };
@@ -2593,9 +2602,11 @@ async function checkViewport(browser, viewport) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 15000 });
+    await installContextFixture(page);
     await loginAs(page, "admin", "demo");
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 15000 });
+    await installContextFixture(page);
 
     // ---- (1) EMPTY, on the pristine zero-Program installation. This has to
     //      run BEFORE anything is created; it is the one state that is only
@@ -2606,8 +2617,18 @@ async function checkViewport(browser, viewport) {
     // ---- fixtures, then everything that needs data.
     trace(`[${L}] fixtures`);
     const fx = await seedFixtures(page, L);
+    // #409: the fixture's last act is an explicit context selection, and that
+    // selection runs through `setActiveContext` — the app's own switch
+    // pipeline — so it legitimately starts a render. Let that render finish
+    // before reloading: this journey's whole contract is that nothing is ever
+    // sampled under one, and a reload issued mid-render would abort its reads
+    // into `requestfailed` entries the next leg would have to explain. The
+    // raw `POST /api/context` this replaced never re-rendered at all, which
+    // is precisely why the client could end up believing a stale tuple.
+    await quiesce(page, `${L}/fixtures`);
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 15000 });
+    await installContextFixture(page);
 
     trace(`[${L}] 2: SUCCESS / complete`);
     await legSuccessComplete(page, L, fx);

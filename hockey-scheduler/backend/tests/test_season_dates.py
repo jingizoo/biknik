@@ -269,12 +269,25 @@ class SeasonDateHttpTest(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read() or b"{}")
 
+    def _select(self, opener, program_id):
+        """Save the EXPLICIT Program-only selection a Season create requires.
+
+        Creating a Program does not select it (#409), and a Season create
+        consumes the Program axis, so without this the create below is refused
+        with 409 ``active_context_required`` before its date parsing is ever
+        reached — which would make these parser assertions unreachable rather
+        than wrong."""
+        s, body = self._req(opener, "POST", "/api/context",
+                            {"program_id": program_id})
+        self.assertEqual(s, 200, body)
+
     def test_date_only_season_create_over_the_wire(self):
         # Manual setup and canonical import share this v2 route → same parser.
         c = self._admin()
         _s, prog = self._req(c, "POST", "/api/v2/setup/program",
                              {"name": "HTTP Prog", "country": "US",
                               "timezone": "America/New_York"})
+        self._select(c, prog["id"])
         s, season = self._req(c, "POST", "/api/v2/setup/season",
                               {"program_id": prog["id"], "name": "2026-27",
                                "start_date": "2026-09-15", "end_date": "2027-03-15"})
@@ -286,6 +299,7 @@ class SeasonDateHttpTest(unittest.TestCase):
         c = self._admin()
         _s, prog = self._req(c, "POST", "/api/v2/setup/program",
                              {"name": "HTTP Prog 2", "timezone": "UTC"})
+        self._select(c, prog["id"])
         s, err = self._req(c, "POST", "/api/v2/setup/season",
                           {"program_id": prog["id"], "name": "Bad",
                            "start_date": "2026-09-15T18:30:00"})
@@ -296,6 +310,7 @@ class SeasonDateHttpTest(unittest.TestCase):
         c = self._admin()
         _s, prog = self._req(c, "POST", "/api/v2/setup/program",
                              {"name": "HTTP Prog 3", "timezone": "America/New_York"})
+        self._select(c, prog["id"])
         s, err = self._req(c, "POST", "/api/v2/setup/season",
                           {"program_id": prog["id"], "name": "Rev",
                            "start_date": "2026-09-15", "end_date": "2026-09-01"})

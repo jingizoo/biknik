@@ -138,6 +138,75 @@ async function checkViewport(browser, viewport) {
     }
     errors.length = 0;  // reset for the console-clean season happy-path below
 
+    // THE FIRST-RUN SELECTION, made through the SHIPPED control (#411).
+    //
+    // #409 requires a PERSISTED Program-only selection before the Season create
+    // below is allowed, and for one round this journey was deliberately left
+    // FAILING here, because in this exact state — one Program, zero Seasons —
+    // no control in the product could make that selection: `contextEntries`
+    // yields one entry, `renderContextSwitcher`'s `single` branch hid
+    // `#ctx-select` behind a non-interactive chip, and `setActiveContext` was
+    // wired only to that select's `onchange`. #411 adds `#ctx-confirm`, a real
+    // button in that collapsed state, and this is it being used exactly as an
+    // operator uses it: one click on the shipped control, nothing else.
+    //
+    // NOT a fixture selection. `context-fixture.js` is deliberately not
+    // installed in this file: its `selectProgram()` would issue the selection
+    // over HTTP, which is precisely what would hide a regression in this
+    // affordance behind a passing test. If the button ever stops persisting,
+    // this journey goes red again — as it should.
+    // (bootstrap-program-selection.js is the dedicated proof: no
+    // POST /api/context before a deliberate click/keypress, asserted from
+    // captured network traffic, at both widths and by mouse, Enter and Space.)
+    await page.waitForSelector("#ctx-confirm:not([hidden])", { timeout: 10000 });
+    const ctxPersisted = page.waitForResponse((r) =>
+      r.url() === `${base}/api/context` && r.request().method() === "POST"
+      && r.status() === 200);
+    await page.click("#ctx-confirm");
+    await ctxPersisted;
+    // Read it back off the SAVED authority, not off `selected` — on a
+    // one-Program install the fallback resolver reports this Program either
+    // way, so only `saved` distinguishes "chosen" from "the only candidate".
+    await page.waitForFunction(async (pid) => {
+      const o = await (await fetch("/api/context/options",
+        { credentials: "same-origin" })).json();
+      return o && o.saved && o.saved.program_id === pid;
+    }, programId, { timeout: 10000 }).catch(() => {
+      throw new Error(`[${L}] the #ctx-confirm click did not persist the `
+        + `Program — /api/context/options.saved never reported ${programId}`);
+    });
+    await page.waitForSelector(".setup-card", { timeout: 10000 });
+
+    // HISTORICAL NOTE — what was MEASURED here between #409 and #411, kept
+    // because it is why the click above is a load-bearing step of this journey
+    // rather than an incidental one, and because it is the evidence that the
+    // affordance had genuinely gone (not that this fixture had taken a
+    // shortcut). All of it is PAST TENSE; none of it describes the app today.
+    //
+    // Driving ONLY shipped controls on a fresh install — no setActiveContext(),
+    // no raw /api/context, no fixture selection — after creating an
+    // Organization and a Program through the real Records drawers:
+    //   #context-switcher   -> hidden=false, but ctx-select hidden=true,
+    //                          0 options, 0 interactive controls; the chip
+    //                          read "Probe Program · Program overview (no
+    //                          season)"
+    //   after a full reload -> #context-switcher hidden=true, still 0 options
+    //   GET /api/context    -> program_id="league_1", season_id=null (the
+    //                          FALLBACK resolver — nothing persisted, yet the
+    //                          app reported the Program as selected)
+    //   Season drawer submit-> 409 {"code":"active_context_required",
+    //                          "message":"Select a Program before creating
+    //                          records in it."}
+    // The same dead end was re-measured through the product's own first-run
+    // path (the ONBOARDING WIZARD's steps 1, 2 and 4, the order the wizard
+    // itself prescribes) so that "the operator took a Records shortcut" could
+    // not explain it away: the wizard's fourth step answered the same 409, on
+    // a surface that painted no context control at all.
+    //
+    // #411 closed both halves: `#ctx-confirm` is the missing act, and
+    // `onboarding.js` now paints the switcher on the wizard surface too, so the
+    // control exists on the screen that raises the refusal.
+
     const openSeasonDrawer = async () => {
       await page.click('.setup-card .sc-new[data-drawer="season"]');
       await page.waitForSelector(".drawer[role=dialog]", { timeout: 10000 });
@@ -160,6 +229,41 @@ async function checkViewport(browser, viewport) {
     }
     await page.waitForFunction(() => !document.querySelector(".drawer[role=dialog]"),
       null, { timeout: 10000 });
+
+    // SWITCH TO THE SEASON THAT WAS JUST CREATED, through the switcher.
+    //
+    // The Records surface is scoped to the ACTIVE tuple (#367/#369), and the
+    // selection the bootstrap requires is Program-ONLY — so with no Season
+    // active the Seasons card renders "None yet" and the row asserted below is
+    // not on screen at all. (Measured: hierarchy and /api/context/options both
+    // list season_1; the card shows 0. Reported as a first-run usability
+    // finding — creating your first Season leaves it invisible in Records until
+    // you switch to it.) Before #409 this journey never selected anything and
+    // the FALLBACK resolver silently moved to (Program, that new Season) on its
+    // own; an explicit Program-only choice is honoured instead, which is the
+    // whole point, so the move has to be made explicitly here too.
+    //
+    // The switcher now holds TWO entries, so it renders as the real <select> —
+    // no #ctx-confirm involved. That makes this step double as proof that the
+    // collapsed state hands over to the ordinary control the moment there is
+    // something to choose between.
+    await page.waitForFunction(() => {
+      const s = document.getElementById("ctx-select");
+      const b = document.getElementById("ctx-confirm");
+      return s && !s.hidden && s.options.length >= 2 && b && b.hidden;
+    }, null, { timeout: 10000 }).catch(() => {
+      throw new Error(`[${L}] the switcher did not hand over from the `
+        + "single-Program button to the <select> once a Season existed");
+    });
+    await page.selectOption("#ctx-select", `${programId}|${created.id}`);
+    await page.waitForFunction(async (sid) => {
+      const o = await (await fetch("/api/context/options",
+        { credentials: "same-origin" })).json();
+      return o && o.saved && o.saved.season_id === sid;
+    }, created.id, { timeout: 10000 }).catch(() => {
+      throw new Error(`[${L}] switching to the new Season did not persist`);
+    });
+    await page.waitForSelector(".setup-card", { timeout: 10000 });
 
     // The Seasons card shows the ENTERED calendar day (Tokyo), not the adjacent
     // UTC day. "Sep 15" must appear; "Sep 14" must NOT.

@@ -13276,6 +13276,14 @@ async function sendContextSwitch(mySeq, programId, seasonId, leagueId) {
   if (contextOptions) {
     contextOptions.selected = { program_id: r.program_id,
       season_id: r.season_id, league_id: r.league_id, read_only: !!r.read_only };
+    // `saved` moves with it (#411), and from the SAME echo. This response is
+    // set_active_context's own -- the code path that WROTE the row -- so the
+    // echo is a direct statement of what is now persisted, not a guess. Leaving
+    // it on the pre-POST value would leave the switcher offering to select a
+    // Program that had just been selected, for the length of the options
+    // refetch below.
+    contextOptions.saved = { program_id: r.program_id,
+      season_id: r.season_id, league_id: r.league_id };
   }
   // Second bump (#331 review round 8): the FIRST bump above only made the
   // PRIOR selection's mutations uncommittable at intent time, before
@@ -13368,17 +13376,32 @@ function renderContextSwitcher() {
   const select = document.getElementById("ctx-select");
   const chip = document.getElementById("ctx-static");
   const roBadge = document.getElementById("ctx-ro");
+  const confirmBtn = document.getElementById("ctx-confirm");
   if (!wrap || !select || !chip || !roBadge) return;
   const opts = contextOptions;
   const show = !!(currentUser && opts && opts.programs && opts.programs.length);
   wrap.hidden = !show;
-  if (!show) { renderLeagueSelect(null, null); return; }
+  if (!show) {
+    if (confirmBtn) confirmBtn.hidden = true;
+    renderLeagueSelect(null, null);
+    return;
+  }
   const { entries, multi } = contextEntries(opts);
   const sel = opts.selected || {};
   const curValue = (sel.program_id || "") + "|" + (sel.season_id || "");
   const curEntry = entries.find((e) => e.value === curValue) || null;
   // Read-only badge is a persistent, always-visible reflection of the selection.
   roBadge.hidden = !(curEntry && curEntry.readOnly);
+  // THE PERSISTED tuple, which is a DIFFERENT fact from `selected` above and
+  // must never be derived from it (#411). `selected` is what the operator is
+  // being SHOWN and may have been invented by the backend's fallback resolver;
+  // `saved` is what they have CHOSEN, and is the only thing a create/mutation
+  // gate honours. On a one-Program install the two carry equal values while
+  // nothing is persisted at all, so comparing values inside `selected` could
+  // never tell them apart -- the server reports them separately for exactly
+  // this reason.
+  const saved = (opts && opts.saved) || {};
+  const savedValue = (saved.program_id || "") + "|" + (saved.season_id || "");
   const single = entries.length <= 1;
   if (single) {
     select.hidden = true; chip.hidden = false;
@@ -13388,8 +13411,40 @@ function renderContextSwitcher() {
     // Omitting it left every seasonless single-Program account with the
     // indistinguishable label "Program overview (no season)".
     chip.textContent = `${e.programName} · ${e.label}`;
+    // THE FIRST-RUN BOOTSTRAP CONTROL (#411). One Program and no Seasons is the
+    // one state with nothing to choose BETWEEN, so the switcher collapsed to a
+    // label -- and with it went the only control wired to setActiveContext(),
+    // leaving an operator who must "select a Program before creating records in
+    // it" no way to select one. The chip stays a label; this button beside it
+    // is the missing act.
+    //
+    // It is painted from `saved`, NOT from `selected`: rendering it against the
+    // fallback-resolved selection would hide it precisely when it is needed,
+    // because that resolver names this Program whether or not anything is
+    // persisted. And it only ever OFFERS the act -- renderContextSwitcher()
+    // runs on every render and must never itself persist anything, or the
+    // fallback would be laundered into a real selection and #409's whole
+    // distinction would be undone from the client side.
+    if (confirmBtn) {
+      const chosen = savedValue === e.value;
+      confirmBtn.hidden = chosen;
+      confirmBtn.dataset.ctxProgram = e.programId;
+      confirmBtn.dataset.ctxSeason = e.seasonId || "";
+      confirmBtn.dataset.ctxProgramName = e.programName;
+      confirmBtn.textContent = `Select ${e.programName}`;
+      // The visible text is a PREFIX of the accessible name (WCAG 2.5.3), so
+      // speech input still matches what a sighted user reads aloud while an AT
+      // user hears why the button exists.
+      confirmBtn.setAttribute("aria-label",
+        `Select ${e.programName} as your active Program`
+        + " — required before creating records in it");
+    }
   } else {
     chip.hidden = true; select.hidden = false;
+    // Only the collapsed state loses its control; wherever the <select> renders
+    // it IS the explicit act, and a second control saying the same thing would
+    // just be a second way to do it.
+    if (confirmBtn) confirmBtn.hidden = true;
     const optionTag = (e) => `<option value="${esc(e.value)}"`
       + `${e.value === curValue ? " selected" : ""}>${esc(e.label)}</option>`;
     if (multi) {
@@ -13479,6 +13534,43 @@ if (ctxLeagueSelect) ctxLeagueSelect.onchange = (e) => {
   // snaps both selects back to the true persisted state, so no client-side
   // guess at which Seasons a League is bound to is needed.
   setActiveContext(sel.program_id, sel.season_id || null, e.target.value || null);
+};
+// THE EXPLICIT SINGLE-PROGRAM SELECTION (#411) — the third and last thing wired
+// to setActiveContext(), and the only one reachable when the switcher has
+// collapsed to a chip. A native <button>, so Enter and Space activate it
+// through the browser's own semantics; there is no keydown handler here and
+// none is wanted.
+//
+// Wired ONCE, here, beside the two selects, rather than rebound inside
+// renderContextSwitcher(): a handler attached during a render is a handler that
+// exists because of a render, and the whole point of this control is that
+// rendering never persists anything -- only this activation does.
+const ctxConfirm = document.getElementById("ctx-confirm");
+if (ctxConfirm) ctxConfirm.onclick = async () => {
+  const p = ctxConfirm.dataset.ctxProgram || "";
+  if (!p) return;
+  const s = ctxConfirm.dataset.ctxSeason || "";
+  const name = ctxConfirm.dataset.ctxProgramName || "";
+  // No League: this is the FIRST selection on an install that has none yet, and
+  // an omitted League is `null` here for the same reason it is everywhere else
+  // in this file -- never "keep whatever was active".
+  await setActiveContext(p, s || null, null);
+  // Everything below is confirmation, and all of it is conditional on the
+  // selection having actually landed. setActiveContext() returns early when it
+  // queues behind an in-flight switch, and a refused one leaves its own error
+  // toast standing -- neither may be overwritten with a success sentence.
+  const savedNow = (contextOptions && contextOptions.saved) || {};
+  if ((savedNow.program_id || null) !== p) return;
+  // The button has just hidden itself (the selection it offered is now saved),
+  // so focus would fall to <body>. Move it to the chip, which is the surviving
+  // statement of the same fact, and say once what happened. #toast-root is the
+  // one sitewide polite region -- see announceCardStatus() -- so this is spoken
+  // exactly once, after the switch's own render() cleared the region.
+  const chip = document.getElementById("ctx-static");
+  if (chip && !chip.hidden) chip.focus();
+  toast = name ? `Now working in ${name}.` : "Program selected.";
+  toastIsError = false;
+  updateToast();
 };
 
 // Sign out ends the server session and returns to the sign-in screen (#71).

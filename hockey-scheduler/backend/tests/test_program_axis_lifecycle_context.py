@@ -471,6 +471,12 @@ class _LifecycleAMixin(_ProgramAxisHarness):
         """Program P with its only Season S, both selected, then S deleted.
         Returns ``(p, s)``. Every call is one an operator makes in the UI."""
         p = self._new_program(c, "Operator P")
+        # The EXPLICIT Program-only selection, which is a REQUIRED step and not
+        # a convenience: minting P does not select it, and a Season create is
+        # PROGRAM-AXIS, so without this call the next request is a 409 (#409
+        # review round — creator ownership of P no longer stands in for the
+        # persisted choice).
+        self._select(c, p)
         status, raw, body = self._req(
             c, "POST", "/api/v2/setup/season",
             {"program_id": p, "name": "Operator P Season"})
@@ -789,8 +795,16 @@ class _AxisChangesUnderTheLockMixin(_ProgramAxisHarness):
             {"league_id": league_id})
 
     def _own_program_with_season(self, c):
-        """The operator's OWN Program and Season, built over real HTTP."""
+        """The operator's OWN Program and Season, built over real HTTP.
+
+        The Program-only selection between the two creates is REQUIRED (#409
+        review round): creating P does not select it, and a Season create
+        consumes the Program axis, so the second call 409s without it. The
+        cases below re-select their own tuple explicitly, so this leaves no
+        selection they depend on.
+        """
         p = self._new_program(c, "Lifecycle C Program")
+        self._select(c, p)
         status, raw, body = self._req(
             c, "POST", "/api/v2/setup/season",
             {"program_id": p, "name": "Lifecycle C Season"})

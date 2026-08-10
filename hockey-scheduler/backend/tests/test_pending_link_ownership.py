@@ -848,6 +848,48 @@ class PendingLinkOwnershipHttpTest(unittest.TestCase):
             ("venue", "organization_id", secret_org["id"], "Organization",
              {"name": "probe-venue"}),
         ]
+
+        # #409 now runs AHEAD of #369's parent-visibility gate, so before the
+        # cross-creator rule below can be measured at all this session has to
+        # have CHOSEN a context. Both halves are asserted, in order.
+        #
+        # (a) UNSELECTED. Every probe whose parent kind can bind the new row to
+        #     a Program is refused by the axis gate BEFORE anything about the
+        #     parent is confirmed or denied, and the body names no id at all —
+        #     a strictly stronger non-disclosure than the not-found below,
+        #     since there is nothing in it to correlate with the id probed.
+        #     `organization_id` is excluded because a Venue inherits nothing
+        #     from its Organization, so that probe is never axis-binding and
+        #     goes straight to the gate this case is about.
+        unselected_refusal = {"error": {
+            "code": "active_context_required",
+            "message": "Select a Program before creating records in it."}}
+        for entity, key, parent_id, _label, rest in probes:
+            if key == "organization_id":
+                continue
+            status, resp = self._req(arena, "POST",
+                                     f"/api/v2/setup/{entity}",
+                                     {key: parent_id, **rest})
+            self.assertEqual(
+                (status, resp), (409, unselected_refusal),
+                f"an Arena Manager with NO chosen context probed {key}="
+                f"{parent_id} and got something other than the stable axis "
+                f"refusal: {status} {resp}")
+
+        # (b) SELECTED, with a tuple read back out of this caller's OWN
+        #     `GET /api/context` and posted verbatim, so it is provably one
+        #     this identity is authorized for. Everything below is then the
+        #     #369 rule alone.
+        status, ctx = self._req(arena, "GET", "/api/context")
+        self.assertEqual(status, 200, ctx)
+        self.assertTrue(
+            ctx.get("program_id"),
+            f"the Arena Manager resolved no Program at all, so the selected "
+            f"half of this case cannot be reached: {ctx}")
+        status, saved = self._req(arena, "POST", "/api/context",
+                                  {"program_id": ctx["program_id"]})
+        self.assertEqual(status, 200, saved)
+
         for entity, key, parent_id, label, rest in probes:
             status, resp = self._req(arena, "POST",
                                      f"/api/v2/setup/{entity}",

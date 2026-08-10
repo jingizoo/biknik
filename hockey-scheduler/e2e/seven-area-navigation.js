@@ -52,6 +52,9 @@ const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
+const {
+  installContextFixture, selectProgram, selectProgramSeason,
+} = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -644,6 +647,7 @@ async function run(browser, viewport) {
     await page.goto(base);
     await loginAs(page, "admin", "demo");
     await page.goto(base);
+    await installContextFixture(page);
     await reachLanding(page, "dashboard");
 
     // A minimal own fixture (a fresh boot seeds only the "admin" account), so
@@ -660,8 +664,20 @@ async function run(browser, viewport) {
     };
     const program = await mkFixture("/api/v2/setup/program",
       { name: `Nav Program ${suffix}`, country: "US" });
+    // THE EXPLICIT SELECTION (#409). Minting the Program does not select it,
+    // and no create below is allowed to infer its axes from the parent it
+    // names. Boundary 1 is Program-only: the Season, Team, Player, Official,
+    // Venue and Rink creates are PROGRAM-AXIS. See ./context-fixture.js for
+    // the axis table these two boundaries are drawn from, and for why the
+    // selection is proved by the POST echo rather than by a GET that the
+    // fallback resolver can satisfy on its own.
+    await selectProgram(page, `${L} Program-only bootstrap`, program.id);
     const season = await mkFixture("/api/v2/setup/season",
       { program_id: program.id, name: `Nav Season ${suffix}` });
+    // BOUNDARY 2 — Program+Season. Everything from the League down here
+    // (League, Division, the team registration, the season venue-access grant)
+    // is SEASON-OWNED and consumes both axes, against THIS Season.
+    await selectProgramSeason(page, `${L} Program+Season`, program.id, season.id);
     const league = await mkFixture("/api/v2/setup/league",
       { season_id: season.id, name: `Nav League ${suffix}` });
     const division = await mkFixture("/api/v2/setup/division",

@@ -41,6 +41,7 @@ const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
+const { installContextFixture } = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -153,19 +154,28 @@ async function checkViewport(browser, viewport) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
 
     // Two rinks, both offered by the builder; step (B) revokes the second one's
     // venue access before previewing, to exercise the venue-access report.
     const ids = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const league = await post("/api/setup/league", { name: "AHL" });
-      const season = await post("/api/setup/season", { league_id: league.id, name: "Fall 2026" });
-      const venue = await post("/api/setup/venue", { name: "Main Arena", league_id: league.id });
-      await post(`/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
-      const rink = await post("/api/setup/rink", { venue_id: venue.id, name: "Rink A" });
+      const F = window.hsFixture;
+      // #409 EXPLICIT SELECTION on the V1 SURFACE. `POST /api/setup/league`
+      // mints the PROGRAM (v1 calls it "league") and `POST /api/setup/season`
+      // is PROGRAM-AXIS on the body's `league_id` (server.py:3686), behind the
+      // same `setup_create_context_error` preflight v2 uses (server.py:1160).
+      // Minting the Program is not selecting it, so the Program-only choice is
+      // persisted first — earlier than the single context write that used to
+      // sit at the BOTTOM of this fixture.
+      const league = await F.create("v1 league (the Program)", "/api/setup/league", { name: "AHL" });
+      await F.selectProgram("Program-only bootstrap", league.id);
+      const season = await F.create("season", "/api/setup/season", { league_id: league.id, name: "Fall 2026" });
+      // Both venue-access grants below are SEASON-OWNED and land in THIS
+      // Season, so both axes are persisted before them.
+      await F.selectProgramSeason("Program+Season", league.id, season.id);
+      const venue = await F.create("venue", "/api/setup/venue", { name: "Main Arena", league_id: league.id });
+      await F.call("season venue-access grant", `/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
+      const rink = await F.create("rink", "/api/setup/rink", { venue_id: venue.id, name: "Rink A" });
       // A second venue, granted to the ACTIVE `season` so the builder actually
       // OFFERS its rink (#369: get_demo_overview's ov.rinks — what the
       // builder's checkboxes render from — treats the resolved Season as a
@@ -178,9 +188,9 @@ async function checkViewport(browser, viewport) {
       // it is precisely why the preview re-checks venue access server-side
       // instead of trusting the rink list the UI offered: this fixture proves
       // that check, not the (no longer reachable) "never granted" shape.
-      const venue2 = await post("/api/setup/venue", { name: "Annex", league_id: league.id });
-      const access2 = await post(`/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue2.id });
-      const rink2 = await post("/api/setup/rink", { venue_id: venue2.id, name: "Annex Ice" });
+      const venue2 = await F.create("venue2", "/api/setup/venue", { name: "Annex", league_id: league.id });
+      const access2 = await F.create("access2", `/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue2.id });
+      const rink2 = await F.create("rink2", "/api/setup/rink", { venue_id: venue2.id, name: "Annex Ice" });
       // The legacy v1 "league" IS a v2 Program under the shim (server.py's
       // POST /api/setup/league routes straight to api.create_program(), and
       // /api/setup/season passes its own league_id through as create_season()'s
@@ -190,7 +200,6 @@ async function checkViewport(browser, viewport) {
       // way Import's own Season select already does, when no Season is
       // actively selected -- this fixture must actively select one, not rely
       // on a silent global default that no longer exists).
-      await post("/api/context", { program_id: league.id, season_id: season.id });
       return { league: league.id, season: season.id, rink: rink.id,
                rink2: rink2.id, access2: access2.id };
     });
@@ -204,6 +213,7 @@ async function checkViewport(browser, viewport) {
     // documented for a freshly-created Program's #ctx-select option.
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
 
     await page.click('.tab[data-tab="calendar"]');
     await page.waitForSelector('[data-mode="month"]', { state: "visible", timeout: 10000 });
@@ -274,13 +284,10 @@ async function checkViewport(browser, viewport) {
     // (E) Exclusion date is honored and reported. Use a FRESH accessible rink so
     // the excluded run isn't all duplicates from (C), then exclude one Tuesday.
     const rink3 = await page.evaluate(async (season) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const venue = await post("/api/setup/venue", { name: "West", league_id: null });
-      await post(`/api/v2/setup/seasons/${season}/venue-access`, { venue_id: venue.id });
-      return (await post("/api/setup/rink", { venue_id: venue.id, name: "West Ice" })).id;
+      const F = window.hsFixture;
+      const venue = await F.create("venue", "/api/setup/venue", { name: "West", league_id: null });
+      await F.call("season venue-access grant", `/api/v2/setup/seasons/${season}/venue-access`, { venue_id: venue.id });
+      return (await F.create("rink", "/api/setup/rink", { venue_id: venue.id, name: "West Ice" })).id;
     }, ids.season);
     // Adding the exclusion re-renders the builder, which refetches the overview
     // and surfaces the new rink's checkbox.
@@ -301,13 +308,10 @@ async function checkViewport(browser, viewport) {
     // where a single uniform block would be 27. Proves the per-day times reach
     // the planner and are not collapsed into one global window.
     const rink4 = await page.evaluate(async (season) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const venue = await post("/api/setup/venue", { name: "East", league_id: null });
-      await post(`/api/v2/setup/seasons/${season}/venue-access`, { venue_id: venue.id });
-      return (await post("/api/setup/rink", { venue_id: venue.id, name: "East Ice" })).id;
+      const F = window.hsFixture;
+      const venue = await F.create("venue", "/api/setup/venue", { name: "East", league_id: null });
+      await F.call("season venue-access grant", `/api/v2/setup/seasons/${season}/venue-access`, { venue_id: venue.id });
+      return (await F.create("rink", "/api/setup/rink", { venue_id: venue.id, name: "East Ice" })).id;
     }, ids.season);
     await page.click("[data-ib-cancel]");
     await page.waitForSelector("[data-ice-builder-open]", { timeout: 10000 });
@@ -327,13 +331,10 @@ async function checkViewport(browser, viewport) {
     // template fields share one invalidation listener; editing a weekday time
     // exercises it. Use a fresh rink so "zero committed" is unambiguous.
     const rink5 = await page.evaluate(async (season) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const venue = await post("/api/setup/venue", { name: "North", league_id: null });
-      await post(`/api/v2/setup/seasons/${season}/venue-access`, { venue_id: venue.id });
-      return (await post("/api/setup/rink", { venue_id: venue.id, name: "North Ice" })).id;
+      const F = window.hsFixture;
+      const venue = await F.create("venue", "/api/setup/venue", { name: "North", league_id: null });
+      await F.call("season venue-access grant", `/api/v2/setup/seasons/${season}/venue-access`, { venue_id: venue.id });
+      return (await F.create("rink", "/api/setup/rink", { venue_id: venue.id, name: "North Ice" })).id;
     }, ids.season);
     await page.click("[data-ib-cancel]");
     await page.waitForSelector("[data-ice-builder-open]", { timeout: 10000 });
@@ -360,13 +361,10 @@ async function checkViewport(browser, viewport) {
     // commit and the UI re-previews the current proposal instead of writing the
     // stale set. (The service/HTTP suites drive the real Season/tz change.)
     const rink6 = await page.evaluate(async (season) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const venue = await post("/api/setup/venue", { name: "South", league_id: null });
-      await post(`/api/v2/setup/seasons/${season}/venue-access`, { venue_id: venue.id });
-      return (await post("/api/setup/rink", { venue_id: venue.id, name: "South Ice" })).id;
+      const F = window.hsFixture;
+      const venue = await F.create("venue", "/api/setup/venue", { name: "South", league_id: null });
+      await F.call("season venue-access grant", `/api/v2/setup/seasons/${season}/venue-access`, { venue_id: venue.id });
+      return (await F.create("rink", "/api/setup/rink", { venue_id: venue.id, name: "South Ice" })).id;
     }, ids.season);
     await page.click("[data-ib-cancel]");
     await page.waitForSelector("[data-ice-builder-open]", { timeout: 10000 });
@@ -403,13 +401,10 @@ async function checkViewport(browser, viewport) {
     // stale commit, and the UI re-previews the CURRENT (22:05) proposal — same
     // slot count, new token — which then commits.
     const rink6b = await page.evaluate(async (season) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const venue = await post("/api/setup/venue", { name: "West", league_id: null });
-      await post(`/api/v2/setup/seasons/${season}/venue-access`, { venue_id: venue.id });
-      return (await post("/api/setup/rink", { venue_id: venue.id, name: "West Ice" })).id;
+      const F = window.hsFixture;
+      const venue = await F.create("venue", "/api/setup/venue", { name: "West", league_id: null });
+      await F.call("season venue-access grant", `/api/v2/setup/seasons/${season}/venue-access`, { venue_id: venue.id });
+      return (await F.create("rink", "/api/setup/rink", { venue_id: venue.id, name: "West Ice" })).id;
     }, ids.season);
     await page.click("[data-ib-cancel]");
     await page.waitForSelector("[data-ice-builder-open]", { timeout: 10000 });
@@ -460,14 +455,11 @@ async function checkViewport(browser, viewport) {
     // takes. The collided window must show as a conflict and drop out of the new
     // count, not be silently counted as idempotent capacity.
     const rink7 = await page.evaluate(async (season) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const venue = await post("/api/setup/venue", { name: "West End", league_id: null });
-      await post(`/api/v2/setup/seasons/${season}/venue-access`, { venue_id: venue.id });
-      const rink = (await post("/api/setup/rink", { venue_id: venue.id, name: "West End Ice" })).id;
-      await post("/api/setup/ice-slot", {
+      const F = window.hsFixture;
+      const venue = await F.create("venue", "/api/setup/venue", { name: "West End", league_id: null });
+      await F.call("season venue-access grant", `/api/v2/setup/seasons/${season}/venue-access`, { venue_id: venue.id });
+      const rink = (await F.create("rink", "/api/setup/rink", { venue_id: venue.id, name: "West End Ice" })).id;
+      await F.call("ice-slot", "/api/setup/ice-slot", {
         rink_id: rink, start_time: "2026-09-01T18:00:00+00:00",
         end_time: "2026-09-01T19:00:00+00:00", slot_type: "maintenance" });
       return rink;
@@ -496,29 +488,32 @@ async function checkViewport(browser, viewport) {
     // days or a bare count (#158 review). The "AHL" program tz is UTC, so the
     // seeded Game's slot tuple and a generated window coincide exactly.
     const long = await page.evaluate(async (ctx) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const venue = await post("/api/setup/venue", { name: "Long Range", league_id: null });
-      await post(`/api/v2/setup/seasons/${ctx.season}/venue-access`, { venue_id: venue.id });
-      const rink = (await post("/api/setup/rink", { venue_id: venue.id, name: "Long Ice" })).id;
+      const F = window.hsFixture;
+      const venue = await F.create("venue", "/api/setup/venue", { name: "Long Range", league_id: null });
+      await F.call("season venue-access grant", `/api/v2/setup/seasons/${ctx.season}/venue-access`, { venue_id: venue.id });
+      const rink = (await F.create("rink", "/api/setup/rink", { venue_id: venue.id, name: "Long Ice" })).id;
       // Seed a Game on a slot LATE in the range (Nov 1 = day 62 of a Sep 1
       // start), so its conflict row falls BEYOND the old 60-day cap. An
       // exhibition game needs only active season participation (no grouping
       // league), keeping the setup minimal.
-      const club = await post("/api/setup/club", { name: "Range Club" });
-      const division = await post("/api/setup/division", { season_id: ctx.season, name: "Range Div" });
-      const mk = async (name) => (await post("/api/setup/team",
+      // #409: the Division, the two registrations and the Game below are
+      // SEASON-OWNED in this Season, and this journey has switched Program
+      // more than once by now — state the tuple instead of assuming the
+      // bootstrap's selection still stands.
+      await F.selectProgramSeason("Program+Season for the long-range fixture",
+        ctx.league, ctx.season);
+      const club = await F.create("club", "/api/setup/club", { name: "Range Club" });
+      const division = await F.create("division", "/api/setup/division", { season_id: ctx.season, name: "Range Div" });
+      const mk = async (name) => (await F.create(`team ${name}`, "/api/setup/team",
         { club_id: club.id, division_id: division.id, name, league_id: ctx.league })).id;
       const home = await mk("Range Home");
       const away = await mk("Range Away");
-      await post(`/api/setup/seasons/${ctx.season}/team-registrations`, { team_id: home, division_id: division.id });
-      await post(`/api/setup/seasons/${ctx.season}/team-registrations`, { team_id: away, division_id: division.id });
-      const slot = await post("/api/setup/ice-slot", {
+      await F.call("team registration", `/api/setup/seasons/${ctx.season}/team-registrations`, { team_id: home, division_id: division.id });
+      await F.call("team registration", `/api/setup/seasons/${ctx.season}/team-registrations`, { team_id: away, division_id: division.id });
+      const slot = await F.create("slot", "/api/setup/ice-slot", {
         rink_id: rink, start_time: "2026-11-01T18:00:00+00:00",
         end_time: "2026-11-01T19:00:00+00:00", slot_type: "game" });
-      const g = await post("/api/setup/game", {
+      const g = await F.create("exhibition game", "/api/setup/game", {
         season_id: ctx.season, division_id: division.id, home_team_id: home,
         away_team_id: away, ice_slot_id: slot.id, game_type: "exhibition" });
       return { rink, game: (g && (g.id || (g.game && g.game.id))) || null };
@@ -592,23 +587,27 @@ async function checkViewport(browser, viewport) {
     // Sunday only, turnover zeroed so the real-hour math above (2 slots / 120
     // reserved for spring, 4 slots / 240 reserved for fall) applies exactly.
     const dstIds = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const league = await post("/api/setup/league", { name: "DST League", timezone: "America/Toronto" });
-      const season = await post("/api/setup/season", {
+      const F = window.hsFixture;
+      const league = await F.create("v1 DST league (the Program)", "/api/setup/league", { name: "DST League", timezone: "America/Toronto" });
+      // #409: this block builds a NEW Program, and the Season create is
+      // PROGRAM-AXIS against it — so the switch has to happen HERE, before
+      // the Season, not below it where the single raw context write used to
+      // sit. The guard is not weakened for the fixture's convenience.
+      await F.selectProgram("DST Program-only bootstrap", league.id);
+      const season = await F.create("DST season", "/api/setup/season", {
         league_id: league.id, name: "DST Season",
         start_date: "2026-08-01", end_date: "2027-06-01" });
-      const venue = await post("/api/setup/venue", { name: "DST Arena", league_id: league.id });
+      const venue = await F.create("venue", "/api/setup/venue", { name: "DST Arena", league_id: league.id });
       // This block builds a NEW Program, so the grant below targets a Season
       // outside the currently active one. Setup mutations bind to the ACTIVE
       // Program (#369 prerequisite), so move into the Program being built --
       // the same explicit switch this journey already does at its first
       // fixture. The guard is not weakened for the fixture's convenience.
-      await post("/api/context", { program_id: league.id, season_id: season.id });
-      await post(`/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
-      const rink = await post("/api/setup/rink", { venue_id: venue.id, name: "DST Sheet" });
+      // The grant is SEASON-OWNED and lands in the DST Season.
+      await F.selectProgramSeason("DST Program+Season", league.id, season.id);
+      await F.call("DST season venue-access grant",
+        `/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
+      const rink = await F.create("rink", "/api/setup/rink", { venue_id: venue.id, name: "DST Sheet" });
       // #369: get_demo_overview's `seasons` (what #ib-season's <option>s
       // render from) is ceilinged on the resolved ACTIVE Season — it lists
       // exactly that one Season — unlike before #367, where it was globally
@@ -617,7 +616,7 @@ async function checkViewport(browser, viewport) {
       // this fresh DST League/Season so it (and its venue-access grants)
       // resolve in the builder below, mirroring the identical requirement the
       // fixture setup above already documents.
-      await post("/api/context", { program_id: league.id, season_id: season.id });
+      await F.call("context", "/api/context", { program_id: league.id, season_id: season.id });
       // Clear the #ctx= deep-link hash the earlier AHL switch's reload/render
       // synced into the URL: restoreContextDeepLink() on the NEXT boot below
       // treats a hash that disagrees with the just-persisted server selection
@@ -633,6 +632,7 @@ async function checkViewport(browser, viewport) {
     // the identical reload the fixture setup above already performs).
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
     await page.click('.tab[data-tab="calendar"]');
     await page.waitForSelector('[data-mode="month"]', { state: "visible", timeout: 10000 });
     await page.click("[data-ice-builder-open]");
@@ -688,13 +688,10 @@ async function checkViewport(browser, viewport) {
     // hour means two distinct UTC slots read the SAME local clock time — the
     // preview must visibly tell them apart (not just be correct server-side).
     const dstRink2 = await page.evaluate(async (season) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const venue = await post("/api/setup/venue", { name: "DST Arena 2", league_id: null });
-      await post(`/api/v2/setup/seasons/${season}/venue-access`, { venue_id: venue.id });
-      return (await post("/api/setup/rink", { venue_id: venue.id, name: "DST Sheet 2" })).id;
+      const F = window.hsFixture;
+      const venue = await F.create("venue", "/api/setup/venue", { name: "DST Arena 2", league_id: null });
+      await F.call("season venue-access grant", `/api/v2/setup/seasons/${season}/venue-access`, { venue_id: venue.id });
+      return (await F.create("rink", "/api/setup/rink", { venue_id: venue.id, name: "DST Sheet 2" })).id;
     }, dstIds.season);
     await page.click("[data-ice-builder-open]");
     await page.waitForSelector(".ib-form", { timeout: 10000 });
@@ -753,13 +750,10 @@ async function checkViewport(browser, viewport) {
     // repeated-clock-only check left open. A fresh rink keeps "exactly 1
     // created" unambiguous.
     const dstRink3 = await page.evaluate(async (season) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const venue = await post("/api/setup/venue", { name: "DST Arena 3", league_id: null });
-      await post(`/api/v2/setup/seasons/${season}/venue-access`, { venue_id: venue.id });
-      return (await post("/api/setup/rink", { venue_id: venue.id, name: "DST Sheet 3" })).id;
+      const F = window.hsFixture;
+      const venue = await F.create("venue", "/api/setup/venue", { name: "DST Arena 3", league_id: null });
+      await F.call("season venue-access grant", `/api/v2/setup/seasons/${season}/venue-access`, { venue_id: venue.id });
+      return (await F.create("rink", "/api/setup/rink", { venue_id: venue.id, name: "DST Sheet 3" })).id;
     }, dstIds.season);
     await page.click("[data-ice-builder-open]");
     await page.waitForSelector(".ib-form", { timeout: 10000 });
@@ -821,13 +815,10 @@ async function checkViewport(browser, viewport) {
     // repeated clock adds. Same shape as K4, one rink further, on the OTHER
     // DST direction and with a non-default playable_minutes.
     const dstRink4 = await page.evaluate(async (season) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const venue = await post("/api/setup/venue", { name: "DST Arena 4", league_id: null });
-      await post(`/api/v2/setup/seasons/${season}/venue-access`, { venue_id: venue.id });
-      return (await post("/api/setup/rink", { venue_id: venue.id, name: "DST Sheet 4" })).id;
+      const F = window.hsFixture;
+      const venue = await F.create("venue", "/api/setup/venue", { name: "DST Arena 4", league_id: null });
+      await F.call("season venue-access grant", `/api/v2/setup/seasons/${season}/venue-access`, { venue_id: venue.id });
+      return (await F.create("rink", "/api/setup/rink", { venue_id: venue.id, name: "DST Sheet 4" })).id;
     }, dstIds.season);
     await page.click("[data-ice-builder-open]");
     await page.waitForSelector(".ib-form", { timeout: 10000 });

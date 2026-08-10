@@ -161,6 +161,9 @@ const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
+const {
+  installContextFixture, selectProgramSeason,
+} = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -580,6 +583,7 @@ async function reenter(page, base) {
     null, "", location.pathname + location.search));
   await page.goto(base, { waitUntil: "domcontentloaded" });
   await page.waitForSelector("#content > *", { timeout: 15000 });
+  await installContextFixture(page);
 }
 
 // Open the Facilities LANDING through a real, permission-gated entry point.
@@ -791,6 +795,7 @@ async function checkViewport(browser, viewport) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 15000 });
+    await installContextFixture(page);
     await loginAs(page, "admin", "demo");
     // A fresh boot seeds only "admin"; the other demo personas ("arena" here)
     // are UserAccount rows /api/demo/load creates. Every fixture below selects
@@ -807,22 +812,25 @@ async function checkViewport(browser, viewport) {
     // then revoke that grant. The overview keeps reporting 1 Venue / 1 Rink as
     // history, which is correct — and none of it is schedulable.
     const a = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const org = await post("/api/v2/setup/organization", { name: "VAG Revoked Org" });
-      const program = await post("/api/v2/setup/program",
+      const F = window.hsFixture;
+      const org = await F.create("org", "/api/v2/setup/organization", { name: "VAG Revoked Org" });
+      const program = await F.create("program", "/api/v2/setup/program",
         { name: "VAG Revoked Program", country: "US",
           operator_organization_id: org.id });
-      const season = await post("/api/v2/setup/season",
+      // #409 EXPLICIT SELECTION. Season is PROGRAM-AXIS, so the Program-only
+      // choice has to be PERSISTED BEFORE the Season create — not after,
+      // where the raw context POST used to sit. The venue-access grant below
+      // is SEASON-OWNED, so both axes are saved before it, and the selection
+      // is proved by the server's own write echo rather than assumed.
+      await F.selectProgram("Program-only bootstrap (A)", program.id);
+      const season = await F.create("season", "/api/v2/setup/season",
         { program_id: program.id, name: "VAG Revoked Season" });
-      await post("/api/context", { program_id: program.id, season_id: season.id });
-      const venue = await post("/api/v2/setup/venue",
+      await F.selectProgramSeason("Program+Season (A)", program.id, season.id);
+      const venue = await F.create("venue", "/api/v2/setup/venue",
         { name: "VAG Revoked Venue", organization_id: org.id });
-      const rink = await post("/api/v2/setup/rink",
+      const rink = await F.create("rink", "/api/v2/setup/rink",
         { venue_id: venue.id, name: "VAG Revoked Rink" });
-      const access = await post(`/api/v2/setup/seasons/${season.id}/venue-access`,
+      const access = await F.create("access", `/api/v2/setup/seasons/${season.id}/venue-access`,
         { venue_id: venue.id });
       const revoked = await post(
         `/api/v2/setup/season-venue-access/${access.id}/remove`, {});
@@ -859,8 +867,17 @@ async function checkViewport(browser, viewport) {
     // -- the same fixture, as the role that cannot resolve it ---------------
     await apiPost(page, "/api/auth/logout", {});
     await loginAs(page, "arena", "demo");
-    await apiPost(page, "/api/context", { program_id: a.program, season_id: a.season });
     await reenter(page, base);
+    // #409: stated and READ BACK, through the app's own switch pipeline.
+    // It runs AFTER `reenter`, not before: an identity change here is a
+    // bare `POST /api/auth/login` with no reload, so until the shell is
+    // re-entered the page is still displaying the PREVIOUS role's view.
+    // Driving `setActiveContext` against that stale view makes it re-fetch
+    // under the new identity — which is how this produced 403s on
+    // /api/players and /api/v2/setup/hierarchy for the Arena Manager. The
+    // raw POST it replaces hid that only because it never re-rendered.
+    await selectProgramSeason(page, `[${L}] select a.program/a.season`,
+      a.program, a.season);
     icePreviews = [];
     await openFacilitiesLanding(page, `${L}/A/arena`);
     await assertBlocked(page, L, "A/arena", a,
@@ -870,8 +887,17 @@ async function checkViewport(browser, viewport) {
     // ================= (C) RECOVERY, through the real entry point =========
     await apiPost(page, "/api/auth/logout", {});
     await loginAs(page, "admin", "demo");
-    await apiPost(page, "/api/context", { program_id: a.program, season_id: a.season });
     await reenter(page, base);
+    // #409: stated and READ BACK, through the app's own switch pipeline.
+    // It runs AFTER `reenter`, not before: an identity change here is a
+    // bare `POST /api/auth/login` with no reload, so until the shell is
+    // re-entered the page is still displaying the PREVIOUS role's view.
+    // Driving `setActiveContext` against that stale view makes it re-fetch
+    // under the new identity — which is how this produced 403s on
+    // /api/players and /api/v2/setup/hierarchy for the Arena Manager. The
+    // raw POST it replaces hid that only because it never re-rendered.
+    await selectProgramSeason(page, `[${L}] select a.program/a.season`,
+      a.program, a.season);
     icePreviews = [];
     await openFacilitiesLanding(page, `${L}/C/before`);
     await assertBlocked(page, L, "C/before", a,
@@ -995,17 +1021,19 @@ async function checkViewport(browser, viewport) {
     // but its creator, and a leg run against rows the signed-in role cannot see
     // would assert against an EMPTY card instead of a blocked one.
     const b = await page.evaluate(async () => {
-      const post = async (p, bd) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(bd),
-      })).json();
-      const program = await post("/api/v2/setup/program",
+      const F = window.hsFixture;
+      const program = await F.create("program", "/api/v2/setup/program",
         { name: "VAG Pending Program", country: "US" });
-      const season = await post("/api/v2/setup/season",
+      // #409, same two boundaries as fixture (A). This fixture deliberately
+      // makes NO grant, so only the Program axis is load-bearing for its
+      // Venue/Rink — the Season is still selected so the screens the journey
+      // then reads are scoped to the Season it means.
+      await F.selectProgram("Program-only bootstrap (B)", program.id);
+      const season = await F.create("season", "/api/v2/setup/season",
         { program_id: program.id, name: "VAG Pending Season" });
-      await post("/api/context", { program_id: program.id, season_id: season.id });
-      const venue = await post("/api/v2/setup/venue", { name: "VAG Pending Venue Admin" });
-      const rink = await post("/api/v2/setup/rink",
+      await F.selectProgramSeason("Program+Season (B)", program.id, season.id);
+      const venue = await F.create("venue", "/api/v2/setup/venue", { name: "VAG Pending Venue Admin" });
+      const rink = await F.create("rink", "/api/v2/setup/rink",
         { venue_id: venue.id, name: "VAG Pending Rink Admin" });
       return { program: program.id, season: season.id, seasonName: season.name,
                venue: venue.id, rink: rink.id };
@@ -1030,22 +1058,37 @@ async function checkViewport(browser, viewport) {
 
     await apiPost(page, "/api/auth/logout", {});
     await loginAs(page, "arena", "demo");
-    await apiPost(page, "/api/context", { program_id: b.program, season_id: b.season });
-    const bArena = await page.evaluate(async () => {
-      const post = async (p, bd) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(bd),
-      })).json();
-      const venue = await post("/api/v2/setup/venue", { name: "VAG Pending Venue Arena" });
-      const rink = await post("/api/v2/setup/rink",
+    // Re-enter the shell BEFORE selecting: `loginAs` is a bare
+    // `POST /api/auth/login` with no reload, so the page is still displaying
+    // the League Admin's view, and driving `setActiveContext` against it
+    // makes that view re-fetch under the Arena Manager identity (403 on
+    // /api/players and /api/v2/setup/hierarchy). Same reason as every other
+    // identity change in this file (#409).
+    await reenter(page, base);
+    const bArena = await page.evaluate(async (fx) => {
+      const F = window.hsFixture;
+      // #409: a Venue is PROGRAM-AXIS, so a saved Program is what this create
+      // needs. This is the ARENA MANAGER's session, whose saved row is its
+      // own, so the tuple is stated here rather than inherited from the admin
+      // session that built fixture (B). BOTH axes are named, not just the
+      // Program the create strictly requires: the assertions that follow read
+      // the Facilities card, whose committed identity must stay bound to
+      // fixture (B)'s Season — a Program-only selection would legitimately
+      // null the Season out and the card would then disagree with the screen.
+      await F.selectProgramSeason("arena session: Program+Season (B)",
+        fx.program, fx.season);
+      const venue = await F.create("venue", "/api/v2/setup/venue", { name: "VAG Pending Venue Arena" });
+      const rink = await F.create("rink", "/api/v2/setup/rink",
         { venue_id: venue.id, name: "VAG Pending Rink Arena" });
       return { venue: venue.id, rink: rink.id };
-    });
+    }, { program: b.program, season: b.season });
     if (!bArena.venue || !bArena.rink) {
       fail(`[${L}] fixture (B) could not create the Arena Manager's own pending `
         + `Venue/Rink: ${JSON.stringify(bArena)}`);
     }
     await reenter(page, base);
+    await selectProgramSeason(page, `[${L}] select b.program/b.season`,
+      b.program, b.season);
     icePreviews = [];
     await openFacilitiesLanding(page, `${L}/B/arena`);
     await assertBlocked(page, L, "B/arena", b,
@@ -1061,24 +1104,26 @@ async function checkViewport(browser, viewport) {
     await apiPost(page, "/api/auth/logout", {});
     await loginAs(page, "admin", "demo");
     const d = await page.evaluate(async () => {
-      const post = async (p, bd) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(bd),
-      })).json();
-      const program = await post("/api/v2/setup/program",
+      const F = window.hsFixture;
+      const program = await F.create("program", "/api/v2/setup/program",
         { name: "VAG Late Program", country: "US" });
-      const s1 = await post("/api/v2/setup/season",
+      // #409: all three Season creates are PROGRAM-AXIS, so the Program-only
+      // choice is persisted first. The Venue and Rink after them are
+      // PROGRAM-AXIS too and deliberately carry NO grant, which is what makes
+      // the Facilities card blocked under either Season.
+      await F.selectProgram("Program-only bootstrap (D)", program.id);
+      const s1 = await F.create("s1", "/api/v2/setup/season",
         { program_id: program.id, name: "VAG Late Season One" });
-      const s2 = await post("/api/v2/setup/season",
+      const s2 = await F.create("s2", "/api/v2/setup/season",
         { program_id: program.id, name: "VAG Late Season Two" });
       // A THIRD selectable Season, for leg (G2): a switch that queues behind
       // an in-flight one needs a target that is neither the departing Season
       // nor the one the in-flight switch is already heading for, or "the
       // queued call named a different destination" would not be observable.
-      const s3 = await post("/api/v2/setup/season",
+      const s3 = await F.create("s3", "/api/v2/setup/season",
         { program_id: program.id, name: "VAG Late Season Three" });
-      const venue = await post("/api/v2/setup/venue", { name: "VAG Late Venue" });
-      const rink = await post("/api/v2/setup/rink",
+      const venue = await F.create("venue", "/api/v2/setup/venue", { name: "VAG Late Venue" });
+      const rink = await F.create("rink", "/api/v2/setup/rink",
         { venue_id: venue.id, name: "VAG Late Rink" });
       return { program: program.id, s1: s1.id, s1Name: s1.name,
                s2: s2.id, s2Name: s2.name, s3: s3.id, s3Name: s3.name,
@@ -1092,8 +1137,17 @@ async function checkViewport(browser, viewport) {
                     action: "Allow a venue for this season" };
 
     // ---- (D) the picker appears long after the old budget would have gone --
-    await apiPost(page, "/api/context", { program_id: d.program, season_id: d.s1 });
     await reenter(page, base);
+    // #409: stated and READ BACK, through the app's own switch pipeline.
+    // It runs AFTER `reenter`, not before: an identity change here is a
+    // bare `POST /api/auth/login` with no reload, so until the shell is
+    // re-entered the page is still displaying the PREVIOUS role's view.
+    // Driving `setActiveContext` against that stale view makes it re-fetch
+    // under the new identity — which is how this produced 403s on
+    // /api/players and /api/v2/setup/hierarchy for the Arena Manager. The
+    // raw POST it replaces hid that only because it never re-rendered.
+    await selectProgramSeason(page, `[${L}] select d.program/d.s1`,
+      d.program, d.s1);
     icePreviews = [];
     await openFacilitiesLanding(page, `${L}/D/before`);
     await assertBlocked(page, L, "D/before", dFx, dWant);
@@ -1272,8 +1326,17 @@ async function checkViewport(browser, viewport) {
     // ====== (F) THE NAVIGATION'S OWN GENERIC POLL, SUPERSEDED =============
     // No delayed reads and no quiesceFocus anywhere in this leg: the subject
     // is the ORDINARY, fast path, which is where the recorded failure lives.
-    await apiPost(page, "/api/context", { program_id: d.program, season_id: d.s1 });
     await reenter(page, base);
+    // #409: stated and READ BACK, through the app's own switch pipeline.
+    // It runs AFTER `reenter`, not before: an identity change here is a
+    // bare `POST /api/auth/login` with no reload, so until the shell is
+    // re-entered the page is still displaying the PREVIOUS role's view.
+    // Driving `setActiveContext` against that stale view makes it re-fetch
+    // under the new identity — which is how this produced 403s on
+    // /api/players and /api/v2/setup/hierarchy for the Arena Manager. The
+    // raw POST it replaces hid that only because it never re-rendered.
+    await selectProgramSeason(page, `[${L}] select d.program/d.s1`,
+      d.program, d.s1);
     icePreviews = [];
     if (await page.evaluate(() => !!document.querySelector(
         '[data-setup-landing-actions="facilities"] .act.primary'))) {
@@ -1595,8 +1658,17 @@ async function checkViewport(browser, viewport) {
     // told, so contextOptions.selected still reads the DEPARTING Season and
     // every stale focus request still looks current to any test that judged by
     // the tuple. Nothing may be focused in it.
-    await apiPost(page, "/api/context", { program_id: d.program, season_id: d.s1 });
     await reenter(page, base);
+    // #409: stated and READ BACK, through the app's own switch pipeline.
+    // It runs AFTER `reenter`, not before: an identity change here is a
+    // bare `POST /api/auth/login` with no reload, so until the shell is
+    // re-entered the page is still displaying the PREVIOUS role's view.
+    // Driving `setActiveContext` against that stale view makes it re-fetch
+    // under the new identity — which is how this produced 403s on
+    // /api/players and /api/v2/setup/hierarchy for the Arena Manager. The
+    // raw POST it replaces hid that only because it never re-rendered.
+    await selectProgramSeason(page, `[${L}] select d.program/d.s1`,
+      d.program, d.s1);
     icePreviews = [];
     // THE SWITCHER HAS TO EXIST BEFORE THE OPERATOR CAN USE IT.
     // renderContextSwitcher() runs late in render() -- after its own awaited
@@ -1796,8 +1868,17 @@ async function checkViewport(browser, viewport) {
     // released switch still reconciling.
     await reenter(page, base);
     await page.waitForLoadState("networkidle").catch(() => {});
-    await apiPost(page, "/api/context", { program_id: d.program, season_id: d.s1 });
     await reenter(page, base);
+    // #409: stated and READ BACK, through the app's own switch pipeline.
+    // It runs AFTER `reenter`, not before: an identity change here is a
+    // bare `POST /api/auth/login` with no reload, so until the shell is
+    // re-entered the page is still displaying the PREVIOUS role's view.
+    // Driving `setActiveContext` against that stale view makes it re-fetch
+    // under the new identity — which is how this produced 403s on
+    // /api/players and /api/v2/setup/hierarchy for the Arena Manager. The
+    // raw POST it replaces hid that only because it never re-rendered.
+    await selectProgramSeason(page, `[${L}] select d.program/d.s1`,
+      d.program, d.s1);
     icePreviews = [];
     // Same reason (G) does this: renderContextSwitcher() runs late in render(),
     // so a freshly re-entered page has #ctx-select still empty. Reach a
@@ -2039,8 +2120,17 @@ async function checkViewport(browser, viewport) {
     await page.waitForLoadState("networkidle").catch(() => {});
     await apiPost(page, "/api/auth/logout", {});
     await loginAs(page, "admin", "demo");
-    await apiPost(page, "/api/context", { program_id: d.program, season_id: d.s1 });
     await reenter(page, base);
+    // #409: stated and READ BACK, through the app's own switch pipeline.
+    // It runs AFTER `reenter`, not before: an identity change here is a
+    // bare `POST /api/auth/login` with no reload, so until the shell is
+    // re-entered the page is still displaying the PREVIOUS role's view.
+    // Driving `setActiveContext` against that stale view makes it re-fetch
+    // under the new identity — which is how this produced 403s on
+    // /api/players and /api/v2/setup/hierarchy for the Arena Manager. The
+    // raw POST it replaces hid that only because it never re-rendered.
+    await selectProgramSeason(page, `[${L}] select d.program/d.s1`,
+      d.program, d.s1);
     icePreviews = [];
     await delayHierarchyReads(page);
     await startFocusTrace(page);

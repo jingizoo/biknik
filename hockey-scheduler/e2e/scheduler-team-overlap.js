@@ -28,6 +28,7 @@ const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
+const { installContextFixture } = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -152,36 +153,45 @@ async function checkViewport(browser, viewport) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
 
     // Issue #373's own fixture: three teams (so consecutive round-robin
     // pairings necessarily share a team) and one 17:00 game slot on EACH of
     // two rinks.
     const ids = await page.evaluate(async (day) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const league = await post("/api/setup/league", { name: "Overlap Program" });
-      const season = await post("/api/setup/season", { league_id: league.id, name: "2026-27" });
-      const level = await post("/api/setup/level", { season_id: season.id, name: "Bronze League" });
-      const division = await post("/api/setup/division", {
+      const F = window.hsFixture;
+      // #409 EXPLICIT SELECTION on the V1 SURFACE. The route family differs;
+      // the axis rule does not. `POST /api/setup/league` mints the PROGRAM
+      // (v1 calls it "league") and `POST /api/setup/season` is a PROGRAM-AXIS
+      // create comparing the body's `league_id` (server.py:3686), guarded by
+      // the same `setup_create_context_error` preflight v2 uses
+      // (server.py:1160). Minting the Program is not selecting it.
+      const league = await F.create("v1 league (the Program)", "/api/setup/league", { name: "Overlap Program" });
+      await F.selectProgram("Program-only bootstrap", league.id);
+      const season = await F.create("season", "/api/setup/season", { league_id: league.id, name: "2026-27" });
+      // The v1 "level" IS the v2 League; it, the Divisions, the registrations
+      // and the venue-access grant are all SEASON-OWNED and land in THIS
+      // Season, so both axes are persisted before them.
+      await F.selectProgramSeason("Program+Season", league.id, season.id);
+      const level = await F.create("level (the v2 League)", "/api/setup/level", { season_id: season.id, name: "Bronze League" });
+      const division = await F.create("division", "/api/setup/division", {
         season_id: season.id, level_id: level.id, name: "Bronze" });
-      const club = await post("/api/setup/club", { name: "Club" });
+      const club = await F.create("club", "/api/setup/club", { name: "Club" });
       const team = async (n) =>
-        (await post("/api/v2/setup/team", { club_id: club.id, league_id: level.id, name: n })).id;
+        (await F.create("team", "/api/v2/setup/team", { club_id: club.id, league_id: level.id, name: n })).id;
       const gold1 = await team("Gold team 1");
       const gold2 = await team("Gold team 2");
       const redwings = await team("Redwings");
       for (const t of [gold1, gold2, redwings]) {
-        await post(`/api/setup/seasons/${season.id}/team-registrations`,
+        await F.call("team-registrations", `/api/setup/seasons/${season.id}/team-registrations`,
                    { team_id: t, division_id: division.id });
       }
-      const venue = await post("/api/setup/venue", { name: "Arena", league_id: league.id });
-      await post(`/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
-      const red = await post("/api/setup/rink", { venue_id: venue.id, name: "Red Rink" });
-      const blue = await post("/api/setup/rink", { venue_id: venue.id, name: "Blue Rink" });
+      const venue = await F.create("venue", "/api/setup/venue", { name: "Arena", league_id: league.id });
+      await F.call("season venue-access grant", `/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
+      const red = await F.create("red", "/api/setup/rink", { venue_id: venue.id, name: "Red Rink" });
+      const blue = await F.create("blue", "/api/setup/rink", { venue_id: venue.id, name: "Blue Rink" });
       for (const rink of [red, blue]) {
-        await post("/api/setup/ice-slot", {
+        await F.call("ice-slot", "/api/setup/ice-slot", {
           rink_id: rink.id, start_time: `${day}T17:00:00+00:00`,
           end_time: `${day}T18:00:00+00:00`, slot_type: "game" });
       }

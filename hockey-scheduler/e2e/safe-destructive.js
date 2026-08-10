@@ -94,25 +94,86 @@ async function checkViewport(browser, viewport) {
     // Build a league with a registered team (so it can't be deleted) plus a
     // bare team (which can). The demo default role is League Admin.
     const ids = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const league = await post("/api/setup/league", { name: "Del League" });
-      const season = await post("/api/setup/season", { league_id: league.id, name: "Del Season" });
+      const post = async (p, b) => {
+        const r = await fetch(p, {
+          method: "POST", credentials: "same-origin",
+          headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+        });
+        return { status: r.status, body: await r.json() };
+      };
+      // ASSERT EVERY CREATE BEFORE ITS ID IS USED (#409 review round). This
+      // fixture used to decode each body and throw the status away, so a
+      // refused create returned an id-less body whose `undefined` id was
+      // threaded straight into the next parent. Nothing noticed until step (1)
+      // waited ten seconds for a `.modal.blocked` that could never appear —
+      // the Program had no dependents to block on because every dependent
+      // create after it had been refused. Each create now fails at its own
+      // line, naming itself.
+      const create = async (what, p, b) => {
+        const { status, body } = await post(p, b);
+        if (status !== 200 || !body || body.error || !body.id) {
+          throw new Error(`${what} create failed: ${status} ${JSON.stringify(body)}`);
+        }
+        return body;
+      };
+      // THE EXPLICIT SELECTION (#409 review round). A create no longer inherits
+      // its axes from the parent it names, nor from the account that minted
+      // that parent: a Program-axis create (Season, Team) requires the SAVED
+      // Program, and a Season-owned two-axis create (League, Division,
+      // registration) requires BOTH saved axes — the same Season it writes
+      // into. Minting "Del League" does not select it.
+      //
+      // Driven through `setActiveContext` — the app's OWN switch pipeline, the
+      // exact function `#ctx-select`'s onchange calls — because this journey
+      // goes on to drive real UI: the Setup hierarchy tree, the Season
+      // participation panel and their delete controls are all painted from
+      // client state, and a raw fetch would leave the page rendering one
+      // context while the server enforced another.
+      //
+      // The read-back is ASSERTED, not assumed: a selection that silently fell
+      // back to inferred context would leave this journey green on precisely
+      // the behaviour #409 removes.
+      const selectContext = async (what, programId, seasonId) => {
+        await setActiveContext(programId, seasonId || null);
+        const r = await fetch("/api/context", { credentials: "same-origin" });
+        const read = await r.json();
+        if (r.status !== 200 || read.error) {
+          throw new Error(`${what}: could not read back the explicit selection: `
+            + `${r.status} ${JSON.stringify(read)}`);
+        }
+        if (read.program_id !== programId
+            || (read.season_id || null) !== (seasonId || null)) {
+          throw new Error(`${what}: the active context did not read back as the `
+            + `explicit selection — wanted program=${programId} `
+            + `season=${seasonId || null}, got program=${read.program_id} `
+            + `season=${read.season_id || null}`);
+        }
+      };
+      const league = await create("Program", "/api/setup/league", { name: "Del League" });
+      // BOUNDARY 1 — the Program-only bootstrap selection. The Season below is
+      // a Program-axis create.
+      await selectContext("the Program-only bootstrap", league.id, null);
+      const season = await create("Season", "/api/setup/season",
+        { league_id: league.id, name: "Del Season" });
+      // BOUNDARY 2 — the Program+Season selection. Everything from the grouping
+      // League down is Season-owned and consumes BOTH axes.
+      await selectContext("the Program+Season selection", league.id, season.id);
       // A grouping League (v1 "level") under the season, with the division
       // parented to it (#233 Slice B2b): the v2 Setup Season participation
       // panel only shows a registration whose League resolves — without a
       // level_id here the division/registration would be structurally
       // dangling and never render a Remove control below.
-      const level = await post("/api/setup/level", { season_id: season.id, name: "Del Level" });
-      const div = await post("/api/setup/division",
+      const level = await create("League", "/api/setup/level",
+        { season_id: season.id, name: "Del Level" });
+      const div = await create("Division", "/api/setup/division",
         { season_id: season.id, name: "Del Div", level_id: level.id });
-      const club = await post("/api/setup/club", { name: "Del Club" });
-      const team = await post("/api/setup/team", { club_id: club.id, league_id: league.id, name: "Del Team" });
-      await post(`/api/setup/seasons/${season.id}/team-registrations`,
+      const club = await create("Club", "/api/setup/club", { name: "Del Club" });
+      const team = await create("Del Team", "/api/setup/team",
+        { club_id: club.id, league_id: league.id, name: "Del Team" });
+      await create("registration", `/api/setup/seasons/${season.id}/team-registrations`,
         { team_id: team.id, division_id: div.id });
-      const bare = await post("/api/setup/team", { club_id: club.id, league_id: league.id, name: "Bare Team" });
+      const bare = await create("Bare Team", "/api/setup/team",
+        { club_id: club.id, league_id: league.id, name: "Bare Team" });
       return { league: league.id, season: season.id, div: div.id,
         club: club.id, team: team.id, bare: bare.id };
     });

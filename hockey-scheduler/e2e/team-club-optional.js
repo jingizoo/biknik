@@ -13,6 +13,7 @@ const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
+const { installContextFixture } = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -69,33 +70,49 @@ async function checkViewport(browser, viewport) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
 
     // Fixture prerequisites (org/program/season/league/venue/rink/slot/away
     // team/club) — proven elsewhere; built via raw fetch to keep this
     // journey's UI interactions focused on the Club-optional lifecycle.
+    //
+    // #409 EXPLICIT SELECTION. The Season create is PROGRAM-AXIS and the
+    // League, venue-access grant and away-team registration are SEASON-OWNED,
+    // so both selections are persisted here in the order the axis table
+    // requires and each create is asserted at its own line
+    // (./context-fixture.js). The Team and Player the journey then creates
+    // through the real drawers are PROGRAM-AXIS and ride on the same saved
+    // Program.
     const fx = await page.evaluate(async (d) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const org = await post("/api/v2/setup/organization", { name: "Club Optional Org" });
-      const program = await post("/api/v2/setup/program",
+      const F = window.hsFixture;
+      const org = await F.create("organization", "/api/v2/setup/organization",
+        { name: "Club Optional Org" });
+      const program = await F.create("program", "/api/v2/setup/program",
         { name: "Club Optional Program", operator_organization_id: org.id });
-      const season = await post("/api/v2/setup/season", { program_id: program.id, name: "2026-27" });
-      const league = await post("/api/v2/setup/league", { season_id: season.id, name: "Adult League" });
-      const venue = await post("/api/v2/setup/venue", { name: "V", organization_id: org.id });
+      await F.selectProgram("Program-only bootstrap", program.id);
+      const season = await F.create("season", "/api/v2/setup/season",
+        { program_id: program.id, name: "2026-27" });
+      await F.selectProgramSeason("Program+Season", program.id, season.id);
+      const league = await F.create("league", "/api/v2/setup/league",
+        { season_id: season.id, name: "Adult League" });
+      const venue = await F.create("venue", "/api/v2/setup/venue",
+        { name: "V", organization_id: org.id });
       // Game ice eligibility (#233 Slice E) requires the ice slot's venue to
       // hold an active SeasonVenueAccess grant for this Season. Out of this
       // journey's scope (proven elsewhere).
-      await post(`/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
-      const rink = await post("/api/v2/setup/rink", { venue_id: venue.id, name: "R" });
-      const slot = await post("/api/v2/setup/ice-slot", {
+      await F.call("season venue-access grant",
+        `/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
+      const rink = await F.create("rink", "/api/v2/setup/rink",
+        { venue_id: venue.id, name: "R" });
+      const slot = await F.create("ice slot", "/api/v2/setup/ice-slot", {
         rink_id: rink.id, start_time: `${d}T18:00:00+00:00`, end_time: `${d}T19:00:00+00:00`,
         slot_type: "game",
       });
-      const club = await post("/api/v2/setup/club", { name: "Lions Club" });
-      const away = await post("/api/v2/setup/team", { league_id: league.id, name: "Away Team" });
-      await post(`/api/v2/setup/seasons/${season.id}/team-registrations`,
+      const club = await F.create("club", "/api/v2/setup/club", { name: "Lions Club" });
+      const away = await F.create("team Away Team", "/api/v2/setup/team",
+        { league_id: league.id, name: "Away Team" });
+      await F.call("registration for Away Team",
+        `/api/v2/setup/seasons/${season.id}/team-registrations`,
         { team_id: away.id, league_id: league.id });
       return { program: program.id, season: season.id, league: league.id,
                slot: slot.id, club: club.id, away: away.id };
@@ -136,21 +153,24 @@ async function checkViewport(browser, viewport) {
     // Register the clubless team for the season/league, add a player to it,
     // and schedule a game — the fixtures this journey must prove survive
     // every Club assignment change untouched.
+    // #409: the registration and the Game are both SEASON-OWNED, and real UI
+    // work (a drawer Team create, a Records re-render) has happened since the
+    // bootstrap. Re-assert the two-axis selection here rather than assume the
+    // earlier one is still the saved row — an assumption is exactly the
+    // inference this issue removes, and re-asserting costs one round trip.
     const fx2 = await page.evaluate(async (i) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      await post(`/api/v2/setup/seasons/${i.season}/team-registrations`,
+      const F = window.hsFixture;
+      await F.selectProgramSeason("Program+Season before the Game", i.program, i.season);
+      await F.call("registration for the clubless team",
+        `/api/v2/setup/seasons/${i.season}/team-registrations`,
         { team_id: i.team, league_id: i.league });
-      const game = await post("/api/v2/setup/game", {
+      const game = await F.create("game", "/api/v2/setup/game", {
         season_id: i.season, league_id: i.league,
         home_team_id: i.team, away_team_id: i.away, ice_slot_id: i.slot,
       });
-      if (game.error) return { error: game.error };
       return { game: game.id };
-    }, { season: fx.season, league: fx.league, team, away: fx.away, slot: fx.slot });
-    if (fx2.error) throw new Error(`[${viewport.label}] game create failed: ${JSON.stringify(fx2.error)}`);
+    }, { program: fx.program, season: fx.season, league: fx.league, team,
+         away: fx.away, slot: fx.slot });
     const game = fx2.game;
 
     await page.click('.setup-card .sc-new[data-drawer="player"]');

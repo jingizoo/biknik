@@ -358,6 +358,9 @@ const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
+// #409: the fixtures below must CHOOSE the axes each create/mutation consumes,
+// and must assert every create response before threading its id onward.
+const { installContextFixture } = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -2887,19 +2890,34 @@ async function attemptSecondWrite(page) {
 // non-zero and the grant is live, so `season_active` is the ONLY unmet floor
 // and the card's one offered control is the real reopen path.
 async function archivedSeasonFixture(page, programId, orgId, venueId, name) {
+  // THREE DIFFERENT AXIS SHAPES IN FOUR CALLS, which is why each selection is
+  // stated separately rather than hoisted to one line at the top:
+  //
+  //   1. create Season          PROGRAM-AXIS  — saved Program only. The Season
+  //                             axis is MINTED here, so there is nothing on it
+  //                             to have chosen yet.
+  //   2. grant venue-access     SEASON-OWNED  — `season_venue_access` needs the
+  //                             saved Program AND the Season it lands in, so
+  //                             the selection can only be made after (1).
+  //   3. archive the Season     SEASON-OWNED, but by the MUTATION table, where
+  //                             `season` is Season-owned even though CREATING
+  //                             one is Program-axis. The tuple (2) saved is
+  //                             already the right one, so no fourth selection
+  //                             is needed — but it is required, not incidental.
   const made = await page.evaluate(async ([pid, oid, vid, nm]) => {
-    const post = async (p, b) => (await fetch(p, {
-      method: "POST", credentials: "same-origin",
-      headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-    })).json();
-    const season = await post("/api/v2/setup/season", { program_id: pid, name: nm });
-    await post("/api/context", { program_id: pid, season_id: season.id });
-    const access = await post(`/api/v2/setup/seasons/${season.id}/venue-access`,
-      { venue_id: vid });
-    const archived = await post(`/api/v2/setup/seasons/${season.id}/archive`,
+    const f = window.hsFixture;
+    await f.selectProgram(`select the Program before Season "${nm}"`, pid);
+    const season = await f.create(`Season "${nm}"`, "/api/v2/setup/season",
+      { program_id: pid, name: nm });
+    await f.selectProgramSeason(`select Season "${nm}" before writing into it`,
+      pid, season.id);
+    const access = await f.create(`venue access for "${nm}"`,
+      `/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: vid });
+    const archived = await f.call(`archive of "${nm}"`,
+      `/api/v2/setup/seasons/${season.id}/archive`,
       { reason: "write-identity fixture" });
-    return { season: season.id, name: season.name, access: access && access.id,
-             archived: !!archived && !archived.error, org: oid };
+    return { season: season.id, name: season.name, access: access.id,
+             archived: archived.status === "archived", org: oid };
   }, [programId, orgId, venueId, name]);
   if (!made.season || !made.access || !made.archived) {
     fail(`fixture "${name}" incomplete: ${JSON.stringify(made)}`);
@@ -2921,6 +2939,8 @@ async function checkViewport(browser, viewport) {
     viewport: { width: viewport.width, height: viewport.height },
   });
   const page = await context.newPage();
+  // addInitScript, so the helpers survive this journey's reloads.
+  await installContextFixture(page);
   const errors = [];
   page.on("pageerror", (e) => errors.push(`[pageerror] ${e.message}`));
   // ========== EVERY FAILED DELIVERY, NAMED (#365 review round 9) ===========
@@ -3062,20 +3082,34 @@ async function checkViewport(browser, viewport) {
     // reviewer's own B fixture, and what makes the snapshot comparison
     // sensitive on every axis rather than only on the generation counter.
     const shared = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const org = await post("/api/v2/setup/organization", { name: "WI Org" });
-      const pa = await post("/api/v2/setup/program",
+      const f = window.hsFixture;
+      // ZERO-AXIS ROOTS: an Organization and two Programs. Nothing to select —
+      // a Program's own edge IS its identity, and it is minted here, not
+      // consumed.
+      const org = await f.create("WI org", "/api/v2/setup/organization",
+        { name: "WI Org" });
+      const pa = await f.create("WI Program A", "/api/v2/setup/program",
         { name: "WI Program A", country: "US", operator_organization_id: org.id });
-      const pb = await post("/api/v2/setup/program",
+      const pb = await f.create("WI Program B", "/api/v2/setup/program",
         { name: "WI Program B", country: "US", operator_organization_id: org.id });
-      const venue = await post("/api/v2/setup/venue",
+      // NO SELECTION BEFORE THESE TWO, DELIBERATELY, and this is the one place
+      // in the journey where that is the correct reading of the rule rather
+      // than an omission. `organization` is the sole member of
+      // `_CREATE_PARENT_NO_INHERIT`: a Venue made under an Organization takes
+      // its Program link from the legacy v1 `league_id` alone and so is born
+      // genuinely UNLINKED, in no Program at all. The create gate sees an
+      // axis-free parent, has nothing to compare, and proceeds. The Rink then
+      // inherits that same axis-free Venue. Selecting a Program here would
+      // pass too, but it would MISREPRESENT these rows as living inside it.
+      const venue = await f.create("WI venue", "/api/v2/setup/venue",
         { name: "WI Venue", organization_id: org.id });
-      const rink = await post("/api/v2/setup/rink",
+      const rink = await f.create("WI rink", "/api/v2/setup/rink",
         { venue_id: venue.id, name: "WI Rink" });
-      const sb = await post("/api/v2/setup/season",
+      // PROGRAM-AXIS: a Season create is compared against the saved Program,
+      // and it is Program B's, not A's — this fixture's whole point is that
+      // the two Programs stay distinguishable.
+      await f.selectProgram("select Program B before its Season", pb.id);
+      const sb = await f.create("WI Season B", "/api/v2/setup/season",
         { program_id: pb.id, name: "WI Season B" });
       return { org: org.id, pa: pa.id, pb: pb.id, venue: venue.id,
                rink: rink.id, sb: sb.id, sbName: sb.name };

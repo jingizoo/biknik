@@ -26,6 +26,7 @@ const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
+const { installContextFixture } = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -83,6 +84,21 @@ for line in sys.stdin:
     team_id, league_id, season_id = line.split(",")
     store = srv.STATE.api.store
     ls = store.league_season_for(league_id, season_id)
+    # SAY WHAT WENT WRONG (#409). This lookup returns None whenever the
+    # League/Season the journey asked to inject under was never created --
+    # which, before the explicit selection above, is exactly what a REFUSED
+    # Season create produced. Letting it fall through raised
+    # "AttributeError: 'NoneType' object has no attribute 'id'" INSIDE the
+    # launcher, so the journey reported "launcher process exited
+    # unexpectedly" and never mentioned context at all. Name the real cause.
+    if ls is None:
+        print(
+            "INJECT_FAILED: no LeagueSeason for league_id=%s season_id=%s -- "
+            "the League/Season this injection targets does not exist, so the "
+            "create that should have made it was refused (check the explicit "
+            "context selection) " % (league_id, season_id),
+            flush=True)
+        continue
     reg_id = store.next_id("streg")
     store.add_season_team_registration(SeasonTeamRegistration(
         id=reg_id, league_season_id=ls.id, team_id=team_id,
@@ -108,6 +124,10 @@ function startInjectableServer(port) {
       buffer = buffer.slice(idx + 1);
       if (line.startsWith("INJECTED:") && pending.length) {
         pending.shift().resolve(line.slice("INJECTED:".length));
+      } else if (line.startsWith("INJECT_FAILED:") && pending.length) {
+        // Surface the launcher's own diagnosis at the inject() call site
+        // instead of leaving the promise pending until the process dies.
+        pending.shift().reject(new Error(line.slice("INJECT_FAILED:".length).trim()));
       }
     }
   });
@@ -161,6 +181,7 @@ async function checkViewport(browser, viewport) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
     await page.waitForFunction(
       () => document.body.dataset.view === "onboarding"
         || document.body.dataset.view === "dashboard", null, { timeout: 10000 });
@@ -194,29 +215,41 @@ async function checkViewport(browser, viewport) {
     // permanent teams, a valid Season registration at League A, a player,
     // and facilities (venue + rink + ice slot + season venue access) --
     // isolates the reproduction to participation alone.
+    //
+    // #409 EXPLICIT SELECTION. The Season create is PROGRAM-AXIS; the two
+    // Leagues, the registration and the venue-access grant are SEASON-OWNED.
+    // Both selections are PERSISTED here, in axis order, and every create is
+    // asserted at its own line — this journey's whole subject is what the
+    // progress card reports, so a prerequisite refused in silence would have
+    // shown up as a card that reads "incomplete" and been mistaken for the
+    // very regression the journey hunts.
     const fixture = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const program = await post("/api/v2/setup/program", { name: "Conflict Program" });
-      const season = await post("/api/v2/setup/season",
+      const F = window.hsFixture;
+      const program = await F.create("program", "/api/v2/setup/program",
+        { name: "Conflict Program" });
+      await F.selectProgram("Program-only bootstrap", program.id);
+      const season = await F.create("season", "/api/v2/setup/season",
         { program_id: program.id, name: "2026-27" });
-      const leagueA = await post("/api/v2/setup/league",
+      await F.selectProgramSeason("Program+Season", program.id, season.id);
+      const leagueA = await F.create("league A", "/api/v2/setup/league",
         { season_id: season.id, name: "League A" });
-      const leagueB = await post("/api/v2/setup/league",
+      const leagueB = await F.create("league B", "/api/v2/setup/league",
         { season_id: season.id, name: "League B" });
-      const club = await post("/api/v2/setup/club", { name: "Club" });
-      const team = await post("/api/v2/setup/team",
+      const club = await F.create("club", "/api/v2/setup/club", { name: "Club" });
+      const team = await F.create("team", "/api/v2/setup/team",
         { league_id: leagueA.id, club_id: club.id, name: "Conflict Team" });
-      const reg = await post(`/api/v2/setup/seasons/${season.id}/team-registrations`,
+      const reg = await F.create("registration at League A",
+        `/api/v2/setup/seasons/${season.id}/team-registrations`,
         { team_id: team.id, league_id: leagueA.id, division_id: null });
-      await post("/api/v2/setup/player",
+      await F.create("player", "/api/v2/setup/player",
         { team_id: team.id, name: "Player One", position: "forward" });
-      const venue = await post("/api/v2/setup/venue", { name: "Venue", league_id: program.id });
-      const rink = await post("/api/v2/setup/rink", { venue_id: venue.id, name: "Rink" });
-      await post(`/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
-      await post("/api/v2/setup/ice-slot", {
+      const venue = await F.create("venue", "/api/v2/setup/venue",
+        { name: "Venue", league_id: program.id });
+      const rink = await F.create("rink", "/api/v2/setup/rink",
+        { venue_id: venue.id, name: "Rink" });
+      await F.call("season venue-access grant",
+        `/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
+      await F.create("ice slot", "/api/v2/setup/ice-slot", {
         rink_id: rink.id, start_time: "2026-09-01T18:00:00+00:00",
         end_time: "2026-09-01T19:00:00+00:00", slot_type: "game",
       });

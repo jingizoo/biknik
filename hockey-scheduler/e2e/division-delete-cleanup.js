@@ -18,6 +18,7 @@ const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
+const { installContextFixture } = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -75,25 +76,41 @@ async function checkViewport(browser, viewport) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
 
     // Fixture prerequisites — proven elsewhere, built via raw fetch so this
     // journey's UI interactions stay focused on register/remove/delete.
+    //
+    // #409 EXPLICIT SELECTION. Every create below is asserted through
+    // ./context-fixture.js, and the two selections that make them legal are
+    // written out rather than inferred from the parent each create names. The
+    // Season create is PROGRAM-AXIS, so the Program-only selection has to be
+    // PERSISTED before it; the three Divisions, the venue-access grant, the
+    // two registrations and the Game are SEASON-OWNED, so both axes have to
+    // be persisted before them — and the Season persisted must be the one
+    // they write into.
     const fx = await page.evaluate(async (d) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const org = await post("/api/v2/setup/organization", { name: "Div Cleanup Org" });
-      const program = await post("/api/v2/setup/program",
+      const F = window.hsFixture;
+      const org = await F.create("organization", "/api/v2/setup/organization",
+        { name: "Div Cleanup Org" });
+      const program = await F.create("program", "/api/v2/setup/program",
         { name: "Div Cleanup Program", operator_organization_id: org.id });
-      const season = await post("/api/v2/setup/season", { program_id: program.id, name: "2026-27" });
-      const league = await post("/api/v2/setup/league", { season_id: season.id, name: "Adult League" });
-      const divClean = await post("/api/v2/setup/division", { league_id: league.id, name: "Cleanup Gold" });
-      const divActive = await post("/api/v2/setup/division", { league_id: league.id, name: "Active Gold" });
-      const divGame = await post("/api/v2/setup/division", { league_id: league.id, name: "Game Gold" });
-      const club = await post("/api/v2/setup/club", { name: "Div Cleanup Club" });
+      await F.selectProgram("Program-only bootstrap", program.id);
+      const season = await F.create("season", "/api/v2/setup/season",
+        { program_id: program.id, name: "2026-27" });
+      await F.selectProgramSeason("Program+Season", program.id, season.id);
+      const league = await F.create("league", "/api/v2/setup/league",
+        { season_id: season.id, name: "Adult League" });
+      const divClean = await F.create("division Cleanup Gold", "/api/v2/setup/division",
+        { league_id: league.id, name: "Cleanup Gold" });
+      const divActive = await F.create("division Active Gold", "/api/v2/setup/division",
+        { league_id: league.id, name: "Active Gold" });
+      const divGame = await F.create("division Game Gold", "/api/v2/setup/division",
+        { league_id: league.id, name: "Game Gold" });
+      const club = await F.create("club", "/api/v2/setup/club", { name: "Div Cleanup Club" });
       const team = async (name) =>
-        (await post("/api/v2/setup/team", { league_id: league.id, club_id: club.id, name })).id;
+        (await F.create(`team ${name}`, "/api/v2/setup/team",
+          { league_id: league.id, club_id: club.id, name })).id;
       const team1 = await team("Cleanup Team A");
       const team2 = await team("Cleanup Team B");
       const teamActive = await team("Active Blocker Team");
@@ -102,27 +119,34 @@ async function checkViewport(browser, viewport) {
       // Fixtures for scenario (3): a cancelled Game referencing divGame, both
       // its teams then removed from the season (a Game still blocks even
       // with zero active registrations left).
-      const venue = await post("/api/v2/setup/venue", { name: "V", organization_id: org.id });
+      const venue = await F.create("venue", "/api/v2/setup/venue",
+        { name: "V", organization_id: org.id });
       // Game ice eligibility (#233 Slice E) requires the ice slot's venue to
       // hold an active SeasonVenueAccess grant for this Season. Out of this
       // journey's scope (proven elsewhere).
-      await post(`/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
-      const rink = await post("/api/v2/setup/rink", { venue_id: venue.id, name: "R" });
-      const slot = await post("/api/v2/setup/ice-slot", {
+      await F.call("season venue-access grant",
+        `/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
+      const rink = await F.create("rink", "/api/v2/setup/rink",
+        { venue_id: venue.id, name: "R" });
+      const slot = await F.create("ice slot", "/api/v2/setup/ice-slot", {
         rink_id: rink.id, start_time: `${d}T18:00:00+00:00`, end_time: `${d}T19:00:00+00:00`,
         slot_type: "game",
       });
-      const regHome = await post(`/api/v2/setup/seasons/${season.id}/team-registrations`,
+      const regHome = await F.create("registration Game Home",
+        `/api/v2/setup/seasons/${season.id}/team-registrations`,
         { team_id: teamGameHome, league_id: league.id, division_id: divGame.id });
-      const regAway = await post(`/api/v2/setup/seasons/${season.id}/team-registrations`,
+      const regAway = await F.create("registration Game Away",
+        `/api/v2/setup/seasons/${season.id}/team-registrations`,
         { team_id: teamGameAway, league_id: league.id, division_id: divGame.id });
-      const game = await post("/api/v2/setup/game", {
+      const game = await F.create("game", "/api/v2/setup/game", {
         season_id: season.id, league_id: league.id, division_id: divGame.id,
         home_team_id: teamGameHome, away_team_id: teamGameAway, ice_slot_id: slot.id,
       });
-      await post(`/api/games/${game.id}/cancel`, {});
-      await post(`/api/v2/setup/season-team-registration/${regHome.id}/remove`, {});
-      await post(`/api/v2/setup/season-team-registration/${regAway.id}/remove`, {});
+      await F.call("game cancel", `/api/games/${game.id}/cancel`, {});
+      await F.call("remove Game Home registration",
+        `/api/v2/setup/season-team-registration/${regHome.id}/remove`, {});
+      await F.call("remove Game Away registration",
+        `/api/v2/setup/season-team-registration/${regAway.id}/remove`, {});
 
       return {
         program: program.id, season: season.id, league: league.id,

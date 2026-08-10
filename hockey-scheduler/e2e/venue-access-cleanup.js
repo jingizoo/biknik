@@ -50,6 +50,7 @@ const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
+const { installContextFixture } = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -114,38 +115,43 @@ async function checkViewport(browser, viewport) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
 
     // Fixture prerequisites — an otherwise-empty Program/Season and a
     // Venue, built via raw fetch so this journey's UI interactions stay
     // focused on the venue-access-cleanup surface itself.
     const fx = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const org = await post("/api/v2/setup/organization", { name: "VA Cleanup Org" });
-      const program = await post("/api/v2/setup/program",
+      const F = window.hsFixture;
+      const org = await F.create("organization", "/api/v2/setup/organization", { name: "VA Cleanup Org" });
+      const program = await F.create("program", "/api/v2/setup/program",
         { name: "VA Cleanup Program", operator_organization_id: org.id });
-      const season = await post("/api/v2/setup/season", { program_id: program.id, name: "2028-29" });
-      const venue = await post("/api/v2/setup/venue", { name: "VA Cleanup Venue", organization_id: org.id });
-      // #369 OWNER RULING: the Allowed-venues list and its Allow picker are
+      // #409 EXPLICIT SELECTION, boundary 1: the Season create is
+      // PROGRAM-AXIS, and minting the Program above is not a selection.
+      await F.selectProgram("Program-only bootstrap", program.id);
+      const season = await F.create("season", "/api/v2/setup/season",
+        { program_id: program.id, name: "2028-29" });
+      const venue = await F.create("venue", "/api/v2/setup/venue",
+        { name: "VA Cleanup Venue", organization_id: org.id });
+      // BOUNDARY 2, and the reason it was already needed here before #409:
+      // #369 OWNER RULING -- the Allowed-venues list and its Allow picker are
       // served only for the EXACT persisted selected Season, and the client
       // decides which Season that is from the context options it loaded at
-      // page load -- i.e. before this raw-fetch fixture existed. Select this
-      // Season explicitly here (and reload below), rather than relying on the
-      // server's fallback resolution happening to land on it.
-      await post("/api/context", { program_id: program.id, season_id: season.id });
+      // page load. The grant the journey then makes through the real Allow
+      // control is SEASON-OWNED besides. Select the Season explicitly, and
+      // through `setActiveContext` rather than a raw POST -- see the note at
+      // the reload below for what that fixes.
+      await F.selectProgramSeason("Program+Season", program.id, season.id);
       return { program: program.id, season: season.id, venue: venue.id };
     });
 
     // Re-enter with the context this journey operates in: `contextOptions` is
-    // seeded once per page load and never re-polled by render(). Drop the
-    // URL's "#ctx=" deep link first — app.js keeps it in sync only through the
-    // real switcher, so after a raw POST it still encodes the PREVIOUS
-    // selection and bootstrap() would faithfully POST that back (the same
-    // guard venue-sharing.js's activate() carries, for the same reason).
-    await page.evaluate(() => history.replaceState(
-      null, "", location.pathname + location.search));
+    // seeded once per page load and never re-polled by render(). The URL's
+    // "#ctx=" deep link no longer has to be dropped first: the selection
+    // above went through `setActiveContext`, the app's own switch pipeline,
+    // which keeps the hash in step with the server — so what bootstrap()
+    // re-adopts on this reload IS this journey's selection. Dropping the hash
+    // was only ever a patch over a raw `POST /api/context` that moved the
+    // server and left the client's URL naming the previous selection (#409).
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
     await page.click('.tab[data-tab="setup"]');
@@ -279,52 +285,53 @@ async function checkViewport(browser, viewport) {
     // must never be purgeable — the cleanup trash action itself must show
     // the blocked modal, not silently succeed.
     const fx2 = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const org = await post("/api/v2/setup/organization", { name: "VA Game Org" });
-      const program = await post("/api/v2/setup/program",
+      const F = window.hsFixture;
+      const org = await F.create("organization", "/api/v2/setup/organization", { name: "VA Game Org" });
+      const program = await F.create("program", "/api/v2/setup/program",
         { name: "VA Game Program", operator_organization_id: org.id });
-      const season = await post("/api/v2/setup/season", { program_id: program.id, name: "2029-30" });
-      const league = await post("/api/v2/setup/league", { season_id: season.id, name: "L" });
-      const division = await post("/api/v2/setup/division", { league_id: league.id, name: "D" });
-      const club = await post("/api/v2/setup/club", { name: "VA Game Club" });
-      const home = await post("/api/v2/setup/team",
+      // #409, same two boundaries as the first fixture: Season is
+      // PROGRAM-AXIS; the League, Division, the two registrations, the
+      // venue-access grant and the Game are all SEASON-OWNED and all land in
+      // THIS Season.
+      await F.selectProgram("Program-only bootstrap (VA Game)", program.id);
+      const season = await F.create("season", "/api/v2/setup/season",
+        { program_id: program.id, name: "2029-30" });
+      await F.selectProgramSeason("Program+Season (VA Game)", program.id, season.id);
+      const league = await F.create("league", "/api/v2/setup/league",
+        { season_id: season.id, name: "L" });
+      const division = await F.create("division", "/api/v2/setup/division", { league_id: league.id, name: "D" });
+      const club = await F.create("club", "/api/v2/setup/club", { name: "VA Game Club" });
+      const home = await F.create("home", "/api/v2/setup/team",
         { league_id: league.id, club_id: club.id, name: "Home" });
-      const away = await post("/api/v2/setup/team",
+      const away = await F.create("away", "/api/v2/setup/team",
         { league_id: league.id, club_id: club.id, name: "Away" });
-      await post(`/api/v2/setup/seasons/${season.id}/team-registrations`,
+      await F.call("team registration", `/api/v2/setup/seasons/${season.id}/team-registrations`,
         { team_id: home.id, league_id: league.id, division_id: division.id });
-      await post(`/api/v2/setup/seasons/${season.id}/team-registrations`,
+      await F.call("team registration", `/api/v2/setup/seasons/${season.id}/team-registrations`,
         { team_id: away.id, league_id: league.id, division_id: division.id });
-      const venue = await post("/api/v2/setup/venue", { name: "VA Game Venue", organization_id: org.id });
-      const rink = await post("/api/v2/setup/rink", { venue_id: venue.id, name: "R" });
-      const slot = await post("/api/v2/setup/ice-slot", {
+      const venue = await F.create("venue", "/api/v2/setup/venue", { name: "VA Game Venue", organization_id: org.id });
+      const rink = await F.create("rink", "/api/v2/setup/rink", { venue_id: venue.id, name: "R" });
+      const slot = await F.create("slot", "/api/v2/setup/ice-slot", {
         rink_id: rink.id, start_time: "2029-09-01T18:00:00+00:00",
         end_time: "2029-09-01T19:30:00+00:00", slot_type: "game",
       });
-      const access = await post(`/api/v2/setup/seasons/${season.id}/venue-access`,
+      const access = await F.create("access", `/api/v2/setup/seasons/${season.id}/venue-access`,
         { venue_id: venue.id });
       // The Game itself is out of this journey's scope (already driven
       // through the wizard/UI in allowed-venues.js) — built via raw fetch
       // so this journey stays focused on the cleanup-block surface.
-      const game = await post("/api/v2/setup/game", {
+      const game = await F.create("game", "/api/v2/setup/game", {
         season_id: season.id, division_id: division.id, league_id: league.id,
         home_team_id: home.id, away_team_id: away.id, ice_slot_id: slot.id,
       });
-      await post(`/api/v2/setup/season-venue-access/${access.id}/remove`, {});
-      // Same reason as the first fixture (#369 owner ruling): this scenario's
-      // Revoked-venue-access row is rendered only for the SELECTED Season, so
-      // move to it explicitly instead of depending on the server's fallback.
-      await post("/api/context", { program_id: program.id, season_id: season.id });
+      await F.call("venue-access remove", `/api/v2/setup/season-venue-access/${access.id}/remove`, {});
       return { season: season.id, venue: venue.id, access: access.id, game: game.id };
     });
 
-    // Same deep-link drop as the first fixture: the hash still names the
-    // Season deleted in step (6), which bootstrap() would try to re-adopt.
-    await page.evaluate(() => history.replaceState(
-      null, "", location.pathname + location.search));
+    // No deep-link drop needed here either: the fixture's own
+    // `selectProgramSeason` moved the hash off the Season deleted in step (6)
+    // and onto this scenario's Season at the same moment it moved the server,
+    // so bootstrap() re-adopts the right one (#409).
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.click('.tab[data-tab="setup"]');
     await page.click('[data-setup-view="hierarchy"]');
@@ -376,39 +383,42 @@ async function checkViewport(browser, viewport) {
     // resolution the row would render a bare id, and the name assertion below
     // is what catches it.
     const fx3 = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const orgA = await post("/api/v2/setup/organization", { name: "VA Archive Org A" });
-      const programA = await post("/api/v2/setup/program",
+      const F = window.hsFixture;
+      const orgA = await F.create("orgA", "/api/v2/setup/organization", { name: "VA Archive Org A" });
+      const programA = await F.create("programA", "/api/v2/setup/program",
         { name: "VA Archive Program A", operator_organization_id: orgA.id });
-      const seasonA = await post("/api/v2/setup/season",
+      // #409: each Season create is PROGRAM-AXIS and names a DIFFERENT
+      // Program, so the saved Program moves to the one being written into
+      // before each — there is no ambient default that could be right for
+      // both, and minting a Program is not selecting it.
+      await F.selectProgram("Program A only", programA.id);
+      const seasonA = await F.create("seasonA", "/api/v2/setup/season",
         { program_id: programA.id, name: "2031-32" });
-      const orgB = await post("/api/v2/setup/organization", { name: "VA Archive Org B" });
-      const programB = await post("/api/v2/setup/program",
+      const orgB = await F.create("orgB", "/api/v2/setup/organization", { name: "VA Archive Org B" });
+      const programB = await F.create("programB", "/api/v2/setup/program",
         { name: "VA Archive Program B", operator_organization_id: orgB.id });
-      const seasonB = await post("/api/v2/setup/season",
+      await F.selectProgram("Program B only", programB.id);
+      const seasonB = await F.create("seasonB", "/api/v2/setup/season",
         { program_id: programB.id, name: "2031-32 B" });
-      const home = await post("/api/v2/setup/venue",
+      const home = await F.create("home", "/api/v2/setup/venue",
         { name: "VA-ARCHIVE-HOME", organization_id: orgA.id });
-      const shared = await post("/api/v2/setup/venue",
+      const shared = await F.create("shared", "/api/v2/setup/venue",
         { name: "VA-ARCHIVE-SHARED", organization_id: orgB.id });
-      const retired = await post("/api/v2/setup/venue",
+      const retired = await F.create("retired", "/api/v2/setup/venue",
         { name: "VA-ARCHIVE-RETIRED", organization_id: orgA.id });
       // A grant binds to the SELECTED destination Season (#369 target
       // authorization), so each destination is selected before granting into
       // it — the production guard is honoured, never bypassed.
-      await post("/api/context", { program_id: programB.id, season_id: seasonB.id });
-      await post(`/api/v2/setup/seasons/${seasonB.id}/venue-access`, { venue_id: shared.id });
-      await post("/api/context", { program_id: programA.id, season_id: seasonA.id });
-      const gHome = await post(`/api/v2/setup/seasons/${seasonA.id}/venue-access`,
+      await F.selectProgramSeason("Program B + Season B", programB.id, seasonB.id);
+      await F.call("Season B venue-access grant", `/api/v2/setup/seasons/${seasonB.id}/venue-access`, { venue_id: shared.id });
+      await F.selectProgramSeason("Program A + Season A", programA.id, seasonA.id);
+      const gHome = await F.create("gHome", `/api/v2/setup/seasons/${seasonA.id}/venue-access`,
         { venue_id: home.id });
-      const gShared = await post(`/api/v2/setup/seasons/${seasonA.id}/venue-access`,
+      const gShared = await F.create("gShared", `/api/v2/setup/seasons/${seasonA.id}/venue-access`,
         { venue_id: shared.id });
-      const gRetired = await post(`/api/v2/setup/seasons/${seasonA.id}/venue-access`,
+      const gRetired = await F.create("gRetired", `/api/v2/setup/seasons/${seasonA.id}/venue-access`,
         { venue_id: retired.id });
-      await post(`/api/v2/setup/season-venue-access/${gRetired.id}/remove`, {});
+      await F.call("venue-access remove", `/api/v2/setup/season-venue-access/${gRetired.id}/remove`, {});
       return {
         program: programA.id, season: seasonA.id,
         home: home.id, shared: shared.id, retired: retired.id,
@@ -470,13 +480,11 @@ async function checkViewport(browser, viewport) {
     // archived through the API), so this is a raw POST; the SELECTION that
     // follows goes through the same /api/context the switcher posts.
     const archivedCtx = await page.evaluate(async (i) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const archived = await post(`/api/v2/setup/seasons/${i.season}/archive`,
+      const F = window.hsFixture;
+      const archived = await F.create("archived", `/api/v2/setup/seasons/${i.season}/archive`,
         { reason: "season complete" });
-      await post("/api/context", { program_id: i.program, season_id: i.season });
+      await F.selectProgramSeason("re-select the now-archived Season",
+        i.program, i.season);
       const ctx = await (await fetch("/api/context", { credentials: "same-origin" })).json();
       return { archived, ctx };
     }, { program: fx3.program, season: fx3.season });

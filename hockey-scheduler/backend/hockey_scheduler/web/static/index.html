@@ -194,7 +194,21 @@
             <select id="ctx-league-select" class="ctx-select ctx-league-select" hidden
                     aria-describedby="ctx-scope-note"
                     aria-label="Active League — leave it on No League to work across every League in this Season"></select>
-            <span id="ctx-static" class="ctx-static" hidden></span>
+            <!-- tabindex="-1" (#411): the chip is where focus LANDS when
+                 #ctx-confirm beside it succeeds and hides itself. Without a
+                 focus target the activation would drop focus to <body> and a
+                 keyboard/AT operator would lose their place at the exact moment
+                 the selection they just made was confirmed. Not in the tab
+                 order (-1) -- it is still a label, not a control. -->
+            <span id="ctx-static" class="ctx-static" tabindex="-1" hidden></span>
+            <!-- THE EXPLICIT SINGLE-PROGRAM SELECTION (#411). A real <button>,
+                 so Enter and Space activate it natively and its text is its
+                 accessible name. Painted ONLY when the switcher has collapsed to
+                 one entry AND that entry is not already PERSISTED (options.saved
+                 -- the authority the create gates read, never the fallback the
+                 chip beside it renders). Nothing here fires on render: a
+                 selection is a mutation and must come from the operator. -->
+            <button id="ctx-confirm" class="act ghost ctx-confirm" type="button" hidden></button>
             <span id="ctx-ro" class="ctx-ro" hidden>read-only</span>
             <span id="ctx-scope-note" class="ctx-scope-note">Switching this changes what you see</span>
           </div>

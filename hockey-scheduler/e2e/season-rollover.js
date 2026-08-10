@@ -29,6 +29,9 @@ const fs = require("fs");
 const http = require("http");
 const os = require("os");
 const path = require("path");
+const {
+  installContextFixture, selectProgramSeason,
+} = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -52,6 +55,21 @@ from hockey_scheduler.domain import SeasonTeamRegistration
 store = create_store(os.environ["FIXTURE_DB_PATH"])
 try:
     ls = store.league_season_for(os.environ["FIXTURE_LEAGUE_ID"], os.environ["FIXTURE_SEASON_ID"])
+    # SAY WHAT WENT WRONG (#409). None here means no LeagueSeason links this
+    # League to this Season -- i.e. the create that should have made it was
+    # REFUSED, for want of an explicit selection, and this injector is the
+    # first thing downstream to touch the missing row. Falling through raised
+    # "AttributeError: 'NoneType' object has no attribute 'id'" from the line
+    # below, inside a subprocess, so the journey reported "launcher process
+    # exited unexpectedly" and never mentioned context at all -- the single
+    # most expensive misdiagnosis in this sweep. Name the real cause here.
+    if ls is None:
+        raise SystemExit(
+            "no LeagueSeason links league {} to season {}, so there is nothing "
+            "to register against. The create that should have made it was "
+            "REFUSED -- check that the journey explicitly SELECTED the Program "
+            "(and, for a Season-owned create, the Season) beforehand.".format(
+                os.environ["FIXTURE_LEAGUE_ID"], os.environ["FIXTURE_SEASON_ID"]))
     reg_id = store.next_id("streg")
     store.add_season_team_registration(SeasonTeamRegistration(
         id=reg_id, league_season_id=ls.id,
@@ -146,6 +164,7 @@ async function checkViewport(browser, viewport) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
 
     // Build three permanent teams, each under its OWN permanent League (#283
     // Slice E rules 2, 3, 7): a Team is created with a REQUIRED league_id and
@@ -166,34 +185,41 @@ async function checkViewport(browser, viewport) {
     // A fourth, league-less season lets the panel refuse a target with no
     // Leagues (review #216, point 3 — re-scoped to League).
     const ids = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const program = await post("/api/v2/setup/program", { name: "Rollover Program" });
-      const src = await post("/api/v2/setup/season", { program_id: program.id, name: "2026-27" });
-      const dst = await post("/api/v2/setup/season", { program_id: program.id, name: "2027-28" });
+      const F = window.hsFixture;
+      const program = await F.create("program", "/api/v2/setup/program", { name: "Rollover Program" });
+      // #409 EXPLICIT SELECTION, boundary 1: all three Season creates are
+      // PROGRAM-AXIS, and minting the Program is not selecting it.
+      await F.selectProgram("Program-only bootstrap", program.id);
+      const src = await F.create("source season", "/api/v2/setup/season", { program_id: program.id, name: "2026-27" });
+      const dst = await F.create("destination season", "/api/v2/setup/season", { program_id: program.id, name: "2027-28" });
       // A fourth season in the same program with NO leagues — the rollover must
       // refuse it as a target (review #216, point 3 — re-scoped to League).
-      const empty = await post("/api/v2/setup/season", { program_id: program.id, name: "2028-29" });
+      const empty = await F.create("empty season", "/api/v2/setup/season", { program_id: program.id, name: "2028-29" });
+      // BOUNDARY 2. lgA/dstA/lgB/dstB are SEASON-OWNED and land in the
+      // DESTINATION season, so the destination is what must be saved for
+      // them. This fixture straddles two Seasons deliberately, so each
+      // create's Season is stated rather than inherited.
+      await F.selectProgramSeason("Program + destination season", program.id, dst.id);
       // Permanent Leagues. lgA/lgB bound to the target first so each can get a
       // target Division before it also spans the source season (below).
-      const lgA = await post("/api/v2/setup/league", { season_id: dst.id, name: "Adult League" });
-      const dstA = await post("/api/v2/setup/division", { league_id: lgA.id, name: "Gold" });
-      const lgB = await post("/api/v2/setup/league", { season_id: dst.id, name: "Junior League" });
-      const dstB = await post("/api/v2/setup/division", { league_id: lgB.id, name: "Silver" });
+      const lgA = await F.create("league lgA", "/api/v2/setup/league", { season_id: dst.id, name: "Adult League" });
+      const dstA = await F.create("destination division Gold", "/api/v2/setup/division", { league_id: lgA.id, name: "Gold" });
+      const lgB = await F.create("league lgB", "/api/v2/setup/league", { season_id: dst.id, name: "Junior League" });
+      const dstB = await F.create("destination division Silver", "/api/v2/setup/division", { league_id: lgB.id, name: "Silver" });
       // lgC lives in the SOURCE season only — no target participation yet.
-      const lgC = await post("/api/v2/setup/league", { season_id: src.id, name: "Youth League" });
-      const club = await post("/api/v2/setup/club", { name: "Rollover Club" });
+      // lgC is SEASON-OWNED in the SOURCE season, so the saved Season moves.
+      await F.selectProgramSeason("Program + source season", program.id, src.id);
+      const lgC = await F.create("league lgC", "/api/v2/setup/league", { season_id: src.id, name: "Youth League" });
+      const club = await F.create("club", "/api/v2/setup/club", { name: "Rollover Club" });
       // Each Team is created under its permanent League (league_id REQUIRED).
-      const lions = await post("/api/v2/setup/team",
+      const lions = await F.create("lions", "/api/v2/setup/team",
         { league_id: lgA.id, club_id: club.id, name: "Lions" });
-      const bears = await post("/api/v2/setup/team",
+      const bears = await F.create("bears", "/api/v2/setup/team",
         { league_id: lgB.id, club_id: club.id, name: "Bears" });
       // Carried in a SEPARATE second rollover round below with only its
       // (fixed, permanent) League and Division left at "No division" — covers
       // a rollover selection whose stored division_id is actually null.
-      const wolves = await post("/api/v2/setup/team",
+      const wolves = await F.create("wolves", "/api/v2/setup/team",
         { league_id: lgC.id, club_id: club.id, name: "Wolves" });
       // All three teams play the source season, each into its OWN permanent
       // League (rule 7). Registering binds lgA/lgB to the source season too;
@@ -202,15 +228,26 @@ async function checkViewport(browser, viewport) {
       // key off the SOURCE registration's own id (never team_id — two rows
       // for one team must never collide on a shared key), so every
       // selector below needs the created registration's id, not the team's.
-      const lionsSrcReg = await post(`/api/v2/setup/seasons/${src.id}/team-registrations`,
+      // The three SOURCE registrations are SEASON-OWNED in the source season.
+      await F.selectProgramSeason("Program + source season", program.id, src.id);
+      const lionsSrcReg = await F.create("Lions' source registration", `/api/v2/setup/seasons/${src.id}/team-registrations`,
         { team_id: lions.id, league_id: lgA.id, division_id: null });
-      const bearsSrcReg = await post(`/api/v2/setup/seasons/${src.id}/team-registrations`,
+      const bearsSrcReg = await F.create("Bears' source registration", `/api/v2/setup/seasons/${src.id}/team-registrations`,
         { team_id: bears.id, league_id: lgB.id, division_id: null });
-      const wolvesSrcReg = await post(`/api/v2/setup/seasons/${src.id}/team-registrations`,
+      const wolvesSrcReg = await F.create("Wolves' source registration", `/api/v2/setup/seasons/${src.id}/team-registrations`,
         { team_id: wolves.id, league_id: lgC.id, division_id: null });
       // Lions is already in the target season under its OWN permanent League
       // (lgA + Gold) — the rollover must skip it, not duplicate it.
-      await post(`/api/v2/setup/seasons/${dst.id}/team-registrations`,
+      // Lions' DESTINATION registration lands in the destination season, so
+      // the saved Season moves back to it. It also leaves the fixture ON the
+      // destination — which is what the roll-forward below requires: for that
+      // one surface the production rule is SPLIT (server.py:3649 plus the
+      // `"program"` narrowing at service.py:2213-2222), the DESTINATION
+      // season must equal the saved Season while the SOURCE is bounded only
+      // by the saved Program. Selecting the source here would be refused.
+      await F.selectProgramSeason("Program + destination season", program.id, dst.id);
+      await F.call("Lions' destination registration",
+        `/api/v2/setup/seasons/${dst.id}/team-registrations`,
         { team_id: lions.id, league_id: lgA.id, division_id: dstA.id });
       return { program: program.id, src: src.id, dst: dst.id, empty: empty.id,
         lgA: lgA.id, lgB: lgB.id, lgC: lgC.id,
@@ -418,28 +455,31 @@ async function checkViewport(browser, viewport) {
     // Division into the committed request, not whichever row a global
     // (non-scoped) attribute lookup happened to find first.
     const foxFixture = await page.evaluate(async (i) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
+      const F = window.hsFixture;
       // Foxes' permanent League (lgD) participates in BOTH seasons, with a
       // target Division ("Copper") both of its source rows' Division
       // selects will offer (Division options derive from the TEAM's
       // permanent League, never the individual source row).
-      const lgD = await post("/api/v2/setup/league", { season_id: i.dst, name: "Copper League" });
-      const dstD = await post("/api/v2/setup/division", { league_id: lgD.id, name: "Copper" });
+      // #409: Copper League and its Division are SEASON-OWNED in the
+      // DESTINATION season.
+      await F.selectProgramSeason("Program + destination season", i.program, i.dst);
+      const lgD = await F.create("Copper League", "/api/v2/setup/league", { season_id: i.dst, name: "Copper League" });
+      const dstD = await F.create("destination division Copper", "/api/v2/setup/division", { league_id: lgD.id, name: "Copper" });
       // A second, SOURCE-only League purely to give the stray row a real
       // LeagueSeason to sit at -- never Foxes' own permanent League, so it
       // reads as the same "stray active row under a different League" shape
       // league_scope.py's own docstring names.
-      const lgE = await post("/api/v2/setup/league", { season_id: i.src, name: "Stray League" });
-      const club = await post("/api/v2/setup/club", { name: "Fox Club" });
-      const foxes = await post("/api/v2/setup/team",
+      // Stray League and Foxes' real registration are SEASON-OWNED in the
+      // SOURCE season.
+      await F.selectProgramSeason("Program + source season", i.program, i.src);
+      const lgE = await F.create("Stray League", "/api/v2/setup/league", { season_id: i.src, name: "Stray League" });
+      const club = await F.create("club", "/api/v2/setup/club", { name: "Fox Club" });
+      const foxes = await F.create("foxes", "/api/v2/setup/team",
         { league_id: lgD.id, club_id: club.id, name: "Foxes" });
-      const realReg = await post(`/api/v2/setup/seasons/${i.src}/team-registrations`,
+      const realReg = await F.create("Foxes' real source registration", `/api/v2/setup/seasons/${i.src}/team-registrations`,
         { team_id: foxes.id, league_id: lgD.id, division_id: null });
       return { lgD: lgD.id, dstD: dstD.id, lgE: lgE.id, foxes: foxes.id, realReg: realReg.id };
-    }, { src: ids.src, dst: ids.dst });
+    }, { program: ids.program, src: ids.src, dst: ids.dst });
     // Planted directly into the SAME durable SQLite file the running server
     // uses -- no current write path can leave this behind for a Team with a
     // permanent League already set (register_team_for_season/
@@ -479,6 +519,16 @@ async function checkViewport(browser, viewport) {
     if (foxRows.sameElement) {
       throw new Error(`[${viewport.label}] both Foxes rows resolved to the SAME element/registration id`);
     }
+
+    // #409 SPLIT RULE, second round. The roll-forward writes its
+    // registrations into the DESTINATION season, so the destination is what
+    // must be SAVED; the source is bounded only by the saved Program. The fox
+    // fixture above finished on the SOURCE season (it created Stray League
+    // and Foxes' source registration there), so state the destination again
+    // before committing — a fixture that left the source selected would be
+    // refused here, and that refusal would look like a rollover bug.
+    await selectProgramSeason(page, `[${viewport.label}] destination season for the roll-forward`,
+      ids.program, ids.dst);
 
     // Check ONLY the stray row (real interaction, not a JS-internal state
     // poke) and pick "Copper" for ITS OWN Division select — the real row
