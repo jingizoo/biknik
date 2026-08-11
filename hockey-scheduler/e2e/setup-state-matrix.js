@@ -152,6 +152,9 @@
 //     at end-of-viewport, never live. Unmatched responses, requestfailed,
 //     failed-resource console lines and UNDELIVERED injections all fail the
 //     run. A fungible "ignore the next console error" counter is forbidden.
+//     The ONE class of failed delivery that is forgiven is an intentional
+//     cancellation by #409's context-switch settlement barrier, and only on
+//     the app's own written claim — see rule (6) in reconcileDeliveries().
 //   * QUIESCENCE BEFORE ACTING. Every sample and every keyboard action is
 //     taken on a page with no request in flight and none started for 300ms.
 //     This is not politeness: an in-flight render commits a fresh model for
@@ -391,9 +394,41 @@ function trace(msg) { console.error(`  · ${msg}`); }
 //      URL in m.location() against the URLs step 2 accepted, one line per
 //      accepted failure. A console line for any other URL fails the run and is
 //      reported WITH that URL, which m.text() alone never carried.
-//   6. A request that never got a response at all is always a failure.
-function reconcileDeliveries(nonOk, injected, consoleErrors, failedReqs) {
+//   6. A request that never got a response at all is a failure UNLESS THE APP
+//      ITSELF CLAIMS IT. #409's context-switch settlement barrier cancels the
+//      two exact-Season-scoped Setup reads (`/venue-access`,
+//      `/venue-candidates`) when the operator switches context, and Chromium
+//      reports every such cancellation as `net::ERR_ABORTED` on a request that
+//      never got a response — which is what leg (7) produces here, on the very
+//      surface CI shard 1 failed. An intentional cancellation is NOT a failed
+//      delivery, so it is forgiven, but only on the app's own written
+//      statement of intent: app.js pushes every abort to
+//      `contextScopedReadAborts` with method, URL, generation and whether the
+//      request had been dispatched, and this journey mirrors that ledger.
+//
+//      A failure is explained only when ALL of these hold, and each claim
+//      explains AT MOST ONE failure:
+//        * the failure text is exactly `net::ERR_ABORTED` — a connection
+//          reset or a DNS failure is not something the app cancelled;
+//        * the URL is one of the two ENROLLED scoped routes — the abort
+//          ledger cannot launder a cancellation of anything else;
+//        * a ledger entry with `dispatched: true` matches by method and URL —
+//          a claim that the request never reached the wire explains no wire
+//          failure at all.
+//      This is also the POSITIVE reading of the enrolment: a scoped read that
+//      is NOT routed through getJSONContextScoped() is cancelled by nothing,
+//      claims nothing, and its 404 (or, once the page moves on, its unclaimed
+//      ERR_ABORTED) arrives here as a named failure.
+const SCOPED_READ_RE =
+  /^\/api\/v2\/setup\/seasons\/[^/?]+\/venue-(access|candidates)(?:\?|$)/;
+// Both ledgers name the same request different ways: Playwright reports an
+// absolute URL, app.js records the path it was given. Compared as paths.
+const relUrl = (u) => String(u || "").replace(/^https?:\/\/[^/]+/, "");
+function reconcileDeliveries(nonOk, injected, consoleErrors, failedReqs, aborts) {
   const out = [];
+  // Copied so a claim can be marked spent without mutating the caller's
+  // harvested ledger, which is also printed.
+  const abortPool = (aborts || []).map((a) => ({ ...a, used: false }));
   const accepted = new Map();  // url -> how many console lines it may explain
   for (const rec of nonOk) {
     if (rec.status < 400) continue;                                    // (1)
@@ -421,6 +456,20 @@ function reconcileDeliveries(nonOk, injected, consoleErrors, failedReqs) {
     out.push(`[console] ${c.text} @ ${c.url || "<no location reported>"}`);
   }
   for (const f of failedReqs) {                                        // (6)
+    const path_ = relUrl(f.url);
+    if (f.failure === "net::ERR_ABORTED" && SCOPED_READ_RE.test(path_)) {
+      const claim = abortPool.find((a) => !a.used && a.dispatched
+        && a.method === f.method && relUrl(a.url) === path_);
+      if (claim) { claim.used = true; continue; }
+      out.push(`[requestfailed] ${f.method} ${f.url} -> ${f.failure} — this is `
+        + `a context-scoped Setup read that was cancelled, but the app's own `
+        + `abort ledger (contextScopedReadAborts) does not claim it. An `
+        + `UNCLAIMED cancellation of an exact-Season read means the read was `
+        + `never enrolled in the settlement barrier — i.e. it went out through `
+        + `the raw fetch and nothing awaited it before the context POST. `
+        + `Ledger: ${JSON.stringify(aborts || [])}`);
+      continue;
+    }
     out.push(`[requestfailed] ${f.method} ${f.url} -> ${f.failure}`);
   }
   return out;
@@ -435,6 +484,12 @@ function selfTestDeliveryReconciler() {
   const OVERVIEW = "http://127.0.0.1:8481/api/v2/setup/overview";
   const PLAYERS = "http://127.0.0.1:8481/api/players";
   const STRAY = "http://127.0.0.1:8481/api/v2/setup/seasons/season_9/venue-access";
+  // The two enrolled scoped reads, as leg (7) really cancels them.
+  const CAND3 = "http://127.0.0.1:8481/api/v2/setup/seasons/season_3/venue-candidates";
+  const ACCESS3 = "http://127.0.0.1:8481/api/v2/setup/seasons/season_3/venue-access";
+  const ABORTED = (url) => ({ method: "GET", url, failure: "net::ERR_ABORTED" });
+  const CLAIM = (url, dispatched) => ({ method: "GET",
+    url: relUrl(url), generation: 1, dispatched: dispatched });
   const line = (code) => "Failed to load resource: the server responded with a "
     + `status of ${code}`;
   const check = (what, got, want) => {
@@ -449,7 +504,7 @@ function selfTestDeliveryReconciler() {
     reconcileDeliveries(
       [{ method: "GET", url: OVERVIEW, status: 500 }],
       [{ method: "GET", url: OVERVIEW, status: 500, matched: false }],
-      [{ text: line(500), url: OVERVIEW }], []),
+      [{ text: line(500), url: OVERVIEW }], [], []),
     []);
 
   // (ii) the same 500 PLUS an unrelated 404 in the same leg. The 404 is
@@ -458,7 +513,7 @@ function selfTestDeliveryReconciler() {
     [{ method: "GET", url: OVERVIEW, status: 500 },
      { method: "GET", url: STRAY, status: 404 }],
     [{ method: "GET", url: OVERVIEW, status: 500, matched: false }],
-    [{ text: line(500), url: OVERVIEW }, { text: line(404), url: STRAY }], []);
+    [{ text: line(500), url: OVERVIEW }, { text: line(404), url: STRAY }], [], []);
   if (out.length !== 2 || !out.every((l) => l.indexOf(STRAY) !== -1
         && l.indexOf("404") !== -1 && l.indexOf(OVERVIEW) === -1)) {
     fail(`delivery-reconciler self-test — an unrelated 404 alongside an `
@@ -472,7 +527,7 @@ function selfTestDeliveryReconciler() {
   out = reconcileDeliveries(
     [{ method: "GET", url: STRAY, status: 404 }],
     [{ method: "GET", url: OVERVIEW, status: 500, matched: false }],
-    [{ text: line(404), url: STRAY }], []);
+    [{ text: line(404), url: STRAY }], [], []);
   if (out.length !== 3
       || !out.some((l) => l.indexOf("[response]") === 0 && l.indexOf(STRAY) !== -1)
       || !out.some((l) => l.indexOf("[injected]") === 0 && l.indexOf(OVERVIEW) !== -1)
@@ -487,7 +542,7 @@ function selfTestDeliveryReconciler() {
   out = reconcileDeliveries(
     [{ method: "GET", url: OVERVIEW, status: 500 },
      { method: "GET", url: PLAYERS, status: 500 }],
-    [{ method: "GET", url: OVERVIEW, status: 500, matched: false }], [], []);
+    [{ method: "GET", url: OVERVIEW, status: 500, matched: false }], [], [], []);
   if (out.length !== 1 || out[0].indexOf(PLAYERS) === -1) {
     fail(`delivery-reconciler self-test — an allowance bound to the overview `
       + `must not cover the player list, got ${JSON.stringify(out)}`);
@@ -497,7 +552,7 @@ function selfTestDeliveryReconciler() {
   out = reconcileDeliveries(
     [{ method: "GET", url: OVERVIEW, status: 500 },
      { method: "GET", url: OVERVIEW, status: 500 }],
-    [{ method: "GET", url: OVERVIEW, status: 500, matched: false }], [], []);
+    [{ method: "GET", url: OVERVIEW, status: 500, matched: false }], [], [], []);
   if (out.length !== 1 || out[0].indexOf(OVERVIEW) === -1) {
     fail(`delivery-reconciler self-test — one allowance must be consumed at `
       + `most once, got ${JSON.stringify(out)}`);
@@ -505,8 +560,72 @@ function selfTestDeliveryReconciler() {
 
   // (vi) a redirect is not a failure.
   check("a 3xx is not a failure",
-    reconcileDeliveries([{ method: "GET", url: STRAY, status: 304 }], [], [], []),
+    reconcileDeliveries([{ method: "GET", url: STRAY, status: 304 }], [], [], [], []),
     []);
+
+  // ---- rule (6): an intentional cancellation, and only on the app's claim --
+  //
+  // (vii) the whole point: a cancelled scoped read that the app CLAIMS is
+  //       forgiven. This is what leg (7) produces on a barriered build.
+  check("a claimed ERR_ABORTED on an enrolled scoped read is forgiven",
+    reconcileDeliveries([], [], [], [ABORTED(CAND3)], [CLAIM(CAND3, true)]), []);
+
+  // (viii) THE FALSIFIER'S OWN ORACLE. The same cancellation with NO claim is
+  //        reported — that is the unenrolled build, where the read goes out
+  //        through the raw fetch, is cancelled by nothing the app records, and
+  //        so has nothing to explain it.
+  out = reconcileDeliveries([], [], [], [ABORTED(CAND3)], []);
+  if (out.length !== 1 || out[0].indexOf("[requestfailed]") !== 0
+      || out[0].indexOf(CAND3) === -1
+      || out[0].indexOf("does not claim it") === -1) {
+    fail(`delivery-reconciler self-test — an UNCLAIMED cancellation of an `
+      + `enrolled scoped read must fail the run naming ${CAND3}, got `
+      + `${JSON.stringify(out)}`);
+  }
+
+  // (ix) a claim is bound to its own URL: cancelling venue-access does not
+  //      explain a cancelled venue-candidates.
+  out = reconcileDeliveries([], [], [], [ABORTED(CAND3)], [CLAIM(ACCESS3, true)]);
+  if (out.length !== 1 || out[0].indexOf(CAND3) === -1) {
+    fail(`delivery-reconciler self-test — an abort claim for ${ACCESS3} must `
+      + `not explain a cancelled ${CAND3}, got ${JSON.stringify(out)}`);
+  }
+
+  // (x) one claim, one failure: two cancellations of the same read need two
+  //     claims, so a single abort can never absorb a repeat.
+  out = reconcileDeliveries([], [], [],
+    [ABORTED(CAND3), ABORTED(CAND3)], [CLAIM(CAND3, true)]);
+  if (out.length !== 1 || out[0].indexOf(CAND3) === -1) {
+    fail(`delivery-reconciler self-test — one abort claim must be consumed at `
+      + `most once, got ${JSON.stringify(out)}`);
+  }
+
+  // (xi) `dispatched: false` means the app says the request NEVER REACHED THE
+  //      WIRE. It therefore explains no wire failure — if a request failed,
+  //      something other than that claim cancelled it.
+  out = reconcileDeliveries([], [], [], [ABORTED(CAND3)], [CLAIM(CAND3, false)]);
+  if (out.length !== 1 || out[0].indexOf(CAND3) === -1) {
+    fail(`delivery-reconciler self-test — an undispatched abort claim must not `
+      + `explain a real failed delivery, got ${JSON.stringify(out)}`);
+  }
+
+  // (xii) the forgiveness is bounded by the FAILURE TEXT and by the ROUTE. A
+  //       connection that died, and a cancellation of any route the barrier
+  //       does not enrol, are still failures no ledger can absolve.
+  out = reconcileDeliveries([], [], [],
+    [{ method: "GET", url: CAND3, failure: "net::ERR_CONNECTION_RESET" }],
+    [CLAIM(CAND3, true)]);
+  if (out.length !== 1 || out[0].indexOf("ERR_CONNECTION_RESET") === -1) {
+    fail(`delivery-reconciler self-test — only net::ERR_ABORTED may be `
+      + `explained by an abort claim, got ${JSON.stringify(out)}`);
+  }
+  out = reconcileDeliveries([], [], [], [ABORTED(OVERVIEW)],
+    [{ method: "GET", url: relUrl(OVERVIEW), generation: 1, dispatched: true }]);
+  if (out.length !== 1 || out[0].indexOf(OVERVIEW) === -1) {
+    fail(`delivery-reconciler self-test — a cancelled request on a route the `
+      + `barrier does not enrol must still fail the run, got `
+      + `${JSON.stringify(out)}`);
+  }
 }
 
 // ============ THE PAGE IS QUIET BEFORE ANYTHING IS SAMPLED ================
@@ -2548,6 +2667,29 @@ async function checkViewport(browser, viewport) {
                       failure: (f && f.errorText) || "unknown" });
   });
 
+  // ---- THE APP'S OWN ABORT LEDGER, MIRRORED (rule 6) -------------------
+  // app.js's `contextScopedReadAborts` is page state, so a reload empties it
+  // while `failedReqs` above keeps growing for the whole viewport. Harvested
+  // into Node so the reconciliation at the end can still be matched against
+  // claims the app made before a navigation.
+  //
+  // `seen` is an index, not a set: the page-side array only ever grows within
+  // one document, so everything past `seen` is new. A length BELOW `seen` can
+  // only mean the document was replaced, so the array is taken whole again.
+  // Absent binding -> nothing is harvested and nothing is forgiven, which is
+  // the correct answer for a build with no barrier at all.
+  const appAborts = [];
+  let seen = 0;
+  const harvestScopedAborts = async () => {
+    const got = await page.evaluate(
+      () => (typeof contextScopedReadAborts === "undefined"
+        ? null : contextScopedReadAborts.slice())).catch(() => null);
+    if (!got) return;
+    if (got.length < seen) seen = 0;
+    for (let i = seen; i < got.length; i += 1) appAborts.push(got[i]);
+    seen = got.length;
+  };
+
   // ---- in-flight accounting, so nothing is ever sampled under a render.
   let inFlight = 0;
   let requestSeq = 0;
@@ -2604,6 +2746,9 @@ async function checkViewport(browser, viewport) {
     await page.waitForSelector("#content > *", { timeout: 15000 });
     await installContextFixture(page);
     await loginAs(page, "admin", "demo");
+    // Harvested BEFORE the navigation that would discard it — see
+    // harvestScopedAborts().
+    await harvestScopedAborts();
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 15000 });
     await installContextFixture(page);
@@ -2626,6 +2771,7 @@ async function checkViewport(browser, viewport) {
     // raw `POST /api/context` this replaced never re-rendered at all, which
     // is precisely why the client could end up believing a stale tuple.
     await quiesce(page, `${L}/fixtures`);
+    await harvestScopedAborts();
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 15000 });
     await installContextFixture(page);
@@ -2658,7 +2804,25 @@ async function checkViewport(browser, viewport) {
       }
     }
 
-    errors.push(...reconcileDeliveries(nonOk, injected, consoleErrors, failedReqs));
+    // Everything the app claimed to cancel since the last harvest — including
+    // leg (7)'s real #ctx-select switches, which are what cancel the departing
+    // Season's scoped reads.
+    await harvestScopedAborts();
+    errors.push(...reconcileDeliveries(nonOk, injected, consoleErrors,
+                                       failedReqs, appAborts));
+    // PRINTED whether or not it passed: a run whose ledger is empty and whose
+    // failure list is empty is a different fact from a run that cancelled reads
+    // and accounted for every one of them, and only one of those two is
+    // evidence that the enrolment is live on this surface.
+    console.log(`[${L}] context-scoped abort ledger `
+      + `(app.js contextScopedReadAborts), reconciled against `
+      + `${failedReqs.length} failed deliver${failedReqs.length === 1
+        ? "y" : "ies"}:`);
+    for (const a of appAborts) {
+      console.log(`    ${a.method} ${relUrl(a.url)} generation=${a.generation} `
+        + `dispatched=${a.dispatched}`);
+    }
+    if (!appAborts.length) console.log("    (none)");
     if (errors.length) fail(`[${L}] browser errors:\n${errors.join("\n")}`);
 
     console.log(`[${L}] Setup state matrix: on a pristine zero-Program `
@@ -2709,7 +2873,12 @@ async function checkViewport(browser, viewport) {
       + `three workflows that carry no confirmation are asserted to offer none `
       + `under the same archived Season. Every failed delivery in the run is `
       + `reconciled by exact method, URL and status against the deliberate `
-      + `500s this file injected.`);
+      + `500s this file injected — and the ONLY failures forgiven beyond those `
+      + `are #409's intentional cancellations of the two exact-Season-scoped `
+      + `Setup reads, each matched one-to-one against a dispatched entry in `
+      + `app.js's own contextScopedReadAborts ledger, so a cancelled scoped `
+      + `read that the app never claimed (i.e. one not enrolled in the `
+      + `settlement barrier) still fails this run by name.`);
   } catch (e) {
     if (serverOutput.trim()) {
       console.error("--- demo server output ---\n" + serverOutput.trim());
