@@ -1226,6 +1226,71 @@ that block is followed by a generation check *before* its assignment. This was a
 real, reproducible mixed-grid defect, not a theoretical one — it is what
 `checkPlayerListRaceGuard` in `e2e/league-filtered-data.js` pins down.
 
+### Where the client guard stops, and what carries on from there
+
+The guards above stop a stale body from being **believed**. A separate barrier
+in `app.js` — `cancelContextScopedReads()` then
+`awaitContextScopedReadSettlement()`, run before `POST /api/context` — stops a
+doomed read from being **dispatched**. Neither can stop the **server** from
+answering a read it has already accepted, and that is a real gap rather than a
+theoretical one:
+
+```
+GET /api/v2/setup/seasons/season_3/venue-candidates -> 404
+(CI run 31504917446, browser shard 1, phone leg; the app's own abort ledger
+ records that read as dispatched:true, so enrolment was never the gap)
+```
+
+`AbortController.abort()` settles the **client's** fetch promise immediately
+while the server keeps executing the request. The POST then commits, and the
+still-running read compares its Season against the **new** selection —
+`season_id != active_season.id` — and returns the generic 404 for a Season the
+operator was legitimately looking at.
+
+**`services/context_gate.py` closes that half, server-side.** A per-process,
+per-user SHARED/EXCLUSIVE quiescence gate orders the two **exact-Season scoped
+reads** against `POST /api/context` **by arrival at the server**:
+
+| level | lock | taken by |
+| --- | --- | --- |
+| **0** | **`ContextSwitchGate`** (shared for a scoped read, exclusive for the switch) | **`Handler.do_GET` / `do_POST` only** |
+| 1 | `active_context_mutex` (session advisory) | mutations |
+| 2 | `store.transaction()` / the store `_lock` | everything |
+| 3 | the ActiveContext row (`resolve_with_league(lock=True)`) | mutating gates |
+| 4 | parent / bridge rows | |
+| 5 | target rows | |
+
+Three things about it are worth stating explicitly, because each is a decision
+that could plausibly have gone the other way:
+
+* **It is not the #386 `active_context_mutex`, and could not be.** That mutex is
+  a PostgreSQL advisory lock on `SqlStore.conn`, and the web process holds
+  exactly one `SqlStore`. PostgreSQL grants an advisory lock re-entrantly to the
+  same session, so it orders *connections*, not requests — which is why every
+  existing test of it builds a second `SqlStore`. It is also a documented no-op
+  on SQLite and in-memory, and this regression is required on all three.
+* **Mutual exclusion is the wrong property.** A mutex says the read and the
+  switch do not interleave; it does not say which goes first. If the switch won,
+  the read would block, wake, resolve the *new* tuple and 404 — the same failure,
+  reproduced through the fix. Ordering by arrival is a request-lifecycle fact no
+  store-layer lock can express.
+* **Nothing hangs, in either direction.** Both waits are bounded
+  (`HS_CONTEXT_GATE_TIMEOUT`, default 10s); on expiry the waiter proceeds and the
+  expiry is counted in `stats()["timeouts"]`. A wedged read must not be able to
+  lock an operator out of switching context.
+
+**The ceiling is untouched.** The `season_id != active_season.id` comparison and
+both generic `NotFoundError`s are byte-identical: an independently issued read
+for a non-selected Season still gets the same generic 404, indistinguishable
+from a nonexistent one. The gate changes *when* a read is evaluated, never
+*what* it is evaluated against.
+
+**Honest scope limit:** the gate is per **process**. The deployment is a single
+`ThreadingHTTPServer`. If the app is ever run multi-replica, a read on replica A
+and a POST on replica B are not ordered by it, and the fix would have to be
+re-expressed at the database — which the existing advisory lock cannot do, for
+the first reason above.
+
 ## Coverage
 
 - `tests/test_league_filtered_setup_progress.py`,
@@ -1252,3 +1317,22 @@ real, reproducible mixed-grid defect, not a theoretical one — it is what
   `dashboard-season-ceiling.js` — the browser layer at desktop and 390×844,
   including two delayed-response races proving the newest tuple always wins
   (one for `render()`'s locals, one for its module-level state).
+- `tests/test_context_switch_server_exit.py` — the server-side ordering gate,
+  across Memory / SQLite / PostgreSQL over authenticated HTTP. A real request is
+  parked *inside* the real `Handler` (at both gate phases: bound, and unbound
+  inside `_resolve_role`) while a switch is driven against it, and the
+  observation is the *persisted* tuple, not a status code. Carries the four
+  named concurrency classes — concurrent switches, failure/cancellation while
+  waiting, repeated switching, and the forced no-indefinite-blocking case — plus
+  the unweakened-ceiling control and an inert-seam anti-vacuity control.
+- `e2e/context-switch-read-settlement.js` — the CLIENT half (#412): the switch
+  cancels its outstanding scoped reads and awaits their settlement before
+  POSTing.
+- `e2e/context-switch-server-exit.js` — the SERVER half, at desktop and 390×844.
+  A scoped read is held inside the server (through `e2e/server-park-harness.py`,
+  an e2e-owned wrapper that monkey-patches the real `ApiService` after import —
+  no production hook, because a flag that let any caller park a request would be
+  a denial-of-service affordance shipped to make a test easier), a real
+  `#ctx-select` switch is made, and the POST is required not to commit until the
+  handler exits. Zero 404s, zero console errors, and the same sibling-Season 404
+  control asserted in the same run.
