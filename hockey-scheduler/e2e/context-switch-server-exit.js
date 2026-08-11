@@ -98,6 +98,13 @@ const VIEWPORTS = [
   { label: "phone", width: 390, height: 844,
     ports: { "venue-candidates": 8822, "venue-access": 8824 } },
 ];
+// The two reads this journey parks IN THE BROWSER. They are the two that CI
+// actually failed on and the two the Setup UI issues, not the whole gate: the
+// authoritative list is `CONTEXT_SCOPED_READ_ROUTES` in `web/server.py`, whose
+// other two entries (the named scenario and Division standings) are covered by
+// `tests/test_context_switch_server_exit.py` over authenticated HTTP on all
+// three stores. The gate is store- and route-agnostic, so what this journey
+// adds over those is the BROWSER, not another route.
 const HELD_READS = ["venue-candidates", "venue-access"];
 
 function waitForServer(url, timeoutMs) {

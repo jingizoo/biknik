@@ -1248,8 +1248,41 @@ still-running read compares its Season against the **new** selection —
 operator was legitimately looking at.
 
 **`services/context_gate.py` closes that half, server-side.** A per-process,
-per-user SHARED/EXCLUSIVE quiescence gate orders the two **exact-Season scoped
-reads** against `POST /api/context` **by arrival at the server**:
+per-user SHARED/EXCLUSIVE quiescence gate orders the **exact-Season scoped
+reads** against `POST /api/context` **by arrival at the server**.
+
+Which reads those are is an explicit, auditable table
+(`CONTEXT_SCOPED_READ_ROUTES` in `web/server.py`), not a prefix and not a
+decorator, because joining it costs a request an ordering constraint against
+every switch by the same operator. A GET route earns its place by *both* (a)
+resolving the active tuple inside the request via `resolve_with_league`, and (b)
+comparing a **caller-named target** against the resolved Season with
+`season_id != active_season.id`, so a tuple that moves underneath the handler
+turns a legitimate answer into a generic refusal.
+
+That comparison is **not** funnelled through a single helper, and an audit that
+assumes it is will miss three of the four rows below. Re-run the enumeration
+this way: every caller of `resolve_with_league` that then compares a
+caller-named target to the resolved Season, by any of the three shapes the code
+actually uses — **inline** (`service.py:9378`, `:10688`; this is how *both*
+venue reads do it), via `_scenario_in_active_tuple` → `_setup_target_edge_allows`
+(`:6536`, `:1013`), or via `_division_matches_active_context` (`:5947`, called
+at `:6025`). Six GET routes reach the comparison; **four** qualify:
+
+| route | named target | what a mid-flight commit turns it into |
+| --- | --- | --- |
+| `/api/v2/setup/seasons/<id>/venue-candidates` | the Season | generic 404 |
+| `/api/v2/setup/seasons/<id>/venue-access` | the Season | generic 404 |
+| `/api/scheduler/scenarios/<id>` | the scenario | `_scenario_not_found` — the same generic 404 a foreign Program's scenario takes |
+| `/api/standings/<division_id>` | the Division | the generic **empty standings** shape: a wrong answer that looks like a real one |
+| `/api/scheduler/scenarios`, `/api/scheduler/drafts` | *none* — **not listed** | nothing; the active tuple is their query, not a ceiling on something the caller asked for, so they cannot refuse anything |
+
+The first two were what CI failed on; the other two were found by re-auditing
+the criterion against the code rather than against the incident, and each has
+its own held-read regression plus its own unweakened-ceiling control in
+`tests/test_context_switch_server_exit.py`.
+
+The lock order:
 
 | level | lock | taken by |
 | --- | --- | --- |
@@ -1278,6 +1311,33 @@ that could plausibly have gone the other way:
   (`HS_CONTEXT_GATE_TIMEOUT`, default 10s); on expiry the waiter proceeds and the
   expiry is counted in `stats()["timeouts"]`. A wedged read must not be able to
   lock an operator out of switching context.
+* **The failure handling is not itself a failure mode.** `_await` *returns* the
+  expiry notice rather than printing it, and both call sites say it out loud
+  only after releasing the gate mutex: a `print` under that mutex would let one
+  stalled stderr freeze every gate operation including `arrive()`, which is the
+  first statement `do_GET` runs for every scoped read. And each registration is
+  removed by a `finally` that covers the wait *and* the notice, so an exception
+  out of either — a full non-blocking pipe, or a `wait_for` that raises on a
+  pathological configured bound — cannot leak a participant for the life of the
+  process.
+* **Cross-user coupling is bounded by a session lookup — two of them on the
+  routes that pre-check with `_operator_only` — and that bound is enforced
+  rather than intended.** An arrival ticket is registered before the request has
+  an identity, so a switch by *another* operator may briefly wait on it. The
+  window is however long identity takes: `_resolve_role` (`server.py:877`) does
+  an uncached `SESSIONS.resolve(store, sid)` every call, and `_operator_only`
+  (`:968-989`) calls it and *then* the route branch calls it again — so it is
+  one lookup on `/api/standings/<division_id>` and two on the two venue reads
+  and `/api/scheduler/scenarios/<id>`. Pre-existing for the venue routes, and
+  inherited by the routes added here. The instant it resolves to somebody else
+  it leaves that switch's wait set,
+  and the narrowing is announced *before* the narrowing thread itself goes to
+  sleep. Announcing it afterwards instead — which is what the first cut did —
+  makes the coupling the other operator's whole switch, and does so silently: a
+  bounded wait whose predicate came true while it slept reports success at the
+  deadline and records no timeout, so `stats()` would show a healthy gate the
+  whole time. `test_one_operators_switch_is_not_stalled_by_anothers_scoped_read`
+  drives exactly that interleaving on two real operators.
 * **The ordering point is entry to the handler, not the wire — and that is the
   right place, but it was measured rather than assumed.** The gate registers a
   read at the top of `do_GET`, which is *after* `accept()` and the per-connection
@@ -1338,10 +1398,23 @@ the first reason above.
   across Memory / SQLite / PostgreSQL over authenticated HTTP. A real request is
   parked *inside* the real `Handler` (at both gate phases: bound, and unbound
   inside `_resolve_role`) while a switch is driven against it, and the
-  observation is the *persisted* tuple, not a status code. Carries the four
-  named concurrency classes — concurrent switches, failure/cancellation while
-  waiting, repeated switching, and the forced no-indefinite-blocking case — plus
-  the unweakened-ceiling control and an inert-seam anti-vacuity control.
+  observation is the *persisted* tuple, not a status code. One case per listed
+  route — the two venue reads, the named scenario, and the Division standings —
+  each with its own unweakened-ceiling control. Carries the four named
+  concurrency classes (concurrent switches, failure/cancellation while waiting,
+  repeated switching, and the forced no-indefinite-blocking case), plus **two
+  distinct operators**, which is the only axis that can see cross-user coupling
+  at all: every other case in the file opens all its sessions for one username,
+  so a gate that coupled unrelated operators would pass them byte-identically.
+  Its inert-seam anti-vacuity control measures against `wait_timeout`, not
+  against `PATIENCE` — the two were numerically equal at the default bound, and
+  under a smaller configured bound the control went green on a mutant whose
+  every wait predicate returned `True`.
+- The same file's `ContextGateInternalsTest` drives the gate directly, with no
+  store and no HTTP, for the failure modes that are reachable through a request
+  only by luck: a bounded wait that raises, an expiry notice whose stderr write
+  raises, and an expiry notice whose stderr write *blocks* while another thread
+  tries to `arrive()`.
 - `e2e/context-switch-read-settlement.js` — the CLIENT half (#412): the switch
   cancels its outstanding scoped reads and awaits their settlement before
   POSTing.

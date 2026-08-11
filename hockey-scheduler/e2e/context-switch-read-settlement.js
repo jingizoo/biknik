@@ -143,10 +143,14 @@ const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
 const READY_TIMEOUT_MS = 15000;
 
-// The two exact-selection-ceilinged Season reads, and the only routes enrolled
-// in the barrier on the app side. Kept as ONE regexp used by the hold, the
-// ledger and the server control, so those three can never disagree about what
-// a "context-scoped read" is.
+// The two exact-selection-ceilinged SEASON reads -- the only routes the app
+// enrols in its client-side barrier, which is what THIS journey is about. It is
+// not the whole set of context-scoped reads: `CONTEXT_SCOPED_READ_ROUTES` in
+// `web/server.py` is authoritative and also carries the named-scenario and the
+// Division-standings reads, which are ordered server-side by the gate and never
+// depended on this barrier. Kept as ONE regexp used by the hold, the ledger and
+// the server control, so those three can never disagree about what a
+// "context-scoped read" is HERE.
 const SCOPED_READ_RE =
   /\/api\/v2\/setup\/seasons\/([^/?]+)\/venue-(access|candidates)(?:\?|$)/;
 

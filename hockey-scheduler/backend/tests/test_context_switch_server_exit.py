@@ -26,6 +26,34 @@ load-bearing assertions are (a) the persisted tuple is still the OLD one while
 the read is held, (b) the read answers 200 for the Season it named, and (c) the
 switch's commit timestamp is strictly after the read handler's exit timestamp.
 
+ONE CASE PER LISTED ROUTE, because the route table is a claim about coverage
+and is tested as one. ``CONTEXT_SCOPED_READ_ROUTES`` states its own admission
+criterion, and applying that criterion to the code rather than to the CI
+incident finds four routes, not the two the incident happened to hit: the two
+venue reads, ``GET /api/scheduler/scenarios/<id>`` (whose ceiling is
+``_scenario_in_active_tuple`` and whose mismatch is the generic
+``_scenario_not_found``), and ``GET /api/standings/<division_id>`` (whose
+ceiling is ``_division_matches_active_context`` and whose mismatch is the
+generic EMPTY standings shape — a wrong answer that looks like a real one).
+Each has a held-read case AND its own unweakened-ceiling control.
+
+TWO DISTINCT OPERATORS, because nothing else in this file can see cross-user
+coupling. Every other case opens all of its sessions for ONE username, so a gate
+that made unrelated operators wait for each other would pass all of them
+byte-identically. ``test_one_operators_switch_is_not_stalled_by_anothers_
+scoped_read`` drives the interleaving where the bound the gate promises
+("cross-user coupling is bounded by one session lookup") is load-bearing, and
+asserts the timeout counter too — because a wait that ends at its deadline with
+the predicate already true reports SUCCESS, so the failure is otherwise
+indistinguishable from a healthy gate.
+
+THE GATE'S OWN FAILURE MODES have their own class, ``ContextGateInternalsTest``,
+driven directly with no store and no HTTP: a bounded wait that raises, an expiry
+notice whose stderr write raises, and one whose stderr write BLOCKS while
+another thread tries to ``arrive()``. Through a request those are reachable only
+by luck; the invariant they defend is that the gate's handling of a degraded
+wait must not itself degrade the gate.
+
 THE PARK POINTS ARE THE TWO PHASES OF THE GATE, and each has its own case:
 
   * PHASE B (bound) -- parked inside ``ApiService.get_venue_grant_candidates``
@@ -64,6 +92,7 @@ mutex, a documented no-op on the other two.
 import json
 import os
 import socket
+import sys
 import tempfile
 import threading
 import time
@@ -72,12 +101,15 @@ import urllib.error
 import urllib.request
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from http.cookiejar import CookieJar
 from http.server import ThreadingHTTPServer
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.domain import Role
+from hockey_scheduler.domain.setup_models import ScheduleScenario
+from hockey_scheduler.services.context_gate import ContextSwitchGate
 
 TZ = "America/Toronto"
 
@@ -260,6 +292,50 @@ class ContextSwitchServerExitBase:
         return {"tag": tag, "program_id": program.id,
                 "s1": s1.id, "s2": s2.id, "s3": s3.id, "venue_id": venue.id}
 
+    def _division_with_teams(self, fx, season_id, tag="Div"):
+        """A Division in ``season_id`` with two registered Teams, so its
+        standings table is NON-EMPTY. That is what makes the standings case
+        falsifiable: the roster comes from active registrations, so a correct
+        answer has rows and a raced one has none."""
+        svc = self.api.setup
+        suffix = uuid.uuid4().hex[:6]
+        league = svc.create_league(season_id, f"{fx['tag']} {tag} L {suffix}")
+        division = svc.create_division(season_id, f"{tag} D {suffix}",
+                                       league_id=league.id)
+        club = svc.create_club(f"{tag} Club {suffix}")
+        for team_name in (f"{tag} Alpha {suffix}", f"{tag} Bravo {suffix}"):
+            team = svc.create_team(club_id=club.id, name=team_name,
+                                   league_id=league.id,
+                                   division_id=division.id)
+            svc.register_team_for_season(season_id, team.id, division.id)
+        return division.id
+
+    def _scenario_in(self, fx, season_id, name="Named run"):
+        """One stored ``ScheduleScenario`` bound to ``season_id``.
+
+        Written straight at the store rather than through
+        ``create_schedule_scenario``: the route under test READS a stored row
+        back and judges it against the active tuple, and the generator's own
+        inputs are not what is being measured. Every FK the SQL stores enforce
+        is real — permanent League, LeagueSeason, Program, Season.
+        """
+        svc = self.api.setup
+        league = svc.create_league(season_id, f"{fx['tag']} League {name}")
+        ls = self.api.store.league_season_for(league.id, season_id)
+        self.assertIsNotNone(ls, "the League was not bound to the Season")
+        scenario = ScheduleScenario(
+            id=f"scenario_{uuid.uuid4().hex[:12]}",
+            name=name, program_id=fx["program_id"], season_id=season_id,
+            league_id=league.id, league_season_id=ls.id, division_id=None,
+            planner_version="round-robin-v1", input_fingerprint="f",
+            proposal_fingerprint="g", request_input={}, proposal={},
+            generation_snapshot={},
+            created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            created_by=None)
+        with self.api.store.transaction():
+            self.api.store.add_schedule_scenario(scenario)
+        return scenario.id
+
     def _persisted(self, user_id):
         ctx = self.api.store.get_active_context(user_id)
         return (None, None) if ctx is None else (ctx.program_id, ctx.season_id)
@@ -428,6 +504,206 @@ class ContextSwitchServerExitBase:
     def test_a_switch_cannot_commit_while_a_venue_access_read_is_inside(self):
         self._assert_switch_waits_for("list_season_venue_access",
                                       "venue-access")
+
+    # ----------------------------------------------------------------------
+    # THE ROUTE TABLE IS A CLAIM ABOUT COVERAGE, so it is tested as one.
+    #
+    # `CONTEXT_SCOPED_READ_ROUTES` states its own admission criterion: a route
+    # belongs there when it has the exact-selected-Season ceiling
+    # (`season_id != active_season.id`). Two routes were listed; three more
+    # GET routes reach that comparison, and two of them apply it to a
+    # CALLER-NAMED record and answer generically when it does not match — the
+    # identical defect shape, on a different noun. Each gets the same case.
+    # ----------------------------------------------------------------------
+    def test_a_switch_cannot_commit_while_a_scenario_read_is_inside(self):
+        """``GET /api/scheduler/scenarios/<id>`` — the same defect, one noun
+        over.
+
+        Its ceiling is ``_scenario_in_active_tuple``, which calls
+        ``resolve_with_league`` INSIDE the request, after the stored row has
+        been read, and hands the result to ``_setup_target_edge_allows`` — the
+        very ``season_id != season.id`` comparison the route table names as its
+        admission criterion. A switch that commits while this read is inside
+        the server makes it answer ``_scenario_not_found``: the same generic
+        404 a scenario of another Program gets, for evidence the operator was
+        legitimately looking at a moment earlier.
+        """
+        fx = self._program_with_two_seasons("Scen")
+        username, user_id = self._operator("scen")
+        reader = self._login(username)
+        switcher = self._login(username)
+        self._select(reader, fx["program_id"], fx["s1"])
+        scenario_id = self._scenario_in(fx, fx["s1"])
+
+        commit = {}
+        self._instrument_commit(commit)
+        read_out = {}
+
+        with self._read_parked_in("get_schedule_scenario", scenario_id) as (
+                park, exited):
+            def do_read():
+                read_out["result"] = self._req(
+                    reader, "GET", f"/api/scheduler/scenarios/{scenario_id}")
+
+            rt = threading.Thread(target=do_read, daemon=True)
+            rt.start()
+            self.assertTrue(park.arrived.wait(PATIENCE),
+                            "the scenario read never reached the server")
+
+            switch = {}
+            st = self._switch_thread(switcher, fx["program_id"], fx["s2"],
+                                     switch)
+            time.sleep(COMMIT_WINDOW)
+            persisted_during = self._persisted(user_id)
+            still_running = st.is_alive()
+
+            park.let_go()
+            rt.join(PATIENCE)
+            st.join(PATIENCE)
+
+        self.assertEqual(
+            persisted_during, (fx["program_id"], fx["s1"]),
+            f"the context switch COMMITTED while a dispatched scenario read "
+            f"was still inside the server (persisted tuple moved to "
+            f"{persisted_during}); that read is now judged against a selection "
+            f"it never saw and answers the generic scenario 404")
+        self.assertTrue(
+            still_running,
+            "the switch's POST had already returned while the scenario read "
+            "was held — the route is not ordered against it at all")
+
+        status, raw, body = read_out["result"]
+        self.assertEqual(status, 200,
+                         f"the held scenario read was refused after the "
+                         f"switch: {raw}")
+        self.assertEqual(body.get("scenario_id"), scenario_id, raw)
+        self.assertEqual(switch["result"][0], 200, switch["result"][1])
+        self.assertEqual(self._persisted(user_id), (fx["program_id"], fx["s2"]))
+        self.assertIn("at", exited, "the scenario read handler never exited")
+        self.assertLess(exited["at"], commit["committed_at"],
+                        "the switch committed BEFORE the scenario read "
+                        "handler exited")
+
+    def test_control_a_non_selected_seasons_scenario_still_gets_the_404(self):
+        """The ceiling this route enforces is NOT weakened by ordering it: an
+        UNRACED read of a scenario belonging to a sibling Season of the active
+        Program is still refused, and still names nothing about it."""
+        fx = self._program_with_two_seasons("ScenCeil")
+        username, _ = self._operator("scenceil")
+        c = self._login(username)
+        self._select(c, fx["program_id"], fx["s1"])
+        mine = self._scenario_in(fx, fx["s1"], name="Mine")
+        sibling = self._scenario_in(fx, fx["s2"], name="Sibling run")
+
+        status, raw, body = self._req(c, "GET",
+                                      f"/api/scheduler/scenarios/{mine}")
+        self.assertEqual(status, 200, f"the selected Season's scenario: {raw}")
+        self.assertEqual(body["scenario_id"], mine, raw)
+
+        status, raw, body = self._req(c, "GET",
+                                      f"/api/scheduler/scenarios/{sibling}")
+        self.assertEqual(status, 404,
+                         f"a sibling Season's scenario was not refused: {raw}")
+        self.assertNotIn("Sibling run", raw)
+        status, raw, _ = self._req(
+            c, "GET", "/api/scheduler/scenarios/scenario_does_not_exist_9")
+        self.assertEqual(status, 404, raw)
+
+    def test_a_switch_cannot_commit_while_a_standings_read_is_inside(self):
+        """``GET /api/standings/<division_id>`` — the third route with the
+        ceiling, found by re-auditing rather than by resemblance.
+
+        ``_division_matches_active_context`` compares the Division's validated
+        LeagueSeason against the resolved active tuple with
+        ``league_season.season_id != season.id``: literally the admission
+        criterion, against the same ``resolve_with_league`` result, resolved
+        INSIDE the request. What differs is only the SHAPE of the wrong answer
+        — an empty standings table rather than a 404 — and that difference
+        makes it worse, not better: the operator is shown a Division that
+        exists, that they selected, and that appears to have no teams.
+        """
+        fx = self._program_with_two_seasons("Stand")
+        username, user_id = self._operator("stand")
+        reader = self._login(username)
+        switcher = self._login(username)
+        self._select(reader, fx["program_id"], fx["s1"])
+        division_id = self._division_with_teams(fx, fx["s1"])
+
+        # Positive control FIRST: this Division really does answer with rows
+        # under the selected Season, so an empty answer below would be the
+        # race and not an empty fixture.
+        status, raw, body = self._req(reader, "GET",
+                                      f"/api/standings/{division_id}")
+        self.assertEqual(status, 200, raw)
+        self.assertTrue(body["standings"],
+                        f"the fixture Division has no standings rows at all, "
+                        f"so this case could not tell a raced read from a "
+                        f"healthy one: {raw}")
+
+        read_out = {}
+        with self._read_parked_in("get_standings", division_id) as (
+                park, _exited):
+            def do_read():
+                read_out["result"] = self._req(
+                    reader, "GET", f"/api/standings/{division_id}")
+
+            rt = threading.Thread(target=do_read, daemon=True)
+            rt.start()
+            self.assertTrue(park.arrived.wait(PATIENCE),
+                            "the standings read never reached the server")
+
+            switch = {}
+            st = self._switch_thread(switcher, fx["program_id"], fx["s2"],
+                                     switch)
+            time.sleep(COMMIT_WINDOW)
+            persisted_during = self._persisted(user_id)
+            still_running = st.is_alive()
+
+            park.let_go()
+            rt.join(PATIENCE)
+            st.join(PATIENCE)
+
+        self.assertEqual(
+            persisted_during, (fx["program_id"], fx["s1"]),
+            f"the context switch COMMITTED while a dispatched standings read "
+            f"was still inside the server (persisted tuple moved to "
+            f"{persisted_during})")
+        self.assertTrue(
+            still_running,
+            "the switch's POST had already returned while the standings read "
+            "was held — the route is not ordered against it at all")
+
+        status, raw, body = read_out["result"]
+        self.assertEqual(status, 200, raw)
+        self.assertTrue(
+            body["standings"],
+            f"the held standings read came back EMPTY — it was judged against "
+            f"the Season the switch installed underneath it, and an operator "
+            f"is now looking at a Division that appears to have no teams: "
+            f"{raw}")
+        self.assertEqual(switch["result"][0], 200, switch["result"][1])
+
+    def test_control_a_non_selected_seasons_division_still_reads_empty(self):
+        """The standings ceiling is unweakened: an UNRACED read of a Division
+        in a sibling Season of the active Program is still the generic empty
+        shape, with no team names in it."""
+        fx = self._program_with_two_seasons("StandCeil")
+        username, _ = self._operator("standceil")
+        c = self._login(username)
+        self._select(c, fx["program_id"], fx["s1"])
+        mine = self._division_with_teams(fx, fx["s1"], tag="Mine")
+        sibling = self._division_with_teams(fx, fx["s2"], tag="Sibling")
+
+        status, raw, body = self._req(c, "GET", f"/api/standings/{mine}")
+        self.assertEqual(status, 200, raw)
+        self.assertTrue(body["standings"], raw)
+
+        status, raw, body = self._req(c, "GET", f"/api/standings/{sibling}")
+        self.assertEqual(status, 200, raw)
+        self.assertEqual(body["standings"], [],
+                         f"a sibling Season's Division answered with rows: "
+                         f"{raw}")
+        self.assertNotIn("Sibling", raw)
 
     def test_a_read_parked_before_identity_still_orders_the_switch(self):
         """PHASE A. The read is parked inside ``SESSIONS.resolve`` — inside
@@ -892,11 +1168,273 @@ class ContextSwitchServerExitBase:
         self.assertEqual(stuck["result"][0], 200, stuck["result"][1])
         self._assert_gate_is_clean("after a bounded read wait expired")
 
+    # ======================================================================
+    # TWO DISTINCT OPERATORS — the axis every case above is blind to
+    # ======================================================================
+    #
+    # Every other case in this file opens all its sessions for ONE username,
+    # so a gate that coupled unrelated operators to each other would pass all
+    # of them byte-identically. The gate's own docstring makes a CROSS-USER
+    # promise ("cross-user coupling is bounded by one session lookup") and
+    # nothing here could falsify it. These two cases can.
+    def _park_next_session_resolve(self):
+        """Park the NEXT server-side ``SESSIONS.resolve`` — i.e. the next
+        request to reach ``_resolve_role()``, before it has any identity and
+        therefore while its gate ticket is still an UNBOUND arrival.
+
+        Returns ``(park, arm)``; the caller arms it immediately before issuing
+        the one request it wants caught, exactly as PHASE A above does."""
+        park = _Park()
+        armed = threading.Event()
+        sessions = self.srv.SESSIONS
+        original = sessions.resolve
+
+        def wrapper(store, sid):
+            if armed.is_set():
+                armed.clear()
+                park.hold()
+            return original(store, sid)
+
+        sessions.resolve = wrapper
+        self._restores.append(lambda: setattr(sessions, "resolve", original))
+        # Released even when an assertion aborts the case mid-park: a victim
+        # left parked keeps its gate ticket registered and would charge the
+        # NEXT case with a leak it did not cause.
+        self.addCleanup(park.let_go)
+        return park, armed
+
+    def _park_next_commit(self):
+        """Park the NEXT ``set_active_context`` BEFORE it runs, so the switch
+        holds the gate's EXCLUSIVE ticket and nothing else — no transaction,
+        no store lock, no #386 mutex. Returns ``(park, arm)``."""
+        park = _Park()
+        armed = threading.Event()
+
+        def factory(original):
+            def wrapper(*args, **kw):
+                if armed.is_set():
+                    armed.clear()
+                    park.hold()
+                return original(*args, **kw)
+            return wrapper
+
+        self._wrap(self.api, "set_active_context", factory)
+        self.addCleanup(park.let_go)          # see _park_next_session_resolve
+        return park, armed
+
+    def test_one_operators_switch_is_not_stalled_by_anothers_scoped_read(self):
+        """CROSS-USER COUPLING, measured on two REAL operators.
+
+        The gate's docstring promises that an unbound arrival ticket couples a
+        foreign switch to it for ONE SESSION LOOKUP and no longer: the instant
+        the ticket resolves to somebody else, it leaves that switch's wait set.
+        This drives the exact interleaving where that promise is load-bearing:
+
+          1. BOB's switch registers and parks INSIDE its own commit, so Bob has
+             an exclusive hold outstanding and nothing else.
+          2. BOB's scoped read arrives and parks PRE-IDENTITY. Its ticket is an
+             UNBOUND arrival with a seq above Bob's switch.
+          3. ALICE — a DIFFERENT operator, sharing nothing with Bob but this
+             process — switches. Her writer registers, sees an unidentified
+             request that arrived before it, and waits. THAT MUCH IS CORRECT.
+          4. Bob's read is released, resolves BOB, and narrows its ticket away
+             from Alice. Alice is now blocked by nothing. Bob's read then waits
+             for BOB's own parked switch — which is Bob's business, not hers.
+
+        The measurement is step 4: how long Alice stays parked AFTER she has
+        stopped having anything to wait for. The promise is "one session
+        lookup". If the narrowing is not ANNOUNCED before the narrowing thread
+        goes to sleep, Alice sleeps out the whole wait bound instead — and does
+        so SILENTLY, because a bounded wait whose predicate came true while it
+        slept reports success at the deadline and records no timeout. That is
+        why the timeout counter is asserted too: without it, the failure looks
+        identical to a healthy gate from the outside.
+        """
+        gate = self._gate()
+        original_timeout = gate.wait_timeout
+        gate.wait_timeout = 4.0
+        self.addCleanup(setattr, gate, "wait_timeout", original_timeout)
+
+        fx = self._program_with_two_seasons("Cross")
+        alice_name, alice_id = self._operator("cross_alice")
+        bob_name, bob_id = self._operator("cross_bob")
+        alice = self._login(alice_name)
+        bob_reader = self._login(bob_name)
+        bob_switcher = self._login(bob_name)
+        self._select(alice, fx["program_id"], fx["s1"])
+        self._select(bob_reader, fx["program_id"], fx["s1"])
+
+        # 1. Bob's switch takes the exclusive hold and parks inside its commit.
+        commit_park, arm_commit = self._park_next_commit()
+        arm_commit.set()
+        bob_switch = {}
+        bst = self._switch_thread(bob_switcher, fx["program_id"], fx["s2"],
+                                  bob_switch)
+        self.assertTrue(commit_park.arrived.wait(PATIENCE),
+                        "Bob's switch never reached its commit")
+
+        # 2. Bob's scoped read arrives and parks BEFORE it has an identity.
+        read_park, arm_resolve = self._park_next_session_resolve()
+        bob_read = {}
+
+        def do_read():
+            arm_resolve.set()
+            bob_read["result"] = self._read(bob_reader, fx["s2"])
+
+        rt = threading.Thread(target=do_read, daemon=True)
+        rt.start()
+        self.assertTrue(read_park.arrived.wait(PATIENCE),
+                        "Bob's read never reached _resolve_role")
+
+        # 3. Alice registers behind that unbound arrival and waits for it.
+        alice_switch = {}
+        at = self._switch_thread(alice, fx["program_id"], fx["s2"],
+                                 alice_switch)
+        self.assertTrue(
+            _wait(lambda: self._gate().stats()["waiting_writers"] >= 1),
+            "Alice's switch never became a waiter, so this case never set up "
+            f"the coupling it measures: {self._gate().stats()}")
+
+        # 4. The session lookup completes. Bob's ticket narrows to Bob and
+        #    goes to sleep behind Bob's own switch; Alice must be released by
+        #    that narrowing, not by the expiry of her bound.
+        timeouts_before = gate.stats()["timeouts"]
+        read_park.let_go()
+        self.assertTrue(
+            _wait(lambda: self._gate().stats()["waiting_readers"] >= 1),
+            "Bob's read never reached its own wait behind his switch, so the "
+            "narrowing-then-sleep interleaving was never constructed: "
+            f"{self._gate().stats()}")
+        freed_at = time.monotonic()
+        at.join(PATIENCE)
+        elapsed = time.monotonic() - freed_at
+
+        self.assertFalse(
+            at.is_alive(),
+            f"Alice's switch never returned at all: {self._gate().stats()}")
+        self.assertLess(
+            elapsed, gate.wait_timeout / 2,
+            f"Alice's switch stayed parked {elapsed:.2f}s against a "
+            f"{gate.wait_timeout}s bound AFTER the only ticket it was waiting "
+            f"for had resolved to another operator. Cross-user coupling is "
+            f"NOT bounded by one session lookup — it is bounded by the other "
+            f"operator's whole switch")
+        self.assertEqual(
+            gate.stats()["timeouts"], timeouts_before,
+            "a bounded wait EXPIRED during a two-operator interleaving that "
+            "should not have waited at all — and had it merely been slow "
+            "rather than expired, nothing here would have said so")
+        self.assertEqual(alice_switch["result"][0], 200,
+                         alice_switch["result"][1])
+
+        # Bob unwinds normally, and his read — which registered AFTER his
+        # switch — is ordered BEHIND it and answers under the tuple that
+        # switch installed.
+        commit_park.let_go()
+        bst.join(PATIENCE)
+        rt.join(PATIENCE)
+        self.assertEqual(bob_switch["result"][0], 200, bob_switch["result"][1])
+        b_status, b_raw, b_body = bob_read["result"]
+        self.assertEqual(b_status, 200,
+                         f"Bob's read, ordered behind his own switch, was "
+                         f"refused under the tuple that switch installed: "
+                         f"{b_raw}")
+        self.assertEqual(b_body.get("season_id", fx["s2"]), fx["s2"], b_raw)
+        self.assertEqual(self._persisted(alice_id), (fx["program_id"], fx["s2"]))
+        self.assertEqual(self._persisted(bob_id), (fx["program_id"], fx["s2"]))
+        self._assert_gate_is_clean("after a two-operator interleaving")
+
+    def test_two_operators_hold_independent_contexts_across_a_held_read(self):
+        """The structural companion to the case above: whatever the gate makes
+        one operator wait for, it must never make the OTHER's tuple move.
+
+        Bob holds a scoped read inside the server for his selected Season while
+        Alice switches. Alice's tuple moves and Bob's does not; Bob's switch is
+        still ordered behind his own read; and afterwards each operator's reads
+        agree with their OWN tuple and only their own. Two distinct persisted
+        contexts, one process, one gate.
+        """
+        fx = self._program_with_two_seasons("Pair")
+        alice_name, alice_id = self._operator("pair_alice")
+        bob_name, bob_id = self._operator("pair_bob")
+        alice = self._login(alice_name)
+        bob_reader = self._login(bob_name)
+        bob_switcher = self._login(bob_name)
+        self._select(alice, fx["program_id"], fx["s1"])
+        self._select(bob_reader, fx["program_id"], fx["s1"])
+
+        with self._read_parked_in("get_venue_grant_candidates", fx["s1"]) as (
+                park, _exited):
+            bob_read = {}
+
+            def do_read():
+                bob_read["result"] = self._read(bob_reader, fx["s1"])
+
+            rt = threading.Thread(target=do_read, daemon=True)
+            rt.start()
+            self.assertTrue(park.arrived.wait(PATIENCE),
+                            "Bob's read never reached the server")
+
+            # ALICE switches while Bob's read is held. Her switch is not Bob's
+            # read's business: it must commit, and promptly.
+            started = time.monotonic()
+            self._select(alice, fx["program_id"], fx["s3"])
+            alice_elapsed = time.monotonic() - started
+            self.assertLess(
+                alice_elapsed, self._gate().wait_timeout / 2,
+                f"Alice's switch waited {alice_elapsed:.2f}s behind ANOTHER "
+                f"operator's held scoped read")
+
+            # BOB's switch, by contrast, IS his read's business.
+            bob_switch = {}
+            bst = self._switch_thread(bob_switcher, fx["program_id"],
+                                      fx["s2"], bob_switch)
+            time.sleep(COMMIT_WINDOW)
+            self.assertEqual(
+                self._persisted(bob_id), (fx["program_id"], fx["s1"]),
+                "Bob's switch committed while Bob's read was inside the "
+                "server")
+            self.assertEqual(
+                self._persisted(alice_id), (fx["program_id"], fx["s3"]),
+                "Alice's committed tuple did not survive Bob's quiesce")
+            park.let_go()
+            rt.join(PATIENCE)
+            bst.join(PATIENCE)
+
+        self.assertEqual(bob_read["result"][0], 200, bob_read["result"][1])
+        self.assertEqual(bob_switch["result"][0], 200, bob_switch["result"][1])
+        self.assertEqual(self._persisted(alice_id), (fx["program_id"], fx["s3"]))
+        self.assertEqual(self._persisted(bob_id), (fx["program_id"], fx["s2"]))
+        self._assert_reads_agree_with(alice, fx, fx["s3"])
+        self._assert_reads_agree_with(bob_reader, fx, fx["s2"])
+        self._assert_gate_is_clean("after two operators interleaved")
+
     def test_control_the_park_seam_is_inert_when_unarmed(self):
         """ANTI-VACUITY for the whole file: with no seam installed, the same
         read and the same switch both complete promptly and correctly, so a
         green race above is the gate and not an accidentally serialized
-        server."""
+        server.
+
+        THE THRESHOLD IS RELATIVE TO THE BOUND, not to ``PATIENCE`` (#159
+        review). ``PATIENCE / 2`` is 10.0 and the default bound is also 10.0, so
+        the two were numerically EQUAL and this control only caught an
+        always-blocking gate because one full bound plus HTTP overhead happened
+        to exceed it. Under ``HS_CONTEXT_GATE_TIMEOUT=3`` — a documented,
+        supported knob, and the whole module is ``Ran 54 tests / OK`` under it —
+        a gate whose every wait predicate returned ``True`` finished this case
+        in 3.5s and the control said OK.
+
+        Measured, not assumed, about the smaller end of that knob: at ``=1`` the
+        module is NOT green (15-16 of 54 fail across the three backends, with 28
+        ``proceeding UNORDERED`` notices). That is the bound working as designed
+        — 1s is shorter than the seams these tests deliberately park reads
+        behind — not a defect, but it means ``=1`` is no evidence for anything
+        here and is not claimed as such. The repair does not need it: M8 kills
+        the repaired control at the default bound and at ``=3``. It is the only
+        absolute timing threshold in the file; every other one (the bounded-wait
+        cases, the leak recovery) is already expressed against
+        ``wait_timeout``, and so is this now.
+        """
         fx = self._program_with_two_seasons("Inert")
         username, user_id = self._operator("inert")
         c = self._login(username)
@@ -906,8 +1444,257 @@ class ContextSwitchServerExitBase:
             c, "GET", f"/api/v2/setup/seasons/{fx['s1']}/venue-candidates")
         self.assertEqual(status, 200, raw)
         self._select(c, fx["program_id"], fx["s2"])
-        self.assertLess(time.monotonic() - started, PATIENCE / 2)
+        elapsed = time.monotonic() - started
+        ceiling = min(PATIENCE / 2, self._gate().wait_timeout / 2)
+        self.assertLess(
+            elapsed, ceiling,
+            f"an UNRACED read and an UNRACED switch together took "
+            f"{elapsed:.2f}s against a {self._gate().wait_timeout}s bound. "
+            f"Nothing here should wait at all, so this is a gate that blocks "
+            f"where it should not — and every green race in this file above "
+            f"would then be an accidentally serialized server rather than the "
+            f"ordering it claims to measure")
         self.assertEqual(self._persisted(user_id), (fx["program_id"], fx["s2"]))
+
+
+class _RaisingStderr:
+    """A stderr whose write FAILS — the non-blocking pipe whose buffer is full,
+    which is what a container's log collector produces when it stops reading."""
+
+    def write(self, _text):
+        raise BlockingIOError(11, "Resource temporarily unavailable")
+
+    def flush(self):
+        pass
+
+
+class _WedgedStderr:
+    """A stderr whose write BLOCKS — the same collector stalled rather than
+    gone. Records that it was entered so a case can observe the wedge instead
+    of sleeping and hoping."""
+
+    def __init__(self):
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def write(self, text):
+        if "[context-gate]" in text:
+            self.entered.set()
+            self.release.wait(PATIENCE)
+        return len(text)
+
+    def flush(self):
+        pass
+
+    def let_go(self):
+        self.release.set()
+
+
+class ContextGateInternalsTest(unittest.TestCase):
+    """The gate's OWN failure modes, driven directly rather than through HTTP.
+
+    Deliberately not parameterized over the three stores: ``ContextSwitchGate``
+    is pure ``threading`` and touches no store at all — the same property that
+    lets the HTTP cases above behave identically on all three. Driving it
+    directly is also the only way these cases are constructible: an exception
+    out of the bounded wait, and a stderr that has stopped accepting writes,
+    are reachable through HTTP only by luck.
+
+    What they defend is narrow and specific: the gate's failure handling must
+    not itself be a failure. A wait that raises must not leave a registration
+    behind, and the line that ANNOUNCES a degraded wait must not be able to
+    take the whole gate down with it.
+    """
+
+    def _stderr(self, replacement):
+        original = sys.stderr
+        sys.stderr = replacement
+        self.addCleanup(setattr, sys, "stderr", original)
+        return replacement
+
+    # -- D2: a wait that raises must not leak the registration -------------
+    def test_a_writer_whose_wait_raises_leaves_no_registration_behind(self):
+        """``HS_CONTEXT_GATE_TIMEOUT='inf'`` is ACCEPTED by the module's own
+        parser — it is a positive float — and makes ``Condition.wait_for``
+        raise ``OverflowError`` on every platform whose ``time_t`` cannot hold
+        it. The raise lands inside the bounded wait: the one window where a
+        writer is already in ``self._writers`` but the ``finally`` that removes
+        it has not been entered.
+
+        A writer leaked there is leaked for the LIFE OF THE PROCESS, and every
+        later switch AND every later scoped read for that user then waits the
+        full bound behind a participant that will never finish. The recovery
+        assertion is the one that matters: it is not enough for the counter to
+        read zero, a subsequent switch must actually be prompt.
+        """
+        gate = ContextSwitchGate(wait_timeout=float("inf"))
+        arrival = gate.arrive()   # an unbound arrival, so the writer really waits
+        with self.assertRaises(OverflowError):
+            with gate.exclusive("user_a"):
+                self.fail("the bounded wait raised; the body must not run")
+        self.assertEqual(
+            gate.stats()["writers"], 0,
+            f"the writer's registration outlived the exception that killed "
+            f"its wait: {gate.stats()}")
+
+        # ...and the gate still WORKS, which a counter alone does not say. The
+        # arrival above is released first so that what the recovery switch is
+        # measured against is the LEAK and nothing else — an outstanding
+        # arrival is a legitimate reason to wait, and leaving it registered
+        # would make this step pass or fail for the wrong reason.
+        arrival.release()
+        gate.wait_timeout = 0.5
+        started = time.monotonic()
+        with gate.exclusive("user_a"):
+            pass
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, gate.wait_timeout,
+                        f"a later switch waited {elapsed:.2f}s behind the "
+                        f"leaked writer")
+        self.assertEqual(gate.stats()["writers"], 0, gate.stats())
+        self.assertEqual(gate.stats()["timeouts"], 0,
+                         f"the recovery switch WAITED rather than proceeding "
+                         f"straight through: {gate.stats()}")
+
+    def test_a_writer_whose_expiry_notice_raises_leaves_nothing_behind(self):
+        """THE WEDGE HANDLER MUST NOT BE A WEDGE. The expiry notice is the one
+        piece of I/O this module performs, and it is performed precisely when
+        things are already going wrong. On a full non-blocking stderr pipe the
+        write raises — and at that moment the writer is registered.
+        """
+        gate = ContextSwitchGate(wait_timeout=0.05)
+        gate.arrive()                        # forces the wait to reach expiry
+        self._stderr(_RaisingStderr())
+        with self.assertRaises(BlockingIOError):
+            with gate.exclusive("user_a"):
+                self.fail("the expiry notice raised; the body must not run")
+        self.assertEqual(
+            gate.stats()["writers"], 0,
+            f"a failed stderr write left a permanent writer registration: "
+            f"{gate.stats()}")
+
+    def test_a_reader_whose_wait_raises_leaves_no_registration_behind(self):
+        """The reader half of the same invariant. ``do_GET`` does wrap the
+        arrival ticket in an outer ``finally``, so this is today a belt on top
+        of braces — but a registration whose removal depends on a CALLER's
+        discipline is one refactor away from the writer's bug, and the writer
+        had no such caller."""
+        gate = ContextSwitchGate(wait_timeout=float("inf"))
+        with gate.exclusive("user_a"):       # a switch the reader must wait for
+            ticket = gate.arrive()
+            with self.assertRaises(OverflowError):
+                with ticket.bind("user_a"):
+                    self.fail("the bounded wait raised; the body must not run")
+            self.assertEqual(
+                gate.stats()["readers"], 0,
+                f"the reader's arrival ticket outlived the exception that "
+                f"killed its wait: {gate.stats()}")
+
+    # -- D3: the expiry notice must not be emitted under the gate mutex ----
+    def test_a_wedged_stderr_cannot_freeze_every_other_gate_operation(self):
+        """``_await`` runs with ``self._cv`` held — the single process-global
+        gate mutex. Doing blocking I/O there means one stalled stderr freezes
+        EVERY gate operation, including ``arrive()``, which is the FIRST
+        statement ``do_GET`` runs for every scoped read. The whole server stops
+        answering scoped reads because one ``print`` is waiting on a pipe.
+
+        The observation is direct: with the notice wedged mid-write, a brand
+        new arrival must still register. `arrive()` never blocks BY DESIGN —
+        that is its entire docstring — so any wait here is the mutex, not the
+        gate's logic.
+        """
+        gate = ContextSwitchGate(wait_timeout=0.05)
+        gate.arrive()                        # forces the wait to reach expiry
+        wedged = self._stderr(_WedgedStderr())
+        self.addCleanup(wedged.let_go)
+
+        expired = threading.Event()
+
+        def switch():
+            with gate.exclusive("user_a"):
+                pass
+            expired.set()
+
+        t = threading.Thread(target=switch, daemon=True)
+        t.start()
+        self.assertTrue(wedged.entered.wait(PATIENCE),
+                        "the expiry notice never reached stderr, so this case "
+                        "never wedged anything")
+
+        arrived = threading.Event()
+
+        def new_scoped_read():
+            gate.arrive()
+            arrived.set()
+
+        threading.Thread(target=new_scoped_read, daemon=True).start()
+        self.assertTrue(
+            arrived.wait(2.0),
+            "arrive() did not complete in 2.00s while the expiry notice was "
+            "wedged on stderr — every scoped read on the server is frozen "
+            "behind one print(), and arrive() is documented never to block")
+
+        wedged.let_go()
+        t.join(PATIENCE)
+        self.assertTrue(expired.is_set(), "the switch never completed")
+
+    def test_the_expiry_is_still_said_out_loud_exactly_once(self):
+        """Moving the notice out from under the lock must not lose it, and must
+        not double it: one expiry, one line, and the machine-readable counter
+        agreeing with the human-readable one."""
+        gate = ContextSwitchGate(wait_timeout=0.05)
+        gate.arrive()
+        written = []
+
+        class _Capture:
+            def write(self, text):
+                written.append(text)
+                return len(text)
+
+            def flush(self):
+                pass
+
+        self._stderr(_Capture())
+        with gate.exclusive("user_a"):
+            pass
+        sys.stderr = sys.__stderr__          # so a failure below is visible
+
+        said = [t for t in written if "[context-gate]" in t]
+        self.assertEqual(len(said), 1,
+                         f"the expiry was said {len(said)} times: {written}")
+        self.assertIn("switch", said[0],
+                      f"the notice lost which side expired: {said[0]}")
+        self.assertEqual(gate.stats()["timeouts"], 1, gate.stats())
+
+    def test_a_reader_expiry_is_said_out_loud_too(self):
+        """The reader side has its own emit path now that the notice travels
+        back out of ``_await``; an expiry that is only COUNTED is the silent
+        failure mode this module's docstring rules out by name."""
+        gate = ContextSwitchGate(wait_timeout=0.05)
+        written = []
+
+        class _Capture:
+            def write(self, text):
+                written.append(text)
+                return len(text)
+
+            def flush(self):
+                pass
+
+        with gate.exclusive("user_a"):       # a switch the reader must wait for
+            ticket = gate.arrive()
+            self._stderr(_Capture())
+            with ticket.bind("user_a"):
+                pass
+            sys.stderr = sys.__stderr__
+
+        said = [t for t in written if "[context-gate]" in t]
+        self.assertEqual(len(said), 1,
+                         f"the reader's expiry was said {len(said)} times: "
+                         f"{written}")
+        self.assertIn("scoped read", said[0],
+                      f"the notice lost which side expired: {said[0]}")
+        self.assertEqual(gate.stats()["timeouts"], 1, gate.stats())
 
 
 class MemoryContextSwitchServerExitTest(

@@ -576,9 +576,58 @@ STATE = DemoState()
 # against every context switch by the same operator, so a route earns its place
 # here by having the exact-selected-Season ceiling
 # (`season_id != active_season.id`), not by resembling one.
+#
+# THE CRITERION, SHARPENED so the table can be audited rather than trusted
+# (#159 review — the first cut listed two of the four that qualify, and stopped
+# at the two it had a CI failure for). A GET route belongs here when BOTH hold:
+#
+#   1. it resolves the active tuple INSIDE the request, via
+#      `ContextService.resolve_with_league`, and
+#   2. it compares a CALLER-NAMED target against the resolved Season with that
+#      exact inequality, so a tuple that moves underneath the handler turns a
+#      legitimate answer into a generic refusal.
+#
+# THE ENUMERATION THAT PRODUCES THIS TABLE, stated so it can actually be re-run.
+# The comparison is NOT funnelled through one helper, and an audit that assumes
+# it is will miss three of the four rows below. Enumerate every caller of
+# `ContextService.resolve_with_league` in `api/service.py` that then compares a
+# caller-named target to the resolved Season — by ANY of the four routes the
+# code actually uses:
+#
+#   * INLINE, `season_id != active_season.id`  (service.py:9378, :10688 — this
+#     is how BOTH venue reads do it; neither touches the helpers below)
+#   * `_scenario_in_active_tuple` -> `_setup_target_edge_allows`  (:6536, :1013)
+#   * `_division_matches_active_context`  (:5947, called at :6025)
+#
+# An earlier revision of this comment named only the middle one and claimed the
+# table was derived from it. It was not: that recipe reaches exactly one of the
+# four listed routes. Six GET routes reach the comparison at all; four qualify:
+#
+#   * /api/v2/setup/seasons/<id>/venue-candidates   LISTED — named Season
+#   * /api/v2/setup/seasons/<id>/venue-access       LISTED — named Season
+#   * /api/scheduler/scenarios/<id>                 LISTED — named scenario,
+#       via `_scenario_in_active_tuple` -> `_setup_target_edge_allows`; a
+#       mismatch is `_scenario_not_found`, the same generic 404 a foreign
+#       Program's scenario takes
+#   * /api/standings/<division_id>                  LISTED — named Division,
+#       via `_division_matches_active_context`'s
+#       `league_season.season_id != season.id`; a mismatch is the generic
+#       EMPTY standings shape, which is a wrong answer that looks like a real
+#       one rather than a refusal — worse to leave unordered, not better
+#   * /api/scheduler/scenarios and /api/scheduler/drafts   NOT LISTED, and
+#       that is the criterion doing its job: they name no target, so the active
+#       tuple IS their query rather than a ceiling on something the caller
+#       asked for. They cannot refuse anything, so there is nothing for a
+#       mid-flight commit to turn into a refusal, and clause 2 fails.
+#
+# Every mutation route that reaches the same comparison takes the WRITER side
+# of this gate (or none of it) by construction: the reader side is wired only
+# into `do_GET`.
 CONTEXT_SCOPED_READ_ROUTES = (
     re.compile(r"^/api/v2/setup/seasons/[^/]+/venue-candidates$"),
     re.compile(r"^/api/v2/setup/seasons/[^/]+/venue-access$"),
+    re.compile(r"^/api/scheduler/scenarios/[^/]+$"),
+    re.compile(r"^/api/standings/[^/]+$"),
 )
 
 
@@ -1376,7 +1425,9 @@ class Handler(BaseHTTPRequestHandler):
         A gate that only knew about IDENTIFIED readers would see nothing to wait
         for and let the switch commit straight past this request — which is the
         CI failure. PHASE B (binding the ticket to the resolved ``user_id``)
-        happens in the two route branches below, around the service call.
+        happens in each listed route's branch below, around the service call —
+        one branch per entry in ``CONTEXT_SCOPED_READ_ROUTES``, which is where
+        the membership criterion and the full per-route enumeration live.
 
         The ticket is released in ``finally`` — including when the response
         write raises ``BrokenPipeError`` on a vanished client — so no gate hold
@@ -1959,8 +2010,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"error": {
                     "code": "unauthorized",
                     "message": "A signed-in account is required."}}, 401)
-            return self._send_api(
-                api.get_standings(sd.group(1), user_id, role, scope))
+            # PHASE B of the context gate (#159). `_division_matches_active_
+            # context` resolves the tuple inside this call and compares the
+            # Division's LeagueSeason against the active Season; a mismatch is
+            # the generic EMPTY standings shape. Unordered, a switch commiting
+            # mid-read makes that empty answer arrive for a Division the
+            # operator has selected and is looking at.
+            with self._context_read_hold(user_id):
+                payload = api.get_standings(sd.group(1), user_id, role, scope)
+            return self._send_api(payload)
         # #283 Slice D: LeagueSeason-wide standings (across all its Divisions),
         # keyed by (league_id, season_id). Exhibition games are excluded.
         lss = re.match(
@@ -2044,8 +2102,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"error": {
                     "code": "unauthorized",
                     "message": "A signed-in account is required."}}, 401)
-            return self._send_api(api.get_schedule_scenario(
-                scenario_get.group(1), user_id, role, scope))
+            # PHASE B of the context gate (#159). Same shape and same reason as
+            # the two venue routes: `_scenario_in_active_tuple` resolves the
+            # tuple inside this call and refuses a scenario that is not in it
+            # with the generic `_scenario_not_found`. The ceiling is untouched
+            # — only WHEN it may be evaluated relative to a commit changes.
+            with self._context_read_hold(user_id):
+                payload = api.get_schedule_scenario(
+                    scenario_get.group(1), user_id, role, scope)
+            return self._send_api(payload)
         if path == "/api/auth/me":
             # Consistent with POST role resolution (#50): no cookie → signed out,
             # a valid cookie → the user, a present-but-invalid/expired cookie →

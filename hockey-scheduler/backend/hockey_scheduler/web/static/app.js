@@ -541,9 +541,19 @@ function contextScopedReadSignal() {
 }
 
 // A GET whose answer is only meaningful under the CURRENTLY PERSISTED context
-// tuple -- today the two exact-selection-ceilinged Season reads. Same transport
-// and same `{error:{...}}` normalization as getJSON(), plus enrolment in the
-// barrier above.
+// tuple. Same transport and same `{error:{...}}` normalization as getJSON(),
+// plus enrolment in the barrier above.
+//
+// WHAT IS ENROLLED HERE IS A SUBSET, and deliberately so. The AUTHORITATIVE
+// list of context-scoped reads is `CONTEXT_SCOPED_READ_ROUTES` in
+// `web/server.py`, which today names four routes: the two Setup Season reads
+// this helper is used for, plus `GET /api/scheduler/scenarios/<id>` and `GET
+// /api/standings/<division_id>`. Those last two are ordered SERVER-SIDE by
+// `services/context_gate.py` and need nothing from this barrier to be correct:
+// cancelling a read client-side cannot un-send it anyway (that is the whole
+// reason the gate exists), so enrolment here is a UX nicety -- it stops a stale
+// answer from being rendered -- and never the ordering guarantee. Do not read
+// "not enrolled here" as "not context-scoped"; read the server table.
 async function getJSONContextScoped(p) {
   const generation = contextScopedReadGeneration;
   const signal = contextScopedReadSignal();

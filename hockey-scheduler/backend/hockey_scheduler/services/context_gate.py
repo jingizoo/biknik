@@ -1,15 +1,27 @@
 """Per-user quiescence gate ordering exact-Season scoped READS against the
 context SWITCH that would invalidate them (#159 follow-up).
 
-THE DEFECT THIS EXISTS FOR. Two GET routes are ceilinged to the caller's
-EXACTLY selected Season — ``/api/v2/setup/seasons/<id>/venue-candidates`` and
-``/api/v2/setup/seasons/<id>/venue-access``. Their handlers resolve the
-persisted ActiveContext and refuse, with a deliberately generic 404, any Season
-that is not the selected one. If a ``POST /api/context`` commits a NEW
-selection while one of those reads is still inside the server, the read is
-judged against a tuple it never saw and answers 404 for a Season the operator
-was legitimately looking at. CI reproduced exactly that (run 31504917446,
-browser shard 1, phone leg).
+THE DEFECT THIS EXISTS FOR. Several GET routes are ceilinged to the caller's
+EXACTLY selected Season. Their handlers resolve the persisted ActiveContext
+INSIDE the request and refuse, generically, any target that is not inside the
+selected tuple. If a ``POST /api/context`` commits a NEW selection while one of
+those reads is still inside the server, the read is judged against a tuple it
+never saw and answers a refusal for something the operator was legitimately
+looking at. CI reproduced exactly that on
+``/api/v2/setup/seasons/<id>/venue-candidates`` (run 31504917446, browser shard
+1, phone leg).
+
+WHICH ROUTES, and why that is a table and not a rule of thumb. The authoritative
+list is ``CONTEXT_SCOPED_READ_ROUTES`` in ``web/server.py``, which carries the
+per-route enumeration and the criterion a route must meet to be in it. Four
+routes are listed today: the two venue reads above, ``GET
+/api/scheduler/scenarios/<id>`` (refused as ``_scenario_not_found``), and ``GET
+/api/standings/<division_id>`` (whose mismatch is the generic EMPTY standings
+shape — a wrong answer that looks like a real one). The last two are NOT the CI
+incident; they were found by auditing the criterion against the code, and the
+first cut of this module named only the two it had a failure for. If a route
+grows the exact-selected-Season ceiling later, it belongs in that table, and
+this paragraph is here so that is not rediscovered from an outage.
 
 WHY THE CLIENT CANNOT FIX IT. ``app.js`` enrols those reads in an
 AbortController barrier and awaits their settlement before POSTing. But
@@ -64,10 +76,28 @@ plausible place for a request to be parked. So a reader registers an UNBOUND
 ARRIVAL ticket at the top of ``do_GET``, before any identity exists, and every
 waiting writer counts unbound tickets that predate it. The ticket then BINDS to
 the resolved ``user_id``; binding to a different user drops it from that
-writer's wait set immediately, so cross-user coupling is bounded by one session
-lookup. A request with no ``user_id`` at all (the identity-less demo
+writer's wait set immediately, so cross-user coupling is bounded by identity
+resolution — ONE session lookup on ``/api/standings/<division_id>``, and TWO on
+the routes that pre-check with ``_operator_only``, which calls
+``_resolve_role()`` and is then followed by the branch calling it again
+(``SESSIONS.resolve`` is uncached). Pre-existing for the venue reads and
+inherited by the routes added later; stated here in the measured form rather
+than the flattering one. A request with no ``user_id`` at all (the identity-less demo
 fallbacks) drops its ticket and takes nothing — the same rule the #386 mutation
 mutex applies.
+
+THAT ONE-SESSION-LOOKUP BOUND IS ENFORCED, NOT MERELY INTENDED, and the way it
+is enforced is not obvious: ``_bind`` must ANNOUNCE the narrowing BEFORE it
+waits on its own predicate, because the narrowing thread can itself go to sleep
+inside ``wait_for`` and would otherwise hold the announcement hostage for the
+whole of its own wait. The first cut announced afterwards, which made the real
+coupling the other operator's entire switch — and, transitively, whatever THEY
+were waiting on. It was also invisible: ``wait_for`` re-evaluates its predicate
+at the deadline, finds it true, and reports SUCCESS, so no expiry is recorded
+and ``stats()`` reads healthy throughout. Nothing in a single-operator test can
+see any of this, which is why
+``test_one_operators_switch_is_not_stalled_by_anothers_scoped_read`` drives two
+real operators through exactly that interleaving.
 
 LOCK ORDER: this gate is level 0, strictly OUTERMOST, above
 ``active_context_mutex`` (1), ``store.transaction()``/the store ``_lock`` (2),
@@ -86,6 +116,22 @@ read that never returns must not be able to lock an operator out of switching
 context. The bound is the handled failure mode, not a promise that it never
 happens — and hitting it means the ordering guarantee was off for that one
 request, which is why it is said out loud rather than only counted.
+
+AND THE HANDLING OF THAT FAILURE IS NOT ITSELF A FAILURE MODE — two separate
+rules, both learned the hard way:
+
+1. ``_await`` RETURNS the expiry notice; the callers print it once they are
+   outside ``self._cv``. That mutex is process-global and every gate operation
+   takes it, so a ``print`` under it lets one stalled stderr — a log collector
+   that stopped reading its pipe — freeze ``arrive()``, which is documented
+   never to block and is the first statement ``do_GET`` runs for every scoped
+   read. The whole server would stop answering scoped reads because one line of
+   diagnostics was waiting on a pipe.
+2. Every registration is removed by a ``finally`` that spans BOTH the wait and
+   the notice. The notice is the module's only I/O and it runs exactly when
+   things are already wrong; a registration leaked there is leaked for the life
+   of the process, and every later participant for that user then waits out the
+   full bound behind a ghost. The wedge handler must not be a wedge.
 
 WHAT AN UNAUTHENTICATED CALLER CAN DO WITH THIS, since the arrival ticket is
 taken before identity exists. It can add unbound tickets to the set a switch
@@ -140,6 +186,17 @@ def _configured_timeout():
     except ValueError:
         return DEFAULT_WAIT_TIMEOUT
     return value if value > 0 else DEFAULT_WAIT_TIMEOUT
+
+
+def _say(notice):
+    """Emit an expiry notice returned by :meth:`ContextSwitchGate._await`.
+
+    MUST be called with the gate mutex RELEASED — that separation is the whole
+    point of ``_await`` returning the text instead of printing it. ``None`` (no
+    expiry) is the common case and writes nothing.
+    """
+    if notice:
+        print(notice, file=sys.stderr, flush=True)
 
 
 class _Ticket:
@@ -229,20 +286,49 @@ class ContextSwitchGate:
             return ReaderTicket(self, ticket)
 
     def _bind(self, ticket, user_id):
-        with self._cv:
-            if ticket.seq not in self._readers:      # already released
-                return
-            ticket.user_id = user_id
-            # Blocked only by switches for this user that arrived FIRST.
-            def blocked():
-                return any(w.user_id == user_id and w.seq < ticket.seq
-                           for w in self._writers.values())
-            self._await(ticket, blocked)
-            ticket.bound = True
-            # Binding narrows this ticket from "every waiting writer" to "this
-            # user's writers", so a writer for a DIFFERENT user may now be
-            # unblocked. Announce it.
-            self._cv.notify_all()
+        notice = None
+        try:
+            with self._cv:
+                if ticket.seq in self._readers:      # else: already released
+                    ticket.user_id = user_id
+                    # ANNOUNCE THE NARROWING BEFORE WAITING ON IT — these two
+                    # statements are not reorderable (#159 review). Setting
+                    # `user_id` narrows this ticket from "every waiting writer"
+                    # to "this user's writers", so a writer for a DIFFERENT
+                    # user may now be unblocked; `_await` below SLEEPS inside
+                    # `wait_for`. Announcing after that sleep leaves the
+                    # foreign writer parked until THIS ticket's own wait ends,
+                    # which makes cross-user coupling the other operator's
+                    # whole switch — and, transitively, their slow read —
+                    # rather than the identity resolution this module's
+                    # docstring bounds it to. It is also SILENT: `wait_for`
+                    # re-evaluates at the deadline, finds the predicate true
+                    # and reports success, so `stats()["timeouts"]` never moves
+                    # and the gate looks healthy while an unrelated operator
+                    # waits out the bound.
+                    self._cv.notify_all()
+
+                    # Blocked only by switches for this user that arrived FIRST.
+                    def blocked():
+                        return any(w.user_id == user_id and w.seq < ticket.seq
+                                   for w in self._writers.values())
+
+                    notice = self._await(ticket, blocked)
+                    # `bound` is bookkeeping for `stats()` and for the notice's
+                    # wording; NO wait predicate in this module reads it (they
+                    # compare `seq` and `user_id` only), so there is
+                    # deliberately no second notify here — nothing any waiter
+                    # can observe changes below this line.
+                    ticket.bound = True
+            _say(notice)
+        except BaseException:
+            # OWN THE INVARIANT LOCALLY (#159 review). ``do_GET``'s outer
+            # ``finally`` does release this ticket today, but a registration
+            # whose removal depends on a CALLER's discipline is one refactor
+            # away from the writer's leak below — and the writer had no such
+            # caller to be saved by.
+            self._release_reader(ticket)
+            raise
 
     def _release_reader(self, ticket):
         with self._cv:
@@ -267,30 +353,44 @@ class ContextSwitchGate:
         if not user_id:
             yield None
             return
-        with self._cv:
-            self._seq += 1
-            ticket = _Ticket(self._seq, user_id)
-            self._writers[ticket.seq] = ticket
-
-            def blocked():
-                for r in self._readers.values():
-                    # An UNBOUND arrival counts: it may yet turn out to be this
-                    # user's, and it is already inside the server.
-                    if r.seq < ticket.seq and r.user_id in (None, user_id):
-                        return True
-                for w in self._writers.values():
-                    if w is not ticket and w.user_id == user_id \
-                            and w.seq < ticket.seq:
-                        return True
-                return False
-
-            self._await(ticket, blocked)
+        # THE REGISTRATION AND THE `try` ARE NOT SEPARABLE (#159 review). From
+        # the moment this ticket enters `self._writers` the ONLY thing that
+        # removes it is the `finally` below, so every statement that can raise
+        # after it — the bounded wait, and the expiry notice that wait may hand
+        # back — has to be inside. `_await` performed the notice's I/O itself
+        # before this correction, which made the handler for a wedged pipe the
+        # thing that leaked a writer PERMANENTLY: every later switch AND every
+        # later scoped read for that user would then wait out the full bound
+        # behind a participant that had already gone. `_bind` has the same
+        # shape and is saved by `do_GET`'s outer `finally`; `exclusive` has no
+        # such caller, which is why the asymmetry mattered.
+        ticket = None
         try:
+            with self._cv:
+                self._seq += 1
+                ticket = _Ticket(self._seq, user_id)
+                self._writers[ticket.seq] = ticket
+
+                def blocked():
+                    for r in self._readers.values():
+                        # An UNBOUND arrival counts: it may yet turn out to be
+                        # this user's, and it is already inside the server.
+                        if r.seq < ticket.seq and r.user_id in (None, user_id):
+                            return True
+                    for w in self._writers.values():
+                        if w is not ticket and w.user_id == user_id \
+                                and w.seq < ticket.seq:
+                            return True
+                    return False
+
+                notice = self._await(ticket, blocked)
+            _say(notice)
             yield ticket
         finally:
-            with self._cv:
-                self._writers.pop(ticket.seq, None)
-                self._cv.notify_all()
+            if ticket is not None:
+                with self._cv:
+                    self._writers.pop(ticket.seq, None)
+                    self._cv.notify_all()
 
     # -- the bounded wait ---------------------------------------------------
     def _await(self, ticket, blocked):
@@ -300,30 +400,48 @@ class ContextSwitchGate:
         participant that never returns must not be able to block another one
         permanently. The expiry is recorded rather than swallowed, so the
         pathological case is observable instead of merely survivable.
+
+        RETURNS THE EXPIRY NOTICE — it does NOT print it (#159 review). This
+        method runs under ``self._cv``, the single process-global gate mutex,
+        and a ``print`` is synchronous blocking I/O: doing it here means one
+        stalled stderr (a log collector that stopped reading its pipe) freezes
+        EVERY gate operation, including ``arrive()``, which is documented never
+        to block and is the FIRST statement ``do_GET`` runs for every scoped
+        read. The whole server would stop answering scoped reads because one
+        line of diagnostics was waiting on a pipe. Both call sites say it out
+        loud via ``_say`` once they are outside the lock, so an expiry is still
+        announced exactly once.
         """
         if not blocked():
-            return
+            return None
         ticket.waiting = True
         try:
             # `wait_for` returns the predicate's final value: False means the
             # timeout expired with the condition still unmet.
             satisfied = self._cv.wait_for(lambda: not blocked(),
                                           timeout=self.wait_timeout)
-            if not satisfied:
-                ticket.timed_out = True
-                self._timeouts += 1
-                # SAID OUT LOUD, once per expiry. A bound that is hit silently
-                # is the failure mode that would make this gate LOOK like it
-                # works while the race it exists for is happening again: the
-                # waiter proceeds, and the ordering guarantee is off for that
-                # one request. `stats()["timeouts"]` is the machine-readable
-                # form; this line is the one a human running the server sees.
-                print(
-                    f"[context-gate] wait bound of {self.wait_timeout}s expired "
-                    f"for {'switch' if ticket.bound else 'scoped read'} "
-                    f"seq={ticket.seq}; proceeding UNORDERED. A scoped read or "
-                    f"a switch is taking longer than the bound.",
-                    file=sys.stderr, flush=True)
+            if satisfied:
+                return None
+            ticket.timed_out = True
+            self._timeouts += 1
+            # SAID OUT LOUD, once per expiry (by the caller — see above).
+            # PRECISELY: the counter moves here, under the mutex, and the line
+            # is printed by the caller just after it releases. An asynchronous
+            # exception (a signal, KeyboardInterrupt) landing in that gap would
+            # leave the expiry COUNTED but UNSAID — the price of not printing
+            # under a process-global lock, and the reason `stats()["timeouts"]`
+            # rather than the log is the authority on how often the bound is
+            # hit. A bound that is hit silently is the failure mode that would make
+            # this gate LOOK like it works while the race it exists for is
+            # happening again: the waiter proceeds, and the ordering guarantee
+            # is off for that one request. `stats()["timeouts"]` is the
+            # machine-readable form; this line is the one a human running the
+            # server sees.
+            return (
+                f"[context-gate] wait bound of {self.wait_timeout}s expired "
+                f"for {'switch' if ticket.bound else 'scoped read'} "
+                f"seq={ticket.seq}; proceeding UNORDERED. A scoped read or "
+                f"a switch is taking longer than the bound.")
         finally:
             ticket.waiting = False
 
