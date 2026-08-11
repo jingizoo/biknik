@@ -171,6 +171,20 @@ class PreferenceHttpAccessTest(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read() or b"{}")
 
+    def _select_active_context(self, c):
+        """Persist the tuple ``GET /api/context`` already resolves for this
+        session (#409). `official/<id>/delete` is a guarded MUTATION, so it
+        now requires a context the operator CHOSE; the tuple persisted here is
+        byte-for-byte the one the fallback was already handing this session,
+        so the delete still reaches its own `has_dependencies` verdict."""
+        status, ctx = self._req(c, "GET", "/api/context")
+        self.assertEqual(status, 200, ctx)
+        status, saved = self._req(c, "POST", "/api/context",
+                                  {"program_id": ctx.get("program_id"),
+                                   "season_id": ctx.get("season_id"),
+                                   "league_id": ctx.get("league_id")})
+        self.assertEqual(status, 200, saved)
+
     def test_operator_manages_any_recipient(self):
         c = self._client()
         self._req(c, "POST", "/api/auth/login", {"username": "admin", "password": "demo"})
@@ -198,6 +212,7 @@ class PreferenceHttpAccessTest(unittest.TestCase):
         # needed anywhere in this test.
         c = self._client()
         self._req(c, "POST", "/api/auth/login", {"username": "admin", "password": "demo"})
+        self._select_active_context(c)                          # #409
         status, official = self._req(c, "POST", "/api/v2/setup/official",
                                      {"name": "Retire Official"})
         self.assertEqual(status, 200, official)
@@ -325,6 +340,7 @@ class PreferenceHttpAccessTest(unittest.TestCase):
         # not silently reverted to the resolver's enabled default.
         c = self._client()
         self._req(c, "POST", "/api/auth/login", {"username": "admin", "password": "demo"})
+        self._select_active_context(c)                          # #409
         status, official = self._req(c, "POST", "/api/v2/setup/official",
                                      {"name": "Blocked Official"})
         self.assertEqual(status, 200, official)

@@ -301,6 +301,92 @@ class ContextService:
             return _detached(program), _detached(season), _detached(league)
         return self._snapshot(work)
 
+    def resolve_saved_with_league(self, user_id: Optional[str], role, scope,
+                                  lock=False):
+        """``(saved_row, program, season, league)`` derived ONLY from the
+        PERSISTED ``ActiveContext`` row — ``_fallback()`` is NEVER called (#409).
+
+        THE AUTHORIZATION SOURCE for every mutation gate. :meth:`resolve` and
+        :meth:`resolve_with_league` answer "what context should this caller be
+        shown", and their answer may be one ``_fallback()`` INVENTED; that is
+        the owner's ruling for landing and navigation and it is untouched here.
+        This answers the different question a WRITE has to ask: "what did the
+        operator themselves CHOOSE, and is it still valid?".
+
+        The distinction is not cosmetic and it cannot be recovered by comparing
+        values afterwards. ``_fallback()`` may well pick the very Program the
+        row names — it walks the caller's authorized Programs in id order, and
+        with one Program in the installation it picks that one every time. A
+        resolved value that merely EQUALS the saved one is not evidence that it
+        CAME from it, so a predicate built on the resolve is only accidentally
+        right, and stops being right the moment the inventory changes. Reading
+        the row and validating IT is the only form of the check that cannot be
+        satisfied by coincidence.
+
+        Each axis is validated exactly as ``_resolve_locked`` validates it, so
+        an honoured saved selection is BYTE-FOR-BYTE the tuple that method
+        already returns for the same row; the only difference is what happens
+        when an axis does not validate. Here the axis is simply dropped:
+
+        * saved row absent, or naming no Program -> ``(row, None, None, None)``;
+        * Program deleted or no longer authorized -> ``(row, None, None, None)``
+          — the Program axis is the root, so nothing below it can stand;
+        * Season deleted or no longer authorized -> the Program is KEPT and the
+          Season becomes ``None``, which is exactly the shape a deliberate
+          Program-only selection already has. A caller whose Season went stale
+          is therefore refused by a two-axis gate and admitted by a
+          Program-axis one, which is the #409 rule;
+        * the League axis reuses :meth:`_resolve_league_locked` unchanged.
+
+        ``lock=True`` takes the caller's ActiveContext ROW LOCK
+        (``get_active_context_for_update``, #386) and holds it for the rest of
+        the SURROUNDING transaction, which the caller must own — and, unlike
+        :meth:`resolve_with_league`, the locked read's RESULT is what is
+        judged, rather than a lock taken beside a separate unlocked read.
+        """
+        def work():
+            saved, program, season, league = self._saved_locked(
+                user_id, role, scope, lock=lock)
+            return (_detached(saved), _detached(program), _detached(season),
+                    _detached(league))
+        return self._snapshot(work)
+
+    def _saved_locked(self, user_id, role, scope, lock=False):
+        """The persisted row and the axes it still validly names, as LIVE rows —
+        MUST run inside the transaction; every caller detaches its result before
+        the lock releases.
+
+        Extracted from :meth:`resolve_saved_with_league` so the switcher's
+        enumeration (:meth:`options_with_saved`) can report the SAME authority
+        the mutation gates are judged against, under the SAME snapshot as the
+        options beside it, rather than through a second read that could disagree
+        with them. The rules are that method's rules verbatim — read its
+        docstring for what each axis drops and why ``_fallback()`` is never
+        consulted here."""
+        saved = None
+        if user_id:
+            saved = (self.store.get_active_context_for_update(user_id)
+                     if lock else self.store.get_active_context(user_id))
+        if saved is None or not saved.program_id:
+            return saved, None, None, None
+        programs = context_scope.authorized_program_ids(
+            self.store, role, scope, user_id)
+        if saved.program_id not in programs:
+            return saved, None, None, None
+        program = self.store.get_program(saved.program_id)
+        if program is None:
+            return saved, None, None, None
+        season = None
+        if saved.season_id is not None:
+            candidate = self.store.get_season(saved.season_id)
+            seasons = context_scope.authorized_season_ids(
+                self.store, role, scope, saved.program_id, user_id)
+            if candidate is not None and saved.season_id in seasons:
+                season = candidate
+        league = self._resolve_league_locked(
+            user_id, role, scope, program, season)
+        return saved, program, season, league
+
     def options_with_league(self, user_id: Optional[str], role, scope):
         """``(programs, selected_program, selected_season, selected_league)``
         where ``programs`` is ``[(program, [season, ...], [league, ...]), ...]``
@@ -316,34 +402,80 @@ class ContextService:
         time, where it can report a precise reason, not silently by omission
         here.
         """
+        return self._snapshot(
+            lambda: self._options_locked(user_id, role, scope))
+
+    def _options_locked(self, user_id, role, scope):
+        """The switcher's enumeration + RESOLVED selection, already detached —
+        MUST run inside the transaction. Shared verbatim by
+        :meth:`options_with_league` and :meth:`options_with_saved` so the two can
+        never drift into offering different option sets."""
+        authorized = context_scope.authorized_program_ids(
+            self.store, role, scope, user_id)
+        programs = []
+        for pid in sorted(authorized):
+            program = self.store.get_program(pid)
+            if program is None:
+                continue
+            season_ids = context_scope.authorized_season_ids(
+                self.store, role, scope, pid, user_id)
+            seasons = sorted(
+                (s for sid in season_ids
+                 if (s := self.store.get_season(sid)) is not None),
+                key=_season_sort_key, reverse=True)   # latest first
+            league_ids = context_scope.authorized_league_ids(
+                self.store, role, scope, pid, user_id)
+            leagues = sorted(
+                (lg for lid in league_ids
+                 if (lg := self.store.get_league(lid)) is not None),
+                key=lambda lg: (lg.sort_order or 0, lg.id))
+            programs.append((_detached(program),
+                             [_detached(s) for s in seasons],
+                             [_detached(lg) for lg in leagues]))
+        sel_program, sel_season = self._resolve_locked(user_id, role, scope)
+        sel_league = self._resolve_league_locked(
+            user_id, role, scope, sel_program, sel_season)
+        return (programs, _detached(sel_program), _detached(sel_season),
+                _detached(sel_league))
+
+    def options_with_saved(self, user_id: Optional[str], role, scope):
+        """``(programs, sel_program, sel_season, sel_league,
+        saved_program, saved_season, saved_league)`` — :meth:`options_with_league`
+        plus the axes the PERSISTED row actually names (#411).
+
+        A new, wider method rather than a changed return shape, exactly as the
+        League axis was added: every positional unpacker of
+        :meth:`options_with_league` keeps its meaning.
+
+        WHY THE SWITCHER NEEDS BOTH TUPLES. ``sel_*`` is the resolved,
+        renderable context and may have been INVENTED by ``_fallback()``;
+        ``saved_*`` is what the operator themselves chose, and is the only thing
+        a mutation gate will honour (:meth:`resolve_saved_with_league`). On a
+        one-Program installation the two are value-identical while nothing is
+        persisted at all, so a UI that has only ``sel_*`` cannot help but claim
+        a selection the writes will refuse — the display/authority disagreement
+        #409 exists to remove. Reporting them side by side, from ONE snapshot,
+        is what lets the switcher paint "showing you this" and "you have chosen
+        this" as the different facts they are.
+
+        The saved half is deliberately reported as VALIDATED axes rather than as
+        the raw row: an operator whose saved Season was deleted still holds a
+        real Program-axis selection, and that is precisely what the create gate
+        will grant them."""
+        # ONE `work()`, not a call to `options_with_league` followed by a call to
+        # `resolve_saved_with_league`: two snapshots could be taken either side
+        # of a concurrent switch, and the pair the switcher compares would then
+        # describe two different moments — the one comparison that must never be
+        # able to go wrong, since a false "already saved" hides the only control
+        # that can save anything.
         def work():
-            authorized = context_scope.authorized_program_ids(
-                self.store, role, scope, user_id)
-            programs = []
-            for pid in sorted(authorized):
-                program = self.store.get_program(pid)
-                if program is None:
-                    continue
-                season_ids = context_scope.authorized_season_ids(
-                    self.store, role, scope, pid, user_id)
-                seasons = sorted(
-                    (s for sid in season_ids
-                     if (s := self.store.get_season(sid)) is not None),
-                    key=_season_sort_key, reverse=True)   # latest first
-                league_ids = context_scope.authorized_league_ids(
-                    self.store, role, scope, pid, user_id)
-                leagues = sorted(
-                    (lg for lid in league_ids
-                     if (lg := self.store.get_league(lid)) is not None),
-                    key=lambda lg: (lg.sort_order or 0, lg.id))
-                programs.append((_detached(program),
-                                 [_detached(s) for s in seasons],
-                                 [_detached(lg) for lg in leagues]))
-            sel_program, sel_season = self._resolve_locked(user_id, role, scope)
-            sel_league = self._resolve_league_locked(
-                user_id, role, scope, sel_program, sel_season)
-            return (programs, _detached(sel_program), _detached(sel_season),
-                    _detached(sel_league))
+            programs, sel_program, sel_season, sel_league = self._options_locked(
+                user_id, role, scope)
+            _row, saved_program, saved_season, saved_league = self._saved_locked(
+                user_id, role, scope)
+            return (programs, sel_program, sel_season, sel_league,
+                    _detached(saved_program), _detached(saved_season),
+                    _detached(saved_league))
         return self._snapshot(work)
 
     # Every League-selection refusal uses this ONE message/reason, whatever the

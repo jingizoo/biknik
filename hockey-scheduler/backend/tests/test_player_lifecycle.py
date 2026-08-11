@@ -495,6 +495,17 @@ class SetPlayerActiveHttpTest(unittest.TestCase):
         self._req(c, "POST", "/api/auth/login",
                   {"username": "admin", "password": "demo"})
         self._req(c, "POST", "/api/demo/load", {})
+        # #409: `player/<id>/active` is a guarded MUTATION, so it now needs an
+        # EXPLICITLY persisted context rather than the read-only fallback.
+        # Persist the very tuple this session already resolves — the Player
+        # acted on is byte-for-byte the one it always was.
+        s, _h, ctx = self._req(c, "GET", "/api/context")
+        self.assertEqual(s, 200, ctx)
+        s, _h, saved = self._req(c, "POST", "/api/context",
+                                 {"program_id": ctx.get("program_id"),
+                                  "season_id": ctx.get("season_id"),
+                                  "league_id": ctx.get("league_id")})
+        self.assertEqual(s, 200, saved)
         return c
 
     def _req(self, opener, method, path, body=None):

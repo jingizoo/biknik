@@ -920,7 +920,16 @@ class ScopedVenueAccessHttpTest(unittest.TestCase):
     def _v2(self, c, entity, body):
         status, raw = self._req(c, "POST", f"/api/v2/setup/{entity}", body)
         self.assertEqual(status, 200, raw[:300])
-        return json.loads(raw)
+        resp = json.loads(raw)
+        # #409: a Season CREATE is PROGRAM-AXIS, so it is judged against the
+        # Program the operator CHOSE. These classes build two Programs in one
+        # shared store, so activate each Program the moment it exists -- what
+        # an operator does, and the same "you set up what you just made" step
+        # `_grant`/`_select` already perform one axis down. Each test still
+        # sets the context it is actually ABOUT afterwards.
+        if entity == "program" and resp.get("id"):
+            self._req(c, "POST", "/api/context", {"program_id": resp["id"]})
+        return resp
 
     def _build(self, c, tag):
         org = self._v2(c, "organization",
@@ -1136,7 +1145,16 @@ class SelectedSeasonCeilingHttpTest(unittest.TestCase):
     def _v2(self, c, entity, body):
         status, raw = self._req(c, "POST", f"/api/v2/setup/{entity}", body)
         self.assertEqual(status, 200, raw[:300])
-        return json.loads(raw)
+        resp = json.loads(raw)
+        # #409: a Season CREATE is PROGRAM-AXIS, so it is judged against the
+        # Program the operator CHOSE. These classes build two Programs in one
+        # shared store, so activate each Program the moment it exists -- what
+        # an operator does, and the same "you set up what you just made" step
+        # `_grant`/`_select` already perform one axis down. Each test still
+        # sets the context it is actually ABOUT afterwards.
+        if entity == "program" and resp.get("id"):
+            self._req(c, "POST", "/api/context", {"program_id": resp["id"]})
+        return resp
 
     def _grant(self, c, season_id, venue_id):
         # The grant is a WRITE naming an EXISTING Season, so the Season end is
@@ -1690,7 +1708,16 @@ class ArchivedSelectedSeasonCandidateHttpTest(unittest.TestCase):
     def _v2(self, c, entity, body):
         status, raw = self._req(c, "POST", f"/api/v2/setup/{entity}", body)
         self.assertEqual(status, 200, raw[:300])
-        return json.loads(raw)
+        resp = json.loads(raw)
+        # #409: a Season CREATE is PROGRAM-AXIS, so it is judged against the
+        # Program the operator CHOSE. These classes build two Programs in one
+        # shared store, so activate each Program the moment it exists -- what
+        # an operator does, and the same "you set up what you just made" step
+        # `_grant`/`_select` already perform one axis down. Each test still
+        # sets the context it is actually ABOUT afterwards.
+        if entity == "program" and resp.get("id"):
+            self._req(c, "POST", "/api/context", {"program_id": resp["id"]})
+        return resp
 
     def _select(self, c, program_id, season_id):
         status, raw = self._req(c, "POST", "/api/context",

@@ -354,7 +354,23 @@ class UpdatePlayerHttpTest(unittest.TestCase):
         self._req(c, "POST", "/api/auth/login",
                   {"username": "admin", "password": "demo"})
         self._req(c, "POST", "/api/demo/load", {})
+        self._select_active_context(c)
         return c
+
+    def _select_active_context(self, c):
+        """Persist the tuple ``GET /api/context`` already resolves for this
+        session (#409). Read-only navigation keeps the deterministic fallback;
+        a guarded MUTATION — and `player/<id>/update` is one — now requires a
+        context the operator CHOSE. The tuple persisted is byte-for-byte the
+        one the fallback was already handing this session, so every case below
+        edits exactly the Player it always did."""
+        s, _h, ctx = self._req(c, "GET", "/api/context")
+        self.assertEqual(s, 200, ctx)
+        s, _h, saved = self._req(c, "POST", "/api/context",
+                                 {"program_id": ctx.get("program_id"),
+                                  "season_id": ctx.get("season_id"),
+                                  "league_id": ctx.get("league_id")})
+        self.assertEqual(s, 200, saved)
 
     def _req(self, opener, method, path, body=None):
         url = f"http://127.0.0.1:{self.port}{path}"

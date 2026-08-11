@@ -54,6 +54,9 @@ const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
+const {
+  installContextFixture, selectProgramSeason,
+} = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -159,69 +162,65 @@ function fail(msg) { throw new Error(msg); }
 // first. The context is left on Alpha, which is where the scenario starts.
 async function buildFixture(page) {
   return page.evaluate(async () => {
-    const post = async (p, b) => {
-      const r = await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      });
-      const json = await r.json().catch(() => ({}));
-      if (!r.ok || (json && json.error)) {
-        throw new Error(`${p} -> ${r.status} ${JSON.stringify(json)}`);
-      }
-      return json;
-    };
+    const F = window.hsFixture;
+    // Thin alias for the non-create calls below (publish/result/approve); it
+    // is `F.call`, so a refusal still fails at its own line (#409).
+    const post = (p, b) => F.call(p, p, b);
 
     // One Program's whole world, built under its own token.
     const buildProgram = async (token, slotDates) => {
-      const org = await post("/api/v2/setup/organization", { name: `${token} Org` });
-      const program = await post("/api/v2/setup/program",
+      const org = await F.create(`${token} organization`, "/api/v2/setup/organization", { name: `${token} Org` });
+      const program = await F.create(`${token} program`, "/api/v2/setup/program",
         { name: `${token} Program`, operator_organization_id: org.id });
-      const season = await post("/api/v2/setup/season",
+      // #409 EXPLICIT SELECTION, boundary 1. The Season create is
+      // PROGRAM-AXIS and minting the Program is not a selection, so the
+      // Program-only choice is persisted BEFORE the Season — earlier than the
+      // single context write that used to sit below the Season create.
+      await F.selectProgram(`${token} Program-only bootstrap`, program.id);
+      const season = await F.create(`${token} Season`, "/api/v2/setup/season",
         { program_id: program.id, name: `${token} Season` });
-      // Enter this Program/Season BEFORE building into it. Setup writes are
-      // gated on the active context (#369's parent-id write gate): creating a
-      // Team under a League the active tuple does not cover is refused with
-      // "League not found or not accessible for this context". With two
-      // Programs in play there is no ambient default that could be right for
-      // both, so each one is entered explicitly -- which is also what an
-      // operator actually does.
-      await post("/api/context", { program_id: program.id, season_id: season.id });
-      const league = await post("/api/v2/setup/league",
+      // BOUNDARY 2. Enter this Program/Season BEFORE building into it. Setup
+      // writes are gated on the active context (#369's parent-id write gate,
+      // and now #409's axis comparison): the League, Division, registrations,
+      // venue-access grant and Games below are all SEASON-OWNED and all land
+      // in THIS Season. With two Programs in play there is no ambient default
+      // that could be right for both, so each one is entered explicitly --
+      // which is also what an operator actually does. Driven through
+      // `setActiveContext` and read back, rather than the raw unasserted
+      // `POST /api/context` this replaces.
+      await F.selectProgramSeason(`${token} Program+Season`, program.id, season.id);
+      const league = await F.create(`${token} League`, "/api/v2/setup/league",
         { season_id: season.id, name: `${token} League` });
-      const club = await post("/api/v2/setup/club", { name: `${token} Club` });
-      const home = await post("/api/v2/setup/team",
+      const club = await F.create(`${token} club`, "/api/v2/setup/club", { name: `${token} Club` });
+      const home = await F.create(`${token} home team`, "/api/v2/setup/team",
         { club_id: club.id, name: `${token} Home`, league_id: league.id });
-      const away = await post("/api/v2/setup/team",
+      const away = await F.create(`${token} away team`, "/api/v2/setup/team",
         { club_id: club.id, name: `${token} Away`, league_id: league.id });
-      const division = await post("/api/v2/setup/division",
+      const division = await F.create(`${token} division`, "/api/v2/setup/division",
         { league_id: league.id, name: `${token} Division`, season_id: season.id });
-      await post(`/api/v2/setup/seasons/${season.id}/team-registrations`,
+      await F.call("team registration", `/api/v2/setup/seasons/${season.id}/team-registrations`,
         { team_id: home.id, league_id: league.id, division_id: division.id });
-      await post(`/api/v2/setup/seasons/${season.id}/team-registrations`,
+      await F.call("team registration", `/api/v2/setup/seasons/${season.id}/team-registrations`,
         { team_id: away.id, league_id: league.id, division_id: division.id });
 
-      const venue = await post("/api/v2/setup/venue",
+      const venue = await F.create(`${token} venue`, "/api/v2/setup/venue",
         { name: `${token} Venue`, organization_id: org.id });
       // The grant binds to the ACTIVE Season, which the context POST above
       // already put on this Program's own Season.
-      const granted = await post(`/api/v2/setup/seasons/${season.id}/venue-access`,
-        { venue_id: venue.id });
-      if (!granted || !granted.id) {
-        throw new Error(`${token} venue-access grant did not succeed: `
-          + JSON.stringify(granted));
-      }
-      const rink = await post("/api/v2/setup/rink",
+      await F.create(`${token} venue-access grant`,
+        `/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
+      const rink = await F.create(`${token} rink`, "/api/v2/setup/rink",
         { venue_id: venue.id, name: `${token} Rink` });
       // Far-future dates, one game per day: the Games screen groups by day and
       // the Dashboard falls back to every scheduled game when none is "today",
       // so dates that can never be today keep this stable whenever it runs.
       const games = [];
       for (const date of slotDates) {
-        const slot = await post("/api/v2/setup/ice-slot", {
+        const slot = await F.create(`${token} ice slot`, "/api/v2/setup/ice-slot", {
           rink_id: rink.id,
           start_time: `${date}T18:00:00+00:00`, end_time: `${date}T20:00:00+00:00`,
         });
-        const g = await post("/api/v2/setup/game", {
+        const g = await F.create(`${token} game`, "/api/v2/setup/game", {
           season_id: season.id, league_id: league.id, division_id: division.id,
           home_team_id: home.id, away_team_id: away.id, ice_slot_id: slot.id,
         });
@@ -243,7 +242,7 @@ async function buildFixture(page) {
     // The account the scenario itself runs as. Global scope: authorized for
     // both Programs, so the switch below is a real operator choice rather
     // than an authorization side effect.
-    const operator = await post("/api/accounts", {
+    const operator = await F.create("operator account", "/api/accounts", {
       username: `scope_ops_${Date.now()}`, password: "demo",
       role: "arena_manager", scope: {},
     });
@@ -596,6 +595,8 @@ async function checkScopeTruth(browser, viewport) {
     if ((await loginAs(page, "admin")).status !== 200) {
       throw new Error(`[${L}] admin login failed`);
     }
+    await page.waitForSelector("#content > *", { timeout: 15000 });
+    await installContextFixture(page);
     const f = await buildFixture(page).catch((e) => fail(
       `[${L}] fixture build failed: ${e.message || e}`));
     const alphaValue = `${f.alpha.program}|${f.alpha.season}`;
@@ -607,12 +608,16 @@ async function checkScopeTruth(browser, viewport) {
     if ((await loginAs(page, f.operator)).status !== 200) {
       throw new Error(`[${L}] arena manager login failed`);
     }
-    if ((await apiPost(page, "/api/context",
-      { program_id: f.alpha.program, season_id: f.alpha.season })).status !== 200) {
-      throw new Error(`[${L}] could not start the operator on Alpha`);
-    }
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 15000 });
+    // Start the operator on Alpha EXPLICITLY (#409), through the app's own
+    // switch pipeline and with the saved tuple read back — the raw
+    // `POST /api/context` this replaces moved the server while the freshly
+    // reloaded client went on believing whatever the fallback resolver had
+    // handed it, and this journey's whole subject is whether the screens
+    // agree with the SAVED context.
+    await selectProgramSeason(page, `[${L}] start the operator on Alpha`,
+      f.alpha.program, f.alpha.season);
     await page.waitForFunction(() => {
       const s = document.getElementById("ctx-select");
       return s && !s.hidden && s.options.length >= 2;

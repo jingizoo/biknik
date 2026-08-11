@@ -936,6 +936,63 @@ class DraftActiveTupleTest(unittest.TestCase):
             self.assertEqual(len(committed["created"]), 6)
         self._on_every_backend(body)
 
+    def test_the_commit_refuses_an_unchosen_context_before_disclosing_anything(self):
+        """#409 PHASE 1 for ``/api/scheduler/commit``.
+
+        The commit's own scope gate is answered TWICE: once before the pre-lock
+        regeneration and once under the locks that write the Games. Only the
+        second existed. The pre-lock path resolves through the raw fallback, so
+        a caller who had chosen NOTHING got the regeneration's diagnostics —
+        ``preview_stale``, ``division_missing``, ``league_season_missing``,
+        ``pairing_already_scheduled`` — about a hierarchy the fallback picked
+        for them, and only after that could the locked half refuse.
+
+        This drives exactly that window: a principal with no saved selection
+        sends a commit carrying a deliberately WRONG fingerprint. The answer
+        must be the stable ``active_context_required``, and it must be
+        BYTE-IDENTICAL for a Division that never existed — that identity is
+        the property the ordering buys, because a refusal that varied between
+        `preview_stale` and `division_missing` is an existence oracle over
+        another Program's hierarchy.
+        """
+        def body(store, api):
+            fixture = build_two_programs(api)
+            pa, sa, la, da = corner(fixture, "A", "1", "a")
+            # The fixture is built and reviewed by an operator who DID choose;
+            # the probe below is a different principal entirely.
+            self._select(api, ADMIN, Role.LEAGUE_ADMIN, pa, sa, la)
+            _ok(self._draft(api, ADMIN, Role.LEAGUE_ADMIN, division_id=da))
+
+            unchosen = "user_never_chose_a_context"
+            self.assertIsNone(
+                store.get_active_context(unchosen),
+                "the probe principal already has a saved selection, so this "
+                "case is not about an unchosen context at all")
+            games_before = list(store.all_games())
+            audit_before = len(store.all_setup_audit())
+            counter_before = _game_counter(store)
+
+            kwargs = dict(draft_fingerprint="a-fingerprint-that-is-not-current",
+                          actor_id=unchosen, user_id=unchosen,
+                          role=Role.LEAGUE_ADMIN, scope={})
+            refused = api.commit_draft_schedule(division_id=da, **kwargs)
+            self.assertIn("error", refused,
+                          "a caller who has chosen NOTHING committed a "
+                          "schedule")
+            self.assertEqual(refused["error"]["code"],
+                             "active_context_required", refused)
+            ghost = api.commit_draft_schedule(
+                division_id="division_never_existed", **kwargs)
+            self.assertEqual(
+                ghost, refused,
+                "the refusal varies with the target, so it discloses whether "
+                "that Division exists")
+            # Nothing ran: no Game, no slot flip, no audit row, no id burned.
+            self.assertEqual(store.all_games(), games_before)
+            self.assertEqual(len(store.all_setup_audit()), audit_before)
+            self.assertEqual(_game_counter(store), counter_before)
+        self._on_every_backend(body)
+
     # -- clause: the draft-review surface ----------------------------------
     def _commit_both_corners(self, api):
         """One committed draft batch in A/1/a and one in B/1/a."""
@@ -1895,15 +1952,27 @@ class DraftFirstSelectionRaceTest(unittest.TestCase):
     to the fixture quietly creates one, these tests fail loudly instead of
     passing while testing nothing.
 
-    The valid serial outcomes are exactly two, and both are asserted:
+    #409 CLOSED THE OTHER HALF OF THIS. A caller with no saved row can no
+    longer MUTATE at all: ``_locked_draft_targets`` now requires an EXPLICIT
+    persisted tuple and refuses with ``active_context_required``, so "the verb
+    acted on the fallback tuple A" is no longer one of the outcomes. That does
+    NOT make this class vacuous — it makes it sharper. The advisory lock is
+    still the only thing that can order an absent-row selection against the
+    unit, and the refusal path is the one that has to keep doing it:
 
-      * the verb ordered FIRST — it acted on the fallback tuple A, and the B
-        selection landed afterwards; or
-      * the selection ordered FIRST — the verb saw tuple B and wrote nothing,
-        because none of the A drafts is in B.
+      * the racing first selection must still be BLOCKED for as long as the
+        refusing unit holds the mutex, and must land afterwards; and
+      * the refusal must leave BOTH tuples untouched — no cross-tuple write,
+        no partial batch, no audit row.
 
-    What must never happen is the third outcome: B persisted AND A's Games
-    mutated. A cross-tuple write is checked directly, not inferred.
+    The seam therefore moved with the code. It used to fire at the batch's
+    first Game mutation; a refused batch never reaches one, so it now fires at
+    ``get_active_context_for_update`` — the ActiveContext lock, which is the
+    refusing transaction's FIRST statement and is taken strictly after the
+    per-user mutex.
+
+    What must never happen is unchanged: B persisted AND A's Games mutated. A
+    cross-tuple write is checked directly, not inferred.
     """
 
     maxDiff = None
@@ -2062,132 +2131,147 @@ class DraftFirstSelectionRaceTest(unittest.TestCase):
                 {s.id: s.status for s in self.store.all_ice_slots()},
                 len(self.store.all_setup_audit()))
 
-    def test_first_selection_races_publish(self):
-        before = self._snapshot()
-        original = self.api.setup.publish_game
+    def _race_at_the_context_lock(self, verb):
+        """Fire the racing first selection at ``get_active_context_for_update``
+        — the refusing unit's first in-transaction statement (#409).
+
+        Racing there rather than at a Game write is what keeps this class
+        alive after #409: an un-chosen caller's batch refuses before it reads
+        a single candidate, so every later seam is unreachable. This one is
+        reached on every attempt, and it sits strictly INSIDE the transaction
+        and strictly AFTER the per-user mutex — so a selection that completes
+        here would prove the mutex is not held.
+        """
+        original = self.store.get_active_context_for_update
         seen = {"calls": 0}
 
         def run(start):
-            def publish_with_the_first_selection(game_id, published,
-                                                 actor_id=None):
+            def lock_with_the_first_selection(user_id):
                 seen["calls"] += 1
                 if seen["calls"] == 1:
                     start()
-                return original(game_id, published, actor_id)
+                return original(user_id)
 
-            self.api.setup.publish_game = publish_with_the_first_selection
+            self.store.get_active_context_for_update = \
+                lock_with_the_first_selection
             try:
-                return _ok(self.api.publish_draft_games(
-                    game_ids=list(self.committed), actor_id=NEWCOMER,
-                    user_id=NEWCOMER, role=Role.LEAGUE_ADMIN, scope={}))
+                return verb()
             finally:
-                self.api.setup.publish_game = original
+                self.store.get_active_context_for_update = original
 
-        result = self._race_first_selection(run, "the first publish_game")
-        self.assertIn(result["published"], (0, 6), result)
+        result = self._race_first_selection(run, "the ActiveContext lock")
+        self.assertGreaterEqual(
+            seen["calls"], 1,
+            "the batch never took its ActiveContext lock, so the barrier "
+            "never fired and nothing was raced")
+        return result
+
+    def _assert_refused_for_want_of_a_selection(self, result):
+        """#409's refusal, asserted as the wire contract the oracle names."""
+        self.assertIsInstance(result, dict)
+        self.assertEqual(
+            (result.get("error") or {}).get("code"), "active_context_required",
+            f"an un-chosen caller's batch was not refused: {result}")
+
+    def test_first_selection_races_publish(self):
+        before = self._snapshot()
+        result = self._race_at_the_context_lock(
+            lambda: self.api.publish_draft_games(
+                game_ids=list(self.committed), actor_id=NEWCOMER,
+                user_id=NEWCOMER, role=Role.LEAGUE_ADMIN, scope={}))
+        self._assert_refused_for_want_of_a_selection(result)
         self._assert_no_cross_tuple_write(before, set(self.committed))
 
     def test_first_selection_races_discard(self):
         before = self._snapshot()
-        original = self.store.delete_game
-        seen = {"calls": 0}
-
-        def run(start):
-            def delete_with_the_first_selection(game_id):
-                seen["calls"] += 1
-                if seen["calls"] == 1:
-                    start()
-                return original(game_id)
-
-            self.store.delete_game = delete_with_the_first_selection
-            try:
-                return _ok(self.api.discard_draft_games(
-                    game_ids=list(self.committed), actor_id=NEWCOMER,
-                    user_id=NEWCOMER, role=Role.LEAGUE_ADMIN, scope={}))
-            finally:
-                self.store.delete_game = original
-
-        result = self._race_first_selection(run, "the first delete_game")
-        self.assertIn(result["discarded"], (0, 6), result)
+        result = self._race_at_the_context_lock(
+            lambda: self.api.discard_draft_games(
+                game_ids=list(self.committed), actor_id=NEWCOMER,
+                user_id=NEWCOMER, role=Role.LEAGUE_ADMIN, scope={}))
+        self._assert_refused_for_want_of_a_selection(result)
         self._assert_no_cross_tuple_write(before, set(self.committed))
 
     def test_first_selection_races_discard_all(self):
         before = self._snapshot()
-        original = self.store.delete_game
-        seen = {"calls": 0}
-
-        def run(start):
-            def delete_with_the_first_selection(game_id):
-                seen["calls"] += 1
-                if seen["calls"] == 1:
-                    start()
-                return original(game_id)
-
-            self.store.delete_game = delete_with_the_first_selection
-            try:
-                return _ok(self.api.discard_draft_games(
-                    all_drafts=True, actor_id=NEWCOMER, user_id=NEWCOMER,
-                    role=Role.LEAGUE_ADMIN, scope={}))
-            finally:
-                self.store.delete_game = original
-
-        result = self._race_first_selection(
-            run, "the first delete_game of an all_drafts discard")
-        self.assertIn(result["discarded"], (0, 6), result)
+        result = self._race_at_the_context_lock(
+            lambda: self.api.discard_draft_games(
+                all_drafts=True, actor_id=NEWCOMER, user_id=NEWCOMER,
+                role=Role.LEAGUE_ADMIN, scope={}))
+        self._assert_refused_for_want_of_a_selection(result)
         self._assert_no_cross_tuple_write(before, set(self.committed))
 
-    def test_first_selection_races_commit(self):
+    def test_an_unchosen_commit_never_reaches_a_game_write_to_race(self):
+        """#409 moved this seam, and the move is why the case now asserts ONE
+        outcome instead of two.
+
+        This used to race the newcomer's very first selection against the
+        commit's first Game INSERT, and accepted either serial ordering —
+        including the branch where the COMMIT ordered first and created six
+        Games "on the fallback tuple A it really did hold at the time". That
+        branch is precisely the defect: a fallback authorized a mutation. It
+        cannot happen any more, and not because the race is won differently
+        but because the seam is UNREACHABLE — ``commit_draft_schedule`` now
+        answers the pre-disclosure ``active_context_required`` before it
+        regenerates anything, and the locked half refuses again behind it. So
+        there is no Game write left for a first selection to race.
+
+        What is asserted here is strictly stronger than the old pair of
+        outcomes: the commit is refused, ``add_game`` is never called even
+        once, nothing is written into EITHER Program, and the newcomer's first
+        selection — run afterwards on its own connection, with nothing to wait
+        for — still lands. The ActiveContext lock itself is still raced, by
+        the publish/discard cases above (which have no pre-lock preflight and
+        so do reach it) and by
+        ``DraftActiveTupleRaceTest.test_commit_holds_the_context_lock_across_its_game_writes``
+        for a caller who HAS chosen.
+        """
         self._assert_no_saved_context()
-        before = self._snapshot()
-        # A second Division in the SAME corner, so there is something left to
-        # commit after setUp's batch.
         _ok(self.api.discard_draft_games(all_drafts=True), "clear")
         before = self._snapshot()
         preview = _ok(self.api.draft_season_schedule(
             division_id=self.da, user_id=NEWCOMER, role=Role.LEAGUE_ADMIN,
             scope={}))
+
         original = self.store.add_game
         seen = {"calls": 0}
 
-        def run(start):
-            def add_with_the_first_selection(game):
-                seen["calls"] += 1
-                if seen["calls"] == 1:
-                    start()
-                return original(game)
+        def counting_add_game(game):
+            seen["calls"] += 1
+            return original(game)
 
-            self.store.add_game = add_with_the_first_selection
-            try:
-                return self.api.commit_draft_schedule(
-                    division_id=self.da,
-                    draft_fingerprint=preview["draft_fingerprint"],
-                    actor_id=NEWCOMER, user_id=NEWCOMER,
-                    role=Role.LEAGUE_ADMIN, scope={})
-            finally:
-                self.store.add_game = original
+        self.store.add_game = counting_add_game
+        try:
+            result = self.api.commit_draft_schedule(
+                division_id=self.da,
+                draft_fingerprint=preview["draft_fingerprint"],
+                actor_id=NEWCOMER, user_id=NEWCOMER,
+                role=Role.LEAGUE_ADMIN, scope={})
+        finally:
+            self.store.add_game = original
 
-        result = self._race_first_selection(run, "the first Game INSERT")
-        # The commit CREATES rows, so the all-or-nothing check above (which
-        # tracks pre-existing targets) does not apply; the two valid serial
-        # outcomes are asserted directly instead.
-        in_a = {g.id for g in self.store.all_games() if g.season_id == self.sa}
-        in_b = {g.id for g in self.store.all_games() if g.season_id == self.sb}
-        self.assertEqual(in_b, set(),
-                         "the commit wrote Games into the newly-selected "
-                         "Program B")
-        if "error" in result:
-            # The selection ordered FIRST: refused, and nothing written.
-            self.assertEqual(result["error"]["details"]["reason"],
-                             "division_missing", result)
-            self.assertEqual(in_a, set(),
-                             "a refused commit still created Games")
-            self.assertEqual(len(self.store.all_setup_audit()), before[2],
-                             "a refused commit still audited")
-        else:
-            # The commit ordered FIRST, on the fallback tuple A it really did
-            # hold at the time.
-            self.assertEqual(len(result["created"]), 6, result)
-            self.assertEqual(len(in_a), 6)
+        self._assert_refused_for_want_of_a_selection(result)
+        self.assertEqual(
+            seen["calls"], 0,
+            "the un-chosen caller's commit reached a Game INSERT before it "
+            "was refused — the refusal is not ahead of the write")
+        self.assertEqual(
+            {g.id for g in self.store.all_games()}, set(before[0]),
+            "a refused commit created Games")
+        self.assertEqual(len(self.store.all_setup_audit()), before[2],
+                         "a refused commit still audited")
+
+        # ...and the newcomer's FIRST selection still lands afterwards, on its
+        # own connection, so the refusal above is about the absent row and not
+        # about a lock nobody released.
+        other = SqlStore(os.environ["TEST_DATABASE_URL"])
+        try:
+            _ok(ApiService(other).set_active_context(
+                NEWCOMER, Role.LEAGUE_ADMIN, {}, self.pb, self.sb, self.lb),
+                "the first selection")
+        finally:
+            other.close()
+        self.assertEqual(
+            self.store.get_active_context(NEWCOMER).program_id, self.pb)
 
     def test_a_batch_waiting_behind_a_first_selection_observes_it(self):
         """SELECTION first, batch second -- the mirror of every race above.
@@ -2451,6 +2535,12 @@ class DraftFirstSelectionRaceTest(unittest.TestCase):
         """
         self.assertTrue(self._mutex_is_free(),
                         "the mutex was already held before this test ran")
+        # #409: the unit has to REACH `get_game_for_update` for the injected
+        # failure to be mid-unit at all, and an un-chosen caller is refused
+        # long before that. Choosing tuple A explicitly is the only change --
+        # the batch, the injected failure and the claim are the same.
+        _ok(self.api.set_active_context(
+            NEWCOMER, Role.LEAGUE_ADMIN, {}, self.pa, self.sa, self.la))
 
         boom = RuntimeError("mid-unit failure")
         original = self.store.get_game_for_update
@@ -2513,6 +2603,12 @@ class DraftFirstSelectionRaceTest(unittest.TestCase):
         """
         self.assertTrue(self._mutex_is_free())
         other_user = "user_draft_someone_else"
+        # #409: the second request must actually RUN a batch for "it waited
+        # and did not raise" to say anything, so it holds an explicit
+        # selection of tuple A. The racing user is still a DIFFERENT one, so
+        # the per-user advisory lock still cannot be why it waits.
+        _ok(self.api.set_active_context(
+            other_user, Role.LEAGUE_ADMIN, {}, self.pa, self.sa, self.la))
         entered = threading.Event()
         release = threading.Event()
         holder = {"error": None}
@@ -2612,10 +2708,13 @@ class DraftFirstSelectionRaceTest(unittest.TestCase):
         tuple A and writes A after B is persisted. The original absent-row
         race, shifted one step earlier.
 
-        The barrier therefore fires at the batch's FIRST candidate read, which
-        is the earliest point inside the transaction that has read anything.
-        The racing selection must be BLOCKED there: if it can complete, the
-        batch does not yet hold the mutex, and its snapshot is already fixed.
+        The barrier therefore fires at the EARLIEST point inside the
+        transaction that has read anything. #409 moved that point: an
+        un-chosen caller's batch now takes its ActiveContext lock and refuses
+        before it reads a single candidate Game, so ``all_games`` is never
+        called and the ActiveContext lock IS the first statement. The racing
+        selection must be BLOCKED there: if it can complete, the batch does
+        not yet hold the mutex, and its snapshot is already fixed.
         """
         self._assert_no_saved_context()
         before = self._snapshot()
@@ -2633,10 +2732,10 @@ class DraftFirstSelectionRaceTest(unittest.TestCase):
             finally:
                 other.close()
 
-        original = self.store.all_games
+        original = self.store.get_active_context_for_update
         seen = {"calls": 0}
 
-        def read_with_a_racing_first_selection():
+        def read_with_a_racing_first_selection(user_id):
             seen["calls"] += 1
             if seen["calls"] == 1:
                 worker = threading.Thread(
@@ -2647,23 +2746,24 @@ class DraftFirstSelectionRaceTest(unittest.TestCase):
                 self.assertTrue(
                     worker.is_alive(),
                     "the caller's FIRST context selection COMPLETED at the "
-                    "batch's first candidate read -- the batch had already "
-                    "established its SERIALIZABLE snapshot without holding "
-                    "the per-user mutex, so it will resolve the stale "
+                    "batch's first in-transaction read -- the batch had "
+                    "already established its SERIALIZABLE snapshot without "
+                    "holding the per-user mutex, so it will resolve the stale "
                     "fallback tuple A and write A after B is persisted")
-            return original()
+            return original(user_id)
 
-        self.store.all_games = read_with_a_racing_first_selection
+        self.store.get_active_context_for_update = \
+            read_with_a_racing_first_selection
         try:
             result = self.api.discard_draft_games(
                 game_ids=list(self.committed), actor_id=NEWCOMER,
                 user_id=NEWCOMER, role=Role.LEAGUE_ADMIN, scope={})
         finally:
-            self.store.all_games = original
+            self.store.get_active_context_for_update = original
 
         self.assertGreaterEqual(seen["calls"], 1,
-                                "the batch never read its candidates, so the "
-                                "barrier never fired")
+                                "the batch never took its ActiveContext lock, "
+                                "so the barrier never fired")
         if race["worker"] is not None:
             race["worker"].join(timeout=15)
             self.assertFalse(race["worker"].is_alive(),
@@ -2673,8 +2773,7 @@ class DraftFirstSelectionRaceTest(unittest.TestCase):
         self.assertTrue(race["done"])
         self.assertEqual(self.store.get_active_context(NEWCOMER).program_id,
                          self.pb, "the racing first selection did not land")
-        self.assertNotIn("error", result, result)
-        self.assertIn(result["discarded"], (0, 6), result)
+        self._assert_refused_for_want_of_a_selection(result)
         self._assert_no_cross_tuple_write(before, set(self.committed))
 
     def test_the_first_selection_completes_freely_when_nothing_holds_it(self):

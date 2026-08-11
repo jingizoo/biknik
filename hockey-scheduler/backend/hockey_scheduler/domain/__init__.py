@@ -25,6 +25,7 @@ from .enums import (
     SubstituteStatus,
 )
 from .errors import (
+    ActiveContextRequiredError,
     AlreadyClaimedError,
     AlreadySelectedError,
     ClaimUnavailableError,
@@ -129,6 +130,7 @@ __all__ = [
     "SlotType",
     "SubstituteStatus",
     # errors
+    "ActiveContextRequiredError",
     "AlreadyClaimedError",
     "AlreadySelectedError",
     "ClaimUnavailableError",

@@ -442,7 +442,20 @@ render = async function renderWithInitialSetup() {
   // where the per-view page title is normally set -- so the title has to be
   // set here too, or landing on Initial Setup (what a fresh Program actually
   // does) leaves the static index.html title in place and announces nothing.
-  if (view === "onboarding") { setPageTitle(view); return renderInitialSetup(); }
+  // #411: the same early return also skips renderContextSwitcher(), which the
+  // base render() owns -- so the guided Initial Setup surface ran with the
+  // topbar switcher stuck at its index.html `hidden`, showing NO context
+  // controls at all. That is precisely the surface a first-run operator is
+  // landed on, and precisely where the wizard's own "Add season" step answers
+  // 409 "Select a Program before creating records in it": the one control able
+  // to satisfy that refusal was invisible on the only screen that raises it.
+  // Painting is all this adds -- renderContextSwitcher() persists nothing, and
+  // the explicit control it may reveal still writes only when activated.
+  if (view === "onboarding") {
+    setPageTitle(view);
+    renderContextSwitcher();
+    return renderInitialSetup();
+  }
   const result = await onboardingBaseRender();
   if (currentUser && hasPerm("manage_setup")) {
     if (onboardingStatusDirty || !onboardingStatus) {

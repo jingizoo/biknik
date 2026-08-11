@@ -18,6 +18,9 @@ const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
+const {
+  installContextFixture, selectProgram, selectProgramSeason,
+} = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -92,6 +95,7 @@ async function checkViewport(browser, viewport) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
     await page.click('.tab[data-tab="setup"]');
     await page.click('[data-setup-view="records"]');
     await page.waitForSelector(".setup-card", { timeout: 10000 });
@@ -101,8 +105,17 @@ async function checkViewport(browser, viewport) {
       { "f-org": "Edit Org" }, "/api/v2/setup/organization");
     const program = await createViaDrawer("league",
       { "f-league": "Edit Program", "f-league-org": org.id }, "/api/v2/setup/program");
+    // THE EXPLICIT SELECTION (#409), boundary 1 — Program-only. Minting the
+    // Program does not select it, and the Season drawer below is a
+    // PROGRAM-AXIS create (so are the Team and Player drawers). The axis table
+    // and the reason the write echo — not a GET — is the oracle live in
+    // ./context-fixture.js.
+    await selectProgram(page, `[${L}] Program-only bootstrap`, program.id);
     const season = await createViaDrawer("season",
       { "f-season-league": program.id, "f-season": "2026-27" }, "/api/v2/setup/season");
+    // BOUNDARY 2 — Program+Season. The League ("level") and Division below are
+    // SEASON-OWNED two-axis creates into THIS Season.
+    await selectProgramSeason(page, `[${L}] Program+Season`, program.id, season.id);
     const league = await createViaDrawer("level",
       { "f-level-season": season.id, "f-level": "Edit League" }, "/api/v2/setup/league");
     await createViaDrawer("division",

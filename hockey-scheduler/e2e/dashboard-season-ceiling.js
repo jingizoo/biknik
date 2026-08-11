@@ -54,6 +54,7 @@ const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
+const { installContextFixture } = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -154,33 +155,37 @@ function fail(msg) { throw new Error(msg); }
 // a standings row, both of which are genuinely Season-scoped.
 async function buildFixture(page) {
   const built = await page.evaluate(async () => {
-    const post = async (p, b) => {
-      const r = await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      });
-      const json = await r.json().catch(() => ({}));
-      if (!r.ok || (json && json.error)) {
-        throw new Error(`${p} -> ${r.status} ${JSON.stringify(json)}`);
-      }
-      return json;
-    };
-    const org = await post("/api/v2/setup/organization", { name: "Ceiling Org" });
-    const program = await post("/api/v2/setup/program",
+    const F = window.hsFixture;
+    // Kept as a thin alias so the non-create calls below (publish, result,
+    // approve, assign-division) stay one-liners; it is `F.call`, so a refusal
+    // still fails at its own line instead of decoding into a usable-looking
+    // body (#409).
+    const post = (p, b) => F.call(p, p, b);
+    const org = await F.create("org", "/api/v2/setup/organization", { name: "Ceiling Org" });
+    const program = await F.create("program", "/api/v2/setup/program",
       { name: "Ceiling Program", operator_organization_id: org.id });
-    const s1 = await post("/api/v2/setup/season",
+    // #409 EXPLICIT SELECTION, boundary 1. Both Season creates are
+    // PROGRAM-AXIS, and minting the Program above is not a selection — so the
+    // Program-only choice is PERSISTED here and proved before either Season
+    // exists. ./context-fixture.js carries the axis table.
+    await F.selectProgram("Program-only bootstrap", program.id);
+    const s1 = await F.create("Season One", "/api/v2/setup/season",
       { program_id: program.id, name: "Season One" });
-    const s2 = await post("/api/v2/setup/season",
+    const s2 = await F.create("Season Two", "/api/v2/setup/season",
       { program_id: program.id, name: "Season Two" });
+    // BOUNDARY 2. Everything from here to the S2 block is SEASON-OWNED and
+    // writes into Season One, so Season One must be the SAVED Season — not
+    // merely "a" Season, and not whichever one a create happens to name.
+    await F.selectProgramSeason("Program + Season One", program.id, s1.id);
     // Creating a League against a Season binds it to THAT Season (the only
     // HTTP-reachable League create); the S2 binding for the SAME two Leagues
     // is created further down, by the first S2 registration.
-    const leagueA = await post("/api/v2/setup/league",
+    const leagueA = await F.create("leagueA", "/api/v2/setup/league",
       { season_id: s1.id, name: "League Alpha" });
-    const leagueB = await post("/api/v2/setup/league",
+    const leagueB = await F.create("leagueB", "/api/v2/setup/league",
       { season_id: s1.id, name: "League Bravo" });
-    const club = await post("/api/v2/setup/club", { name: "Ceiling Club" });
-    const team = (name, leagueId) => post("/api/v2/setup/team",
+    const club = await F.create("club", "/api/v2/setup/club", { name: "Ceiling Club" });
+    const team = (name, leagueId) => F.create("team", "/api/v2/setup/team",
       { club_id: club.id, name, league_id: leagueId });
     // A Team is a PERMANENT member of one League (#180/#283 rule 7), so each
     // Season's teams are separate Team records under the same two Leagues.
@@ -193,10 +198,14 @@ async function buildFixture(page) {
     const s2b1 = await team("S2-TeamB1", leagueB.id);
     const s2b2 = await team("S2-TeamB2", leagueB.id);
 
-    const division = (leagueId, name, seasonId) => post("/api/v2/setup/division",
+    const division = (leagueId, name, seasonId) => F.create("division", "/api/v2/setup/division",
       { league_id: leagueId, name, season_id: seasonId });
+    // A registration's id is used further down (assign-division), so this is
+    // an ASSERTED create, not a bare call — a refusal must not reach the next
+    // line as an id-less body (#409).
     const register = (seasonId, teamId, leagueId, divisionId) =>
-      post(`/api/v2/setup/seasons/${seasonId}/team-registrations`,
+      F.create("team registration",
+        `/api/v2/setup/seasons/${seasonId}/team-registrations`,
         { team_id: teamId, league_id: leagueId, division_id: divisionId || null });
 
     const s1DivA = await division(leagueA.id, "S1-DivA", s1.id);
@@ -213,6 +222,10 @@ async function buildFixture(page) {
     // _resolve_registration_league_season find-or-creates LeagueSeason(League,
     // Season). Hence: register one team per League into S2 with no division,
     // create S2's divisions, then assign those two registrations into them.
+    // #409: the S2 block writes into Season Two, so the saved Season moves
+    // with it. The registrations, the Divisions and the division assignments
+    // below are all SEASON-OWNED and all land in Season Two.
+    await F.selectProgramSeason("Program + Season Two", program.id, s2.id);
     const s2RegA1 = await register(s2.id, s2a1.id, leagueA.id, null);
     const s2RegB1 = await register(s2.id, s2b1.id, leagueB.id, null);
     const s2DivA = await division(leagueA.id, "S2-DivA", s2.id);
@@ -228,7 +241,7 @@ async function buildFixture(page) {
     // SeasonVenueAccess axis get_demo_overview scopes venues/rinks/ice slots
     // through. Different slot COUNTS (3 vs 4) so the Dashboard's ice tile
     // reports a number that is unique to the active Season.
-    const venue = (name) => post("/api/v2/setup/venue",
+    const venue = (name) => F.create("venue", "/api/v2/setup/venue",
       { name, organization_id: org.id });
     const s1Venue = await venue("S1-Venue");
     const s2Venue = await venue("S2-Venue");
@@ -238,24 +251,25 @@ async function buildFixture(page) {
     // than parsing a refusal as ordinary JSON. Leaves the context on s1, which
     // is what the ceiling assertions below expect.
     const grantVenue = async (seasonId, venueId, label) => {
-      await post("/api/context", { program_id: program.id, season_id: seasonId });
-      const granted = await post(`/api/v2/setup/seasons/${seasonId}/venue-access`,
-        { venue_id: venueId });
-      if (!granted || !granted.id || granted.error) {
-        throw new Error(`${label} venue-access grant did not succeed: `
-          + JSON.stringify(granted));
-      }
+      // The selection is the app's own switch pipeline and is READ BACK
+      // (#409), replacing a raw `POST /api/context` whose status was dropped
+      // — a refused switch used to be indistinguishable from a successful one
+      // until the grant that depended on it failed.
+      await F.selectProgramSeason(`${label} destination Season`,
+        program.id, seasonId);
+      await F.create(`${label} venue-access grant`,
+        `/api/v2/setup/seasons/${seasonId}/venue-access`, { venue_id: venueId });
     };
     await grantVenue(s2.id, s2Venue.id, "S2");
     await grantVenue(s1.id, s1Venue.id, "S1");
-    const s1Rink = await post("/api/v2/setup/rink",
+    const s1Rink = await F.create("s1Rink", "/api/v2/setup/rink",
       { venue_id: s1Venue.id, name: "S1-Rink" });
-    const s2Rink = await post("/api/v2/setup/rink",
+    const s2Rink = await F.create("s2Rink", "/api/v2/setup/rink",
       { venue_id: s2Venue.id, name: "S2-Rink" });
     // Far-future, one game per day: the Dashboard's game list shows TODAY's
     // games and falls back to every scheduled game when none is today, so
     // dates that can never be "today" keep the list stable whenever this runs.
-    const slot = (rinkId, date) => post("/api/v2/setup/ice-slot", {
+    const slot = (rinkId, date) => F.create("slot", "/api/v2/setup/ice-slot", {
       rink_id: rinkId,
       start_time: `${date}T18:00:00+00:00`, end_time: `${date}T20:00:00+00:00`,
     });
@@ -270,9 +284,12 @@ async function buildFixture(page) {
     // Scheduled + PUBLISHED + a recorded, APPROVED (FINAL) result: only a
     // FINAL result reaches the standings snapshot, which is one of the
     // Dashboard values the ceiling has to narrow.
+    // Each Game is SEASON-OWNED and lands in the Season it names, so the
+    // saved Season is moved to that one first (#409).
     const game = async (seasonId, leagueId, divisionId, home, away, slotId,
                         homeScore, awayScore) => {
-      const g = await post("/api/v2/setup/game", {
+      await F.selectProgramSeason("Season the Game lands in", program.id, seasonId);
+      const g = await F.create("game", "/api/v2/setup/game", {
         season_id: seasonId, league_id: leagueId, division_id: divisionId,
         home_team_id: home, away_team_id: away, ice_slot_id: slotId,
       });
@@ -469,6 +486,8 @@ async function checkCeiling(browser, viewport) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     if ((await loginAs(page, "admin")).status !== 200) throw new Error(`[${L}] admin login failed`);
+    await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
     const f = await buildFixture(page);
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });

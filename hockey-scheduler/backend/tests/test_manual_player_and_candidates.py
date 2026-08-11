@@ -274,6 +274,16 @@ class ManualPlayerAndCandidateHttpTest(unittest.TestCase):
         c = urllib.request.build_opener(
             urllib.request.HTTPCookieProcessor(CookieJar()))
         self._post(c, "/api/auth/login", {"username": username, "password": "demo"})
+        # #409: the Player CREATE is guarded and now needs a context the
+        # operator CHOSE. Persist byte-for-byte the tuple this session already
+        # resolves, so the Player lands on exactly the seeded Team it always
+        # did.
+        status, ctx = self._get(c, "/api/context")
+        if status == 200 and ctx.get("program_id"):
+            self._post(c, "/api/context",
+                       {"program_id": ctx.get("program_id"),
+                        "season_id": ctx.get("season_id"),
+                        "league_id": ctx.get("league_id")})
         return c
 
     def _post(self, opener, path, body):

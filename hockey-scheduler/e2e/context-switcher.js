@@ -53,6 +53,15 @@ const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
+// #409. Every guarded mutation below (archive, reopen) and the one Season
+// create need an EXPLICIT persisted selection; no fallback authorizes them any
+// more. `selectForMutation` applies the MUTATION axis table, which is not the
+// create one — `season` is SEASON-OWNED for a mutation (two axes) while
+// CREATING a Season is Program-axis, so the two calls in this file that look
+// alike genuinely require different selections.
+const {
+  installContextFixture, selectProgram, selectForMutation,
+} = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -198,6 +207,8 @@ async function newPage(browser, viewport) {
   });
   const page = await context.newPage();
   await installResponseDelay(page);
+  // addInitScript, so the helpers survive every reload this journey does.
+  await installContextFixture(page);
   const errors = [];
   page.on("pageerror", (e) => errors.push(`[pageerror] ${e.message}`));
   page.on("console", (m) => {
@@ -407,8 +418,33 @@ async function checkSwitcher(browser, viewport) {
     // (F) Archived Season ⇒ labeled read-only in the option, and the persistent
     //     read-only badge shows when it is the selection.
     if ((await loginAs(page, "admin")).status !== 200) throw new Error(`[${L}] admin re-login (archive) failed`);
-    if ((await apiPost(page, `/api/v2/setup/seasons/${winterId}/archive`, { reason: "done" })).status !== 200) {
-      throw new Error(`[${L}] archive failed`);
+    // #409. Archive is a MUTATION, and `season` is SEASON-OWNED under the
+    // mutation table, so it needs an explicit saved Program AND Season — a
+    // stricter rule than the Program-only selection that CREATING a Season
+    // takes. This journey walks straight into that: (D) deliberately lets a
+    // Program-only deep link win over the persisted row and (E) normalizes a
+    // bogus link back to it, so by this line the saved Season axis is null BY
+    // DESIGN. That deep-link adoption is the behaviour (D)/(E) exist to prove
+    // and it is not what should give way; the Season axis is re-selected here
+    // instead, which is exactly what an operator would have to do.
+    //
+    // Selected on the ADMIN identity, and the store keys ActiveContext by user
+    // (`user_active_context`), so this is a different row from the viewer's and
+    // neither reads nor disturbs the Program-only selection (D)/(E) just
+    // established — which (F) still depends on after the re-login below.
+    //
+    // Driven "api": the SERVER session was swapped to admin by an API call but
+    // the client on this page is still the viewer's booted shell, so the app's
+    // own switch pipeline would be re-rendering and rewriting location.hash as
+    // the wrong persona — and that hash is precisely what (E) just asserted.
+    // Nothing is driven from this DOM until the reload below, which is the
+    // condition that makes the direct write the faithful one here.
+    await selectForMutation(page, `[${L}] (F) select the Season being archived`,
+      "season", programId, winterId, "api");
+    const archived = await apiPost(page, `/api/v2/setup/seasons/${winterId}/archive`, { reason: "done" });
+    if (archived.status !== 200) {
+      throw new Error(`[${L}] archive failed: ${archived.status} `
+        + `${JSON.stringify(archived.json)}`);
     }
     if ((await loginAs(page, "viewer")).status !== 200) throw new Error(`[${L}] viewer re-login (archive) failed`);
     await reloadShell(page);
@@ -551,8 +587,19 @@ async function checkReconcile(browser, viewport) {
     // (1) Archive BETWEEN options-load and POST: the viewer's row still says
     //     Winter is writable; a concurrent archive + the viewer selecting Winter
     //     must reconcile to read-only from a fresh GET — WITHOUT a reload.
-    if ((await apiPost(admin.page, `/api/v2/setup/seasons/${winterId}/archive`, { reason: "done" })).status !== 200) {
-      throw new Error(`[${L}] concurrent archive failed`);
+    // #409: the admin ACTOR must choose the axes its mutation consumes, like
+    // any other operator. Season archive is SEASON-OWNED, so both. Issued on
+    // admin.page ONLY — a separate ActiveContext row (keyed by user) on a
+    // separate page — so the viewer subject's deliberately stale option set is
+    // untouched, which is the whole point of this scenario. "api" because
+    // admin.page is a pure API actor here and asserts no UI at all.
+    await selectForMutation(admin.page, `[${L}] (1) admin selects the Season it archives`,
+      "season", programId, winterId, "api");
+    const concurrentArchive = await apiPost(
+      admin.page, `/api/v2/setup/seasons/${winterId}/archive`, { reason: "done" });
+    if (concurrentArchive.status !== 200) {
+      throw new Error(`[${L}] concurrent archive failed: ${concurrentArchive.status} `
+        + `${JSON.stringify(concurrentArchive.json)}`);
     }
     await page.selectOption("#ctx-select", winter);
     await waitFor(page, "(1) read-only badge reconciled after a concurrent archive", () => {
@@ -568,23 +615,30 @@ async function checkReconcile(browser, viewport) {
     // (2) Reopen: the reverse also reconciles without reload — badge clears, the
     //     archived marker drops. Toggle away first so re-selecting Winter fires.
     //
-    //     The admin ACTOR (a separate page from the viewer subject) carries no
-    //     saved context, so its active Season is the fallback's pick — and the
-    //     fallback excludes archived Seasons (context_service). Once the archive
-    //     above lands, the only Season is archived, so admin resolves to
-    //     Program-only and the reopen's target guard (#369 prereq) refuses
-    //     ("season season_1 not found."). Reopen is the documented exemption
-    //     from the archived-Season read-only guard, and ContextService.set
-    //     accepts an archived Season as a read-only historical context — so
-    //     select Winter explicitly on the admin page first. Issued on
-    //     admin.page ONLY: the viewer subject's stale-option state must not be
-    //     disturbed.
-    if ((await apiPost(admin.page, "/api/context",
-      { program_id: programId, season_id: winterId })).status !== 200) {
-      throw new Error(`[${L}] admin could not enter the archived Season before reopen`);
-    }
-    if ((await apiPost(admin.page, `/api/v2/setup/seasons/${winterId}/reopen`, { reason: "back" })).status !== 200) {
-      throw new Error(`[${L}] concurrent reopen failed`);
+    //     Reopen is SEASON-OWNED too, and the Season it needs saved is the
+    //     archived one — so admin re-enters Winter explicitly. Two independent
+    //     rules both demand this now, and the #409 one is the stricter:
+    //       * #409: a mutation consumes the Season axis, so it must be CHOSEN.
+    //         Note what this replaced — the previous note here explained that
+    //         admin "carries no saved context, so its active Season is the
+    //         fallback's pick", i.e. the mutation was riding on an inference.
+    //         That is exactly the authorization #409 removes, so the selection
+    //         is now required outright rather than as a workaround for which
+    //         Season the fallback happens to choose;
+    //       * #369's target guard would refuse the archived Season as
+    //         out-of-context ("season season_1 not found.") regardless.
+    //     Reopen is the documented exemption from the archived-Season
+    //     read-only guard, and ContextService.set accepts an archived Season as
+    //     a read-only historical context, so this selection is legal.
+    //     Issued on admin.page ONLY: the viewer subject's stale-option state
+    //     must not be disturbed.
+    await selectForMutation(admin.page, `[${L}] (2) admin re-enters the archived Season before reopen`,
+      "season", programId, winterId, "api");
+    const concurrentReopen = await apiPost(
+      admin.page, `/api/v2/setup/seasons/${winterId}/reopen`, { reason: "back" });
+    if (concurrentReopen.status !== 200) {
+      throw new Error(`[${L}] concurrent reopen failed: ${concurrentReopen.status} `
+        + `${JSON.stringify(concurrentReopen.json)}`);
     }
     await page.selectOption("#ctx-select", progOnly);
     await waitFor(page, "(2) select value toggled to Program-only before re-selecting the reopened Season",
@@ -602,6 +656,15 @@ async function checkReconcile(browser, viewport) {
     // (3) A Season created AFTER options loaded must surface on the next POST's
     //     fresh fetch — still WITHOUT reload — proving `selected` is always drawn
     //     from a reconciled option set, not the stale one.
+    // CREATING a Season is PROGRAM-AXIS (`_CREATE_CONSUMED_AXES`), not the
+    // two-axis rule the archive/reopen above took: a Season create MINTS the
+    // Season axis, so there is nothing on that axis to have chosen. The
+    // Program is still compared against this body's `program_id`, so it must
+    // be explicitly saved — `selectProgram` also CLEARS the Season, which is
+    // what keeps this create from riding on the Winter selection left over
+    // from the reopen.
+    await selectProgram(admin.page, `[${L}] (3) admin selects the Program it creates a Season in`,
+      programId, "api");
     const created = await apiPost(admin.page, "/api/v2/setup/season", { program_id: programId, name: "Spring Cup" });
     if (created.status !== 200 || !created.json.id) {
       throw new Error(`[${L}] concurrent season create failed: ${JSON.stringify(created.json)}`);

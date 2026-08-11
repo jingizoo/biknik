@@ -109,6 +109,9 @@ const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
+const {
+  installContextFixture, selectProgram, selectProgramSeason,
+} = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -299,6 +302,25 @@ async function checkWithdrawal(browser, viewport, transition) {
       throw new Error(`[${L}] second Program create failed: ${JSON.stringify(createdProgram.json)}`);
     }
     const progB = createdProgram.json.id;
+    // #409 EXPLICIT SELECTION. This is the journey the brief calls the
+    // sharpest instance of the whole boundary: the demo load above left the
+    // saved row on Program A, so a Season create naming Program B is
+    // PROGRAM-AXIS against the WRONG saved Program and is refused --
+    // "Select a Program before creating records in it." The first Season in
+    // this install succeeded only because a persona that had selected made
+    // it; the second did not. That difference is precisely the inference
+    // #409 removes, so the selection is stated here and read back, and the
+    // journey stops depending on which account happened to mint what.
+    //
+    // Placed AFTER the shell is live so it runs through `setActiveContext`,
+    // the same pipeline #ctx-select uses -- this journey goes on to assert
+    // what the real switcher does, and a raw POST would desync the client it
+    // is about to inspect. It is also well before every `ctxPosts.slice(N)`
+    // marker below, so it cannot be mistaken for one of the switches under
+    // test.
+    await reloadShell(page);
+    await installContextFixture(page);
+    await selectProgram(page, `[${L}] select Rival Program before its Season`, progB);
     const createdSeason = await apiPost(page, "/api/v2/setup/season",
       { program_id: progB, name: "Rival Cup" });
     if (createdSeason.status !== 200 || !createdSeason.json.id) {
@@ -340,10 +362,18 @@ async function checkWithdrawal(browser, viewport, transition) {
       throw new Error(`[${L}] seeding ${IDENTITY_C}'s canonical context failed`);
     }
     if ((await loginAs(page, IDENTITY_A)).status !== 200) throw new Error(`[${L}] ${IDENTITY_A} login failed`);
-    if ((await apiPost(page, "/api/context",
-      { program_id: progA, season_id: seasonA })).status !== 200) {
-      throw new Error(`[${L}] seeding ${IDENTITY_A}'s canonical context failed`);
-    }
+    // A's canonical seed goes through `setActiveContext`, not a raw
+    // `POST /api/context` (#409). It has to: the fixture above selected Rival
+    // Program in order to create its Season, and THAT selection also wrote
+    // `#ctx=` into the URL. A raw seed would move only the server, leaving
+    // the stale Rival hash in place — and this app deliberately lets a
+    // deep-link hash win on reload, so the very next `reloadShell` would
+    // re-adopt Rival and the "deterministic starting point" below would find
+    // the switcher sitting on the wrong context. Driving the app's own
+    // pipeline moves the hash, the client and the server together, which is
+    // exactly why ./context-fixture.js insists on it.
+    await selectProgramSeason(page,
+      `[${L}] seeding ${IDENTITY_A}'s canonical context`, progA, seasonA);
     await reloadShell(page);
 
     // -- deterministic starting point: A's switcher, hash and server all agree

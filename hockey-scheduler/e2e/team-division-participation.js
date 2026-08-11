@@ -126,19 +126,66 @@ async function checkViewport(browser, viewport) {
     const CAL_DAY = await page.evaluate(() => calendarDate);
 
     const ids = await page.evaluate(async (day) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
+      const post = async (p, b) => {
+        const r = await fetch(p, {
+          method: "POST", credentials: "same-origin",
+          headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+        });
+        return { status: r.status, body: await r.json() };
+      };
+      // ASSERT EVERY CREATE BEFORE ITS ID IS USED (#409 review round). This
+      // fixture used to decode each body and throw the status away, so the
+      // FIRST refusal returned an id-less body whose `undefined` id was then
+      // threaded into the next create — and the journey blew up ~15 creates
+      // later at `grantVenue`, the first line that asserted anything, blaming
+      // "venue_id is required" for a Program that had simply never been
+      // selected. Each create now fails at its own line, naming itself.
+      const create = async (what, p, b) => {
+        const { status, body } = await post(p, b);
+        if (status !== 200 || !body || body.error || !body.id) {
+          throw new Error(`${what} create failed: ${status} ${JSON.stringify(body)}`);
+        }
+        return body;
+      };
+      // THE EXPLICIT SELECTION (#409 review round). A create no longer inherits
+      // its axes from the parent it names, nor from the account that minted
+      // that parent: a Program-axis create (Season, Venue-in-Program, Rink,
+      // Ice-slot, Team) requires the SAVED Program, and a Season-owned two-axis
+      // create (League, Division, registration, venue-access) requires BOTH
+      // saved axes — the SAME Season it is writing into. Minting the Program
+      // does not select it.
+      //
+      // The read-back is ASSERTED, not assumed: a selection that silently fell
+      // back to inferred context would leave this fixture standing on exactly
+      // the behaviour #409 removes. (The journey's own PROOF steps still drive
+      // the real `#ctx-select` through `switchSeason` — this is fixture setup
+      // that runs before the reload seeds that control.)
+      const selectContext = async (what, programId, seasonId) => {
+        const sel = await post("/api/context",
+          { program_id: programId, season_id: seasonId || null });
+        if (sel.status !== 200 || !sel.body || sel.body.error) {
+          throw new Error(`could not select ${what}: ${sel.status} ${JSON.stringify(sel.body)}`);
+        }
+        const read = await (await fetch("/api/context",
+          { credentials: "same-origin" })).json();
+        if (read.program_id !== programId
+            || (read.season_id || null) !== (seasonId || null)) {
+          throw new Error(`${what} did not read back as the explicit selection: `
+            + `${JSON.stringify(read)}`);
+        }
+      };
       // An operator Organization is linked at Program creation so that the
       // reload below lands a League Admin on the normal shell (with the header
       // context switcher) instead of the blocking Initial Setup wizard — the
       // established fixture convention, see league-filtered-data.js.
-      const org = await post("/api/v2/setup/organization", { name: "Perm Org" });
-      const league = await post("/api/setup/league",
+      const org = await create("Organization", "/api/v2/setup/organization", { name: "Perm Org" });
+      const league = await create("Program", "/api/setup/league",
         { name: "Perm League", operator_organization_id: org.id });
-      const s1 = await post("/api/setup/season", { league_id: league.id, name: "2026" });
-      const s2 = await post("/api/setup/season", { league_id: league.id, name: "2027" });
+      // BOUNDARY 1 — the Program-only bootstrap selection. Both Seasons below
+      // are Program-axis creates.
+      await selectContext("the Program-only bootstrap", league.id, null);
+      const s1 = await create("Season 2026", "/api/setup/season", { league_id: league.id, name: "2026" });
+      const s2 = await create("Season 2027", "/api/setup/season", { league_id: league.id, name: "2027" });
       // #283 Slice E / rule 7: Perma's two registrations (d1 in s1, d2 in s2)
       // must both fall under Perma's SINGLE permanent League. So one permanent
       // League L_A (lv1) spans BOTH Seasons — it is created for s1 here, and
@@ -147,17 +194,25 @@ async function checkViewport(browser, viewport) {
       // A SECOND permanent League L_B (lv2) also exists in s1 so the scheduling
       // wizard's League picker still offers ≥2 Leagues (never implicitly
       // pre-selected) and has a foreign Division to prove league-scoping.
-      const lv1 = await post("/api/setup/level", { season_id: s1.id, name: "Level One" });  // L_A
-      const lv2 = await post("/api/setup/level", { season_id: s1.id, name: "Level Two" });  // L_B
-      const d1 = await post("/api/setup/division", { season_id: s1.id, level_id: lv1.id, name: "S1 Div One" });
-      const d1b = await post("/api/setup/division", { season_id: s1.id, level_id: lv1.id, name: "S1 Div Two" });
-      // d2 is L_A's Division in s2 — creating it binds L_A to s2 (rule 7 keeps
-      // Perma's s1 + s2 registrations in the same permanent League).
-      const d2 = await post("/api/setup/division", { season_id: s2.id, level_id: lv1.id, name: "S2 Div One" });
+      //
+      // BOUNDARY 2 — every League and Division below is Season-owned, so the
+      // selection has to be the Season each one is written INTO. The s1 group
+      // and the s2 group are therefore built under their own selections; d2
+      // moved below dOther purely so the two groups are contiguous.
+      await selectContext("Season 2026", league.id, s1.id);
+      const lv1 = await create("League One", "/api/setup/level", { season_id: s1.id, name: "Level One" });  // L_A
+      const lv2 = await create("League Two", "/api/setup/level", { season_id: s1.id, name: "Level Two" });  // L_B
+      const d1 = await create("S1 Div One", "/api/setup/division", { season_id: s1.id, level_id: lv1.id, name: "S1 Div One" });
+      const d1b = await create("S1 Div Two", "/api/setup/division", { season_id: s1.id, level_id: lv1.id, name: "S1 Div Two" });
       // dOther is L_B's own Division in s1 — a foreign-League division that must
       // never leak into L_A's picker (assertion B1).
-      const dOther = await post("/api/setup/division", { season_id: s1.id, level_id: lv2.id, name: "S1 L2 Div" });
-      const venue = await post("/api/setup/venue", { name: "V", league_id: league.id });
+      const dOther = await create("S1 L2 Div", "/api/setup/division", { season_id: s1.id, level_id: lv2.id, name: "S1 L2 Div" });
+      // d2 is L_A's Division in s2 — creating it binds L_A to s2 (rule 7 keeps
+      // Perma's s1 + s2 registrations in the same permanent League), and it is
+      // written into s2, so s2 is what must be selected.
+      await selectContext("Season 2027", league.id, s2.id);
+      const d2 = await create("S2 Div One", "/api/setup/division", { season_id: s2.id, level_id: lv1.id, name: "S2 Div One" });
+      const venue = await create("Venue", "/api/setup/venue", { name: "V", league_id: league.id });
       // Game ice eligibility (#233 Slice E) requires the venue to hold active
       // SeasonVenueAccess for the season the game is scheduled in. Since #369
       // that grant is also what makes the venue — and its rinks and ice slots —
@@ -167,29 +222,30 @@ async function checkViewport(browser, viewport) {
       // the one arena is granted to both — the same physical rink used across
       // two seasons.
       //
-      // Each grant is a WRITE gated on the ACTIVE Season (#369 prereq): the
-      // no-context fallback would resolve to the latest-id Season (s2), so a
-      // grant is only accepted while its own Season is selected. So the context
-      // is switched explicitly before each one and BOTH responses are asserted
-      // — this helper decodes the body without checking status, and a silent
-      // 404 would otherwise surface much later as an unexplained wizard
-      // timeout. The production guard is honoured, never bypassed. The context
-      // is left on s1, the Season steps (B)–(D) work in (step (A) reloads and
-      // calls switchSeason for s1 anyway, so this is belt-and-braces).
+      // Each grant is a WRITE gated on the ACTIVE Season (#369 prereq, and a
+      // two-axis create under #409): the no-context fallback would resolve to
+      // the latest-id Season (s2), so a grant is only accepted while its own
+      // Season is selected. So the context is switched explicitly before each
+      // one and BOTH responses are asserted — a silent 404 would otherwise
+      // surface much later as an unexplained wizard timeout. The production
+      // guard is honoured, never bypassed. The context is left on s1, the
+      // Season steps (B)–(D) work in (step (A) reloads and calls switchSeason
+      // for s1 anyway, so this is belt-and-braces).
+      //
+      // The old `(ctx.season || {}).id !== seasonId` check could not fail
+      // usefully: when an upstream refusal made `seasonId` undefined, the read
+      // was `undefined !== undefined`, i.e. false, and the broken context
+      // sailed through. selectContext() compares the SERVER's read-back
+      // against the id this fixture meant to select.
       const grantVenue = async (seasonId, label) => {
-        const ctx = await post("/api/context", { program_id: league.id, season_id: seasonId });
-        if (!ctx || (ctx.season || {}).id !== seasonId) {
-          throw new Error(`could not select ${label} context: ${JSON.stringify(ctx)}`);
-        }
-        const grant = await post(`/api/v2/setup/seasons/${seasonId}/venue-access`, { venue_id: venue.id });
-        if (!grant || !grant.id) {
-          throw new Error(`${label} venue-access grant refused: ${JSON.stringify(grant)}`);
-        }
+        await selectContext(`${label} context`, league.id, seasonId);
+        await create(`${label} venue-access`,
+          `/api/v2/setup/seasons/${seasonId}/venue-access`, { venue_id: venue.id });
       };
       await grantVenue(s2.id, "s2");
       await grantVenue(s1.id, "s1");
-      const rink = await post("/api/setup/rink", { venue_id: venue.id, name: "R" });
-      const club = await post("/api/setup/club", { name: "Club" });
+      const rink = await create("Rink", "/api/setup/rink", { venue_id: venue.id, name: "R" });
+      const club = await create("Club", "/api/setup/club", { name: "Club" });
       // #180/#283 Slice E: create every permanent Team under its permanent
       // League L_A (lv1) via the canonical v2 route (league_id REQUIRED; the
       // service derives Program from it). Its season/division placement is set
@@ -197,34 +253,48 @@ async function checkViewport(browser, viewport) {
       // Program now holds two permanent Leagues, so a v1 create keyed only on
       // the Program (no division) is ambiguous (team_league_required).
       const team = async (n) =>
-        (await post("/api/v2/setup/team", { club_id: club.id, league_id: lv1.id, name: n })).id;
+        (await create(`Team ${n}`, "/api/v2/setup/team",
+          { club_id: club.id, league_id: lv1.id, name: n })).id;
       const perma = await team("Perma");   // the one permanent team we track
       const mateA = await team("Mate A");
       const mateB = await team("Mate B");
       const otherD = await team("Other D");
-      // Perma plays d1 in season 1 and d2 in season 2 (different divisions);
-      // it is NOT registered in d1b.
-      await post(`/api/setup/seasons/${s1.id}/team-registrations`, { team_id: perma, division_id: d1.id });
-      await post(`/api/setup/seasons/${s1.id}/team-registrations`, { team_id: mateA, division_id: d1.id });
-      await post(`/api/setup/seasons/${s2.id}/team-registrations`, { team_id: perma, division_id: d2.id });
-      await post(`/api/setup/seasons/${s2.id}/team-registrations`, { team_id: mateB, division_id: d2.id });
-      await post(`/api/setup/seasons/${s1.id}/team-registrations`, { team_id: otherD, division_id: d1b.id });
       // A league-only registration (no Division) under lv1 — #233 B2c
       // review: proves the wizard's no-Division path still creates a valid
-      // league-only game.
+      // league-only game. Created here with the other Teams so every
+      // registration below can be grouped under the Season it writes into.
       const leagueOnly = await team("League Only");
-      await post(`/api/setup/seasons/${s1.id}/team-registrations`,
-        { team_id: leagueOnly, division_id: null });
-      const slot = await post("/api/setup/ice-slot", {
+      // Perma plays d1 in season 1 and d2 in season 2 (different divisions);
+      // it is NOT registered in d1b.
+      //
+      // A registration is a Season-owned TWO-AXIS create (#409), judged against
+      // the LeagueSeason it lands in, so the selection must be the Season in
+      // the URL — the s1 and s2 groups each run under their own. Context is
+      // already on s1 from grantVenue.
+      const register = (seasonId, teamId, divisionId) => create(
+        `registration in ${seasonId}`,
+        `/api/setup/seasons/${seasonId}/team-registrations`,
+        { team_id: teamId, division_id: divisionId });
+      await register(s1.id, perma, d1.id);
+      await register(s1.id, mateA, d1.id);
+      await register(s1.id, otherD, d1b.id);
+      await register(s1.id, leagueOnly, null);
+      await selectContext("Season 2027", league.id, s2.id);
+      await register(s2.id, perma, d2.id);
+      await register(s2.id, mateB, d2.id);
+      // Back to s1 — the Season steps (B)–(D) work in, and the state this
+      // fixture is documented to leave behind.
+      await selectContext("Season 2026", league.id, s1.id);
+      const slot = await create("Ice slot 1", "/api/setup/ice-slot", {
         rink_id: rink.id, start_time: `${day}T18:00:00+00:00`,
         end_time: `${day}T19:00:00+00:00`, slot_type: "game" });
       // A second game slot for the #283 Slice D Exhibition step below, and a
       // third for the season-2 wizard step (E) — the ice is physical and shared,
       // but slots 1 and 2 are consumed by the games created in season 1.
-      const slot2 = await post("/api/setup/ice-slot", {
+      const slot2 = await create("Ice slot 2", "/api/setup/ice-slot", {
         rink_id: rink.id, start_time: `${day}T20:00:00+00:00`,
         end_time: `${day}T21:00:00+00:00`, slot_type: "game" });
-      const slot3 = await post("/api/setup/ice-slot", {
+      const slot3 = await create("Ice slot 3", "/api/setup/ice-slot", {
         rink_id: rink.id, start_time: `${day}T22:00:00+00:00`,
         end_time: `${day}T23:00:00+00:00`, slot_type: "game" });
       return { league: league.id, s1: s1.id, s2: s2.id, lv1: lv1.id,

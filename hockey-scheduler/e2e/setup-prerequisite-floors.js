@@ -63,6 +63,11 @@ const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
+// #409: the explicit-selection contract. Every fixture create below is
+// ASSERTED and every context-requiring one is preceded by a PERSISTED
+// selection made through the app's own switch pipeline — see context-fixture.js
+// for why a raw `POST /api/context` is not an acceptable substitute here.
+const { installContextFixture } = require("./context-fixture");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -109,6 +114,41 @@ async function apiPost(page, path_, body) {
 async function apiGet(page, path_) {
   return page.evaluate(async (p) =>
     (await fetch(p, { credentials: "same-origin" })).json(), path_);
+}
+
+// #409: the fixture now selects through the app's OWN switch pipeline
+// (context-fixture.js), so a selection starts a REAL render pass — the raw
+// `POST /api/context` it replaced moved the server silently and started
+// nothing. ARCHIVING the selected Season while that pass is still in flight
+// makes the app re-read it mid-pass, and `/venue-candidates` then answers its
+// (correct, deliberately generic) archived-destination 404 — service.py's
+// `get_venue_grant_candidates`, ruling 4. That console error is the fixture
+// racing the app, not a product defect, so the fixture waits the pass out
+// instead of being made to tolerate it.
+// `networkidle` is unusable here — the shell keeps its own traffic going and
+// the state never arrives. Quiescence of the APP'S OWN API traffic is the
+// signal that actually corresponds to "the render pass has finished".
+async function settleRender(getLastApi, quietMs = 750, timeoutMs = 20000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (Date.now() - getLastApi() >= quietMs) return;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  throw new Error(
+    `the app never stopped issuing API requests for ${quietMs}ms, so a render `
+    + `pass could not be confirmed finished before mutating underneath it`);
+}
+
+// Archive a Season the fixture has just selected, once the render it kicked
+// off has settled. MUTATION context (#409), judged by the mutation table
+// rather than `_CREATE_CONSUMED_AXES`, and satisfied by that same selection.
+async function archiveSelectedSeason(page, what, seasonId, getLastApi) {
+  await settleRender(getLastApi);
+  return page.evaluate(async ([w, sid]) => {
+    const r = await window.hsFixture.call(
+      w, `/api/v2/setup/seasons/${sid}/archive`, { reason: "round 3 fixture" });
+    return !!r && !r.error;
+  }, [what, seasonId]);
 }
 
 async function loginAs(page, username, password) {
@@ -348,9 +388,24 @@ async function checkViewport(browser, viewport) {
     viewport: { width: viewport.width, height: viewport.height },
   });
   const page = await context.newPage();
+  await installContextFixture(page);
   const errors = [];
   page.on("pageerror", (e) => errors.push(`[pageerror] ${e.message}`));
   page.on("console", (m) => { if (m.type() === "error") errors.push(`[console] ${m.text()}`); });
+  // Last time the app touched its own API, used only to tell when a render
+  // pass it started has gone quiet (see settleRender). Deliberately NOT an
+  // assertion about status codes: several legs below depend on real 4xx
+  // answers — the Arena Manager's 403 on /venue-candidates, the reopen that
+  // refuses a blank reason — so treating any 4xx as a failure would break the
+  // very behaviour this journey exists to pin.
+  let lastApi = Date.now();
+  page.on("request", (r) => {
+    if (r.url().indexOf("/api/") !== -1) lastApi = Date.now();
+  });
+  page.on("response", (r) => {
+    if (r.url().indexOf("/api/") !== -1) lastApi = Date.now();
+  });
+  const getLastApi = () => lastApi;
   let icePreviews = [];
   page.on("request", (r) => {
     if (r.url().indexOf(ICE_PREVIEW) !== -1) icePreviews.push(r.url());
@@ -380,29 +435,33 @@ async function checkViewport(browser, viewport) {
     // described: Program + active Season + Venue + Rink, grant the Venue to
     // that Season, ARCHIVE the selected Season, reopen Facilities.
     const a = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const org = await post("/api/v2/setup/organization", { name: "PF Org" });
-      const program = await post("/api/v2/setup/program",
+      const f = window.hsFixture;
+      // ZERO-AXIS ROOTS: nothing to select for these.
+      const org = await f.create("A org", "/api/v2/setup/organization",
+        { name: "PF Org" });
+      const program = await f.create("A program", "/api/v2/setup/program",
         { name: "PF Archived Program", country: "US",
           operator_organization_id: org.id });
-      const season = await post("/api/v2/setup/season",
+      // PROGRAM-AXIS: the Season create consumes the saved Program, so the
+      // Program-only choice has to be PERSISTED first. Minting the Program is
+      // not the same act as selecting it (#409).
+      await f.selectProgram("A/program", program.id);
+      const season = await f.create("A season", "/api/v2/setup/season",
         { program_id: program.id, name: "PF Archived Season" });
-      await post("/api/context", { program_id: program.id, season_id: season.id });
-      const venue = await post("/api/v2/setup/venue",
+      // SEASON-OWNED ahead (`season_venue_access`): both axes, and the Season
+      // selected must be the one the grant is written INTO.
+      await f.selectProgramSeason("A/program+season", program.id, season.id);
+      const venue = await f.create("A venue", "/api/v2/setup/venue",
         { name: "PF Venue", organization_id: org.id });
-      const rink = await post("/api/v2/setup/rink",
+      const rink = await f.create("A rink", "/api/v2/setup/rink",
         { venue_id: venue.id, name: "PF Rink" });
-      const access = await post(`/api/v2/setup/seasons/${season.id}/venue-access`,
+      const access = await f.create("A venue-access",
+        `/api/v2/setup/seasons/${season.id}/venue-access`,
         { venue_id: venue.id });
-      const archived = await post(`/api/v2/setup/seasons/${season.id}/archive`,
-        { reason: "round 3 fixture" });
       return { program: program.id, season: season.id, seasonName: season.name,
-               venue: venue.id, rink: rink.id, access: access.id,
-               archived: !!archived && !archived.error };
+               venue: venue.id, rink: rink.id, access: access.id };
     });
+    a.archived = await archiveSelectedSeason(page, "A archive", a.season, getLastApi);
     for (const k of ["program", "season", "venue", "rink", "access"]) {
       if (!a[k]) fail(`[${L}] fixture (A) failed to create ${k}: ${JSON.stringify(a)}`);
     }
@@ -586,28 +645,28 @@ async function checkViewport(browser, viewport) {
     // Otherwise valid League + Division + Team, so the eligibility floor
     // asserts met and the archived Season is the only blocker left.
     const c = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const program = await post("/api/v2/setup/program",
+      const f = window.hsFixture;
+      const program = await f.create("C program", "/api/v2/setup/program",
         { name: "PF Part Program", country: "US" });
-      const season = await post("/api/v2/setup/season",
+      await f.selectProgram("C/program", program.id);
+      const season = await f.create("C season", "/api/v2/setup/season",
         { program_id: program.id, name: "PF Part Season" });
-      const league = await post("/api/v2/setup/league",
+      // The League create used to run BEFORE the selection was made at all —
+      // it is SEASON-OWNED (it mints the LeagueSeason and so consumes the
+      // Season named by `season_id`), so it needs BOTH axes saved first.
+      await f.selectProgramSeason("C/program+season", program.id, season.id);
+      const league = await f.create("C league", "/api/v2/setup/league",
         { season_id: season.id, name: "PF League" });
-      await post("/api/context", { program_id: program.id, season_id: season.id });
-      const club = await post("/api/v2/setup/club", { name: "PF Club" });
-      const team = await post("/api/v2/setup/team",
+      const club = await f.create("C club", "/api/v2/setup/club",
+        { name: "PF Club" });
+      const team = await f.create("C team", "/api/v2/setup/team",
         { club_id: club.id, league_id: league.id, name: "PF Team" });
-      const division = await post("/api/v2/setup/division",
+      const division = await f.create("C division", "/api/v2/setup/division",
         { season_id: season.id, league_id: league.id, name: "PF Division" });
-      const archived = await post(`/api/v2/setup/seasons/${season.id}/archive`,
-        { reason: "round 3 fixture" });
       return { program: program.id, season: season.id, seasonName: season.name,
-               league: league.id, team: team.id, division: division.id,
-               archived: !!archived && !archived.error };
+               league: league.id, team: team.id, division: division.id };
     });
+    c.archived = await archiveSelectedSeason(page, "C archive", c.season, getLastApi);
     for (const k of ["program", "season", "league", "team", "division"]) {
       if (!c[k]) fail(`[${L}] fixture (C) failed to create ${k}: ${JSON.stringify(c)}`);
     }
@@ -632,26 +691,35 @@ async function checkViewport(browser, viewport) {
     // Divisions count is non-zero and the Teams really exist -- they are just
     // permanently bound to another League.
     const d = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const program = await post("/api/v2/setup/program",
+      const f = window.hsFixture;
+      const program = await f.create("D program", "/api/v2/setup/program",
         { name: "PF Rule7 Program", country: "US" });
-      const seasonA = await post("/api/v2/setup/season",
+      // TWO Seasons in one Program, and each SEASON-OWNED create must run
+      // under the Season it is WRITTEN INTO — not merely under "some" Season
+      // of the right Program. That is the whole two-axis rule, and this block
+      // is where it bites: the old order created League B while Season A was
+      // the saved one, which the create comparison refuses.
+      await f.selectProgram("D/program (season A)", program.id);
+      const seasonA = await f.create("D seasonA", "/api/v2/setup/season",
         { program_id: program.id, name: "PF Rule7 A" });
-      const leagueA = await post("/api/v2/setup/league",
+      await f.selectProgramSeason("D/program+seasonA", program.id, seasonA.id);
+      const leagueA = await f.create("D leagueA", "/api/v2/setup/league",
         { season_id: seasonA.id, name: "PF Rule7 League A" });
-      await post("/api/context", { program_id: program.id, season_id: seasonA.id });
-      const club = await post("/api/v2/setup/club", { name: "PF Rule7 Club" });
-      const team = await post("/api/v2/setup/team",
+      const club = await f.create("D club", "/api/v2/setup/club",
+        { name: "PF Rule7 Club" });
+      const team = await f.create("D team", "/api/v2/setup/team",
         { club_id: club.id, league_id: leagueA.id, name: "PF Rule7 Team A" });
-      const seasonB = await post("/api/v2/setup/season",
+      // Season B is PROGRAM-AXIS: drop back to the Program-only choice so the
+      // Season axis is explicitly CLEARED rather than left holding Season A —
+      // a leftover Season is exactly what a later two-axis create must not be
+      // able to ride on.
+      await f.selectProgram("D/program (season B)", program.id);
+      const seasonB = await f.create("D seasonB", "/api/v2/setup/season",
         { program_id: program.id, name: "PF Rule7 B" });
-      const leagueB = await post("/api/v2/setup/league",
+      await f.selectProgramSeason("D/program+seasonB", program.id, seasonB.id);
+      const leagueB = await f.create("D leagueB", "/api/v2/setup/league",
         { season_id: seasonB.id, name: "PF Rule7 League B" });
-      await post("/api/context", { program_id: program.id, season_id: seasonB.id });
-      const division = await post("/api/v2/setup/division",
+      const division = await f.create("D division", "/api/v2/setup/division",
         { season_id: seasonB.id, league_id: leagueB.id, name: "PF Rule7 Division" });
       return { program: program.id, season: seasonB.id, seasonName: seasonB.name,
                club: club.id, leagueB: leagueB.id, team: team.id,

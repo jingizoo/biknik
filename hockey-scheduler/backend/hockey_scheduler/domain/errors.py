@@ -72,6 +72,28 @@ class NotAuthorizedError(DomainError):
     code = "forbidden"
 
 
+class ActiveContextRequiredError(DomainError):
+    """The caller has no EXPLICIT, still-valid persisted Program/Season tuple
+    and asked to MUTATE (#393 PR A, #409).
+
+    Deliberately NOT an authorization error. These callers may legitimately
+    switch context and perform the very same write; what is missing is a
+    CHOICE, not a privilege. `ContextService._fallback` auto-selects a Program
+    for read-only landing and navigation, and that convenience must never be
+    laundered into the operator's decision at a write boundary — a stale saved
+    selection would otherwise silently retarget their work into a Program they
+    navigated away from.
+
+    ONE code for the whole rule, defined here exactly once, so the ice
+    availability commit (#393 PR A), the scheduler draft batches and the
+    guarded setup mutations cannot drift into three wire contracts for one
+    condition. `web.server.ERROR_HTTP_STATUS` maps it to 409: recoverable, and
+    distinct from the generic 404 a target the caller may not touch returns.
+    """
+
+    code = "active_context_required"
+
+
 class HasDependenciesError(DomainError):
     """A record can't be deleted because dependent records/history exist.
 

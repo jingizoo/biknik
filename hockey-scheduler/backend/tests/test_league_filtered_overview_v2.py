@@ -1255,13 +1255,22 @@ class SetupOverviewV2HttpTest(unittest.TestCase):
         program = self._post(c, "program",
                              {"name": "HTTP Ceil Program",
                               "operator_organization_id": org["id"]})
+        # #409: a Season create is PROGRAM-AXIS and a League/Division create
+        # is SEASON-OWNED, so each is judged against the axis the operator
+        # CHOSE. Select the Program, then each Season as its own records are
+        # built -- the same per-Season selection the venue grants below already
+        # make, extended to the creates. Every record is the one this test
+        # always built, and the assertions set their own selection anyway.
+        self._select(c, program["id"])
         s1 = self._post(c, "season",
                         {"program_id": program["id"], "name": "HTTP-S1"})
         s2 = self._post(c, "season",
                         {"program_id": program["id"], "name": "HTTP-S2"})
+        self._select(c, program["id"], s1["id"])
         lg1 = self._post(c, "league", {"season_id": s1["id"], "name": "HTTP-L1"})
-        lg2 = self._post(c, "league", {"season_id": s2["id"], "name": "HTTP-L2"})
         d1 = self._post(c, "division", {"league_id": lg1["id"], "name": "HTTP-D1"})
+        self._select(c, program["id"], s2["id"])
+        lg2 = self._post(c, "league", {"season_id": s2["id"], "name": "HTTP-L2"})
         d2 = self._post(c, "division", {"league_id": lg2["id"], "name": "HTTP-D2"})
         v1 = self._post(c, "venue", {"name": "HTTP-V1",
                                      "organization_id": org["id"]})

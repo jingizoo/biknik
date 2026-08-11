@@ -22,6 +22,7 @@ const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
+const { installContextFixture } = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -115,26 +116,36 @@ async function checkViewport(browser, viewport) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
 
     // Build one League with three Divisions: 0-team, 1-team, and 4-team. Create a
     // rink but NO game ice yet — the 4-team Division is first generated with an
     // empty ice pool (six unscheduled), then again after six slots are added.
     const ids = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const league = await post("/api/setup/league", { name: "AHL Program" });
-      const season = await post("/api/setup/season", { league_id: league.id, name: "Fall 2026" });
-      const level = await post("/api/setup/level", { season_id: season.id, name: "Silver League" });
-      const dEmpty = await post("/api/setup/division", { season_id: season.id, level_id: level.id, name: "SilverEmpty" });
-      const dSolo = await post("/api/setup/division", { season_id: season.id, level_id: level.id, name: "SilverSolo" });
-      const dQuad = await post("/api/setup/division", { season_id: season.id, level_id: level.id, name: "SilverNorth" });
-      const club = await post("/api/setup/club", { name: "Club" });
+      const F = window.hsFixture;
+      // #409 EXPLICIT SELECTION on the V1 SURFACE. The route family differs;
+      // the axis rule does not. `POST /api/setup/league` mints the PROGRAM
+      // (v1 calls it "league"), and server.py:3686 makes `POST
+      // /api/setup/season` a PROGRAM-AXIS create comparing the body's
+      // `league_id` — server.py:1160 runs the same
+      // `setup_create_context_error` preflight for v1 and v2 alike, so v1 is
+      // not a loophole and is not used as one here. Minting the Program is
+      // not selecting it.
+      const league = await F.create("v1 league (the Program)", "/api/setup/league", { name: "AHL Program" });
+      await F.selectProgram("Program-only bootstrap", league.id);
+      const season = await F.create("season", "/api/setup/season", { league_id: league.id, name: "Fall 2026" });
+      // The v1 "level" IS the v2 League, and it plus the Divisions, the five
+      // registrations and the venue-access grant are all SEASON-OWNED.
+      await F.selectProgramSeason("Program+Season", league.id, season.id);
+      const level = await F.create("level (the v2 League)", "/api/setup/level", { season_id: season.id, name: "Silver League" });
+      const dEmpty = await F.create("dEmpty", "/api/setup/division", { season_id: season.id, level_id: level.id, name: "SilverEmpty" });
+      const dSolo = await F.create("dSolo", "/api/setup/division", { season_id: season.id, level_id: level.id, name: "SilverSolo" });
+      const dQuad = await F.create("dQuad", "/api/setup/division", { season_id: season.id, level_id: level.id, name: "SilverNorth" });
+      const club = await F.create("club", "/api/setup/club", { name: "Club" });
       // Permanent Teams belong to the competition League (level); season/division
       // placement is a separate SeasonTeamRegistration below.
       const team = async (n) =>
-        (await post("/api/v2/setup/team", { club_id: club.id, league_id: level.id, name: n })).id;
+        (await F.create(`team ${n}`, "/api/v2/setup/team", { club_id: club.id, league_id: level.id, name: n })).id;
       const solo = await team("Solo");
       const q1 = await team("Quad 1");
       const q2 = await team("Quad 2");
@@ -149,14 +160,14 @@ async function checkViewport(browser, viewport) {
       await register(q3, dQuad.id);
       await register(q4, dQuad.id);
       // dEmpty gets no registrations at all.
-      const venue = await post("/api/setup/venue", { name: "Arena", league_id: league.id });
+      const venue = await F.create("venue", "/api/setup/venue", { name: "Arena", league_id: league.id });
       // The draft draws ice only from slots whose Venue holds active
       // SeasonVenueAccess for the Season (league_scoped_scheduler); without this
       // grant every slot is filtered out as "not assigned to this season", so
       // scenario (4) could never schedule. Granting it now is harmless to the
       // no-ice case (3), which still has zero slots when it generates.
-      await post(`/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
-      const rink = await post("/api/setup/rink", { venue_id: venue.id, name: "Rink 1" });
+      await F.call("season venue-access grant", `/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
+      const rink = await F.create("rink", "/api/setup/rink", { venue_id: venue.id, name: "Rink 1" });
       return { dEmpty: dEmpty.id, dSolo: dSolo.id, dQuad: dQuad.id, rink: rink.id };
     });
 
@@ -224,14 +235,11 @@ async function checkViewport(browser, viewport) {
 
     // Add six game ice slots, then regenerate the same Division.
     await page.evaluate(async (arg) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
+      const F = window.hsFixture;
       for (const h of arg.hours) {
         const hh = String(h).padStart(2, "0");
         const eh = String(h + 1).padStart(2, "0");
-        await post("/api/setup/ice-slot", {
+        await F.call("ice-slot", "/api/setup/ice-slot", {
           rink_id: arg.rink,
           start_time: `${arg.day}T${hh}:00:00+00:00`,
           end_time: `${arg.day}T${eh}:00:00+00:00`,

@@ -589,14 +589,39 @@ class ScenarioActiveTupleTest(unittest.TestCase):
             self.assertIn("error", committed,
                           "a principal authorized for NO Program COMMITTED a "
                           "scenario")
-            self.assertEqual(committed["error"]["details"]["reason"],
-                             "schedule_scenario_missing", committed)
+            # #409 — the refusal now lands one rung EARLIER, and that is the
+            # stricter answer rather than a different one. A principal with no
+            # authorized Program has, by construction, no EXPLICIT persisted
+            # selection either, so `_require_explicit_selection` refuses at the
+            # head of the committing transaction and the scenario row is never
+            # looked up at all. `schedule_scenario_missing` was the verdict of
+            # `_scenario_in_active_tuple`, which sits BEHIND that gate.
+            self.assertEqual(committed["error"]["code"],
+                             "active_context_required", committed)
+            # ...and it is INDEPENDENT of the id, which is the property that
+            # made the old wording safe and must survive the reordering: a
+            # scenario that never existed answers byte-identically, so the
+            # refusal is still no kind of existence oracle.
+            ghost = api.commit_schedule_scenario(
+                "scenario_never_existed", actor_id=unbound[0],
+                user_id=unbound[0], role=unbound[1], scope={})
+            self.assertEqual(ghost, committed, (ghost, committed))
             created = self._create(api, "By nobody", da, *unbound)
             self.assertIn("error", created,
                           "a principal authorized for NO Program CREATED a "
                           "scenario")
-            self.assertEqual(created["error"]["details"]["reason"],
-                             "division_missing", created)
+            # #409, exactly as for the commit above: creating a scenario
+            # PERSISTS a row bound to a (Program, Season, League) the caller
+            # never chose, so the explicit-selection gate refuses at the head
+            # of the transaction and `division_missing` — the verdict of the
+            # generator's own scope resolution, which sits behind it — is never
+            # reached. Earlier, not different.
+            self.assertEqual(created["error"]["code"],
+                             "active_context_required", created)
+            ghost_created = self._create(
+                api, "By nobody", "division_never_existed", *unbound)
+            self.assertEqual(ghost_created, created,
+                             (ghost_created, created))
             self.assertEqual(store.all_games(), [])
             self.assertEqual(len(store.all_schedule_scenarios()), 1)
         self._on_every_backend(body)

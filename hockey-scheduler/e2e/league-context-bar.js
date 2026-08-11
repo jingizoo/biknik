@@ -71,6 +71,9 @@ const fs = require("fs");
 const http = require("http");
 const os = require("os");
 const path = require("path");
+const {
+  installContextFixture, selectProgramSeason,
+} = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -159,6 +162,11 @@ async function newPage(browser, viewport) {
       errors.push(`[console] ${m.text()}`);
     }
   });
+  // #409: install the shared context fixture on EVERY page this journey
+  // opens (it runs several browser contexts side by side, including a second
+  // admin session), so each one selects explicitly with the same asserted
+  // helper instead of inheriting another session's saved row.
+  await installContextFixture(page);
   return { context, page, errors };
 }
 async function reloadShell(page) {
@@ -295,32 +303,40 @@ finally:
 // #content (context-switcher.js's own established convention).
 async function buildCoreFixture(page, suffix) {
   return page.evaluate(async (sfx) => {
-    const post = async (p, b) => (await fetch(p, {
-      method: "POST", credentials: "same-origin",
-      headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-    })).json();
+    const F = window.hsFixture;
     // An operator Organization, linked at Program creation (division-delete-
     // cleanup.js's own established fixture pattern): satisfies the client
     // onboarding wizard's own prerequisites so League Admin lands on the real
     // Setup tab for (K) below instead of the "Initial Setup" wizard taking
     // over #content -- unrelated to anything this journey itself asserts.
-    const org = await post("/api/v2/setup/organization", { name: `Zulu Org ${sfx}` });
-    const zulu = await post("/api/v2/setup/program",
+    const org = await F.create("Zulu organization", "/api/v2/setup/organization", { name: `Zulu Org ${sfx}` });
+    const zulu = await F.create("Zulu program", "/api/v2/setup/program",
       { name: `Zulu Program ${sfx}`, operator_organization_id: org.id });
-    const s1 = await post("/api/v2/setup/season", { program_id: zulu.id, name: "S1 2026" });
-    const s2 = await post("/api/v2/setup/season", { program_id: zulu.id, name: "S2 2027" });
-    const s3 = await post("/api/v2/setup/season", { program_id: zulu.id, name: "S3 Unbound" });
-    const dual = await post("/api/v2/setup/league", { season_id: s1.id, name: "Dual League" });
-    const solo = await post("/api/v2/setup/league", { season_id: s1.id, name: "Solo League" });
-    const club = await post("/api/v2/setup/club", { name: "Fixture Club" });
-    const team = await post("/api/v2/setup/team",
+    // #409 EXPLICIT SELECTION, boundary 1: the three Season creates are
+    // PROGRAM-AXIS, and minting the Program is not selecting it.
+    await F.selectProgram("Zulu Program-only bootstrap", zulu.id);
+    const s1 = await F.create("season S1", "/api/v2/setup/season", { program_id: zulu.id, name: "S1 2026" });
+    const s2 = await F.create("season S2", "/api/v2/setup/season", { program_id: zulu.id, name: "S2 2027" });
+    const s3 = await F.create("season S3", "/api/v2/setup/season", { program_id: zulu.id, name: "S3 Unbound" });
+    // BOUNDARY 2: both Leagues and the S1 registration are SEASON-OWNED in S1.
+    await F.selectProgramSeason("Zulu + S1", zulu.id, s1.id);
+    const dual = await F.create("Dual League", "/api/v2/setup/league", { season_id: s1.id, name: "Dual League" });
+    const solo = await F.create("Solo League", "/api/v2/setup/league", { season_id: s1.id, name: "Solo League" });
+    const club = await F.create("club", "/api/v2/setup/club", { name: "Fixture Club" });
+    const team = await F.create("team", "/api/v2/setup/team",
       { league_id: dual.id, club_id: club.id, name: "Fixture Team" });
-    await post(`/api/v2/setup/seasons/${s1.id}/team-registrations`,
+    await F.call("team-registrations", `/api/v2/setup/seasons/${s1.id}/team-registrations`,
       { team_id: team.id, league_id: dual.id, division_id: null });
-    await post(`/api/v2/setup/seasons/${s2.id}/roll-forward`,
+    // THE SPLIT RULE (#409, service.py:2213-2222): a roll-forward writes into
+    // the DESTINATION season, so S2 must be the SAVED Season here; the SOURCE
+    // (S1) is bounded only by the saved Program. Selecting S1 — the Season
+    // every create above used — would be REFUSED.
+    await F.selectProgramSeason("Zulu + S2 as the roll-forward destination",
+      zulu.id, s2.id);
+    await F.call("roll-forward into S2", `/api/v2/setup/seasons/${s2.id}/roll-forward`,
       { from_season_id: s1.id, selections: [{ team_id: team.id, league_id: dual.id }] });
-    const alpha = await post("/api/v2/setup/program", { name: `Alpha Program ${sfx}` });
-    const acct = await post("/api/accounts",
+    const alpha = await F.create("alpha", "/api/v2/setup/program", { name: `Alpha Program ${sfx}` });
+    const acct = await F.create("viewer account", "/api/accounts",
       { username: `lcb_seer_${sfx}`, password: "demo", role: "viewer", scope: {} });
     return {
       zulu: zulu.id, s1: s1.id, s2: s2.id, s3: s3.id,
@@ -1023,26 +1039,27 @@ async function checkUnboundRevokedRestore(browser) {
     await page.goto(base, { waitUntil: "domcontentloaded" });
     if ((await loginAs(page, "admin")).status !== 200) throw new Error("admin login failed");
     const f = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const program = await post("/api/v2/setup/program", { name: "Unbound Program" });
-      const s1 = await post("/api/v2/setup/season", { program_id: program.id, name: "S1" });
-      const league = await post("/api/v2/setup/league", { season_id: s1.id, name: "Revocable League" });
-      const club = await post("/api/v2/setup/club", { name: "Revocable Club" });
-      const teamA = await post("/api/v2/setup/team", { league_id: league.id, club_id: club.id, name: "Team A" });
-      const teamB = await post("/api/v2/setup/team", { league_id: league.id, club_id: club.id, name: "Team B" });
+      const F = window.hsFixture;
+      const program = await F.create("program", "/api/v2/setup/program", { name: "Unbound Program" });
+      // #409: Season is PROGRAM-AXIS; both Leagues and teamA's registration
+      // are SEASON-OWNED in S1.
+      await F.selectProgram("Program-only bootstrap", program.id);
+      const s1 = await F.create("season S1", "/api/v2/setup/season", { program_id: program.id, name: "S1" });
+      await F.selectProgramSeason("Program + S1", program.id, s1.id);
+      const league = await F.create("Revocable League", "/api/v2/setup/league", { season_id: s1.id, name: "Revocable League" });
+      const club = await F.create("club", "/api/v2/setup/club", { name: "Revocable Club" });
+      const teamA = await F.create("teamA", "/api/v2/setup/team", { league_id: league.id, club_id: club.id, name: "Team A" });
+      const teamB = await F.create("teamB", "/api/v2/setup/team", { league_id: league.id, club_id: club.id, name: "Team B" });
       // Coach's own authorized_season_ids is derived from its team's ACTIVE
       // registration (context_scope.py's _team_season_ids), not merely its
       // permanent League's bindings -- an unregistered Team authorizes no
       // Season at all.
-      const teamAReg = await post(`/api/v2/setup/seasons/${s1.id}/team-registrations`,
+      const teamAReg = await F.create("teamAReg", `/api/v2/setup/seasons/${s1.id}/team-registrations`,
         { team_id: teamA.id, league_id: league.id, division_id: null });
-      const otherLeague = await post("/api/v2/setup/league", { season_id: s1.id, name: "Other League" });
-      const coach = await post("/api/accounts",
+      const otherLeague = await F.create("otherLeague", "/api/v2/setup/league", { season_id: s1.id, name: "Other League" });
+      const coach = await F.create("coach", "/api/accounts",
         { username: "lcb_coach", password: "demo", role: "coach", scope: { team_id: teamA.id } });
-      const viewer = await post("/api/accounts",
+      const viewer = await F.create("viewer", "/api/accounts",
         { username: "lcb_seer_missing", password: "demo", role: "viewer", scope: {} });
       return { program: program.id, s1: s1.id, league: league.id, otherLeague: otherLeague.id,
         teamA: teamA.id, teamB: teamB.id, teamAReg: teamAReg.id,
@@ -1145,16 +1162,29 @@ async function checkUnboundRevokedRestore(browser) {
     // single selection INTO S1 -- is the one HTTP-reachable way to re-bind an
     // existing League back onto a Season it already left.
     const throwaway = await admin.page.evaluate(async (programId) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      return (await post("/api/v2/setup/season", { program_id: programId, name: "S-throwaway" })).id;
+      const F = window.hsFixture;
+      // #409: this Season create is PROGRAM-AXIS and this page is a SECOND
+      // browser context (the admin's), whose saved row is its own. State the
+      // Program before creating into it rather than inheriting whatever this
+      // session's fallback resolves to.
+      await window.hsFixture.selectProgram("admin session: Program-only", programId);
+      return (await window.hsFixture.create("throwaway season",
+        "/api/v2/setup/season", { program_id: programId, name: "S-throwaway" })).id;
     }, f.program);
+    // #409: a registration is SEASON-OWNED, so the admin session must have
+    // the THROWAWAY season saved to write one into it.
+    await selectProgramSeason(admin.page,
+      "admin session: Program + throwaway season", f.program, throwaway);
     if ((await apiPost(admin.page, `/api/v2/setup/seasons/${throwaway}/team-registrations`,
       { team_id: f.teamB, league_id: f.league, division_id: null })).status !== 200) {
       throw new Error("throwaway registration failed");
     }
+    // THE SPLIT RULE (#409): this roll-forward READS the throwaway season and
+    // WRITES into S1, so S1 — the destination — is what must be saved. The
+    // source is bounded only by the saved Program, which is why it can stay
+    // the season we just left.
+    await selectProgramSeason(admin.page,
+      "admin session: Program + S1 as the roll-forward destination", f.program, f.s1);
     const restoreRoll = await apiPost(admin.page, `/api/v2/setup/seasons/${f.s1}/roll-forward`,
       { from_season_id: throwaway, selections: [{ team_id: f.teamB, league_id: f.league }] });
     if (restoreRoll.status !== 200) throw new Error(`restore rebind failed: ${JSON.stringify(restoreRoll)}`);
@@ -1192,15 +1222,15 @@ async function checkRaceGuard(browser) {
     await page.goto(base, { waitUntil: "domcontentloaded" });
     if ((await loginAs(page, "admin")).status !== 200) throw new Error("admin login failed");
     const f = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const program = await post("/api/v2/setup/program", { name: "Race Program" });
-      const s1 = await post("/api/v2/setup/season", { program_id: program.id, name: "S1" });
-      const leagueA = await post("/api/v2/setup/league", { season_id: s1.id, name: "League A" });
-      const leagueB = await post("/api/v2/setup/league", { season_id: s1.id, name: "League B" });
-      const acct = await post("/api/accounts",
+      const F = window.hsFixture;
+      const program = await F.create("Race program", "/api/v2/setup/program", { name: "Race Program" });
+      // #409: Season is PROGRAM-AXIS; both Leagues are SEASON-OWNED in S1.
+      await F.selectProgram("Race Program-only bootstrap", program.id);
+      const s1 = await F.create("season S1", "/api/v2/setup/season", { program_id: program.id, name: "S1" });
+      await F.selectProgramSeason("Race Program + S1", program.id, s1.id);
+      const leagueA = await F.create("League A", "/api/v2/setup/league", { season_id: s1.id, name: "League A" });
+      const leagueB = await F.create("League B", "/api/v2/setup/league", { season_id: s1.id, name: "League B" });
+      const acct = await F.create("viewer account", "/api/accounts",
         { username: "lcb_racer", password: "demo", role: "viewer", scope: {} });
       return { program: program.id, s1: s1.id, leagueA: leagueA.id, leagueB: leagueB.id, viewer: acct.username };
     });
@@ -1271,37 +1301,37 @@ async function checkRoleScoping(browser) {
     await page.goto(base, { waitUntil: "domcontentloaded" });
     if ((await loginAs(page, "admin")).status !== 200) throw new Error("admin login failed");
     const f = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const program = await post("/api/v2/setup/program", { name: "Scope Program" });
-      const s1 = await post("/api/v2/setup/season", { program_id: program.id, name: "S1" });
-      const ownLeague = await post("/api/v2/setup/league", { season_id: s1.id, name: "Own League" });
-      const otherLeague = await post("/api/v2/setup/league", { season_id: s1.id, name: "Other League" });
-      const club = await post("/api/v2/setup/club", { name: "Scope Club" });
-      const ownTeam = await post("/api/v2/setup/team",
+      const F = window.hsFixture;
+      const program = await F.create("Scope program", "/api/v2/setup/program", { name: "Scope Program" });
+      // #409: Season is PROGRAM-AXIS; both Leagues are SEASON-OWNED in S1.
+      await F.selectProgram("Scope Program-only bootstrap", program.id);
+      const s1 = await F.create("season S1", "/api/v2/setup/season", { program_id: program.id, name: "S1" });
+      await F.selectProgramSeason("Scope Program + S1", program.id, s1.id);
+      const ownLeague = await F.create("Own League", "/api/v2/setup/league", { season_id: s1.id, name: "Own League" });
+      const otherLeague = await F.create("Other League", "/api/v2/setup/league", { season_id: s1.id, name: "Other League" });
+      const club = await F.create("club", "/api/v2/setup/club", { name: "Scope Club" });
+      const ownTeam = await F.create("ownTeam", "/api/v2/setup/team",
         { league_id: ownLeague.id, club_id: club.id, name: "Own Team" });
-      const player = await post("/api/v2/setup/player",
+      const player = await F.create("player", "/api/v2/setup/player",
         { team_id: ownTeam.id, name: "Scope Player", position: "forward" });
-      const official = await post("/api/v2/setup/official", { name: "Scope Official" });
+      const official = await F.create("official", "/api/v2/setup/official", { name: "Scope Official" });
       const PW = "scope-pw";
-      const coach = await post("/api/accounts",
+      const coach = await F.create("coach", "/api/accounts",
         { username: "lcb_scope_coach", password: PW, role: "coach", scope: { team_id: ownTeam.id } });
-      const plyr = await post("/api/accounts",
+      const plyr = await F.create("plyr", "/api/accounts",
         { username: "lcb_scope_player", password: PW,
           role: "player", scope: { player_id: player.id, team_id: ownTeam.id } });
-      const guardian = await post("/api/accounts",
+      const guardian = await F.create("guardian", "/api/accounts",
         { username: "lcb_scope_guardian", password: PW, role: "guardian", scope: {} });
-      const link = await post("/api/guardians/links",
+      const link = await F.create("link", "/api/guardians/links",
         { guardian_user_id: guardian.id, player_id: player.id });
-      await post(`/api/guardians/links/${link.id}/verify`, { consent_method: "verbal_confirmed" });
-      const arena = await post("/api/accounts",
+      await F.call("verify", `/api/guardians/links/${link.id}/verify`, { consent_method: "verbal_confirmed" });
+      const arena = await F.create("arena", "/api/accounts",
         { username: "lcb_scope_arena", password: PW, role: "arena_manager", scope: {} });
-      const official_acct = await post("/api/accounts",
+      const official_acct = await F.create("official_acct", "/api/accounts",
         { username: "lcb_scope_official", password: PW,
           role: "official", scope: { official_id: official.id } });
-      const viewer = await post("/api/accounts",
+      const viewer = await F.create("viewer", "/api/accounts",
         { username: "lcb_scope_viewer", password: PW, role: "viewer", scope: {} });
       return { program: program.id, ownLeague: ownLeague.id, otherLeague: otherLeague.id, PW,
         coach: coach.username, player: plyr.username, guardian: guardian.username,

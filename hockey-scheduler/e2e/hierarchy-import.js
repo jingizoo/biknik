@@ -43,6 +43,21 @@ from hockey_scheduler.domain import SeasonTeamRegistration
 store = create_store(os.environ["FIXTURE_DB_PATH"])
 try:
     ls = store.league_season_for(os.environ["FIXTURE_LEAGUE_ID"], os.environ["FIXTURE_SEASON_ID"])
+    # SAY WHAT WENT WRONG (#409). None here means no LeagueSeason links this
+    # League to this Season -- i.e. the create that should have made it was
+    # REFUSED, for want of an explicit selection, and this injector is the
+    # first thing downstream to touch the missing row. Falling through raised
+    # "AttributeError: 'NoneType' object has no attribute 'id'" from the line
+    # below, inside a subprocess, so the journey reported "launcher process
+    # exited unexpectedly" and never mentioned context at all -- the single
+    # most expensive misdiagnosis in this sweep. Name the real cause here.
+    if ls is None:
+        raise SystemExit(
+            "no LeagueSeason links league {} to season {}, so there is nothing "
+            "to register against. The create that should have made it was "
+            "REFUSED -- check that the journey explicitly SELECTED the Program "
+            "(and, for a Season-owned create, the Season) beforehand.".format(
+                os.environ["FIXTURE_LEAGUE_ID"], os.environ["FIXTURE_SEASON_ID"]))
     reg_id = store.next_id("streg")
     store.add_season_team_registration(SeasonTeamRegistration(
         id=reg_id, league_season_id=ls.id,
@@ -395,6 +410,47 @@ async function checkViewport(browser, viewport) {
       throw new Error(`[${viewport.label}] expected one active season venue access grant: ${JSON.stringify(verify)}`);
     }
 
+    // THE EXPLICIT SELECTION (#409 review round). The import above names no
+    // parent id of its own — it creates by CODE — so it is ungated. But
+    // section (6) below creates a second League under the imported Season,
+    // and a League is a Season-owned TWO-AXIS create: it requires the
+    // operator's own PERSISTED (Program, Season), which importing them does
+    // not establish. The selection is made HERE, before section (5)'s
+    // `beforeInvalid` baseline, so every record count this journey compares is
+    // read under one and the same context — moving it later would have the
+    // zero-change assertions comparing two different scopes.
+    //
+    // The read-back is ASSERTED, not assumed: a selection that silently fell
+    // back to inferred context would leave section (6) standing on exactly the
+    // behaviour #409 removes.
+    //
+    // Driven through `setActiveContext` — the app's OWN switch pipeline, the
+    // exact function `#ctx-select`'s onchange calls — and NOT a raw
+    // `POST /api/context`. This journey never reloads: sections (4)–(6) go on
+    // to drive the real Import wizard on this same page. A raw fetch would move
+    // the SERVER's context while the client went on believing the old one, so
+    // the Validate/Commit clicks below would run against a binding stamped for
+    // a context the server had already left — a state no operator can reach,
+    // because a real switch runs invalidateContextScopedMutations() and clears
+    // importState.report/validatedKey/committed. Passing that way would prove
+    // nothing about the wizard an operator actually uses, and would hide any
+    // regression in that invalidation. (The wizard's own sheet contents and its
+    // Validate/Commit controls survive the switch — only the staleness does —
+    // so section (4) still re-validates from scratch exactly as before.)
+    const ctx = await page.evaluate(async (want) => {
+      await setActiveContext(want.programId, want.seasonId);
+      const read = await (await fetch("/api/context",
+        { credentials: "same-origin" })).json();
+      return { read };
+    }, { programId: verify.programId, seasonId: verify.seasonId });
+    if (ctx.read.program_id !== verify.programId
+        || ctx.read.season_id !== verify.seasonId) {
+      throw new Error(`[${viewport.label}] the active context did not read back `
+        + `as the explicit selection — wanted program=${verify.programId} `
+        + `season=${verify.seasonId}, got program=${ctx.read.program_id} `
+        + `season=${ctx.read.season_id}`);
+    }
+
     // (4) Idempotent repeat commit: same draft, same wizard answers — must
     // update/skip in place, never duplicate.
     const revalidateResponse = page.waitForResponse((response) =>
@@ -472,25 +528,51 @@ async function checkViewport(browser, viewport) {
     // stand-in for it.
     const fixtureIds = await page.evaluate(async () => {
       const getJson = async (url) => (await fetch(url, { credentials: "same-origin" })).json();
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
+      // Returns the STATUS alongside the body: a refused create answers a
+      // perfectly well-formed JSON error, and the old body-only helper made
+      // that indistinguishable from a success until something downstream
+      // tripped over the missing id.
+      const post = async (p, b) => {
+        const r = await fetch(p, {
+          method: "POST", credentials: "same-origin",
+          headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+        });
+        return { status: r.status, body: await r.json() };
+      };
       const overview = await getJson("/api/v2/setup/overview");
       const season = (overview.seasons || []).find((s) => s.name === "Browser Season");
       const league = (overview.leagues || []).find((l) => l.name === "Browser League");
       const team = (overview.teams || []).find((t) => t.name === "Browser Team");
+      if (!season || !league || !team) {
+        throw new Error("the imported Season/League/Team are not all readable: "
+          + JSON.stringify({ season: !!season, league: !!league, team: !!team }));
+      }
       const regsResp = await getJson(`/api/v2/setup/seasons/${season.id}/team-registrations`);
       const existingReg = (regsResp.registrations || [])
         .find((r) => r.team_id === team.id && r.active);
+      if (!existingReg) {
+        throw new Error("the imported Team has no active registration to conflict with");
+      }
       // A second league bound to the SAME season — fixture setup (not the
       // behavior under test), so a direct API call is appropriate here the
       // same way this file's own overview/verify reads already are.
+      //
+      // ASSERTED BEFORE ITS ID IS USED (#409 review round). This create is
+      // Season-owned and two-axis; before the explicit selection above it was
+      // refused 409, and the id-less body's `undefined` id was carried out of
+      // this evaluate and into the SQLite injector, which died on
+      // `KeyError: 'FIXTURE_LEAGUE_ID'` — a Python traceback naming an
+      // environment variable, for a missing context selection.
       const otherLeague = await post("/api/v2/setup/league",
         { season_id: season.id, name: "Browser Other League" });
+      if (otherLeague.status !== 200 || !otherLeague.body
+          || otherLeague.body.error || !otherLeague.body.id) {
+        throw new Error("second-league fixture create failed: "
+          + `${otherLeague.status} ${JSON.stringify(otherLeague.body)}`);
+      }
       return {
         seasonId: season.id, leagueId: league.id, teamId: team.id,
-        existingRegId: existingReg.id, otherLeagueId: otherLeague.id,
+        existingRegId: existingReg.id, otherLeagueId: otherLeague.body.id,
       };
     });
     const strayRegId = injectSecondActiveRegistration(databasePath, {

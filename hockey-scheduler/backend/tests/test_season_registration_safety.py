@@ -12,6 +12,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from http.cookiejar import CookieJar
 from http.server import ThreadingHTTPServer
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
@@ -119,16 +120,49 @@ class RegistrationActorIntegrityHttpTest(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read() or b"{}")
 
+    def _session_post(self, opener, path, body):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}", data=json.dumps(body).encode(),
+            method="POST", headers={"Content-Type": "application/json"})
+        try:
+            with opener.open(req) as r:
+                return r.status, json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read() or b"{}")
+
     def test_forged_actor_id_in_body_is_ignored(self):
-        _, league = self._post("/api/setup/league", {"name": "Actor League"})
-        _, season = self._post("/api/setup/season",
-                               {"league_id": league["id"], "name": "S"})
-        _, division = self._post("/api/setup/division",
-                                {"season_id": season["id"], "name": "D"})
-        _, club = self._post("/api/setup/club", {"name": "C"})
-        _, team = self._post("/api/setup/team",
-                            {"club_id": club["id"], "division_id": division["id"],
-                             "name": "A"})
+        # #409: the setup CREATES below are guarded and are judged against the
+        # Program/Season the operator CHOSE; an ``X-Demo-Role`` caller has no
+        # account to persist a choice against, so the hierarchy is built by a
+        # real signed-in League Admin that selects each axis as it goes. The
+        # forged-actor probe itself stays on the header path -- its 400 is a
+        # write-schema refusal decided before any gate.
+        from hockey_scheduler.domain import Role
+        if STATE.api.store.get_user_account_by_username("safety_admin") is None:
+            STATE.api.accounts.create_account(
+                "safety_admin", "demo", Role.LEAGUE_ADMIN, scope={},
+                actor_id="test_seed")
+        c = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(CookieJar()))
+        status, body = self._session_post(
+            c, "/api/auth/login",
+            {"username": "safety_admin", "password": "demo"})
+        self.assertEqual(status, 200, body)
+        _, league = self._session_post(c, "/api/setup/league",
+                                       {"name": "Actor League"})
+        self._session_post(c, "/api/context", {"program_id": league["id"]})
+        _, season = self._session_post(c, "/api/setup/season",
+                                       {"league_id": league["id"], "name": "S"})
+        self._session_post(c, "/api/context",
+                           {"program_id": league["id"],
+                            "season_id": season["id"]})
+        _, division = self._session_post(c, "/api/setup/division",
+                                         {"season_id": season["id"], "name": "D"})
+        _, club = self._session_post(c, "/api/setup/club", {"name": "C"})
+        _, team = self._session_post(
+            c, "/api/setup/team",
+            {"club_id": club["id"], "division_id": division["id"], "name": "A"})
         # The registration route now carries a strict write schema (#271): a
         # forged top-level actor_id is an unknown field and is rejected outright
         # (400) rather than silently ignored — an even stronger guarantee that

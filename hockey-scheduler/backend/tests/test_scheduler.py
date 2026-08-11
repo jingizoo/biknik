@@ -3504,6 +3504,13 @@ class SchedulerHttpTest(unittest.TestCase):
         post("/api/context", {"program_id": league["id"]})
         season = post("/api/setup/season",
                       {"league_id": league["id"], "name": "HCC Season"})
+        # #409: a Level/Division CREATE is SEASON-OWNED (the level create also
+        # mints the LeagueSeason), so it needs the Season this fixture just
+        # made to be the operator's own EXPLICIT choice. Selecting it here is
+        # what an operator does — you set up the Season you just created — and
+        # it is the same tuple the fallback was already handing this session.
+        post("/api/context",
+             {"program_id": league["id"], "season_id": season["id"]})
         level = post("/api/setup/level",
                      {"season_id": season["id"], "name": "HCC Level"})
         division = post("/api/setup/division", {

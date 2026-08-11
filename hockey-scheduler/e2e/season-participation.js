@@ -19,6 +19,9 @@ const fs = require("fs");
 const http = require("http");
 const os = require("os");
 const path = require("path");
+const {
+  installContextFixture, selectProgramSeason,
+} = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -124,6 +127,21 @@ from hockey_scheduler.domain import SeasonTeamRegistration
 store = create_store(os.environ["FIXTURE_DB_PATH"])
 try:
     ls = store.league_season_for(os.environ["FIXTURE_LEAGUE_ID"], os.environ["FIXTURE_SEASON_ID"])
+    # SAY WHAT WENT WRONG (#409). None here means no LeagueSeason links this
+    # League to this Season -- i.e. the create that should have made it was
+    # REFUSED, for want of an explicit selection, and this injector is the
+    # first thing downstream to touch the missing row. Falling through raised
+    # "AttributeError: 'NoneType' object has no attribute 'id'" from the line
+    # below, inside a subprocess, so the journey reported "launcher process
+    # exited unexpectedly" and never mentioned context at all -- the single
+    # most expensive misdiagnosis in this sweep. Name the real cause here.
+    if ls is None:
+        raise SystemExit(
+            "no LeagueSeason links league {} to season {}, so there is nothing "
+            "to register against. The create that should have made it was "
+            "REFUSED -- check that the journey explicitly SELECTED the Program "
+            "(and, for a Season-owned create, the Season) beforehand.".format(
+                os.environ["FIXTURE_LEAGUE_ID"], os.environ["FIXTURE_SEASON_ID"]))
     reg_id = store.next_id("streg")
     store.add_season_team_registration(SeasonTeamRegistration(
         id=reg_id, league_season_id=ls.id,
@@ -196,6 +214,7 @@ async function checkViewport(browser, viewport) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
 
     // Shared helpers (defined up front so both the main flow and the
     // edit/repair sections below can use them). refreshSetup re-clicks the
@@ -229,20 +248,17 @@ async function checkViewport(browser, viewport) {
     // be silently refused. This journey therefore selects its target Season
     // explicitly before each block of guarded edits rather than leaning on that
     // fallback — the guard is never weakened for the fixture's convenience.
-    const selectContext = async (programId, seasonId) => {
-      const res = await page.evaluate(async ([pid, sid]) => {
-        const r = await fetch("/api/context", {
-          method: "POST", credentials: "same-origin",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ program_id: pid, season_id: sid }),
-        });
-        return { status: r.status, body: await r.json().catch(() => ({})) };
-      }, [programId, seasonId]);
-      if (res.status !== 200 || (res.body.season || {}).id !== seasonId) {
-        throw new Error(`[${viewport.label}] could not select context `
-          + `${programId}/${seasonId}: ${JSON.stringify(res)}`);
-      }
-    };
+    // #409: this is now ./context-fixture.js's asserted selection rather than
+    // a local raw `POST /api/context`. Two things change. It goes through
+    // `setActiveContext`, the app's own switch pipeline -- this journey drives
+    // the Setup UI on the same page between blocks, so the client has to move
+    // with the server. And the selection is proved by the server's own WRITE
+    // ECHO as well as a read-back; the local version checked only the POST's
+    // body, which cannot distinguish a persisted choice from the fallback
+    // resolver's guess.
+    const selectContext = (programId, seasonId) => selectProgramSeason(
+      page, `[${viewport.label}] select ${programId}/${seasonId}`,
+      programId, seasonId);
 
     // Build a permanent program team under its PERMANENT League, plus two
     // seasons. #283 Slice E: a Team is created with a REQUIRED league_id (its
@@ -256,18 +272,23 @@ async function checkViewport(browser, viewport) {
     // create is ambiguous once its League spans several) gives the edit-path
     // Save a real Division to move the registration to WITHIN its own League.
     const ids = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const program = await post("/api/v2/setup/program", { name: "Participation Program" });
-      const s1 = await post("/api/v2/setup/season", { program_id: program.id, name: "2026-27" });
-      const s2 = await post("/api/v2/setup/season", { program_id: program.id, name: "2027-28" });
-      const lg1 = await post("/api/v2/setup/league", { season_id: s1.id, name: "Adult League" });
-      const dA = await post("/api/v2/setup/division", { league_id: lg1.id, name: "Gold" });
-      const dA2 = await post("/api/v2/setup/division", { league_id: lg1.id, name: "Platinum" });
-      const club = await post("/api/v2/setup/club", { name: "Participation Club" });
-      const team = await post("/api/v2/setup/team",
+      const F = window.hsFixture;
+      const program = await F.create("program", "/api/v2/setup/program", { name: "Participation Program" });
+      // #409 EXPLICIT SELECTION, boundary 1: both Season creates are
+      // PROGRAM-AXIS, and minting the Program is not selecting it.
+      await F.selectProgram("Program-only bootstrap", program.id);
+      const s1 = await F.create("season 2026-27", "/api/v2/setup/season", { program_id: program.id, name: "2026-27" });
+      const s2 = await F.create("season 2027-28", "/api/v2/setup/season", { program_id: program.id, name: "2027-28" });
+      // BOUNDARY 2: the League and both Divisions are SEASON-OWNED and land
+      // in SEASON ONE — not merely "a" Season, and not the s2 that was
+      // created last. With two Seasons in the install the fallback would pick
+      // the latest-id one, which is exactly the wrong answer here.
+      await F.selectProgramSeason("Program + Season One", program.id, s1.id);
+      const lg1 = await F.create("Adult League", "/api/v2/setup/league", { season_id: s1.id, name: "Adult League" });
+      const dA = await F.create("division Gold", "/api/v2/setup/division", { league_id: lg1.id, name: "Gold" });
+      const dA2 = await F.create("division Platinum", "/api/v2/setup/division", { league_id: lg1.id, name: "Platinum" });
+      const club = await F.create("club", "/api/v2/setup/club", { name: "Participation Club" });
+      const team = await F.create("team", "/api/v2/setup/team",
         { league_id: lg1.id, club_id: club.id, name: "Perma Lions" });
       // lg1 is the team's ONE permanent League; the team plays it in BOTH
       // seasons. lg2 is kept as an alias so the season-2 selectors below read
@@ -293,11 +314,16 @@ async function checkViewport(browser, viewport) {
     await page.waitForFunction(
       (sel) => !!document.querySelector(sel), `#reg-team-${ids.s1}-${ids.lg1}`, { timeout: 15000 });
 
-    // The Season-2 bootstrap + register + remove steps below all target s2
-    // rows, so make s2 the active context explicitly (rather than relying on
-    // the latest-id fallback that would otherwise pick it) before the first
-    // guarded s2 mutation.
-    await selectContext(ids.program, ids.s2);
+    // #409 ORDERING FIX. This used to select SEASON TWO here — but the very
+    // next thing the journey does is register the team into SEASON ONE
+    // through the real UI, and a registration is SEASON-OWNED: it is judged
+    // against the SAVED Season, which would have been the wrong one. The
+    // Season-2 selection now sits where the Season-2 work actually starts
+    // (the bootstrap block below states it for itself), and Season One is
+    // stated here, for the Season-One registration that immediately follows.
+    // The old order only survived because the create inferred its Season from
+    // the parent it named; that inference is what #409 removes.
+    await selectContext(ids.program, ids.s1);
 
     // #233 B2b review r3: the fixture Program above was created with no
     // operator_organization_id (optional on the canonical Program, B2a/ADR
@@ -332,13 +358,15 @@ async function checkViewport(browser, viewport) {
     // page, keeping the selector unambiguous, and the real UI registration
     // below reactivates the bootstrapped row in place.
     await page.evaluate(async (i) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const boot = await post(`/api/v2/setup/seasons/${i.s2}/team-registrations`,
+      const F = window.hsFixture;
+      // #409: this bootstrap registration is SEASON-OWNED and lands in
+      // SEASON TWO, so Season Two is what has to be saved for it.
+      await F.selectProgramSeason("Program + Season Two", i.program, i.s2);
+      const boot = await F.create("season-2 bootstrap registration",
+        `/api/v2/setup/seasons/${i.s2}/team-registrations`,
         { team_id: i.team, league_id: i.lg1, division_id: null });
-      await post(`/api/v2/setup/season-team-registration/${boot.id}/remove`, {});
+      await F.call("remove the bootstrap registration",
+        `/api/v2/setup/season-team-registration/${boot.id}/remove`, {});
     }, ids);
     await refreshSetup({ selector: `#reg-team-${ids.s2}-${ids.lg2}` });
 
@@ -427,16 +455,16 @@ async function checkViewport(browser, viewport) {
     // below tries (and fails) to move Lions, and is the permanent League of a
     // NEW team (Perma Bears) used for the league-only register step.
     const edit = await page.evaluate(async (i) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
+      const F = window.hsFixture;
       const get = async (p) => (await fetch(p, { credentials: "same-origin" })).json();
-      const lg1b = await post("/api/v2/setup/league", { season_id: i.s1, name: "Sapphire" });
-      const divC = await post("/api/v2/setup/division", { league_id: lg1b.id, name: "Division C" });
-      const club = await post("/api/v2/setup/club", { name: "Edit Coverage Club" });
+      // #409: Sapphire and Division C are SEASON-OWNED and land in Season
+      // One, which the block above left the saved Season off.
+      await F.selectProgramSeason("Program + Season One", i.program, i.s1);
+      const lg1b = await F.create("league Sapphire", "/api/v2/setup/league", { season_id: i.s1, name: "Sapphire" });
+      const divC = await F.create("divC", "/api/v2/setup/division", { league_id: lg1b.id, name: "Division C" });
+      const club = await F.create("club", "/api/v2/setup/club", { name: "Edit Coverage Club" });
       // Perma Bears' permanent League is Sapphire (rule 2/7).
-      const bears = await post("/api/v2/setup/team",
+      const bears = await F.create("bears", "/api/v2/setup/team",
         { league_id: lg1b.id, club_id: club.id, name: "Perma Bears" });
       const r1 = (await get(`/api/v2/setup/seasons/${i.s1}/team-registrations`)).registrations;
       const lionsReg = r1.find((r) => r.active && r.team_id === i.team);
@@ -570,15 +598,15 @@ async function checkViewport(browser, viewport) {
     // against this journey's own durable SQLite-backed server (#233 B2b
     // review r3).
     const lgGuarded = await page.evaluate(async (i) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const lg = await post("/api/v2/setup/league", { season_id: i.s1, name: "Bronze" });
+      const F = window.hsFixture;
+      // #409: Bronze and Perma Foxes' registration are SEASON-OWNED in
+      // Season One.
+      await F.selectProgramSeason("Program + Season One", i.program, i.s1);
+      const lg = await F.create("league Bronze", "/api/v2/setup/league", { season_id: i.s1, name: "Bronze" });
       // Perma Foxes' permanent League is Bronze; it registers there (rule 7).
-      const foxes = await post("/api/v2/setup/team",
+      const foxes = await F.create("foxes", "/api/v2/setup/team",
         { league_id: lg.id, club_id: i.club, name: "Perma Foxes" });
-      const reg = await post(`/api/v2/setup/seasons/${i.s1}/team-registrations`,
+      const reg = await F.create("reg", `/api/v2/setup/seasons/${i.s1}/team-registrations`,
         { team_id: foxes.id, league_id: lg.id, division_id: null });
       return { lg: lg.id, reg: reg.id };
     }, { s1: ids.s1, program: ids.program, club: edit.club });
@@ -627,10 +655,7 @@ async function checkViewport(browser, viewport) {
     // injectCorruptRegistration above), never through a documented v2
     // mutation, then drives the row through Needs assignment end to end.
     const repairFixture = await page.evaluate(async (i) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
+      const F = window.hsFixture;
       // The CORRECT League (repair target) lives in seasonR and is the
       // permanent League of the corrupt row's team (rule 7 — the repair's
       // assign-league only succeeds into the team's own League). The corrupt
@@ -641,12 +666,24 @@ async function checkViewport(browser, viewport) {
       // a DIFFERENT season under the same program proves the repair row's
       // League select is scoped to seasonR — it must offer leagueR but never
       // otherLeagueR.
-      const seasonR = await post("/api/v2/setup/season", { program_id: i.program, name: "Repair Season" });
-      const leagueR = await post("/api/v2/setup/league", { season_id: seasonR.id, name: "Repair League" });
-      const otherSeasonR = await post("/api/v2/setup/season", { program_id: i.program, name: "Repair Season B" });
-      const otherLeagueR = await post("/api/v2/setup/league", { season_id: otherSeasonR.id, name: "Repair League B" });
-      const clubR = await post("/api/v2/setup/club", { name: "Repair Club" });
-      const teamR = await post("/api/v2/setup/team",
+      // #409: the two Season creates are PROGRAM-AXIS; each League is
+      // SEASON-OWNED and lands in a DIFFERENT Season, so the saved Season
+      // moves to the one being written into before each. That distinction is
+      // the point of this fixture — the repair row's League select must be
+      // scoped to seasonR and must never offer otherLeagueR.
+      await F.selectProgram("Program-only for the repair Seasons", i.program);
+      const seasonR = await F.create("Repair Season", "/api/v2/setup/season", { program_id: i.program, name: "Repair Season" });
+      await F.selectProgramSeason("Program + Repair Season", i.program, seasonR.id);
+      const leagueR = await F.create("Repair League", "/api/v2/setup/league", { season_id: seasonR.id, name: "Repair League" });
+      const otherSeasonR = await F.create("Repair Season B", "/api/v2/setup/season", { program_id: i.program, name: "Repair Season B" });
+      await F.selectProgramSeason("Program + Repair Season B", i.program, otherSeasonR.id);
+      const otherLeagueR = await F.create("Repair League B", "/api/v2/setup/league", { season_id: otherSeasonR.id, name: "Repair League B" });
+      // Back to seasonR: Repair Foxes is PROGRAM-AXIS, but leaving the saved
+      // Season on Repair Season B would misstate which Season this fixture
+      // block is building into.
+      await F.selectProgramSeason("Program + Repair Season", i.program, seasonR.id);
+      const clubR = await F.create("clubR", "/api/v2/setup/club", { name: "Repair Club" });
+      const teamR = await F.create("teamR", "/api/v2/setup/team",
         { league_id: leagueR.id, club_id: clubR.id, name: "Repair Foxes" });
       return { seasonR: seasonR.id, leagueR: leagueR.id, otherLeagueR: otherLeagueR.id, teamR: teamR.id };
     }, { program: ids.program });
@@ -732,19 +769,20 @@ async function checkViewport(browser, viewport) {
     // as two DISTINCT, independently addressable rows — never one row's
     // Save/Remove silently acting on the OTHER row's registration.
     const dupFixture = await page.evaluate(async (i) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const home = await post("/api/v2/setup/league", { season_id: i.s1, name: "Timber League" });
-      const stray = await post("/api/v2/setup/league", { season_id: i.s1, name: "Ridge League" });
-      const club = await post("/api/v2/setup/club", { name: "Duplicate Coverage Club" });
-      const team = await post("/api/v2/setup/team",
+      const F = window.hsFixture;
+      // #409: both Leagues and Perma Wolves' registration are SEASON-OWNED
+      // in Season One, and the repair block above left the saved Season on
+      // Repair Season.
+      await F.selectProgramSeason("Program + Season One", i.program, i.s1);
+      const home = await F.create("league Timber", "/api/v2/setup/league", { season_id: i.s1, name: "Timber League" });
+      const stray = await F.create("league Ridge", "/api/v2/setup/league", { season_id: i.s1, name: "Ridge League" });
+      const club = await F.create("club", "/api/v2/setup/club", { name: "Duplicate Coverage Club" });
+      const team = await F.create("team", "/api/v2/setup/team",
         { league_id: home.id, club_id: club.id, name: "Perma Wolves" });
-      const homeReg = await post(`/api/v2/setup/seasons/${i.s1}/team-registrations`,
+      const homeReg = await F.create("homeReg", `/api/v2/setup/seasons/${i.s1}/team-registrations`,
         { team_id: team.id, league_id: home.id, division_id: null });
       return { home: home.id, stray: stray.id, team: team.id, homeReg: homeReg.id };
-    }, { s1: ids.s1 });
+    }, { s1: ids.s1, program: ids.program });
     const strayRegId = injectSecondActiveRegistration(databasePath, {
       seasonId: ids.s1, leagueId: dupFixture.stray, teamId: dupFixture.team,
     });

@@ -92,6 +92,19 @@ class V2SetupContractTest(unittest.TestCase):
         return c
 
     def _v2(self, c, entity, body):
+        # #409: a Season create is PROGRAM-AXIS — it is judged against the
+        # Program the operator CHOSE, and this class shares one store, so the
+        # selection can still be pointing at whichever Program an earlier test
+        # built. Activating the brand-new Program the moment it exists is the
+        # same "you set up what you just made" rule the Season branch below
+        # already encodes, one rung up, and it keeps every create in this class
+        # aimed at exactly the hierarchy it was always aimed at.
+        if entity == "program":
+            status, resp = self._req(c, "POST", "/api/v2/setup/program", body)
+            self.assertEqual(status, 200, (entity, resp))
+            self.assertNotIn("error", resp, (entity, resp))
+            self._req(c, "POST", "/api/context", {"program_id": resp["id"]})
+            return resp
         status, resp = self._req(c, "POST", f"/api/v2/setup/{entity}", body)
         self.assertEqual(status, 200, (entity, resp))
         self.assertNotIn("error", resp, (entity, resp))
@@ -1177,6 +1190,11 @@ class V2SetupContractTest(unittest.TestCase):
         program = self._program(c, {"name": "DivCtx Prog", "country": "US"})
         s1 = self._v2(c, "season", {"program_id": program["id"], "name": "S1"})
         s2 = self._v2(c, "season", {"program_id": program["id"], "name": "S2"})
+        # #409: a League create is SEASON-OWNED (it mints the LeagueSeason
+        # too), so it is judged against the Season the operator CHOSE. Creating
+        # S2 moved the selection there, so move back to S1 — the Season this
+        # League is actually being bound into — before creating it.
+        self._select(c, program["id"], s1["id"])
         league = self._v2(c, "league", {"season_id": s1["id"], "name": "Shared"})
         self.srv.STATE.api.setup.create_league_season(
             league["id"], s2["id"], actor_id="fixture")
@@ -1185,6 +1203,11 @@ class V2SetupContractTest(unittest.TestCase):
     def test_v2_division_season_id_persists_exact_binding(self):
         c = self._admin()
         program, s1, s2, league = self._two_season_league_http(c)
+        # #409: a Division create is SEASON-OWNED, so the Season it is being
+        # bound into must be the one the operator CHOSE. The request under
+        # test names S2 explicitly, so select S2 — the exact binding this test
+        # pins is unchanged.
+        self._select(c, program["id"], s2["id"])
         status, div = self._req(
             c, "POST", "/api/v2/setup/division",
             {"league_id": league["id"], "name": "Gold", "season_id": s2["id"]})
@@ -1213,9 +1236,22 @@ class V2SetupContractTest(unittest.TestCase):
             c, "POST", "/api/v2/setup/division",
             {"league_id": league["id"], "name": "Gold",
              "season_id": other_season["id"]})
-        self.assertEqual(status, 400, resp)
-        self.assertEqual(resp["error"]["details"]["reason"],
-                         "league_season_program_mismatch", resp)
+        # #409: the request names a League in one Program and a Season in
+        # ANOTHER, so no saved selection can satisfy both — whichever the
+        # operator chose, one named parent lies outside it. The transport
+        # therefore refuses GENERICALLY, byte-identical to a nonexistent id,
+        # BEFORE the domain validation runs. That is strictly less disclosing
+        # than the reason code this route used to emit (which named the
+        # cross-Program relationship outright), and it is not a relaxation:
+        # the domain rule is unchanged and is asserted directly below, at the
+        # layer that owns it.
+        self.assertEqual(status, 404, resp)
+        self.assertEqual(resp["error"]["code"], "not_found", resp)
+        facade = self.srv.STATE.api.create_division_v2(
+            league["id"], "Gold", "", "fixture",
+            season_id=other_season["id"])
+        self.assertEqual(facade["error"]["details"]["reason"],
+                         "league_season_program_mismatch", facade)
 
     def test_v2_division_season_not_bound_fails_closed(self):
         c = self._admin()
@@ -1231,6 +1267,8 @@ class V2SetupContractTest(unittest.TestCase):
     def test_v2_division_archived_season_fails_closed(self):
         c = self._admin()
         program, s1, s2, league = self._two_season_league_http(c)
+        # #409: archive is a guarded mutation on S2, so select S2 first.
+        self._select(c, program["id"], s2["id"])
         status, _ = self._req(
             c, "POST", f"/api/v2/setup/seasons/{s2['id']}/archive",
             {"reason": "done"})
@@ -1326,12 +1364,28 @@ class V2SetupContractTest(unittest.TestCase):
                               {"program_id": other_program["id"], "name": "S2"})
         other_league = self._v2(c, "league",
                               {"season_id": other_season["id"], "name": "OL"})
+        # #409: building the foreign Program moved this session's selection
+        # there. The registration under test belongs to `env`'s Season, so
+        # select that Season back before making it — otherwise the request
+        # stops at the context gate and never reaches the cross-Program League
+        # validation this test exists to pin.
+        self._select(c, env["program"]["id"], env["season"]["id"])
         status, resp = self._req(
             c, "POST",
             f"/api/v2/setup/seasons/{env['season']['id']}/team-registrations",
             {"team_id": env["team_a"]["id"], "league_id": other_league["id"]})
-        self.assertEqual(status, 400, resp)
-        self.assertEqual(resp["error"]["code"], "validation_error", resp)
+        # #409: the Season is in one Program and the League in another, so no
+        # saved selection can satisfy both named parents and the transport
+        # refuses GENERICALLY before the LeagueSeason invariant is evaluated —
+        # strictly less disclosing than the validation_error this used to
+        # return. The invariant itself is unchanged and is asserted directly
+        # on the facade below, so nothing checked here stopped being checked.
+        self.assertEqual(status, 404, resp)
+        self.assertEqual(resp["error"]["code"], "not_found", resp)
+        facade = self.srv.STATE.api.register_team_for_season(
+            env["season"]["id"], env["team_a"]["id"], None, "fixture",
+            league_id=other_league["id"])
+        self.assertEqual(facade["error"]["code"], "validation_error", facade)
 
     def _playable(self, c):
         """A full canonical hierarchy + a bookable game ice slot (no regs yet)."""

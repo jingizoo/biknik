@@ -39,6 +39,7 @@ const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
+const { installContextFixture } = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -160,43 +161,52 @@ async function checkViewport(browser, viewport) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
 
     const ids = await page.evaluate(async (day) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const league = await post("/api/setup/league", { name: "Turnaround Program" });
-      const season = await post("/api/setup/season",
+      const F = window.hsFixture;
+      // #409 EXPLICIT SELECTION on the V1 SURFACE. The route family differs;
+      // the axis rule does not. `POST /api/setup/league` mints the PROGRAM
+      // (v1 calls it "league") and `POST /api/setup/season` is a PROGRAM-AXIS
+      // create comparing the body's `league_id` (server.py:3686), guarded by
+      // the same `setup_create_context_error` preflight v2 uses
+      // (server.py:1160). Minting the Program is not selecting it.
+      const league = await F.create("v1 league (the Program)", "/api/setup/league", { name: "Turnaround Program" });
+      await F.selectProgram("Program-only bootstrap", league.id);
+      const season = await F.create("season", "/api/setup/season",
                                 { league_id: league.id, name: "Fall 2026" });
-      const level = await post("/api/setup/level",
+      // The v1 "level" IS the v2 League; it, the Divisions, the registrations
+      // and the venue-access grant are all SEASON-OWNED and land in THIS
+      // Season, so both axes are persisted before them.
+      await F.selectProgramSeason("Program+Season", league.id, season.id);
+      const level = await F.create("level (the v2 League)", "/api/setup/level",
                                { season_id: season.id, name: "Turnaround League" });
-      const div = await post("/api/setup/division", {
+      const div = await F.create("div", "/api/setup/division", {
         season_id: season.id, level_id: level.id, name: "TurnNorth" });
-      const club = await post("/api/setup/club", { name: "Club" });
+      const club = await F.create("club", "/api/setup/club", { name: "Club" });
       const teams = [];
       for (const name of ["Turn Home", "Turn Away"]) {
-        const t = await post("/api/v2/setup/team",
+        const t = await F.create("t", "/api/v2/setup/team",
                              { club_id: club.id, league_id: level.id, name });
-        await post(`/api/setup/seasons/${season.id}/team-registrations`,
+        await F.call("team-registrations", `/api/setup/seasons/${season.id}/team-registrations`,
                    { team_id: t.id, division_id: div.id });
         teams.push(t.id);
       }
-      const venue = await post("/api/setup/venue",
+      const venue = await F.create("venue", "/api/setup/venue",
                                { name: "Arena", league_id: league.id });
       // Without an active SeasonVenueAccess grant the league-scoped scheduler
       // filters out every slot as "not assigned to this season".
-      await post(`/api/v2/setup/seasons/${season.id}/venue-access`,
+      await F.call("season venue-access grant", `/api/v2/setup/seasons/${season.id}/venue-access`,
                  { venue_id: venue.id });
-      const rink = await post("/api/setup/rink",
+      const rink = await F.create("rink", "/api/setup/rink",
                               { venue_id: venue.id, name: "Rink 1" });
-      const slot = async (from, to) => (await post("/api/setup/ice-slot", {
+      const slot = async (from, to) => (await F.create("ice-slot", "/api/setup/ice-slot", {
         rink_id: rink.id, start_time: `${day}T${from}:00+00:00`,
         end_time: `${day}T${to}:00+00:00`, slot_type: "game",
       })).id;
       // The issue's own example: a 2:00-3:30 pm game, already on the ice.
       const priorSlot = await slot("14:00", "15:30");
-      const prior = await post("/api/v2/setup/game", {
+      const prior = await F.create("prior", "/api/v2/setup/game", {
         season_id: season.id, division_id: div.id, league_id: level.id,
         home_team_id: teams[0], away_team_id: teams[1],
         ice_slot_id: priorSlot, game_type: "regular",

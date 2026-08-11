@@ -45,6 +45,16 @@ class ActorAttributionHttpTest(unittest.TestCase):
         opener = self._client()
         self._req(opener, "POST", "/api/auth/login",
                   {"username": username, "password": password})
+        # #409: the ice-slot and game CREATES below are guarded, so they need
+        # a context the operator CHOSE rather than the read-only fallback.
+        # Persist byte-for-byte the tuple this session already resolves, so
+        # every record these fixtures build is the one they always built.
+        status, ctx = self._req(opener, "GET", "/api/context")
+        if status == 200 and ctx.get("program_id"):
+            self._req(opener, "POST", "/api/context",
+                      {"program_id": ctx.get("program_id"),
+                       "season_id": ctx.get("season_id"),
+                       "league_id": ctx.get("league_id")})
         return opener
 
     def _req(self, opener, method, path, body=None):

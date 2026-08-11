@@ -432,6 +432,197 @@ async function getJSON(p) {
     return networkErrorResult();
   }
 }
+
+// ===== THE CONTEXT-SCOPED READ SETTLEMENT BARRIER (#409, CI shard 1) ======
+//
+// THE DEFECT, as CI reproduced it at 390px and nowhere else:
+//
+//     GET /api/v2/setup/seasons/season_3/venue-candidates -> 404
+//
+// THE SERVER IS CORRECT. Under #369's ruling `/venue-access` and
+// `/venue-candidates` answer only for the EXACTLY-persisted selected Season;
+// a sibling Season of the same Program is refused with the same generic
+// not-found as a foreign one. Nothing about that ceiling may be weakened, and
+// nothing here does.
+//
+// The defect is on THIS side. render()'s Setup pass dispatches those two reads
+// for the Season that is selected AT DISPATCH TIME. setActiveContext() then
+// invalidates generations (contextRevision, contextSwitchSeq,
+// iceOperationSeq/importOperationSeq) and POSTs the new context -- but it does
+// not CANCEL the reads already on the wire. If the POST commits first, an
+// already-dispatched read for the departing Season arrives at a server whose
+// persisted selection has moved, and is answered 404. The `contextRevision !==
+// myRenderContext` guards after each await are DISCARD-AFTER-ARRIVAL: they stop
+// the stale body from being believed, which is a different and strictly later
+// property than stopping the request from failing. By the time a guard runs,
+// the 404 has already been served and Chromium has already written its own
+// "Failed to load resource" console error -- and a browser journey that fails
+// on console errors is right to fail on it, because an operator's devtools
+// shows the same line.
+//
+// AN AbortController ALONE IS NOT THE FIX, and this is the owner's constraint
+// rather than a stylistic preference: aborting client-side does not UN-SEND a
+// request the server has already received. Abort, POST immediately, and the
+// server can still be part-way through the old read when the new context
+// lands -- it processes it, it 404s, and the only thing that changed is that
+// nobody was listening. So the switch takes a real SETTLEMENT BARRIER:
+//
+//     CANCEL the outstanding scoped reads
+//       -> AWAIT THEIR FULL SETTLEMENT (abort delivered, or body fully drained)
+//       -> only THEN POST the new context.
+//
+// The ordering is what makes it sound. While the barrier waits, the persisted
+// selection is STILL THE OLD ONE, so a read that wins the race against its own
+// abort is answered 200 by the exact ceiling that would have 404'd it a moment
+// later; a read that loses is aborted, its connection is torn down, and it
+// never becomes a response this page can observe.
+//
+// WHAT THIS DOES *NOT* CLAIM, stated plainly because the overstated version is
+// tempting and false. The barrier does NOT prove the SERVER has finished with a
+// read it already received. Nothing on this side can: HTTP gives the client no
+// way to learn that a cancelled request's server-side work has ended, so a read
+// that reached the server microseconds before the abort may still be executing
+// when the POST lands, and may still be answered 404 into a closed connection.
+// That residue is unobservable and harmless -- no response is delivered, no
+// `contextRevision` guard is consulted, no venue map is touched, and Chromium
+// writes no console line, because the request was cancelled rather than
+// answered. What the barrier DOES guarantee is the whole of what CI measures
+// and the whole of what an operator sees: the switch never publishes a new
+// selection while a scoped read of the old one is still live on this client, so
+// no old-tuple read can ARRIVE as a 404, and every cancellation is recorded as
+// an intentional one. Closing the remaining server-side window would take a
+// server-side change -- and #369's ceiling, which is the thing being protected,
+// is explicitly not to be touched.
+//
+// SETTLEMENT MEANS THE BODY IS DRAINED, not that headers arrived. A fetch whose
+// response stream is never read stays open until something else cancels it, and
+// Chromium reports that later cancellation as net::ERR_ABORTED on the request
+// -- a failed delivery the journey would then have to explain. readApiResponse()
+// consumes the whole body, so the settlement promise below resolves only after
+// there is nothing left on the wire.
+//
+// AN INTENTIONAL CANCELLATION IS NOT A FAILED DELIVERY, and the two are kept
+// distinguishable at both levels a reviewer can check:
+//   * IN THE APP -- an aborted read resolves to CONTEXT_READ_ABORTED, a shape
+//     with `aborted: true` and NO `error` key. It is not networkErrorResult():
+//     "we called this off" and "we could not reach the server" are different
+//     facts, and only the second is worth telling an operator about. Callers
+//     that reach their next `contextRevision` guard return before touching it.
+//   * ON THE WIRE -- Chromium raises net::ERR_ABORTED for the cancelled
+//     request, and Playwright surfaces it as `requestfailed`. So every abort is
+//     recorded here, with method/URL/generation, in a ledger the page exposes.
+//     e2e/context-switch-read-settlement.js reconciles its own requestfailed
+//     ledger against THIS one entry by entry, so an intentional abort is
+//     explained by the app's own statement of intent and any OTHER failed
+//     delivery remains unexplained and fails the journey.
+// Frozen and shared: it is a SENTINEL, so `result === CONTEXT_READ_ABORTED` is
+// a legitimate test, and a caller must never be able to mutate the value every
+// other cancelled read will also receive.
+const CONTEXT_READ_ABORTED = Object.freeze({ aborted: true });
+// Bumped by every cancellation, so a read can tell "my generation is still the
+// current one" from "the tuple moved while I was in flight" without consulting
+// contextRevision (which other, non-network concerns also bump).
+let contextScopedReadGeneration = 0;
+// One AbortController per generation, created lazily by the first read of that
+// generation and dropped at the cancellation that ends it.
+let contextScopedReadController = null;
+// The reads not yet settled. Each entry holds a promise that resolves when its
+// fetch has finished one way or the other -- delivered and drained, aborted, or
+// failed.
+const contextScopedReadsInFlight = new Set();
+// The app's own statement of intent, read by the regression journey.
+const contextScopedReadAborts = [];   // {method, url, generation, at}
+
+function contextScopedReadSignal() {
+  if (!contextScopedReadController) {
+    contextScopedReadController = new AbortController();
+  }
+  return contextScopedReadController.signal;
+}
+
+// A GET whose answer is only meaningful under the CURRENTLY PERSISTED context
+// tuple -- today the two exact-selection-ceilinged Season reads. Same transport
+// and same `{error:{...}}` normalization as getJSON(), plus enrolment in the
+// barrier above.
+async function getJSONContextScoped(p) {
+  const generation = contextScopedReadGeneration;
+  const signal = contextScopedReadSignal();
+  let markSettled;
+  const entry = { url: p, generation,
+                  settled: new Promise((r) => { markSettled = r; }) };
+  contextScopedReadsInFlight.add(entry);
+  // `dispatched` separates the two shapes an abort can take, because they leave
+  // DIFFERENT traces on the wire and the journey reconciles against the wire:
+  //   true  -- cancelled after dispatch, so Chromium raises net::ERR_ABORTED
+  //            and Playwright records exactly one `requestfailed` for this URL.
+  //            This is the shape every cancellation takes today.
+  //   false -- never dispatched at all, so there is no request and nothing for
+  //            Chromium to report. UNREACHABLE BY CONSTRUCTION as this file
+  //            stands, and recorded honestly as such rather than described as
+  //            something that happens: cancelContextScopedReads() drops the
+  //            controller, so the next read always opens a fresh, un-aborted
+  //            one and the guard below cannot fire. It is kept because it is
+  //            the correct answer if the controller ever outlives a
+  //            cancellation, and because a silently-dispatched read would be
+  //            the one failure mode this whole barrier exists to prevent.
+  const abortedResult = (dispatched) => {
+    contextScopedReadAborts.push({ method: "GET", url: p, generation,
+                                   dispatched, at: Date.now() });
+    return CONTEXT_READ_ABORTED;
+  };
+  try {
+    // Defensive, and currently unreachable -- see `dispatched` above. If a
+    // cancellation ever could reach a read before its fetch, this is the only
+    // correct answer: do not dispatch it, so the server never sees a request
+    // the ceiling would have to refuse.
+    if (signal.aborted) return abortedResult(false);
+    const response = await fetch(p, { credentials: "same-origin", signal });
+    // Drains the body -- see SETTLEMENT MEANS THE BODY IS DRAINED above.
+    const body = await readApiResponse(response);
+    // Delivered in full, but the tuple moved while it was arriving. The body
+    // describes a context the operator has left, so it is refused HERE as well
+    // as at the caller's own generation guard: a scoped read must never be able
+    // to answer for a context it did not name.
+    //
+    // Reached rather than the catch below when the abort landed DURING the body
+    // read: readApiResponse() swallows its own `r.text()` rejection by design
+    // (a 502 HTML page must not throw), so a torn body comes back as an
+    // ordinary-looking value. The generation, not the exception, is what makes
+    // it an abort.
+    if (generation !== contextScopedReadGeneration) return abortedResult(true);
+    return body;
+  } catch (e) {
+    if (signal.aborted || (e && e.name === "AbortError")) return abortedResult(true);
+    return networkErrorResult();
+  } finally {
+    contextScopedReadsInFlight.delete(entry);
+    markSettled();
+  }
+}
+
+// Step one of the barrier. SYNCHRONOUS, and called at setActiveContext()'s own
+// synchronous prologue alongside the other invalidations -- a switch that only
+// QUEUES behind an in-flight one must still cancel, because its predecessor's
+// POST is what will move the server and the queued call never reaches one of
+// its own.
+function cancelContextScopedReads() {
+  contextScopedReadGeneration += 1;
+  if (contextScopedReadController) contextScopedReadController.abort();
+  // Dropped rather than reused: the next read opens a fresh controller for the
+  // new generation, so a cancellation can never reach across into it.
+  contextScopedReadController = null;
+}
+
+// Step two. Resolves once no scoped read is outstanding. Looped rather than a
+// single Promise.all: a read's own continuation can enrol another before the
+// first `await` returns, and a barrier that sampled the set once could let that
+// successor slip past it onto the wire beside the POST.
+async function awaitContextScopedReadSettlement() {
+  while (contextScopedReadsInFlight.size) {
+    await Promise.all(
+      Array.from(contextScopedReadsInFlight, (entry) => entry.settled));
+  }
+}
 async function post(p, b) {
   // Reset first: an explicit success message the caller sets after a clean
   // response (the common `if (r && !r.error) toast = "..."` pattern) always
@@ -10317,7 +10508,18 @@ async function render() {
           if (s.id === selectedSeasonId) {
             // Allowed venues (#233 Slice E): which Venues this Season may use
             // for game ice, independent of any Venue-Program ownership.
-            const va = await getJSON(`/api/v2/setup/seasons/${s.id}/venue-access`);
+            //
+            // getJSONContextScoped, not getJSON, and this is the whole of the
+            // #409/CI-shard-1 fix's call-site surface. These two reads are the
+            // ONLY ones ceilinged to the EXACTLY-persisted selected Season, so
+            // they are the only ones a context switch can turn into a 404 in
+            // flight. Enrolling them in the barrier makes setActiveContext()
+            // cancel them and WAIT for their settlement before its POST moves
+            // the persisted selection. The generation guard on the next line
+            // stays exactly as it was: it is a discard-after-arrival check and
+            // was never the thing that stopped the request.
+            const va = await getJSONContextScoped(
+              `/api/v2/setup/seasons/${s.id}/venue-access`);
             if (contextRevision !== myRenderContext) return;  // superseded
             seasonVenueAccess[s.id] = (va && va.venue_access) || [];
             // Grant CANDIDATES for this Season (#369 review): its own
@@ -10332,7 +10534,9 @@ async function render() {
             // request is issued, so the archived surface can render no picker
             // even by accident.
             if (!selectionIsReadOnly) {
-              const vc = await getJSON(
+              // Scoped for the same reason as venue-access above -- and this is
+              // the exact request CI shard 1 recorded 404ing at 390px.
+              const vc = await getJSONContextScoped(
                 `/api/v2/setup/seasons/${s.id}/venue-candidates`);
               if (contextRevision !== myRenderContext) return;  // superseded
               seasonVenueCandidates[s.id] = (vc && vc.candidates) || [];
@@ -13203,6 +13407,16 @@ async function setActiveContext(programId, seasonId, leagueId) {
   // would otherwise not reach any cancellation at all until its predecessor
   // settled.
   abandonFocusWorkForContextSwitch();
+  // STEP ONE OF THE SETTLEMENT BARRIER, and synchronous for the same reason
+  // the invalidations above are: from this instant every context-scoped read
+  // already on the wire is cancelled, and one that has not reached the network
+  // yet will never be dispatched at all. Placed BEFORE the early return so a
+  // switch that merely QUEUES still cancels -- the queued intent sends no POST
+  // of its own, but its predecessor's POST is what moves the server, and a read
+  // left running across it is exactly the request the ceiling would 404.
+  // Only the AWAIT (step two, in sendContextSwitch) is deferred to the sender,
+  // because only the sender has a POST to hold back.
+  cancelContextScopedReads();
   if (contextSwitchInFlight) {
     contextSwitchQueued = { programId, seasonId, leagueId, mySeq };
     return;
@@ -13210,9 +13424,33 @@ async function setActiveContext(programId, seasonId, leagueId) {
   await sendContextSwitch(mySeq, programId, seasonId, leagueId);
 }
 async function sendContextSwitch(mySeq, programId, seasonId, leagueId) {
+  // Claimed SYNCHRONOUSLY, before the barrier's await below: a second switch
+  // arriving while we wait for settlement must QUEUE, not open a second POST
+  // beside this one. #331 round 9's "at most one /api/context POST in flight"
+  // invariant is what makes the server's last-write-wins equal last-intent-wins,
+  // and the barrier must not punch a hole in it.
   contextSwitchInFlight = true;
+  // STEP TWO OF THE SETTLEMENT BARRIER. The cancellation is already done (see
+  // setActiveContext's prologue); this waits for those reads to be FULLY
+  // settled -- abort delivered, or response delivered and its body drained --
+  // before the POST that moves the persisted selection is allowed out.
+  //
+  // This await is the whole fix. An abort does not un-send a request the server
+  // already holds, so cancelling and POSTing in the same turn still lets the
+  // server answer an old-tuple read against a NEW persisted selection and 404
+  // it. Waiting here keeps the old selection persisted for as long as any
+  // scoped read can still be in the server's hands, so such a read is answered
+  // 200 by the very ceiling that would otherwise have refused it -- or is
+  // aborted and never becomes a response at all.
+  //
+  // It cannot deadlock on a scoped read that is itself waiting on this POST:
+  // scoped reads are GETs issued by render(), never by the switch pipeline, and
+  // cancelContextScopedReads() has already signalled every one of them.
+  await awaitContextScopedReadSettlement();
   // #369: publish the intent to the hash BEFORE the server can act on it, so
   // the hash never lags an already-mutated server. See writeContextHash().
+  // Still immediately before the POST -- the barrier above sits on the far side
+  // of it, so the hash cannot lead the server by any longer than it used to.
   writeContextHash(encodeContextHash(programId, seasonId || null, leagueId || null));
   contextHashIntentPending = true;
   const r = await post("/api/context",
@@ -13276,6 +13514,14 @@ async function sendContextSwitch(mySeq, programId, seasonId, leagueId) {
   if (contextOptions) {
     contextOptions.selected = { program_id: r.program_id,
       season_id: r.season_id, league_id: r.league_id, read_only: !!r.read_only };
+    // `saved` moves with it (#411), and from the SAME echo. This response is
+    // set_active_context's own -- the code path that WROTE the row -- so the
+    // echo is a direct statement of what is now persisted, not a guess. Leaving
+    // it on the pre-POST value would leave the switcher offering to select a
+    // Program that had just been selected, for the length of the options
+    // refetch below.
+    contextOptions.saved = { program_id: r.program_id,
+      season_id: r.season_id, league_id: r.league_id };
   }
   // Second bump (#331 review round 8): the FIRST bump above only made the
   // PRIOR selection's mutations uncommittable at intent time, before
@@ -13368,17 +13614,32 @@ function renderContextSwitcher() {
   const select = document.getElementById("ctx-select");
   const chip = document.getElementById("ctx-static");
   const roBadge = document.getElementById("ctx-ro");
+  const confirmBtn = document.getElementById("ctx-confirm");
   if (!wrap || !select || !chip || !roBadge) return;
   const opts = contextOptions;
   const show = !!(currentUser && opts && opts.programs && opts.programs.length);
   wrap.hidden = !show;
-  if (!show) { renderLeagueSelect(null, null); return; }
+  if (!show) {
+    if (confirmBtn) confirmBtn.hidden = true;
+    renderLeagueSelect(null, null);
+    return;
+  }
   const { entries, multi } = contextEntries(opts);
   const sel = opts.selected || {};
   const curValue = (sel.program_id || "") + "|" + (sel.season_id || "");
   const curEntry = entries.find((e) => e.value === curValue) || null;
   // Read-only badge is a persistent, always-visible reflection of the selection.
   roBadge.hidden = !(curEntry && curEntry.readOnly);
+  // THE PERSISTED tuple, which is a DIFFERENT fact from `selected` above and
+  // must never be derived from it (#411). `selected` is what the operator is
+  // being SHOWN and may have been invented by the backend's fallback resolver;
+  // `saved` is what they have CHOSEN, and is the only thing a create/mutation
+  // gate honours. On a one-Program install the two carry equal values while
+  // nothing is persisted at all, so comparing values inside `selected` could
+  // never tell them apart -- the server reports them separately for exactly
+  // this reason.
+  const saved = (opts && opts.saved) || {};
+  const savedValue = (saved.program_id || "") + "|" + (saved.season_id || "");
   const single = entries.length <= 1;
   if (single) {
     select.hidden = true; chip.hidden = false;
@@ -13388,8 +13649,40 @@ function renderContextSwitcher() {
     // Omitting it left every seasonless single-Program account with the
     // indistinguishable label "Program overview (no season)".
     chip.textContent = `${e.programName} · ${e.label}`;
+    // THE FIRST-RUN BOOTSTRAP CONTROL (#411). One Program and no Seasons is the
+    // one state with nothing to choose BETWEEN, so the switcher collapsed to a
+    // label -- and with it went the only control wired to setActiveContext(),
+    // leaving an operator who must "select a Program before creating records in
+    // it" no way to select one. The chip stays a label; this button beside it
+    // is the missing act.
+    //
+    // It is painted from `saved`, NOT from `selected`: rendering it against the
+    // fallback-resolved selection would hide it precisely when it is needed,
+    // because that resolver names this Program whether or not anything is
+    // persisted. And it only ever OFFERS the act -- renderContextSwitcher()
+    // runs on every render and must never itself persist anything, or the
+    // fallback would be laundered into a real selection and #409's whole
+    // distinction would be undone from the client side.
+    if (confirmBtn) {
+      const chosen = savedValue === e.value;
+      confirmBtn.hidden = chosen;
+      confirmBtn.dataset.ctxProgram = e.programId;
+      confirmBtn.dataset.ctxSeason = e.seasonId || "";
+      confirmBtn.dataset.ctxProgramName = e.programName;
+      confirmBtn.textContent = `Select ${e.programName}`;
+      // The visible text is a PREFIX of the accessible name (WCAG 2.5.3), so
+      // speech input still matches what a sighted user reads aloud while an AT
+      // user hears why the button exists.
+      confirmBtn.setAttribute("aria-label",
+        `Select ${e.programName} as your active Program`
+        + " — required before creating records in it");
+    }
   } else {
     chip.hidden = true; select.hidden = false;
+    // Only the collapsed state loses its control; wherever the <select> renders
+    // it IS the explicit act, and a second control saying the same thing would
+    // just be a second way to do it.
+    if (confirmBtn) confirmBtn.hidden = true;
     const optionTag = (e) => `<option value="${esc(e.value)}"`
       + `${e.value === curValue ? " selected" : ""}>${esc(e.label)}</option>`;
     if (multi) {
@@ -13479,6 +13772,43 @@ if (ctxLeagueSelect) ctxLeagueSelect.onchange = (e) => {
   // snaps both selects back to the true persisted state, so no client-side
   // guess at which Seasons a League is bound to is needed.
   setActiveContext(sel.program_id, sel.season_id || null, e.target.value || null);
+};
+// THE EXPLICIT SINGLE-PROGRAM SELECTION (#411) — the third and last thing wired
+// to setActiveContext(), and the only one reachable when the switcher has
+// collapsed to a chip. A native <button>, so Enter and Space activate it
+// through the browser's own semantics; there is no keydown handler here and
+// none is wanted.
+//
+// Wired ONCE, here, beside the two selects, rather than rebound inside
+// renderContextSwitcher(): a handler attached during a render is a handler that
+// exists because of a render, and the whole point of this control is that
+// rendering never persists anything -- only this activation does.
+const ctxConfirm = document.getElementById("ctx-confirm");
+if (ctxConfirm) ctxConfirm.onclick = async () => {
+  const p = ctxConfirm.dataset.ctxProgram || "";
+  if (!p) return;
+  const s = ctxConfirm.dataset.ctxSeason || "";
+  const name = ctxConfirm.dataset.ctxProgramName || "";
+  // No League: this is the FIRST selection on an install that has none yet, and
+  // an omitted League is `null` here for the same reason it is everywhere else
+  // in this file -- never "keep whatever was active".
+  await setActiveContext(p, s || null, null);
+  // Everything below is confirmation, and all of it is conditional on the
+  // selection having actually landed. setActiveContext() returns early when it
+  // queues behind an in-flight switch, and a refused one leaves its own error
+  // toast standing -- neither may be overwritten with a success sentence.
+  const savedNow = (contextOptions && contextOptions.saved) || {};
+  if ((savedNow.program_id || null) !== p) return;
+  // The button has just hidden itself (the selection it offered is now saved),
+  // so focus would fall to <body>. Move it to the chip, which is the surviving
+  // statement of the same fact, and say once what happened. #toast-root is the
+  // one sitewide polite region -- see announceCardStatus() -- so this is spoken
+  // exactly once, after the switch's own render() cleared the region.
+  const chip = document.getElementById("ctx-static");
+  if (chip && !chip.hidden) chip.focus();
+  toast = name ? `Now working in ${name}.` : "Program selected.";
+  toastIsError = false;
+  updateToast();
 };
 
 // Sign out ends the server session and returns to the sign-in screen (#71).

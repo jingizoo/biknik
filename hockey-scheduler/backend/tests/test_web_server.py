@@ -65,6 +65,46 @@ def _request_signed_in(method, path, body=None):
         return e.code, (json.loads(raw) if raw else None)
 
 
+def _request_selected(method, path, body=None):
+    """Like ``_request_signed_in``, but the session also PERSISTS the context
+    it already resolves (#409).
+
+    A guarded CREATE is authorized against the Program/Season the operator
+    CHOSE, and an ``X-Demo-Role`` caller has no account to persist a choice
+    against. The tuple persisted here is byte-for-byte the one the fallback was
+    already handing this session, so the record built below is exactly the one
+    this test always built."""
+    url = f"http://{HOST}:{PORT}/api/auth/login"
+    data = json.dumps({"username": "admin", "password": "demo"}).encode()
+    req = urllib.request.Request(url, data=data, method="POST",
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req) as resp:
+        cookie = resp.headers.get("Set-Cookie", "").split(";", 1)[0]
+
+    def _call(m, p, b=None):
+        u = f"http://{HOST}:{PORT}{p}"
+        d = json.dumps(b).encode() if b is not None else None
+        r = urllib.request.Request(u, data=d, method=m,
+                                   headers={"Cookie": cookie})
+        if d is not None:
+            r.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(r) as resp:
+                raw = resp.read()
+                return resp.status, (json.loads(raw) if raw else None)
+        except urllib.error.HTTPError as e:
+            raw = e.read()
+            return e.code, (json.loads(raw) if raw else None)
+
+    _status, ctx = _call("GET", "/api/context")
+    if isinstance(ctx, dict) and ctx.get("program_id"):
+        _call("POST", "/api/context",
+              {"program_id": ctx.get("program_id"),
+               "season_id": ctx.get("season_id"),
+               "league_id": ctx.get("league_id")})
+    return _call(method, path, body)
+
+
 def setUpModule():
     global PORT, _HTTPD, _THREAD
     _HTTPD = ThreadingHTTPServer((HOST, 0), web.Handler)
@@ -143,7 +183,7 @@ class WebServerTest(unittest.TestCase):
         slot = next(s for s in ov["ice_slots"] if s["status"] == "available")
         u16_div = next(d for d in ov["divisions"] if d["name"] == "U16 Elite")
         u16 = [r for r in ov["registrations"] if r["division_id"] == u16_div["id"]]
-        status, game = _request("POST", "/api/setup/game", {
+        status, game = _request_selected("POST", "/api/setup/game", {
             "season_id": u16_div["season_id"],
             "division_id": u16_div["id"],
             "home_team_id": u16[0]["team_id"], "away_team_id": u16[1]["team_id"],

@@ -22,6 +22,9 @@ const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
+const {
+  installContextFixture, selectProgram, selectProgramSeason,
+} = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -97,6 +100,7 @@ async function checkViewport(browser, viewport) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
     // This journey books ice and then reads it back off the Arena Calendar's
     // DEFAULT day, without navigating — so the day it books on must be the day
     // the calendar opens on. That used to be the literal "2026-09-05", which
@@ -114,8 +118,20 @@ async function checkViewport(browser, viewport) {
       { "f-org": "Allowed Venues Org" }, "/api/v2/setup/organization");
     const program = await createViaDrawer("league",
       { "f-league": "Allowed Venues Program", "f-league-org": org.id }, "/api/v2/setup/program");
+    // THE EXPLICIT SELECTION (#409), boundary 1 — Program-only. Minting the
+    // Program above does not select it, and the Season drawer below is a
+    // PROGRAM-AXIS create, as are the Team, Venue, Rink and Ice-slot drawers
+    // further down. ./context-fixture.js carries the axis table and explains
+    // why the selection is proved by the write echo rather than by a GET the
+    // fallback resolver can satisfy on its own.
+    await selectProgram(page, `[${viewport.label}] Program-only bootstrap`, program.id);
     const season = await createViaDrawer("season",
       { "f-season-league": program.id, "f-season": "2026-27" }, "/api/v2/setup/season");
+    // BOUNDARY 2 — Program+Season. The League ("level"), Division, the three
+    // team registrations and the Season venue-access grant are all
+    // SEASON-OWNED, and every one of them writes into THIS Season.
+    await selectProgramSeason(page, `[${viewport.label}] Program+Season`,
+      program.id, season.id);
     const league = await createViaDrawer("level",
       { "f-level-season": season.id, "f-level": "Adult League" }, "/api/v2/setup/league");
     const division = await createViaDrawer("division",
@@ -151,16 +167,20 @@ async function checkViewport(browser, viewport) {
     // Team-registration creation is Season participation's own already-proven
     // UI (Slice B2b) — out of THIS regression's scope, so built via raw fetch
     // like every other journey's non-target prerequisites.
+    // Each registration is ASSERTED (#409 review round). The bare `post()` that
+    // stood here decoded the body and dropped the status, so all three could be
+    // refused in silence and the failure would surface much later as a
+    // scheduler draft that had no registered teams to place — blaming the
+    // scheduler for a prerequisite that was never allowed to exist.
     await page.evaluate(async (i) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      await post(`/api/v2/setup/seasons/${i.season}/team-registrations`,
+      await window.hsFixture.create("registration for Team One",
+        `/api/v2/setup/seasons/${i.season}/team-registrations`,
         { team_id: i.team1, league_id: i.league, division_id: i.division });
-      await post(`/api/v2/setup/seasons/${i.season}/team-registrations`,
+      await window.hsFixture.create("registration for Team Two",
+        `/api/v2/setup/seasons/${i.season}/team-registrations`,
         { team_id: i.team2, league_id: i.league, division_id: i.division });
-      await post(`/api/v2/setup/seasons/${i.season}/team-registrations`,
+      await window.hsFixture.create("registration for Team Three",
+        `/api/v2/setup/seasons/${i.season}/team-registrations`,
         { team_id: i.team3, league_id: i.league, division_id: i.division });
     }, { season: season.id, league: league.id, division: division.id,
          team1: team1.id, team2: team2.id, team3: team3.id });

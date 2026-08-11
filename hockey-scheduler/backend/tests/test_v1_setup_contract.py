@@ -153,8 +153,14 @@ class V1SetupContractTest(unittest.TestCase):
         self.assertNotIn("operator_organization_id", league)
 
         # season: response league_id (the Program id), NOT program_id.
+        # #409: a Season CREATE is PROGRAM-AXIS, so select the Program this
+        # test just built before creating into it; a League/Division create is
+        # SEASON-OWNED, so select the Season the moment it exists. Both are the
+        # selections this file already makes further down, one step earlier.
+        self._select(c, league["id"])
         season = self._create(c, "season",
                               {"league_id": league["id"], "name": "Fall 2026"})
+        self._select(c, league["id"], season["id"])
         self.assertEqual(set(season), SEASON_KEYS, season)
         self.assertEqual(season["league_id"], league["id"])
         self.assertNotIn("program_id", season)
@@ -359,8 +365,10 @@ class V1SetupContractTest(unittest.TestCase):
         org = self._create(c, "organization", {"name": "H Org", "short_name": "HOG"})
         league = self._create(c, "league",
                               {"name": "H Prog", "organization_id": org["id"]})
+        self._select(c, league["id"])
         season = self._create(c, "season",
                               {"league_id": league["id"], "name": "H S"})
+        self._select(c, league["id"], season["id"])
         level = self._create(c, "level", {"season_id": season["id"], "name": "H L"})
         self._create(c, "division",
                      {"season_id": season["id"], "level_id": level["id"],

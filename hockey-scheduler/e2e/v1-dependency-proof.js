@@ -100,13 +100,60 @@ async function checkViewport(browser, viewport) {
     const resp = page.waitForResponse((r) =>
       r.url() === `${base}${expectedUrl}` && r.request().method() === "POST");
     await page.click(`[data-drawer-submit="${key}"]`);
-    const body = await (await resp).json();
+    const response = await resp;
+    const body = await response.json();
     if (body.error) {
       throw new Error(`[${viewport.label}] ${key} create failed: ${JSON.stringify(body.error)}`);
+    }
+    // ASSERT THE RESPONSE BEFORE ANYTHING USES ITS ID (#409 review round).
+    // A refused create used to be discovered many steps later, as a missing
+    // select option or an empty modal, because only `body.error` was read and
+    // an id-less 200-shaped body sailed through. Every downstream step here
+    // threads `body.id` into a later parent, so an absent id must fail HERE,
+    // naming the create that actually failed.
+    if (response.status() !== 200 || typeof body.id !== "string" || !body.id) {
+      throw new Error(`[${viewport.label}] ${key} create returned no usable id: `
+        + `${response.status()} ${JSON.stringify(body)}`);
     }
     await page.waitForFunction(
       () => !document.querySelector(".drawer[role=dialog]"), null, { timeout: 10000 });
     return body;
+  };
+
+  // #409 review round: a create no longer inherits its axes from the parent it
+  // names, nor from the account that minted that parent — it requires the
+  // operator's OWN PERSISTED selection. A Program-axis create (Season, Rink,
+  // Ice-slot, Official, Team, Player, a Program-linked Venue) requires the
+  // SAVED Program; a Season-owned two-axis create (League, Division, Game,
+  // team-registration, season venue-access) requires BOTH saved axes. Nothing
+  // about creating the Program selects it.
+  //
+  // Driven through `setActiveContext` — the app's OWN switch pipeline, the
+  // exact function `#ctx-select`'s onchange calls — so the client's options,
+  // hash and render stay coherent with the server, rather than a raw fetch
+  // that leaves the page believing something else.
+  //
+  // The read-back is ASSERTED, not assumed: a selection that silently fell
+  // back to inferred context would leave this journey green on precisely the
+  // behaviour #409 removes.
+  const selectContext = async (what, programId, seasonId) => {
+    await page.evaluate(
+      ([p, s]) => setActiveContext(p, s), [programId, seasonId || null]);
+    const ctx = await page.evaluate(async () => {
+      const r = await fetch("/api/context", { credentials: "same-origin" });
+      return { status: r.status, body: await r.json() };
+    });
+    if (ctx.status !== 200 || ctx.body.error) {
+      throw new Error(`[${viewport.label}] ${what}: could not read back the `
+        + `explicit selection: ${ctx.status} ${JSON.stringify(ctx.body)}`);
+    }
+    if (ctx.body.program_id !== programId
+        || (ctx.body.season_id || null) !== (seasonId || null)) {
+      throw new Error(`[${viewport.label}] ${what}: the active context did not `
+        + `read back as the explicit selection — wanted program=${programId} `
+        + `season=${seasonId || null}, got program=${ctx.body.program_id} `
+        + `season=${ctx.body.season_id || null}`);
+    }
   };
 
   try {
@@ -133,8 +180,14 @@ async function checkViewport(browser, viewport) {
       { "f-org": "Spare Facilities" }, "/api/v2/setup/organization");
     const program = await createViaDrawer("league",
       { "f-league": "V1 Proof Program", "f-league-org": org.id }, "/api/v2/setup/program");
+    // BOUNDARY 1 — the explicit Program-only selection. The Season below is a
+    // Program-axis create, and minting the Program does not select it.
+    await selectContext("Program-only bootstrap", program.id, null);
     const season = await createViaDrawer("season",
       { "f-season-league": program.id, "f-season": "2026-27" }, "/api/v2/setup/season");
+    // BOUNDARY 2 — the explicit Program+Season selection. Everything from the
+    // League down is Season-owned and consumes BOTH axes.
+    await selectContext("Program+Season", program.id, season.id);
     const league = await createViaDrawer("level",
       { "f-level-season": season.id, "f-level": "Adult League" }, "/api/v2/setup/league");
     const division = await createViaDrawer("division",
@@ -168,18 +221,33 @@ async function checkViewport(browser, viewport) {
     // proven v2 in Slice B2b) — out of this journey's explicit scope, so
     // built via raw fetch, matching the established fixture-building pattern
     // used elsewhere for prerequisites this journey isn't itself proving.
-    await page.evaluate(async (i) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      await post(`/api/v2/setup/seasons/${i.season}/team-registrations`,
-        { team_id: i.team1, league_id: i.league, division_id: i.division });
-      await post(`/api/v2/setup/seasons/${i.season}/team-registrations`,
-        { team_id: i.team2, league_id: i.league, division_id: i.division });
+    // ASSERTED, not fire-and-forget (#409 review round): a registration is a
+    // TWO-AXIS create, so a missing/stale selection refuses it 409. Swallowing
+    // that turned up much later as an empty "#w-home" option list, blaming the
+    // Calendar wizard for a fixture that never existed.
+    const regs = await page.evaluate(async (i) => {
+      const post = async (p, b) => {
+        const r = await fetch(p, {
+          method: "POST", credentials: "same-origin",
+          headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
+        });
+        return { status: r.status, body: await r.json() };
+      };
+      return [
+        await post(`/api/v2/setup/seasons/${i.season}/team-registrations`,
+          { team_id: i.team1, league_id: i.league, division_id: i.division }),
+        await post(`/api/v2/setup/seasons/${i.season}/team-registrations`,
+          { team_id: i.team2, league_id: i.league, division_id: i.division }),
+      ];
     }, {
       season: season.id, league: league.id, division: division.id,
       team1: team1.id, team2: team2.id,
+    });
+    regs.forEach((r, n) => {
+      if (r.status !== 200 || !r.body || r.body.error || !r.body.id) {
+        throw new Error(`[${viewport.label}] team-registration ${n + 1} failed: `
+          + `${r.status} ${JSON.stringify(r.body)}`);
+      }
     });
 
     // (1) Official create — drawer submit must hit v2.

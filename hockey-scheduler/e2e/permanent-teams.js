@@ -21,6 +21,9 @@ const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
+const {
+  installContextFixture, selectProgram,
+} = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -150,6 +153,7 @@ async function checkViewport(browser, viewport) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
     await page.click('.tab[data-tab="setup"]');
     // Setup now LANDS on the six-workflow hub (#345 batch 2), so a journey
     // that works against the Hierarchy tree must select that sub-view
@@ -219,27 +223,31 @@ async function checkViewport(browser, viewport) {
     //    The grouping + division give the hierarchy real League and Division
     //    nodes so their move/delete dialog nouns can be asserted below.
     const ids = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const league = await post("/api/setup/league", { name: "Permanent League" });
-      const season = await post("/api/setup/season", { league_id: league.id, name: "2026-27" });
-      const level = await post("/api/setup/level", { season_id: season.id, name: "Adult League" });
-      const division = await post("/api/setup/division",
+      const F = window.hsFixture;
+      // #409 EXPLICIT SELECTION on the V1 SURFACE. `POST /api/setup/league`
+      // mints the PROGRAM (v1 calls it "league") and `POST /api/setup/season`
+      // is PROGRAM-AXIS on the body's `league_id` (server.py:3686), behind the
+      // same `setup_create_context_error` preflight v2 uses (server.py:1160).
+      const league = await F.create("v1 league (the Program)", "/api/setup/league", { name: "Permanent League" });
+      await F.selectProgram("Program-only bootstrap", league.id);
+      const season = await F.create("season", "/api/setup/season", { league_id: league.id, name: "2026-27" });
+      // Both "levels" (v2 Leagues) and the Division are SEASON-OWNED here.
+      await F.selectProgramSeason("Program+Season", league.id, season.id);
+      const level = await F.create("level Adult League", "/api/setup/level", { season_id: season.id, name: "Adult League" });
+      const division = await F.create("division", "/api/setup/division",
         { season_id: season.id, level_id: level.id, name: "U14" });
-      const club = await post("/api/setup/club", { name: "Perma Club" });
+      const club = await F.create("club", "/api/setup/club", { name: "Perma Club" });
       // #283 Slice E: a v1 team create keyed only on the Program (no division)
       // resolves its permanent League only when that Program has exactly ONE —
       // so create the Team while "Adult League" is still the sole League, and
       // the v1 program_id→league_id response still equals league.id.
-      const team = await post("/api/setup/team",
+      const team = await F.create("team", "/api/setup/team",
         { club_id: club.id, league_id: league.id, name: "Perma Bruins" });
       // A second grouping League in the same season, so the Division-move
       // dialog (below) has a real target to move to (#233 B2a review r1).
       // Created AFTER the Team so it doesn't make the sole-League resolution
       // above ambiguous.
-      const level2 = await post("/api/setup/level", { season_id: season.id, name: "Junior League" });
+      const level2 = await F.create("level Junior League", "/api/setup/level", { season_id: season.id, name: "Junior League" });
       return { league: league.id, team: team.id, division: division.id, level2: level2.id,
                teamOk: !team.error && team.league_id === league.id && !team.division_id,
                structureOk: !level.error && !level2.error && !division.error };
@@ -489,6 +497,7 @@ async function checkArenaManager(browser, viewport) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
     // A fresh boot only seeds the "admin" account — the other demo personas
     // (including "arena") are UserAccount rows built by /api/demo/load, so
     // load the sample dataset first (as the auto-logged-in League Admin)
@@ -506,6 +515,39 @@ async function checkArenaManager(browser, viewport) {
     if (loginStatus !== 200) fail(`arena manager login failed (status ${loginStatus})`);
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
+
+    // #409 EXPLICIT SELECTION for the ARENA MANAGER. The Venue and Rink this
+    // leg creates through the real drawers are PROGRAM-AXIS, and an Arena
+    // Manager who has just signed in has no saved selection of their own —
+    // the demo load ran under the League Admin. Without a persisted Program
+    // the Venue create is refused, and this leg's only symptom was the
+    // "Arena One" text never appearing: a 10s waitForFunction timeout that
+    // named neither context nor the refusal.
+    //
+    // It is a REAL selection an Arena Manager can make: `arena_manager` is a
+    // global role (context_scope._GLOBAL_ROLES), so every Program is offered
+    // in the header switcher this drives. The Program is taken from the
+    // switcher's own options rather than hard-coded, so the fixture selects
+    // something the operator is genuinely offered.
+    // WAIT for the switcher to be POPULATED before reading it. `#ctx-select`
+    // fills in only after GET /api/context/options resolves, so a synchronous
+    // page.evaluate() races that fetch: it wins locally and loses on a slower
+    // CI runner, where it returned null and this leg failed with
+    // "offered the Arena Manager no Program to select". The options are the
+    // subject of the assertion, so waiting for them is the assertion — not a
+    // retry papering over a product defect.
+    await page.waitForFunction(() => {
+      const sel = document.getElementById("ctx-select");
+      return !!(sel && [...sel.options].some((o) => o.value));
+    }, null, { timeout: 15000 }).catch(() => {});
+    const arenaProgram = await page.evaluate(() => {
+      const sel = document.getElementById("ctx-select");
+      const opt = sel && [...sel.options].find((o) => o.value);
+      return opt ? opt.value.split("|")[0] : null;
+    });
+    if (!arenaProgram) fail("the context switcher offered the Arena Manager no Program to select");
+    await selectProgram(page, `[arena-manager/${tag}] Program-only selection`, arenaProgram);
 
     await page.click('.tab[data-tab="setup"]');
     await page.click('[data-setup-view="hierarchy"]');
@@ -587,6 +629,7 @@ async function checkNoSetupAccess(browser, viewport) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
     // Seed the "coach" persona (a fresh boot only has "admin" — see
     // checkArenaManager above) while still the auto-logged-in League Admin.
     const loadStatus = await page.evaluate(() => fetch("/api/demo/load", {
@@ -598,6 +641,7 @@ async function checkNoSetupAccess(browser, viewport) {
     // 1) A fresh sign-in as Coach never sees the Setup tab at all.
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
     const loginStatus = await page.evaluate(() => fetch("/api/auth/login", {
       method: "POST", credentials: "same-origin",
       headers: { "Content-Type": "application/json" },
@@ -606,6 +650,7 @@ async function checkNoSetupAccess(browser, viewport) {
     if (loginStatus !== 200) fail(`coach login failed (status ${loginStatus})`);
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
     if (await page.isVisible('.tab[data-tab="setup"]'))
       fail(`Setup tab is visible for a fresh Coach sign-in`);
 
@@ -620,6 +665,7 @@ async function checkNoSetupAccess(browser, viewport) {
     if (adminLoginStatus !== 200) fail(`admin re-login failed (status ${adminLoginStatus})`);
     await page.reload({ waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
     await page.click('.tab[data-tab="setup"]');
     await page.click('[data-setup-view="hierarchy"]');
     await page.waitForSelector(".setup-trees, .setup-card", { timeout: 10000 });
@@ -675,19 +721,21 @@ async function checkSliceB(browser, viewport) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
 
     // Build a program → season → two permanent Leagues via the canonical v2
     // surface, plus an extra Program team under Rec to prove multi-team
     // league-nesting in the tree. Elite gets sort_order 1 so it sorts before Rec.
     const ids = await page.evaluate(async () => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const program = await post("/api/v2/setup/program", { name: "Slice B Program" });
-      const season = await post("/api/v2/setup/season", { program_id: program.id, name: "2027-28" });
-      const elite = await post("/api/v2/setup/league", { season_id: season.id, name: "Elite", sort_order: 1 });
-      const rec = await post("/api/v2/setup/league", { season_id: season.id, name: "Rec", sort_order: 2 });
+      const F = window.hsFixture;
+      const program = await F.create("Slice B program", "/api/v2/setup/program", { name: "Slice B Program" });
+      // #409: Season is PROGRAM-AXIS; both Leagues are SEASON-OWNED. This is
+      // a SECOND Program in the same run, so nothing ambient could be right.
+      await F.selectProgram("Slice B Program-only bootstrap", program.id);
+      const season = await F.create("Slice B season", "/api/v2/setup/season", { program_id: program.id, name: "2027-28" });
+      await F.selectProgramSeason("Slice B Program+Season", program.id, season.id);
+      const elite = await F.create("league Elite", "/api/v2/setup/league", { season_id: season.id, name: "Elite", sort_order: 1 });
+      const rec = await F.create("league Rec", "/api/v2/setup/league", { season_id: season.id, name: "Rec", sort_order: 2 });
       // #283 Slice E: a Team must always resolve a permanent League — NEITHER
       // the v1 nor the v2 create path can mint a league-less Team anymore (a
       // "teams_without_league" row is now only reachable as a legacy migration
@@ -695,7 +743,7 @@ async function checkSliceB(browser, viewport) {
       // created under a real League (Rec) via the canonical v2 route; the tree
       // assertion below verifies it nests under that League rather than a
       // now-unreachable "No league" bucket.
-      const loose = await post("/api/v2/setup/team", { league_id: rec.id, name: "Undrafted" });
+      const loose = await F.create("team Undrafted", "/api/v2/setup/team", { league_id: rec.id, name: "Undrafted" });
       return { program: program.id, season: season.id, elite: elite.id, rec: rec.id,
                loose: loose.id, looseOk: !loose.error && !!loose.id };
     });

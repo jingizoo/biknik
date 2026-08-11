@@ -53,6 +53,9 @@ const { chromium } = require("playwright");
 const { spawn } = require("child_process");
 const http = require("http");
 const path = require("path");
+const {
+  installContextFixture, selectProgramSeason,
+} = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -294,25 +297,27 @@ async function checkLandings(page, L, phase, expect) {
 // trap is untouched.
 async function seedFullPrerequisiteChain(page, L) {
   const ids = await page.evaluate(async () => {
-    const post = async (path, body) => (await fetch(path, {
-      method: "POST", credentials: "same-origin",
-      headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
-    })).json();
-    const prog = await post("/api/v2/setup/program", { name: "MMM Provisioned", country: "US" });
-    const season = await post("/api/v2/setup/season",
+    const F = window.hsFixture;
+    const prog = await F.create("program", "/api/v2/setup/program", { name: "MMM Provisioned", country: "US" });
+    // #409 EXPLICIT SELECTION, boundary 1: Season is PROGRAM-AXIS.
+    await F.selectProgram("Program-only bootstrap", prog.id);
+    const season = await F.create("season", "/api/v2/setup/season",
       { program_id: prog.id, name: "MMM Provisioned Season" });
-    const league = await post("/api/v2/setup/league",
+    // BOUNDARY 2: League, Division and the venue-access grant are
+    // SEASON-OWNED and all land in THIS Season.
+    await F.selectProgramSeason("Program+Season", prog.id, season.id);
+    const league = await F.create("league", "/api/v2/setup/league",
       { season_id: season.id, name: "MMM Provisioned League" });
-    const team = await post("/api/v2/setup/team",
+    const team = await F.create("team", "/api/v2/setup/team",
       { league_id: league.id, name: "MMM Provisioned Team" });
-    await post("/api/v2/setup/division",
+    await F.call("division", "/api/v2/setup/division",
       { league_id: league.id, season_id: season.id, name: "MMM Provisioned Division" });
-    const org = await post("/api/v2/setup/organization", { name: "MMM Provisioned Org" });
-    const venue = await post("/api/v2/setup/venue",
+    const org = await F.create("org", "/api/v2/setup/organization", { name: "MMM Provisioned Org" });
+    const venue = await F.create("venue", "/api/v2/setup/venue",
       { name: "MMM Provisioned Venue", organization_id: org.id });
-    await post("/api/v2/setup/rink", { venue_id: venue.id, name: "MMM Provisioned Rink" });
-    await post(`/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
-    await post("/api/context", { program_id: prog.id, season_id: season.id });
+    await F.call("rink", "/api/v2/setup/rink", { venue_id: venue.id, name: "MMM Provisioned Rink" });
+    await F.call("season venue-access grant",
+      `/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
     return { prog: prog.id, season: season.id, league: league.id, team: team.id,
              venue: venue.id };
   });
@@ -321,6 +326,7 @@ async function seedFullPrerequisiteChain(page, L) {
   }
   await page.reload();
   await page.waitForSelector("#content", { timeout: 15000 });
+  await installContextFixture(page);
   return ids;
 }
 
@@ -351,21 +357,23 @@ const PARTIAL_FIXTURES = [
   { key: "leagueless",
     label: "a program with no league, holding a club and an official",
     seed: async (page) => page.evaluate(async () => {
-      const post = async (path, body) => (await fetch(path, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
-      })).json();
-      const prog = await post("/api/v2/setup/program",
+      const F = window.hsFixture;
+      const prog = await F.create("prog", "/api/v2/setup/program",
         { name: "PPA Partial Leagueless", country: "US" });
-      const season = await post("/api/v2/setup/season",
+      // #409: the Season create is PROGRAM-AXIS, so the selection has to come
+      // BEFORE it, not after — where the raw context POST used to sit. This
+      // journey builds several Programs in one run, so nothing ambient could
+      // be right for all of them.
+      await F.selectProgram("PPA Program-only bootstrap", prog.id);
+      const season = await F.create("season", "/api/v2/setup/season",
         { program_id: prog.id, name: "PPA Partial Season" });
       // Everything after this is created from INSIDE the new Program's own
       // context: the v2 setup writes are judged against the caller's ACTIVE
       // Program (#367), and a season belonging to another Program is refused
       // with the same not-found a nonexistent one gets.
-      await post("/api/context", { program_id: prog.id, season_id: season.id });
-      await post("/api/v2/setup/club", { name: "PPA Partial Club" });
-      await post("/api/v2/setup/official", { name: "PPA Partial Official" });
+      await F.selectProgramSeason("PPA Program+Season", prog.id, season.id);
+      await F.call("club", "/api/v2/setup/club", { name: "PPA Partial Club" });
+      await F.call("official", "/api/v2/setup/official", { name: "PPA Partial Official" });
       return { prog: prog.id, season: season.id };
     }),
     expect: {
@@ -388,23 +396,22 @@ const PARTIAL_FIXTURES = [
   { key: "teamless",
     label: "a program with a division but no team, and a venue with no rink",
     seed: async (page) => page.evaluate(async () => {
-      const post = async (path, body) => (await fetch(path, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
-      })).json();
-      const prog = await post("/api/v2/setup/program",
+      const F = window.hsFixture;
+      const prog = await F.create("prog", "/api/v2/setup/program",
         { name: "PPB Partial Teamless", country: "US" });
-      const season = await post("/api/v2/setup/season",
+      // #409, same two boundaries as PPA above.
+      await F.selectProgram("PPB Program-only bootstrap", prog.id);
+      const season = await F.create("season", "/api/v2/setup/season",
         { program_id: prog.id, name: "PPB Partial Season" });
-      await post("/api/context", { program_id: prog.id, season_id: season.id });
-      const league = await post("/api/v2/setup/league",
+      await F.selectProgramSeason("PPB Program+Season", prog.id, season.id);
+      const league = await F.create("league", "/api/v2/setup/league",
         { season_id: season.id, name: "PPB Partial League" });
-      await post("/api/v2/setup/division",
+      await F.call("division", "/api/v2/setup/division",
         { league_id: league.id, season_id: season.id, name: "PPB Partial Division" });
-      const org = await post("/api/v2/setup/organization", { name: "PPB Partial Org" });
-      const venue = await post("/api/v2/setup/venue",
+      const org = await F.create("org", "/api/v2/setup/organization", { name: "PPB Partial Org" });
+      const venue = await F.create("venue", "/api/v2/setup/venue",
         { name: "PPB Partial Venue", organization_id: org.id });
-      await post(`/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
+      await F.call("venue-access", `/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
       return { prog: prog.id, season: season.id, league: league.id, venue: venue.id };
     }),
     expect: {
@@ -439,6 +446,7 @@ async function checkPartials(page, L) {
       history.replaceState(null, "", location.pathname + location.search));
     await page.reload();
     await page.waitForSelector("#content", { timeout: 15000 });
+    await installContextFixture(page);
 
     for (const [key, want] of Object.entries(fx.expect)) {
       seen.add(key);
@@ -586,6 +594,7 @@ async function checkViewport(browser, viewport) {
     await loginAs(page, "admin", "demo");
     await page.goto(base);
     await page.waitForSelector("#content", { timeout: 15000 });
+    await installContextFixture(page);
 
     // ---- (1) Setup lands on the workflow hub, not the mega-page ----------
     // Deliberately NOT openSetupHub(): clicking the toggle would make this
@@ -666,27 +675,33 @@ async function checkViewport(browser, viewport) {
     // under the wrong parent. Asserting the select's rendered value is not
     // enough -- it must be checked against what the server actually stored.
     const fx = await page.evaluate(async () => {
-      const post = async (path, body) => (await fetch(path, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
-      })).json();
+      const F = window.hsFixture;
       // Program A sorts first globally, so it is what every unseeded fallback
       // lands on. All assertions below act from Program B.
-      const pA = await post("/api/v2/setup/program", { name: "AAA Ctx Program A", country: "US" });
-      const sA = await post("/api/v2/setup/season", { program_id: pA.id, name: "AAA Season A" });
-      const lA = await post("/api/v2/setup/league", { season_id: sA.id, name: "AAA League A" });
-      const pB = await post("/api/v2/setup/program", { name: "ZZZ Ctx Program B", country: "US" });
-      const s1 = await post("/api/v2/setup/season", { program_id: pB.id, name: "ZZZ Season One" });
-      const s2 = await post("/api/v2/setup/season", { program_id: pB.id, name: "ZZZ Season Two" });
+      const pA = await F.create("Program A", "/api/v2/setup/program", { name: "AAA Ctx Program A", country: "US" });
+      // #409: three Programs and three Seasons in one block, so EVERY create
+      // states which Program/Season it is writing into and the saved row is
+      // moved to match first. Season is PROGRAM-AXIS; League and Division are
+      // SEASON-OWNED and are judged against the Season they name.
+      await F.selectProgram("Program A only", pA.id);
+      const sA = await F.create("Season A", "/api/v2/setup/season", { program_id: pA.id, name: "AAA Season A" });
+      await F.selectProgramSeason("Program A + Season A", pA.id, sA.id);
+      const lA = await F.create("League A", "/api/v2/setup/league", { season_id: sA.id, name: "AAA League A" });
+      const pB = await F.create("Program B", "/api/v2/setup/program", { name: "ZZZ Ctx Program B", country: "US" });
+      await F.selectProgram("Program B only", pB.id);
+      const s1 = await F.create("Season One", "/api/v2/setup/season", { program_id: pB.id, name: "ZZZ Season One" });
+      const s2 = await F.create("Season Two", "/api/v2/setup/season", { program_id: pB.id, name: "ZZZ Season Two" });
       // A league in EACH of B's seasons, so "first league of the Program" and
       // "a league in the ACTIVE season" are different answers -- that gap is
       // the wrong-Season write the seeding must close.
-      const l1 = await post("/api/v2/setup/league", { season_id: s1.id, name: "ZZZ League S1" });
-      const l2 = await post("/api/v2/setup/league", { season_id: s2.id, name: "ZZZ League S2" });
+      await F.selectProgramSeason("Program B + Season One", pB.id, s1.id);
+      const l1 = await F.create("League S1", "/api/v2/setup/league", { season_id: s1.id, name: "ZZZ League S1" });
+      await F.selectProgramSeason("Program B + Season Two", pB.id, s2.id);
+      const l2 = await F.create("League S2", "/api/v2/setup/league", { season_id: s2.id, name: "ZZZ League S2" });
       // A Program with NO seasons: the only shape in which the active context
       // genuinely has no Season, since /api/context auto-selects one whenever
       // the chosen Program has any.
-      const pC = await post("/api/v2/setup/program", { name: "ZZZ Ctx Program C", country: "US" });
+      const pC = await F.create("Program C", "/api/v2/setup/program", { name: "ZZZ Ctx Program C", country: "US" });
       // One EXISTING division under the active season's own league. #365
       // makes a landing's demoted actions state-dependent -- an EMPTY card
       // (the "Season participation and divisions" card counts divisions, so
@@ -697,20 +712,19 @@ async function checkViewport(browser, viewport) {
       // PERSISTED, and the trap (drawerField()'s first-global-row fallback,
       // which points at Program A's league) is untouched by an existing row
       // in Program B.
-      await post("/api/v2/setup/division",
+      // Still on Program B / Season Two, which is where this Division lands.
+      await F.call("existing Division in Season Two", "/api/v2/setup/division",
         { league_id: l2.id, season_id: s2.id, name: "ZZZ Existing Division S2" });
       return { pA: pA.id, sA: sA.id, lA: lA.id, pB: pB.id, pC: pC.id,
                s1: s1.id, s2: s2.id, l1: l1.id, l2: l2.id };
     });
 
-    // Act from Program B / Season TWO.
-    await page.evaluate(async ([program_id, season_id]) => {
-      await fetch("/api/context", {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ program_id, season_id }),
-      });
-    }, [fx.pB, fx.s2]);
+    // Act from Program B / Season TWO — stated, and READ BACK (#409). The
+    // bare fetch this replaces discarded the status entirely, so a refused
+    // switch was indistinguishable from a successful one and the assertions
+    // below would have been made from the wrong context.
+    await selectProgramSeason(page, `[${L}] act from Program B / Season Two`,
+      fx.pB, fx.s2);
     // One permanent Team under the ACTIVE season's league, created from INSIDE
     // Program B's own context -- #367 requires a Team's League to belong to the
     // CALLER'S ACTIVE Program, so this cannot be seeded above alongside the
@@ -726,17 +740,12 @@ async function checkViewport(browser, viewport) {
     // drawerField()'s first-GLOBAL-row fallback pointing at Program A's league,
     // and a Team in Program B leaves both the fallback and the assertion (where
     // the NEXT division is PERSISTED) untouched.
-    const teamB = await page.evaluate(async (league_id) => (await fetch(
-      "/api/v2/setup/team", {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ league_id, name: "ZZZ Ctx Team S2" }),
-      })).json(), fx.l2);
-    if (!teamB || teamB.error || !teamB.id) {
-      fail(`[${L}] could not seed Program B's permanent team: ${JSON.stringify(teamB)}`);
-    }
+    const teamB = await page.evaluate((league_id) => window.hsFixture.create(
+      "Program B's permanent team", "/api/v2/setup/team",
+      { league_id, name: "ZZZ Ctx Team S2" }), fx.l2);
     await page.reload();
     await page.waitForSelector("#content", { timeout: 15000 });
+    await installContextFixture(page);
 
     // (i) Divisions must persist under a league in the ACTIVE Season.
     await openSetupHub(page, `${L}/persist-division`);
@@ -804,22 +813,25 @@ async function checkViewport(browser, viewport) {
     // production code already relies on to link an existing League into a
     // new Season (register_team_for_season -> _link_league_season with an
     // explicit league_id), so no internal/test-only backdoor is needed.
-    const shared = await page.evaluate(async ([s1, s2]) => {
-      const post = async (path, body) => (await fetch(path, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
-      })).json();
-      const lShared = await post("/api/v2/setup/league", { season_id: s1, name: "ZZZ League Shared" });
-      const club = await post("/api/v2/setup/club", { name: "ZZZ Shared Club" });
-      const team = await post("/api/v2/setup/team",
+    const shared = await page.evaluate(async ([program_id, s1, s2]) => {
+      const F = window.hsFixture;
+      // #409: this League is SEASON-OWNED and lands in Season ONE, while the
+      // leg above left the saved Season on Season TWO. The saved Season must
+      // be the one written into, so move to s1 first and back to s2 after —
+      // the registration below is what binds the League to Season Two.
+      await F.selectProgramSeason("Program B + Season One for the shared League",
+        program_id, s1);
+      const lShared = await F.create("shared League", "/api/v2/setup/league", { season_id: s1, name: "ZZZ League Shared" });
+      const club = await F.create("club", "/api/v2/setup/club", { name: "ZZZ Shared Club" });
+      const team = await F.create("team", "/api/v2/setup/team",
         { league_id: lShared.id, club_id: club.id, name: "ZZZ Shared Team" });
-      const reg = await post(`/api/v2/setup/seasons/${s2}/team-registrations`,
+      await F.selectProgramSeason("Program B + Season Two for the registration",
+        program_id, s2);
+      await F.create("registration binding the shared League to Season Two",
+        `/api/v2/setup/seasons/${s2}/team-registrations`,
         { team_id: team.id, league_id: lShared.id });
-      if (reg.error) {
-        return { error: `binding league to second season failed: ${JSON.stringify(reg.error)}` };
-      }
       return { lShared: lShared.id };
-    }, [fx.s1, fx.s2]);
+    }, [fx.pB, fx.s1, fx.s2]);
     if (shared.error) fail(`[${L}] ${shared.error}`);
 
     // #345 review: this leg's own required evidence is keyboard-open/submit,
@@ -895,6 +907,7 @@ async function checkViewport(browser, viewport) {
     }, [fx.pB, fx.s2]);
     await page.reload();
     await page.waitForSelector("#content", { timeout: 15000 });
+    await installContextFixture(page);
     // One venue + rink, granted into the ACTIVE season, before opening the
     // landing. #365 makes a landing's demoted actions state-dependent, and
     // this workflow's card counts venues and rinks -- with none of either the
@@ -904,25 +917,24 @@ async function checkViewport(browser, viewport) {
     // an OFFERED control must open a real drawer rather than being
     // permanently-failing decoration. Uses the same public endpoints
     // dashboard-season-ceiling.js already seeds venues through.
-    const facilitiesSeed = await page.evaluate(async ([season_id]) => {
-      const post = async (path, body) => (await fetch(path, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
-      })).json();
-      const org = await post("/api/v2/setup/organization", { name: "ZZZ Facilities Org" });
-      const venue = await post("/api/v2/setup/venue",
+    const facilitiesSeed = await page.evaluate(async ([program_id, season_id]) => {
+      const F = window.hsFixture;
+      const org = await F.create("org", "/api/v2/setup/organization", { name: "ZZZ Facilities Org" });
+      const venue = await F.create("venue", "/api/v2/setup/venue",
         { name: "ZZZ Facilities Venue", organization_id: org.id });
       if (venue.error) return { error: `venue create failed: ${JSON.stringify(venue.error)}` };
-      const granted = await post(`/api/v2/setup/seasons/${season_id}/venue-access`,
-        { venue_id: venue.id });
-      if (!granted || granted.error) {
-        return { error: `venue-access grant failed: ${JSON.stringify(granted)}` };
-      }
-      const rink = await post("/api/v2/setup/rink",
+      // #409: the grant is SEASON-OWNED and lands in Season Two, which this
+      // leg is already acting from — stated here so the dependency is visible
+      // at the create rather than inherited silently from an earlier leg.
+      await F.selectProgramSeason("Program B + Season Two for the grant",
+        program_id, season_id);
+      await F.create("season venue-access grant",
+        `/api/v2/setup/seasons/${season_id}/venue-access`, { venue_id: venue.id });
+      const rink = await F.create("rink", "/api/v2/setup/rink",
         { venue_id: venue.id, name: "ZZZ Facilities Rink" });
       if (rink.error) return { error: `rink create failed: ${JSON.stringify(rink.error)}` };
       return { venue: venue.id, rink: rink.id };
-    }, [fx.s2]);
+    }, [fx.pB, fx.s2]);
     if (facilitiesSeed.error) fail(`[${L}] ${facilitiesSeed.error}`);
     await openSetupHub(page, `${L}/facilities-live`);
     await page.click('[data-setup-workflow="facilities"]');

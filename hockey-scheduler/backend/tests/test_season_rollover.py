@@ -15,6 +15,7 @@ import unittest
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
+from http.cookiejar import CookieJar
 from http.server import ThreadingHTTPServer
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
@@ -490,40 +491,88 @@ class SeasonRolloverHttpTest(unittest.TestCase):
         except urllib.error.HTTPError as e:
             return e.code, json.loads(e.read() or b"{}")
 
+    def _operator(self):
+        """A real signed-in League Admin session (#409).
+
+        Every setup CREATE below is guarded and is authorized against the
+        Program/Season the operator CHOSE. An ``X-Demo-Role`` caller has no
+        backing account and so nowhere to persist a choice, which is the same
+        reason the guarded reassign/remove routes already moved to a session
+        in `test_season_registration_http`. The viewer 403 probe stays on the
+        header path unchanged -- role is decided before any of this.
+        """
+        from hockey_scheduler.domain import Role
+        if STATE.api.store.get_user_account_by_username("roll_admin") is None:
+            STATE.api.accounts.create_account(
+                "roll_admin", "demo", Role.LEAGUE_ADMIN, scope={},
+                actor_id="test_seed")
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(CookieJar()))
+        status, body = self._session(opener, "/api/auth/login",
+                                     {"username": "roll_admin",
+                                      "password": "demo"})
+        self.assertEqual(status, 200, body)
+        return opener
+
+    def _session(self, opener, path, body):
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}{path}", data=json.dumps(body).encode(),
+            method="POST", headers={"Content-Type": "application/json"})
+        try:
+            with opener.open(req) as r:
+                return r.status, json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read() or b"{}")
+
+    def _hierarchy(self, tag):
+        """Program / two Seasons / Division / Club / Team / registration, built
+        by a signed-in operator that SELECTS each axis as it creates it."""
+        c = self._operator()
+        _, league = self._session(c, "/api/setup/league", {"name": tag})
+        self._session(c, "/api/context", {"program_id": league["id"]})
+        _, s1 = self._session(c, "/api/setup/season",
+                              {"league_id": league["id"], "name": "A"})
+        _, s2 = self._session(c, "/api/setup/season",
+                              {"league_id": league["id"], "name": "B"})
+        self._session(c, "/api/context",
+                      {"program_id": league["id"], "season_id": s1["id"]})
+        _, d1 = self._session(c, "/api/setup/division",
+                              {"season_id": s1["id"], "name": "D"})
+        _, club = self._session(c, "/api/setup/club", {"name": "C"})
+        _, team = self._session(c, "/api/setup/team",
+                                {"club_id": club["id"],
+                                 "division_id": d1["id"], "name": "T"})
+        status, reg = self._session(
+            c, f"/api/setup/seasons/{s1['id']}/team-registrations",
+            {"team_id": team["id"], "division_id": d1["id"]})
+        self.assertEqual(status, 200, reg)
+        # The roll-forward WRITES into S2 and READS S1, so the saved Season
+        # must be the destination and the source must be in the same saved
+        # Program (#409's two-Season rule).
+        self._session(c, "/api/context",
+                      {"program_id": league["id"], "season_id": s2["id"]})
+        return c, league, s1, s2, team
+
     def test_admin_can_roll_forward_and_viewer_cannot(self):
-        _, league = self._post("/api/setup/league", {"name": "RL"}, "league_admin")
-        _, s1 = self._post("/api/setup/season", {"league_id": league["id"], "name": "A"}, "league_admin")
-        _, s2 = self._post("/api/setup/season", {"league_id": league["id"], "name": "B"}, "league_admin")
-        _, d1 = self._post("/api/setup/division", {"season_id": s1["id"], "name": "D"}, "league_admin")
-        _, club = self._post("/api/setup/club", {"name": "C"}, "league_admin")
-        _, team = self._post("/api/setup/team",
-                            {"club_id": club["id"], "division_id": d1["id"], "name": "T"}, "league_admin")
-        self._post(f"/api/setup/seasons/{s1['id']}/team-registrations",
-                   {"team_id": team["id"], "division_id": d1["id"]}, "league_admin")
+        c, _league, s1, s2, _team = self._hierarchy("RL")
         # Viewer is forbidden.
         status, body = self._post(f"/api/setup/seasons/{s2['id']}/roll-forward",
                                   {"from_season_id": s1["id"]}, "viewer")
         self.assertEqual(status, 403)
         self.assertEqual(body["error"]["details"]["required"], "manage_setup")
         # League Admin succeeds.
-        status, res = self._post(f"/api/setup/seasons/{s2['id']}/roll-forward",
-                                 {"from_season_id": s1["id"]}, "league_admin")
-        self.assertEqual(status, 200)
+        status, res = self._session(
+            c, f"/api/setup/seasons/{s2['id']}/roll-forward",
+            {"from_season_id": s1["id"]})
+        self.assertEqual(status, 200, res)
         self.assertEqual(res["rolled_forward"], 1)
 
     def test_malformed_body_returns_400_not_500(self):
         # Req #4 is a transport guarantee: malformed HTTP input must map to a
         # structured 400, never a 500 from an uncaught TypeError/AttributeError.
         # Exercise the full route -> facade -> ERROR_HTTP_STATUS path.
-        _, league = self._post("/api/setup/league", {"name": "ML"}, "league_admin")
-        _, s1 = self._post("/api/setup/season", {"league_id": league["id"], "name": "A"}, "league_admin")
-        _, s2 = self._post("/api/setup/season", {"league_id": league["id"], "name": "B"}, "league_admin")
-        _, d1 = self._post("/api/setup/division", {"season_id": s1["id"], "name": "D"}, "league_admin")
-        _, club = self._post("/api/setup/club", {"name": "C"}, "league_admin")
-        _, team = self._post("/api/setup/team",
-                             {"club_id": club["id"], "division_id": d1["id"], "name": "T"}, "league_admin")
-        self._post(f"/api/setup/seasons/{s1['id']}/team-registrations",
-                   {"team_id": team["id"], "division_id": d1["id"]}, "league_admin")
+        c, _league, s1, s2, team = self._hierarchy("ML")
         rf = f"/api/setup/seasons/{s2['id']}/roll-forward"
         for body in (
             {"from_season_id": s1["id"], "selections": "not-a-list"},
@@ -532,7 +581,7 @@ class SeasonRolloverHttpTest(unittest.TestCase):
                                                          "division_id": {"x": 1}}]},
             {"from_season_id": ["x"]},               # unhashable season id
         ):
-            status, resp = self._post(rf, body, "league_admin")
+            status, resp = self._session(c, rf, body)
             self.assertEqual(status, 400, f"expected 400 for body={body!r}, got {status}")
             self.assertEqual(resp["error"]["code"], "validation_error")
 

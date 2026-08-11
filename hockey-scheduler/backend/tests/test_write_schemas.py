@@ -133,6 +133,15 @@ class WriteSchemaHttpTest(unittest.TestCase):
         c = self._client()
         self._req(c, "POST", "/api/auth/login",
                   {"username": "admin", "password": "demo"})
+        # #409: a guarded setup MUTATION (this class drives
+        # `team/<id>/assign-club`) now needs an EXPLICITLY persisted context
+        # rather than the read-only fallback. Persist the very tuple this
+        # session already resolves, so nothing else about the case changes.
+        _s, _h, ctx = self._req(c, "GET", "/api/context")
+        self._req(c, "POST", "/api/context",
+                  {"program_id": ctx.get("program_id"),
+                   "season_id": ctx.get("season_id"),
+                   "league_id": ctx.get("league_id")})
         return c
 
     # -- malformed / non-object JSON (criterion 2) ---------------------------

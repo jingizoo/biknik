@@ -2388,6 +2388,9 @@ class SetupTargetRouteMatrixTest(unittest.TestCase):
                 o, "/api/v2/setup/season",
                 {"program_id": program["id"],
                  "name": f"AX Season {key}"})["id"]
+        # #409: a League CREATE is SEASON-OWNED (it mints the LeagueSeason
+        # too), so the Season it binds into must be the operator's own choice.
+        self._select(o, program["id"], w["season"]["A"])
         for key in ("A", "B"):
             league = self._ok(o, "/api/v2/setup/league",
                               {"season_id": w["season"]["A"],
@@ -2465,6 +2468,11 @@ class SetupTargetRouteMatrixTest(unittest.TestCase):
                          "home_club_id": self.ax["club"][lk]})["id"]
 
     def _ax_division(self, lk, sk):
+        # #409: a Division CREATE is SEASON-OWNED, so the fixture OWNER stands
+        # in the Season the spare row is being built into. This is the owner's
+        # own persisted context and is irrelevant to the CALLER's, which is
+        # what every case below actually varies.
+        self._select(self.ax_owner, self.ax["program"], self.ax["season"][sk])
         return self._ok(self.ax_owner, "/api/v2/setup/division",
                         {"league_id": self.ax["league"][lk],
                          "season_id": self.ax["season"][sk],
@@ -2479,6 +2487,9 @@ class SetupTargetRouteMatrixTest(unittest.TestCase):
         LeagueSeason's League axis is the League it binds, so "switch to the
         record's own League" means that one. Childless, so the dependency gate
         never masks the target gate's answer."""
+        # #409: a League CREATE is SEASON-OWNED -- stand in the Season it
+        # binds into (the OWNER's context, not the caller's).
+        self._select(self.ax_owner, self.ax["program"], self.ax["season"][sk])
         league = self._ok(self.ax_owner, "/api/v2/setup/league",
                           {"season_id": self.ax["season"][sk],
                            "name": f"AX Bound League {self._seq()}"})["id"]
@@ -4496,6 +4507,9 @@ class SetupTargetGameParentConsistencyHttpTest(unittest.TestCase):
             self.assertIsNotNone(binding,
                                  f"fixture: the {tag}/{index} binding")
             bindings.append(binding.id)
+            # #409: a Division CREATE is SEASON-OWNED, so stand in the
+            # Season this one is being bound into.
+            self._select(opener, program["id"], season_id)
             division = self._ok(opener, "/api/v2/setup/division",
                                 {"league_id": league["id"],
                                  "season_id": season_id,

@@ -71,6 +71,7 @@ const { spawn } = require("child_process");
 const fs = require("fs");
 const http = require("http");
 const path = require("path");
+const { installContextFixture } = require("./context-fixture.js");
 
 const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
@@ -315,38 +316,47 @@ async function checkViewport(browser, viewport) {
     await waitForServer(`${base}/api/health`, READY_TIMEOUT_MS);
     await page.goto(base, { waitUntil: "domcontentloaded" });
     await page.waitForSelector("#content > *", { timeout: 10000 });
+    await installContextFixture(page);
 
     const ids = await page.evaluate(async ([day, hours]) => {
-      const post = async (p, b) => (await fetch(p, {
-        method: "POST", credentials: "same-origin",
-        headers: { "Content-Type": "application/json" }, body: JSON.stringify(b),
-      })).json();
-      const league = await post("/api/setup/league", { name: "Format Program" });
-      const season = await post("/api/setup/season", { league_id: league.id, name: "Fall 2026" });
-      const level = await post("/api/setup/level", { season_id: season.id, name: "Format League" });
-      const div = await post("/api/setup/division", {
+      const F = window.hsFixture;
+      // #409 EXPLICIT SELECTION on the V1 SURFACE. The route family differs;
+      // the axis rule does not. `POST /api/setup/league` mints the PROGRAM
+      // (v1 calls it "league") and `POST /api/setup/season` is a PROGRAM-AXIS
+      // create comparing the body's `league_id` (server.py:3686), guarded by
+      // the same `setup_create_context_error` preflight v2 uses
+      // (server.py:1160). Minting the Program is not selecting it.
+      const league = await F.create("v1 league (the Program)", "/api/setup/league", { name: "Format Program" });
+      await F.selectProgram("Program-only bootstrap", league.id);
+      const season = await F.create("season", "/api/setup/season", { league_id: league.id, name: "Fall 2026" });
+      // The v1 "level" IS the v2 League; it, the Divisions, the registrations
+      // and the venue-access grant are all SEASON-OWNED and land in THIS
+      // Season, so both axes are persisted before them.
+      await F.selectProgramSeason("Program+Season", league.id, season.id);
+      const level = await F.create("level (the v2 League)", "/api/setup/level", { season_id: season.id, name: "Format League" });
+      const div = await F.create("div", "/api/setup/division", {
         season_id: season.id, level_id: level.id, name: "FormatNorth" });
       // A SECOND even Division, kept untouched by (1)-(4), so scenario (5)
       // asks for its odd format against an empty calendar rather than against
       // the 16 games (3) commits into FormatNorth.
-      const south = await post("/api/setup/division", {
+      const south = await F.create("south", "/api/setup/division", {
         season_id: season.id, level_id: level.id, name: "FormatSouth" });
       // And an ODD one, for the refusal in (6). 5 teams x 5 games = 25 team
       // appearances, which no schedule can split into whole games.
-      const odd = await post("/api/setup/division", {
+      const odd = await F.create("odd", "/api/setup/division", {
         season_id: season.id, level_id: level.id, name: "FormatOdd" });
       // A TWO-team Division for scenario (7): 2 x 31 = 62 team appearances =
       // 31 pairings, all between the same pair, so "every team plays 31" and
       // "31 rows" are the same statement and the count is unambiguous.
-      const pair = await post("/api/setup/division", {
+      const pair = await F.create("pair", "/api/setup/division", {
         season_id: season.id, level_id: level.id, name: "FormatPair" });
-      const club = await post("/api/setup/club", { name: "Club" });
+      const club = await F.create("club", "/api/setup/club", { name: "Club" });
       const team = async (n) =>
-        (await post("/api/v2/setup/team", { club_id: club.id, league_id: level.id, name: n })).id;
+        (await F.create("team", "/api/v2/setup/team", { club_id: club.id, league_id: level.id, name: n })).id;
       const register = async (names, divisionId) => {
         for (const name of names) {
           const id = await team(name);
-          await post(`/api/setup/seasons/${season.id}/team-registrations`,
+          await F.call("team-registrations", `/api/setup/seasons/${season.id}/team-registrations`,
                      { team_id: id, division_id: divisionId });
         }
       };
@@ -354,11 +364,11 @@ async function checkViewport(browser, viewport) {
       await register(["South 1", "South 2", "South 3", "South 4"], south.id);
       await register(["Odd 1", "Odd 2", "Odd 3", "Odd 4", "Odd 5"], odd.id);
       await register(["Pair 1", "Pair 2"], pair.id);
-      const venue = await post("/api/setup/venue", { name: "Arena", league_id: league.id });
+      const venue = await F.create("venue", "/api/setup/venue", { name: "Arena", league_id: league.id });
       // Without an active SeasonVenueAccess grant the league-scoped scheduler
       // filters out every slot as "not assigned to this season".
-      await post(`/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
-      const rink = await post("/api/setup/rink", { venue_id: venue.id, name: "Rink 1" });
+      await F.call("season venue-access grant", `/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
+      const rink = await F.create("rink", "/api/setup/rink", { venue_id: venue.id, name: "Rink 1" });
       // One slot per DAY, never per hour: two meetings of the same pair must
       // not be refused as a team double-booking (#373).
       const pad = (n) => String(n).padStart(2, "0");
@@ -366,7 +376,7 @@ async function checkViewport(browser, viewport) {
         const d = new Date(`${day}T08:00:00Z`);
         d.setUTCDate(d.getUTCDate() + i);
         const iso = `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
-        await post("/api/setup/ice-slot", {
+        await F.call("ice-slot", "/api/setup/ice-slot", {
           rink_id: rink.id, start_time: `${iso}T08:00:00+00:00`,
           end_time: `${iso}T09:00:00+00:00`, slot_type: "game",
         });
