@@ -2830,8 +2830,10 @@ class Handler(BaseHTTPRequestHandler):
             # into the Season the BODY names, and a Division is SEASON-OWNED,
             # so the whole unit is judged by the two-axis rule against that
             # Season. The other two import commits (officials/availability,
-            # rinks/ice-slots) name no parent id at all -- they create facility
-            # and person rows by NAME, which carry no axis to compare.
+            # rinks/ice-slots) carry no parent id, and #411 corrected the
+            # conclusion once drawn from that: their NAME and external-ref
+            # keys resolve existing Program-scoped rows, so they are gated by
+            # `ApiService.setup_guarded_import` on the Program axis instead.
             return self._guarded_create(
                 "division", [("season", body.get("season_id") or None)],
                 lambda: api.commit_teams_players_import(
@@ -2841,16 +2843,35 @@ class Handler(BaseHTTPRequestHandler):
         # Pilot onboarding import COMMIT — officials + availability (#94).
         # Server-resolved actor, not the forgeable body field — same fix
         # #93 had to make after review, applied here from the start.
+        #
+        # #411: the session identity is passed as well as the actor, because
+        # this commit is NOT axis-free. `official_code` and `home_club_name`
+        # resolve EXISTING Program-scoped Officials and Clubs, which the
+        # commit updates, REPARENTS, and hangs contacts and availability
+        # windows off — so a name is identity exactly as a parent id is, and
+        # the payload carrying no numeric parent is not evidence of the
+        # contrary. The gate itself lives at `ApiService.setup_guarded_import`
+        # rather than here: unlike `_guarded_create`, the axis-bearing keys are
+        # inside the CSV text, which only the facade has parsed by this point,
+        # and re-parsing it at the transport to answer earlier would be a
+        # second copy of the same rule. The refusals still arrive on the
+        # established wire contracts — `active_context_required` -> 409 and the
+        # generic `not_found` -> 404, both via ERROR_HTTP_STATUS.
         if path == "/api/import/commit/officials-availability":
             return self._send_api(api.commit_officials_availability_import(
-                body, actor_id=user_id))
+                body, actor_id=user_id, user_id=user_id, role=role,
+                scope=scope))
 
         # Pilot onboarding import COMMIT — rinks + ice slots (#95).
         # Server-resolved actor, not the forgeable body field — same fix
         # #93 had to make after review, applied here from the start.
+        # #411: same correction as the officials commit above — `rink_code`
+        # and `venue_name` resolve EXISTING Program-scoped Rinks and Venues,
+        # and the commit reparents them and writes ice onto them.
         if path == "/api/import/commit/rinks-ice-slots":
             return self._send_api(api.commit_rinks_ice_slots_import(
-                body, actor_id=user_id))
+                body, actor_id=user_id, user_id=user_id, role=role,
+                scope=scope))
 
         # Season scheduler v1 (#84, extended #233 Slice G): generate a draft
         # round-robin proposal for a Division, or for a whole League within a

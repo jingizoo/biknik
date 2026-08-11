@@ -44,6 +44,7 @@ from ..domain.errors import (
     ActiveContextRequiredError,
     ConcurrencyConflictError,
     DomainError,
+    IntegrityConflictError,
     NotAuthorizedError,
     NotFoundError,
     ScheduleConflictError,
@@ -71,6 +72,14 @@ from ..services import (
     changed_snapshot_sections,
     material_input_snapshot,
     resolve_scenario_scope,
+)
+# #411: the import-context gate must normalize a lookup key EXACTLY as the
+# commit that writes it does, or the gate is bypassable by whitespace (and
+# "NA" would stop meaning "no Club"). Imported verbatim rather than re-spelled.
+from ..services.setup_service import (
+    _blank as _import_blank,
+    _clean as _import_clean,
+    _no_club as _import_no_club,
 )
 from ..services.scheduler import (
     _active_game_slot_pairs,
@@ -2516,6 +2525,458 @@ class ApiService:
             return exc.to_dict(), None
         raise AssertionError("guarded create retry loop exited without a "
                              "result")
+
+    # ---- #411, THE IMPORT FAMILY: A NAME IS STILL IDENTITY ---------------
+    #
+    # The two spreadsheet commits `/api/import/commit/officials-availability`
+    # and `/api/import/commit/rinks-ice-slots` used to reach their write with
+    # NO gate at all, on the reasoning that their payload carries no parent id
+    # and therefore names no axis. THAT REASONING IS WRONG, and it is wrong on
+    # the REPEAT import rather than the first one:
+    #
+    #   * `official_code` resolves an EXISTING Official by `external_ref` and
+    #     `home_club_name` an EXISTING Club by exact name;
+    #   * `rink_code` resolves an EXISTING Rink by `external_ref` and
+    #     `venue_name` an EXISTING Venue by exact name.
+    #
+    # Those resolved rows already carry a Program axis (`_setup_target_edges`
+    # walks it: a Club through its Teams, an Official through its home Club
+    # and every Game it worked, a Venue through its SeasonVenueAccess grants
+    # and its legacy Program-holding `league_id`, a Rink through its Venue),
+    # and the commits then UPDATE and REPARENT them — `official.home_club_id`
+    # and `rink.venue_id` are both overwritten — and hang contacts,
+    # availability windows, ice slots, an import batch and audit rows off
+    # them. A lookup KEY is an identity handle exactly like a numeric FK, so an
+    # operator with no saved selection, or a stale one, could match a
+    # Program-scoped key and receive a successful durable write into a Program
+    # they never chose.
+    #
+    # THE SPLIT IS ON THE RESOLUTION, NOT ON THE PAYLOAD SHAPE. Treating either
+    # endpoint as a whole-endpoint zero-axis root is the defect; treating it as
+    # a whole-endpoint axis-bearing create would break the bootstrap that
+    # `tests/test_zero_program_bootstrap_scoping.py` and the pilot onboarding
+    # wizard both depend on (the FIRST import into a fresh install, where
+    # nothing matches anything and every row is genuinely new). So the payload
+    # is classified by what its keys actually RESOLVE TO:
+    #
+    #   * NOTHING in the payload resolves to a persisted row -> genuinely
+    #     axis-free. Returns before `_explicit_selection` is called at all,
+    #     which is what makes "zero `ContextService._fallback` calls on this
+    #     path" a property a spy can MEASURE rather than a claim about a
+    #     status code — the same line the ZERO-AXIS ROOT creates draw.
+    #   * A key resolves but the row it names carries NO Program edge ->
+    #     nothing to compare, so the import proceeds. Same clause, same
+    #     wording, same reason as `_create_parent_is_axis_free`: the ruling
+    #     says "compare the SAVED Program against the PARENT's Program", and
+    #     on a Program-LESS install there is no Program to select, so any
+    #     stronger reading makes the pilot wizard's own repeat import
+    #     UNSATISFIABLE rather than merely strict. The saved row is still READ
+    #     on this path (it is what proves nothing needs comparing), but no
+    #     resolver fallback is consulted, so both halves stay spy-measurable.
+    #   * A key resolves to a row that DOES carry a Program edge ->
+    #     PROGRAM-AXIS, matching the existing `_CREATE_PROGRAM_AXIS`
+    #     classification of venue / rink / ice_slot / official and its stated
+    #     rationale: facility Season edges are ACCESS GRANTS and an Official
+    #     outlives every Season, so no saved Season is demanded for either
+    #     endpoint.
+    #
+    # FAIL CLOSED ON EVERYTHING THAT DOES NOT DETERMINE ONE AXIS. The keys can
+    # disagree in four distinct ways and all four take the SAME stable 409 as
+    # the missing/stale-context case rather than a guess:
+    #
+    #   1. ROW VS ROW — one sheet naming a Program-A club and a Program-B club,
+    #      or a Program-A venue and a Program-B venue. Nothing constrains the
+    #      rows of one upload to a single Program.
+    #   2. ONE KEY, MANY PROGRAMS — a Club really does own "Teams across
+    #      Programs and Leagues"; an Official who has worked Games in two
+    #      Programs carries both; a Venue's grants can span Programs and can
+    #      disagree with its legacy `league_id`.
+    #   3. SOURCE VS DESTINATION — the REPARENT names two axes in one row. A
+    #      Program-A rink moved onto a Program-B venue spans; a Program-A rink
+    #      moved onto a brand-new unlinked venue silently EXITS Program A, and
+    #      that must not be admitted merely because the destination has no axis
+    #      to compare. Both halves are covered because a matched Rink's edges
+    #      ARE its CURRENT Venue's edges and a matched Official's edges include
+    #      its CURRENT home Club's, so the source axis is in `targets` already.
+    #   4. LINKED BUT UNJUDGEABLE — `saw_link` True with an EMPTY edge set (a
+    #      dangling FK, or `_setup_target_edges`'s cross-Program disagreement
+    #      branches). The mutation family already refuses this; so does this.
+    #
+    # A DANGLING REFERENCE IS A NOT-FOUND, NOT A REPORT. `official_code` on the
+    # `official_availability` sheet is a pure REFERENCE — the sheet exists so
+    # an operator can "import officials once, then import availability windows
+    # in a separate later commit", so the code MUST already name a persisted
+    # Official. Before this gate, a code that resolved let the commit proceed
+    # while a code that resolved to nothing produced a validation report naming
+    # it, computed from `store.all_officials()` across the WHOLE install — an
+    # existence oracle over every Program's officials, emitted before any
+    # context decision existed. Now an unresolvable reference answers the same
+    # generic `"<Label> <key> not found."` a key resolving into ANOTHER
+    # Program answers, and both sit behind the 409, so an unselected caller
+    # learns nothing at all and a selected one cannot tell "exists elsewhere"
+    # from "never existed".
+    #
+    # WHAT IS DELIBERATELY *NOT* CLAIMED. A key that resolves to NOTHING on the
+    # `officials` / `rinks` sheets is a genuine CREATE and still proceeds (that
+    # is the bootstrap). Because `external_ref` is globally unique by index,
+    # "this code is already taken somewhere" is observable from the import
+    # surface no matter how this gate is written; what the gate guarantees is
+    # that it can never be observed by WRITING into the row that holds it.
+    _IMPORT_PROGRAM_MESSAGE = (
+        "Select the Program these records belong to before importing them.")
+
+    # Every import commit that resolves persisted keys, and nothing else. A
+    # kind absent here has no classification and raises rather than skipping
+    # the gate — the same fail-closed posture `_setup_target_record` takes for
+    # an unrecognized kind.
+    _IMPORT_AXIS_KINDS = frozenset({"officials_availability",
+                                    "rinks_ice_slots"})
+
+    # Resolved-key kind -> the noun the FACADE's own NotFoundError uses, so a
+    # cross-Program refusal is byte-identical to a genuinely absent key.
+    _IMPORT_KEY_LABELS = {
+        "official": "Official", "club": "Club",
+        "venue": "Venue", "rink": "Rink",
+    }
+
+    @staticmethod
+    def _import_rows(sheets, name):
+        """The dict rows of one sheet, defensively — this gate runs BEFORE
+        `validate_import`, so it must survive a payload that validation would
+        later reject rather than raising a shape error that would itself be a
+        pre-context answer."""
+        rows = (sheets or {}).get(name)
+        if not isinstance(rows, list):
+            return []
+        return [row for row in rows if isinstance(row, dict)]
+
+    def _import_axis_targets(self, import_kind, sheets):
+        """``(targets, dangling)`` — every PERSISTED row this payload's lookup
+        keys resolve to, and every pure REFERENCE key that resolves to nothing.
+
+        ``targets`` entries are ``(kind, key, record_id, parent)`` where
+        ``parent`` is the ``(kind, id)`` of the resolved row's CURRENT parent
+        (a matched Official's home Club, a matched Rink's Venue) or None. The
+        parent is carried for the LOCK ONLY: its axis is already inside the
+        record's own edges, so it is never compared twice.
+
+        Normalization is imported VERBATIM from the commit implementations
+        (`_clean` / `_blank` / `_no_club`) rather than re-spelled here. A gate
+        that trimmed differently from the writer would be bypassable by
+        whitespace, and "NA" must keep meaning "no Club" instead of resolving
+        a Club literally named NA.
+
+        Lookup ORDER also mirrors each writer exactly: the Club and Venue
+        by-name matches take the FIRST row of that name the store yields,
+        which is what `_find_or_create_import_club` and the venue match do;
+        the Rink by-`external_ref` map is built the same way the commit builds
+        it. (Both `external_ref` columns are uniquely indexed, so the
+        distinction is belt-and-braces.)"""
+        if import_kind not in self._IMPORT_AXIS_KINDS:
+            raise ValueError(f"#411: unclassified import kind {import_kind!r}")
+        targets, dangling = [], []
+
+        if import_kind == "officials_availability":
+            officials_by_ref = {}
+            for official in self.store.all_officials():
+                if official.external_ref:
+                    officials_by_ref.setdefault(official.external_ref, official)
+            clubs_by_name = {}
+            for club in self.store.all_clubs():
+                clubs_by_name.setdefault(club.name, club)
+
+            codes_in_sheet = set()
+            for row in self._import_rows(sheets, "officials"):
+                raw_code = row.get("official_code")
+                if not _import_blank(raw_code):
+                    code = _import_clean(raw_code)
+                    codes_in_sheet.add(code)
+                    official = officials_by_ref.get(code)
+                    if official is not None:
+                        # UPDATE + REPARENT of a persisted Official. Its edges
+                        # already carry the SOURCE axis (its current home Club
+                        # plus every Game it has worked).
+                        targets.append(("official", code, official.id,
+                                        ("club", official.home_club_id)))
+                raw_club = row.get("home_club_name")
+                if not _import_no_club(raw_club):
+                    name = _import_clean(raw_club)
+                    club = clubs_by_name.get(name)
+                    if club is not None:
+                        # The DESTINATION axis: a matched Club is where both
+                        # the updated and the brand-new Official land, so a
+                        # "new" Official is born inside Program A whenever the
+                        # club name matched a Program-A Club.
+                        targets.append(("club", name, club.id, None))
+
+            for row in self._import_rows(sheets, "official_availability"):
+                raw_code = row.get("official_code")
+                if _import_blank(raw_code):
+                    continue
+                code = _import_clean(raw_code)
+                if code in codes_in_sheet:
+                    continue        # resolved by THIS upload's officials sheet
+                official = officials_by_ref.get(code)
+                if official is None:
+                    # A pure REFERENCE that names nothing. See the block
+                    # comment: this is a not-found, never a report.
+                    dangling.append(("official", code))
+                else:
+                    targets.append(("official", code, official.id,
+                                    ("club", official.home_club_id)))
+            return targets, dangling
+
+        rinks_by_ref = {rink.external_ref: rink
+                        for rink in self.store.all_rinks()
+                        if rink.external_ref}
+        venues_by_name = {}
+        for venue in self.store.all_venues():
+            venues_by_name.setdefault(venue.name, venue)
+        for row in self._import_rows(sheets, "rinks"):
+            raw_code = row.get("rink_code")
+            if not _import_blank(raw_code):
+                code = _import_clean(raw_code)
+                rink = rinks_by_ref.get(code)
+                if rink is not None:
+                    # UPDATE + REPARENT of a persisted Rink; its edges ARE its
+                    # CURRENT Venue's, i.e. the SOURCE axis it would leave.
+                    targets.append(("rink", code, rink.id,
+                                    ("venue", rink.venue_id)))
+            raw_venue = row.get("venue_name")
+            if not _import_blank(raw_venue):
+                name = _import_clean(raw_venue)
+                venue = venues_by_name.get(name)
+                if venue is not None:
+                    targets.append(("venue", name, venue.id, None))
+        # `ice_slots[].rink_code` is constrained SHEET-INTERNALLY to a row of
+        # this same upload's rinks sheet, so it contributes no independent
+        # axis — it only PROPAGATES whichever axis that rinks row resolved to,
+        # which is already in `targets` above.
+        return targets, dangling
+
+    def _import_context_error(self, import_kind, sheets, user_id, role, scope,
+                              lock=False):
+        """``(error, refused_key)`` — the #411 IMPORT refusal, or
+        ``(None, None)``. ``refused_key`` is a ``(kind, key)`` pair the caller
+        renders as the generic ``"<Label> <key> not found."``.
+
+        ORDER IS THE CONTRACT, and it is the same order the create family
+        already keeps: the 409 for an unchosen or stale axis is decided and
+        returned BEFORE any key's existence is confirmed or denied, and before
+        the commit's own store-backed passes run — `validate_import`'s policy
+        advisories read another Program's ice slots, games and curfew policy,
+        and `validate_official_availability` reads every Program's officials.
+        All of that now sits behind this gate.
+
+        LOCK ORDER, when ``lock=True``: ActiveContext FIRST, then every
+        resolved row and its current parent in canonical ``(kind, id)`` order.
+        Rinks therefore lock in ascending id within their kind, which is the
+        order `commit_rinks_ice_slots_import` and `commit_ice_availability`
+        both already take, so this cannot invert against them.
+
+        ICE SLOTS ARE NOT LOCKED SEPARATELY, and that is the right grain
+        rather than an omission: an `ice_slots` row carries no persisted key of
+        its own (it is matched by the natural ``(rink_id, start, end)`` tuple
+        inside this same upload's rinks sheet) and an IceSlot's edges are its
+        Rink's verbatim, so nothing about a slot can move the axis while its
+        Rink is held. The RINK row lock is the serialization point
+        `commit_ice_availability` and `create_game` already take before
+        touching ice, so holding it is what keeps a concurrent booking from
+        changing the answer.
+
+        The keys are then RE-RESOLVED under those locks and compared with the
+        unlocked pass. A name or `external_ref` can REMAP — a row deleted and
+        another created under the same key — so a plan frozen before the locks
+        could otherwise authorize against a row that was never locked. A
+        mismatch raises `ConcurrencyConflictError`, and the guarded retry
+        re-reads a snapshot that includes the winner. Same idiom, same reason
+        as `commit_rinks_ice_slots_import`'s own `_rink_plan` freeze.
+
+        ``role is None`` — the seeds, the demo/acceptance harnesses and the
+        facade-level tests — is completely ungated and takes no context read,
+        matching every other #409 gate."""
+        if role is None:
+            return None, None
+        targets, dangling = self._import_axis_targets(import_kind, sheets)
+        if not targets and not dangling:
+            # GENUINELY AXIS-FREE: no key in this payload names a persisted
+            # row, so there is nothing to compare a selection against. Return
+            # before ANY context read — this is the line the fallback spy
+            # measures.
+            return None, None
+        program, _season = self._explicit_selection(
+            user_id, role, scope, lock=lock)
+        if lock:
+            lock_rows = {(kind, record_id)
+                         for kind, _key, record_id, _parent in targets}
+            lock_rows |= {parent for _k, _key, _rid, parent in targets
+                          if parent and parent[1]}
+            for kind, record_id in sorted(lock_rows):
+                self._lock_setup_row(kind, record_id)
+            fresh_targets, fresh_dangling = self._import_axis_targets(
+                import_kind, sheets)
+            # Compared as text: a concurrent reparent can leave two otherwise
+            # equal entries whose `parent` is None on one side and a tuple on
+            # the other, and ordering those directly is a TypeError rather than
+            # the drift signal it actually is.
+            if (sorted(map(repr, fresh_targets)) != sorted(map(repr, targets))
+                    or sorted(map(repr, fresh_dangling))
+                    != sorted(map(repr, dangling))):
+                raise ConcurrencyConflictError(
+                    "A record this import references changed while the import "
+                    "was being authorized; please retry.",
+                    {"reason": "import_key_remapped"})
+        # The per-key axis, read once, under the locks.
+        per_key = []
+        for kind, key, record_id, _parent in targets:
+            record = self._setup_target_record(kind, record_id)
+            if record is None:
+                # It resolved a moment ago and is gone under our own lock.
+                raise ConcurrencyConflictError(
+                    "A record this import references was removed while the "
+                    "import was being authorized; please retry.",
+                    {"reason": "import_key_vanished"})
+            edges, saw_link = self._setup_target_edges(kind, record)
+            per_key.append((kind, key, {edge[0] for edge in edges if edge[0]},
+                            saw_link))
+
+        # (A) THE PRE-DISCLOSURE GATE. Before any key's identity is confirmed
+        #     or denied to the caller: is the Program axis this payload
+        #     consumes explicitly chosen and still valid?
+        #
+        #     A resolved row that carries NO Program edge has nothing to
+        #     compare, so it does not make the import context-requiring. That
+        #     is not a softening; it is what the ruling's PROGRAM-AXIS clause
+        #     literally says ("compare the SAVED Program against the PARENT's
+        #     Program"), it is the same reading `_create_parent_is_axis_free`
+        #     already applies one family over, and it is the only reading the
+        #     bootstrap survives: on a Program-LESS install there is no Program
+        #     to select, so demanding one would make the pilot onboarding
+        #     wizard's own second import UNSATISFIABLE rather than merely
+        #     strict (`tests/test_zero_program_bootstrap_scoping.py` pins that
+        #     an Arena Manager works exactly there). A row that is LINKED but
+        #     whose Program cannot be resolved is never read as axis-free, and
+        #     a dangling pure REFERENCE fails closed here so that "exists in
+        #     another Program" and "never existed" stay one answer.
+        if program is None:
+            for _kind, _key, row_programs, saw_link in per_key:
+                if row_programs or saw_link:
+                    return (ActiveContextRequiredError(
+                        self._IMPORT_PROGRAM_MESSAGE), None)
+            if dangling:
+                return (ActiveContextRequiredError(
+                    self._IMPORT_PROGRAM_MESSAGE), None)
+            return None, None       # every resolved key binds NO Program
+
+        # (B) ONLY NOW, with the explicit axis valid, is the comparison made.
+        programs, foreign = set(), None
+        for kind, key, row_programs, saw_link in per_key:
+            if saw_link and not row_programs:
+                # LINKED BUT UNJUDGEABLE — never read as axis-free.
+                return (ActiveContextRequiredError(
+                    self._IMPORT_PROGRAM_MESSAGE), None)
+            if row_programs and program.id not in row_programs and foreign is None:
+                foreign = (kind, key)
+            programs |= row_programs
+        if len(programs) > 1:
+            # The keys SPAN Programs (row-vs-row, one key carrying several, or
+            # a reparent whose source and destination differ). Never guess.
+            #
+            # This is EQUALITY, not containment, and the difference is load
+            # bearing. Containment — "every key admits the saved Program" —
+            # would let a Club that owns Teams in both A and B through on a
+            # saved A, silently writing an Official into a row that is also
+            # Program B's. The payload must determine ONE axis, and it does
+            # not, so this takes the SAME 409 as an unchosen selection rather
+            # than resolving the ambiguity in the operator's favour. It is
+            # placed BEFORE the `foreign` not-found so a spanning payload can
+            # never be answered by a 404 that would confirm which of its keys
+            # the caller may see.
+            return ActiveContextRequiredError(self._IMPORT_PROGRAM_MESSAGE), None
+        if foreign is not None:
+            return None, foreign
+        if dangling:
+            return None, dangling[0]
+        # Either every resolved key sits in the saved Program, or every one of
+        # them is genuinely unlinked and binds the write to no Program at all.
+        return None, None
+
+    def setup_import_context_error(self, import_kind, sheets, user_id, role,
+                                   scope):
+        """PREFLIGHT ONLY: ``(refusal_dict_or_None, refused_key_or_None)``.
+
+        Exposed for callers that want the cheap lock-free answer. It is NOT the
+        security boundary: `setup_guarded_import` re-decides the identical rule
+        under the ActiveContext ROW LOCK and the resolved rows' locks, inside
+        the transaction that performs the commit and its audits."""
+        error, refused = self._import_context_error(
+            import_kind, sheets, user_id, role, scope)
+        return (None if error is None else error.to_dict()), refused
+
+    def setup_guarded_import(self, import_kind, sheets, mutation, user_id,
+                             role, scope):
+        """THE boundary for an import COMMIT: decide #411's key-to-axis
+        comparison under the ActiveContext row lock and the resolved rows'
+        locks, and run ``mutation`` — validation, every entity write, the
+        contact/availability/slot rows, the import batch and every audit entry
+        — inside that same transaction.
+
+        Returns the commit payload, or a structured error dict:
+        the #411 409 itself, the generic not-found for a key outside the saved
+        Program (or one that resolves to nothing), or any domain error the
+        commit raised. Every one of those is RAISED rather than returned from
+        inside the transaction, so the refusal provably costs zero entity,
+        contact, availability, rink, slot, import-batch and audit rows.
+
+        ``role is None`` and a payload whose keys resolve to nothing take no
+        lock and read no context — but the transaction is still opened for the
+        latter, deliberately: "nothing resolves" is a STORE READ, and deciding
+        it outside the transaction that then writes would reintroduce exactly
+        the check/use gap this gate exists to close (a concurrent writer
+        creating the very `official_code` this payload is about, between the
+        decision and the write).
+
+        The commit implementations run their own bounded retry loops for the
+        unique-index backstop; those now execute inside this transaction,
+        where an aborted statement poisons the whole nest. `IntegrityConflictError`
+        is therefore retried HERE as well, from a fresh transaction — the same
+        bounded shape, one level up."""
+        if role is None:
+            return mutation()
+        try:
+            for attempt in range(self._GUARDED_MUTATION_RETRIES):
+                try:
+                    return self._guarded_import_attempt(
+                        import_kind, sheets, mutation, user_id, role, scope)
+                except _SetupMutationRefused as exc:
+                    return exc.payload      # rolled back: nothing happened
+                except (ConcurrencyConflictError, IntegrityConflictError):
+                    if attempt == self._GUARDED_MUTATION_RETRIES - 1:
+                        raise
+        except DomainError as exc:
+            # The #411 refusals themselves (raised so the transaction rolls
+            # back) and any domain error the commit raised inside it.
+            return exc.to_dict()
+        raise AssertionError("guarded import retry loop exited without a "
+                             "result")
+
+    def _guarded_import_attempt(self, import_kind, sheets, mutation, user_id,
+                                role, scope):
+        """One all-or-nothing attempt. See ``setup_guarded_import``."""
+        with self.store.transaction(isolation="SERIALIZABLE"):
+            error, refused = self._import_context_error(
+                import_kind, sheets, user_id, role, scope, lock=True)
+            if error is not None:
+                raise error
+            if refused is not None:
+                kind, key = refused
+                raise NotFoundError(
+                    f"{self._IMPORT_KEY_LABELS.get(kind, kind)} {key} "
+                    "not found.")
+            payload = mutation()
+            if isinstance(payload, dict) and "error" in payload:
+                raise _SetupMutationRefused(payload)
+            return payload
 
     # The permission each Setup workflow's own primary action needs (#330
     # review round 1 finding 1). Facilities is MANAGE_ARENA — the one
@@ -10765,8 +11226,9 @@ class ApiService:
     # ====================================================================
     @catch
     def commit_officials_availability_import(self, sheets_csv: dict,
-                                              actor_id: Optional[str] = None
-                                              ) -> dict:
+                                              actor_id: Optional[str] = None,
+                                              user_id: Optional[str] = None,
+                                              role=None, scope=None) -> dict:
         """Commit step 3 of the pilot onboarding import wizard.
 
         Parses the present ``officials_csv``/``official_availability_csv``
@@ -10777,6 +11239,16 @@ class ApiService:
         ice_slots commit is out of scope here (#93 already owns
         teams/players; rinks/ice_slots are #95) — reject the request
         outright rather than silently dropping operator-submitted data.
+
+        #411: `official_code` and `home_club_name` RESOLVE existing
+        Program-scoped Officials and Clubs, which the commit then updates and
+        REPARENTS, so this is not the axis-free root it was classified as.
+        `setup_guarded_import` decides the Program comparison under the
+        ActiveContext lock and the resolved rows' locks, in the same
+        transaction as the write — and before the commit's own
+        `validate_official_availability` pass, which reads every Program's
+        officials. `role is None` (seeds, harnesses, facade tests) is ungated
+        exactly as everywhere else.
         """
         sheets_csv = sheets_csv or {}
         unsupported = [key for key in
@@ -10796,15 +11268,20 @@ class ApiService:
             if not isinstance(text, str):
                 raise ValidationError(f"{key} must be a CSV text string.")
             sheets[name] = parse_csv_text(text)
-        return self.setup.commit_officials_availability_import(
-            sheets, actor_id=actor_id)
+        return self.setup_guarded_import(
+            "officials_availability", sheets,
+            lambda: self.setup.commit_officials_availability_import(
+                sheets, actor_id=actor_id),
+            user_id, role, scope)
 
     # ====================================================================
     # Pilot onboarding import — rinks + ice slots commit (#95)
     # ====================================================================
     @catch
     def commit_rinks_ice_slots_import(self, sheets_csv: dict,
-                                      actor_id: Optional[str] = None) -> dict:
+                                      actor_id: Optional[str] = None,
+                                      user_id: Optional[str] = None,
+                                      role=None, scope=None) -> dict:
         """Commit step 4 of the pilot onboarding import wizard.
 
         Parses the present ``rinks_csv``/``ice_slots_csv`` text (same shape
@@ -10814,6 +11291,16 @@ class ApiService:
         Teams/players (#93) and officials/availability (#94) are out of
         scope here — reject the request outright rather than silently
         dropping operator-submitted data.
+
+        #411: `rink_code` and `venue_name` RESOLVE existing Program-scoped
+        Rinks and Venues, which the commit then updates and REPARENTS (and
+        hangs ice slots off), so this is not the axis-free root it was
+        classified as. `setup_guarded_import` decides the Program comparison
+        under the ActiveContext lock and the resolved rows' locks, in the same
+        transaction as the write — and BEFORE `validate_import(store=...)`,
+        whose policy advisories otherwise disclose another Program's ice
+        inventory, curfew policy and neighbouring-slot timing, and before the
+        booked-slot / overlap gates that name an existing slot id.
         """
         sheets_csv = sheets_csv or {}
         unsupported = [key for key in
@@ -10833,5 +11320,8 @@ class ApiService:
             if not isinstance(text, str):
                 raise ValidationError(f"{name}_csv must be a CSV text string.")
             sheets[name] = parse_csv_text(text)
-        return self.setup.commit_rinks_ice_slots_import(
-            sheets, actor_id=actor_id)
+        return self.setup_guarded_import(
+            "rinks_ice_slots", sheets,
+            lambda: self.setup.commit_rinks_ice_slots_import(
+                sheets, actor_id=actor_id),
+            user_id, role, scope)

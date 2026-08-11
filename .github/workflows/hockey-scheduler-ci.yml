@@ -265,6 +265,7 @@ jobs:
           node --check hockey-scheduler/e2e/seven-area-navigation.js
           node --check hockey-scheduler/e2e/setup-progress-conflict-attention.js
           node --check hockey-scheduler/e2e/facilities-venue-access.js
+          node --check hockey-scheduler/e2e/context-switch-read-settlement.js
           node --check hockey-scheduler/e2e/setup-prerequisite-floors.js
           node --check hockey-scheduler/e2e/setup-card-write-identity.js
           node --check hockey-scheduler/e2e/setup-state-matrix.js
@@ -316,7 +317,10 @@ jobs:
         # runner.
         include:
           - shard: 1
-            scripts: "smoke setup-claim onboarding-wizard hierarchy-import season-participation hierarchy-duplicate-registration season-rollover season-dates scheduling-policy breakpoint-boundaries shell-accessibility-coverage seven-area-navigation setup-state-matrix"
+            # context-switch-read-settlement lands HERE deliberately: shard 1 is
+            # where the 390px `venue-candidates -> 404` was caught, so its
+            # regression runs on the same shard that produced the evidence.
+            scripts: "smoke setup-claim onboarding-wizard hierarchy-import season-participation hierarchy-duplicate-registration season-rollover season-dates scheduling-policy breakpoint-boundaries shell-accessibility-coverage seven-area-navigation setup-state-matrix context-switch-read-settlement"
           - shard: 2
             scripts: "team-division-participation scheduler-empty-state scheduler-already-scheduled scheduler-team-overlap scheduler-games-per-team scheduler-turnaround allowed-venues venue-access-cleanup facilities-venue-access venue-sharing permanent-teams player-edit accessibility-foundations setup-workflow-hub setup-v2-context-scope context-identity-withdrawal"
           - shard: 3
