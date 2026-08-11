@@ -20,6 +20,42 @@ from ..domain.enums import SeasonStatus
 from ..domain.errors import NotFoundError, ValidationError
 
 
+def season_is_historical(season, now) -> bool:
+    """The ONE definition of "this Season is history" (#159 + #283 rule 10).
+
+    There are TWO INDEPENDENT routes into history and both count:
+
+    * the explicit **ARCHIVED** lifecycle state (#159). ``archive_season``
+      deliberately does *not* invent an ``end_date``, so an archived Season is
+      routinely undated (or even future-dated); and
+    * a real ``end_date`` that has **definitely** passed (#283 rule 10).
+
+    A missing/undated, non-archived Season is current/future — the safe default
+    — until an operator resolves it. ``season`` may be ``None`` (an unresolvable
+    Season is not history).
+
+    Every historicity decision goes through this one function, and the reason is
+    concrete: the transfer WRITE path freezes a historical Season's registration
+    instead of moving it, so the standings READERS must stop re-checking the
+    Team's *current* permanent League for exactly the same Seasons. When the
+    expression was written out twice the two halves drifted — the readers tested
+    only the date — and a later, entirely legitimate Team transfer retroactively
+    deleted the Team from, and zeroed its opponent's record in, an ARCHIVED
+    Season's standings. Do not write the expression a third time; call this.
+
+    ``now`` is passed in rather than read here so a caller that already
+    snapshotted the clock (the transfer path holds one ``now`` across every
+    Season it locked; the import preflight holds one for the whole batch) makes
+    a decision that cannot straddle a clock tick.
+    """
+    if season is None:
+        return False
+    if season.status == SeasonStatus.ARCHIVED:
+        return True
+    end = season.end_date
+    return end is not None and now is not None and end < now
+
+
 def require_active_season(store, season_id: str):
     """Return the (row-locked) Season, or raise if it is missing/archived.
 

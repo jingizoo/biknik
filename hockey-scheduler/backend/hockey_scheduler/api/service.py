@@ -6056,20 +6056,22 @@ class ApiService:
         # The division roster comes from active SeasonTeamRegistrations (#180
         # shared guard), not the legacy Team.division_id — a team plays in a
         # division only for the season(s) it is registered there.
-        # #283 rule 10: on a DEFINITELY-ended Season, historical standings keep a
-        # validly-transferred Team (its permanent League has since changed), so
-        # the current-ownership check that live scheduling/draft applies is
+        # #283 rule 10 + #159: on a HISTORICAL Season, historical standings keep
+        # a validly-transferred Team (its permanent League has since changed),
+        # so the current-ownership check that live scheduling/draft applies is
         # skipped here — matching _standings_for_league_season. A live Season
-        # still excludes a same-Program cross-League drift.
+        # still excludes a same-Program cross-League drift. "Historical" is the
+        # shared SetupService.season_is_historical predicate — ARCHIVED *or*
+        # definitely end-dated, the exact question the transfer write path asks
+        # when it decides to freeze the registration rather than move it.
         division = self.store.get_division(division_id)
         league_season = (self.store.get_league_season(division.league_season_id)
                          if division and division.league_season_id else None)
         season = (self.store.get_season(league_season.season_id)
                   if league_season else None)
-        season_ended = (season is not None and season.end_date is not None
-                        and season.end_date < self.setup.clock())
+        season_is_history = self.setup.season_is_historical(season)
         team_ids = self.setup.registered_team_ids_in_division(
-            division_id, enforce_team_league=not season_ended)
+            division_id, enforce_team_league=not season_is_history)
         teams = [t for t in (self.store.get_team(tid) for tid in team_ids)
                  if t is not None]
         rows = {t.id: {"team_id": t.id, "team_name": t.name, "gp": 0,
@@ -6155,20 +6157,22 @@ class ApiService:
         # ``league_season_id`` (every row from ``registrations_for_league_season``
         # already has it). Whether the Team's CURRENT permanent ``league_id`` must
         # still agree depends on the Season:
-        #   * A DEFINITELY-ENDED Season is history (#283 rule 10): a Team validly
-        #     transferred to another League afterward keeps its historical
-        #     registration/Games/results here and must still appear in this table,
-        #     so current ownership is NOT re-checked (same "ended" test the
-        #     transfer uses to leave the registration in place).
-        #   * An undated/current/future Season is live: an active registration
-        #     whose Team's current permanent League differs from this League is a
-        #     rule-7 violation (e.g. a migration-preserved current registration in
-        #     L1 while an operator decision moved the Team to L2) and is EXCLUDED,
-        #     never counted in the wrong League's standings.
+        #   * A HISTORICAL Season — ARCHIVED (#159) *or* definitely end-dated
+        #     (#283 rule 10) — is frozen: a Team validly transferred to another
+        #     League afterward keeps its historical registration/Games/results
+        #     here and must still appear in this table, so current ownership is
+        #     NOT re-checked. This is the SAME ``season_is_historical`` question
+        #     the transfer uses to leave the registration in place; asking a
+        #     narrower one here is what let a later transfer rewrite history.
+        #   * An undated/current/future ACTIVE Season is live: an active
+        #     registration whose Team's current permanent League differs from
+        #     this League is a rule-7 violation (e.g. a migration-preserved
+        #     current registration in L1 while an operator decision moved the
+        #     Team to L2) and is EXCLUDED, never counted in the wrong League's
+        #     standings.
         # A registration whose Team no longer exists is an orphan and is skipped.
         season = self.store.get_season(season_id)
-        season_ended = (season is not None and season.end_date is not None
-                        and season.end_date < self.setup.clock())
+        season_is_history = self.setup.season_is_historical(season)
         team_ids = set()
         for reg in self.store.registrations_for_league_season(ls.id):
             if not reg.active:
@@ -6176,7 +6180,7 @@ class ApiService:
             team = self.store.get_team(reg.team_id)
             if team is None:
                 continue
-            if not season_ended and team.league_id != league_id:
+            if not season_is_history and team.league_id != league_id:
                 continue  # live-Season rule-7 mismatch — never counted here
             team_ids.add(reg.team_id)
         teams = [t for t in (self.store.get_team(tid) for tid in team_ids)

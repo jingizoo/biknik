@@ -132,6 +132,60 @@ registration in a Season that is archived under the lock is frozen history and
 never moved; a concurrent archive cannot slip between the status read and the
 registration rewrite.
 
+### Two independent routes into "history" — and one predicate
+
+A Season becomes **history** by *either* of two routes, and they are
+independent:
+
+1. the explicit **ARCHIVED** lifecycle state (#159) — and `archive_season`
+   deliberately does **not** set `end_date`, so an archived Season is routinely
+   **undated**, or even future-dated; or
+2. a real **`end_date` that has definitely passed** (#283 rule 10) — on an
+   `active` Season that simply ran out.
+
+Neither implies the other. Every historicity test must therefore accept **both**,
+and there is exactly one place that decides it:
+**`services/season_guard.season_is_historical(season, now)`**, reached from the
+service layer as `SetupService.season_is_historical(season, now=None)` (which
+defaults `now` to the service clock). `now` is a parameter, not a fresh
+`clock()` call, so a caller holding a snapshot across several Seasons makes one
+decision that cannot straddle a tick.
+
+Historicity flips a **read** rule, never a write rule: on a historical Season the
+live rule-7 check "the Team's *current* permanent League must still be this
+League" is **not** re-applied, because the transfer write path froze that
+registration in place rather than moving it. Writes stay refused either way —
+an archived Season answers `season_archived` regardless (see above), so widening
+what counts as history can only widen a **row set**, never authorize a mutation.
+
+The call sites converted so far, all three of which must stay in agreement:
+
+| Site | Role |
+| --- | --- |
+| `services/setup_service.py` `_transfer_team_to_league_inner` | the **write**: freeze a historical registration instead of moving it |
+| `api/service.py` `_standings_for_division` | reader: `enforce_team_league=not season_is_history` |
+| `api/service.py` `_standings_for_league_season` | reader: skip the rule-7 `team.league_id != league_id` exclusion |
+
+This is written down because the halves **had** drifted: the two standings
+readers tested only `end_date`, so an ARCHIVED-but-undated Season read as if it
+were live, and a later legitimate Team transfer retroactively deleted a Team
+from — and zeroed its opponent's record in — that Season's operator *and* public
+standings, in both the Division and the LeagueSeason view. Do not re-derive the
+expression at a fourth site; call the predicate.
+
+#### Known outstanding (NOT delivered here)
+
+* `services/hierarchy_import.py` `_preflight_reassignment_safety` (a2) still
+  re-derives its own historicity expression and has drifted the *other* way,
+  refusing a move the write would have allowed. Converting it is a separate
+  follow-up; this section does not claim it is done.
+* This slice fixes only **which registered Teams** an archived Season's
+  standings are built from. The **points, tiebreak and eligibility rules** are
+  still read live and are **not** version-pinned to the Season, so changing a
+  live points rule *does* still alter archived output. That behaviour is
+  identical with and without the change described here — it is not a regression
+  introduced by it — and pinning rule versions is a separate, larger #159 child.
+
 ## Active-context selection (#159 Slice 2 — backend foundation)
 
 Which Program + Season a user is *working in*, persisted per user in
