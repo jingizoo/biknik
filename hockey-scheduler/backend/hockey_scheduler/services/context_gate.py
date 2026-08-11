@@ -91,9 +91,19 @@ WHAT AN UNAUTHENTICATED CALLER CAN DO WITH THIS, since the arrival ticket is
 taken before identity exists. It can add unbound tickets to the set a switch
 waits on. That is bounded twice over and deliberately: a writer waits only for
 the FINITE set of tickets that already existed when it registered (never for
-later arrivals, so no stream of requests can extend the wait), each such ticket
-lives only until the request finishes ``_resolve_role()``, and the whole wait is
-capped by ``wait_timeout`` regardless. The alternative — registering only after
+later arrivals, so no stream of requests can extend the wait), and the whole
+wait is capped by ``wait_timeout`` regardless. It is also NOT a slowloris seam:
+``do_GET`` is called only after the request line and headers have been fully
+read, so a client that dribbles bytes holds no ticket at all.
+
+Said precisely, because the loose version would be wrong: a ticket that BINDS is
+released before its response is written, so a dead client socket cannot pin it.
+A scoped-read request that never binds — one refused at the authorization
+boundary, or an identity-less demo fallback — keeps its arrival ticket until
+``do_GET`` returns, which includes writing that refusal. That write is a small
+JSON body into the kernel buffer, and the wait bound covers it regardless; it is
+recorded here rather than rounded off to "until ``_resolve_role()`` finishes".
+The alternative — registering only after
 identity — is what falsifier 2 in ``tests/test_context_switch_server_exit.py``
 shows to be broken: it lets a switch commit straight past a read parked inside
 ``_resolve_role()``, which is the most plausible reading of the CI failure.

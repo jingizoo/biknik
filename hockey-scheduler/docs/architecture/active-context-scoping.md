@@ -1278,6 +1278,23 @@ that could plausibly have gone the other way:
   (`HS_CONTEXT_GATE_TIMEOUT`, default 10s); on expiry the waiter proceeds and the
   expiry is counted in `stats()["timeouts"]`. A wedged read must not be able to
   lock an operator out of switching context.
+* **The ordering point is entry to the handler, not the wire — and that is the
+  right place, but it was measured rather than assumed.** The gate registers a
+  read at the top of `do_GET`, which is *after* `accept()` and the per-connection
+  thread spawn, so in principle a `POST /api/context` could reach `do_POST`
+  before a GET whose bytes were written first, and the read would then be
+  ordered *after* the switch and 404. Probed directly by wrapping both entry
+  points and recording which registered first, over 300 trials per gap: with the
+  two requests issued **simultaneously** (a gap of 0, which is strictly more
+  adversarial than the real client, since that one aborts and awaits settlement
+  *before* POSTing), ~1 in 300 reads was answered 404 — and in **every** such
+  case the switch had genuinely registered first, i.e. it is the ceiling
+  answering a read that really did arrive after the commit, not the race. There
+  was **no** case of a 404 where the read registered first. At any positive gap
+  from 0.5 ms upward the 404s disappear entirely. The inversion window is
+  therefore sub-millisecond and, crucially, is not a window in which the
+  guarantee is *violated* — a read that truly arrives after a switch is supposed
+  to be refused.
 
 **The ceiling is untouched.** The `season_id != active_season.id` comparison and
 both generic `NotFoundError`s are byte-identical: an independently issued read

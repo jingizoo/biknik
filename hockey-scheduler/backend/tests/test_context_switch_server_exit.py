@@ -50,7 +50,7 @@ asserts on the gate's own counters (``ContextSwitchGate.stats()``) so "nothing
 was left behind" is measured, not asserted in prose:
 
   1. ``test_concurrent_switches_for_one_user_stay_context_coherent``
-  2. ``test_a_switch_cancelled_while_waiting_leaks_nothing``
+  2. ``test_a_switch_that_fails_or_is_cancelled_while_waiting_leaks_nothing``
   3. ``test_repeated_switching_accumulates_no_waiters``
   4. ``test_a_waiter_cannot_block_forever_on_a_read_that_never_returns``
 
