@@ -71,6 +71,7 @@ from ..store import InMemoryStore
 from .import_validator import validate_import, validate_official_availability
 from .ice_availability import (plan_ice_windows, parse_hhmm,
                                curfew_instant, WEEKDAY_NAMES)
+from . import season_guard
 from .season_guard import require_active_season
 from .league_scope import (
     exact_registration_or_conflict,
@@ -760,6 +761,16 @@ class SetupService:
         self._audit("season_reopened", "season", season_id, actor_id,
                     {"reason": normalized_reason})
         return season
+
+    def season_is_historical(self, season, now=None) -> bool:
+        """Is this Season history? — the service-layer entry point to the one
+        shared predicate, :func:`season_guard.season_is_historical` (ARCHIVED
+        *or* definitely end-dated). Defaults ``now`` to this service's clock so
+        readers need no clock of their own; callers holding a snapshot (the
+        transfer path) pass theirs so a multi-Season decision cannot straddle a
+        tick. See the shared function for why there is exactly one copy."""
+        return season_guard.season_is_historical(
+            season, self.clock() if now is None else now)
 
     def _lock_league_for_binding(self, league_id: str) -> League:
         """Row-lock an existing permanent League before binding it to a Season
@@ -1973,14 +1984,13 @@ class SetupService:
         for reg in fresh_candidates:
             season_id = self._season_of_league_season(reg.league_season_id)
             season = locked_seasons.get(season_id) if season_id else None
-            # A Season is historical only once it has DEFINITELY ended (a real
-            # end_date in the past). A missing/undated Season is treated as
-            # current/future (the safe default) until an operator resolves it.
-            if season is not None and (
-                    season.status == SeasonStatus.ARCHIVED
-                    or (season.end_date is not None and season.end_date < now)):
-                # #159 — an ended OR archived Season is frozen history: never
-                # move its registration (archived may be undated/future).
+            # #159 — an ended OR archived Season is frozen history: never move
+            # its registration (archived may be undated/future). ``now`` is the
+            # single clock snapshot taken for this whole transfer, so a
+            # multi-Season decision cannot straddle a tick. The standings
+            # readers ask ``season_is_historical`` the SAME question, which is
+            # what keeps a frozen registration visible in its own history.
+            if self.season_is_historical(season, now=now):
                 continue
             stranded = self._games_scheduled_for_team_in_season(
                 season_id, team_id)
@@ -4527,8 +4537,10 @@ class SetupService:
 
         ``enforce_team_league`` (default ``True``) keeps the live-scheduling
         rule that a Team must currently belong to the Division's League; pass
-        ``False`` for an ENDED Season's historical standings so a validly
-        transferred Team is still counted (#283 rule 10)."""
+        ``False`` for a HISTORICAL Season's standings so a validly transferred
+        Team is still counted (#283 rule 10 + #159). Callers decide historicity
+        with :meth:`season_is_historical` — never by re-testing ``end_date``,
+        which silently misses an ARCHIVED-but-undated Season."""
         return _registered_team_ids(self.store, division_id,
                                     enforce_team_league=enforce_team_league)
 
