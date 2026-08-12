@@ -45,6 +45,24 @@
 //           picker, every Revoke control and the whole "Revoked venue access"
 //           cleanup section are gone, explicit read-only copy is shown, and
 //           NO /venue-candidates request is issued.
+//   (9) the ARCHIVE-WITHOUT-RE-SELECTION window — the same read-only rule,
+//       reached the way an operator actually reaches it. Step (8) re-selects
+//       the Season after archiving it, which re-fetches /api/context/options;
+//       that is the one sequence in which the client's cached context signal
+//       cannot be stale, which is why (8) passed for months while CI shard 1
+//       kept failing on an undeclared `.../venue-candidates -> 404`. Here a
+//       FOURTH fixture's Season is archived and NOTHING else happens: no
+//       /api/context POST, no reload, no options fetch, just a plain re-render
+//       through the shipped Records/Hierarchy control. The candidate request
+//       must not be issued AT ALL (asserted on the same request log, before
+//       any DOM assertion, so the ledger claim is reachable on the build that
+//       breaks it), the panel must switch to its read-only face, and the
+//       allowed-venues history must survive. The same leg also pins the
+//       SUB-VIEW gate from both sides on a still-writable Season: the Setup
+//       HUB, which has no Allowed-venues panel at all, must request no
+//       candidates, while the HIERARCHY sub-view, which does, must request
+//       them — so "no request" is a property of the surface rather than of a
+//       build that stopped fetching everywhere.
 // Fails on any browser console/page error.
 const { chromium } = require("playwright");
 const { spawn } = require("child_process");
@@ -569,11 +587,204 @@ async function checkViewport(browser, viewport) {
         + `explicit read-only copy: ${archivedPanelText.slice(0, 400)}`);
     }
 
+    // (9) THE STALE-CACHE WINDOW — an archive with NO re-selection after it.
+    //
+    // Step (8) archives and then RE-SELECTS the Season, which re-fetches
+    // /api/context/options and so refreshes the client cache the guards used
+    // to read. That is why (8) passed all along while CI shard 1 kept failing:
+    // the sequence it tests is the one sequence in which the cache is never
+    // stale. The real operator sequence has no re-selection in it — the Season
+    // they are already sitting in becomes archived, and the very next render
+    // decides what to fetch and what to paint.
+    //
+    // `contextOptions` is loaded ONCE per page load and is never re-polled by
+    // render() (app.js says so at its own loadContextOptions call sites), so
+    // in that window the cached `selected.read_only` still read "writable".
+    // The candidate fetch went out and collected the server's deliberate 404 —
+    // the undeclared `.../venue-candidates -> 404` that fails
+    // setup-state-matrix roughly one run in three — and the panel painted an
+    // Allow picker, Revoke buttons and a permanent-cleanup action for writes
+    // that all fail `season_archived`.
+    //
+    // So this leg deliberately does NOTHING between the archive and the
+    // re-render except re-render: no /api/context POST, no reload, no options
+    // fetch. The re-render is driven through the shipped Records/Hierarchy
+    // segmented control, whose handler is a bare `render()`.
+    //
+    // A FRESH Program/Season is used rather than reopening step (8)'s, so this
+    // leg's precondition is established from a genuinely writable surface and
+    // step (8)'s assertions above are left exactly as they were.
+    const fx4 = await page.evaluate(async () => {
+      const F = window.hsFixture;
+      const org = await F.create("staleOrg", "/api/v2/setup/organization",
+        { name: "VA Stale Org" });
+      const program = await F.create("staleProgram", "/api/v2/setup/program",
+        { name: "VA Stale Program", operator_organization_id: org.id });
+      await F.selectProgram("Stale Program only", program.id);
+      const season = await F.create("staleSeason", "/api/v2/setup/season",
+        { program_id: program.id, name: "2032-33" });
+      await F.selectProgramSeason("Stale Program + Season", program.id, season.id);
+      const venue = await F.create("staleVenue", "/api/v2/setup/venue",
+        { name: "VA-STALE-HOME", organization_id: org.id });
+      // One ACTIVE grant, so the archived panel below has real history to
+      // render, and one further Venue left UNGRANTED so the Allow picker has
+      // something to offer while the Season is still writable.
+      const grant = await F.create("staleGrant",
+        `/api/v2/setup/seasons/${season.id}/venue-access`, { venue_id: venue.id });
+      const spare = await F.create("staleSpare", "/api/v2/setup/venue",
+        { name: "VA-STALE-SPARE", organization_id: org.id });
+      return { program: program.id, season: season.id, venue: venue.id,
+               grant: grant.id, spare: spare.id };
+    });
+    if (!fx4.grant || !fx4.spare) {
+      throw new Error(`[${viewport.label}] stale-window fixture did not land: `
+        + JSON.stringify(fx4));
+    }
+
+    // Enter with a FRESH page load, so the context cache genuinely says
+    // "writable" — which is what makes the staleness below real rather than
+    // inherited from step (8).
+    await enterSetup();
+    await page.waitForSelector(`#va-add-${fx4.season}`, { timeout: 15000 });
+
+    // A render is fired by a click and settles on its own, so the leg waits
+    // until the candidate traffic has actually stopped before archiving.
+    // Otherwise a render still in flight — one that read the hierarchy while
+    // the Season was genuinely writable — could dispatch its candidate request
+    // after the archive lands, and this leg would be measuring an ordinary
+    // concurrent mutation instead of the stale-cache defect it is about.
+    const settleCandidateTraffic = async () => {
+      let last = -1;
+      while (last !== candidateRequests.length) {
+        last = candidateRequests.length;
+        await page.waitForTimeout(750);
+      }
+    };
+
+    // GATE (i), on a Season that is still perfectly WRITABLE: the Setup HUB
+    // has no Allowed-venues panel — `renderSeasonParticipation` is reached
+    // only from the hierarchy sub-view — so a hub render must ask for no grant
+    // candidates at all. It used to ask on every Setup render regardless of
+    // sub-view and discard the answer, which is the one facility list that
+    // deliberately reaches ACROSS the Program ceiling being fetched for a
+    // surface that cannot show it. It is also why an out-of-band archive could
+    // still race a hub render into a 404: the only way not to lose that race
+    // is not to have issued the request.
+    candidateRequests = [];
+    await page.click('[data-setup-view="hub"]');
+    await page.waitForSelector("#season-participation", { state: "detached", timeout: 15000 });
+    await settleCandidateTraffic();
+    if (candidateRequests.length) {
+      throw new Error(`[${viewport.label}] the Setup HUB requested grant candidates it `
+        + `cannot render: ${candidateRequests.join(", ")}`);
+    }
+
+    // PRECONDITION on the WRITABLE Season: on the sub-view that DOES render
+    // the picker, it is there and the candidate read really is issued. Without
+    // it, "no picker, no request" after the archive would be satisfied by a
+    // surface that never had either — and the hub assertion above would be
+    // satisfied by a build that never fetches candidates anywhere.
+    candidateRequests = [];
+    await page.click('[data-setup-view="hierarchy"]');
+    await page.waitForSelector(`#va-add-${fx4.season}`, { timeout: 15000 });
+    await settleCandidateTraffic();
+    if (candidateRequests.length === 0) {
+      throw new Error(`[${viewport.label}] precondition failed: a plain re-render of the `
+        + `WRITABLE season on the HIERARCHY sub-view issued no /venue-candidates request, `
+        + `so "no request" after the archive would be vacuously true`);
+    }
+    if (await page.locator(`[data-va-readonly="${fx4.season}"]`).count() !== 0) {
+      throw new Error(`[${viewport.label}] precondition failed: the WRITABLE season already `
+        + `renders the archived read-only copy`);
+    }
+
+    // THE ARCHIVE — and nothing else. No /api/context, no reload.
+    const staleArchive = await page.evaluate(async (season) => {
+      const F = window.hsFixture;
+      const archived = await F.create("staleArchived",
+        `/api/v2/setup/seasons/${season}/archive`, { reason: "season complete" });
+      // The SERVER's own view at this instant. The page has issued no
+      // /api/context/options since, so its cached `selected.read_only` is
+      // necessarily still the pre-archive answer — that disagreement is the
+      // condition this leg needs, and asserting the server half turns a leg
+      // that silently stopped reproducing it into a failure.
+      const ctx = await (await fetch("/api/context", { credentials: "same-origin" })).json();
+      return { archived, serverReadOnly: ctx.read_only };
+    }, fx4.season);
+    if (staleArchive.archived.error
+        || staleArchive.archived.status !== "archived") {
+      throw new Error(`[${viewport.label}] archiving the stale-window season failed: `
+        + JSON.stringify(staleArchive.archived));
+    }
+    if (staleArchive.serverReadOnly !== true) {
+      throw new Error(`[${viewport.label}] the server does not report the just-archived `
+        + `selection as read-only, so there is no disagreement to test: `
+        + JSON.stringify(staleArchive));
+    }
+
+    // A PLAIN RE-RENDER through the shipped control — the whole point of the
+    // leg. `render()` re-reads the hierarchy from the server; it does not
+    // re-read /api/context/options.
+    //
+    // `#season-participation` exists ONLY in the hierarchy view, so toggling
+    // Records → Hierarchy and waiting for it to disappear and come back is a
+    // sync point BOTH builds reach: render() finishes its fetch loop before it
+    // paints, so once the panel is back, whatever requests this pass was going
+    // to issue have already been issued. Waiting on the read-only copy instead
+    // would have made the ledger assertion below unreachable on exactly the
+    // build that fails it.
+    candidateRequests = [];
+    await page.click('[data-setup-view="records"]');
+    await page.waitForSelector("#season-participation", { state: "detached", timeout: 15000 });
+    await page.click('[data-setup-view="hierarchy"]');
+    await page.waitForSelector("#season-participation", { timeout: 15000 });
+    await settleCandidateTraffic();
+
+    // THE ASSERTION THIS LEG EXISTS FOR: the request was SKIPPED, not merely
+    // tolerated. A 404 that the page ignores is still a 404 on the wire, still
+    // a console error, and still a failed CI shard.
+    if (candidateRequests.length) {
+      throw new Error(`[${viewport.label}] after the SELECTED season was archived with no `
+        + `re-selection, the next render still requested grant candidates: `
+        + `${candidateRequests.join(", ")} — the guard is reading a cached context signal `
+        + `rather than the season's own read_only from the hierarchy it just fetched`);
+    }
+    // The panel must also have SWITCHED to its read-only face in that same
+    // window. The fetch guard alone would not do it: `grantableFor` unions the
+    // scoped overview venues, so the picker has facilities to list even with
+    // zero candidates fetched.
+    if (await page.locator(`[data-va-readonly="${fx4.season}"]`).count() === 0) {
+      throw new Error(`[${viewport.label}] after archiving the SELECTED season with no `
+        + `re-selection, the panel never switched to its read-only copy — the surface `
+        + `is still painting from the stale context cache`);
+    }
+    // ...and no control that cannot succeed survived the same window.
+    for (const [label, selector] of [
+      ["Allow picker", `#va-add-${fx4.season}`],
+      ["Allow button", `[data-va-add="${fx4.season}"]`],
+      ["Revoke control", `[data-va-revoke="${fx4.grant}"]`],
+    ]) {
+      const count = await page.locator(selector).count();
+      if (count !== 0) {
+        throw new Error(`[${viewport.label}] the just-archived season still offers its `
+          + `${label} (${count} matching "${selector}") — a control whose write fails `
+          + `season_archived`);
+      }
+    }
+    // The history still renders, exactly as in step (8): only controls are
+    // withheld, never the Season's own past.
+    const stalePanelText = await page.textContent("#season-participation");
+    if (!stalePanelText.includes("VA-STALE-HOME")) {
+      throw new Error(`[${viewport.label}] the just-archived season lost its allowed-venues `
+        + `history: ${stalePanelText.slice(0, 400)}`);
+    }
+
     if (errors.length) {
       throw new Error(`[${viewport.label}] console/page errors:\n${errors.join("\n")}`);
     }
     console.log(`[${viewport.label}] OK — venue access cleanup UI verified, `
-      + `including the archived season's read-only history.`);
+      + `including the archived season's read-only history and the archive-without-`
+      + `re-selection window, in which no grant-candidate request is issued at all.`);
   } catch (error) {
     throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {

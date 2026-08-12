@@ -4308,11 +4308,19 @@ function renderSeasonParticipation(hv, ov, sv) {
   // candidate route now refuses the read that feeds the Allow picker. So the
   // selected Season still shows its OWN allowed-venues history, names included
   // -- that is what a historical Season is for -- but offers no control that
-  // cannot succeed. Read off `contextOptions.selected.read_only`, the same
-  // signal behind the switcher's "archived (read-only)" label and #ctx-ro
-  // badge, so this can never disagree with what the context bar shows.
-  const selectionIsReadOnly = !!(contextOptions && contextOptions.selected
-    && contextOptions.selected.read_only);
+  // cannot succeed.
+  //
+  // Read off the SEASON ROW's own `read_only` (see `isHistoricalSeason`
+  // below), not `contextOptions.selected.read_only`. This side carried the
+  // SAME staleness bug as the fetch loop and for the same reason: the cache is
+  // written only by a /api/context/options fetch, so in the window after an
+  // archive of the SELECTED Season this surface painted the Allow picker, the
+  // Revoke buttons and the permanent-cleanup action on a Season whose every
+  // one of those writes fails `season_archived`. The fetch-side fix alone
+  // would not have closed it -- `grantableFor` unions the scoped overview
+  // venues, so the picker had real facilities to list even with zero
+  // candidates fetched. `s` comes from the hierarchy this render pass read, so
+  // the controls and the server's refusal now answer to one fact.
 
   const programBlocks = programs.map((program) => {
     const permanentTeams = leagueTeams[program.id] || [];
@@ -4407,9 +4415,15 @@ function renderSeasonParticipation(hv, ov, sv) {
       // venues" — a claim this surface is no longer entitled to make.
       // ...and when the SELECTED Season is archived it is read-only HISTORY:
       // its own grant rows still render, names and all, but every control that
-      // would mutate them is gone (see `selectionIsReadOnly` above).
+      // would mutate them is gone (see the note above the map).
       const isSelectedSeason = s.id === selectedSeasonId;
-      const isHistoricalSeason = isSelectedSeason && selectionIsReadOnly;
+      // `s.read_only` is THIS Season's own row from the same-pass hierarchy —
+      // the server's own answer to "would a write here be refused" — so it can
+      // never lag behind an archive the way the cached context signal did. The
+      // `isSelectedSeason` conjunct stays because only the selected Season has
+      // fetched rows to render at all; every other Season takes the
+      // no-request placeholder branch regardless of its lifecycle.
+      const isHistoricalSeason = isSelectedSeason && !!s.read_only;
       const seasonAccessRows = isSelectedSeason
         ? (seasonVenueAccess[s.id] || []) : [];
       const venueNameById = {};
@@ -10481,11 +10495,20 @@ async function render() {
       // refuses that read generically, so issuing it would only produce a 404
       // per render; the gate is here so the request is never made and the
       // read-only surface holds nothing to render a picker from.
-      // `read_only` is the SAME signal the context bar's "archived
-      // (read-only)" option label and #ctx-ro badge already use -- it comes
-      // straight off /api/context/options' `selected`.
-      const selectionIsReadOnly = !!(contextOptions && contextOptions.selected
-        && contextOptions.selected.read_only);
+      //
+      // The gate reads the SEASON ROW's own `read_only` (below), NOT
+      // `contextOptions.selected.read_only`. That distinction is the whole fix.
+      // `contextOptions` is a client-side CACHE of the last
+      // /api/context/options fetch, so between an archive of the SELECTED
+      // Season and the next options load it still said "writable" -- the guard
+      // passed, the request went out, and the server answered its deliberate
+      // 404. CI shard 1 and this file's own e2e journeys caught it as an
+      // undeclared 404 on .../season_3/venue-candidates, roughly one run in
+      // three. Refreshing the cache harder would have left the defect CLASS
+      // alive, depending on every future mutation remembering to invalidate.
+      // `hv` was fetched a few lines above IN THIS PASS, from the same store
+      // the candidate route is about to consult, so its `read_only` and that
+      // route's refusal cannot describe different moments.
       for (const program of (hv.programs || [])) {
         const r = await getJSON(`/api/v2/setup/programs/${program.id}/teams`);
         // Same reason as the player list above, and more acute: this loop
@@ -10540,10 +10563,38 @@ async function render() {
             // Arena Manager gets a 403 here and simply has no picker, rather
             // than being handed every linked Venue in the installation by the
             // overview.
-            // Skipped outright for a READ-ONLY (archived) selection: no
-            // request is issued, so the archived surface can render no picker
-            // even by accident.
-            if (!selectionIsReadOnly) {
+            // TWO gates, closing two different holes.
+            //
+            // (i) `setupView === "hierarchy"` -- the SUB-VIEW that consumes
+            //     this list. `seasonVenueCandidates` is read in exactly one
+            //     place (`grantableFor`), called from exactly one function
+            //     (`renderSeasonParticipation`), reached from exactly one
+            //     branch (`setupView === "hierarchy"`). On the Setup HUB and
+            //     RECORDS sub-views this pass fetched the cross-Program
+            //     candidate directory and then discarded it unrendered, which
+            //     is the disclosure #369's ruling narrowed leaking back in
+            //     through a sub-view the ruling never considered -- its own
+            //     words are "fetched only where it is used". Every
+            //     `setupView = "hierarchy"` assignment happens BEFORE the
+            //     render() that must paint the picker (the segmented control,
+            //     and the `participation` / `venue_access` deep-link
+            //     destinations), so the surfaces that DO use it still get it.
+            //
+            //     This also removes a whole class of doomed request. An
+            //     archive that lands DURING a pass -- after the hierarchy read
+            //     above and before this fetch -- is a genuine race that no
+            //     client-side guard can win, because gate (ii) can only be as
+            //     fresh as the read it came from. The only way not to lose that
+            //     race is not to have issued the request, and a hub render now
+            //     issues none at all. It stays open on the hierarchy sub-view,
+            //     narrowed to the gap between those two reads.
+            //
+            // (ii) `!s.read_only` -- a READ-ONLY (archived) selection asks for
+            //     nothing, so the archived surface can render no picker even
+            //     by accident. `s.read_only` is this Season's OWN row out of
+            //     the hierarchy this pass just read -- see the note above the
+            //     loop for why the cached context signal cannot be used here.
+            if (setupView === "hierarchy" && !s.read_only) {
               // Scoped for the same reason as venue-access above -- and this is
               // the exact request CI shard 1 recorded 404ing at 390px.
               const vc = await getJSONContextScoped(

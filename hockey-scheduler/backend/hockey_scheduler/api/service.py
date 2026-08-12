@@ -9387,7 +9387,15 @@ class ApiService:
         # not select) and BEFORE any Venue is resolved or serialized (so the
         # cross-Program candidate directory is never even built for a
         # destination whose grant would fail `season_archived` anyway).
-        if active_season.status == SeasonStatus.ARCHIVED:
+        #
+        # Asked through `season_is_read_only` -- the SAME predicate
+        # `require_active_season` refuses the grant on, and the SAME one
+        # `get_setup_hierarchy_v2` reports per Season as `read_only`. The
+        # refusal is byte-for-byte the rule it always was; what changes is that
+        # the client's skip-this-read guard and this refusal are now one
+        # expression, so they cannot drift apart into a request that is always
+        # answered 404.
+        if self.setup.season_is_read_only(active_season):
             raise NotFoundError(f"Season {season_id} not found.")
         season = active_season
         granted = {a.venue_id for a in
@@ -10447,6 +10455,33 @@ class ApiService:
                     not in league_ids]
                 season_nodes.append({
                     "id": s.id, "name": s.name, "leagues": league_nodes,
+                    # ADDITIVE (#159 follow-up). Whether this Season refuses
+                    # writes, answered by `season_guard.season_is_read_only` --
+                    # the SAME predicate `require_active_season` refuses every
+                    # Season-owned write on, and the same one
+                    # `get_venue_grant_candidates` refuses the grant-candidate
+                    # READ on.
+                    #
+                    # It is here because the client needs the fact in the SAME
+                    # PASS as the tree it is iterating. app.js gated the
+                    # candidate fetch on `/api/context/options`' cached
+                    # `selected.read_only`, and that cache is written only when
+                    # the options are re-fetched -- so between an archive of the
+                    # SELECTED Season and the next options load, the guard read
+                    # "writable", the request went out, and the server answered
+                    # its deliberate 404. Nothing invalidated the cache because
+                    # nothing had to: staleness was possible by construction.
+                    # Carried on the Season row the client is already looping
+                    # over, the guard's input and the server's decision come
+                    # from one read of one store, so they cannot disagree.
+                    #
+                    # A BOOL, not the raw `status`. Shipping the status would
+                    # hand the client the raw material and let it re-derive the
+                    # rule -- a second notion of "archived" living in JavaScript,
+                    # free to drift from this one. `status` remains available on
+                    # the Season ENTITY DTO for surfaces that render lifecycle;
+                    # this structural tree ships the DECISION.
+                    "read_only": self.setup.season_is_read_only(s),
                     "needs_assignment": {
                         "divisions_without_league": [
                             {"id": d.id, "name": d.name, "age_group": d.age_group,

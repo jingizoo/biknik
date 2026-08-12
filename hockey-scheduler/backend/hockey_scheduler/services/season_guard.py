@@ -56,6 +56,29 @@ def season_is_historical(season, now) -> bool:
     return end is not None and now is not None and end < now
 
 
+def season_is_read_only(season) -> bool:
+    """The ONE definition of "this Season refuses writes" — the ARCHIVED
+    lifecycle state, and nothing else (#159).
+
+    Deliberately NARROWER than :func:`season_is_historical`, and the two are not
+    interchangeable. Historicity is a READING rule and takes a passed-in ``now``
+    because a real elapsed ``end_date`` also counts; read-only-ness is the WRITE
+    rule ``require_active_season`` enforces below, it is clock-independent, and
+    a dated-but-not-archived Season is still perfectly writable. Answering the
+    write question with the reading predicate would freeze every Season whose
+    end_date has passed.
+
+    Extracted so the write refusal and every payload that ADVERTISES it are one
+    expression rather than two that agree today. ``get_setup_hierarchy_v2``
+    emits ``read_only`` per Season from this function and the client skips the
+    grant-candidate read on it, so a client guard that disagreed with the
+    server's refusal would issue exactly the request the server answers 404 —
+    which is what happened while the client guessed from a cached
+    ``/api/context/options``. ``season`` may be ``None`` (nothing to refuse).
+    """
+    return season is not None and season.status == SeasonStatus.ARCHIVED
+
+
 def require_active_season(store, season_id: str):
     """Return the (row-locked) Season, or raise if it is missing/archived.
 
@@ -65,7 +88,7 @@ def require_active_season(store, season_id: str):
     season = store.get_season_for_update(season_id)
     if season is None:
         raise NotFoundError(f"Season {season_id} not found.")
-    if season.status == SeasonStatus.ARCHIVED:
+    if season_is_read_only(season):
         raise ValidationError(
             f"Season '{season.name}' is archived and read-only. Reopen it "
             "before making changes.",
