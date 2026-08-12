@@ -144,9 +144,22 @@ class BootWithoutStoreTest(unittest.TestCase):
             status, body = self._get(port, path)
             self.assertEqual(status, 503, f"{path} answered {status}")
             self.assertEqual(body.get("status"), "unavailable", body)
-            self.assertIn("resolve host",
-                          json.dumps(body.get("store") or {}),
-                          f"{path} did not name the real reason: {body}")
+            # THE PROPERTY IS "a cause is reported", NOT which cause.
+            # An earlier version asserted the substring "resolve host" and
+            # passed only where psycopg happens to be installed: CI's
+            # Memory/SQLite job has no driver, so the same unreachable URL fails
+            # with ModuleNotFoundError instead, and the assertion failed on a
+            # server that was behaving perfectly. Pinning the incidental text of
+            # one environment's failure is not the contract — not hiding the
+            # cause is.
+            reason = (body.get("store") or {}).get("reason") or ""
+            self.assertTrue(
+                reason.strip(),
+                f"{path} reported no reason at all, so an operator still "
+                f"cannot tell why the store is down: {body}")
+            self.assertIn(
+                "Error", reason,
+                f"{path} should name the underlying exception, got: {reason!r}")
 
         for path in ("/api/demo/overview", "/api/auth/roles"):
             status, body = self._get(port, path)
