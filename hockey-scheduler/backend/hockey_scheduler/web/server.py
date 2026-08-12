@@ -430,7 +430,59 @@ class DemoState:
         # Demo mode boots to a CLEAN SLATE (#215): an empty setup the operator
         # can Load sample data into or build by hand. (Production ignores `seed`
         # and preserves its durable store.)
-        self.reset(seed=False)
+        #
+        # THE STORE MAY BE UNREACHABLE AT BOOT, AND THAT MUST NOT KILL THE
+        # PROCESS. `STATE = DemoState()` runs at MODULE IMPORT, so an exception
+        # here propagates out of `from .server import serve` and the process
+        # exits before it has bound a port. Observed in production: a managed
+        # Postgres whose host stopped resolving took the whole web service down
+        # with `No open ports detected` — no health endpoint, no readiness
+        # endpoint, no way to ask the running instance what was wrong, and a
+        # restart loop that could never recover on its own even once the
+        # database came back.
+        #
+        # That defeated the guards this server already has: `/api/health`
+        # answers 503 precisely "or a bricked instance is never restarted"
+        # (see `do_GET`), and `/api/readiness` exists to report deployment
+        # problems. Neither can answer if the module cannot finish importing.
+        #
+        # So a boot-time store failure is RECORDED, not raised: `api` stays
+        # None, the port still binds, and every data route answers a clear 503
+        # while health/readiness name the actual error. `try_reconnect()` then
+        # lets the instance recover WITHOUT a redeploy once the store returns.
+        self.boot_error: Optional[str] = None
+        try:
+            self.reset(seed=False)
+        except Exception as exc:                      # noqa: BLE001
+            self.api = None
+            self.game_id = None
+            self.ids = {}
+            self.boot_error = f"{type(exc).__name__}: {exc}"
+            print(f"[boot] store unavailable, serving 503 until it returns: "
+                  f"{self.boot_error}", file=sys.stderr, flush=True)
+
+    @property
+    def store_available(self) -> bool:
+        return getattr(self, "api", None) is not None
+
+    def try_reconnect(self) -> bool:
+        """Attempt to build the store again after a failed boot.
+
+        Returns True once ``api`` exists. Never raises: a failed retry updates
+        ``boot_error`` and leaves the instance answering 503, exactly as before
+        the attempt, so a probe can be called on any request without turning a
+        degraded instance into a crashing one.
+        """
+        if self.store_available:
+            return True
+        try:
+            self.reset(seed=False)
+        except Exception as exc:                      # noqa: BLE001
+            self.api = None
+            self.boot_error = f"{type(exc).__name__}: {exc}"
+            return False
+        self.boot_error = None
+        return True
 
     def _make_api(self, store):
         # Email/push transports come from EMAIL_MODE / SMTP_* (#63) and
@@ -1415,6 +1467,36 @@ class Handler(BaseHTTPRequestHandler):
     # right lifetime for it.
     _context_read_ticket = None
 
+    def _store_unavailable(self) -> bool:
+        """True (and a 503 already sent) when the store has never come up.
+
+        Every data route needs the facade; without it the honest answer is
+        "running, not ready", not a traceback. Called first in every ``do_*`` so
+        a new verb cannot silently bypass it.
+
+        HEALTH AND READINESS ARE EXEMPT, and the exemption lives HERE rather
+        than relying on route order. Being called first is what makes this guard
+        trustworthy, but it also means it would otherwise answer for the two
+        endpoints whose entire purpose is to report this condition — a health
+        check would still see 503, but an operator would lose the reason. The
+        exemption is by exact path so no other route can inherit it.
+
+        Each call retries the connection once, so an instance that booted
+        against a dead database recovers on its own the moment the database
+        returns — no redeploy, no manual restart. ``try_reconnect`` never
+        raises, so probing here cannot turn a degraded instance into a
+        crashing one.
+        """
+        if STATE.store_available or STATE.try_reconnect():
+            return False
+        if self.path.split("?", 1)[0] in ("/api/health", "/api/readiness"):
+            return False
+        self._send_json({"error": {
+            "code": "store_unavailable",
+            "message": "The service is running but cannot reach its database.",
+            "details": {"reason": STATE.boot_error}}}, 503)
+        return True
+
     def do_GET(self):
         """Dispatch a GET, registering an ARRIVAL with the context gate first
         when the path is one of the exact-Season scoped reads (#159).
@@ -1433,6 +1515,8 @@ class Handler(BaseHTTPRequestHandler):
         write raises ``BrokenPipeError`` on a vanished client — so no gate hold
         can outlive the handler.
         """
+        if self._store_unavailable():
+            return
         path = self.path.split("?", 1)[0]
         if not is_context_scoped_read(path):
             return self._dispatch_get()
@@ -1769,6 +1853,22 @@ class Handler(BaseHTTPRequestHandler):
             status["factory_reset_enabled"] = (
                 _app_mode() == "production" and _allow_production_factory_reset())
             return self._send_json(status)
+        if path in ("/api/health", "/api/readiness") and not STATE.store_available:
+            # THE ONE PAIR THAT MUST ANSWER WHILE THE STORE IS DOWN. Both
+            # normally delegate to the facade, which does not exist yet when the
+            # store was unreachable at boot. Answering from process state keeps
+            # the platform health check meaningful (503, so the instance is
+            # restarted / marked unhealthy) and gives an operator the actual
+            # reason without shell access.
+            return self._send_json({
+                "status": "unavailable",
+                "app_mode": _app_mode(),
+                "store": {"status": "unavailable",
+                          "reason": STATE.boot_error},
+                "detail": "The service is running but has never reached its "
+                          "database. It will recover without a redeploy once "
+                          "the database is reachable.",
+            }, 503)
         if path == "/api/health":
             # Liveness + dependency snapshot (#90). Public, non-sensitive.
             # The STATUS CODE carries the verdict (#404): a platform health
@@ -2311,12 +2411,18 @@ class Handler(BaseHTTPRequestHandler):
             "code": "not_found", "message": "Unknown endpoint."}}, 404)
 
     def do_PUT(self):
+        if self._store_unavailable():
+            return
         self._method_fallback("PUT")
 
     def do_PATCH(self):
+        if self._store_unavailable():
+            return
         self._method_fallback("PATCH")
 
     def do_DELETE(self):
+        if self._store_unavailable():
+            return
         self._method_fallback("DELETE")
 
     def do_HEAD(self):
@@ -2325,6 +2431,8 @@ class Handler(BaseHTTPRequestHandler):
         (an unauthenticated ``HEAD /api/accounts`` mirrors GET's 401/403, never
         a blind 200) — with body writes suppressed via ``_head_only``. A
         POST-only path falls through do_GET's tail to a bodyless 405 + Allow."""
+        if self._store_unavailable():
+            return
         self._head_only = True
         try:
             self.do_GET()
@@ -2334,6 +2442,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         """OPTIONS contract (#271): a known path → 204 (+ ``Allow``); an unknown
         path → 404. Always bodyless."""
+        if self._store_unavailable():
+            return
         path = self.path.split("?", 1)[0]
         methods = self._supported_methods(path)
         if not methods:
@@ -2341,6 +2451,8 @@ class Handler(BaseHTTPRequestHandler):
         return self._send_status(204, [("Allow", ", ".join(sorted(methods)))])
 
     def do_POST(self):
+        if self._store_unavailable():
+            return
         path = self.path.split("?", 1)[0]
         # Confirm the path actually supports POST *before* touching the body
         # (#271). Otherwise a malformed body on a non-POST path 400s as
@@ -4685,12 +4797,25 @@ def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
     # Configure the delivery worker loop from env and start it if enabled (#79).
     # ApiService keeps a disabled loop by default (safe for tests); only the
     # running server process reads env and may spin the background thread.
-    STATE.api.delivery_loop = delivery_loop_from_env(STATE.api.delivery,
-                                                     os.environ)
-    if STATE.api.delivery_loop.start():
-        print(f"Delivery worker loop started "
-              f"(every {STATE.api.delivery_loop.interval_seconds}s, "
-              f"batch {STATE.api.delivery_loop.batch_size}).")
+    #
+    # SKIPPED when the store never came up: there is no facade to hang a loop
+    # on, and dereferencing it here would crash BEFORE `Server(...)` binds —
+    # reintroducing the exact `No open ports detected` failure the boot-time
+    # tolerance above exists to prevent. Binding the port is what makes the
+    # instance diagnosable and lets it recover on its own; the delivery loop is
+    # started by the first successful reconnect instead.
+    if STATE.store_available:
+        STATE.api.delivery_loop = delivery_loop_from_env(STATE.api.delivery,
+                                                         os.environ)
+        if STATE.api.delivery_loop.start():
+            print(f"Delivery worker loop started "
+                  f"(every {STATE.api.delivery_loop.interval_seconds}s, "
+                  f"batch {STATE.api.delivery_loop.batch_size}).")
+    else:
+        print(f"[boot] starting WITHOUT a store: {STATE.boot_error}. "
+              f"Data routes answer 503; /api/health and /api/readiness report "
+              f"the reason; the instance recovers when the store returns.",
+              file=sys.stderr, flush=True)
     httpd = Server((host, port), Handler)
     print(f"Hockey Scheduler demo running at http://{host}:{port}")
     print("Open that URL in your browser. Press Ctrl+C to stop.")
