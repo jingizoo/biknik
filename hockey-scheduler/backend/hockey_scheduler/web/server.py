@@ -589,19 +589,22 @@ STATE = DemoState()
 #
 # THE ENUMERATION THAT PRODUCES THIS TABLE, stated so it can actually be re-run.
 # The comparison is NOT funnelled through one helper, and an audit that assumes
-# it is will miss three of the four rows below. Enumerate every caller of
+# it is will miss three of the five rows below. Enumerate every caller of
 # `ContextService.resolve_with_league` in `api/service.py` that then compares a
-# caller-named target to the resolved Season — by ANY of the four routes the
-# code actually uses:
+# caller-named target to the resolved Season — by ANY of the three SHAPES the
+# code actually uses (the count is of shapes, not of routes; an earlier revision
+# said "routes" here and meant this):
 #
-#   * INLINE, `season_id != active_season.id`  (service.py:9378, :10688 — this
+#   * INLINE, `season_id != active_season.id`  (service.py:9441, :10751 — this
 #     is how BOTH venue reads do it; neither touches the helpers below)
-#   * `_scenario_in_active_tuple` -> `_setup_target_edge_allows`  (:6536, :1013)
-#   * `_division_matches_active_context`  (:5947, called at :6025)
+#   * `_scenario_in_active_tuple` -> `_setup_target_edge_allows`  (:6599, :991)
+#   * `_league_season_matches_active_context`  (:5947) — reached by BOTH
+#     standings reads: directly (:6187) and through
+#     `_division_matches_active_context` (:5995, called at :6045)
 #
 # An earlier revision of this comment named only the middle one and claimed the
 # table was derived from it. It was not: that recipe reaches exactly one of the
-# four listed routes. Six GET routes reach the comparison at all; four qualify:
+# listed routes. Seven GET routes reach the comparison at all; five qualify:
 #
 #   * /api/v2/setup/seasons/<id>/venue-candidates   LISTED — named Season
 #   * /api/v2/setup/seasons/<id>/venue-access       LISTED — named Season
@@ -614,6 +617,14 @@ STATE = DemoState()
 #       `league_season.season_id != season.id`; a mismatch is the generic
 #       EMPTY standings shape, which is a wrong answer that looks like a real
 #       one rather than a refusal — worse to leave unordered, not better
+#   * /api/standings/league-season/<l>/<s>          LISTED — named LeagueSeason,
+#       via the same comparison one level up; a mismatch is the generic
+#       `not_found` a nonexistent (league, season) pair takes. NOT listed
+#       before #202, and correctly so: the route then passed no role/scope at
+#       all, so it never resolved the tuple and failed clause 1 outright. That
+#       is the criterion tracking a real defect rather than papering over it —
+#       the route was answering ANONYMOUS callers, which is what #202 fixed;
+#       giving it the ceiling is what earns it the ordering constraint.
 #   * /api/scheduler/scenarios and /api/scheduler/drafts   NOT LISTED, and
 #       that is the criterion doing its job: they name no target, so the active
 #       tuple IS their query rather than a ceiling on something the caller
@@ -628,6 +639,7 @@ CONTEXT_SCOPED_READ_ROUTES = (
     re.compile(r"^/api/v2/setup/seasons/[^/]+/venue-access$"),
     re.compile(r"^/api/scheduler/scenarios/[^/]+$"),
     re.compile(r"^/api/standings/[^/]+$"),
+    re.compile(r"^/api/standings/league-season/[^/]+/[^/]+$"),
 )
 
 
@@ -2024,8 +2036,40 @@ class Handler(BaseHTTPRequestHandler):
         lss = re.match(
             r"^/api/standings/league-season/([^/]+)/([^/]+)$", path)
         if lss:
-            return self._send_api(api.get_league_season_standings(
-                lss.group(1), lss.group(2)))
+            # #202: this sat in the AUTHENTICATED namespace but passed no
+            # identity, so it answered any anonymous caller — while its
+            # per-Division sibling directly above required a session. It was
+            # read as harmless on the grounds that its payload matched the
+            # deliberate public route's byte for byte. It does not: this is the
+            # OPERATOR aggregate (`public_only=False`), so it counts UNPUBLISHED
+            # games' final results and, on a drifted Game, returns a
+            # data_integrity_error naming that Game's id. Both are exactly what
+            # the public variant's skip-before-integrity-check exists to
+            # withhold (#83). The payloads agree only until a draft carries a
+            # final result, so the sameness that made it look like a public
+            # alias was a property of the fixture, not of the route.
+            #
+            # It therefore takes its sibling's contract in full: a real session,
+            # then the named LeagueSeason bound to the caller's ACTIVE tuple.
+            # The scraping ceiling the public route carries is not the fix and
+            # is not added here — an operator read behind a session and its own
+            # active tuple is not an anonymous scraping surface, and the sibling
+            # rate-limits nothing either.
+            role, scope, user_id, err = self._resolve_role()
+            if err is not None:
+                code, payload = err
+                return self._send_json(payload, code)
+            if user_id is None:
+                return self._send_json({"error": {
+                    "code": "unauthorized",
+                    "message": "A signed-in account is required."}}, 401)
+            # PHASE B, for the same reason the sibling takes it: now that this
+            # route resolves the active tuple, a switch committing mid-read
+            # turns a legitimately-requested table into the generic not_found.
+            with self._context_read_hold(user_id):
+                payload = api.get_league_season_standings(
+                    lss.group(1), lss.group(2), user_id, role, scope)
+            return self._send_api(payload)
         # Public, no-auth surface (#83): schedule / standings / game detail,
         # public-safe fields only. Reachable unauthenticated in production.
         # Rate-limited (#131) — generous, since the public portal itself
