@@ -13,6 +13,7 @@ import re
 import ssl
 import sys
 import threading
+import time
 import uuid
 import traceback
 from contextlib import contextmanager
@@ -425,6 +426,10 @@ def demo_seed_instant_from_env(env=None) -> Optional[datetime]:
     return instant
 
 
+RETRY_BACKOFF_MIN = 1.0
+RETRY_BACKOFF_MAX = 30.0
+
+
 class DemoState:
     """Holds the demo facade; can (re)build or clear itself for the demo."""
 
@@ -457,6 +462,17 @@ class DemoState:
         # ONE reconnect at a time, and one runtime initialization ever.
         self._reconnect_lock = threading.Lock()
         self._runtime_started = False
+        # BOUNDED RETRY SCHEDULE (#203 review). Without it every public request
+        # -- including routine platform health probes -- drives its own
+        # DNS/connect attempt, so an outage becomes a connection storm against a
+        # database that is trying to come back, and a slow TCP failure makes
+        # each request hang for the connect timeout. Attempts are spaced by an
+        # exponential backoff; requests in between get their 503 immediately.
+        # `_clock` is injectable so the regression can advance time without
+        # sleeping.
+        self._clock = time.monotonic
+        self._next_retry_at = 0.0
+        self._retry_backoff = 0.0
         try:
             self.reset(seed=False)
         except Exception as exc:                      # noqa: BLE001
@@ -466,6 +482,22 @@ class DemoState:
             self._record_boot_error(exc)
 
     # -- degraded-boot bookkeeping ------------------------------------------
+    @staticmethod
+    def _redact(text: str) -> str:
+        """Strip credentials before ANYTHING writes this, including the log.
+
+        Sanitizing the response but printing the raw exception moved the leak
+        rather than removing it -- #203 says credentials must never be logged.
+        A store failure can carry `scheme://user:pass@host/db`, a bare
+        `password=...`, or a token, so those are redacted here, once, at the
+        single place the text is captured.
+        """
+        text = re.sub(r"(?i)\b([a-z][a-z0-9+.-]*://)([^\s/@]+)@",
+                      r"\1***:***@", text)
+        text = re.sub(r"(?i)\b(password|passwd|pwd|token|secret|api[_-]?key)"
+                      r"\s*[=:]\s*\S+", r"\1=***", text)
+        return text
+
     def _record_boot_error(self, exc) -> None:
         """Keep the FULL cause for the operator; publish only a category.
 
@@ -480,8 +512,15 @@ class DemoState:
         greps the log for the reference; a stranger learns only that the store
         is unreachable, which they can already tell from the 503.
         """
-        self.boot_error = f"{type(exc).__name__}: {exc}"
-        self.boot_error_ref = uuid.uuid4().hex[:8]
+        self.boot_error = self._redact(f"{type(exc).__name__}: {exc}")
+        # ONE reference for one incident. Minting a fresh id per failed attempt
+        # made the reference useless for correlation and turned every public
+        # request into a new "incident"; it is cleared only on recovery.
+        if not self.boot_error_ref:
+            self.boot_error_ref = uuid.uuid4().hex[:8]
+        # RATE-BOUNDED: one line per ATTEMPT, and attempts are themselves
+        # bounded by the retry schedule -- not one line per request, which under
+        # routine platform probing is a log storm against a recovering database.
         print(f"[boot ref={self.boot_error_ref}] store unavailable, serving 503 "
               f"until it returns: {self.boot_error}",
               file=sys.stderr, flush=True)
@@ -496,7 +535,7 @@ class DemoState:
     def store_available(self) -> bool:
         return getattr(self, "api", None) is not None
 
-    def _start_runtime_once(self) -> None:
+    def _start_runtime_on(self, api=None) -> None:
         """The one-time initialization a healthy boot performs in ``serve()``.
 
         Recovery has to do this too. ``try_reconnect`` used to only rebuild the
@@ -507,15 +546,23 @@ class DemoState:
         called under the reconnect lock, so concurrent first requests cannot
         start two loops.
         """
-        if self._runtime_started or not self.store_available:
+        if self._runtime_started:
             return
+        target = api if api is not None else getattr(self, "api", None)
+        if target is None:
+            return
+        target.delivery_loop = delivery_loop_from_env(target.delivery,
+                                                      os.environ)
+        started = target.delivery_loop.start()
+        # THE FLAG IS SET ONLY AFTER START SUCCEEDS. Setting it first meant an
+        # exception here was recorded as "runtime started", so no later attempt
+        # would ever retry it and the worker stayed stopped for the life of the
+        # process.
         self._runtime_started = True
-        self.api.delivery_loop = delivery_loop_from_env(self.api.delivery,
-                                                        os.environ)
-        if self.api.delivery_loop.start():
+        if started:
             print(f"Delivery worker loop started "
-                  f"(every {self.api.delivery_loop.interval_seconds}s, "
-                  f"batch {self.api.delivery_loop.batch_size}).")
+                  f"(every {target.delivery_loop.interval_seconds}s, "
+                  f"batch {target.delivery_loop.batch_size}).")
 
     def try_reconnect(self) -> bool:
         """Rebuild the store after a failed boot -- SINGLE-FLIGHT and ATOMIC.
@@ -544,9 +591,14 @@ class DemoState:
         """
         if self.store_available:
             return True
+        now = self._clock()
+        if now < self._next_retry_at:     # inside the backoff window
+            return False
         with self._reconnect_lock:
             if self.store_available:      # another thread won the race
                 return True
+            if self._clock() < self._next_retry_at:
+                return False              # another thread just attempted
             store = None
             try:
                 store = create_store()
@@ -554,18 +606,32 @@ class DemoState:
                 if _app_mode() == "production":
                     bootstrap_admin_from_env(api, os.environ)
                 RATE_LIMITER.reset()      # (#131) clean slate, as on boot
+                # RUNTIME INITIALIZATION BEFORE PUBLISH (#203 review). Marking
+                # the runtime started before it succeeded, and publishing the
+                # facade before initializing it, meant a failure here left the
+                # worker permanently stopped while later requests saw a healthy
+                # store and never retried -- recovery advertised, delivery dead.
+                # Doing it on the off-to-the-side object means a failure is just
+                # another failed attempt: nothing is published, and the schedule
+                # allows a later one.
+                self._start_runtime_on(api)
             except Exception as exc:      # noqa: BLE001
                 if store is not None:
                     self._close_store(store, None)   # never leak the loser
                 self._record_boot_error(exc)
+                self._retry_backoff = min(
+                    max(self._retry_backoff * 2.0, RETRY_BACKOFF_MIN),
+                    RETRY_BACKOFF_MAX)
+                self._next_retry_at = self._clock() + self._retry_backoff
                 return False
-            # PUBLISH — fully built, exactly once, last.
+            # PUBLISH — fully built AND fully initialized, exactly once, last.
             self.api = api
             self.game_id = None
             self.ids = {}
             self.boot_error = None
             self.boot_error_ref = None
-            self._start_runtime_once()
+            self._next_retry_at = 0.0
+            self._retry_backoff = 0.0
             return True
 
     def _make_api(self, store):
@@ -1571,9 +1637,17 @@ class Handler(BaseHTTPRequestHandler):
         raises, so probing here cannot turn a degraded instance into a
         crashing one.
         """
-        if STATE.store_available or STATE.try_reconnect():
+        if STATE.store_available:
             return False
+        # EXEMPTED BEFORE ANY CONNECT ATTEMPT. Checking this after
+        # `try_reconnect()` meant the two endpoints whose job is to report the
+        # outage each drove a fresh DNS/connect first, so a slow TCP failure
+        # made the health check hang for the connect timeout instead of
+        # promptly returning the diagnosable 503 this whole change exists to
+        # provide. They must answer from process state, always, immediately.
         if self.path.split("?", 1)[0] in ("/api/health", "/api/readiness"):
+            return False
+        if STATE.try_reconnect():
             return False
         # SANITIZED for the same reason as health/readiness: this route is
         # reachable without a session, so the raw exception must not go out.
@@ -2535,8 +2609,17 @@ class Handler(BaseHTTPRequestHandler):
     def do_OPTIONS(self):
         """OPTIONS contract (#271): a known path → 204 (+ ``Allow``); an unknown
         path → 404. Always bodyless."""
-        if self._store_unavailable():
-            return
+        # "Always bodyless" includes the degraded answer. The store guard
+        # replies with `_send_json`, so without this an outage silently changed
+        # OPTIONS' contract to a JSON-bodied 503. `_head_only` is the existing,
+        # already-tested body suppression -- reusing it keeps one mechanism
+        # rather than adding a second that could drift.
+        self._head_only = True
+        try:
+            if self._store_unavailable():
+                return
+        finally:
+            self._head_only = False
         path = self.path.split("?", 1)[0]
         methods = self._supported_methods(path)
         if not methods:
@@ -4901,7 +4984,7 @@ def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
         # The SAME one-time initialization recovery performs, so the two paths
         # cannot drift: a degraded boot that later recovers must end up in the
         # identical runtime state as a healthy boot.
-        STATE._start_runtime_once()
+        STATE._start_runtime_on()
     else:
         print(f"[boot] starting WITHOUT a store: {STATE.boot_error}. "
               f"Data routes answer 503; /api/health and /api/readiness report "

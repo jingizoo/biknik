@@ -46,6 +46,7 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
 import threading
 import unittest
 import urllib.error
@@ -105,13 +106,34 @@ class BootWithoutStoreTest(unittest.TestCase):
                 else:
                     os.environ[key] = value
 
+        # EVERY piece of degraded state is restored, not just `api`. Leaving
+        # `boot_error_ref`, `_runtime_started`, `_next_retry_at` or
+        # `_retry_backoff` behind makes later tests order-dependent -- most
+        # sharply `_runtime_started`, which would leave the restored healthy
+        # facade marked started while owning no loop.
+        original_ref = getattr(srv.STATE, "boot_error_ref", None)
+        original_started = getattr(srv.STATE, "_runtime_started", False)
+        original_next = getattr(srv.STATE, "_next_retry_at", 0.0)
+        original_backoff = getattr(srv.STATE, "_retry_backoff", 0.0)
+        original_clock = getattr(srv.STATE, "_clock", None)
         self.addCleanup(_restore)
+        self.addCleanup(setattr, srv.STATE, "_clock", original_clock)
+        self.addCleanup(setattr, srv.STATE, "_retry_backoff", original_backoff)
+        self.addCleanup(setattr, srv.STATE, "_next_retry_at", original_next)
+        self.addCleanup(setattr, srv.STATE, "_runtime_started", original_started)
+        self.addCleanup(setattr, srv.STATE, "boot_error_ref", original_ref)
         self.addCleanup(setattr, srv.STATE, "boot_error", original_error)
         self.addCleanup(setattr, srv.STATE, "api", original_api)
         os.environ["APP_MODE"] = "production"
         os.environ["DATABASE_URL"] = DEAD_URL
         srv.STATE.api = None
         srv.STATE.boot_error = "OperationalError: failed to resolve host"
+        # A real degraded boot always recorded a reference (via
+        # `_record_boot_error`), and health/readiness no longer mint one --
+        # they are exempted BEFORE any connect attempt, by design.
+        srv.STATE.boot_error_ref = "fixture0"
+        srv.STATE._next_retry_at = 0.0
+        srv.STATE._retry_backoff = 0.0
 
     # -- 1: the import itself ------------------------------------------------
     def test_importing_the_server_survives_an_unreachable_store(self):
@@ -194,12 +216,20 @@ class BootWithoutStoreTest(unittest.TestCase):
             lambda: os.environ.__setitem__("DATABASE_URL", original)
             if original is not None else os.environ.pop("DATABASE_URL", None))
         os.environ["DATABASE_URL"] = "sqlite:///" + tempfile.mktemp(".db")
+        # THE CONTRACT IS "next PERMITTED attempt", not "next request" (#203
+        # review). The 503 above consumed an attempt and opened a backoff
+        # window, which is the entire point of blocker 1: without it every
+        # request drives its own connect and an outage becomes a connection
+        # storm. Clearing the deadline here stands in for the clock advancing
+        # past that window -- a real instance recovers within RETRY_BACKOFF_MAX
+        # without anyone touching it.
+        srv.STATE._next_retry_at = 0.0
 
         self.assertEqual(
             self._get(port, "/api/auth/roles")[0], 200,
-            "the instance did not recover on the first request after the store "
-            "returned -- it would need a manual redeploy, which is the whole "
-            "cost this fix exists to remove")
+            "the instance did not recover on the next permitted attempt after "
+            "the store returned -- it would need a manual redeploy, which is "
+            "the whole cost this fix exists to remove")
         self.assertTrue(srv.STATE.store_available)
         self.assertIsNone(srv.STATE.boot_error)
 
@@ -257,6 +287,7 @@ class DegradedBootHardeningTest(BootWithoutStoreTest):
         self.addCleanup(setattr, srv, "create_store", real_create)
 
         os.environ["DATABASE_URL"] = "sqlite:///" + tempfile.mktemp(".db")
+        srv.STATE._next_retry_at = 0.0    # stand in for the backoff elapsing
 
         n = 32
         barrier = th.Barrier(n)
@@ -305,6 +336,7 @@ class DegradedBootHardeningTest(BootWithoutStoreTest):
         srv.bootstrap_admin_from_env = probing_bootstrap
         self.addCleanup(setattr, srv, "bootstrap_admin_from_env", real_bootstrap)
         os.environ["DATABASE_URL"] = "sqlite:///" + tempfile.mktemp(".db")
+        srv.STATE._next_retry_at = 0.0    # stand in for the backoff elapsing
 
         self.assertEqual(self._get(port, "/api/auth/roles")[0], 200)
         if "available_during_bootstrap" in seen:
@@ -337,6 +369,7 @@ class DegradedBootHardeningTest(BootWithoutStoreTest):
         srv.delivery_loop_from_env = counting_from_env
         self.addCleanup(setattr, srv, "delivery_loop_from_env", real_from_env)
         os.environ["DATABASE_URL"] = "sqlite:///" + tempfile.mktemp(".db")
+        srv.STATE._next_retry_at = 0.0    # stand in for the backoff elapsing
 
         barrier = th.Barrier(8)
 
@@ -427,3 +460,236 @@ class DegradedBootHardeningTest(BootWithoutStoreTest):
             f"{body[:200]!r}")
         self.assertIn(b"Content-Length:", head,
                       "the mirrored headers should still be present")
+
+
+class DegradedBootSecondRoundTest(BootWithoutStoreTest):
+    """The four blockers from the second review round (#203)."""
+
+    # -- B1: health never blocks; attempts are bounded by a clock ------------
+    def test_health_answers_promptly_and_attempts_are_bounded(self):
+        """No sleeps: a fake clock drives the schedule, a barrier drives load.
+
+        Every public request used to force its own DNS/connect, so routine
+        probing became a connection storm and a slow TCP failure made the
+        health endpoint hang for the connect timeout -- the one endpoint that
+        must always answer.
+        """
+        import threading as th
+        self._break_store()
+        now = {"t": 1000.0}
+        srv.STATE._clock = lambda: now["t"]
+        attempts = []
+        real_create = srv.create_store
+
+        def counting_create(*a, **kw):
+            attempts.append(1)
+            return real_create(*a, **kw)
+
+        srv.create_store = counting_create
+        self.addCleanup(setattr, srv, "create_store", real_create)
+        port = self._serve()
+
+        n = 16
+        barrier = th.Barrier(n)
+        codes, lock = [], th.Lock()
+
+        def hit(path):
+            barrier.wait()
+            code = self._get(port, path)[0]
+            with lock:
+                codes.append(code)
+
+        paths = ["/api/health", "/api/readiness"] * 4 + ["/api/auth/roles"] * 8
+        threads = [th.Thread(target=hit, args=(p,), daemon=True) for p in paths]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+
+        self.assertEqual(sorted(set(codes)), [503],
+                         f"every request should answer 503 promptly: {codes}")
+        # NOTE: this bounds the SCHEDULE, not the exemption ordering -- the
+        # backoff caps attempts either way. The ordering is proven separately by
+        # test_health_never_blocks_on_a_slow_connector.
+        self.assertLessEqual(
+            len(attempts), 1,
+            f"{len(attempts)} connect attempts for {n} concurrent requests -- "
+            f"the retry is not bounded, so an outage becomes a connection "
+            f"storm against a recovering database")
+        first_ref = srv.STATE.boot_error_ref
+        self.assertTrue(first_ref, "no incident reference was recorded")
+
+        # inside the backoff window: still no new attempt, SAME reference
+        before = len(attempts)
+        self.assertEqual(self._get(port, "/api/auth/roles")[0], 503)
+        self.assertEqual(len(attempts), before,
+                         "a request inside the backoff window still attempted")
+        self.assertEqual(srv.STATE.boot_error_ref, first_ref,
+                         "the incident reference changed, so it cannot "
+                         "correlate a log line to a response")
+
+        # advance the clock past the window: exactly one further attempt
+        now["t"] += 120.0
+        self.assertEqual(self._get(port, "/api/auth/roles")[0], 503)
+        self.assertEqual(
+            len(attempts), before + 1,
+            "advancing past the backoff window did not permit a retry -- the "
+            "instance would never recover")
+
+    def test_health_never_blocks_on_a_slow_connector(self):
+        """THE ordering property, and the one a bounded-attempt count cannot see.
+
+        An earlier version of this test asserted only "at most one connect
+        attempt", which the backoff satisfies whether the exemption sits before
+        or after `try_reconnect()` -- so it passed with the defect restored and
+        proved nothing. What the ordering actually governs is whether health
+        BLOCKS: with the exemption after the retry, a slow TCP failure makes the
+        health endpoint hang for the connect timeout, which is exactly when a
+        platform most needs an answer from it.
+
+        No sleeps as proof: the connector waits on an Event this test controls,
+        so "did health answer while the connector was still stuck" is a
+        deterministic question.
+        """
+        import threading as th
+        self._break_store()
+        release = th.Event()
+        entered = th.Event()
+        real_create = srv.create_store
+
+        def blocking_create(*a, **kw):
+            entered.set()
+            release.wait(20)          # held until this test says otherwise
+            return real_create(*a, **kw)
+
+        srv.create_store = blocking_create
+        self.addCleanup(release.set)
+        self.addCleanup(setattr, srv, "create_store", real_create)
+        port = self._serve()
+
+        # a data route enters the connector and is stuck there
+        stuck = []
+        t = th.Thread(target=lambda: stuck.append(
+            self._get(port, "/api/auth/roles")[0]), daemon=True)
+        t.start()
+        self.assertTrue(entered.wait(10), "the connector was never reached")
+
+        # ...and while it is stuck, health must still answer, promptly
+        started = time.monotonic()
+        status, body = self._get(port, "/api/health")
+        elapsed = time.monotonic() - started
+        self.assertEqual(status, 503, body)
+        self.assertLess(
+            elapsed, 5.0,
+            f"/api/health took {elapsed:.1f}s while a connect was in flight -- "
+            f"it is waiting behind the database instead of answering from "
+            f"process state, so a slow TCP failure hangs the health check")
+        self.assertFalse(release.is_set(), "the connector finished too early "
+                                           "for this to have proven anything")
+        release.set()
+        t.join(20)
+
+    # -- B2: the worker really runs, and a failed start stays retryable ------
+    def test_an_enabled_worker_is_actually_running_after_recovery(self):
+        import os
+        self._break_store()
+        os.environ["DELIVERY_WORKER_ENABLED"] = "1"
+        self.addCleanup(os.environ.pop, "DELIVERY_WORKER_ENABLED", None)
+        srv.STATE._runtime_started = False
+        port = self._serve()
+        os.environ["DATABASE_URL"] = "sqlite:///" + tempfile.mktemp(".db")
+        srv.STATE._next_retry_at = 0.0    # stand in for the backoff elapsing
+
+        self.assertEqual(self._get(port, "/api/auth/roles")[0], 200)
+        loop = srv.STATE.api.delivery_loop
+        self.addCleanup(lambda: getattr(loop, "stop", lambda: None)())
+        self.assertTrue(
+            loop.is_running(),
+            "the delivery loop is not RUNNING after recovery -- the previous "
+            "version of this test only proved a loop object was constructed, "
+            "with the worker disabled by default")
+
+    def test_a_failed_runtime_start_does_not_advertise_recovery(self):
+        """A crash during runtime init must stay retryable, not stick."""
+        import os
+        self._break_store()
+        srv.STATE._runtime_started = False
+        calls = []
+        real_from_env = srv.delivery_loop_from_env
+
+        def exploding(delivery, env):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("worker init blew up")
+            return real_from_env(delivery, env)
+
+        srv.delivery_loop_from_env = exploding
+        self.addCleanup(setattr, srv, "delivery_loop_from_env", real_from_env)
+        port = self._serve()
+        os.environ["DATABASE_URL"] = "sqlite:///" + tempfile.mktemp(".db")
+
+        self.assertEqual(
+            self._get(port, "/api/auth/roles")[0], 503,
+            "a failed runtime start was published as a successful recovery")
+        self.assertFalse(srv.STATE.store_available)
+        self.assertFalse(
+            srv.STATE._runtime_started,
+            "the runtime was marked started even though it raised, so no later "
+            "attempt would ever retry it")
+
+        srv.STATE._next_retry_at = 0.0     # allow the next controlled attempt
+        self.assertEqual(
+            self._get(port, "/api/auth/roles")[0], 200,
+            "the next attempt could not recover -- the failure was sticky")
+
+    # -- B3: credentials must not reach the LOG either ----------------------
+    def test_no_credentials_reach_the_log(self):
+        import io, contextlib
+        SENTINELS = ("hunter2", "s3cr3t-token", "svcuser")
+        self._break_store()
+        buf = io.StringIO()
+
+        class Boom(Exception):
+            pass
+
+        with contextlib.redirect_stderr(buf):
+            srv.STATE._record_boot_error(Boom(
+                "connection to postgresql://svcuser:hunter2@h:5432/db failed; "
+                "password=hunter2 token=s3cr3t-token"))
+        logged = buf.getvalue()
+
+        for sentinel in SENTINELS:
+            self.assertNotIn(
+                sentinel, logged,
+                f"{sentinel!r} was written to the LOG. Sanitizing only the "
+                f"response moves the leak; #203 says credentials must never be "
+                f"logged. Captured: {logged!r}")
+        self.assertIn("Boom", logged,
+                      f"the exception type was lost, so the log is no longer a "
+                      f"useful diagnostic: {logged!r}")
+        self.assertIn(srv.STATE.boot_error_ref or "\0", logged,
+                      "the log line carries no reference to correlate with the "
+                      "public response")
+
+    # -- B4: degraded OPTIONS is bodyless -----------------------------------
+    def test_degraded_options_is_bodyless_on_the_wire(self):
+        import socket
+        self._break_store()
+        port = self._serve()
+        sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+        self.addCleanup(sock.close)
+        sock.sendall(b"OPTIONS /api/auth/roles HTTP/1.1\r\n"
+                     b"Host: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        chunks = []
+        while True:
+            piece = sock.recv(65536)
+            if not piece:
+                break
+            chunks.append(piece)
+        raw = b"".join(chunks)
+        head, _, body = raw.partition(b"\r\n\r\n")
+        self.assertIn(b"503", head.split(b"\r\n")[0])
+        self.assertEqual(
+            body, b"",
+            f"degraded OPTIONS wrote {len(body)} body bytes -- its contract is "
+            f"'Always bodyless', outage or not. Sent: {body[:200]!r}")
