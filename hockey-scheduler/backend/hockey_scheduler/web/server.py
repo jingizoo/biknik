@@ -12,6 +12,8 @@ import os
 import re
 import ssl
 import sys
+import threading
+import uuid
 import traceback
 from contextlib import contextmanager
 from datetime import datetime
@@ -451,38 +453,120 @@ class DemoState:
         # while health/readiness name the actual error. `try_reconnect()` then
         # lets the instance recover WITHOUT a redeploy once the store returns.
         self.boot_error: Optional[str] = None
+        self.boot_error_ref: Optional[str] = None
+        # ONE reconnect at a time, and one runtime initialization ever.
+        self._reconnect_lock = threading.Lock()
+        self._runtime_started = False
         try:
             self.reset(seed=False)
         except Exception as exc:                      # noqa: BLE001
             self.api = None
             self.game_id = None
             self.ids = {}
-            self.boot_error = f"{type(exc).__name__}: {exc}"
-            print(f"[boot] store unavailable, serving 503 until it returns: "
-                  f"{self.boot_error}", file=sys.stderr, flush=True)
+            self._record_boot_error(exc)
+
+    # -- degraded-boot bookkeeping ------------------------------------------
+    def _record_boot_error(self, exc) -> None:
+        """Keep the FULL cause for the operator; publish only a category.
+
+        ``/api/health`` and ``/api/readiness`` are documented public and
+        non-sensitive, so the exception text must not go out on them: a store
+        failure can carry an internal hostname, a username, a database name or
+        path, or a DSN. Measured on this very branch, the public payload
+        contained ``failed to resolve host 'db-internal.example'``.
+
+        So the full text goes to STDERR next to a short reference, and the
+        response carries the reference plus a stable category. An operator
+        greps the log for the reference; a stranger learns only that the store
+        is unreachable, which they can already tell from the 503.
+        """
+        self.boot_error = f"{type(exc).__name__}: {exc}"
+        self.boot_error_ref = uuid.uuid4().hex[:8]
+        print(f"[boot ref={self.boot_error_ref}] store unavailable, serving 503 "
+              f"until it returns: {self.boot_error}",
+              file=sys.stderr, flush=True)
+
+    def public_store_failure(self) -> dict:
+        """The SANITIZED shape both public endpoints and the 503 body use."""
+        return {"status": "unavailable",
+                "reason": "store_unreachable",
+                "reference": self.boot_error_ref}
 
     @property
     def store_available(self) -> bool:
         return getattr(self, "api", None) is not None
 
-    def try_reconnect(self) -> bool:
-        """Attempt to build the store again after a failed boot.
+    def _start_runtime_once(self) -> None:
+        """The one-time initialization a healthy boot performs in ``serve()``.
 
-        Returns True once ``api`` exists. Never raises: a failed retry updates
-        ``boot_error`` and leaves the instance answering 503, exactly as before
-        the attempt, so a probe can be called on any request without turning a
+        Recovery has to do this too. ``try_reconnect`` used to only rebuild the
+        store, so an instance that booted degraded came back serving HTTP while
+        the delivery worker stayed STOPPED until someone restarted it by hand --
+        queued mail and push silently going nowhere, which is the opposite of
+        what "recovers without a redeploy" should mean. Guarded by a flag and
+        called under the reconnect lock, so concurrent first requests cannot
+        start two loops.
+        """
+        if self._runtime_started or not self.store_available:
+            return
+        self._runtime_started = True
+        self.api.delivery_loop = delivery_loop_from_env(self.api.delivery,
+                                                        os.environ)
+        if self.api.delivery_loop.start():
+            print(f"Delivery worker loop started "
+                  f"(every {self.api.delivery_loop.interval_seconds}s, "
+                  f"batch {self.api.delivery_loop.batch_size}).")
+
+    def try_reconnect(self) -> bool:
+        """Rebuild the store after a failed boot -- SINGLE-FLIGHT and ATOMIC.
+
+        Two properties this must have, both learned from review:
+
+        SINGLE-FLIGHT. ``ThreadingHTTPServer`` calls this from every request
+        thread, so without the lock a burst of first requests each builds its
+        own store: a connection storm against a database that has only just
+        come back, and every loser leaked because each captured the old value
+        before any of them published.
+
+        ATOMIC PUBLISH. ``reset()``'s production branch assigns ``self.api``
+        BEFORE ``bootstrap_admin_from_env`` and the rate-limit reset run, so a
+        concurrent request could see ``store_available`` True and dispatch
+        through a facade whose bootstrap was still in progress -- inconsistent
+        authorization state, from a half-built object. Recovery therefore does
+        NOT call ``reset()``: it builds, bootstraps and configures the
+        replacement entirely off to the side and assigns ``self.api`` exactly
+        once, as the last step, only on success. Waiting requests keep getting
+        503 until that assignment, which is the honest answer while it is true.
+
+        Never raises: a failed attempt records the cause and leaves the instance
+        exactly as degraded as it was, so probing on every request cannot turn a
         degraded instance into a crashing one.
         """
         if self.store_available:
             return True
-        try:
-            self.reset(seed=False)
-        except Exception as exc:                      # noqa: BLE001
-            self.api = None
-            self.boot_error = f"{type(exc).__name__}: {exc}"
-            return False
-        self.boot_error = None
-        return True
+        with self._reconnect_lock:
+            if self.store_available:      # another thread won the race
+                return True
+            store = None
+            try:
+                store = create_store()
+                api = self._make_api(store)
+                if _app_mode() == "production":
+                    bootstrap_admin_from_env(api, os.environ)
+                RATE_LIMITER.reset()      # (#131) clean slate, as on boot
+            except Exception as exc:      # noqa: BLE001
+                if store is not None:
+                    self._close_store(store, None)   # never leak the loser
+                self._record_boot_error(exc)
+                return False
+            # PUBLISH — fully built, exactly once, last.
+            self.api = api
+            self.game_id = None
+            self.ids = {}
+            self.boot_error = None
+            self.boot_error_ref = None
+            self._start_runtime_once()
+            return True
 
     def _make_api(self, store):
         # Email/push transports come from EMAIL_MODE / SMTP_* (#63) and
@@ -1491,10 +1575,13 @@ class Handler(BaseHTTPRequestHandler):
             return False
         if self.path.split("?", 1)[0] in ("/api/health", "/api/readiness"):
             return False
+        # SANITIZED for the same reason as health/readiness: this route is
+        # reachable without a session, so the raw exception must not go out.
         self._send_json({"error": {
             "code": "store_unavailable",
             "message": "The service is running but cannot reach its database.",
-            "details": {"reason": STATE.boot_error}}}, 503)
+            "details": {"reason": "store_unreachable",
+                        "reference": STATE.boot_error_ref}}}, 503)
         return True
 
     def do_GET(self):
@@ -1863,11 +1950,11 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json({
                 "status": "unavailable",
                 "app_mode": _app_mode(),
-                "store": {"status": "unavailable",
-                          "reason": STATE.boot_error},
+                "store": STATE.public_store_failure(),
                 "detail": "The service is running but has never reached its "
                           "database. It will recover without a redeploy once "
-                          "the database is reachable.",
+                          "the database is reachable. The full cause is in the "
+                          "server log under this reference.",
             }, 503)
         if path == "/api/health":
             # Liveness + dependency snapshot (#90). Public, non-sensitive.
@@ -2431,10 +2518,16 @@ class Handler(BaseHTTPRequestHandler):
         (an unauthenticated ``HEAD /api/accounts`` mirrors GET's 401/403, never
         a blind 200) — with body writes suppressed via ``_head_only``. A
         POST-only path falls through do_GET's tail to a bodyless 405 + Allow."""
-        if self._store_unavailable():
-            return
+        # ``_head_only`` FIRST. The store guard writes a 503 body like any other
+        # response helper, so checking it before this flag is set made a
+        # degraded HEAD send a JSON payload — a bodyless verb answering with
+        # bytes, which is the one thing this contract exists to prevent. The
+        # degraded answer must mirror the degraded GET exactly: same status,
+        # same headers, zero bytes.
         self._head_only = True
         try:
+            if self._store_unavailable():
+                return
             self.do_GET()
         finally:
             self._head_only = False
@@ -4805,12 +4898,10 @@ def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
     # instance diagnosable and lets it recover on its own; the delivery loop is
     # started by the first successful reconnect instead.
     if STATE.store_available:
-        STATE.api.delivery_loop = delivery_loop_from_env(STATE.api.delivery,
-                                                         os.environ)
-        if STATE.api.delivery_loop.start():
-            print(f"Delivery worker loop started "
-                  f"(every {STATE.api.delivery_loop.interval_seconds}s, "
-                  f"batch {STATE.api.delivery_loop.batch_size}).")
+        # The SAME one-time initialization recovery performs, so the two paths
+        # cannot drift: a degraded boot that later recovers must end up in the
+        # identical runtime state as a healthy boot.
+        STATE._start_runtime_once()
     else:
         print(f"[boot] starting WITHOUT a store: {STATE.boot_error}. "
               f"Data routes answer 503; /api/health and /api/readiness report "

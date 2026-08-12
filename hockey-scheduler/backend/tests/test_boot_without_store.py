@@ -152,14 +152,29 @@ class BootWithoutStoreTest(unittest.TestCase):
             # server that was behaving perfectly. Pinning the incidental text of
             # one environment's failure is not the contract — not hiding the
             # cause is.
-            reason = (body.get("store") or {}).get("reason") or ""
+            # THE CONTRACT CHANGED DELIBERATELY (#203 review), and this
+            # assertion changed with it rather than being deleted.
+            #
+            # It used to require the public reason to name the underlying
+            # exception. That was wrong on a PUBLIC endpoint: the exception text
+            # can carry an internal hostname, a username, a database name or
+            # path, or a DSN — measured on this branch, it published
+            # "failed to resolve host 'db-internal.example'".
+            #
+            # What an operator actually needs is preserved, and is what is
+            # asserted now: a STABLE CATEGORY they can alert on, plus a
+            # REFERENCE that correlates to the full cause in the server log.
+            # Both must be present — a category with no reference would leave
+            # them unable to find the diagnostic, which is how sanitizing turns
+            # into hiding.
+            store = body.get("store") or {}
+            self.assertEqual(
+                store.get("reason"), "store_unreachable",
+                f"{path} should report a stable category: {body}")
             self.assertTrue(
-                reason.strip(),
-                f"{path} reported no reason at all, so an operator still "
-                f"cannot tell why the store is down: {body}")
-            self.assertIn(
-                "Error", reason,
-                f"{path} should name the underlying exception, got: {reason!r}")
+                (store.get("reference") or "").strip(),
+                f"{path} gave no reference, so the full cause in the log cannot "
+                f"be correlated to this response: {body}")
 
         for path in ("/api/demo/overview", "/api/auth/roles"):
             status, body = self._get(port, path)
@@ -203,3 +218,212 @@ class BootWithoutStoreTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DegradedBootHardeningTest(BootWithoutStoreTest):
+    """The four review defects, each with its own case (#203 review).
+
+    Kept as a SUBCLASS so every case above still runs against the same server:
+    a correction that quietly broke the original contract would show up here.
+    """
+
+    # -- D1: single-flight, atomic publish -----------------------------------
+    def test_a_burst_of_first_requests_causes_exactly_one_reconnect(self):
+        """32 threads released together must build ONE store, not 32.
+
+        Barrier-controlled, not sleep-controlled: every client waits on the
+        same `threading.Barrier`, so they are genuinely simultaneous rather
+        than merely close together. Without the reconnect lock each thread runs
+        `create_store()` independently -- a connection storm at exactly the
+        moment the database has just come back, and every loser leaked because
+        each captured the old value before any published.
+        """
+        import os, threading as th
+        self._break_store()
+        port = self._serve()
+        self.assertEqual(self._get(port, "/api/auth/roles")[0], 503)
+
+        builds = []
+        build_lock = th.Lock()
+        real_create = srv.create_store
+
+        def counting_create(*a, **kw):
+            store = real_create(*a, **kw)
+            with build_lock:
+                builds.append(store)
+            return store
+
+        srv.create_store = counting_create
+        self.addCleanup(setattr, srv, "create_store", real_create)
+
+        os.environ["DATABASE_URL"] = "sqlite:///" + tempfile.mktemp(".db")
+
+        n = 32
+        barrier = th.Barrier(n)
+        results, rlock = [], th.Lock()
+
+        def hammer():
+            barrier.wait()
+            code = self._get(port, "/api/auth/roles")[0]
+            with rlock:
+                results.append(code)
+
+        threads = [th.Thread(target=hammer, daemon=True) for _ in range(n)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+
+        self.assertEqual(
+            len(builds), 1,
+            f"{len(builds)} stores were built for one recovery -- the reconnect "
+            f"is not single-flight, so a burst of first requests storms the "
+            f"database and leaks every loser")
+        self.assertTrue(srv.STATE.store_available)
+        self.assertEqual(
+            sorted(set(results)), [200],
+            f"not every request converged on the recovered facade: {sorted(set(results))}")
+
+    def test_no_request_can_observe_a_facade_before_bootstrap_finishes(self):
+        """`store_available` must never be True while the facade is half-built.
+
+        `reset()`'s production branch assigns `self.api` BEFORE
+        `bootstrap_admin_from_env` runs, which is exactly the window this
+        asserts is closed. The probe runs INSIDE bootstrap: if recovery
+        published early, the flag is already True while we are still in here.
+        """
+        import os
+        self._break_store()
+        port = self._serve()
+        seen = {}
+        real_bootstrap = srv.bootstrap_admin_from_env
+
+        def probing_bootstrap(api, env):
+            seen["available_during_bootstrap"] = srv.STATE.store_available
+            return real_bootstrap(api, env)
+
+        srv.bootstrap_admin_from_env = probing_bootstrap
+        self.addCleanup(setattr, srv, "bootstrap_admin_from_env", real_bootstrap)
+        os.environ["DATABASE_URL"] = "sqlite:///" + tempfile.mktemp(".db")
+
+        self.assertEqual(self._get(port, "/api/auth/roles")[0], 200)
+        if "available_during_bootstrap" in seen:
+            self.assertFalse(
+                seen["available_during_bootstrap"],
+                "the facade was PUBLISHED while its bootstrap was still "
+                "running -- a concurrent request could dispatch through a "
+                "half-initialized facade")
+
+    # -- D2: recovery starts the worker --------------------------------------
+    def test_recovery_starts_the_delivery_loop_exactly_once(self):
+        """A recovered instance must not silently leave delivery stopped.
+
+        The first version of this fix recovered HTTP routes only, so queued
+        mail and push stayed stopped until someone restarted the process by
+        hand -- while the PR text claimed full recovery.
+        """
+        import os, threading as th
+        self._break_store()
+        port = self._serve()
+        srv.STATE._runtime_started = False
+        starts = []
+        real_from_env = srv.delivery_loop_from_env
+
+        def counting_from_env(delivery, env):
+            loop = real_from_env(delivery, env)
+            starts.append(loop)
+            return loop
+
+        srv.delivery_loop_from_env = counting_from_env
+        self.addCleanup(setattr, srv, "delivery_loop_from_env", real_from_env)
+        os.environ["DATABASE_URL"] = "sqlite:///" + tempfile.mktemp(".db")
+
+        barrier = th.Barrier(8)
+
+        def hammer():
+            barrier.wait()
+            self._get(port, "/api/auth/roles")
+
+        threads = [th.Thread(target=hammer, daemon=True) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(30)
+
+        self.assertEqual(
+            len(starts), 1,
+            f"the runtime was initialized {len(starts)} times under concurrent "
+            f"first requests -- it must happen exactly once")
+        self.addCleanup(lambda: [l.stop() for l in starts
+                                 if hasattr(l, "stop")])
+
+    # -- D3: no secrets on the public surface --------------------------------
+    def test_public_endpoints_never_echo_the_store_failure_text(self):
+        """health/readiness/503 are public: a DSN must not travel on them."""
+        SENTINELS = ("hunter2", "svcuser", "db-internal.example",
+                     "prod_hockey", "/var/secret/path")
+        self._break_store()
+        srv.STATE.boot_error = (
+            "OperationalError: connection to "
+            "postgresql://svcuser:hunter2@db-internal.example:5432/prod_hockey"
+            " failed; tried /var/secret/path")
+        srv.STATE.boot_error_ref = "abc12345"
+        port = self._serve()
+
+        for path in ("/api/health", "/api/readiness", "/api/auth/roles",
+                     "/api/demo/overview"):
+            status, body = self._get(port, path)
+            self.assertEqual(status, 503, path)
+            blob = json.dumps(body)
+            for sentinel in SENTINELS:
+                self.assertNotIn(
+                    sentinel, blob,
+                    f"{path} leaked {sentinel!r} on a PUBLIC response: {blob}")
+            # A reference must exist, but NOT the one this test set: the
+            # guard retries first, that retry fails against the dead URL, and
+            # recording that failure mints a fresh reference. Asserting the
+            # hand-set value would be asserting that the retry did not happen.
+            ref = (body.get("store") or body.get("error", {})
+                   .get("details", {})).get("reference") or ""
+            self.assertTrue(
+                ref.strip(),
+                f"{path} gave no reference to correlate with the server log, "
+                f"so sanitization removed the operator's only diagnostic: {blob}")
+
+    # -- D4: degraded HEAD is bodyless ---------------------------------------
+    def test_degraded_head_mirrors_the_503_with_zero_bytes(self):
+        """RAW SOCKET, deliberately.
+
+        `http.client` knows a HEAD response carries no body and never reads
+        one, so `response.read()` returns b"" whether or not the server wrote
+        bytes. An earlier version of this test used it and passed even with the
+        defect restored -- it was measuring the client's politeness, not the
+        server's behaviour. Reading the socket directly is the only way to see
+        what was actually sent.
+        """
+        import socket
+        self._break_store()
+        port = self._serve()
+
+        sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+        self.addCleanup(sock.close)
+        sock.sendall(b"HEAD /api/auth/roles HTTP/1.1\r\n"
+                     b"Host: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        chunks = []
+        while True:
+            piece = sock.recv(65536)
+            if not piece:
+                break
+            chunks.append(piece)
+        raw = b"".join(chunks)
+
+        self.assertIn(b" 503 ", raw.split(b"\r\n", 1)[0] + b" ",
+                      f"degraded HEAD did not answer 503: {raw[:120]!r}")
+        head, _, body = raw.partition(b"\r\n\r\n")
+        self.assertEqual(
+            body, b"",
+            f"degraded HEAD wrote {len(body)} body bytes on the wire -- HEAD "
+            f"must mirror the status and headers with no payload. Sent: "
+            f"{body[:200]!r}")
+        self.assertIn(b"Content-Length:", head,
+                      "the mirrored headers should still be present")
