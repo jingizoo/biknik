@@ -1226,6 +1226,148 @@ that block is followed by a generation check *before* its assignment. This was a
 real, reproducible mixed-grid defect, not a theoretical one — it is what
 `checkPlayerListRaceGuard` in `e2e/league-filtered-data.js` pins down.
 
+### Where the client guard stops, and what carries on from there
+
+The guards above stop a stale body from being **believed**. A separate barrier
+in `app.js` — `cancelContextScopedReads()` then
+`awaitContextScopedReadSettlement()`, run before `POST /api/context` — stops a
+doomed read from being **dispatched**. Neither can stop the **server** from
+answering a read it has already accepted, and that is a real gap rather than a
+theoretical one:
+
+```
+GET /api/v2/setup/seasons/season_3/venue-candidates -> 404
+(CI run 31504917446, browser shard 1, phone leg; the app's own abort ledger
+ records that read as dispatched:true, so enrolment was never the gap)
+```
+
+`AbortController.abort()` settles the **client's** fetch promise immediately
+while the server keeps executing the request. The POST then commits, and the
+still-running read compares its Season against the **new** selection —
+`season_id != active_season.id` — and returns the generic 404 for a Season the
+operator was legitimately looking at.
+
+**`services/context_gate.py` closes that half, server-side.** A per-process,
+per-user SHARED/EXCLUSIVE quiescence gate orders the **exact-Season scoped
+reads** against `POST /api/context` **by arrival at the server**.
+
+Which reads those are is an explicit, auditable table
+(`CONTEXT_SCOPED_READ_ROUTES` in `web/server.py`), not a prefix and not a
+decorator, because joining it costs a request an ordering constraint against
+every switch by the same operator. A GET route earns its place by *both* (a)
+resolving the active tuple inside the request via `resolve_with_league`, and (b)
+comparing a **caller-named target** against the resolved Season with
+`season_id != active_season.id`, so a tuple that moves underneath the handler
+turns a legitimate answer into a generic refusal.
+
+That comparison is **not** funnelled through a single helper, and an audit that
+assumes it is will miss three of the four rows below. Re-run the enumeration
+this way: every caller of `resolve_with_league` that then compares a
+caller-named target to the resolved Season, by any of the three shapes the code
+actually uses — **inline** (`service.py:9378`, `:10688`; this is how *both*
+venue reads do it), via `_scenario_in_active_tuple` → `_setup_target_edge_allows`
+(`:6536`, `:1013`), or via `_division_matches_active_context` (`:5947`, called
+at `:6025`). Six GET routes reach the comparison; **four** qualify:
+
+| route | named target | what a mid-flight commit turns it into |
+| --- | --- | --- |
+| `/api/v2/setup/seasons/<id>/venue-candidates` | the Season | generic 404 |
+| `/api/v2/setup/seasons/<id>/venue-access` | the Season | generic 404 |
+| `/api/scheduler/scenarios/<id>` | the scenario | `_scenario_not_found` — the same generic 404 a foreign Program's scenario takes |
+| `/api/standings/<division_id>` | the Division | the generic **empty standings** shape: a wrong answer that looks like a real one |
+| `/api/scheduler/scenarios`, `/api/scheduler/drafts` | *none* — **not listed** | nothing; the active tuple is their query, not a ceiling on something the caller asked for, so they cannot refuse anything |
+
+The first two were what CI failed on; the other two were found by re-auditing
+the criterion against the code rather than against the incident, and each has
+its own held-read regression plus its own unweakened-ceiling control in
+`tests/test_context_switch_server_exit.py`.
+
+The lock order:
+
+| level | lock | taken by |
+| --- | --- | --- |
+| **0** | **`ContextSwitchGate`** (shared for a scoped read, exclusive for the switch) | **`Handler.do_GET` / `do_POST` only** |
+| 1 | `active_context_mutex` (session advisory) | mutations |
+| 2 | `store.transaction()` / the store `_lock` | everything |
+| 3 | the ActiveContext row (`resolve_with_league(lock=True)`) | mutating gates |
+| 4 | parent / bridge rows | |
+| 5 | target rows | |
+
+Three things about it are worth stating explicitly, because each is a decision
+that could plausibly have gone the other way:
+
+* **It is not the #386 `active_context_mutex`, and could not be.** That mutex is
+  a PostgreSQL advisory lock on `SqlStore.conn`, and the web process holds
+  exactly one `SqlStore`. PostgreSQL grants an advisory lock re-entrantly to the
+  same session, so it orders *connections*, not requests — which is why every
+  existing test of it builds a second `SqlStore`. It is also a documented no-op
+  on SQLite and in-memory, and this regression is required on all three.
+* **Mutual exclusion is the wrong property.** A mutex says the read and the
+  switch do not interleave; it does not say which goes first. If the switch won,
+  the read would block, wake, resolve the *new* tuple and 404 — the same failure,
+  reproduced through the fix. Ordering by arrival is a request-lifecycle fact no
+  store-layer lock can express.
+* **Nothing hangs, in either direction.** Both waits are bounded
+  (`HS_CONTEXT_GATE_TIMEOUT`, default 10s); on expiry the waiter proceeds and the
+  expiry is counted in `stats()["timeouts"]`. A wedged read must not be able to
+  lock an operator out of switching context.
+* **The failure handling is not itself a failure mode.** `_await` *returns* the
+  expiry notice rather than printing it, and both call sites say it out loud
+  only after releasing the gate mutex: a `print` under that mutex would let one
+  stalled stderr freeze every gate operation including `arrive()`, which is the
+  first statement `do_GET` runs for every scoped read. And each registration is
+  removed by a `finally` that covers the wait *and* the notice, so an exception
+  out of either — a full non-blocking pipe, or a `wait_for` that raises on a
+  pathological configured bound — cannot leak a participant for the life of the
+  process.
+* **Cross-user coupling is bounded by a session lookup — two of them on the
+  routes that pre-check with `_operator_only` — and that bound is enforced
+  rather than intended.** An arrival ticket is registered before the request has
+  an identity, so a switch by *another* operator may briefly wait on it. The
+  window is however long identity takes: `_resolve_role` (`server.py:877`) does
+  an uncached `SESSIONS.resolve(store, sid)` every call, and `_operator_only`
+  (`:968-989`) calls it and *then* the route branch calls it again — so it is
+  one lookup on `/api/standings/<division_id>` and two on the two venue reads
+  and `/api/scheduler/scenarios/<id>`. Pre-existing for the venue routes, and
+  inherited by the routes added here. The instant it resolves to somebody else
+  it leaves that switch's wait set,
+  and the narrowing is announced *before* the narrowing thread itself goes to
+  sleep. Announcing it afterwards instead — which is what the first cut did —
+  makes the coupling the other operator's whole switch, and does so silently: a
+  bounded wait whose predicate came true while it slept reports success at the
+  deadline and records no timeout, so `stats()` would show a healthy gate the
+  whole time. `test_one_operators_switch_is_not_stalled_by_anothers_scoped_read`
+  drives exactly that interleaving on two real operators.
+* **The ordering point is entry to the handler, not the wire — and that is the
+  right place, but it was measured rather than assumed.** The gate registers a
+  read at the top of `do_GET`, which is *after* `accept()` and the per-connection
+  thread spawn, so in principle a `POST /api/context` could reach `do_POST`
+  before a GET whose bytes were written first, and the read would then be
+  ordered *after* the switch and 404. Probed directly by wrapping both entry
+  points and recording which registered first, over 300 trials per gap: with the
+  two requests issued **simultaneously** (a gap of 0, which is strictly more
+  adversarial than the real client, since that one aborts and awaits settlement
+  *before* POSTing), ~1 in 300 reads was answered 404 — and in **every** such
+  case the switch had genuinely registered first, i.e. it is the ceiling
+  answering a read that really did arrive after the commit, not the race. There
+  was **no** case of a 404 where the read registered first. At any positive gap
+  from 0.5 ms upward the 404s disappear entirely. The inversion window is
+  therefore sub-millisecond and, crucially, is not a window in which the
+  guarantee is *violated* — a read that truly arrives after a switch is supposed
+  to be refused.
+
+**The ceiling is untouched.** The `season_id != active_season.id` comparison and
+both generic `NotFoundError`s are byte-identical: an independently issued read
+for a non-selected Season still gets the same generic 404, indistinguishable
+from a nonexistent one. The gate changes *when* a read is evaluated, never
+*what* it is evaluated against.
+
+**Honest scope limit:** the gate is per **process**. The deployment is a single
+`ThreadingHTTPServer`. If the app is ever run multi-replica, a read on replica A
+and a POST on replica B are not ordered by it, and the fix would have to be
+re-expressed at the database — which the existing advisory lock cannot do, for
+the first reason above.
+
 ## Coverage
 
 - `tests/test_league_filtered_setup_progress.py`,
@@ -1252,3 +1394,35 @@ real, reproducible mixed-grid defect, not a theoretical one — it is what
   `dashboard-season-ceiling.js` — the browser layer at desktop and 390×844,
   including two delayed-response races proving the newest tuple always wins
   (one for `render()`'s locals, one for its module-level state).
+- `tests/test_context_switch_server_exit.py` — the server-side ordering gate,
+  across Memory / SQLite / PostgreSQL over authenticated HTTP. A real request is
+  parked *inside* the real `Handler` (at both gate phases: bound, and unbound
+  inside `_resolve_role`) while a switch is driven against it, and the
+  observation is the *persisted* tuple, not a status code. One case per listed
+  route — the two venue reads, the named scenario, and the Division standings —
+  each with its own unweakened-ceiling control. Carries the four named
+  concurrency classes (concurrent switches, failure/cancellation while waiting,
+  repeated switching, and the forced no-indefinite-blocking case), plus **two
+  distinct operators**, which is the only axis that can see cross-user coupling
+  at all: every other case in the file opens all its sessions for one username,
+  so a gate that coupled unrelated operators would pass them byte-identically.
+  Its inert-seam anti-vacuity control measures against `wait_timeout`, not
+  against `PATIENCE` — the two were numerically equal at the default bound, and
+  under a smaller configured bound the control went green on a mutant whose
+  every wait predicate returned `True`.
+- The same file's `ContextGateInternalsTest` drives the gate directly, with no
+  store and no HTTP, for the failure modes that are reachable through a request
+  only by luck: a bounded wait that raises, an expiry notice whose stderr write
+  raises, and an expiry notice whose stderr write *blocks* while another thread
+  tries to `arrive()`.
+- `e2e/context-switch-read-settlement.js` — the CLIENT half (#412): the switch
+  cancels its outstanding scoped reads and awaits their settlement before
+  POSTing.
+- `e2e/context-switch-server-exit.js` — the SERVER half, at desktop and 390×844.
+  A scoped read is held inside the server (through `e2e/server-park-harness.py`,
+  an e2e-owned wrapper that monkey-patches the real `ApiService` after import —
+  no production hook, because a flag that let any caller park a request would be
+  a denial-of-service affordance shipped to make a test easier), a real
+  `#ctx-select` switch is made, and the POST is required not to commit until the
+  handler exits. Zero 404s, zero console errors, and the same sibling-Season 404
+  control asserted in the same run.

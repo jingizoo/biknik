@@ -13,6 +13,7 @@ import re
 import ssl
 import sys
 import traceback
+from contextlib import contextmanager
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -38,6 +39,7 @@ from ..services import (
     email_transport_from_env,
     push_transport_from_env,
 )
+from ..services.context_gate import ContextSwitchGate
 from ..store import SqlStore, create_store
 from .auth import (
     DEFAULT_TTL_SECONDS,
@@ -567,6 +569,77 @@ class DemoState:
 
 
 STATE = DemoState()
+
+# The exact-Season scoped READS whose answer is only meaningful under the
+# CURRENTLY PERSISTED context tuple. Deliberately an EXPLICIT table rather than
+# a prefix or a decorator: joining it costs a request an ordering constraint
+# against every context switch by the same operator, so a route earns its place
+# here by having the exact-selected-Season ceiling
+# (`season_id != active_season.id`), not by resembling one.
+#
+# THE CRITERION, SHARPENED so the table can be audited rather than trusted
+# (#159 review — the first cut listed two of the four that qualify, and stopped
+# at the two it had a CI failure for). A GET route belongs here when BOTH hold:
+#
+#   1. it resolves the active tuple INSIDE the request, via
+#      `ContextService.resolve_with_league`, and
+#   2. it compares a CALLER-NAMED target against the resolved Season with that
+#      exact inequality, so a tuple that moves underneath the handler turns a
+#      legitimate answer into a generic refusal.
+#
+# THE ENUMERATION THAT PRODUCES THIS TABLE, stated so it can actually be re-run.
+# The comparison is NOT funnelled through one helper, and an audit that assumes
+# it is will miss three of the four rows below. Enumerate every caller of
+# `ContextService.resolve_with_league` in `api/service.py` that then compares a
+# caller-named target to the resolved Season — by ANY of the four routes the
+# code actually uses:
+#
+#   * INLINE, `season_id != active_season.id`  (service.py:9378, :10688 — this
+#     is how BOTH venue reads do it; neither touches the helpers below)
+#   * `_scenario_in_active_tuple` -> `_setup_target_edge_allows`  (:6536, :1013)
+#   * `_division_matches_active_context`  (:5947, called at :6025)
+#
+# An earlier revision of this comment named only the middle one and claimed the
+# table was derived from it. It was not: that recipe reaches exactly one of the
+# four listed routes. Six GET routes reach the comparison at all; four qualify:
+#
+#   * /api/v2/setup/seasons/<id>/venue-candidates   LISTED — named Season
+#   * /api/v2/setup/seasons/<id>/venue-access       LISTED — named Season
+#   * /api/scheduler/scenarios/<id>                 LISTED — named scenario,
+#       via `_scenario_in_active_tuple` -> `_setup_target_edge_allows`; a
+#       mismatch is `_scenario_not_found`, the same generic 404 a foreign
+#       Program's scenario takes
+#   * /api/standings/<division_id>                  LISTED — named Division,
+#       via `_division_matches_active_context`'s
+#       `league_season.season_id != season.id`; a mismatch is the generic
+#       EMPTY standings shape, which is a wrong answer that looks like a real
+#       one rather than a refusal — worse to leave unordered, not better
+#   * /api/scheduler/scenarios and /api/scheduler/drafts   NOT LISTED, and
+#       that is the criterion doing its job: they name no target, so the active
+#       tuple IS their query rather than a ceiling on something the caller
+#       asked for. They cannot refuse anything, so there is nothing for a
+#       mid-flight commit to turn into a refusal, and clause 2 fails.
+#
+# Every mutation route that reaches the same comparison takes the WRITER side
+# of this gate (or none of it) by construction: the reader side is wired only
+# into `do_GET`.
+CONTEXT_SCOPED_READ_ROUTES = (
+    re.compile(r"^/api/v2/setup/seasons/[^/]+/venue-candidates$"),
+    re.compile(r"^/api/v2/setup/seasons/[^/]+/venue-access$"),
+    re.compile(r"^/api/scheduler/scenarios/[^/]+$"),
+    re.compile(r"^/api/standings/[^/]+$"),
+)
+
+
+def is_context_scoped_read(path: str) -> bool:
+    return any(rx.match(path) for rx in CONTEXT_SCOPED_READ_ROUTES)
+
+
+# ONE gate per process, beside STATE and with the same lifetime — it orders
+# REQUESTS, not data, so it deliberately survives STATE.reset()/store swaps.
+# See services/context_gate.py for the ordering argument, the lock level, and
+# the honest per-process scope limit.
+CONTEXT_GATE = ContextSwitchGate()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1336,7 +1409,59 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
 
     # -- routing -----------------------------------------------------------
+    # The live scoped-read ticket for THIS request, or None. One request is in
+    # flight per handler instance at a time (keep-alive requests are served
+    # serially on the connection's own thread), so an instance attribute is the
+    # right lifetime for it.
+    _context_read_ticket = None
+
     def do_GET(self):
+        """Dispatch a GET, registering an ARRIVAL with the context gate first
+        when the path is one of the exact-Season scoped reads (#159).
+
+        PHASE A of the two-phase reader registration lives here, and it has to:
+        the ticket is taken BEFORE ``_resolve_role()``, which is itself a store
+        read and is where a request most plausibly sits when a switch arrives.
+        A gate that only knew about IDENTIFIED readers would see nothing to wait
+        for and let the switch commit straight past this request — which is the
+        CI failure. PHASE B (binding the ticket to the resolved ``user_id``)
+        happens in each listed route's branch below, around the service call —
+        one branch per entry in ``CONTEXT_SCOPED_READ_ROUTES``, which is where
+        the membership criterion and the full per-route enumeration live.
+
+        The ticket is released in ``finally`` — including when the response
+        write raises ``BrokenPipeError`` on a vanished client — so no gate hold
+        can outlive the handler.
+        """
+        path = self.path.split("?", 1)[0]
+        if not is_context_scoped_read(path):
+            return self._dispatch_get()
+        ticket = CONTEXT_GATE.arrive()
+        self._context_read_ticket = ticket
+        try:
+            return self._dispatch_get()
+        finally:
+            ticket.release()
+            self._context_read_ticket = None
+
+    @contextmanager
+    def _context_read_hold(self, user_id):
+        """PHASE B. Hold the gate SHARED for ``user_id`` across a scoped read's
+        service call, then release BEFORE the response is written — a slow or
+        dead client socket must never be able to pin the gate.
+
+        A request that reached here without an arrival ticket (a route not in
+        ``CONTEXT_SCOPED_READ_ROUTES``) takes nothing, so adding the hold to a
+        branch is inert until the route is also listed there.
+        """
+        ticket = self._context_read_ticket
+        if ticket is None:
+            yield None
+            return
+        with ticket.bind(user_id) as held:
+            yield held
+
+    def _dispatch_get(self):
         path = self.path.split("?", 1)[0]
         api = STATE.api
         if path == "/favicon.ico":
@@ -1489,8 +1614,18 @@ class Handler(BaseHTTPRequestHandler):
             if err is not None:
                 code, payload = err
                 return self._send_json(payload, code)
-            return self._send_api(api.get_venue_grant_candidates(
-                mvc.group(1), user_id, role, scope))
+            # PHASE B of the context gate (#159). The SHARED hold spans the
+            # whole service call — `resolve_with_league`, the exact-Season
+            # comparison, and the payload build — so a context switch for this
+            # user cannot commit in the middle of them. It is released before
+            # `_send_api` writes, so the client's socket is never in the
+            # critical section. The ceiling itself is untouched: this read is
+            # still refused with the same generic 404 when the Season it names
+            # is not the selected one.
+            with self._context_read_hold(user_id):
+                payload = api.get_venue_grant_candidates(
+                    mvc.group(1), user_id, role, scope)
+            return self._send_api(payload)
 
         if path == "/api/v2/setup/overview":
             # Canonical flat setup-entity lists for the Setup/Records UI (#233
@@ -1596,8 +1731,12 @@ class Handler(BaseHTTPRequestHandler):
             if err is not None:
                 code, payload = err
                 return self._send_json(payload, code)
-            return self._send_api(api.list_season_venue_access(
-                mv2va.group(1), user_id, role, scope))
+            # PHASE B of the context gate (#159) — same shape, same reason, and
+            # the same untouched ceiling as the candidates route above.
+            with self._context_read_hold(user_id):
+                payload = api.list_season_venue_access(
+                    mv2va.group(1), user_id, role, scope)
+            return self._send_api(payload)
         if path == "/api/v2/onboarding/status":
             if self._operator_only("/api/v2/onboarding/status"):
                 return
@@ -1871,8 +2010,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"error": {
                     "code": "unauthorized",
                     "message": "A signed-in account is required."}}, 401)
-            return self._send_api(
-                api.get_standings(sd.group(1), user_id, role, scope))
+            # PHASE B of the context gate (#159). `_division_matches_active_
+            # context` resolves the tuple inside this call and compares the
+            # Division's LeagueSeason against the active Season; a mismatch is
+            # the generic EMPTY standings shape. Unordered, a switch commiting
+            # mid-read makes that empty answer arrive for a Division the
+            # operator has selected and is looking at.
+            with self._context_read_hold(user_id):
+                payload = api.get_standings(sd.group(1), user_id, role, scope)
+            return self._send_api(payload)
         # #283 Slice D: LeagueSeason-wide standings (across all its Divisions),
         # keyed by (league_id, season_id). Exhibition games are excluded.
         lss = re.match(
@@ -1956,8 +2102,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"error": {
                     "code": "unauthorized",
                     "message": "A signed-in account is required."}}, 401)
-            return self._send_api(api.get_schedule_scenario(
-                scenario_get.group(1), user_id, role, scope))
+            # PHASE B of the context gate (#159). Same shape and same reason as
+            # the two venue routes: `_scenario_in_active_tuple` resolves the
+            # tuple inside this call and refuses a scenario that is not in it
+            # with the generic `_scenario_not_found`. The ceiling is untouched
+            # — only WHEN it may be evaluated relative to a commit changes.
+            with self._context_read_hold(user_id):
+                payload = api.get_schedule_scenario(
+                    scenario_get.group(1), user_id, role, scope)
+            return self._send_api(payload)
         if path == "/api/auth/me":
             # Consistent with POST role resolution (#50): no cookie → signed out,
             # a valid cookie → the user, a present-but-invalid/expired cookie →
@@ -2508,10 +2661,21 @@ class Handler(BaseHTTPRequestHandler):
                                   "league_id": (str, type(None))})
             except BodyError as exc:
                 return self._send_json(exc.payload, exc.status)
-            return self._send_api(api.set_active_context(
-                user_id, role, scope,
-                body.get("program_id"), body.get("season_id"),
-                body.get("league_id")))
+            # WRITER SIDE of the context gate (#159). The EXCLUSIVE hold wraps
+            # ONLY the commit. On entry it waits for the exact-Season scoped
+            # reads that were ALREADY inside the server — client settlement is
+            # not handler exit, and an AbortController cannot un-send a request
+            # the server already holds — and from the instant it registers, a
+            # newly arriving scoped read for this user waits for IT instead, so
+            # nothing can be admitted mid-quiesce and straddle the commit.
+            # Bounded: see `ContextSwitchGate._await`. Nothing else in the
+            # application takes this gate; no mutation is a participant.
+            with CONTEXT_GATE.exclusive(user_id):
+                payload = api.set_active_context(
+                    user_id, role, scope,
+                    body.get("program_id"), body.get("season_id"),
+                    body.get("league_id"))
+            return self._send_api(payload)
 
         # Authorize the acting role at the HTTP boundary (#24/#50). A session
         # cookie is authoritative; the X-Demo-Role header is a dev fallback.

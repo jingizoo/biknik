@@ -49,11 +49,26 @@
 // WHAT THIS JOURNEY DOES NOT PROVE, said plainly. It cannot show that the
 // SERVER has finished with a read it already received; HTTP offers the client
 // no such signal, and no browser test can invent one. It proves the whole of
-// what CI measured and what an operator sees -- that no old-tuple scoped read
-// ARRIVES as a 404, that none can paint, and that every cancellation is
-// accounted for as intentional. The remaining server-side window is
-// unobservable (the connection is gone before any answer could be written) and
-// closing it would take a server change, which #369's ruling forbids.
+// what CI measured from the CLIENT side and what an operator sees -- that no
+// old-tuple scoped read ARRIVES as a 404, that none can paint, and that every
+// cancellation is accounted for as intentional.
+//
+// THAT REMAINING SERVER-SIDE WINDOW IS NOW CLOSED, ELSEWHERE. An earlier
+// revision of this paragraph said the window was unobservable and that closing
+// it "would take a server change, which #369's ruling forbids". The first half
+// was right about THIS journey and is still why the barrier below is worth
+// having; the second half was wrong. #369's ruling constrains the exact-Season
+// CEILING -- which is untouched, and is still asserted here by leg (S) -- not
+// the ORDER in which the server processes a read and a switch.
+// `services/context_gate.py` supplies that order, and
+// `context-switch-server-exit.js` measures it by holding a read INSIDE the
+// server (through an e2e-owned harness, no production hook) and requiring the
+// switch to be unable to commit until the handler exits.
+//
+// The two journeys are complements and neither subsumes the other: this one
+// keeps the CLIENT from ever dispatching a doomed read or believing a stale
+// body; that one keeps the SERVER from answering a read it already accepted
+// against a selection that moved underneath it.
 //
 // HOW THE OLD READ IS MADE TO LOSE THE RACE. The held request is intercepted
 // BEFORE it is forwarded, so the SERVER HAS NOT SEEN IT YET; it is released only
@@ -128,10 +143,14 @@ const HOST = "127.0.0.1";
 const BACKEND_DIR = path.resolve(__dirname, "..", "backend");
 const READY_TIMEOUT_MS = 15000;
 
-// The two exact-selection-ceilinged Season reads, and the only routes enrolled
-// in the barrier on the app side. Kept as ONE regexp used by the hold, the
-// ledger and the server control, so those three can never disagree about what
-// a "context-scoped read" is.
+// The two exact-selection-ceilinged SEASON reads -- the only routes the app
+// enrols in its client-side barrier, which is what THIS journey is about. It is
+// not the whole set of context-scoped reads: `CONTEXT_SCOPED_READ_ROUTES` in
+// `web/server.py` is authoritative and also carries the named-scenario and the
+// Division-standings reads, which are ordered server-side by the gate and never
+// depended on this barrier. Kept as ONE regexp used by the hold, the ledger and
+// the server control, so those three can never disagree about what a
+// "context-scoped read" is HERE.
 const SCOPED_READ_RE =
   /\/api\/v2\/setup\/seasons\/([^/?]+)\/venue-(access|candidates)(?:\?|$)/;
 

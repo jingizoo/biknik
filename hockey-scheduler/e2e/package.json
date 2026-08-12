@@ -9,6 +9,7 @@
     "bootstrap-program-selection": "node bootstrap-program-selection.js",
     "context-identity-withdrawal": "node context-identity-withdrawal.js",
     "context-switch-read-settlement": "node context-switch-read-settlement.js",
+    "context-switch-server-exit": "node context-switch-server-exit.js",
     "league-context-bar": "node league-context-bar.js",
     "league-filtered-data": "node league-filtered-data.js",
     "dashboard-season-ceiling": "node dashboard-season-ceiling.js",
