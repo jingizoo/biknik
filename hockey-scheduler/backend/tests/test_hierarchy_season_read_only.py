@@ -20,7 +20,13 @@ decided not to want the data. It reproduced roughly one run in three in the
 every future mutation remembering to invalidate. Instead the hierarchy -- the
 tree the client is already looping over in that same render pass -- carries the
 fact per Season, so the guard's input and the refusal's decision come from one
-read of one store and cannot describe different moments.
+read of one store -- as fresh as a client-side value can be.
+
+THAT IS NOT THE SAME AS CURRENT, and this file does not claim it is. The
+hierarchy read and the candidate request are two separate reads and CAN describe
+different moments: a Season archived between them still takes the deliberate
+404. Closing that window needs a server-side binding (a version/epoch on the
+follow-up read), which is deliberately NOT in this change.
 
 These tests are therefore about AGREEMENT, not about a field existing. The
 field is asserted to track the refusal at every step (active -> archived ->

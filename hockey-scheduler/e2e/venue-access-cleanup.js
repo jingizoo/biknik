@@ -653,11 +653,37 @@ async function checkViewport(browser, viewport) {
     // the Season was genuinely writable — could dispatch its candidate request
     // after the archive lands, and this leg would be measuring an ordinary
     // concurrent mutation instead of the stale-cache defect it is about.
+    //
+    // WHAT THIS LEG DOES NOT COVER, stated so the drain is not mistaken for
+    // coverage it does not provide: by settling traffic BEFORE archiving, this
+    // deliberately EXCLUDES the archive-between-the-two-reads window. A Season
+    // archived after the hierarchy response but before the candidate request
+    // reaches the service still takes the deliberate 404, and no client-side
+    // guard can close that. It is an owner-accepted limit of this change,
+    // closed separately by binding the follow-up read to a server-issued
+    // version/epoch (#203 transport work). This leg proves the STALE-CACHE
+    // defect only.
+    //
+    // The wait below is a bounded QUIESCENCE POLL, not a fixed pause: it exits
+    // as soon as two consecutive observations agree, so a fast machine leaves
+    // immediately and a slow one simply polls more times. No assertion in this
+    // leg is true because any particular interval elapsed.
     const settleCandidateTraffic = async () => {
+      const deadline = Date.now() + 20000;
       let last = -1;
       while (last !== candidateRequests.length) {
         last = candidateRequests.length;
-        await page.waitForTimeout(750);
+        for (;;) {
+          await new Promise((r) => setTimeout(r, 50));   // poll interval only
+          if (candidateRequests.length !== last) break;  // still moving
+          if (Date.now() > deadline) {
+            throw new Error("candidate traffic never settled before the "
+              + "archive; this leg cannot isolate the stale-cache defect");
+          }
+          // two agreeing observations 50ms apart == quiet
+          await new Promise((r) => setTimeout(r, 50));
+          if (candidateRequests.length === last) return;
+        }
       }
     };
 

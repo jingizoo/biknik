@@ -10506,9 +10506,15 @@ async function render() {
       // undeclared 404 on .../season_3/venue-candidates, roughly one run in
       // three. Refreshing the cache harder would have left the defect CLASS
       // alive, depending on every future mutation remembering to invalidate.
-      // `hv` was fetched a few lines above IN THIS PASS, from the same store
-      // the candidate route is about to consult, so its `read_only` and that
-      // route's refusal cannot describe different moments.
+      // `hv` was fetched a few lines above IN THIS PASS, so its `read_only` is
+      // as fresh as any client-side value can be -- which is NOT the same as
+      // current. They ARE two separate reads and they CAN describe different
+      // moments: a Season archived after the hierarchy response but before this
+      // request reaches the service still yields the deliberate 404. That
+      // residual window is a known, owner-accepted limit of a client-side
+      // guard, closed separately at the server contract (#203 transport work).
+      // An earlier version of this comment claimed the two reads could not
+      // differ; that was false, and contradicted this PR's own description.
       for (const program of (hv.programs || [])) {
         const r = await getJSON(`/api/v2/setup/programs/${program.id}/teams`);
         // Same reason as the player list above, and more acute: this loop
