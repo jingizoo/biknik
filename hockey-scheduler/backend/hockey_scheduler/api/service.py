@@ -5944,18 +5944,22 @@ class ApiService:
             return None, None
         return league_season, season
 
-    def _division_matches_active_context(self, division_id, program, season,
-                                         league):
-        """Whether ``division_id``'s validated LeagueSeason -> Season ->
-        Program chain matches the ACTIVE resolved tuple.
+    def _league_season_matches_active_context(self, league_season, ls_season,
+                                              program, season, league):
+        """Whether a validated ``LeagueSeason -> Season -> Program`` chain
+        matches the ACTIVE resolved tuple. The ONE comparison behind BOTH
+        operator standings reads (per-Division and LeagueSeason-wide, #202) —
+        shared rather than transcribed so the two route contracts cannot drift
+        into disagreeing about who may read which table.
 
         Program is the hard ceiling, and a Season MUST be active and match
         EXACTLY (#367 owner ruling: "Season-bound rows must match the active
         Season; a Program-only context returns EMPTY for Season-bound data").
-        Standings are Season-bound by construction — a Division reaches its
-        Season only through its LeagueSeason — so a Program-only context can
-        never satisfy this and returns the generic empty shape for EVERY
-        Division, indistinguishably from a nonexistent one.
+        Standings are Season-bound by construction — both a Division and a
+        League reach their Season only through a LeagueSeason — so a
+        Program-only context can never satisfy this and takes the caller's
+        generic not-here answer for EVERY target, indistinguishably from a
+        nonexistent one.
 
         An earlier revision enforced the Season axis only ``if season is not
         None``, which silently WIDENED the read exactly where it should have
@@ -5978,15 +5982,31 @@ class ApiService:
         authorized, which is exactly the leak #369 review flags."""
         if program is None or season is None:
             return False
-        league_season, div_season = self._division_league_season_chain(
-            division_id)
-        if league_season is None or div_season.program_id != program.id:
+        if league_season is None or ls_season is None:
+            return False
+        if ls_season.program_id != program.id:
             return False
         if league_season.season_id != season.id:
             return False
         if league is not None and league_season.league_id != league.id:
             return False
         return True
+
+    def _division_matches_active_context(self, division_id, program, season,
+                                         league):
+        """Whether ``division_id``'s validated LeagueSeason -> Season ->
+        Program chain matches the ACTIVE resolved tuple. Resolving the chain
+        is the Division-specific part; the comparison itself is the shared
+        ``_league_season_matches_active_context``, which carries the rules and
+        the reasoning behind each axis.
+
+        A dangling chain (no Division, no LeagueSeason, or no Season) is
+        ``(None, None)`` and never matches, so it takes the same generic empty
+        standings shape a nonexistent ``division_id`` does."""
+        league_season, div_season = self._division_league_season_chain(
+            division_id)
+        return self._league_season_matches_active_context(
+            league_season, div_season, program, season, league)
 
     @catch
     def get_standings(self, division_id: str, user_id=None, role=None,
@@ -6117,15 +6137,56 @@ class ApiService:
                         key=lambda x: (-x["pts"], -x["gd"], -x["gf"], x["team_name"]))
         return {"division_id": division_id, "standings": ranked}
 
+    def _league_season_not_found_error(self) -> dict:
+        """The ONE not-here answer this route has. Returned both for a
+        LeagueSeason that does not exist and for one outside the caller's
+        active tuple, from the same expression so the two can never be told
+        apart by a byte (#202)."""
+        return {"error": {
+            "code": "not_found",
+            "message": "No such league in that season."}}
+
     @catch
-    def get_league_season_standings(self, league_id: str,
-                                    season_id: str) -> dict:
+    def get_league_season_standings(self, league_id: str, season_id: str,
+                                    user_id=None, role=None,
+                                    scope=None) -> dict:
         """LeagueSeason-wide standings (#283 Slice D): one table across ALL of a
         LeagueSeason's Divisions (and its division-less teams), from FINAL
         results of REGULAR games only. The per-Division ``get_standings`` view
         stays available; this is the League-level aggregate the permanent model
         makes first-class. Same points model (win=2/tie=1/loss=0) and ordering.
+
+        This is the OPERATOR view: ``public_only=False`` counts UNPUBLISHED
+        games' final results and fails closed on a drifted Game by returning a
+        ``data_integrity_error`` naming it. It is therefore not an alias for
+        ``get_public_league_season_standings`` and never can be — the public
+        variant skips unpublished Games precisely so a draft result cannot leak
+        by aggregation or through that error (#83). Measured on a seeded store
+        the two agree exactly until one unpublished Game carries a final
+        result, which is why "the payloads look identical" is not a safe reason
+        to serve this one unauthenticated.
+
+        #202 scoping, the SAME contract as ``get_standings`` one level down:
+        when a real user context is supplied (``role`` is not ``None`` — the
+        HTTP route always supplies one), the named LeagueSeason must match the
+        caller's ACTIVE resolved tuple, not merely be *some* LeagueSeason the
+        caller is broadly authorized for. A mismatch returns the identical
+        ``not_found`` a nonexistent (league, season) pair already returns, so
+        an inaccessible-from-here LeagueSeason is indistinguishable from one
+        that does not exist. Called with no arguments beyond the ids (the
+        default), performs no ownership check — unchanged behavior for existing
+        direct/internal callers, which is what keeps the service-level history
+        and integrity tests addressing the computation rather than the gate.
         """
+        if role is not None:
+            ls = self.store.league_season_for(league_id, season_id)
+            program, active_season, league = self.context.resolve_with_league(
+                user_id, role, scope)
+            ls_season = (self.store.get_season(ls.season_id)
+                         if ls is not None else None)
+            if not self._league_season_matches_active_context(
+                    ls, ls_season, program, active_season, league):
+                return self._league_season_not_found_error()
         return self._standings_for_league_season(
             league_id, season_id, public_only=False)
 
@@ -6150,9 +6211,7 @@ class ApiService:
         """
         ls = self.store.league_season_for(league_id, season_id)
         if ls is None:
-            return {"error": {
-                "code": "not_found",
-                "message": "No such league in that season."}}
+            return self._league_season_not_found_error()
         # Roster membership in THIS LeagueSeason is the registration's canonical
         # ``league_season_id`` (every row from ``registrations_for_league_season``
         # already has it). Whether the Team's CURRENT permanent ``league_id`` must

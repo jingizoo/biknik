@@ -1261,13 +1261,15 @@ comparing a **caller-named target** against the resolved Season with
 turns a legitimate answer into a generic refusal.
 
 That comparison is **not** funnelled through a single helper, and an audit that
-assumes it is will miss three of the four rows below. Re-run the enumeration
+assumes it is will miss three of the five rows below. Re-run the enumeration
 this way: every caller of `resolve_with_league` that then compares a
 caller-named target to the resolved Season, by any of the three shapes the code
-actually uses — **inline** (`service.py:9378`, `:10688`; this is how *both*
+actually uses — **inline** (`service.py:9441`, `:10751`; this is how *both*
 venue reads do it), via `_scenario_in_active_tuple` → `_setup_target_edge_allows`
-(`:6536`, `:1013`), or via `_division_matches_active_context` (`:5947`, called
-at `:6025`). Six GET routes reach the comparison; **four** qualify:
+(`:6599`, `:991`), or via `_league_season_matches_active_context` (`:5947`),
+which **both** standings reads reach: directly (`:6187`) and through
+`_division_matches_active_context` (`:5995`, called at `:6045`). Seven GET
+routes reach the comparison; **five** qualify:
 
 | route | named target | what a mid-flight commit turns it into |
 | --- | --- | --- |
@@ -1275,12 +1277,30 @@ at `:6025`). Six GET routes reach the comparison; **four** qualify:
 | `/api/v2/setup/seasons/<id>/venue-access` | the Season | generic 404 |
 | `/api/scheduler/scenarios/<id>` | the scenario | `_scenario_not_found` — the same generic 404 a foreign Program's scenario takes |
 | `/api/standings/<division_id>` | the Division | the generic **empty standings** shape: a wrong answer that looks like a real one |
+| `/api/standings/league-season/<l>/<s>` | the LeagueSeason | the generic `not_found` a nonexistent (league, season) pair takes |
 | `/api/scheduler/scenarios`, `/api/scheduler/drafts` | *none* — **not listed** | nothing; the active tuple is their query, not a ceiling on something the caller asked for, so they cannot refuse anything |
 
-The first two were what CI failed on; the other two were found by re-auditing
-the criterion against the code rather than against the incident, and each has
-its own held-read regression plus its own unweakened-ceiling control in
+The first two were what CI failed on; the next two were found by re-auditing the
+criterion against the code rather than against the incident, and each has its
+own held-read regression plus its own unweakened-ceiling control in
 `tests/test_context_switch_server_exit.py`.
+
+The fifth arrived differently and the difference is worth keeping, because it is
+the criterion working rather than the table growing. Before #202
+`/api/standings/league-season/<l>/<s>` resolved no tuple at all — it sat in the
+authenticated namespace but passed no `user_id`/`role`/`scope`, so it answered
+**anonymous** callers with the operator table and failed clause (a) outright.
+Listing it then would have been wrong; the audit was right to exclude it, and
+what it was really pointing at was the missing authorization, not a missing
+ordering constraint. Giving it its sibling's contract — a session, then the
+named LeagueSeason bound to the active tuple — is what made it qualify. The
+route it was mistaken for, `/api/public/standings/league-season/<l>/<s>`, is
+**not** an alias for it: the operator view is `public_only=False`, so it counts
+unpublished games' final results and, on a drifted Game, names that Game in a
+`data_integrity_error`. Their payloads agree only until one unpublished Game
+carries a final result. `tests/test_standings_route_contract.py` pins both
+routes' answers side by side, signed-out and signed-in, so they cannot drift
+apart again.
 
 The lock order:
 
@@ -1324,13 +1344,13 @@ that could plausibly have gone the other way:
   routes that pre-check with `_operator_only` — and that bound is enforced
   rather than intended.** An arrival ticket is registered before the request has
   an identity, so a switch by *another* operator may briefly wait on it. The
-  window is however long identity takes: `_resolve_role` (`server.py:877`) does
+  window is however long identity takes: `_resolve_role` (`server.py:900`) does
   an uncached `SESSIONS.resolve(store, sid)` every call, and `_operator_only`
-  (`:968-989`) calls it and *then* the route branch calls it again — so it is
-  one lookup on `/api/standings/<division_id>` and two on the two venue reads
-  and `/api/scheduler/scenarios/<id>`. Pre-existing for the venue routes, and
-  inherited by the routes added here. The instant it resolves to somebody else
-  it leaves that switch's wait set,
+  (`:991-1012`) calls it and *then* the route branch calls it again — so it is
+  one lookup on each of the two `/api/standings/...` reads, and two on the two
+  venue reads and `/api/scheduler/scenarios/<id>`. Pre-existing for the venue
+  routes, and inherited by the routes added here. The instant it resolves to
+  somebody else it leaves that switch's wait set,
   and the narrowing is announced *before* the narrowing thread itself goes to
   sleep. Announcing it afterwards instead — which is what the first cut did —
   makes the coupling the other operator's whole switch, and does so silently: a

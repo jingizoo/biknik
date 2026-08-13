@@ -35,7 +35,12 @@ venue reads, ``GET /api/scheduler/scenarios/<id>`` (whose ceiling is
 ``_scenario_not_found``), and ``GET /api/standings/<division_id>`` (whose
 ceiling is ``_division_matches_active_context`` and whose mismatch is the
 generic EMPTY standings shape — a wrong answer that looks like a real one).
-Each has a held-read case AND its own unweakened-ceiling control.
+A FIFTH joined in #202: ``GET /api/standings/league-season/<l>/<s>``, whose
+mismatch is the generic ``not_found``. It did NOT qualify when this file was
+written and was correctly left out then — the route resolved no tuple at all,
+because it passed no role/scope and answered ANONYMOUS callers. #202 gave it its
+per-Division sibling's contract, and acquiring the ceiling is what earned it a
+row here. Each has a held-read case AND its own unweakened-ceiling control.
 
 TWO DISTINCT OPERATORS, because nothing else in this file can see cross-user
 coupling. Every other case opens all of its sessions for ONE username, so a gate
@@ -292,11 +297,17 @@ class ContextSwitchServerExitBase:
         return {"tag": tag, "program_id": program.id,
                 "s1": s1.id, "s2": s2.id, "s3": s3.id, "venue_id": venue.id}
 
-    def _division_with_teams(self, fx, season_id, tag="Div"):
-        """A Division in ``season_id`` with two registered Teams, so its
-        standings table is NON-EMPTY. That is what makes the standings case
-        falsifiable: the roster comes from active registrations, so a correct
-        answer has rows and a raced one has none."""
+    def _league_with_teams(self, fx, season_id, tag="Div"):
+        """A League in ``season_id`` with one Division and two registered
+        Teams, so BOTH standings tables built over it — per-Division and
+        LeagueSeason-wide — are NON-EMPTY. That is what makes the two standings
+        cases falsifiable: each roster comes from active registrations, so a
+        correct answer has rows and a raced one has none.
+
+        Returns both ids because the two routes name different levels of the
+        same hierarchy; building one fixture for both keeps the pair honest,
+        since a divergence in what they can see would show up as one case
+        passing on a fixture the other could not use."""
         svc = self.api.setup
         suffix = uuid.uuid4().hex[:6]
         league = svc.create_league(season_id, f"{fx['tag']} {tag} L {suffix}")
@@ -308,7 +319,12 @@ class ContextSwitchServerExitBase:
                                    league_id=league.id,
                                    division_id=division.id)
             svc.register_team_for_season(season_id, team.id, division.id)
-        return division.id
+        return {"league_id": league.id, "division_id": division.id}
+
+    def _division_with_teams(self, fx, season_id, tag="Div"):
+        """The Division of ``_league_with_teams`` — the per-Division route's
+        named target."""
+        return self._league_with_teams(fx, season_id, tag)["division_id"]
 
     def _scenario_in(self, fx, season_id, name="Named run"):
         """One stored ``ScheduleScenario`` bound to ``season_id``.
@@ -704,6 +720,112 @@ class ContextSwitchServerExitBase:
                          f"a sibling Season's Division answered with rows: "
                          f"{raw}")
         self.assertNotIn("Sibling", raw)
+
+    def test_a_switch_cannot_commit_while_a_league_season_read_is_inside(self):
+        """``GET /api/standings/league-season/<l>/<s>`` — the fifth route, and
+        the only one that joined the table by ACQUIRING the ceiling rather than
+        by an audit finding one already there.
+
+        Before #202 it resolved no tuple: it passed no ``user_id``/``role``/
+        ``scope`` and answered anonymous callers, so it failed the admission
+        criterion outright and was correctly absent from this file. It now runs
+        the SAME comparison as its per-Division sibling
+        (``_league_season_matches_active_context``, shared by both), one level
+        of the hierarchy up, so a switch landing mid-read turns a table the
+        operator explicitly asked for into the generic ``not_found``.
+        """
+        fx = self._program_with_two_seasons("LsStand")
+        username, user_id = self._operator("lsstand")
+        reader = self._login(username)
+        switcher = self._login(username)
+        self._select(reader, fx["program_id"], fx["s1"])
+        ids = self._league_with_teams(fx, fx["s1"])
+        path = (f"/api/standings/league-season/{ids['league_id']}/"
+                f"{fx['s1']}")
+
+        # Positive control FIRST, for the same reason the sibling has one: this
+        # LeagueSeason really does answer with rows under the selected Season,
+        # so a refusal below is the race and not an empty fixture.
+        status, raw, body = self._req(reader, "GET", path)
+        self.assertEqual(status, 200, raw)
+        self.assertTrue(body["standings"],
+                        f"the fixture LeagueSeason has no standings rows at "
+                        f"all, so this case could not tell a raced read from a "
+                        f"healthy one: {raw}")
+
+        read_out = {}
+        with self._read_parked_in("get_league_season_standings",
+                                  ids["league_id"]) as (park, _exited):
+            def do_read():
+                read_out["result"] = self._req(reader, "GET", path)
+
+            rt = threading.Thread(target=do_read, daemon=True)
+            rt.start()
+            self.assertTrue(park.arrived.wait(PATIENCE),
+                            "the LeagueSeason standings read never reached the "
+                            "server")
+
+            switch = {}
+            st = self._switch_thread(switcher, fx["program_id"], fx["s2"],
+                                     switch)
+            time.sleep(COMMIT_WINDOW)
+            persisted_during = self._persisted(user_id)
+            still_running = st.is_alive()
+
+            park.let_go()
+            rt.join(PATIENCE)
+            st.join(PATIENCE)
+
+        self.assertEqual(
+            persisted_during, (fx["program_id"], fx["s1"]),
+            f"the context switch COMMITTED while a dispatched LeagueSeason "
+            f"standings read was still inside the server (persisted tuple "
+            f"moved to {persisted_during})")
+        self.assertTrue(
+            still_running,
+            "the switch's POST had already returned while the LeagueSeason "
+            "standings read was held — the route is not ordered against it "
+            "at all")
+
+        status, raw, body = read_out["result"]
+        self.assertEqual(
+            status, 200,
+            f"the held LeagueSeason standings read was REFUSED — it was judged "
+            f"against the Season the switch installed underneath it: {raw}")
+        self.assertTrue(body["standings"], raw)
+        self.assertEqual(switch["result"][0], 200, switch["result"][1])
+
+    def test_control_a_non_selected_seasons_league_season_still_refuses(self):
+        """The LeagueSeason ceiling is unweakened: an UNRACED read of a League
+        in a sibling Season of the active Program is still the generic
+        ``not_found``, with no team names in it — and is the SAME answer a
+        nonexistent (league, season) pair takes, so it is not an oracle."""
+        fx = self._program_with_two_seasons("LsCeil")
+        username, _ = self._operator("lsceil")
+        c = self._login(username)
+        self._select(c, fx["program_id"], fx["s1"])
+        mine = self._league_with_teams(fx, fx["s1"], tag="Mine")
+        sibling = self._league_with_teams(fx, fx["s2"], tag="Sibling")
+
+        status, raw, body = self._req(
+            c, "GET",
+            f"/api/standings/league-season/{mine['league_id']}/{fx['s1']}")
+        self.assertEqual(status, 200, raw)
+        self.assertTrue(body["standings"], raw)
+
+        status, raw, _ = self._req(
+            c, "GET",
+            f"/api/standings/league-season/{sibling['league_id']}/{fx['s2']}")
+        self.assertEqual(status, 404,
+                         f"a sibling Season's LeagueSeason answered: {raw}")
+        self.assertNotIn("Sibling", raw)
+        missing_status, missing_raw, _ = self._req(
+            c, "GET",
+            "/api/standings/league-season/league_nope_9/season_nope_9")
+        self.assertEqual(missing_status, 404, missing_raw)
+        self.assertEqual(raw, missing_raw,
+                         "a sibling Season's LeagueSeason is distinguishable "
+                         "from one that does not exist")
 
     def test_a_read_parked_before_identity_still_orders_the_switch(self):
         """PHASE A. The read is parked inside ``SESSIONS.resolve`` — inside

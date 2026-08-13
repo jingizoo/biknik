@@ -13,15 +13,20 @@ looking at. CI reproduced exactly that on
 
 WHICH ROUTES, and why that is a table and not a rule of thumb. The authoritative
 list is ``CONTEXT_SCOPED_READ_ROUTES`` in ``web/server.py``, which carries the
-per-route enumeration and the criterion a route must meet to be in it. Four
+per-route enumeration and the criterion a route must meet to be in it. Five
 routes are listed today: the two venue reads above, ``GET
-/api/scheduler/scenarios/<id>`` (refused as ``_scenario_not_found``), and ``GET
+/api/scheduler/scenarios/<id>`` (refused as ``_scenario_not_found``), ``GET
 /api/standings/<division_id>`` (whose mismatch is the generic EMPTY standings
-shape — a wrong answer that looks like a real one). The last two are NOT the CI
-incident; they were found by auditing the criterion against the code, and the
-first cut of this module named only the two it had a failure for. If a route
-grows the exact-selected-Season ceiling later, it belongs in that table, and
-this paragraph is here so that is not rediscovered from an outage.
+shape — a wrong answer that looks like a real one), and ``GET
+/api/standings/league-season/<l>/<s>`` (whose mismatch is the generic
+``not_found``). The last three are NOT the CI incident; they were found by
+auditing the criterion against the code, and the first cut of this module named
+only the two it had a failure for. The fifth is the newest and arrived by the
+route acquiring the ceiling rather than by an audit finding one already there:
+before #202 it resolved no tuple at all — it answered ANONYMOUS callers — so it
+genuinely did not qualify, and listing it then would have been wrong. If a
+route grows the exact-selected-Season ceiling later, it belongs in that table,
+and this paragraph is here so that is not rediscovered from an outage.
 
 WHY THE CLIENT CANNOT FIX IT. ``app.js`` enrols those reads in an
 AbortController barrier and awaits their settlement before POSTing. But
@@ -77,8 +82,8 @@ ARRIVAL ticket at the top of ``do_GET``, before any identity exists, and every
 waiting writer counts unbound tickets that predate it. The ticket then BINDS to
 the resolved ``user_id``; binding to a different user drops it from that
 writer's wait set immediately, so cross-user coupling is bounded by identity
-resolution — ONE session lookup on ``/api/standings/<division_id>``, and TWO on
-the routes that pre-check with ``_operator_only``, which calls
+resolution — ONE session lookup on the two ``/api/standings/...`` reads, and TWO
+on the routes that pre-check with ``_operator_only``, which calls
 ``_resolve_role()`` and is then followed by the branch calling it again
 (``SESSIONS.resolve`` is uncached). Pre-existing for the venue reads and
 inherited by the routes added later; stated here in the measured form rather
