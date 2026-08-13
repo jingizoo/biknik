@@ -225,7 +225,14 @@ EVERY_SHAPE = _module('''
                 return self._send(6)
             if sub == "lineups":
                 return self._send(7)
-        if self._operator_only(path):
+        # A guard shape among many others in this fixture -- deliberately a
+        # LITERAL guard, not `path` itself: #202 repair round 4, finding 1
+        # made a bare call's ARGUMENTS count when the call IS the whole
+        # test, so `self._operator_only(path)` here would need its own
+        # reviewed waiver (see UnknownShapesRaiseTests' dedicated pair of
+        # tests for that exemption, now waiver-based); this fixture is
+        # about the OTHER shapes below it, not that one.
+        if self._operator_only("/api/admin"):
             return
         if path.startswith("/api/"):
             return self._unmatched_route("GET")
@@ -1052,16 +1059,20 @@ class WaiverFingerprintTests(unittest.TestCase):
             route_extract_module._AUDIT_WAIVERS.update(saved)))
 
     def test_every_real_waiver_is_hit_exactly_once(self):
-        """The real server.py, unmodified: each of the 18 declared waivers
-        (10 from round 2 -- 2 pre-existing + 2 pre-existing ternaries + 6
-        that round's findings added -- plus 8 round-3 finding E additions,
-        once a Call reached as a comparison operand had its arguments
-        scanned too) is consulted for precisely the one line it names --
-        proves the instrumentation is wired all the way through
-        _propagates_taint AND the ast.If/ast.IfExp/ast.While scan, not
-        just one of them."""
+        """The real server.py, unmodified: each of the 29 declared waivers
+        (18 from rounds 2-3 -- 2 pre-existing + 2 pre-existing ternaries + 6
+        round-2 finding A additions + 8 round-3 finding E additions -- plus
+        11 round-4 finding 1 additions, once a Call reached DIRECTLY as the
+        whole test had its arguments scanned too) is consulted for precisely
+        the one line it names -- proves the instrumentation is wired all the
+        way through _propagates_taint AND the ast.If/ast.IfExp/ast.While/
+        ast.match_case scan, not just one of them. Each key is now a 4-tuple
+        (#202 repair round 4, finding 3: function, text, parent shape,
+        enclosing if) rather than the original 2-tuple -- WaiverRelocation
+        FingerprintTests below is the dedicated proof for what the extra two
+        parts catch that this exact-one-hit check alone would not."""
         walker = extract_walker()
-        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 18)
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 29)
         for key in route_extract_module._AUDIT_WAIVERS:
             with self.subTest(waiver=key):
                 self.assertEqual(len(walker.waiver_hits.get(key, ())), 1)
@@ -1070,7 +1081,8 @@ class WaiverFingerprintTests(unittest.TestCase):
         """The exact reproduced shape: an orphaned entry, matching no line
         anywhere, used to sit silently with extraction succeeding normally."""
         self._with_waivers({
-            ("do_GET", "this_never_matches_anything_in_the_fixture"): "orphaned",
+            ("do_GET", "this_never_matches_anything_in_the_fixture",
+             "if_test", ""): "orphaned",
         })
         walker = extract_walker(_module('''
             def do_GET(self):
@@ -1088,9 +1100,14 @@ class WaiverFingerprintTests(unittest.TestCase):
         """"More than one hit" is a failure too -- a waiver text that
         happens to match TWO sibling occurrences of the identical
         unrecognised test cannot be trusted as pinned to the one line its
-        author reviewed."""
+        author reviewed. Both occurrences share the SAME parent shape and
+        the SAME (absent) enclosing if here -- true top-level siblings, not
+        the branch-distinguishable case WaiverRelocationFingerprintTests
+        covers -- so the fingerprint's extra context does not save this one,
+        by design: it is still genuinely too broad."""
         waiver_text = "path == '/api/x' or path == '/api/y'"
-        self._with_waivers({("do_GET", waiver_text): "matches two lines"})
+        self._with_waivers({
+            ("do_GET", waiver_text, "if_test", ""): "matches two lines"})
         walker = extract_walker(_module('''
             def do_GET(self):
                 path = self.path.split("?", 1)[0]
@@ -1110,7 +1127,8 @@ class WaiverFingerprintTests(unittest.TestCase):
         failure-mode tests above, proving they fail for the stated reason
         and not merely because verify_waiver_usage always raises."""
         waiver_text = "path == '/api/x' or path == '/api/y'"
-        self._with_waivers({("do_GET", waiver_text): "matches one line"})
+        self._with_waivers({
+            ("do_GET", waiver_text, "if_test", ""): "matches one line"})
         walker = extract_walker(_module('''
             def do_GET(self):
                 path = self.path.split("?", 1)[0]
@@ -1136,6 +1154,161 @@ class WaiverFingerprintTests(unittest.TestCase):
         # None of the real _AUDIT_WAIVERS were consulted -- would fail
         # fingerprinting if checked, but extract_walker() must not have.
         self.assertEqual(walker.waiver_hits, {})
+
+
+# --------------------------------------------------------------------------- #
+# #202 repair round 4, finding 3: a waiver keyed on just (function, exact     #
+# expression text) is blind to RELOCATION -- the SAME once-used expression,   #
+# moved into a NEW, routing-relevant structural position, still unparses      #
+# identically, so the old waiver keeps matching a line that is now a          #
+# genuine, unreviewed routing decision. _waiver_key widens the key with the   #
+# expression's own PARENT SHAPE and its nearest ENCLOSING if-test -- this     #
+# class proves both halves, using the reviewer's own named attack.            #
+# --------------------------------------------------------------------------- #
+class WaiverRelocationFingerprintTests(unittest.TestCase):
+    def _with_waivers(self, waivers: dict):
+        saved = dict(route_extract_module._AUDIT_WAIVERS)
+        route_extract_module._AUDIT_WAIVERS.clear()
+        route_extract_module._AUDIT_WAIVERS.update(waivers)
+        self.addCleanup(lambda: (
+            route_extract_module._AUDIT_WAIVERS.clear(),
+            route_extract_module._AUDIT_WAIVERS.update(saved)))
+
+    def test_relocating_the_identical_expression_into_a_routing_selector_is_caught(self):
+        """The reviewer's own named attack, reproduced exactly: a waiver
+        reviewed for ``required_permission(path)`` used as an Assign's RHS
+        (the real do_POST's own shape -- see that entry in _AUDIT_WAIVERS)
+        must NOT keep matching once the IDENTICAL expression, unchanged
+        character for character, is moved into a dict-subscript SELECTOR
+        that picks a handler by the tracked path's derived permission --
+        the textbook "hide a route behind an already-waived expression"
+        attack this finding exists to close.
+
+        BEFORE (this test, at the safe position): no raise.
+        AFTER (relocated into a selector): raises fresh, because the
+        waiver's parent_shape ("assign_rhs") no longer matches the
+        relocated expression's ("subscript_index")."""
+        self._with_waivers({
+            ("do_POST", "not authorize(role, path)", "if_test", ""):
+                "reviewed blanket per-request authorisation gate",
+            ("do_POST", "required_permission(path)", "assign_rhs",
+             "not authorize(role, path)"):
+                "reviewed: builds a 403 message, not a routing decision "
+                "(the real do_POST's own shape)",
+        })
+        # SAFE: the exact reviewed position -- must not raise.
+        safe_routes = extract_routes(_module('''
+            def do_POST(self):
+                path = self.path.split("?", 1)[0]
+                role = "whatever"
+                if not authorize(role, path):
+                    perm = required_permission(path)
+                    return self._send_status(403)
+                if path == "/api/x":
+                    return self._send(1)
+        '''))
+        self.assertEqual([(r.method, r.template) for r in safe_routes],
+                         [("POST", "/api/x")])
+        # ATTACK: the IDENTICAL text `required_permission(path)`, unchanged,
+        # relocated into a Subscript index that selects a handler -- a
+        # real routing decision hidden behind the already-waived text.
+        with self.assertRaises(ExtractionError) as caught:
+            extract_routes(_module('''
+                _HANDLERS = {}
+                def do_POST(self):
+                    path = self.path.split("?", 1)[0]
+                    handler = _HANDLERS[required_permission(path)]
+                    return handler()
+            '''))
+        msg = str(caught.exception)
+        self.assertIn("required_permission(path)", msg)
+        self.assertIn("unlisted call", msg)
+
+    def test_a_two_tuple_key_would_have_conflated_the_safe_and_attack_positions(self):
+        """Documents WHY the wider key is necessary, not just that it works:
+        the (function, text) PREFIX is IDENTICAL between the safe and the
+        attack fixture above -- a waiver keyed on only those two parts
+        cannot tell them apart at all, which is exactly the gap this
+        finding closes."""
+        safe_key = ("do_POST", "required_permission(path)", "assign_rhs",
+                   "not authorize(role, path)")
+        attack_key = ("do_POST", "required_permission(path)",
+                      "subscript_index", "")
+        self.assertEqual(safe_key[:2], attack_key[:2])
+        self.assertNotEqual(safe_key, attack_key)
+
+    def _guardian_fixture(self):
+        return _module('''
+            def do_POST(self):
+                path = self.path.split("?", 1)[0]
+                mga = re.match(r"^/api/one/([^/]+)/availability$", path)
+                if mga:
+                    guid, jid = "g", mga.group(1)
+                    if self._guardian_link_or_403(guid, jid):
+                        return
+                    return self._send(1)
+                mgs = re.match(r"^/api/two/([^/]+)/offer$", path)
+                if mgs:
+                    guid, jid = "g", mgs.group(1)
+                    if self._guardian_link_or_403(guid, jid):
+                        return
+                    return self._send(2)
+        ''')
+
+    def test_identical_text_in_two_branches_needs_both_waivers_not_one(self):
+        """A small reproduction of the real do_POST collision:
+        ``self._guardian_link_or_403(guid, jid)`` appears VERBATIM under
+        BOTH ``if mga:`` and ``if mgs:``. A SINGLE waiver, keyed with only
+        ONE branch's enclosing_if_text, covers ONLY that branch -- the
+        OTHER, textually-identical call site still raises fresh, proving
+        the two are tracked as genuinely separate call sites rather than
+        one waiver silently also covering a second the reviewer never
+        looked at."""
+        self._with_waivers({
+            ("do_POST", "self._guardian_link_or_403(guid, jid)", "if_test",
+             "mga"): "reviewed for the mga branch only",
+        })
+        with self.assertRaises(ExtractionError) as caught:
+            extract_routes(self._guardian_fixture())
+        msg = str(caught.exception)
+        self.assertIn("self._guardian_link_or_403(guid, jid)", msg)
+        self.assertIn("unrecognised shape", msg)
+
+    def test_both_branches_waived_separately_extracts_cleanly_and_each_is_exact_one_hit(self):
+        """The legitimate, fully-reviewed case -- the control for the test
+        above: with a SEPARATE, correctly-fingerprinted waiver for EACH
+        branch, extraction succeeds and verify_waiver_usage sees each
+        waiver hit exactly once (never both hits folded onto one key)."""
+        self._with_waivers({
+            ("do_POST", "self._guardian_link_or_403(guid, jid)", "if_test",
+             "mga"): "reviewed for the mga branch",
+            ("do_POST", "self._guardian_link_or_403(guid, jid)", "if_test",
+             "mgs"): "reviewed for the mgs branch",
+        })
+        walker = extract_walker(self._guardian_fixture())
+        self.assertEqual(
+            {(r.method, r.template) for r in walker.routes.values()},
+            {("POST", "/api/one/{}/availability"), ("POST", "/api/two/{}/offer")})
+        for key in route_extract_module._AUDIT_WAIVERS:
+            with self.subTest(waiver=key):
+                self.assertEqual(len(walker.waiver_hits.get(key, ())), 1)
+
+    def test_the_real_guardian_link_waivers_are_distinguished_by_branch(self):
+        """The real server.py's own two ``self._guardian_link_or_403(guid,
+        jid)`` waivers (do_POST, one per branch) are BOTH declared, BOTH
+        hit exactly once, and carry DIFFERENT enclosing_if_text -- the
+        concrete, non-invented proof that this mechanism is load-bearing
+        today, not merely passing a synthetic fixture."""
+        matching = [key for key in route_extract_module._AUDIT_WAIVERS
+                   if key[0] == "do_POST"
+                   and key[1] == "self._guardian_link_or_403(guid, jid)"]
+        self.assertEqual(len(matching), 2)
+        enclosing = {key[3] for key in matching}
+        self.assertEqual(enclosing, {"mga", "mgs"})
+        walker = extract_walker()
+        for key in matching:
+            with self.subTest(waiver=key):
+                self.assertEqual(len(walker.waiver_hits.get(key, ())), 1)
 
 
 # --------------------------------------------------------------------------- #
@@ -1326,19 +1499,30 @@ class UnknownShapesRaiseTests(unittest.TestCase):
         self.assertIn("does not follow", str(caught.exception))
 
     def test_a_guard_that_merely_passes_the_path_along_is_not_a_route(self):
-        """A BARE call (never reached as a comparison operand) that takes
-        the raw path as an argument stays exempt with NO waiver needed --
-        #202 repair round 3, finding E deliberately did not widen this
-        far (see _direct_operand_names' own docstring): ``path`` is an
-        ARGUMENT to ``_operator_only``, not that call's own comparison
-        operand, the same distinction ``_official_guard(oav.group(1))``
-        already draws for a captured group. Contrast
+        """A BARE call reached directly as the whole if-test stays exempt
+        from raising -- but, since #202 repair round 4, finding 1, ONLY via
+        an EXPLICIT, REVIEWED waiver, not the structural gap that used to
+        exempt this shape without even inspecting its arguments (that gap
+        is exactly what finding 1 closed: a genuinely NEW, unreviewed
+        helper predicate reached the same way now raises -- see
+        HelperPredicateCallEscapeTests). This fixture registers the SAME
+        kind of waiver the real do_POST needs for its own `_operator_only`/
+        `authorize` blanket gates (see _AUDIT_WAIVERS' round 4 entries),
+        proving the mechanism, not a structural exemption, is what keeps a
+        REVIEWED blanket guard quiet. Contrast
         ``test_a_call_reached_as_a_comparison_operand_raises_even_when_
         it_is_a_known_guard_shape`` immediately below: the SAME
         ``_supported_methods`` guard, reached through ``not in`` instead
-        of bare truthiness, is a comparison operand and DOES now raise
-        without a waiver -- this is finding E's real boundary, not the
-        one this test used to assert."""
+        of bare truthiness, is a comparison operand and raises without a
+        waiver either way -- this is round 3 finding E's boundary, kept
+        exactly as it was."""
+        saved = dict(route_extract_module._AUDIT_WAIVERS)
+        route_extract_module._AUDIT_WAIVERS[
+            ("do_GET", "self._operator_only(path)", "if_test", "")
+        ] = "test-only: the reviewed blanket-guard shape, see the module's real entries"
+        self.addCleanup(lambda: (
+            route_extract_module._AUDIT_WAIVERS.clear(),
+            route_extract_module._AUDIT_WAIVERS.update(saved)))
         routes = self._extract('''
             def do_GET(self):
                 path = self.path.split("?", 1)[0]
@@ -1371,6 +1555,260 @@ class UnknownShapesRaiseTests(unittest.TestCase):
                         return self._send(1)
             ''')
         self.assertIn("unrecognised shape", str(caught.exception))
+
+
+# --------------------------------------------------------------------------- #
+# #202 repair round 4, finding 1: a Call reached DIRECTLY as (or and/or/      #
+# not-ed into) the WHOLE test -- never a comparison operand -- had its         #
+# arguments left completely unscanned, a STRUCTURAL exemption rather than a    #
+# reviewed one: `if self._is_hidden(path): ...` was neither classified nor     #
+# raised on, while a real localhost Handler answers HTTP 200 for the path it   #
+# hides. Distinct from round 2 finding A (calls flowing into taint as VALUES)  #
+# and round 3 finding E (calls as Compare operands, gated by whether they sat  #
+# inside an ast.Compare) -- this is the third and last position a Call can     #
+# occupy relative to an if/while/ifexp/case-guard test, and the only one       #
+# still unscanned before this round.                                          #
+# --------------------------------------------------------------------------- #
+class HelperPredicateCallEscapeTests(unittest.TestCase):
+    def _raises(self, body, *substrings):
+        with self.assertRaises(ExtractionError) as caught:
+            extract_routes(_module(body))
+        msg = str(caught.exception)
+        for s in substrings:
+            self.assertIn(s, msg)
+
+    def test_bare_call_as_if_test_raises(self):
+        """The reviewer's own reproduction, via the static extractor: a
+        NEW, unreviewed helper predicate consuming the path, reached
+        directly as the whole if-test -- no ast.Compare anywhere."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if self._is_hidden(path):
+                    return self._send(1)
+        ''', "unrecognised shape", "self._is_hidden(path)")
+
+    def test_bare_call_as_if_test_answers_over_real_http_while_the_pre_fix_extractor_stayed_silent(self):
+        """The reviewer's own words: "I verified a real localhost Handler
+        where `if self._is_hidden(path): ...` returns HTTP 200 for
+        /api/hidden, while `extract_routes(source)` returns [] with no
+        error." Reproduced here against a REAL loopback server built from
+        the IDENTICAL source the extractor call above raises on -- proving
+        the static miss corresponded to a genuine, answering HTTP route,
+        not a hypothetical shape. route_extract.py performs no runtime
+        behaviour of its own, so the HTTP half of this proof holds
+        regardless of the extractor fix's own presence; the static half
+        (asserted above, in the previous test) is what the fix changes."""
+        status, text = _real_http_probe('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if self._is_hidden(path):
+                    return self._send(1)
+                return self._send_json({"error": "not_found"}, 404)
+
+            def _is_hidden(self, path):
+                return path == "/api/hidden"
+        ''', "GET", "/api/hidden")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"n": 1})
+
+    def test_negated_bare_call_as_if_test_raises(self):
+        """``if not GUARD(path):`` -- a UnaryOp wrapping the call, still
+        directly forming the whole test."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if not self._is_allowed(path):
+                    return self._send_status(403)
+                return self._send(1)
+        ''', "unrecognised shape")
+
+    def test_boolop_combined_bare_calls_as_if_test_raises(self):
+        """``if GUARD_A(path) and GUARD_B():`` -- and/or-combined, still no
+        ast.Compare anywhere; both operands are examined."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if self._is_hidden(path) and self._extra_check():
+                    return self._send(1)
+        ''', "unrecognised shape")
+
+    def test_bare_call_as_while_test_raises(self):
+        """The same shape, reached from a ``while`` guard instead of
+        ``if`` -- round 2 finding B's own node type, round 4 finding 1's
+        own gap."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                while self._is_hidden(path):
+                    return self._send(1)
+        ''', "unrecognised shape")
+
+    def test_bare_call_as_ifexp_test_raises(self):
+        """A ternary whose OWN test is a bare call touching the path. Goes
+        through the pre-existing, ternary-specific message (route_extract
+        does not model ternaries at all, regardless of what their test
+        looks like) rather than the generic "unrecognised shape" wording
+        the If/While/case-guard scans use -- a different, older check
+        (#202 repair, invented-evasion track) that this finding's Call-arg
+        scanning feeds into via the SAME `_direct_operand_names` call, not
+        a new message of its own."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                return self._send(1 if self._is_hidden(path) else 2)
+        ''', "does not model ternaries", "'path'")
+
+    def test_match_case_guard_with_bare_call_raises(self):
+        """A match-case GUARD is neither ast.If nor ast.IfExp -- the SAME
+        default-deny must still reach it (see the dedicated match-case-guard
+        tests below for the non-call, comparison-shaped form of this same
+        gap)."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                mode = "x"
+                match mode:
+                    case _ if self._is_hidden(path):
+                        return self._send(1)
+        ''', "match-case guard", "unrecognised shape")
+
+    def test_a_captured_group_as_a_bare_call_argument_still_does_not_raise(self):
+        """The design principle this finding does NOT touch: an opaque
+        captured group handed to a guard, reached the exact same way (a
+        bare call as the whole if-test), still does not raise -- ``oav``
+        itself never leaks out of ``oav.group(1))`` regardless of which of
+        the three Call positions (value, compare operand, bare test) this
+        module examines it from."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                oav = re.match(r"^/officials/([^/]+)/availability$", path)
+                if oav:
+                    if self._official_guard(oav.group(1)):
+                        return self._send_status(403)
+                    return self._send(1)
+
+            def _official_guard(self, official_id):
+                return False
+        '''))}
+        self.assertEqual(found, {("GET", "/officials/{}/availability")})
+
+    def test_a_call_as_an_argument_to_another_call_still_does_not_raise(self):
+        """The OTHER design principle this finding does not touch: a call
+        reached as an ARGUMENT to some other call (never itself the tested
+        condition, nor a comparison operand of it) is not scanned either --
+        this module never looks at what a call's return value is
+        subsequently passed to, only at how the value ITSELF was reached."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if self._wrap_bool(self._is_hidden_unrelated()):
+                    return self._send(1)
+                if path == "/api/x":
+                    return self._send(2)
+
+            def _wrap_bool(self, value):
+                return bool(value)
+
+            def _is_hidden_unrelated(self):
+                return False
+        '''))}
+        self.assertEqual(found, {("GET", "/api/x")})
+
+    def test_the_real_server_extracts_with_no_new_raises(self):
+        """The real server.py -- including do_POST's own bare
+        ``authorize(role, path)``/``_operator_only`` blanket gates (never
+        previously scanned as the whole if-test) and the guardian-link
+        verification reached from FOUR different routes (two GET, two
+        POST) -- must still extract cleanly: each is a reviewed, declared
+        _AUDIT_WAIVERS entry, not a scoping hole."""
+        walker = extract_walker()
+        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(walker.unreachable, [])
+
+
+# --------------------------------------------------------------------------- #
+# #202 repair round 4, finding 1 (match-case guards specifically): a          #
+# ``case ... if TEST:`` guard is an expression on its own AST node type       #
+# (``ast.match_case``), neither ``ast.If`` nor ``ast.IfExp`` -- the           #
+# completeness scan never even visited it, and `_walk_stmt`'s own Match       #
+# handling only ever inspects the match SUBJECT, a different expression       #
+# entirely, so a guard on an UNTAINTED subject reached neither check.         #
+# --------------------------------------------------------------------------- #
+class MatchCaseGuardTests(unittest.TestCase):
+    def _raises(self, body, *substrings):
+        with self.assertRaises(ExtractionError) as caught:
+            extract_routes(_module(body))
+        msg = str(caught.exception)
+        for s in substrings:
+            self.assertIn(s, msg)
+
+    def test_case_guard_on_a_tracked_subject_raises(self):
+        """``match mode: case _ if path == "...":`` -- ``mode`` itself is
+        NOT tracked, so `_walk_stmt`'s own match-SUBJECT check stays quiet;
+        only the guard-specific scan this finding adds can catch it."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                mode = "x"
+                match mode:
+                    case _ if path == "/api/evade-case-guard":
+                        return self._send(1)
+        ''', "match-case guard", "unrecognised shape")
+
+    def test_case_guard_on_an_untainted_subject_and_guard_is_walked_normally(self):
+        """The SAME statement shape must not be flagged when NEITHER the
+        subject nor the guard touches a tracked name -- and a route nested
+        inside the case body is still found, proving the guard scan does
+        not merely tolerate this shape but walks it."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                mode = "x"
+                flag = True
+                match mode:
+                    case _ if flag:
+                        if path == "/api/inside-guarded-case":
+                            return self._send(1)
+        '''))}
+        self.assertEqual(found, {("GET", "/api/inside-guarded-case")})
+
+    def test_case_guard_calling_a_guard_with_a_captured_group_still_does_not_raise(self):
+        """The opaque-extraction boundary applies here exactly as it does
+        for an ordinary bare-call if-test (HelperPredicateCallEscapeTests'
+        own captured-group test): a guard call reached DIRECTLY as the
+        whole case-guard, with an opaque captured-group ARGUMENT, stays
+        exempt -- ``oav`` itself never leaks out of ``oav.group(1)``.
+        (Contrast: ``oav.group(1) == "special"`` reached DIRECTLY as the
+        guard -- not wrapped in a call -- is a routing-relevant COMPARISON
+        on the captured value itself and correctly still raises; that is
+        not this test.)"""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                oav = re.match(r"^/officials/([^/]+)/availability$", path)
+                if oav:
+                    mode = "x"
+                    match mode:
+                        case _ if self._official_guard(oav.group(1)):
+                            return self._send_status(403)
+                    return self._send(1)
+
+            def _official_guard(self, official_id):
+                return False
+        '''))}
+        self.assertEqual(found, {("GET", "/officials/{}/availability")})
+
+    def test_the_real_server_has_no_match_statements_to_flag(self):
+        """server.py uses no match/case at all today; every guard above is
+        not vacuous only because InventedEvasionTests' own
+        test_match_statement_on_a_tracked_subject_raises already proves the
+        SUBJECT-level check fires on the real extractor's synthetic
+        fixtures, and this module's zero-new-raises tests (in
+        HelperPredicateCallEscapeTests and elsewhere) independently confirm
+        the real file still extracts clean."""
+        extract_routes()  # raises if any match/case guard were ever added
 
 
 # --------------------------------------------------------------------------- #

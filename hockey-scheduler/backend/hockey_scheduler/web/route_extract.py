@@ -757,12 +757,11 @@ class _DispatchWalker:
         if not orphaned and not too_broad:
             return
         lines = []
-        for fn_name, expr in orphaned:
-            lines.append(f"  DORMANT (0 hits): ({fn_name!r}, {expr!r})")
-        for fn_name, expr in too_broad:
-            hits = len(self.waiver_hits[(fn_name, expr)])
-            lines.append(f"  TOO BROAD ({hits} distinct locations): "
-                        f"({fn_name!r}, {expr!r})")
+        for key in orphaned:
+            lines.append(f"  DORMANT (0 hits): {key!r}")
+        for key in too_broad:
+            hits = len(self.waiver_hits[key])
+            lines.append(f"  TOO BROAD ({hits} distinct locations): {key!r}")
         raise ExtractionError(
             "_AUDIT_WAIVERS entries failed exact-one-hit fingerprinting:\n"
             + "\n".join(lines) +
@@ -1356,6 +1355,13 @@ class _DispatchWalker:
 
     def _else_rederives_subject(self, orelse: list, subject: str,
                                 fn_name: str) -> bool:
+        # No `parents` map passed (#202 repair round 4, finding 3): this
+        # runs during the main WALK, before _audit_function builds one for
+        # the function being audited, and this narrow, terminal-else-only
+        # check consults no waiver in the shipped server.py today --
+        # _waiver_key degrades to an empty enclosing_if_text rather than
+        # requiring one, so a future waiver reached this way still gets the
+        # relocation-detecting parent_shape half of the fingerprint.
         for stmt in orelse:
             if isinstance(stmt, ast.Assign) \
                     and _propagates_taint(stmt.value, {subject}, fn_name,
@@ -1779,6 +1785,11 @@ class _DispatchWalker:
         # to run its scan first.
         self._audit_dispatch_helper_calls(fn)
         tracked = set(ctx.seen) | {"path"}
+        # #202 repair round 4, finding 3: built ONCE per audited function and
+        # threaded into every waiver-key computation below (directly, and via
+        # _propagates_taint) -- see _waiver_key's own docstring for what it
+        # is for and why it costs one linear pass per function, not per node.
+        parents = _build_parent_map(fn)
         # TAINT PROPAGATION. Any local bound from the path — directly, sliced,
         # or from another tainted local — joins the tracked set, so renaming it
         # cannot hide a branch. Iterated to a fixed point because one rename can
@@ -1823,7 +1834,7 @@ class _DispatchWalker:
                     # this coarse, flat-namespace check to duplicate it.
                     continue
                 derived = _propagates_taint(value, tracked, fn.name,
-                                            self.waiver_hits)
+                                            self.waiver_hits, parents)
                 if not derived:
                     continue
                 for leaf in leaves:
@@ -1834,7 +1845,7 @@ class _DispatchWalker:
             if isinstance(node, ast.If) and id(node) not in self._classified:
                 names = _direct_operand_names(node.test, tracked)
                 hit = names & tracked
-                key = (fn.name, ast.unparse(node.test))
+                key = _waiver_key(fn.name, node.test, parents)
                 if hit and key in _AUDIT_WAIVERS:
                     self._record_waiver_hit(key, node)
                     continue
@@ -1859,7 +1870,7 @@ class _DispatchWalker:
                 # already exists for, so it goes through the SAME waivers.
                 names = _direct_operand_names(node.test, tracked)
                 hit = names & tracked
-                key = (fn.name, ast.unparse(node.test))
+                key = _waiver_key(fn.name, node.test, parents)
                 if hit and key in _AUDIT_WAIVERS:
                     self._record_waiver_hit(key, node)
                     continue
@@ -1881,7 +1892,7 @@ class _DispatchWalker:
                 # (none needed today -- server.py has no `while` at all).
                 names = _direct_operand_names(node.test, tracked)
                 hit = names & tracked
-                key = (fn.name, ast.unparse(node.test))
+                key = _waiver_key(fn.name, node.test, parents)
                 if hit and key in _AUDIT_WAIVERS:
                     self._record_waiver_hit(key, node)
                     continue
@@ -1890,6 +1901,35 @@ class _DispatchWalker:
                         f"{fn.name}:{node.lineno} a while loop tests "
                         f"dispatch subject(s) {sorted(hit)} in an "
                         f"unrecognised shape: {ast.unparse(node.test)}")
+            if hasattr(ast, "match_case") and isinstance(node, ast.match_case) \
+                    and node.guard is not None:
+                # #202 repair round 4, finding 1: a ``match``/``case`` GUARD
+                # (``case _ if path == "...":``) is an EXPRESSION on its own
+                # node type -- neither ``ast.If`` nor ``ast.IfExp`` -- so the
+                # scans above never matched it. `_walk_stmt`'s own Match
+                # handling (#202 repair, invented-evasion track) already
+                # raises when the match SUBJECT itself is tracked, but that
+                # is a DIFFERENT check on a DIFFERENT expression; a guard on
+                # an UNTAINTED subject (``match mode: case _ if path ==
+                # "...":``) reached neither check and was DEMONSTRATED
+                # silent: zero exception, zero route. Same shape as the
+                # ast.If case above, just a different statement type; goes
+                # through the SAME waivers (none needed today -- server.py
+                # has no ``match`` statement at all, case guard or otherwise).
+                names = _direct_operand_names(node.guard, tracked)
+                hit = names & tracked
+                key = _waiver_key(fn.name, node.guard, parents)
+                if hit and key in _AUDIT_WAIVERS:
+                    self._record_waiver_hit(key, node)
+                    continue
+                if hit:
+                    # ast.match_case itself carries no .lineno (unlike every
+                    # other statement/expression node in this module) -- its
+                    # own guard expression does.
+                    raise ExtractionError(
+                        f"{fn.name}:{node.guard.lineno} a match-case guard "
+                        f"tests dispatch subject(s) {sorted(hit)} in an "
+                        f"unrecognised shape: {ast.unparse(node.guard)}")
             if isinstance(node, ast.Expr):
                 # #202 repair round 3, finding G: a class-level dispatch-
                 # table lookup invoked as a BARE, UNASSIGNED statement
@@ -1914,7 +1954,7 @@ class _DispatchWalker:
                 # only the RAISE (or waiver) side effect matters here; a
                 # bare statement has no target to add to ``tracked``.
                 _propagates_taint(node.value, tracked, fn.name,
-                                  self.waiver_hits)
+                                  self.waiver_hits, parents)
 
     def _audit_dispatch_helper_calls(self, fn: ast.FunctionDef) -> None:
         """Raise if ``fn`` calls an uncatalogued ``_handle_*``/``_dispatch_*``
@@ -1949,6 +1989,140 @@ class _DispatchWalker:
                         "in a form the walker does not follow")
 
 
+# --------------------------------------------------------------------------- #
+# Waiver fingerprinting (#202 repair round 4, finding 3). A waiver keyed on   #
+# just (function, exact expression text) is exact-one-hit against DRIFT of   #
+# the text itself (round 2 finding D), but blind to RELOCATION: the SAME     #
+# once-used expression, moved into a NEW, routing-relevant structural        #
+# position -- e.g. ``required_permission(path)`` moved from a 403 error      #
+# body's local (its current, reviewed position) into a dict key selecting a  #
+# handler -- still unparses identically, so the old waiver keeps matching a  #
+# line that is now a genuine, unreviewed routing decision. DEMONSTRATED: the #
+# waiver text alone does not change when the STATEMENT changes.              #
+#                                                                             #
+# The fix widens the key with two structural facts, both cheap to compute   #
+# from a PARENT MAP built once per audited function:                        #
+#                                                                             #
+#   parent_shape       the role the expression plays for its nearest        #
+#                       MEANINGFUL parent (walking up through pure           #
+#                       pass-through BoolOp/UnaryOp wrappers) -- "if_test",   #
+#                       "compare_operand", "assign_rhs", "call_argument",    #
+#                       "subscript_index", ... Relocating an expression from #
+#                       one of these into another (the attack named above)   #
+#                       changes this value, so the old waiver stops          #
+#                       matching and the new position raises fresh.          #
+#   enclosing_if_text  the nearest ENCLOSING ``ast.If``'s own test (not the  #
+#                       expression's own, if it IS reached as an if-test),   #
+#                       distinguishing two occurrences of textually          #
+#                       IDENTICAL expressions reached from two DIFFERENT     #
+#                       branches of the SAME function -- DEMONSTRATED in the #
+#                       real server.py: ``self._guardian_link_or_403(guid,   #
+#                       jid)`` appears verbatim under BOTH ``if mga:`` and    #
+#                       ``if mgs:`` inside do_POST (two different            #
+#                       guardian-scoped routes, the SAME reviewed link       #
+#                       check applied twice) -- parent_shape alone           #
+#                       ("if_test" both times) cannot tell them apart; the   #
+#                       enclosing branch can.                               #
+#                                                                             #
+# Neither depends on a line number (the ORIGINAL design's whole point --     #
+# unrelated code moving elsewhere in the file must not invalidate a waiver), #
+# only on structural POSITION relative to the expression itself.            #
+# --------------------------------------------------------------------------- #
+def _build_parent_map(root: ast.AST) -> dict:
+    """``id(node) -> its immediate AST parent`` for every node in ``root``'s
+    subtree. ``ast.iter_child_nodes`` already flattens list-valued fields
+    (a statement inside ``If.body``, an item inside ``With.items``, ...) to
+    direct parent/child edges, so this needs no special-casing per field
+    shape -- one pass, same as :func:`ast.walk` itself uses internally."""
+    parents = {}
+    for node in ast.walk(root):
+        for child in ast.iter_child_nodes(node):
+            parents[id(child)] = node
+    return parents
+
+
+#: parent node type -> the attribute name on it that, when it holds the
+#: child being fingerprinted, names a MEANINGFUL structural role rather than
+#: the generic type-name fallback in :func:`_parent_shape`.
+_ROLE_ATTRS = {
+    ast.If: (("test", "if_test"),),
+    ast.While: (("test", "while_test"),),
+    ast.IfExp: (("test", "ifexp_test"),),
+    ast.Assign: (("value", "assign_rhs"),),
+    ast.AnnAssign: (("value", "assign_rhs"),),
+    ast.AugAssign: (("value", "assign_rhs"),),
+    ast.NamedExpr: (("value", "assign_rhs"),),
+    ast.Subscript: (("slice", "subscript_index"), ("value", "subscript_value")),
+    ast.Return: (("value", "return_value"),),
+}
+if hasattr(ast, "match_case"):  # pragma: no branch -- Python 3.10+
+    _ROLE_ATTRS[ast.match_case] = (("guard", "case_guard"),)
+
+
+def _parent_shape(child: ast.AST, parent: Optional[ast.AST]) -> str:
+    """A short, stable descriptor of the STRUCTURAL role ``child`` plays for
+    its immediate ``parent`` -- part of the waiver fingerprint. See this
+    section's own module comment for why relocating an expression between
+    two of these values must invalidate an existing waiver."""
+    if parent is None:
+        return "root"
+    for attr, label in _ROLE_ATTRS.get(type(parent), ()):
+        if getattr(parent, attr, None) is child:
+            return label
+    if isinstance(parent, ast.Compare):
+        return "compare_operand"
+    if isinstance(parent, ast.Expr):
+        return "bare_stmt"
+    if isinstance(parent, ast.Call):
+        if parent.func is child:
+            return "call_callee"
+        if any(kw.value is child for kw in parent.keywords):
+            return "call_keyword_argument"
+        return "call_argument"
+    if isinstance(parent, (ast.Tuple, ast.List, ast.Set)):
+        return f"{type(parent).__name__.lower()}_element"
+    if isinstance(parent, ast.Dict):
+        return "dict_value" if child in parent.values else "dict_key"
+    return type(parent).__name__.lower()
+
+
+def _enclosing_if_text(expr: ast.AST, parents: dict) -> str:
+    """The nearest ``ast.If`` STRICTLY ENCLOSING ``expr`` -- i.e. reached
+    through its body/orelse, not merely because ``expr`` IS that same If's
+    own ``.test`` (the self-reference :meth:`_DispatchWalker._audit_function`
+    creates when it fingerprints an If/While/IfExp's test against ITSELF,
+    which names nothing about which BRANCH the test lives in). Returns
+    ``""`` when there is no enclosing If at all (a top-level statement)."""
+    current = parents.get(id(expr))
+    if isinstance(current, ast.If) and current.test is expr:
+        current = parents.get(id(current))
+    while current is not None:
+        if isinstance(current, ast.If):
+            return ast.unparse(current.test)
+        current = parents.get(id(current))
+    return ""
+
+
+def _waiver_key(fn_name: str, expr: ast.AST, parents: Optional[dict]) -> tuple:
+    """The full ``_AUDIT_WAIVERS`` key for ``expr``, reached while auditing
+    ``fn_name``: ``(function, exact text, parent shape, enclosing if)``.
+    Every waiver-consulting call site in this module builds its key through
+    this ONE function, so the four-part shape (and any future change to it)
+    never drifts between them. ``parents`` may be ``None`` for a caller that
+    has no whole-function parent map handy (:meth:`_DispatchWalker.
+    _else_rederives_subject`'s narrow, terminal-else-only check, which does
+    not consult a waiver in the shipped server.py today) -- the fingerprint
+    degrades to an empty ``enclosing_if_text`` rather than failing, since
+    ``parent_shape`` alone (computable from ``expr`` and its own immediate
+    AST parent, independent of any map) still captures finding 3's primary,
+    REQUIRED case: a relocated expression's shape differs regardless.
+    """
+    parent = parents.get(id(expr)) if parents is not None else None
+    shape = _parent_shape(expr, parent)
+    enclosing = _enclosing_if_text(expr, parents) if parents is not None else ""
+    return (fn_name, ast.unparse(expr), shape, enclosing)
+
+
 # Branches (or, since #202 repair round 2 finding A, unlisted CALLS reached
 # while auditing an assignment for taint propagation) that DECIDE ON a
 # path-derived name but are not routing decisions.
@@ -1959,17 +2133,22 @@ class _DispatchWalker:
 # a waiver is deliberately as conspicuous as adding a route, because a waiver
 # is how the gate would be quietly defeated.
 #
-# Keyed by (function name, the exact unparsed test OR call expression). A
-# drifted test/expression no longer matches its waiver and raises again,
-# which is the intended behaviour.
+# Keyed by _waiver_key(function, expression, parents) -- #202 repair round 4,
+# finding 3: (function name, the exact unparsed test OR call expression, the
+# expression's own structural PARENT SHAPE, the nearest ENCLOSING if-test's
+# text). A drifted expression, a RELOCATED one (moved to a new parent shape),
+# or one moved to a different branch of the same function no longer matches
+# its waiver and raises again -- see the fingerprinting section above this
+# dict for what each of the four parts defends against and why.
 _AUDIT_WAIVERS = {
     ("_serve_static",
-     "STATIC_DIR not in target.parents or not target.is_file()"):
+     "STATIC_DIR not in target.parents or not target.is_file()",
+     "if_test", ""):
         "filesystem containment on the already-resolved static target -- it "
         "decides whether to SERVE, not which route was chosen",
-    ("_serve_static", "target.suffix == '.html'"):
+    ("_serve_static", "target.suffix == '.html'", "if_test", ""):
         "content-type selection for the already-resolved static target",
-    ("_handle_setup_v2", "mar.group(2) == 'archive'"):
+    ("_handle_setup_v2", "mar.group(2) == 'archive'", "ifexp_test", "mar"):
         "a TERNARY (#202 repair, invented-evasion track) choosing which "
         "backend function to call -- api.archive_season vs "
         "api.reopen_season. NOT a routing decision: mar's own pattern "
@@ -1977,7 +2156,7 @@ _AUDIT_WAIVERS = {
         "regex-alternation leaves (see route_registry.py's "
         "post_v2_setup_seasons_id_archive/_reopen), so this ternary picks "
         "an implementation for a route already fully decided upstream",
-    ("_handle_setup_v2", "kind == 'venue'"):
+    ("_handle_setup_v2", "kind == 'venue'", "ifexp_test", "md"):
         "a TERNARY (#202 repair, invented-evasion track) choosing a "
         "response mapper (_v2p.venue_to_v2 vs identity). NOT a routing "
         "decision: kind comes from md's own entity alternation, which "
@@ -1985,7 +2164,7 @@ _AUDIT_WAIVERS = {
         "route_registry.py's post_v2_setup_<entity>_id_delete specs); this "
         "ternary only reshapes the response for one of those already-"
         "enumerated leaves",
-    ("_handle_reassign", "_REASSIGN_PARENTS.get(combo)"):
+    ("_handle_reassign", "_REASSIGN_PARENTS.get(combo)", "assign_rhs", ""):
         "#202 repair round 2 finding A -- a MODULE-LEVEL authorisation-"
         "parent lookup keyed on the already-tracked combo. NOT a routing "
         "decision: the route was already fully decided upstream by `combo "
@@ -1996,11 +2175,12 @@ _AUDIT_WAIVERS = {
         "_REASSIGN_PARENTS being a plain module dict isn't something a "
         "shape rule can tell apart from a genuine hidden route table, so "
         "it is reviewed here instead)",
-    ("_handle_reassign_v2", "_REASSIGN_PARENTS.get(combo)"):
+    ("_handle_reassign_v2", "_REASSIGN_PARENTS.get(combo)", "assign_rhs", ""):
         "same authorisation-parent lookup as _handle_reassign's own "
         "waiver above, reached from the v2 handler -- the route is already "
         "decided upstream by the v2 combo/schema dispatch; see that entry",
-    ("_handle_reassign", "self._V1_SETUP_KIND.get(entity, entity)"):
+    ("_handle_reassign", "self._V1_SETUP_KIND.get(entity, entity)",
+     "tuple_element", ""):
         "#202 repair round 2 finding A -- a legacy-name-alias lookup "
         "(v1 'league' -> canonical 'program', identity for everything "
         "else) that only relabels the authorisation TARGET kind added to "
@@ -2008,7 +2188,7 @@ _AUDIT_WAIVERS = {
         "by the regex + combo/schema dispatch upstream; this reshapes an "
         "authorisation-check argument, the same 'produces a RESULT' shape "
         "as a captured group handed to a service",
-    ("_handle_setup", "_to_v1.get(kind, lambda r: r)"):
+    ("_handle_setup", "_to_v1.get(kind, lambda r: r)", "assign_rhs", "md"):
         "#202 repair round 2 finding A -- selects the RESPONSE mapper "
         "(canonical entity -> its legacy v1 wire shape) for the delete "
         "route's already-decided entity kind (`kind = md.group(1)`, "
@@ -2018,18 +2198,20 @@ _AUDIT_WAIVERS = {
         "route_registry.py); this only reshapes the response body, the "
         "same 'produces a RESULT' shape as the two _handle_setup_v2 "
         "ternary waivers above",
-    ("do_POST", "required_permission(path)"):
+    ("do_POST", "required_permission(path)", "assign_rhs",
+     "not authorize(role, path)"):
         "#202 repair round 2 finding A -- builds the human-readable "
         "permission name for a 403 error body, AFTER `authorize(role, "
-        "path)` (the actual gate, tested directly and already exempt: "
-        "`path` is an ARGUMENT there, not that call's operand per "
-        "_direct_operand_names) has already refused the request. A "
-        "blanket per-verb authorisation gate, not a route selector -- see "
-        "test_a_guard_that_merely_passes_the_path_along_is_not_a_route "
-        "for the same shape via `_operator_only`/`_supported_methods`",
+        "path)` (the actual gate; see that call's OWN waiver below -- "
+        "#202 repair round 4, finding 1 closed the structural gap that "
+        "used to exempt a bare call reached directly as a whole if-test "
+        "without even scanning its arguments) has already refused the "
+        "request. A blanket per-verb authorisation gate, not a route "
+        "selector -- see test_a_guard_that_merely_passes_the_path_along_"
+        "is_not_a_route for the same shape via `_operator_only`",
     ("do_POST",
      "scope_violation(role, scope, path, body, api.store, "
-     "allow_unscoped_dev_fallback=allow_dev_fallback)"):
+     "allow_unscoped_dev_fallback=allow_dev_fallback)", "assign_rhs", ""):
         "#202 repair round 2 finding A -- resource-scoping authorisation "
         "(#51: a coach only their team, a player only self), run "
         "UNCONDITIONALLY for every POST before any path-based dispatch "
@@ -2045,14 +2227,15 @@ _AUDIT_WAIVERS = {
     # not a selector between different templates. Membership against a
     # small FIXED set of verb strings ("GET"/"POST"/...) can never pick a
     # different route the way `len(path) == N`/`str(path) == lit` could.
-    ("do_POST", "'POST' not in self._supported_methods(path)"):
+    ("do_POST", "'POST' not in self._supported_methods(path)", "if_test", ""):
         "#202 repair round 3, finding E -- the very first line of do_POST: "
         "refuses (405/Allow) BEFORE any path-based dispatch branch, using "
         "the SAME derived method-admission source the registry's own gate "
         "is diffed against; see this waiver's own comment block above "
         "for the general shape",
     ("_handle_reassign_v2",
-     "targets.append((dest[0], b.get(dest[1]) or None))"):
+     "targets.append((dest[0], b.get(dest[1]) or None))", "bare_stmt",
+     "dest is not None"):
         "#202 repair round 3, finding E -- `targets` is the AUTHORISATION-"
         "TARGET list fed to `_refuse_unchosen_context`/"
         "`_reject_target_outside_scope` below, seeded from `(entity, "
@@ -2067,7 +2250,7 @@ _AUDIT_WAIVERS = {
         "upstream by `combo in _V2_REASSIGN_SCHEMA`",
     ("_handle_reassign_v2",
      "targets.append((parent[0], b.get(parent[1]) or None, "
-     "'writable_parent'))"):
+     "'writable_parent'))", "bare_stmt", "parent is not None"):
         "#202 repair round 3, finding E -- same `targets` list as the "
         "immediately preceding waiver (this entry's own comment explains "
         "why `targets` itself reads as tracked); `parent` is "
@@ -2075,7 +2258,8 @@ _AUDIT_WAIVERS = {
         "existing waiver above -- appending it extends the SAME "
         "authorisation-target list with the write-side parent-ownership "
         "check (#369), not a routing decision",
-    ("_handle_reassign_v2", "check_body(b, **_V2_REASSIGN_SCHEMA[combo])"):
+    ("_handle_reassign_v2", "check_body(b, **_V2_REASSIGN_SCHEMA[combo])",
+     "bare_stmt", "combo in _V2_REASSIGN_SCHEMA"):
         "#202 repair round 3, finding E -- request-BODY field validation "
         "against the schema for the ALREADY-DECIDED `combo` (`combo in "
         "_V2_REASSIGN_SCHEMA` chose the route upstream); `check_body` "
@@ -2083,7 +2267,9 @@ _AUDIT_WAIVERS = {
         "between templates -- the same 'produces a RESULT for a "
         "post-dispatch concern' shape as every other waiver in this "
         "dict, just reached as a bare statement instead of an assignment",
-    ("_handle_reassign_v2", "len(target) > 2"):
+    ("_handle_reassign_v2", "len(target) > 2", "ifexp_test",
+     "self._reject_target_outside_scope(target[0], target[1], actor_id, "
+     "role, scope, target[2] if len(target) > 2 else 'scope')"):
         "#202 repair round 3, finding E -- a NAME COLLISION this flat, "
         "unscoped `tracked` set cannot see past: `target` is BOTH "
         "_handle_reassign_v2's own tracked parameter (the reassignment "
@@ -2099,19 +2285,23 @@ _AUDIT_WAIVERS = {
         "KNOWN LIMITATIONS section), so a same-named inner shadow of an "
         "outer tracked subject is indistinguishable from the real thing "
         "without this kind of human review",
-    ("_handle_reassign", "targets.append((dest[0], b.get(dest[1]) or None))"):
+    ("_handle_reassign", "targets.append((dest[0], b.get(dest[1]) or None))",
+     "bare_stmt", "dest is not None"):
         "#202 repair round 3, finding E -- the v1 sibling of "
         "_handle_reassign_v2's own identical-shape waiver above (see that "
         "entry): `dest` is `_V1_REASSIGN_DEST.get(combo)`, a richly-"
         "tracked tuple-dict lookup keyed on the already-decided `combo`; "
         "appending it onto the authorisation-target list widens the #369 "
         "write-side ownership check, it does not choose a route",
-    ("_handle_reassign", "check_body(b, **_V1_REASSIGN_SCHEMA[combo])"):
+    ("_handle_reassign", "check_body(b, **_V1_REASSIGN_SCHEMA[combo])",
+     "bare_stmt", "combo in _V1_REASSIGN_SCHEMA"):
         "#202 repair round 3, finding E -- the v1 sibling of "
         "_handle_reassign_v2's own identical-shape waiver above (see that "
         "entry): request-body field validation against the schema for "
         "the already-decided `combo`, not a routing decision",
-    ("_handle_reassign", "len(target) > 2"):
+    ("_handle_reassign", "len(target) > 2", "ifexp_test",
+     "self._reject_target_outside_scope(target[0], target[1], actor_id, "
+     "role, scope, target[2] if len(target) > 2 else 'scope')"):
         "#202 repair round 3, finding E -- the v1 sibling of "
         "_handle_reassign_v2's own identical-shape waiver above (see that "
         "entry for the full name-collision explanation): `target` here is "
@@ -2119,6 +2309,113 @@ _AUDIT_WAIVERS = {
         "target tuple), shadowing _handle_reassign's own tracked `target` "
         "parameter (the reassignment destination's entity kind) in name "
         "only",
+    # -- #202 repair round 4, finding 1 -- newly examined now that a Call
+    # reached DIRECTLY AS (or and/or/not-ed into) the WHOLE test has its
+    # arguments scanned too, the same way finding E already did for a
+    # comparison operand (see _direct_operand_names' own docstring). Every
+    # entry below is a genuine, reviewed BLANKET GUARD -- an authorisation
+    # or bookkeeping check that runs on an ALREADY-SELECTED route/resource,
+    # never a selector between templates -- previously exempt only because
+    # this shape was never even inspected, not because it was judged
+    # harmless. Each is fingerprinted the SAME way as every entry above
+    # (parent shape + enclosing if-text), verified exact-one-hit by
+    # WaiverFingerprintTests' own real-server test.
+    ("_dispatch_get", "self._operator_only(guard)", "if_test", "mvc"):
+        "get_v2_setup_seasons_id_venue_candidates: `guard` is an f-string "
+        "built from the ALREADY-DECIDED `mvc` regex match "
+        "(f'/api/v2/setup/seasons/{mvc.group(1)}/venue-candidates'), fed "
+        "into the SAME blanket `_operator_only` operator-permission gate "
+        "used ~24 times elsewhere in server.py (see the do_POST "
+        "`required_permission(path)`/`scope_violation(...)` waivers above "
+        "for the same shape) -- not a routing decision, the route was "
+        "already selected by `mvc`",
+    ("_dispatch_get", "self._operator_only(path)", "if_test", "ms"):
+        "get_accounts_id_sessions: the SAME blanket `_operator_only` gate, "
+        "this call site passes the raw `path` directly rather than a "
+        "literal guard string; the route was already selected by `ms` "
+        "(^/api/accounts/([^/]+)/sessions$) before this line runs",
+    ("_dispatch_get", "self._guardian_link_or_403(guid, jid)", "if_test",
+     "mgo"):
+        "get_me_guardian_id_substitute_opportunities_id: verifies the "
+        "signed-in guardian holds a VERIFIED link to the named junior "
+        "(`jid`, captured by `mgo`) before returning opportunity detail. "
+        "NOT a routing decision: the route is already selected by `mgo`'s "
+        "own regex match; this refuses an unlinked guardian access to an "
+        "already-identified resource, the same 'produces a RESULT, not a "
+        "routing decision' shape as `_official_guard`'s own calls "
+        "elsewhere in this function (which stay exempt because their "
+        "arguments are opaque captures/attributes, never a bare tracked "
+        "Name)",
+    ("_dispatch_get",
+     "not can_read_private_game_data(role, scope, gid, api.store)",
+     "if_test", "m"):
+        "the /api/games/{}/<sub> family's private-data gate (#73): `gid` "
+        "is captured by `m`'s own regex match; this decides whether the "
+        "SIGNED-IN caller may view an already-selected game's private "
+        "sub-resource (board/roster/etc, all already enumerated as "
+        "separate leaves under the SAME `m` match), not which route was "
+        "chosen",
+    ("do_GET", "not is_context_scoped_read(path)", "if_test", ""):
+        "do_GET's own PHASE A context-gate arrival ticket (#159): BOTH "
+        "arms of this if unconditionally call self._dispatch_get() "
+        "(server.py:1336-1341) -- the branch only decides whether to wrap "
+        "that SAME delegation with reader-registration bookkeeping around "
+        "the context-switch gate, never which template _dispatch_get goes "
+        "on to select",
+    ("_handle_reassign_v2",
+     "self._refuse_unchosen_context(targets, actor_id, role, scope)",
+     "if_test", ""):
+        "the #369 write-side context check on the AUTHORISATION-TARGET "
+        "list `targets`, built entirely from names this dict's own "
+        "`targets.append(...)` waivers above already established are "
+        "'produces a RESULT, not a routing decision' (the route was fully "
+        "decided upstream by `combo in _V2_REASSIGN_SCHEMA`); this is the "
+        "SAME `targets` list, now examined as a bare if-test instead of "
+        "an assignment/append",
+    ("_handle_reassign_v2",
+     "self._reject_target_outside_scope(target[0], target[1], actor_id, "
+     "role, scope, target[2] if len(target) > 2 else 'scope')", "if_test",
+     ""):
+        "per-target #369 scope check inside `for target in targets:`; "
+        "`len(target) > 2` (this call's own ternary argument) already has "
+        "its own waiver above under the SAME name-collision reasoning -- "
+        "this waives the ENCLOSING call now that it too is examined as a "
+        "bare if-test, not a new routing decision: `target` is one entry "
+        "of the ALREADY-decided authorisation-target list",
+    ("_handle_reassign",
+     "self._reject_target_outside_scope(target[0], target[1], actor_id, "
+     "role, scope, target[2] if len(target) > 2 else 'scope')", "if_test",
+     ""):
+        "the v1 sibling of _handle_reassign_v2's own identical-shape "
+        "waiver immediately above; see that entry",
+    ("do_POST", "not authorize(role, path)", "if_test", ""):
+        "do_POST's own generic per-request authorisation gate (#24/#50), "
+        "the SAME blanket check `required_permission(path)`/"
+        "`scope_violation(...)` (waived above) sit inside/beside: "
+        "`authorize(role, path)` decides whether THIS role may perform "
+        "the action the path ALREADY selected, not which route it is. "
+        "Previously exempt via the structural gap THIS finding closes -- "
+        "a bare call directly forming the whole if-test was never even "
+        "scanned for tracked arguments; now it is, and gets this "
+        "explicit, reviewed waiver instead",
+    ("do_POST", "self._guardian_link_or_403(guid, jid)", "if_test", "mga"):
+        "POST sibling of get_me_guardian_id_substitute_opportunities_id's "
+        "own identical-text waiver above (see that entry for the general "
+        "shape): verifies the signed-in guardian's VERIFIED link to the "
+        "junior captured by `mga` (jid = mga.group(1)) before setting "
+        "that junior's availability. NOT a routing decision -- the route "
+        "is already selected by `mga`",
+    ("do_POST", "self._guardian_link_or_403(guid, jid)", "if_test", "mgs"):
+        "same guardian-link check as the `mga`-branch waiver immediately "
+        "above, guarding a DIFFERENT POST action: before the junior "
+        "captured by `mgs` (jid = mgs.group(1)) may accept/decline a "
+        "coach's substitute offer on the guardian's behalf. Textually "
+        "IDENTICAL to that entry -- the SAME reviewed check, applied "
+        "twice; #202 repair round 4, finding 3's enclosing-if-text "
+        "fingerprint (`mga` vs `mgs`) is what lets both be recorded as "
+        "separate, individually exact-one-hit entries rather than one "
+        "waiver silently also covering a second, independently-reviewed "
+        "call site it was never written against",
 }
 
 
@@ -2325,7 +2622,8 @@ def _binding_value_and_targets(node):
 
 
 def _propagates_taint(value, tracked: set, fn_name: str = "",
-                      waiver_hits: Optional[dict] = None) -> bool:
+                      waiver_hits: Optional[dict] = None,
+                      parents: Optional[dict] = None) -> bool:
     """Does this expression still CARRY the request path?
 
     Deliberately narrow. `p2 = self.path.split("?", 1)[0]` carries it -- string
@@ -2384,11 +2682,11 @@ def _propagates_taint(value, tracked: set, fn_name: str = "",
             manipulates = (isinstance(func, ast.Attribute)
                            and func.attr in (_PATH_OPS + _PATH_METHODS)
                            and _propagates_taint(func.value, tracked, fn_name,
-                                                 waiver_hits))
+                                                 waiver_hits, parents))
             if manipulates:
                 continue
             if _mentions_tracked(node, tracked):
-                waiver_key = (fn_name, ast.unparse(node))
+                waiver_key = _waiver_key(fn_name, node, parents)
                 if waiver_key in _AUDIT_WAIVERS:
                     # Reviewed and declared not-a-routing-decision (see the
                     # waiver's own entry) -- like a provably-unrelated call,
@@ -2423,10 +2721,13 @@ def _propagates_taint(value, tracked: set, fn_name: str = "",
         # pathlib's own join operator: `STATIC_DIR / rel` is a Path built
         # from whichever operand carries the path -- the construction
         # analogue of the method calls handled above.
-        return (_propagates_taint(value.left, tracked, fn_name, waiver_hits)
-                or _propagates_taint(value.right, tracked, fn_name, waiver_hits))
+        return (_propagates_taint(value.left, tracked, fn_name, waiver_hits,
+                                  parents)
+                or _propagates_taint(value.right, tracked, fn_name,
+                                     waiver_hits, parents))
     if isinstance(value, ast.Attribute) and value.attr in _PATH_PROPERTIES:
-        return _propagates_taint(value.value, tracked, fn_name, waiver_hits)
+        return _propagates_taint(value.value, tracked, fn_name, waiver_hits,
+                                 parents)
     return any(isinstance(x, ast.Name) and x.id in tracked
                for x in ast.walk(value))
 
@@ -2455,24 +2756,40 @@ def _direct_operand_names(test, tracked: frozenset = frozenset({"path"})) -> set
     permissions, not about which route this is. So arguments of a call are NOT
     operand positions, while a call's own receiver is.
 
-    UNLESS the call is itself reached as a COMPARISON OPERAND -- the LEFT or a
-    comparator of an ``ast.Compare`` (``len(path) == N``, ``str(path) ==
-    lit``, ``hash(path) == hash(lit)``, any project-local wrapper reached the
-    same way) -- in which case an argument that still carries a tracked name
-    undisguised by an opaque extraction DOES count (#202 repair round 3,
-    finding E; see the ``root_name`` Call branch below, and ``in_compare``
-    throughout this function). Deliberately NOT widened to every call
-    position: a BARE call used directly as (or inside a ``not``/``and``/
-    ``or`` around) the whole test -- ``if not authorize(role, path):``, ``if
-    self._operator_only(path):`` -- is a reviewed, DELIBERATE exemption
-    (see ``test_a_guard_that_merely_passes_the_path_along_is_not_a_route``
-    and the ``required_permission(path)``/``scope_violation(...)``
-    ``_AUDIT_WAIVERS`` entries' own comments): a blanket per-request
-    authorisation gate that happens to take the raw path as an argument is
-    not, itself, a routing decision, and finding E's own examples are all
-    comparison-shaped -- widening past that would re-litigate an
-    already-reviewed round-2 design choice this round was not asked to
-    revisit, not close a new gap.
+    UNLESS the call is itself the tested condition -- the LEFT or a comparator
+    of an ``ast.Compare`` (``len(path) == N``, #202 repair round 3, finding E),
+    OR the call IS the test (directly, or reached through any nesting of
+    ``not``/``and``/``or`` around it: ``if self._is_hidden(path):``, ``if not
+    authorize(role, path):``, ``if guard_a(path) and guard_b():`` -- #202
+    repair round 4, finding 1) -- in which case an argument that still
+    carries a tracked name undisguised by an opaque extraction DOES count
+    (see the ``root_name`` Call branch below). A call reached NEITHER way --
+    as an argument to some OTHER call, or as a captured-group/Path-property
+    extraction's own receiver -- still does not count: ``_official_guard(
+    oav.group(1))``'s ``oav`` stays invisible here regardless (opaque
+    extraction, see :func:`_tracked_mentions`), and nothing in this module
+    ever looks at what a call's return value is subsequently passed to.
+
+    Finding 1 closes what finding E deliberately left open: before it, a
+    BARE call used directly as (or boolop/not-ed into) the whole test was a
+    STRUCTURAL exemption -- its arguments were never even inspected, not
+    just judged harmless -- so a NEW, unreviewed helper predicate consuming
+    the path (``if self._is_hidden(path):``) was silently invisible, not
+    merely un-waived. DEMONSTRATED: a real localhost Handler answers HTTP
+    200 for a path such a predicate hides, while ``extract_routes`` records
+    zero routes and raises nothing. The fix removes the structural
+    exemption entirely -- a Call's arguments are now scanned wherever
+    ``root_name`` reaches the call, regardless of ``ast.Compare`` -- so
+    every one of THIS round's genuinely reviewed blanket guards
+    (``_operator_only``, ``authorize``, the two other guard shapes named in
+    the ``_AUDIT_WAIVERS`` comments below) now needs, and has, an explicit
+    waiver instead of relying on this structural gap; an unreviewed
+    predicate has no such entry and raises. This does NOT re-litigate round
+    2's design choice that a blanket per-request authorisation gate is not
+    itself a routing decision (see those waivers' own comments) -- it only
+    changes HOW that conclusion is recorded: a declared, fingerprinted,
+    one-hit-verified waiver (:meth:`_DispatchWalker.verify_waiver_usage`)
+    rather than an implicit shape this function silently never looked at.
 
     ``tracked`` defaults to just ``{"path"}`` for callers outside the
     completeness audit's own ``ctx``-aware fixed point (e.g.
@@ -2483,7 +2800,7 @@ def _direct_operand_names(test, tracked: frozenset = frozenset({"path"})) -> set
     """
     found = set()
 
-    def root_name(node, in_compare):
+    def root_name(node):
         while True:
             # DIRECT ``self.path`` (#202 repair, invented-evasion track):
             # bypassing the local entirely (``if self.path == "/x":``, never
@@ -2508,9 +2825,9 @@ def _direct_operand_names(test, tracked: frozenset = frozenset({"path"})) -> set
             # loop recognised ``ast.NamedExpr`` before this fix, so a
             # walrus-bound routing decision raised nothing and recorded
             # nothing, whether tested in the SAME if-test or a later one.
-            # Unconditional (not gated by ``in_compare``): unlike the Call
-            # case below there is no round-2-established "bare walrus test
-            # is a reviewed exemption" precedent to preserve.
+            # Unconditional: no shape reached by root_name (walrus, the Call
+            # case below, ...) gets a structural pass any more (#202 repair
+            # round 4, finding 1 removed the last one -- see below).
             if isinstance(node, ast.NamedExpr):
                 return node.target.id
             if isinstance(node, ast.Name):
@@ -2518,56 +2835,48 @@ def _direct_operand_names(test, tracked: frozenset = frozenset({"path"})) -> set
             if isinstance(node, (ast.Attribute, ast.Subscript)):
                 node = node.value
             elif isinstance(node, ast.Call):
-                # A Call's ARGUMENTS, but ONLY when reached AS A COMPARISON
-                # OPERAND (#202 repair round 3, finding E -- see this
-                # function's own docstring for why ``in_compare`` gates
-                # this and not the callee-chain unwrap below): invisible
-                # before this fix, which only ever unwrapped the CALLEE
-                # chain (``path.startswith(...)``'s own receiver), never
-                # looked at what was PASSED to a call. DEMONSTRATED: zero
-                # exception, zero recorded route; when the branch is an
-                # earlier arm of a chain whose terminal else re-derives the
-                # subject (root cause 6's unconditional static tail), it
-                # also silently dropped THAT chain's own static-tail route,
-                # because walking an unclassified branch's orelse never
-                # reaches _walk_terminal_else. Fail closed the SAME WAY
-                # _propagates_taint does for an unlisted call's
-                # receiver/arguments: reuse _tracked_mentions (the
-                # name-collecting counterpart of _mentions_tracked, same
-                # opaque-extraction boundary) rather than duplicate that
-                # logic here. This only ADDS names to ``found`` -- it never
-                # suppresses the existing callee-chain resolution below, so
-                # ``path.startswith(...)`` (reached with ``in_compare``
-                # either way, since it is a call's own RECEIVER, not an
-                # argument) still resolves to "path" exactly as before.
-                if in_compare:
-                    for arg in list(node.args) + [kw.value for kw in node.keywords]:
-                        found.update(_tracked_mentions(arg, tracked))
+                # A Call's ARGUMENTS -- UNCONDITIONALLY (#202 repair round 4,
+                # finding 1; round 3, finding E introduced this scan but
+                # gated it to ``in_compare`` -- a comparison operand only).
+                # Every node ``root_name`` ever examines is already reached
+                # from ``visit_operand`` as part of THE TESTED CONDITION
+                # ITSELF (the whole test, or and/or/not-ed into it, or a
+                # comparison operand of it -- see this function's own
+                # docstring) -- there is no OTHER way into this loop -- so
+                # there is no remaining shape where scanning a Call's
+                # arguments here would reach past what the test actually
+                # decides on. Before this round, a BARE call used directly
+                # as the whole test (no ``ast.Compare`` anywhere) left this
+                # branch entirely unscanned -- not merely judged harmless --
+                # so a NEW, unreviewed helper predicate consuming the path
+                # (``if self._is_hidden(path):``) was structurally
+                # invisible: zero exception, zero route, a real HTTP 200.
+                # Fail closed the SAME WAY _propagates_taint does for an
+                # unlisted call's receiver/arguments: reuse
+                # _tracked_mentions (the name-collecting counterpart of
+                # _mentions_tracked, same opaque-extraction boundary) rather
+                # than duplicate that logic here. This only ADDS names to
+                # ``found`` -- it never suppresses the callee-chain
+                # resolution below, so ``path.startswith(...)`` still
+                # resolves to "path" exactly as before either way.
+                for arg in list(node.args) + [kw.value for kw in node.keywords]:
+                    found.update(_tracked_mentions(arg, tracked))
                 node = node.func
             else:
                 return None
 
-    def visit_operand(node, in_compare=False):
+    def visit_operand(node):
         if isinstance(node, ast.BoolOp):
-            # Thread ``in_compare`` through unchanged (#202 repair round 3,
-            # finding E completeness): a BoolOp is not itself a comparison
-            # operand, but ``(a or len(path)) == 5`` still reaches
-            # ``len(path)`` FROM a genuine comparator position -- the flag
-            # must survive passing through the boolop, not reset to False,
-            # or this exact nesting would silently re-open the gap the
-            # in_compare gate elsewhere already believes it closed. Stays
-            # False for a BoolOp reached OUTSIDE any Compare (e.g. `if not
-            # authorize(...) and ...:`), preserving that exemption exactly.
             for value in node.values:
-                visit_operand(value, in_compare)
+                visit_operand(value)
             return
         if isinstance(node, ast.UnaryOp):
-            visit_operand(node.operand, in_compare)  # same reasoning as BoolOp above
+            visit_operand(node.operand)
             return
         if isinstance(node, ast.Compare):
-            visit_operand(node.left, True)
+            visit_operand(node.left)
             for comparator in node.comparators:
-                visit_operand(comparator, True)
+                visit_operand(comparator)
             return
         # any(...)/all(...) over a generator or list/set comprehension (#202
         # repair, invented-evasion track): the comprehension's own element
@@ -2585,7 +2894,7 @@ def _direct_operand_names(test, tracked: frozenset = frozenset({"path"})) -> set
                 for cond in generator.ifs:
                     visit_operand(cond)
             return
-        name = root_name(node, in_compare)
+        name = root_name(node)
         if name is not None:
             found.add(name)
 
