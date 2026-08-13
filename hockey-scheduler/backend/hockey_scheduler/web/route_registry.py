@@ -376,19 +376,37 @@ REGISTRY = (
                     "applicable.")),
     RouteSpec("GET", r"^/api/me/guardian/home$", "/api/me/guardian/home",
               "get_me_guardian_home", "_dispatch_get",
-              auth="session", scope_axis="none",
-              note=("#202: _require_guardian_scope (server.py:1177-1203, "
-                    "called at 1881) -- no/expired cookie -> 401, "
-                    "non-guardian session -> 403. get_guardian_home(guid) "
-                    "is keyed by the caller's own guardian user id -- no "
-                    "P/S/L concept, not applicable.")),
+              auth="session+guardian-scope", scope_axis="none",
+              note=("#202 repair round 4, finding 4: relabelled from bare "
+                    "'session' -- the gate this route actually runs "
+                    "(_require_guardian_scope) is the SAME one its own "
+                    "POST siblings (post_me_guardian_...) are already "
+                    "labelled 'session+guardian-scope[+verified-link]' "
+                    "for; leaving this GET sibling at the coarser 'session' "
+                    "was an inconsistency with this entry's own cited "
+                    "evidence, not a deliberate distinction. "
+                    "_require_guardian_scope (server.py:1177-1203, called "
+                    "at 1881) -- no/expired cookie -> 401, "
+                    "non-guardian session -> 403. NOT '+verified-link': "
+                    "unlike the substitute-opportunity-detail sibling below, "
+                    "this route returns EVERY linked junior's home data "
+                    "(service.py's own get_guardian_home enumerates the "
+                    "guardian's links itself) -- there is no single named "
+                    "junior for _guardian_link_or_403 to check a link "
+                    "against. get_guardian_home(guid) is keyed by the "
+                    "caller's own guardian user id -- no P/S/L concept, not "
+                    "applicable.")),
     RouteSpec("GET",
               r"^/api/me/guardian/[^/]+/substitute-opportunities/[^/]+$",
               "/api/me/guardian/{}/substitute-opportunities/{}",
               "get_me_guardian_id_substitute_opportunities_id",
               "_dispatch_get",
-              auth="session", scope_axis="none",
-              note=("#202: _require_guardian_scope (server.py:1891) then "
+              auth="session+guardian-scope+verified-link", scope_axis="none",
+              note=("#202 repair round 4, finding 4: relabelled from bare "
+                    "'session' to match this entry's own cited evidence "
+                    "and its POST siblings' identical-shape gate (same "
+                    "inconsistency as get_me_guardian_home immediately "
+                    "above). _require_guardian_scope (server.py:1891) then "
                     "_guardian_link_or_403 (server.py:1205-1215, called "
                     "at 1895) -- the guardian must hold a VERIFIED link "
                     "to the named junior. get_substitute_opportunity(jid, "
@@ -405,8 +423,16 @@ REGISTRY = (
     RouteSpec("GET", r"^/api/me/substitute-opportunities/[^/]+$",
               "/api/me/substitute-opportunities/{}",
               "get_me_substitute_opportunities_id", "_dispatch_get",
-              auth="session", scope_axis="none",
-              note=("#202: _require_player_scope (server.py:1152-1175, "
+              auth="session+player-scope", scope_axis="none",
+              note=("#202 repair round 4, finding 4: relabelled from bare "
+                    "'session' -- the gate this route actually runs "
+                    "(_require_player_scope) is the SAME one its own POST "
+                    "siblings (post_me_substitute_opportunities_id_...) "
+                    "are already labelled 'session+player-scope' for; "
+                    "leaving this GET sibling at the coarser 'session' was "
+                    "an inconsistency with this entry's own cited "
+                    "evidence, not a deliberate distinction. "
+                    "_require_player_scope (server.py:1152-1175, "
                     "called at 1871) -- no/expired cookie -> 401, session "
                     "without a player binding -> 403. "
                     "get_substitute_opportunity(pid, game_id) is keyed by "
@@ -2006,24 +2032,24 @@ REGISTRY = (
                     "never League")),
     RouteSpec("POST", r"^/api/v2/setup/club$", "/api/v2/setup/club",
               "post_v2_setup_club", "_handle_setup_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='zero_axis',
               note=("#202: Permission.MANAGE_SETUP (authz.py:88-89, 'club' in _V2_SETUP_SETUP) -- League Admin only. _guarded_create('club', [], ...) (server.py:4531-4537, 'ZERO-AXIS ROOT (#409)'); service.py:2174")),
     RouteSpec("POST", r"^/api/v2/setup/club/[^/]+/delete$",
               "/api/v2/setup/club/{}/delete", "post_v2_setup_club_id_delete",
               "_handle_setup_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='program',
               note=("#202: Permission.MANAGE_SETUP (authz.py:74-82 default) -- League Admin only. _guarded_mutation([('club', id)], ...) (server.py:4446-4482); service.py:1860-1862 club in _PROGRAM_AXIS_TARGET_KINDS")),
     RouteSpec("POST", r"^/api/v2/setup/division$", "/api/v2/setup/division",
               "post_v2_setup_division", "_handle_setup_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='cross',
               note=("#202: Permission.MANAGE_SETUP (authz.py:88-89, 'division' in _V2_SETUP_SETUP) -- League Admin only. _guarded_create('division', [('league', lid), ('season', sid)], ...) (server.py:4513-4530, 'SEASON-OWNED (#409)'); service.py:2186")),
     RouteSpec("POST", r"^/api/v2/setup/division/[^/]+/assign-league$",
               "/api/v2/setup/division/{}/assign-league",
               "post_v2_setup_division_id_assign_league", "_handle_reassign_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='cross',
               note=("#202: Permission.MANAGE_SETUP (authz.py:33-34). targets = [('division', id), ('league', dest)] (server.py:4143-4144); service.py:1858-1859 division in _SEASON_OWNED_TARGET_KINDS -> kinds - _PROGRAM_AXIS_TARGET_KINDS is nonempty -> Program+Season both required (service.py:1961-1968) || ORIGINAL: ""#202 repair root cause 1: the concrete leaf. "
                     "_V2_REASSIGN_SCHEMA/_V2_REASSIGN_CALL admit ONLY "
@@ -2031,7 +2057,7 @@ REGISTRY = (
     RouteSpec("POST", r"^/api/v2/setup/division/[^/]+/delete$",
               "/api/v2/setup/division/{}/delete",
               "post_v2_setup_division_id_delete", "_handle_setup_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='cross',
               note=("#202: Permission.MANAGE_SETUP (authz.py:74-82 default) -- League Admin only. _guarded_mutation([('division', id)], ...) (server.py:4446-4482); service.py:1858-1859 division in _SEASON_OWNED_TARGET_KINDS")),
     RouteSpec("POST", r"^/api/v2/setup/game$", "/api/v2/setup/game",
@@ -2058,19 +2084,19 @@ REGISTRY = (
               note=("#202: Permission.MANAGE_ARENA (authz.py:74-81, kind 'ice-slot' folds to 'ice_slot', in _V2_ARENA_SETUP). _guarded_mutation([('ice_slot', id)], ...) (server.py:4446-4482); service.py:1860-1862 ice_slot in _PROGRAM_AXIS_TARGET_KINDS")),
     RouteSpec("POST", r"^/api/v2/setup/league$", "/api/v2/setup/league",
               "post_v2_setup_league", "_handle_setup_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='cross',
               note=("#202: Permission.MANAGE_SETUP (authz.py:88-89, 'league' in _V2_SETUP_SETUP) -- League Admin only. _guarded_create('league', [('season', sid)], ...) (server.py:4502-4512, 'SEASON-OWNED (#409): the create also mints the LeagueSeason'); service.py:2184 _CREATE_TWO_AXIS -- both Program AND Season required (contrast the MUTATION table, service.py:1860-1862, where an existing League is PROGRAM-AXIS only -- create and delete of the SAME kind carry different axis classes here, by design)")),
     RouteSpec("POST", r"^/api/v2/setup/league-season/[^/]+/delete$",
               "/api/v2/setup/league-season/{}/delete",
               "post_v2_setup_league_season_id_delete", "_handle_setup_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='cross',
               note=("#202: Permission.MANAGE_SETUP (authz.py:74-82 default, kind 'league-season' folds to 'league_season') -- League Admin only. _guarded_mutation([('league_season', id)], ...) (server.py:4446-4482); service.py:1858-1859 league_season in _SEASON_OWNED_TARGET_KINDS")),
     RouteSpec("POST", r"^/api/v2/setup/league/[^/]+/delete$",
               "/api/v2/setup/league/{}/delete",
               "post_v2_setup_league_id_delete", "_handle_setup_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='program',
               note=("#202: Permission.MANAGE_SETUP (authz.py:74-82 default) -- League Admin only. _guarded_mutation([('league', id)], ...) (server.py:4446-4482); service.py:1860-1862 league in _PROGRAM_AXIS_TARGET_KINDS for MUTATION (contrast the CREATE table, service.py:2184, where creating a League is two-axis because it also mints a LeagueSeason)")),
     RouteSpec("POST", r"^/api/v2/setup/official$", "/api/v2/setup/official",
@@ -2081,7 +2107,7 @@ REGISTRY = (
     RouteSpec("POST", r"^/api/v2/setup/official/[^/]+/delete$",
               "/api/v2/setup/official/{}/delete",
               "post_v2_setup_official_id_delete", "_handle_setup_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='program',
               note=("#202: Permission.MANAGE_SETUP (authz.py:74-82, 'official' not in _V2_ARENA_SETUP -> default) -- League Admin only (contrast official CREATE, MANAGE_SCHEDULE at authz.py:84-85 -- create and delete of the SAME kind carry different PERMISSIONS here, by design). _guarded_mutation([('official', id)], ...) (server.py:4446-4482); service.py:1860-1862 official in _PROGRAM_AXIS_TARGET_KINDS")),
     RouteSpec("POST", r"^/api/v2/setup/organization$",
@@ -2098,19 +2124,19 @@ REGISTRY = (
               note=("#202: Permission.MANAGE_ARENA (authz.py:74-81, kind in _V2_ARENA_SETUP). _guarded_mutation([('organization', id)], ...) (server.py:4446-4482); service.py:1860-1862 organization in _PROGRAM_AXIS_TARGET_KINDS")),
     RouteSpec("POST", r"^/api/v2/setup/player$", "/api/v2/setup/player",
               "post_v2_setup_player", "_handle_setup_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='program',
               note=("#202: Permission.MANAGE_SETUP (authz.py:88-89, 'player' in _V2_SETUP_SETUP) -- League Admin only. _guarded_create('player', [('team', tid)], ...) (server.py:4629-4649, 'PROGRAM-AXIS (#409)'); service.py:2182")),
     RouteSpec("POST", r"^/api/v2/setup/player/[^/]+/active$",
               "/api/v2/setup/player/{}/active",
               "post_v2_setup_player_id_active", "_handle_setup_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='program',
               note=("#202: Permission.MANAGE_SETUP (authz.py:90, catch-all default -- same as /update, 'player/<id>/active' matches no dedicated regex) -- League Admin only. _guarded_mutation([('player', id)], ...) (server.py:4245-4260); service.py:1860-1862")),
     RouteSpec("POST", r"^/api/v2/setup/player/[^/]+/assign-team$",
               "/api/v2/setup/player/{}/assign-team",
               "post_v2_setup_player_id_assign_team", "_handle_reassign_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='program',
               note=("#202: Permission.MANAGE_SETUP (authz.py:33-34). targets = [('player', id), ('team', dest)] (server.py:4156-4157); service.py:1860-1862 player AND team both in _PROGRAM_AXIS_TARGET_KINDS || ORIGINAL: ""#202 repair root cause 1: the concrete leaf. "
                     "_V2_REASSIGN_SCHEMA/_V2_REASSIGN_CALL admit ONLY "
@@ -2118,25 +2144,25 @@ REGISTRY = (
     RouteSpec("POST", r"^/api/v2/setup/player/[^/]+/delete$",
               "/api/v2/setup/player/{}/delete",
               "post_v2_setup_player_id_delete", "_handle_setup_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='program',
               note=("#202: Permission.MANAGE_SETUP (authz.py:74-82 default) -- League Admin only. _guarded_mutation([('player', id)], ...) (server.py:4446-4482); service.py:1860-1862 player in _PROGRAM_AXIS_TARGET_KINDS")),
     RouteSpec("POST", r"^/api/v2/setup/player/[^/]+/update$",
               "/api/v2/setup/player/{}/update",
               "post_v2_setup_player_id_update", "_handle_setup_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='program',
               note=("#202: Permission.MANAGE_SETUP (authz.py:90, catch-all default -- no dedicated regex in _v2_setup_permission matches 'player/<id>/update') -- League Admin only. _guarded_mutation([('player', id)], ...) (server.py:4222-4239); service.py:1860-1862 player in _PROGRAM_AXIS_TARGET_KINDS")),
     RouteSpec("POST", r"^/api/v2/setup/program$", "/api/v2/setup/program",
               "post_v2_setup_program", "_handle_setup_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='zero_axis',
               note=("#202: Permission.MANAGE_SETUP (authz.py:88-89, 'program' in _V2_SETUP_SETUP) -- League Admin only (roles.py:37-42). _guarded_create('program', [], ...) (server.py:4485-4493, 'ZERO-AXIS ROOT (#409)'); service.py:2172 _CREATE_CONSUMED_AXES['program'] = _CREATE_ZERO_AXIS -- no parent, no context read at all (service.py:2338-2342)")),
     RouteSpec("POST", r"^/api/v2/setup/program/[^/]+/assign-organization$",
               "/api/v2/setup/program/{}/assign-organization",
               "post_v2_setup_program_id_assign_organization",
               "_handle_reassign_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='program',
               note=("#202: Permission.MANAGE_SETUP (authz.py:33-34, (program|division|team|player)/[^/]+/assign-\\w+) -- League Admin only. targets = [('program', id), ('organization', dest)] (server.py:4098-4114, 4140-4141); service.py:1860-1862 program AND organization both in _PROGRAM_AXIS_TARGET_KINDS || ORIGINAL: ""#202 repair root cause 1: the concrete leaf. "
                     "_V2_REASSIGN_SCHEMA/_V2_REASSIGN_CALL admit ONLY "
@@ -2144,7 +2170,7 @@ REGISTRY = (
     RouteSpec("POST", r"^/api/v2/setup/program/[^/]+/delete$",
               "/api/v2/setup/program/{}/delete",
               "post_v2_setup_program_id_delete", "_handle_setup_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='program',
               note=("#202: Permission.MANAGE_SETUP (authz.py:74-82, kind not in _V2_ARENA_SETUP nor 'game' -> default) -- League Admin only. _guarded_mutation([('program', id)], ...) (server.py:4446-4482); service.py:1860-1862 program in _PROGRAM_AXIS_TARGET_KINDS")),
     RouteSpec("POST", r"^/api/v2/setup/rink$", "/api/v2/setup/rink",
@@ -2168,7 +2194,7 @@ REGISTRY = (
               note=("#202: Permission.MANAGE_ARENA (authz.py:74-81, kind in _V2_ARENA_SETUP). _guarded_mutation([('rink', id)], ...) (server.py:4446-4482); service.py:1860-1862 rink in _PROGRAM_AXIS_TARGET_KINDS")),
     RouteSpec("POST", r"^/api/v2/setup/season$", "/api/v2/setup/season",
               "post_v2_setup_season", "_handle_setup_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='program',
               note=("#202: Permission.MANAGE_SETUP (authz.py:88-89, 'season' in _V2_SETUP_SETUP) -- League Admin only. _guarded_create('season', [('program', pid)], ...) (server.py:4494-4501, 'PROGRAM-AXIS (#409): the Season axis is MINTED, not consumed'); service.py:2176 _CREATE_PROGRAM_AXIS")),
     RouteSpec("POST",
@@ -2176,7 +2202,7 @@ REGISTRY = (
               "/api/v2/setup/season-team-registration/{}/assign-division",
               "post_v2_setup_season_team_registration_id_assign_division",
               "_handle_setup_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='cross',
               note=("#202: Permission.MANAGE_SETUP (authz.py:37-39). _guarded_mutation([('registration', id), ('division', did)], ...) (server.py:4303-4324); service.py:413-416, 1858-1859")),
     RouteSpec("POST",
@@ -2184,7 +2210,7 @@ REGISTRY = (
               "/api/v2/setup/season-team-registration/{}/assign-league",
               "post_v2_setup_season_team_registration_id_assign_league",
               "_handle_setup_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='cross',
               note=("#202: Permission.MANAGE_SETUP (authz.py:37-39). _guarded_mutation([('registration', id), ('league', lid)], ...) (server.py:4286-4302); service.py:413-416 'registration' bridges to 'league_season'; service.py:1858-1859 league_season in _SEASON_OWNED_TARGET_KINDS")),
     RouteSpec("POST",
@@ -2192,7 +2218,7 @@ REGISTRY = (
               "/api/v2/setup/season-team-registration/{}/delete",
               "post_v2_setup_season_team_registration_id_delete",
               "_handle_setup_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='cross',
               note=("#202: Permission.MANAGE_SETUP (authz.py:74-82 generic delete catch-all, kind='season-team-registration', not in _V2_ARENA_SETUP nor 'game'). _guarded_mutation([('registration', id)], ...) (server.py:4339-4351); service.py:413-416, 1858-1859")),
     RouteSpec("POST",
@@ -2200,69 +2226,69 @@ REGISTRY = (
               "/api/v2/setup/season-team-registration/{}/remove",
               "post_v2_setup_season_team_registration_id_remove",
               "_handle_setup_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='cross',
               note=("#202: Permission.MANAGE_SETUP (authz.py:37-39). _guarded_mutation([('registration', id)], ...) (server.py:4325-4335); service.py:413-416, 1858-1859")),
     RouteSpec("POST", r"^/api/v2/setup/season-venue-access/[^/]+/delete$",
               "/api/v2/setup/season-venue-access/{}/delete",
               "post_v2_setup_season_venue_access_id_delete",
               "_handle_setup_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='cross',
               note=("#202: Permission.MANAGE_SETUP (authz.py:49-50). _guarded_mutation([('season_venue_access', id)], ...) (server.py:4400-4412); service.py:417-419, 1858-1859")),
     RouteSpec("POST", r"^/api/v2/setup/season-venue-access/[^/]+/remove$",
               "/api/v2/setup/season-venue-access/{}/remove",
               "post_v2_setup_season_venue_access_id_remove",
               "_handle_setup_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='cross',
               note=("#202: Permission.MANAGE_SETUP (authz.py:49-50). _guarded_mutation([('season_venue_access', id)], ...) (server.py:4386-4399); service.py:417-419 'season_venue_access' bridges to 'season'; service.py:1858-1859")),
     RouteSpec("POST", r"^/api/v2/setup/season/[^/]+/delete$",
               "/api/v2/setup/season/{}/delete",
               "post_v2_setup_season_id_delete", "_handle_setup_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='cross',
               note=("#202: Permission.MANAGE_SETUP (authz.py:74-82 default) -- League Admin only. _guarded_mutation([('season', id)], ...) (server.py:4446-4482); service.py:1858-1859 season in _SEASON_OWNED_TARGET_KINDS -> both Program AND Season required (service.py:1899-1972 _mutation_context_error)")),
     RouteSpec("POST", r"^/api/v2/setup/seasons/[^/]+/archive$",
               "/api/v2/setup/seasons/{}/archive",
               "post_v2_setup_seasons_id_archive", "_handle_setup_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='cross',
               note=("#202: Permission.MANAGE_SETUP (authz.py:42-44). _guarded_mutation([('season', id)], ...) (server.py:4426-4445); service.py:1858-1859 season in _SEASON_OWNED_TARGET_KINDS")),
     RouteSpec("POST", r"^/api/v2/setup/seasons/[^/]+/reopen$",
               "/api/v2/setup/seasons/{}/reopen",
               "post_v2_setup_seasons_id_reopen", "_handle_setup_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='cross',
               note=("#202: Permission.MANAGE_SETUP (authz.py:42-44). _guarded_mutation([('season', id)], ...) (server.py:4426-4445); service.py:1858-1859")),
     RouteSpec("POST", r"^/api/v2/setup/seasons/[^/]+/roll-forward$",
               "/api/v2/setup/seasons/{}/roll-forward",
               "post_v2_setup_seasons_id_roll_forward", "_handle_setup_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='cross',
               note=("#202: Permission.MANAGE_SETUP (authz.py:42-44). _guarded_create('registration', [('season', to_id), ('season', from_id, 'program')], ...) (server.py:4413-4425); service.py:2189 registration in _CREATE_TWO_AXIS (the from_season_id parent is narrowed to a Program-only comparison per its 'program' rule tag, but the create's own axis class stays two-axis)")),
     RouteSpec("POST", r"^/api/v2/setup/seasons/[^/]+/team-registrations$",
               "/api/v2/setup/seasons/{}/team-registrations",
               "post_v2_setup_seasons_id_team_registrations",
               "_handle_setup_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='cross',
               note=("#202: Permission.MANAGE_SETUP (authz.py:42-44, 'seasons/<id>/team-registrations') -- League Admin only. _guarded_create('registration', [('season', sid), ('team', tid), ('league', lid), ('division', did)], ...) (server.py:4263-4285); service.py:2188 registration in _CREATE_TWO_AXIS")),
     RouteSpec("POST", r"^/api/v2/setup/seasons/[^/]+/venue-access$",
               "/api/v2/setup/seasons/{}/venue-access",
               "post_v2_setup_seasons_id_venue_access", "_handle_setup_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='cross',
               note=("#202: Permission.MANAGE_SETUP (authz.py:51-52, 'seasons/<id>/venue-access'). _guarded_mutation([('season', id), ('venue', vid, 'grantable')], ...) (server.py:4352-4385); service.py:1858-1859 season in _SEASON_OWNED_TARGET_KINDS so the #409 preflight requires Program+Season. The Venue END is checked under the narrower 'grantable' facility-tree exception (service.py:1637-1678), not the generic ceiling -- a per-target RULE, not the mutation's overall axis class")),
     RouteSpec("POST", r"^/api/v2/setup/team$", "/api/v2/setup/team",
               "post_v2_setup_team", "_handle_setup_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='program',
               note=("#202: Permission.MANAGE_SETUP (authz.py:88-89, 'team' in _V2_SETUP_SETUP) -- League Admin only. NOT a _guarded_create: server.py:4538-4562 routes through _guarded_mutation([('league', league_id, 'active_program_league')], ...) instead -- #367's create-side League rule, 'the supplied League must belong to the caller's ACTIVE Program'. 'league' as a MUTATION target is in _PROGRAM_AXIS_TARGET_KINDS (service.py:1860-1862); the narrower predicate is service.py:1079 setup_league_in_active_program, dispatched at service.py:1678")),
     RouteSpec("POST", r"^/api/v2/setup/team/[^/]+/assign-club$",
               "/api/v2/setup/team/{}/assign-club",
               "post_v2_setup_team_id_assign_club", "_handle_reassign_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='program',
               note=("#202: Permission.MANAGE_SETUP (authz.py:33-34). targets = [('team', id), ('club', dest)] (server.py:4147-4148); service.py:1860-1862 team AND club both in _PROGRAM_AXIS_TARGET_KINDS || ORIGINAL: ""#202 repair root cause 1: one of TWO concrete "
                     "leaves for this entity (see assign-league below) -- "
@@ -2272,7 +2298,7 @@ REGISTRY = (
     RouteSpec("POST", r"^/api/v2/setup/team/[^/]+/assign-league$",
               "/api/v2/setup/team/{}/assign-league",
               "post_v2_setup_team_id_assign_league", "_handle_reassign_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='program',
               note=("#202: Permission.MANAGE_SETUP (authz.py:33-34). targets = [('team', id), ('league', dest)] (server.py:4153-4155), both in _PROGRAM_AXIS_TARGET_KINDS (service.py:1860-1862) so the #409 HTTP-boundary preflight requires only an explicit Program. NOTE the documented mid-transaction exception (server.py:4149-4155, service.py:1327-1361 _season_axis_guard): transfer_team_to_league's OWN transaction may discover, under its row locks, ACTIVE SeasonTeamRegistrations to rewrite, and at that instant the mutation becomes CROSS-AXIS and the two-axis rule is re-applied INSIDE the transaction. Data-dependent, not request-shape-dependent, so documented here rather than split into a second RouteSpec || ORIGINAL: ""#202 repair root cause 1: the other of the two "
                     "concrete leaves for this entity -- #283 Slice B, "
@@ -2281,7 +2307,7 @@ REGISTRY = (
     RouteSpec("POST", r"^/api/v2/setup/team/[^/]+/delete$",
               "/api/v2/setup/team/{}/delete", "post_v2_setup_team_id_delete",
               "_handle_setup_v2",
-              auth="operator_only",
+              auth="session+MANAGE_SETUP",
               scope_axis='program',
               note=("#202: Permission.MANAGE_SETUP (authz.py:74-82 default) -- League Admin only. _guarded_mutation([('team', id)], ...) (server.py:4446-4482); service.py:1860-1862 team in _PROGRAM_AXIS_TARGET_KINDS")),
     RouteSpec("POST", r"^/api/v2/setup/venue$", "/api/v2/setup/venue",
