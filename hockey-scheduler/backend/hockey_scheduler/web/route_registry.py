@@ -1,10 +1,15 @@
 """The RouteSpec inventory: one entry per live (method, path) the server
 dispatches (#202 step 1).
 
-INERT BY CONSTRUCTION. Nothing in ``server.py`` imports this module, and this
-step changes no response. The registry exists so the LATER steps of #202 have
-one declared place to enforce from, and so CI can already refuse two kinds of
-drift today:
+NO LONGER INERT (#202 wiring step). Through the routespec-inventory step
+nothing in ``server.py`` imported this module and no response could change as
+a result -- that was true then and is not true now: ``server.py`` imports
+``REGISTRY`` to build ``_GET_ROUTES``/``_POST_ROUTES``, the 405/Allow
+admission source (see server.py's own comment above their definition, and
+``tests/test_route_registry.py``'s ``KindClassificationTests`` for what makes
+that safe). The registry exists so LATER steps of #202 (full auth/schema/
+rate-limit enforcement) have one declared place to enforce from, and so CI
+already refuses two kinds of drift:
 
   UNCLASSIFIED — a live dispatch branch with no ``RouteSpec``
   DEAD         — a ``RouteSpec`` matching no live dispatch branch
@@ -38,10 +43,25 @@ Each spec carries BOTH
 
 What is NOT here
 ----------------
-* ``_GET_ROUTES`` / ``_POST_ROUTES`` / ``CONTEXT_SCOPED_READ_ROUTES`` in
-  ``server.py`` still exist and are still the code paths that run. This step
-  only CROSS-CHECKS them against this registry (see the gate); removing them is
-  a later step.
+* ``CONTEXT_SCOPED_READ_ROUTES`` in ``server.py`` still exists as a separate,
+  hand-maintained table and is still the code path that runs; this file only
+  CROSS-CHECKS it against this registry (see the gate). Rewiring it is
+  separate, later work (#202 enforcement) -- narrower in scope than this step.
+* ``_GET_ROUTES`` / ``_POST_ROUTES`` in ``server.py`` are NO LONGER a second
+  hand-maintained table (#202 wiring step): they are now derived directly from
+  ``REGISTRY`` at import time -- every ``kind="route"`` entry whose pattern is
+  scoped to ``/api/`` (see server.py's own comment above their definition for
+  the exact filter and why each exclusion reproduces this table's PRE-EXISTING
+  scope rather than silently widening it). ``RouteSpec.kind`` is therefore
+  LOAD-BEARING now, in a way the dispatch-vs-registry gate above does not
+  check (that gate compares ``(method, template)`` set membership only, never
+  ``kind``) -- see ``tests/test_route_registry.py``'s ``KindClassificationTests``
+  for the two structural invariants that close that gap: no ``kind="route"``
+  entry may carry a free-tail token (``{*}``/``{*0}`` -- that is exactly what
+  distinguishes a family/fallthrough/the static tail from a single concrete
+  leaf, #202 repair root cause 1's own lesson), and every non-``"route"``
+  entry is pinned by name so retagging even one is a conspicuous, reviewed
+  diff line, the same discipline ``_AUDIT_WAIVERS`` uses in route_extract.py.
 * ``auth`` and ``scope_axis`` are declared slots for that later work and are
   ``UNCLASSIFIED`` on every entry. They are deliberately NOT filled in with
   guesses: a half-populated policy field reads as authority and would be

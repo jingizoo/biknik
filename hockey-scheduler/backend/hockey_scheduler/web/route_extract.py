@@ -4,11 +4,19 @@ Why this exists
 ---------------
 ``server.py`` dispatches with hand-written ``if`` chains, and three separate
 hand-maintained tables (``_GET_ROUTES``, ``_POST_ROUTES``,
-``CONTEXT_SCOPED_READ_ROUTES``) transcribe parts of that dispatch. A registry
+``CONTEXT_SCOPED_READ_ROUTES``) transcribed parts of that dispatch. A registry
 checked against another hand-written list proves nothing: both are prose, both
 drift, and they drift silently the moment someone adds a branch. So the
 inventory's counterpart is the DISPATCH ITSELF, read out of the source with
 ``ast``.
+
+(#202 wiring step: ``_GET_ROUTES``/``_POST_ROUTES`` stopped being a second
+hand-maintained table -- server.py now derives them from ``route_registry.py``
+directly, closing the loop this module's own output feeds. That is precisely
+what this paragraph's original problem statement predicts should happen once
+the inventory this module produces is trustworthy enough to build on:
+``CONTEXT_SCOPED_READ_ROUTES`` is the one still hand-transcribed, separately,
+today.)
 
 What "live route" means here
 ----------------------------

@@ -11,10 +11,19 @@ adding a route without registering it fails, and registering a route that was
 deleted fails. See ``test_route_extract.py`` for the extractor's own proof that
 it finds every branch shape and refuses the ones it cannot read.
 
-The three hand-maintained tables in ``server.py`` (``_GET_ROUTES``,
-``_POST_ROUTES``, ``CONTEXT_SCOPED_READ_ROUTES``) are CROSS-CHECKED here and
-otherwise left exactly as they are: replacing them is a later step of #202, and
-this one changes no behaviour.
+``CONTEXT_SCOPED_READ_ROUTES`` in ``server.py`` is still a separate,
+hand-maintained table, CROSS-CHECKED here and otherwise left exactly as it is
+-- rewiring it is separate, later #202 work (enforcement, not admission).
+
+``_GET_ROUTES``/``_POST_ROUTES`` were the same kind of hand-maintained table
+through the #202 routespec-inventory step; the #202 WIRING step replaced
+their SOURCE with a live derivation from this registry (every ``kind="route"``
+entry scoped to ``/api/`` -- see server.py's own comment), so what this file
+checks for them now is that the derivation still reproduces their exact
+PRE-EXISTING scope (``MethodTableNarrowingTests`` below), plus two structural
+invariants ``kind`` itself needs now that it is load-bearing
+(``KindClassificationTests``) -- not that a hand-written list happens to agree
+with the parser, which was the old question and no longer applies.
 """
 
 import re
@@ -119,13 +128,19 @@ class RegistryInternalConsistencyTests(unittest.TestCase):
                   if s.auth != UNCLASSIFIED or s.scope_axis != UNCLASSIFIED]
         self.assertEqual(filled, [])
 
-    def test_the_registry_is_inert(self):
-        """server.py must not import the registry in this step.
+    def test_the_registry_is_now_wired_not_inert(self):
+        """server.py DOES import the registry now -- the #202 wiring step.
 
-        This is what makes "no behaviour change" checkable rather than claimed:
-        an inventory nothing reads cannot alter a single response.
+        Through the routespec-inventory step this test asserted the OPPOSITE
+        (``assertNotIn``): that nothing read the registry, which is what made
+        "no behaviour change" checkable rather than claimed for THAT step.
+        The wiring step's whole point is to stop that being true -- RouteSpec
+        is now the 405/Allow admission source (server.py's ``_GET_ROUTES``/
+        ``_POST_ROUTES``) -- so what is worth pinning now is that the import
+        is real and did not quietly get reverted, not that it is absent.
         """
-        self.assertNotIn("route_registry", SERVER_PATH.read_text())
+        self.assertIn("from .route_registry import REGISTRY",
+                      SERVER_PATH.read_text())
 
 
 class DispatchHasNoDeadBranchesTests(unittest.TestCase):
@@ -141,8 +156,11 @@ class DispatchHasNoDeadBranchesTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# Cross-checks against the three hand-maintained tables (#202: assertions       #
-# only — this step does NOT rewire or delete them).                            #
+# Cross-checks against server.py's three method/scope tables. Assertions      #
+# only -- none of this rewires or deletes them; ``_GET_ROUTES``/              #
+# ``_POST_ROUTES`` are already wired (they ARE a REGISTRY derivation, see     #
+# server.py), ``CONTEXT_SCOPED_READ_ROUTES`` still is not (separate, later    #
+# #202 work).                                                                 #
 # --------------------------------------------------------------------------- #
 TABLES = (("_GET_ROUTES", srv._GET_ROUTES, "GET"),
           ("_POST_ROUTES", srv._POST_ROUTES, "POST"),
@@ -197,29 +215,35 @@ class TableCrossCheckTests(unittest.TestCase):
 class MethodTableNarrowingTests(unittest.TestCase):
     """The OTHER direction, pinned rather than asserted-correct.
 
-    ``_GET_ROUTES``/``_POST_ROUTES`` are deliberately narrower than the dispatch
-    in places, so "every route is in the table" is NOT true today and forcing it
-    would be a behaviour change. What must not happen is a NEW divergence
-    appearing unnoticed — for POST that is severe, because ``do_POST`` refuses
-    anything ``_supported_methods`` does not admit BEFORE the dispatch chain
-    runs, so a new POST branch missing from ``_POST_ROUTES`` is unreachable
-    code that answers 404.
+    ``_GET_ROUTES``/``_POST_ROUTES`` are deliberately narrower than the full
+    registry -- their own derivation filter (server.py: ``kind == "route"``
+    and the pattern scoped to ``/api/``) excludes some live routes on
+    purpose, so "every route is in the table" is NOT true today and forcing
+    it would be a behaviour change (#202 wiring step: proven byte-for-byte
+    via HTTP diffing that this exact narrowing survived the hand-written
+    table's replacement, not merely reasoned about). What must not happen is
+    a NEW divergence appearing unnoticed — for POST that is severe, because
+    ``do_POST`` refuses anything ``_supported_methods`` does not admit BEFORE
+    the dispatch chain runs, so a live POST branch whose spec stops being
+    admitted (e.g. by a ``kind`` retag -- see ``KindClassificationTests``) is
+    unreachable code that answers 404.
 
     So the current divergence is pinned exactly. Each entry below is a fact
-    about today's tables, not an endorsement.
+    about today's derivation filter, not an endorsement.
     """
 
     maxDiff = None
 
-    #: Live GET routes ``_GET_ROUTES`` does not list. Consequence: their
+    #: Live GET routes ``_GET_ROUTES`` does not admit. Consequence: their
     #: ``_supported_methods`` is empty, so ``OPTIONS`` on them answers 404
     #: instead of 204+Allow and a PUT/DELETE answers 404 instead of 405+Allow.
-    #: The static shells and /favicon.ico are outside that table's declared
-    #: scope; the four /calendar feeds are a REAL hole and are reported as a
-    #: finding of this step, not fixed here (no behaviour changes). ``/{*}``
-    #: (#202 repair root cause 6, the static tail) joins this set for the
-    #: same reason the shells do: static files are outside this table's
-    #: declared (API 405/Allow) scope, not a new hole.
+    #: The static shells, /favicon.ico, and the four /calendar feeds are all
+    #: excluded by the ``/api/`` prefix filter (kind="route", but not scoped
+    #: to /api/); the calendar hole is REAL and reported as a finding of the
+    #: #202 routespec-inventory step, not fixed here (no behaviour changes --
+    #: closing it is enforcement, separate later work). ``/{*}``/``/api/{*0}``
+    #: would join this set too on prefix alone, but are ALSO excluded by
+    #: ``kind`` (static/fallthrough, never "route") -- belt and suspenders.
     GET_NOT_IN_TABLE = {
         "", "/", "/favicon.ico", "/mobile", "/mobile/", "/setup", "/setup/",
         "/api/{*0}", "/{*}",
@@ -227,19 +251,22 @@ class MethodTableNarrowingTests(unittest.TestCase):
         "/calendar/player/{}.ics", "/calendar/team/{}.ics",
     }
 
-    #: Live POST branches ``_POST_ROUTES`` does not admit as written.
+    #: Live POST branches ``_POST_ROUTES`` does not admit.
     #:
     #: #202 repair root cause 1: this set SHRANK from 12 entries to 1. The 12
     #: assign-\w+ WILDCARD templates that used to be here are gone -- they
     #: were never real leaves, and their replacement (the 13 CONCRETE combo
-    #: templates _handle_reassign's own schema admits) are already listed
-    #: EXACTLY, one for one, in ``_POST_ROUTES`` -- proof, independent of this
-    #: registry, that the concrete leaves (and not the wildcard) were always
-    #: the intended reachable set: whoever wrote the 405 table by hand had
+    #: templates _handle_reassign's own schema admits) are all kind="route"
+    #: and /api/-scoped, so the #202 wiring step's derivation admits them
+    #: automatically -- proof, independent of this registry, that the
+    #: concrete leaves (and not the wildcard) were always the intended
+    #: reachable set: whoever wrote the ORIGINAL 405 table by hand had
     #: already worked out the real combos, and the OLD registry disagreed
     #: with its own neighbour table without either side ever being checked
-    #: against the other. Only the games family remains: it matches any
-    #: subpath (the real actions are listed individually as their own specs).
+    #: against the other. Only the games family remains excluded, now by
+    #: ``kind == "family"`` rather than simply not being hand-transcribed: it
+    #: matches ANY subpath, including nonexistent ones (the real actions are
+    #: each their own kind="route" spec, and each IS admitted).
     POST_NOT_IN_TABLE = {
         "/api/games/{}/{*}",
     }
@@ -262,13 +289,78 @@ class MethodTableNarrowingTests(unittest.TestCase):
 
         ``_supported_methods`` sees no methods for a live ICS feed path, which
         is why ``OPTIONS``/``PUT`` on it answer 404 rather than 204/405. Pinned
-        so the day someone lists /calendar in _GET_ROUTES, this test tells them
-        the hole is closed instead of silently passing.
+        so the day someone widens the ``/api/`` prefix filter (or otherwise
+        starts admitting ``/calendar/...``) in server.py's ``_GET_ROUTES``,
+        this test tells them the hole is closed instead of silently passing.
         """
         feed = sample_path("/calendar/team/{}.ics")
         self.assertFalse(any(rx.match(feed) for rx in srv._GET_ROUTES))
         self.assertTrue(any(re.compile(spec.pattern).match(feed)
                             for spec in REGISTRY if spec.method == "GET"))
+
+
+class KindClassificationTests(unittest.TestCase):
+    """#202 wiring step, go-beyond finding: ``kind`` is now LOAD-BEARING.
+
+    server.py's ``_GET_ROUTES``/``_POST_ROUTES`` admit exactly the
+    ``kind == "route"`` specs (scoped to ``/api/``) -- but
+    ``RegistryCoversTheDispatchTests`` above only ever compares ``(method,
+    template)`` SET MEMBERSHIP between the registry and the live dispatch; it
+    never looks at ``kind``. So retagging a genuine concrete leaf from
+    ``"route"`` to ``"static"``/``"fallthrough"``/``"family"`` -- or the
+    reverse, retagging the games family or the static tail TO ``"route"`` --
+    would sail through every existing test in this file: the (method,
+    template) key is unchanged, only its ``kind`` moved, and nothing checked
+    that. The live consequence is real either way: mistag a concrete POST
+    leaf as non-"route" and it silently stops being admitted (a 405/Allow
+    regression, exactly the shape ``MethodTableNarrowingTests`` pins for the
+    entries that ARE deliberately excluded); mistag ``post_games_id_action``
+    (or the static tail) TO "route" and ``_GET_ROUTES``/``_POST_ROUTES``
+    would over-claim every path under it, including nonexistent game actions
+    and every static path on the wire -- the OPPOSITE failure from the one
+    #202's post-merge review found (a wildcard silently standing in for a
+    finite set), and just as invisible to the dispatch-vs-registry gate.
+
+    These two invariants close that gap independently of the hand-typed
+    label itself.
+    """
+
+    #: Every non-``"route"`` RouteSpec, pinned by (method, name, kind) --
+    #: exactly like ``_AUDIT_WAIVERS`` in route_extract.py, retagging one is
+    #: now a conspicuous, reviewed diff line instead of a silent set-member
+    #: move nothing here would otherwise notice.
+    NON_ROUTE_KINDS = {
+        ("GET", "get_empty_path", "static"),
+        ("GET", "get_index", "static"),
+        ("GET", "get_api_unmatched", "fallthrough"),
+        ("GET", "get_mobile_shell", "static"),
+        ("GET", "get_mobile_shell_slash", "static"),
+        ("GET", "get_setup_shell", "static"),
+        ("GET", "get_setup_shell_slash", "static"),
+        ("GET", "get_static_tail", "static"),
+        ("POST", "post_games_id_action", "family"),
+    }
+
+    def test_every_non_route_kind_is_exactly_the_pinned_set(self):
+        actual = {(s.method, s.name, s.kind) for s in REGISTRY
+                 if s.kind != "route"}
+        self.assertEqual(actual, self.NON_ROUTE_KINDS)
+
+    def test_no_route_kind_spec_carries_a_free_tail_token(self):
+        """A free, unbounded tail (``{*}``/``{*0}``) is exactly what makes a
+        family/fallthrough/the static tail NOT a single concrete leaf --
+        #202 repair root cause 1's own lesson, that a wildcard is not a real
+        route on its own. Every entry that carries one today IS one of the
+        three non-"route" kinds (this is what makes them non-"route" in the
+        first place); this pins the converse too, mechanically, independent
+        of ``kind`` -- so a future ``kind="route"`` spec that reintroduces a
+        free tail (which WOULD be silently admitted and over-claim every
+        path under it) fails here even if someone forgets to update
+        ``NON_ROUTE_KINDS`` at all.
+        """
+        offenders = [spec.name for spec in REGISTRY if spec.kind == "route"
+                    and ("{*}" in spec.template or "{*0}" in spec.template)]
+        self.assertEqual(offenders, [])
 
 
 if __name__ == "__main__":  # pragma: no cover
