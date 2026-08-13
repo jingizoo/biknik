@@ -772,6 +772,19 @@ class SetupService:
         return season_guard.season_is_historical(
             season, self.clock() if now is None else now)
 
+    def season_is_read_only(self, season) -> bool:
+        """Does this Season refuse writes? — the service-layer entry point to
+        :func:`season_guard.season_is_read_only`, the SAME predicate
+        ``_require_active_season`` refuses on.
+
+        Sits beside ``season_is_historical`` and is deliberately not it: this
+        one takes no clock, because an elapsed ``end_date`` makes a Season
+        history to READ but does not make it read-only to WRITE. Exposed so a
+        read that ADVERTISES the refusal (``get_setup_hierarchy_v2``'s per-Season
+        ``read_only``) is answered by the refusal's own authority instead of by
+        a second copy of the expression."""
+        return season_guard.season_is_read_only(season)
+
     def _lock_league_for_binding(self, league_id: str) -> League:
         """Row-lock an existing permanent League before binding it to a Season
         (#159 concurrency). This establishes the FIRST half of the canonical
