@@ -48,6 +48,7 @@ built to be safe on a cluster that is NOT disposable:
 import os
 import unittest
 import uuid
+from urllib.parse import urlsplit, urlunsplit
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
@@ -61,6 +62,36 @@ PG = os.environ.get("TEST_DATABASE_URL")
 ASCII_DB = f"hs_ascii_probe_{uuid.uuid4().hex[:16]}"
 
 
+def _with_database(url, dbname):
+    """``url`` pointed at ``dbname``, with every other connection parameter
+    left exactly as it was.
+
+    The database name is the URL's PATH segment, and it is the only part that
+    may be rewritten. A libpq URL can ALSO carry connection parameters in a
+    query string, and those routinely contain slashes: the socket form
+    ``postgresql://hockey@/hockey?host=/tmp&port=55643`` is what a local
+    ``initdb``/``pg_ctl`` cluster produces and what ``psql -h /tmp`` speaks.
+
+    Splitting the whole URL on its last ``/`` — as this fixture originally did
+    — cuts inside ``host=/tmp`` on that form and yields
+    ``postgresql://hockey@/hockey?host=/hs_ascii_probe_…``: the probe database
+    name becomes a socket DIRECTORY, the port disappears with the rest of the
+    truncated query string, and all four tests below ERROR on a connection
+    failure that has nothing to do with #405. Split the URL structurally
+    instead, so anything after ``?`` is carried through untouched.
+    """
+    return urlunsplit(urlsplit(url)._replace(path="/" + dbname))
+
+
+def _database_of(url):
+    """The database ``url`` names — its path segment, and nothing else.
+
+    ``?host=/tmp`` is a connection parameter, not a path, so anything that
+    reads the database name off the END of the string reads that instead.
+    """
+    return urlsplit(url).path.strip("/")
+
+
 @unittest.skipUnless(PG, "PostgreSQL required (set TEST_DATABASE_URL)")
 class SqlAsciiEncodingTest(unittest.TestCase):
     """A SQL_ASCII database must behave like any other."""
@@ -71,10 +102,12 @@ class SqlAsciiEncodingTest(unittest.TestCase):
     def setUpClass(cls):
         import psycopg
         cls.psycopg = psycopg
-        base = PG.rstrip("/")
-        cls.admin_url = base
-        cls.ascii_url = base.rsplit("/", 1)[0] + "/" + ASCII_DB
-        with psycopg.connect(base, autocommit=True) as c:
+        # Both URLs go through the same structural rewrite: it is what keeps
+        # the probe out of the connection parameters, and it also normalises
+        # away a trailing slash that would otherwise land in the database name.
+        cls.admin_url = _with_database(PG, _database_of(PG))
+        cls.ascii_url = _with_database(PG, ASCII_DB)
+        with psycopg.connect(cls.admin_url, autocommit=True) as c:
             row = c.execute(
                 "SELECT rolsuper OR rolcreatedb AS may_create FROM pg_roles "
                 "WHERE rolname = current_user").fetchone()
@@ -169,6 +202,63 @@ class SqlAsciiEncodingTest(unittest.TestCase):
         self.assertEqual(
             before, after,
             "constructing a second store re-applied migrations")
+
+
+class ProbeUrlConstructionTest(unittest.TestCase):
+    """The probe URL must name the probe DATABASE, on every URL form libpq
+    accepts.
+
+    Pure string work, so — unlike the fixture it serves — this runs everywhere,
+    with or without a PostgreSQL server. It has to: the defect it pins made all
+    four tests above ERROR rather than fail, which reads like a broken
+    environment rather than a bug in this file, and it struck only the people
+    whose ``TEST_DATABASE_URL`` used the socket form. On a TCP URL the old
+    last-slash split happened to be right, so ``test_a_tcp_url_…`` alone would
+    pass against the unfixed code and prove nothing; ``test_a_socket_url_…`` is
+    the one that fails against it, and the TCP case is here to pin that the fix
+    did not trade one form for the other.
+    """
+
+    # The two shapes a local cluster hands out: a UNIX socket (what `initdb`
+    # + `pg_ctl -k /tmp` and most run-it-yourself setups produce) and TCP.
+    SOCKET = "postgresql://hockey@/hockey_415?host=/tmp&port=55643"
+    TCP = "postgresql://hockey@127.0.0.1:55643/hockey_415"
+
+    def test_a_socket_url_keeps_its_connection_parameters(self):
+        """THE REGRESSION. Splitting on the last ``/`` cut inside ``host=/tmp``
+        and produced ``postgresql://hockey@/hockey_415?host=/probe`` — a socket
+        directory named after the database, on the default port, against the
+        original database."""
+        self.assertEqual(
+            _with_database(self.SOCKET, "probe"),
+            "postgresql://hockey@/probe?host=/tmp&port=55643")
+
+    def test_a_tcp_url_still_gets_its_database_replaced(self):
+        self.assertEqual(
+            _with_database(self.TCP, "probe"),
+            "postgresql://hockey@127.0.0.1:55643/probe")
+
+    def test_the_database_name_is_read_from_the_path_not_the_tail(self):
+        """What the admin URL is normalised with. The socket form's tail is
+        ``/tmp`` — a directory, not a database."""
+        self.assertEqual(_database_of(self.SOCKET), "hockey_415")
+        self.assertEqual(_database_of(self.TCP), "hockey_415")
+        self.assertEqual(_database_of(self.TCP + "/"), "hockey_415")
+
+    def test_libpq_reads_the_rewritten_urls_the_way_this_module_intends(self):
+        """String equality above asserts what WE think those URLs mean; this
+        asserts what the driver thinks, which is the part that actually
+        decides whether the fixture connects."""
+        try:
+            from psycopg.conninfo import conninfo_to_dict
+        except ImportError:                      # driver optional for the rest
+            raise unittest.SkipTest("psycopg is not installed")
+        for url, host in ((self.SOCKET, "/tmp"), (self.TCP, "127.0.0.1")):
+            with self.subTest(url=url):
+                info = conninfo_to_dict(_with_database(url, "probe"))
+                self.assertEqual(info.get("dbname"), "probe")
+                self.assertEqual(info.get("host"), host)
+                self.assertEqual(info.get("port"), "55643")
 
 
 if __name__ == "__main__":
