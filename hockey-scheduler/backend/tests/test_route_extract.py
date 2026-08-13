@@ -585,6 +585,388 @@ class StaticTailTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# #202 repair round 2, finding A: _propagates_taint's per-Call loop used to    #
+# return False -- silently "not tainted" -- for the WHOLE expression the       #
+# instant ANY unlisted call appeared anywhere in it, with no regard for        #
+# whether that call's own receiver/arguments still carried a tracked name.     #
+# A local bound this way never joined `tracked`, so the `if` that actually     #
+# decided the route was invisible to the completeness scan: no route, no       #
+# raise. Three concrete, reproduced escapes, plus proof the fix is a GENERAL   #
+# rule (an unbounded family of shapes, not 3 hardcoded patterns) that still    #
+# does not flag a value legitimately handed to an unrelated call.              #
+# --------------------------------------------------------------------------- #
+class UnlistedCallTaintDetachmentTests(unittest.TestCase):
+    def _raises(self, body, *substrings):
+        with self.assertRaises(ExtractionError) as caught:
+            extract_routes(_module(body))
+        msg = str(caught.exception)
+        for s in substrings:
+            self.assertIn(s, msg)
+
+    def test_next_over_a_genexpr_bound_then_tested_truthy_raises(self):
+        """``found = next((r for r in KNOWN if r == path), None)`` then
+        ``if found:`` -- a routing decision (compare path against a known
+        set) spelled as a generator lookup instead of ``path in (...)``.
+        ``next`` is a bare-name call (``func`` isn't even an ``ast.Attribute``),
+        so the OLD code's ``isinstance(func, ast.Attribute)`` check failed
+        immediately and silently returned "not tainted" without ever looking
+        inside the generator's own condition."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                found = next((r for r in ("/api/evade-next-1",
+                                          "/api/evade-next-2")
+                             if r == path), None)
+                if found:
+                    return self._send(1)
+        ''', "unlisted call")
+
+    def test_index_in_try_except_used_as_a_sentinel_raises(self):
+        """``.index()`` raising ``ValueError`` as control flow: a decision
+        variable produced inside ``try``/``except``, tested afterwards."""
+        self._raises('''
+            KNOWN = ("/api/evade-index-1", "/api/evade-index-2")
+
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                try:
+                    which = KNOWN.index(path)
+                except ValueError:
+                    which = -1
+                if which >= 0:
+                    return self._send(1)
+        ''', "unlisted call")
+
+    def test_getattr_indirect_dispatch_raises(self):
+        """``getattr(self, computed_name, None)`` used to obtain and invoke a
+        handler indirectly -- doubly invisible under the old code: the
+        ``getattr`` call itself is a bare-name call (trips the same
+        immediate "not tainted" return as ``next``), and even a tainted
+        result would not have matched the separate "unknown dispatch
+        helper" check, which only pattern-matches literal
+        ``self.<name>(...)`` attribute calls, never a call through a
+        variable."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                suffix = path.rsplit("/", 1)[-1]
+                handler_name = "_handle_evade_" + suffix
+                handler = getattr(self, handler_name, None)
+                if handler:
+                    return handler()
+
+            def _handle_evade_target(self):
+                return self._send(1)
+        ''', "unlisted call")
+
+    def test_general_unlisted_call_shapes_all_raise(self):
+        """The gap is unbounded, not 3 specific shapes: every construct the
+        finding names as "equally unmodelled and equally silent" -- .count(),
+        a generic dict.get() (not the recognised inline-dict/tuple-dict
+        forms), sorted() wrapping a comprehension, str.format_map(), and an
+        arbitrary project-local helper function -- must ALSO raise, proving
+        the fix is a rule about unlisted calls in general, not a lookup
+        table of the 3 reproduced cases."""
+        shapes = {
+            # NOTE: `.count()` bound to a local first, then tested -- NOT
+            # `if path.count(...):` directly, which a DIFFERENT, pre-existing
+            # mechanism already raises on (_classify's own "unsupported
+            # method count() on dispatch subject" check for a method call
+            # used AS an if-test). Binding it to a local is what actually
+            # exercises _propagates_taint's new check, same as the 3
+            # reproduced escapes (each also binds to a local before testing).
+            "dot_count": '''
+                def do_GET(self):
+                    path = self.path.split("?", 1)[0]
+                    n = path.count("/api/evade-count")
+                    if n:
+                        return self._send(1)
+            ''',
+            "generic_dict_get": '''
+                _ROUTE_KIND = {"/api/evade-dictget": "special"}
+
+                def do_GET(self):
+                    path = self.path.split("?", 1)[0]
+                    kind = _ROUTE_KIND.get(path)
+                    if kind == "special":
+                        return self._send(1)
+            ''',
+            "sorted_over_comprehension": '''
+                def do_GET(self):
+                    path = self.path.split("?", 1)[0]
+                    matches = sorted(p for p in ("/api/evade-sorted",)
+                                     if p == path)
+                    if matches:
+                        return self._send(1)
+            ''',
+            "str_format_map": '''
+                def do_GET(self):
+                    path = self.path.split("?", 1)[0]
+                    s = "{x}".format_map({"x": path})
+                    if s == "/api/evade-formatmap":
+                        return self._send(1)
+            ''',
+            "arbitrary_helper_function": '''
+                def _looks_like_evade(p):
+                    return p == "/api/evade-helper"
+
+                def do_GET(self):
+                    path = self.path.split("?", 1)[0]
+                    hit = _looks_like_evade(path)
+                    if hit:
+                        return self._send(1)
+            ''',
+        }
+        for name, body in shapes.items():
+            with self.subTest(shape=name):
+                self._raises(body, "unlisted call")
+
+    def test_captured_group_handed_inline_to_a_service_does_not_raise(self):
+        """The legitimate case, spelled the way the real ``_dispatch_get``
+        spells it: a captured group hand-delivered straight into a service
+        call, never bound to a local first. Mirrors
+        ``ics = api.calendar_feed_ics(cal.group(1))`` from
+        ``_propagates_taint``'s own docstring -- must NOT raise merely
+        because the extraction is inline instead of pre-bound."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                cal = re.match(r"^/calendar/(team|division)/([^/]+)\\.ics$",
+                              path)
+                if cal:
+                    ics = api.calendar_feed_ics(cal.group(1), cal.group(2))
+                    if ics is None:
+                        return self._send_json({"error": "not_found"}, 404)
+                    return self._send_ics(ics)
+        '''))}
+        self.assertEqual(found, {("GET", "/calendar/team/{}.ics"),
+                                 ("GET", "/calendar/division/{}.ics")})
+
+    def test_path_property_handed_to_an_unrelated_lookup_does_not_raise(self):
+        """Mirrors the real ``_serve_static``'s
+        ``CONTENT_TYPES.get(target.suffix, "application/octet-stream")``:
+        ``target`` is legitimately tracked (#202 repair root cause 2 --
+        pathlib reshaping IS still the path), but ``.suffix`` is a lossy,
+        narrow EXTRACTION (the pathlib analogue of a captured regex group),
+        and handing it to an unrelated content-type table is not a routing
+        decision. This is the over-broad failure mode the round 2 fix must
+        NOT reintroduce."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                return self._serve_static(path)
+
+            def _serve_static(self, path):
+                if path in ("/shell", "/shell/"):
+                    rel = "shell.html"
+                target = (STATIC_DIR / rel).resolve()
+                ctype = CONTENT_TYPES.get(target.suffix, "application/octet-stream")
+                return ctype
+        '''))}
+        self.assertEqual(found, {("GET", "/shell"), ("GET", "/shell/")})
+
+    def test_path_consuming_method_does_not_raise(self):
+        """Mirrors the real ``_serve_static``'s ``data = target.read_bytes()``:
+        a Path method that CONSUMES an already-resolved location to produce
+        something wholly unrelated (file content), not another Path. Not the
+        same list as the Path-reshaping ``_PATH_METHODS`` (those still
+        return a Path); this is the pathlib analogue of a captured group,
+        the SAME "over-broad failure mode" guard as the property test above."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                return self._serve_static(path)
+
+            def _serve_static(self, path):
+                if path in ("/shell", "/shell/"):
+                    rel = "shell.html"
+                target = (STATIC_DIR / rel).resolve()
+                data = target.read_bytes()
+                return data
+        '''))}
+        self.assertEqual(found, {("GET", "/shell"), ("GET", "/shell/")})
+
+    def test_the_real_server_extracts_with_no_new_raises(self):
+        """The real server.py -- including ``_handle_reassign``'s
+        ``_REASSIGN_PARENTS.get(combo)``/``self._V1_SETUP_KIND.get(entity,
+        entity)``, ``_handle_setup``'s ``_to_v1.get(kind, lambda r: r)``, and
+        do_POST's blanket ``required_permission(path)``/``scope_violation(
+        ...)`` authorisation calls -- must still extract cleanly: each is a
+        reviewed, declared ``_AUDIT_WAIVERS`` entry, not a scoping hole."""
+        walker = extract_walker()
+        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(walker.unreachable, [])
+
+
+# --------------------------------------------------------------------------- #
+# #202 repair round 2, finding B: a `while` loop's own `.test` was invisible   #
+# to the completeness audit -- `_walk_stmt`'s (Try, With, For, While)          #
+# handling walks the BODY (so a route nested further inside is still found),   #
+# but neither that walk nor the audit's ast.walk scan (which matched only      #
+# ast.If/ast.IfExp) ever inspected the loop's own guard. A `while path ==      #
+# "/new-route":` produced ZERO routes and ZERO exceptions -- not even a raise. #
+# --------------------------------------------------------------------------- #
+class WhileLoopGuardTests(unittest.TestCase):
+    def test_a_while_guard_on_a_tracked_subject_raises(self):
+        """The exact reproduced shape: silent before the fix (no route, no
+        exception), must now raise loudly."""
+        with self.assertRaises(ExtractionError) as caught:
+            extract_routes(_module('''
+                def do_GET(self):
+                    path = self.path.split("?", 1)[0]
+                    while path == "/new-route":
+                        return self._send(1)
+            '''))
+        msg = str(caught.exception)
+        self.assertIn("while loop", msg)
+        self.assertIn("path", msg)
+
+    def test_an_untainted_while_guard_is_not_flagged(self):
+        """The SAME statement shape, but the loop condition does not touch a
+        tracked name -- must NOT raise (over-triggering would be a new
+        false-positive bug, not a fix), and a route nested inside the loop
+        body must still be found (the walker's own body-walk is unaffected
+        by this audit-only addition)."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                i = 0
+                while i < 3:
+                    if path == "/api/inside-while":
+                        return self._send(1)
+                    i += 1
+        '''))}
+        self.assertEqual(found, {("GET", "/api/inside-while")})
+
+    def test_the_real_server_has_no_while_loops_to_flag(self):
+        """server.py uses none today; the guard above is not vacuous only
+        because a synthetic fixture proves it fires when one exists."""
+        extract_routes()  # raises if the real file somehow grew one unaudited
+
+
+# --------------------------------------------------------------------------- #
+# #202 repair round 2, finding C: the existing unreachable-branch detector     #
+# only fires when a NESTED branch's subject is already narrowed by an          #
+# ENCLOSING alternation -- two top-level SIBLING branches narrow nothing, so   #
+# a second, identical-literal branch (dead code after the first's              #
+# unconditional return) claimed the same route with zero signal: ONE route     #
+# recorded, no trace a duplicate/dead branch ever existed.                     #
+# --------------------------------------------------------------------------- #
+class SiblingOverlapTests(unittest.TestCase):
+    def test_two_sibling_ifs_claiming_the_same_literal_raises(self):
+        """The exact reproduced shape: silent before the fix."""
+        with self.assertRaises(ExtractionError) as caught:
+            extract_routes(_module('''
+                def do_GET(self):
+                    path = self.path.split("?", 1)[0]
+                    if path == "/api/dup":
+                        return self._send(1)
+                    if path == "/api/dup":
+                        return self._send(2)
+            '''))
+        msg = str(caught.exception)
+        self.assertIn("ambiguous overlap", msg)
+        # Both locations named, per the fix's own requirement -- the
+        # duplicated test text appears twice: once for "this branch tests
+        # X", once for "already claimed by ... X".
+        self.assertIn("already claimed by", msg)
+        self.assertEqual(msg.count("path == '/api/dup'"), 2)
+
+    def test_duplicate_elif_arm_also_raises(self):
+        """An elif ARM sharing a literal with an earlier arm of the SAME
+        chain is the identical ambiguity, just spelled as `elif` instead of
+        a second top-level `if` -- elif arms must share the sibling scope,
+        not each get a fresh one."""
+        with self.assertRaises(ExtractionError) as caught:
+            extract_routes(_module('''
+                def do_GET(self):
+                    path = self.path.split("?", 1)[0]
+                    if path == "/api/a":
+                        return self._send(1)
+                    elif path == "/api/a":
+                        return self._send(2)
+            '''))
+        self.assertIn("ambiguous overlap", str(caught.exception))
+
+    def test_elif_chain_with_distinct_literals_is_not_flagged(self):
+        """The ordinary, non-ambiguous elif shape -- every arm tests a
+        DIFFERENT literal -- must keep working exactly as before."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if path == "/api/a":
+                    return self._send(1)
+                elif path == "/api/b":
+                    return self._send(2)
+        '''))}
+        self.assertEqual(found, {("GET", "/api/a"), ("GET", "/api/b")})
+
+    def test_overlap_is_not_ambiguous_when_the_first_body_falls_through(self):
+        """SCOPE guard, not incidental: two siblings may legitimately share
+        every claimed literal when the FIRST's body does not unconditionally
+        exit -- mirrors the real ``_handle_reassign_v2``'s ``if combo in
+        _V2_REASSIGN_SCHEMA:`` (returns only on a body-validation FAILURE,
+        falls through to ordinary control flow on success) followed by an
+        unrelated, independently-reachable ``dest = _V2_REASSIGN_DEST.get(
+        combo); if dest is not None:`` authorisation-target lookup that
+        happens to share every key. Flagging this pairing was a genuine
+        over-broad failure, found and closed by requiring the EARLIER
+        sibling's body to always exit before a later, overlapping claim
+        counts as provably dead."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if path == "/api/shared":
+                    log_something()
+                if path == "/api/shared":
+                    return self._send(1)
+        '''))}
+        self.assertEqual(found, {("GET", "/api/shared")})
+
+    def test_siblings_with_no_overlap_are_unaffected(self):
+        """Two ordinary, non-overlapping top-level ifs -- the common case
+        throughout server.py -- must be completely unaffected."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if path == "/api/a":
+                    return self._send(1)
+                if path == "/api/b":
+                    return self._send(2)
+        '''))}
+        self.assertEqual(found, {("GET", "/api/a"), ("GET", "/api/b")})
+
+    def test_the_same_literal_in_a_different_nested_scope_is_unaffected(self):
+        """The IDENTICAL literal, tested again inside a DIFFERENT enclosing
+        body (its own fresh sibling scope, one level down in a prefix
+        branch whose body the walker does not narrow the subject for) --
+        must NOT be flagged. This check is scoped to siblings sharing ONE
+        dispatch scope, not "the same literal anywhere in the function"."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if path == "/api/shared-literal":
+                    return self._send(1)
+                if path.startswith("/api/wrap/"):
+                    if path == "/api/shared-literal":
+                        return self._send(2)
+        '''))}
+        # The startswith() branch is itself a real (non-delegating) prefix
+        # route -- unrelated to this test's point, just the ordinary "prefix"
+        # shape -- alongside the literal claimed identically in both scopes.
+        self.assertEqual(found, {("GET", "/api/shared-literal"),
+                                 ("GET", "/api/wrap/{*0}")})
+
+    def test_the_real_server_has_no_ambiguous_sibling_overlaps(self):
+        """server.py has none today -- including the _handle_reassign_v2
+        schema/dest-lookup pairing above, which shares every key but is not
+        ambiguous. Not vacuous: the earlier tests prove the check fires."""
+        walker = extract_walker()
+        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(walker.unreachable, [])
+
+
+# --------------------------------------------------------------------------- #
 # INVENTED evasions -- not named in the #202 repair review, found by trying to #
 # defeat the finished gate the same way the review's own examples do.         #
 # --------------------------------------------------------------------------- #

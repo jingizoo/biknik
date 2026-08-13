@@ -724,21 +724,32 @@ class _DispatchWalker:
         self._audit_function(fn, ctx)
 
     def _walk_body(self, body: list, ctx: _Ctx):
+        # A fresh sibling-overlap SCOPE per statement list (#202 repair round
+        # 2, finding C): every ast.If directly in THIS list -- and every
+        # elif arm continuing one of them, via _walk_terminal_else -- shares
+        # this one dict, so a LATER sibling claiming a template an EARLIER
+        # one already claimed is caught. A NESTED if's own body gets its own
+        # fresh scope from ITS OWN _walk_body call below, which is exactly
+        # what keeps this scoped to "siblings", not "anywhere in the
+        # function" -- the nested-unreachable detector already owns that.
+        scope = {}
         for stmt in body:
-            self._walk_stmt(stmt, ctx)
+            self._walk_stmt(stmt, ctx, scope)
 
-    def _walk_stmt(self, stmt, ctx: _Ctx):
+    def _walk_stmt(self, stmt, ctx: _Ctx, scope: dict):
         if isinstance(stmt, ast.Assign):
             self._record_binding(stmt, ctx)
         elif isinstance(stmt, ast.If):
-            self._walk_if(stmt, ctx)
+            self._walk_if(stmt, ctx, scope)
         elif isinstance(stmt, (ast.Try, ast.With, ast.For, ast.While)):
-            for attr in ("body", "orelse", "finalbody", "handlers"):
-                for sub in getattr(stmt, attr, []) or []:
-                    if isinstance(sub, ast.ExceptHandler):
-                        self._walk_body(sub.body, ctx)
-                    else:
-                        self._walk_stmt(sub, ctx)
+            # Each of body/orelse/finalbody is its OWN statement list -- walk
+            # it exactly as _walk_body would (own fresh sibling scope), not
+            # folded into this statement's enclosing scope: a `try:`'s body
+            # is a different dispatch scope than the code around the `try`.
+            for attr in ("body", "orelse", "finalbody"):
+                self._walk_body(getattr(stmt, attr, []) or [], ctx)
+            for handler in getattr(stmt, "handlers", []) or []:
+                self._walk_body(handler.body, ctx)
         elif isinstance(stmt, ast.Return) and stmt.value is not None:
             self._maybe_delegate(stmt.value, ctx)
         elif isinstance(stmt, ast.Expr):
@@ -1014,7 +1025,7 @@ class _DispatchWalker:
         return Alt(prefix, suffix, FREE)
 
     # -- branches ----------------------------------------------------------
-    def _walk_if(self, node: ast.If, ctx: _Ctx):
+    def _walk_if(self, node: ast.If, ctx: _Ctx, scope: dict):
         outcome = self._classify(node.test, ctx)
         if outcome is None:
             # Not a dispatch test (an auth guard, an error check, ...): its body
@@ -1061,6 +1072,8 @@ class _DispatchWalker:
             # constrained to shapes the test excludes. Dead dispatch code.
             self.unreachable.append(
                 (ctx.handler, node.lineno, ast.unparse(node.test)))
+        if templates:
+            self._check_sibling_overlap(scope, set(templates), node, ctx)
         for template in sorted(set(templates)):
             self._emit(ctx, template, outcome.shape, node.lineno, node.test)
         child = ctx.child()
@@ -1068,9 +1081,91 @@ class _DispatchWalker:
                 and outcome.shape != "prefix":
             child.bind_subject(outcome.subject, outcome.alts)
         self._walk_body(node.body, child)
-        self._walk_terminal_else(node, ctx, outcome)
+        self._walk_terminal_else(node, ctx, outcome, scope)
 
-    def _walk_terminal_else(self, node: ast.If, ctx: _Ctx, outcome: _Outcome):
+    def _check_sibling_overlap(self, scope: dict, templates: set,
+                               node: ast.If, ctx: _Ctx) -> None:
+        """#202 repair round 2, finding C: raise when a SIBLING branch --
+        not one NESTED inside another (the unreachable detector above
+        already owns that case) -- claims a template an EARLIER sibling in
+        the SAME dispatch scope already claimed, and that EARLIER sibling's
+        body ALWAYS EXITS (see :meth:`_body_always_exits`) -- i.e. THIS
+        branch is now provably dead code, exactly the reproduced shape:
+
+        Two top-level ``if path == "/x": return self._send(1)`` /
+        ``if path == "/x": return self._send(2)`` branches (the second
+        provably dead code, unreachable after the first's unconditional
+        return) used to produce ONE recorded route with no signal that a
+        second, duplicate/dead branch exists -- silent, because the
+        EXISTING unreachable detector only fires when a NESTED branch's
+        subject is already narrowed by an ENCLOSING alternation; two
+        top-level siblings narrow nothing, so their (identical) templates
+        computed cleanly and the second simply lost the ``self.routes``
+        ``setdefault`` race with no trace.
+
+        The "earlier body always exits" gate is deliberate, not incidental:
+        two siblings can legitimately share every key of a tuple-dict
+        without either being dead code, when the first's body does NOT
+        unconditionally exit -- the real ``_handle_reassign_v2`` has
+        exactly this shape (``if combo in _V2_REASSIGN_SCHEMA:`` validates
+        the body and only returns on FAILURE, falling through on success to
+        an unrelated, independently-reachable ``dest =
+        _V2_REASSIGN_DEST.get(combo); if dest is not None:`` authorisation-
+        target lookup that happens to share every key). Flagging that
+        pairing was a genuine over-broad failure, found and closed by this
+        gate -- overlap alone is not ambiguity; overlap where the second
+        claim can PROVABLY never be reached is.
+
+        ``scope`` is fresh per :meth:`_walk_body` call (and threaded through
+        an elif chain by :meth:`_walk_terminal_else`), so this only ever
+        compares branches AT THE SAME DECISION POINT, never unrelated
+        branches elsewhere in the function -- that breadth is deliberately
+        not this check's job.
+        """
+        for template in sorted(templates):
+            prior = scope.get(template)
+            if prior is None:
+                continue
+            prior_lineno, prior_test, prior_always_exits = prior
+            if not prior_always_exits:
+                continue
+            raise ExtractionError(
+                f"{ctx.handler}:{node.lineno} tests `{ast.unparse(node.test)}`, "
+                f"which claims {template!r} -- already claimed by "
+                f"{ctx.handler}:{prior_lineno}'s `{prior_test}` in the same "
+                "dispatch scope, whose body always exits, making this "
+                "branch unreachable. Two sibling branches claiming the "
+                "same route, the first provably dead-ending before the "
+                "second could ever run, is an ambiguous overlap (often "
+                "dead code after the first's unconditional return, or a "
+                "copy/paste mistake that meant to test something else) -- "
+                "resolve the duplication in server.py; a second, "
+                "unreachable claim on an already-claimed route must not "
+                "pass silently")
+        for template in templates:
+            scope.setdefault(
+                template, (node.lineno, ast.unparse(node.test),
+                          self._body_always_exits(node.body)))
+
+    @staticmethod
+    def _body_always_exits(body: list) -> bool:
+        """Does this branch's body unconditionally ``return``/``raise`` on
+        its last statement, so nothing textually after it in the SAME
+        statement list can ever run once this branch is entered?
+
+        Deliberately conservative -- a simple, common shape (the LAST
+        statement is a bare ``return``/``raise``), not full control-flow
+        reachability (e.g. an ``if``/``else`` where BOTH arms return is not
+        recognised). A false NEGATIVE here just leaves
+        :meth:`_check_sibling_overlap` silent for that shape -- no worse
+        than before finding C. A false POSITIVE would wrongly call live,
+        independently-reachable code "dead", which is the over-broad
+        failure this module's fail-closed checks must never produce.
+        """
+        return bool(body) and isinstance(body[-1], (ast.Return, ast.Raise))
+
+    def _walk_terminal_else(self, node: ast.If, ctx: _Ctx, outcome: _Outcome,
+                            scope: dict):
         """Walk ``node.orelse`` -- continuing an elif CHAIN when it is one,
         or, at the chain's true bottom, checking whether the terminal
         ``else`` is itself an IMPLICIT route (#202 repair root cause 6: the
@@ -1091,12 +1186,19 @@ class _DispatchWalker:
         """
         orelse = node.orelse
         if len(orelse) == 1 and isinstance(orelse[0], ast.If):
-            self._walk_if(orelse[0], ctx)
+            # An elif ARM continuing this chain shares the SAME sibling-
+            # overlap scope (#202 repair round 2, finding C) as the chain's
+            # earlier arms -- they are exactly the "siblings ... in the same
+            # dispatch scope" finding C means, just spelled as `elif`
+            # instead of a second top-level `if`. `_walk_body`'s call for
+            # `orelse` below (the chain's NON-elif tail) still gets its own
+            # fresh scope, same as any other nested body.
+            self._walk_if(orelse[0], ctx, scope)
             return
         self._walk_body(orelse, ctx)
         if outcome.shape not in ("literal", "literal-set") or not outcome.subject:
             return
-        if not self._else_rederives_subject(orelse, outcome.subject):
+        if not self._else_rederives_subject(orelse, outcome.subject, ctx.handler):
             return
         for base in ctx.subjects.get(outcome.subject, ()):
             if not base.is_free:
@@ -1114,10 +1216,10 @@ class _DispatchWalker:
             self._emit(ctx, template, "static-tail", node.lineno, node.test)
 
     @staticmethod
-    def _else_rederives_subject(orelse: list, subject: str) -> bool:
+    def _else_rederives_subject(orelse: list, subject: str, fn_name: str) -> bool:
         for stmt in orelse:
             if isinstance(stmt, ast.Assign) \
-                    and _propagates_taint(stmt.value, {subject}):
+                    and _propagates_taint(stmt.value, {subject}, fn_name):
                 return True
         return False
 
@@ -1523,6 +1625,19 @@ class _DispatchWalker:
         way the walker did not classify, or if it calls an unknown dispatch
         helper. This is what makes "the extractor sees every branch" checkable
         rather than hopeful."""
+        # Delegation/unknown-dispatch-helper calls are checked FIRST, before
+        # taint propagation runs (#202 repair round 2, finding A interaction):
+        # this check needs nothing but `self._followed` (fully populated by
+        # the walk, long before this audit runs) and is far more SPECIFIC
+        # than the generic "unlisted call touches a tracked name" check
+        # _propagates_taint now performs. An unfollowed delegate assigned to
+        # a local first (`answer = self._handle_setup(...)`) is BOTH "a
+        # delegation in a form the walker does not follow" AND "an unlisted
+        # call whose argument includes a tracked name" -- the former names
+        # the actual mistake and must win the race, not be pre-empted by the
+        # latter, coarser diagnosis merely because taint propagation happens
+        # to run its scan first.
+        self._audit_dispatch_helper_calls(fn)
         tracked = set(ctx.seen) | {"path"}
         # TAINT PROPAGATION. Any local bound from the path — directly, sliced,
         # or from another tainted local — joins the tracked set, so renaming it
@@ -1537,16 +1652,36 @@ class _DispatchWalker:
                 value = node.value
                 if value is None:
                     continue
-                derived = _propagates_taint(value, tracked)
-                if not derived:
-                    continue
                 targets = node.targets if isinstance(node, ast.Assign) \
                     else [node.target]
-                for target in targets:
-                    for leaf in ast.walk(target):
-                        if isinstance(leaf, ast.Name) and leaf.id not in tracked:
-                            tracked.add(leaf.id)
-                            changed = True
+                leaves = [leaf for target in targets
+                         for leaf in ast.walk(target)
+                         if isinstance(leaf, ast.Name)]
+                if leaves and all(leaf.id in tracked for leaf in leaves):
+                    # Every name this assignment binds is ALREADY tracked --
+                    # almost always because _record_binding's own richer,
+                    # ctx-aware recognisers (a regex match, a `{...}.get()`,
+                    # a tuple-dict lookup, a direct `m.group(K)` call, ...)
+                    # classified it as a proper dispatch subject during the
+                    # walk, well before this audit runs (ctx.seen is fully
+                    # populated by then). Nothing to learn by re-deriving a
+                    # coarse yes/no from the bare syntax here -- and (#202
+                    # repair round 2, finding A) _propagates_taint's own
+                    # unlisted-call check now RAISES on exactly these shapes
+                    # (`re.match(...)`, `{...}.get(subject)`,
+                    # `SCHEMA.get(combo)`) examined in isolation, precisely
+                    # BECAUSE it cannot see the richer, ctx-aware reasoning
+                    # that already cleared them. Skip re-deriving what
+                    # _record_binding already resolved rather than force
+                    # this coarse, flat-namespace check to duplicate it.
+                    continue
+                derived = _propagates_taint(value, tracked, fn.name)
+                if not derived:
+                    continue
+                for leaf in leaves:
+                    if leaf.id not in tracked:
+                        tracked.add(leaf.id)
+                        changed = True
         for node in ast.walk(fn):
             if isinstance(node, ast.If) and id(node) not in self._classified:
                 names = _direct_operand_names(node.test)
@@ -1581,6 +1716,34 @@ class _DispatchWalker:
                         f"{fn.name}:{node.lineno} a ternary tests dispatch "
                         f"subject(s) {sorted(hit)} -- route_extract does not "
                         "model ternaries; rewrite as if/elif")
+            if isinstance(node, ast.While):
+                # #202 repair round 2, finding B: `_walk_stmt`'s own
+                # (Try, With, For, While) handling walks a `while` loop's
+                # BODY (so a route nested further inside one is still
+                # found), but neither that walk nor this scan (which, until
+                # now, only matched ast.If/ast.IfExp) ever looked at the
+                # loop's OWN `.test` -- a `while path == "/new-route":`
+                # guard produced ZERO recorded routes and ZERO exceptions,
+                # DEMONSTRATED. Same shape as the ast.If case above, just a
+                # different statement type; goes through the SAME waivers
+                # (none needed today -- server.py has no `while` at all).
+                names = _direct_operand_names(node.test)
+                hit = names & tracked
+                if hit and (fn.name, ast.unparse(node.test)) in _AUDIT_WAIVERS:
+                    continue
+                if hit:
+                    raise ExtractionError(
+                        f"{fn.name}:{node.lineno} a while loop tests "
+                        f"dispatch subject(s) {sorted(hit)} in an "
+                        f"unrecognised shape: {ast.unparse(node.test)}")
+
+    def _audit_dispatch_helper_calls(self, fn: ast.FunctionDef) -> None:
+        """Raise if ``fn`` calls an uncatalogued ``_handle_*``/``_dispatch_*``
+        helper, or a catalogued one in a statement form :meth:`_maybe_delegate`
+        does not follow. See :meth:`_audit_function` for why this runs before
+        taint propagation rather than alongside the ``If``/``IfExp`` scan.
+        """
+        for node in ast.walk(fn):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
                     and isinstance(node.func.value, ast.Name) \
                     and node.func.value.id == "self":
@@ -1607,15 +1770,19 @@ class _DispatchWalker:
                         "in a form the walker does not follow")
 
 
-# Branches that DECIDE ON a path-derived name but are not routing decisions.
+# Branches (or, since #202 repair round 2 finding A, unlisted CALLS reached
+# while auditing an assignment for taint propagation) that DECIDE ON a
+# path-derived name but are not routing decisions.
 #
-# Fail-closed is the rule: an unrecognised test on a dispatch subject stops the
-# build. These are the declared exceptions — each one reviewed, each one a
-# visible line in the diff. Adding a waiver is deliberately as conspicuous as
-# adding a route, because a waiver is how the gate would be quietly defeated.
+# Fail-closed is the rule: an unrecognised test -- or, now, an unrecognised
+# call consuming a tracked name -- stops the build. These are the declared
+# exceptions — each one reviewed, each one a visible line in the diff. Adding
+# a waiver is deliberately as conspicuous as adding a route, because a waiver
+# is how the gate would be quietly defeated.
 #
-# Keyed by (function name, the exact unparsed test). A drifted test no longer
-# matches its waiver and raises again, which is the intended behaviour.
+# Keyed by (function name, the exact unparsed test OR call expression). A
+# drifted test/expression no longer matches its waiver and raises again,
+# which is the intended behaviour.
 _AUDIT_WAIVERS = {
     ("_serve_static",
      "STATIC_DIR not in target.parents or not target.is_file()"):
@@ -1639,6 +1806,57 @@ _AUDIT_WAIVERS = {
         "route_registry.py's post_v2_setup_<entity>_id_delete specs); this "
         "ternary only reshapes the response for one of those already-"
         "enumerated leaves",
+    ("_handle_reassign", "_REASSIGN_PARENTS.get(combo)"):
+        "#202 repair round 2 finding A -- a MODULE-LEVEL authorisation-"
+        "parent lookup keyed on the already-tracked combo. NOT a routing "
+        "decision: the route was already fully decided upstream by `combo "
+        "in _V1_REASSIGN_SCHEMA`; this result only feeds `targets` for the "
+        "#369 write-side parent-ownership check, the same 'produces a "
+        "RESULT' shape as a captured group handed to a service, just not a "
+        "mechanical one (unlike a captured group or a Path property, "
+        "_REASSIGN_PARENTS being a plain module dict isn't something a "
+        "shape rule can tell apart from a genuine hidden route table, so "
+        "it is reviewed here instead)",
+    ("_handle_reassign_v2", "_REASSIGN_PARENTS.get(combo)"):
+        "same authorisation-parent lookup as _handle_reassign's own "
+        "waiver above, reached from the v2 handler -- the route is already "
+        "decided upstream by the v2 combo/schema dispatch; see that entry",
+    ("_handle_reassign", "self._V1_SETUP_KIND.get(entity, entity)"):
+        "#202 repair round 2 finding A -- a legacy-name-alias lookup "
+        "(v1 'league' -> canonical 'program', identity for everything "
+        "else) that only relabels the authorisation TARGET kind added to "
+        "`targets`. NOT a routing decision: the route was already decided "
+        "by the regex + combo/schema dispatch upstream; this reshapes an "
+        "authorisation-check argument, the same 'produces a RESULT' shape "
+        "as a captured group handed to a service",
+    ("_handle_setup", "_to_v1.get(kind, lambda r: r)"):
+        "#202 repair round 2 finding A -- selects the RESPONSE mapper "
+        "(canonical entity -> its legacy v1 wire shape) for the delete "
+        "route's already-decided entity kind (`kind = md.group(1)`, "
+        "itself matched against a fixed literal alternation). NOT a "
+        "routing decision: every kind in `md`'s pattern already yields "
+        "the SAME `/api/setup/<entity>/{}/delete` leaf (see "
+        "route_registry.py); this only reshapes the response body, the "
+        "same 'produces a RESULT' shape as the two _handle_setup_v2 "
+        "ternary waivers above",
+    ("do_POST", "required_permission(path)"):
+        "#202 repair round 2 finding A -- builds the human-readable "
+        "permission name for a 403 error body, AFTER `authorize(role, "
+        "path)` (the actual gate, tested directly and already exempt: "
+        "`path` is an ARGUMENT there, not that call's operand per "
+        "_direct_operand_names) has already refused the request. A "
+        "blanket per-verb authorisation gate, not a route selector -- see "
+        "test_a_guard_that_merely_passes_the_path_along_is_not_a_route "
+        "for the same shape via `_operator_only`/`_supported_methods`",
+    ("do_POST",
+     "scope_violation(role, scope, path, body, api.store, "
+     "allow_unscoped_dev_fallback=allow_dev_fallback)"):
+        "#202 repair round 2 finding A -- resource-scoping authorisation "
+        "(#51: a coach only their team, a player only self), run "
+        "UNCONDITIONALLY for every POST before any path-based dispatch "
+        "branch is reached. Same blanket-gate shape as `required_"
+        "permission(path)` immediately above -- refuses access to an "
+        "already-identified resource, does not select a route",
 }
 
 
@@ -1661,7 +1879,98 @@ _PATH_METHODS = ("resolve", "absolute", "expanduser", "with_name",
 _PATH_PROPERTIES = ("parent", "name", "stem", "suffix", "parts")
 
 
-def _propagates_taint(value, tracked: set) -> bool:
+#: ``X.group(<int constant>)`` -- the ONLY shape a regex capture surfaces as
+#: anywhere in this module (:meth:`_DispatchWalker._as_group_call` and
+#: :meth:`_DispatchWalker._group_origin` both hardcode exactly this pattern).
+#: A captured value consumed this way -- however it is spelled, bound to a
+#: local first (``gid = m.group(1)``) or written inline as a call argument
+#: (``api.calendar_feed_ics(cal.group(1))``) -- is the SAME "produces a
+#: RESULT, not a routing decision" case this module already draws elsewhere:
+#: the walker's own group machinery accounts for every way a captured value
+#: can propagate further (becoming a new dispatch subject, joining a tracked
+#: tuple, ...); ``_propagates_taint``/``_mentions_tracked`` must not ALSO
+#: treat the same call as an unrecognised-call escape merely because it was
+#: written inline instead of bound to a name first.
+def _is_known_capture_extraction(node) -> bool:
+    return (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "group" and len(node.args) == 1
+            and isinstance(node.args[0], ast.Constant))
+
+
+#: pathlib ``Path`` methods that CONSUME an already-resolved location to
+#: produce something UNRELATED to any path/route (file content, a
+#: readable stream, ...) rather than another Path -- the terminal end of
+#: the SAME chain ``_PATH_METHODS`` reshapes. The real ``_serve_static``
+#: demonstrates this: ``target`` is legitimately tracked (#202 repair root
+#: cause 2), but ``data = target.read_bytes()`` reads the FILE'S BYTES --
+#: exactly as unrelated to routing as ``ics = api.calendar_feed_ics(
+#: cal.group(1))``, just spelled as a Path method instead of a service
+#: call. NOT the same list as ``_PATH_METHODS`` (those still return a
+#: Path, further reshapable/comparable); these terminate the chain, the
+#: pathlib analogue of a captured regex group.
+_PATH_CONSUMING_METHODS = ("read_bytes", "read_text", "open")
+
+
+#: A node that EXTRACTS or CONSUMES a narrower, unrelated value from a
+#: tracked one, as opposed to one that RESHAPES a tracked value while
+#: keeping it fully comparable (``_PATH_OPS``/``_PATH_METHODS`` --
+#: ``path.strip()`` is still the whole path, just trimmed). A captured
+#: regex group and a ``_PATH_CONSUMING_METHODS`` call are the CALL-shaped
+#: case; the pathlib PROPERTIES (``.suffix``, ``.parent``, ``.name``,
+#: ``.stem``, ``.parts``) are the ATTRIBUTE-shaped case -- not a third
+#: thing, ``target.suffix`` is just a file extension, exactly as narrow
+#: and exactly as opaque-once-extracted as a captured id. All are already
+#: the SAME "produces a RESULT, not the routing-relevant value itself"
+#: pattern this module draws for ``api.calendar_feed_ics(cal.group(1))``;
+#: the real ``_serve_static``'s ``CONTENT_TYPES.get(target.suffix, ...)``
+#: and ``target.read_bytes()`` are the concrete cases that demonstrated
+#: both need the SAME treatment -- `target` is legitimately tracked (#202
+#: repair root cause 2: pathlib reshaping IS still the path), but reading
+#: or classifying it this way is not a routing decision, the same way a
+#: service keyed on a captured id isn't. Deliberately NOT extended to
+#: ``_PATH_OPS``/``_PATH_METHODS`` themselves: those calls are still
+#: independently visited as their own node by the loop below (and
+#: correctly pass as "manipulates" there), so a tracked name reached ONLY
+#: through full reshaping (``path.strip()``) must still surface as a
+#: mention when it is nested inside some OTHER unlisted call's arguments
+#: (e.g. a routing comparison hidden inside a genexpr) -- only an
+#: EXTRACTION/CONSUMPTION's receiver must not leak outward like that.
+def _is_opaque_extraction(node) -> bool:
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        if _is_known_capture_extraction(node):
+            return True
+        if node.func.attr in _PATH_CONSUMING_METHODS:
+            return True
+        return False
+    return isinstance(node, ast.Attribute) and node.attr in _PATH_PROPERTIES
+
+
+def _mentions_tracked(node, tracked: set) -> bool:
+    """Does ``node`` reference a tracked name anywhere in its subtree,
+    treating a nested :func:`_is_opaque_extraction` node as opaque?
+
+    A plain ``ast.walk`` would find ``cal`` inside ``cal.group(1)`` (or
+    ``target`` inside ``target.suffix``) even when that expression is
+    itself just an ARGUMENT to some unrelated, unlisted call
+    (``api.calendar_feed_ics(cal.group(1))``,
+    ``CONTENT_TYPES.get(target.suffix, ...)``) -- leaking the tracked
+    receiver's trackedness into an enclosing call this check is really
+    about. Stopping at an extraction's own boundary is what keeps those
+    legitimate shapes (see ``_propagates_taint``'s docstring) from tripping
+    the fail-closed check below; the extracted VALUE's own further use is
+    already covered by this module's dedicated machinery elsewhere (the
+    walker's group-tracking for a capture, the completeness audit's own
+    waivers for a Path property compared directly), not this coarse check.
+    """
+    if isinstance(node, ast.Name):
+        return node.id in tracked
+    if _is_opaque_extraction(node):
+        return False
+    return any(_mentions_tracked(child, tracked)
+               for child in ast.iter_child_nodes(node))
+
+
+def _propagates_taint(value, tracked: set, fn_name: str = "") -> bool:
     """Does this expression still CARRY the request path?
 
     Deliberately narrow. `p2 = self.path.split("?", 1)[0]` carries it -- string
@@ -1680,25 +1989,81 @@ def _propagates_taint(value, tracked: set) -> bool:
     spurious failures, which I initially waived -- waiving an analysis defect
     would have left eleven standing invitations to hide a route behind a service
     call.
+
+    FAIL CLOSED on an UNLISTED call (#202 repair round 2, finding A): the
+    loop below used to return False -- silently "not tainted" -- the instant
+    ANY call not on the ``_PATH_OPS``/``_PATH_METHODS`` whitelist appeared
+    ANYWHERE in the expression, with no regard for whether that call's own
+    receiver or arguments still carried a tracked name. That is all-or-
+    nothing over the WHOLE subtree, so it could not tell a value that is
+    merely handed to an unrelated service (fine) apart from a routing
+    decision hidden behind an unmodelled call -- DEMONSTRATED live escapes:
+    `found = next((r for r in KNOWN if r == path), None)` then `if found:`;
+    a `KNOWN.index(path)` bound inside a `try`/`except ValueError:` and
+    tested as a sentinel; `getattr(self, "_handle_" + suffix, None)` used to
+    dispatch indirectly. All three bind a LOCAL that still decides the
+    route, through a call this module does not model -- and none of them
+    joined `tracked`, so the `if` that actually chose the route was never
+    even looked at by the completeness scan below. Whether the call
+    "manipulates" (the whitelist), is provably UNRELATED to any tracked
+    name (see `_mentions_tracked`, which treats a nested capture-group or
+    Path-property/consuming extraction as opaque so `cal.group(1)` handed
+    to a service still does NOT trip this), or matches a reviewed
+    ``_AUDIT_WAIVERS`` entry the SAME way an unrecognised ``if`` test does
+    (e.g. ``_handle_reassign``'s own `_REASSIGN_PARENTS.get(combo)`: a
+    module-level authorisation-parent lookup keyed on an already-tracked
+    combo, consulted AFTER the route itself was decided by `combo in
+    _V1_REASSIGN_SCHEMA` -- the same "produces a RESULT, not a routing
+    decision" shape as the calendar feed, just not a MECHANICAL one a
+    blanket rule can recognise, so it goes through the same declared,
+    reviewed, one-hit-fingerprinted escape hatch as everything else that
+    needs human judgement rather than a shape rule) are the only ways to
+    end this function quietly now; anything else raises rather than
+    guessing.
     """
     for node in ast.walk(value):
         if isinstance(node, ast.Call):
+            if _is_opaque_extraction(node):
+                continue
             func = node.func
             manipulates = (isinstance(func, ast.Attribute)
                            and func.attr in (_PATH_OPS + _PATH_METHODS)
-                           and _propagates_taint(func.value, tracked))
-            if not manipulates:
-                return False          # a call result is not the path
+                           and _propagates_taint(func.value, tracked, fn_name))
+            if manipulates:
+                continue
+            if _mentions_tracked(node, tracked):
+                if (fn_name, ast.unparse(node)) in _AUDIT_WAIVERS:
+                    # Reviewed and declared not-a-routing-decision (see the
+                    # waiver's own entry) -- like a provably-unrelated call,
+                    # this must not propagate either, or the LHS would join
+                    # `tracked` anyway via the fallback below and simply
+                    # relocate the raise to whatever `if` tests it next
+                    # (DEMONSTRATED: `_REASSIGN_PARENTS.get(combo)` waived
+                    # here but left `parent` tracked moved this exact error
+                    # onto `if parent is not None:`, unwaived, one line
+                    # down).
+                    return False
+                raise ExtractionError(
+                    f"line {node.lineno}: `{ast.unparse(node)}` is an "
+                    "unlisted call whose receiver or argument(s) include a "
+                    "tracked dispatch name; route_extract cannot tell "
+                    "whether the result still decides the route. Classify "
+                    "it here (extend the whitelist, or model the shape "
+                    "explicitly) -- do not let it be silently treated as "
+                    "detached from the path.")
+            return False              # provably unrelated to any tracked name
+    if isinstance(value, ast.Call) and _is_opaque_extraction(value):
+        return False                  # an extraction/consumption, alone, is not the path
     if _is_path_derived(value):
         return True
     if isinstance(value, ast.BinOp) and isinstance(value.op, ast.Div):
         # pathlib's own join operator: `STATIC_DIR / rel` is a Path built
         # from whichever operand carries the path -- the construction
         # analogue of the method calls handled above.
-        return (_propagates_taint(value.left, tracked)
-                or _propagates_taint(value.right, tracked))
+        return (_propagates_taint(value.left, tracked, fn_name)
+                or _propagates_taint(value.right, tracked, fn_name))
     if isinstance(value, ast.Attribute) and value.attr in _PATH_PROPERTIES:
-        return _propagates_taint(value.value, tracked)
+        return _propagates_taint(value.value, tracked, fn_name)
     return any(isinstance(x, ast.Name) and x.id in tracked
                for x in ast.walk(value))
 
