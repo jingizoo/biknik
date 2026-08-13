@@ -73,10 +73,15 @@ class RegistryCoversTheDispatchTests(unittest.TestCase):
                                     "dispatch (name, declared, actual)")
 
     def test_counts(self):
-        """A visible total, so a silent halving of the inventory is not silent."""
+        """A visible total, so a silent halving of the inventory is not silent.
+
+        #202 repair: 74 GET -> 75 (root cause 6, the static tail: +1) and
+        163 POST -> 164 (root cause 1: -12 assign-\\w+ wildcard families +
+        13 concrete combo leaves = +1).
+        """
         self.assertEqual(len(REGISTRY), len(LIVE))
-        self.assertEqual(sum(1 for s in REGISTRY if s.method == "GET"), 74)
-        self.assertEqual(sum(1 for s in REGISTRY if s.method == "POST"), 163)
+        self.assertEqual(sum(1 for s in REGISTRY if s.method == "GET"), 75)
+        self.assertEqual(sum(1 for s in REGISTRY if s.method == "POST"), 164)
 
 
 class RegistryInternalConsistencyTests(unittest.TestCase):
@@ -211,29 +216,32 @@ class MethodTableNarrowingTests(unittest.TestCase):
     #: instead of 204+Allow and a PUT/DELETE answers 404 instead of 405+Allow.
     #: The static shells and /favicon.ico are outside that table's declared
     #: scope; the four /calendar feeds are a REAL hole and are reported as a
-    #: finding of this step, not fixed here (no behaviour changes).
+    #: finding of this step, not fixed here (no behaviour changes). ``/{*}``
+    #: (#202 repair root cause 6, the static tail) joins this set for the
+    #: same reason the shells do: static files are outside this table's
+    #: declared (API 405/Allow) scope, not a new hole.
     GET_NOT_IN_TABLE = {
         "", "/", "/favicon.ico", "/mobile", "/mobile/", "/setup", "/setup/",
-        "/api/{*}",
+        "/api/{*0}", "/{*}",
         "/calendar/division/{}.ics", "/calendar/official/{}.ics",
         "/calendar/player/{}.ics", "/calendar/team/{}.ics",
     }
 
-    #: Live POST branches ``_POST_ROUTES`` does not admit as written. All are
-    #: branches BROADER than the real routes under them, and the table is
-    #: right to be narrower: the game family regex matches any subpath (the
-    #: real actions are listed individually), and ``assign-(\w+)`` matches any
-    #: word where only the combos in ``_handle_reassign``'s table exist.
+    #: Live POST branches ``_POST_ROUTES`` does not admit as written.
+    #:
+    #: #202 repair root cause 1: this set SHRANK from 12 entries to 1. The 12
+    #: assign-\w+ WILDCARD templates that used to be here are gone -- they
+    #: were never real leaves, and their replacement (the 13 CONCRETE combo
+    #: templates _handle_reassign's own schema admits) are already listed
+    #: EXACTLY, one for one, in ``_POST_ROUTES`` -- proof, independent of this
+    #: registry, that the concrete leaves (and not the wildcard) were always
+    #: the intended reachable set: whoever wrote the 405 table by hand had
+    #: already worked out the real combos, and the OLD registry disagreed
+    #: with its own neighbour table without either side ever being checked
+    #: against the other. Only the games family remains: it matches any
+    #: subpath (the real actions are listed individually as their own specs).
     POST_NOT_IN_TABLE = {
         "/api/games/{}/{*}",
-        "/api/setup/division/{}/assign-{}", "/api/setup/league/{}/assign-{}",
-        "/api/setup/player/{}/assign-{}", "/api/setup/rink/{}/assign-{}",
-        "/api/setup/team/{}/assign-{}", "/api/setup/venue/{}/assign-{}",
-        "/api/v2/setup/division/{}/assign-{}",
-        "/api/v2/setup/player/{}/assign-{}",
-        "/api/v2/setup/program/{}/assign-{}",
-        "/api/v2/setup/rink/{}/assign-{}", "/api/v2/setup/team/{}/assign-{}",
-        "/api/v2/setup/venue/{}/assign-{}",
     }
 
     def _unadmitted(self, table, method):

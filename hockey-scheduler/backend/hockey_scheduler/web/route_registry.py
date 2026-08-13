@@ -19,12 +19,21 @@ Identity: ``template``
 ----------------------
 Each spec carries BOTH
 
-  ``pattern``   the full-path regex, faithful to what the dispatch tests
-                (``assign-\\w+`` stays ``\\w+``, not the looser ``[^/]+``); this
-                is what a policy engine will match a real request path against;
-  ``template``  the canonical shape — ``{}`` for one path segment, ``{*}`` for
-                a free tail — which is the key both sides can derive, so the
-                gate compares templates and separately proves that each
+  ``pattern``   the full-path regex, faithful to what the dispatch tests --
+                a literal ``assign-organization`` stays a LITERAL, not the
+                looser ``assign-\\w+`` a naive reading of the outer dispatch
+                regex would suggest (see #202 repair root cause 1: the
+                target is resolved by ``_handle_reassign``'s own combo
+                schema, which is exactly the set of literals a spec here
+                may claim -- a bare ``\\w+``/``[^/]+`` wildcard is never a
+                real leaf on its own); this is what a policy engine will
+                match a real request path against;
+  ``template``  the canonical shape — ``{}`` for a ``[^/]+`` segment, ``{w}``
+                for the narrower ``\\w+`` (kept distinct: #202 repair root
+                cause 4), ``{*}`` for a non-empty free tail (``.+``), ``{*0}``
+                for a possibly-empty one (``.*``, or a ``startswith()``
+                prefix route) — the key both sides can derive, so the gate
+                compares templates and separately proves that each
                 ``pattern`` expands to exactly its own ``template``.
 
 What is NOT here
@@ -37,12 +46,15 @@ What is NOT here
   ``UNCLASSIFIED`` on every entry. They are deliberately NOT filled in with
   guesses: a half-populated policy field reads as authority and would be
   believed. Nothing reads either field.
-* The two UNCONDITIONAL tails of the dispatch are not branches and so have no
-  spec: ``_dispatch_get`` ends by handing any non-``/api/`` path to
-  ``_serve_static`` (which serves a file from ``static/`` or 404s), and
-  ``do_POST`` ends in ``_unmatched_route("POST")``. The ``if`` branches INSIDE
-  ``_serve_static`` (the ``/setup`` and ``/`` shells) do appear, as
-  ``kind="static"``.
+* ``do_POST``'s tail (``_unmatched_route("POST")``) is an UNCONDITIONAL
+  fallthrough, not a branch, and so has no spec. ``_dispatch_get``'s
+  equivalent tail hands any non-``/api/`` path to ``_serve_static`` -- which
+  DOES get a spec now (``get_static_tail``, #202 repair root cause 6): unlike
+  the POST tail, ``_serve_static``'s own else branch re-derives a filename
+  from the path and serves a REAL file or 404s, which is a reachable leaf
+  (the current files under ``web/static/``), not an unreachable fallthrough.
+  The ``if``/``elif`` branches INSIDE ``_serve_static`` (the ``/setup`` and
+  ``/`` shells) also appear, as ``kind="static"``.
 
 Reading a POST entry
 --------------------
@@ -257,11 +269,14 @@ REGISTRY = (
     RouteSpec("GET", r"^/api/v2/setup/seasons/[^/]+/venue-candidates$",
               "/api/v2/setup/seasons/{}/venue-candidates",
               "get_v2_setup_seasons_id_venue_candidates", "_dispatch_get"),
-    RouteSpec("GET", r"^/api/.*$", "/api/{*}", "get_api_unmatched",
+    RouteSpec("GET", r"^/api/.*$", "/api/{*0}", "get_api_unmatched",
               "_dispatch_get", kind="fallthrough",
               note=("no resource: the tail that answers 405 (known "
                     "path, wrong method) or 404 for anything under "
-                    "/api/")),
+                    "/api/. Template uses {*0} (.* -- POSSIBLY EMPTY), "
+                    "not {*} (.+): /api/ alone matches, distinctly from "
+                    "the games-action family below, which is .+ (#202 "
+                    "repair root cause 4)")),
     RouteSpec("GET", r"^/calendar/division/[^/]+\.ics$",
               "/calendar/division/{}.ics", "get_calendar_division_id_ics",
               "_dispatch_get"),
@@ -283,6 +298,17 @@ REGISTRY = (
               "_serve_static", kind="static"),
     RouteSpec("GET", r"^/setup/$", "/setup/", "get_setup_shell_slash",
               "_serve_static", kind="static"),
+    RouteSpec("GET", r"^/.+$", "/{*}", "get_static_tail", "_serve_static",
+              kind="static",
+              note=("the UNCONDITIONAL static tail (#202 repair root "
+                    "cause 6): any path not matched above -- and not "
+                    "starting with /api/, which _dispatch_get claims "
+                    "first -- reaches _serve_static's else branch "
+                    "(rel = path.lstrip('/')) and serves whatever real "
+                    "file under web/static/ that name resolves to, or "
+                    "404s. This is what makes the current files under "
+                    "web/static/ reachable; it was previously omitted "
+                    "from the inventory entirely, not merely mis-typed")),
 
     # -- POST --------------------------------------------------------------
     RouteSpec("POST", r"^/api/accounts$", "/api/accounts", "post_accounts",
@@ -511,12 +537,16 @@ REGISTRY = (
               "_handle_setup"),
     RouteSpec("POST", r"^/api/setup/division$", "/api/setup/division",
               "post_setup_division", "_handle_setup"),
-    RouteSpec("POST", r"^/api/setup/division/[^/]+/assign-\w+$",
-              "/api/setup/division/{}/assign-{}",
-              "post_setup_division_id_assign_target", "_handle_setup",
-              note=("the target is narrowed downstream by "
-                    "_handle_reassign's combo table; the dispatch "
-                    "itself accepts any assign-<word>")),
+    RouteSpec("POST", r"^/api/setup/division/[^/]+/assign-level$",
+              "/api/setup/division/{}/assign-level",
+              "post_setup_division_id_assign_level", "_handle_reassign",
+              note=("#202 repair root cause 1: the concrete leaf, not "
+                    "the assign-\\w+ wildcard family that used to stand "
+                    "in for it. _handle_reassign's own "
+                    "_V1_REASSIGN_SCHEMA/_V1_REASSIGN_CALL admit ONLY "
+                    "(division, level) for this entity -- no other "
+                    "assign-<word> on /api/setup/division/<id> reaches "
+                    "anything but a 404")),
     RouteSpec("POST", r"^/api/setup/division/[^/]+/delete$",
               "/api/setup/division/{}/delete",
               "post_setup_division_id_delete", "_handle_setup"),
@@ -538,12 +568,12 @@ REGISTRY = (
               "post_setup_ice_slot_id_delete", "_handle_setup"),
     RouteSpec("POST", r"^/api/setup/league$", "/api/setup/league",
               "post_setup_league", "_handle_setup"),
-    RouteSpec("POST", r"^/api/setup/league/[^/]+/assign-\w+$",
-              "/api/setup/league/{}/assign-{}",
-              "post_setup_league_id_assign_target", "_handle_setup",
-              note=("the target is narrowed downstream by "
-                    "_handle_reassign's combo table; the dispatch "
-                    "itself accepts any assign-<word>")),
+    RouteSpec("POST", r"^/api/setup/league/[^/]+/assign-organization$",
+              "/api/setup/league/{}/assign-organization",
+              "post_setup_league_id_assign_organization", "_handle_reassign",
+              note=("#202 repair root cause 1: the concrete leaf. "
+                    "_V1_REASSIGN_SCHEMA/_V1_REASSIGN_CALL admit ONLY "
+                    "(league, organization) for this entity")),
     RouteSpec("POST", r"^/api/setup/league/[^/]+/delete$",
               "/api/setup/league/{}/delete", "post_setup_league_id_delete",
               "_handle_setup"),
@@ -564,23 +594,23 @@ REGISTRY = (
               "post_setup_organization_id_delete", "_handle_setup"),
     RouteSpec("POST", r"^/api/setup/player$", "/api/setup/player",
               "post_setup_player", "_handle_setup"),
-    RouteSpec("POST", r"^/api/setup/player/[^/]+/assign-\w+$",
-              "/api/setup/player/{}/assign-{}",
-              "post_setup_player_id_assign_target", "_handle_setup",
-              note=("the target is narrowed downstream by "
-                    "_handle_reassign's combo table; the dispatch "
-                    "itself accepts any assign-<word>")),
+    RouteSpec("POST", r"^/api/setup/player/[^/]+/assign-team$",
+              "/api/setup/player/{}/assign-team",
+              "post_setup_player_id_assign_team", "_handle_reassign",
+              note=("#202 repair root cause 1: the concrete leaf. "
+                    "_V1_REASSIGN_SCHEMA/_V1_REASSIGN_CALL admit ONLY "
+                    "(player, team) for this entity")),
     RouteSpec("POST", r"^/api/setup/player/[^/]+/delete$",
               "/api/setup/player/{}/delete", "post_setup_player_id_delete",
               "_handle_setup"),
     RouteSpec("POST", r"^/api/setup/rink$", "/api/setup/rink",
               "post_setup_rink", "_handle_setup"),
-    RouteSpec("POST", r"^/api/setup/rink/[^/]+/assign-\w+$",
-              "/api/setup/rink/{}/assign-{}",
-              "post_setup_rink_id_assign_target", "_handle_setup",
-              note=("the target is narrowed downstream by "
-                    "_handle_reassign's combo table; the dispatch "
-                    "itself accepts any assign-<word>")),
+    RouteSpec("POST", r"^/api/setup/rink/[^/]+/assign-venue$",
+              "/api/setup/rink/{}/assign-venue",
+              "post_setup_rink_id_assign_venue", "_handle_reassign",
+              note=("#202 repair root cause 1: the concrete leaf. "
+                    "_V1_REASSIGN_SCHEMA/_V1_REASSIGN_CALL admit ONLY "
+                    "(rink, venue) for this entity")),
     RouteSpec("POST", r"^/api/setup/rink/[^/]+/delete$",
               "/api/setup/rink/{}/delete", "post_setup_rink_id_delete",
               "_handle_setup"),
@@ -609,23 +639,23 @@ REGISTRY = (
               "post_setup_seasons_id_team_registrations", "_handle_setup"),
     RouteSpec("POST", r"^/api/setup/team$", "/api/setup/team",
               "post_setup_team", "_handle_setup"),
-    RouteSpec("POST", r"^/api/setup/team/[^/]+/assign-\w+$",
-              "/api/setup/team/{}/assign-{}",
-              "post_setup_team_id_assign_target", "_handle_setup",
-              note=("the target is narrowed downstream by "
-                    "_handle_reassign's combo table; the dispatch "
-                    "itself accepts any assign-<word>")),
+    RouteSpec("POST", r"^/api/setup/team/[^/]+/assign-club$",
+              "/api/setup/team/{}/assign-club",
+              "post_setup_team_id_assign_club", "_handle_reassign",
+              note=("#202 repair root cause 1: the concrete leaf. "
+                    "_V1_REASSIGN_SCHEMA/_V1_REASSIGN_CALL admit ONLY "
+                    "(team, club) for this entity")),
     RouteSpec("POST", r"^/api/setup/team/[^/]+/delete$",
               "/api/setup/team/{}/delete", "post_setup_team_id_delete",
               "_handle_setup"),
     RouteSpec("POST", r"^/api/setup/venue$", "/api/setup/venue",
               "post_setup_venue", "_handle_setup"),
-    RouteSpec("POST", r"^/api/setup/venue/[^/]+/assign-\w+$",
-              "/api/setup/venue/{}/assign-{}",
-              "post_setup_venue_id_assign_target", "_handle_setup",
-              note=("the target is narrowed downstream by "
-                    "_handle_reassign's combo table; the dispatch "
-                    "itself accepts any assign-<word>")),
+    RouteSpec("POST", r"^/api/setup/venue/[^/]+/assign-organization$",
+              "/api/setup/venue/{}/assign-organization",
+              "post_setup_venue_id_assign_organization", "_handle_reassign",
+              note=("#202 repair root cause 1: the concrete leaf. "
+                    "_V1_REASSIGN_SCHEMA/_V1_REASSIGN_CALL admit ONLY "
+                    "(venue, organization) for this entity")),
     RouteSpec("POST", r"^/api/setup/venue/[^/]+/delete$",
               "/api/setup/venue/{}/delete", "post_setup_venue_id_delete",
               "_handle_setup"),
@@ -636,12 +666,12 @@ REGISTRY = (
               "_handle_setup_v2"),
     RouteSpec("POST", r"^/api/v2/setup/division$", "/api/v2/setup/division",
               "post_v2_setup_division", "_handle_setup_v2"),
-    RouteSpec("POST", r"^/api/v2/setup/division/[^/]+/assign-\w+$",
-              "/api/v2/setup/division/{}/assign-{}",
-              "post_v2_setup_division_id_assign_target", "_handle_setup_v2",
-              note=("the target is narrowed downstream by "
-                    "_handle_reassign's combo table; the dispatch "
-                    "itself accepts any assign-<word>")),
+    RouteSpec("POST", r"^/api/v2/setup/division/[^/]+/assign-league$",
+              "/api/v2/setup/division/{}/assign-league",
+              "post_v2_setup_division_id_assign_league", "_handle_reassign_v2",
+              note=("#202 repair root cause 1: the concrete leaf. "
+                    "_V2_REASSIGN_SCHEMA/_V2_REASSIGN_CALL admit ONLY "
+                    "(division, league) for this entity")),
     RouteSpec("POST", r"^/api/v2/setup/division/[^/]+/delete$",
               "/api/v2/setup/division/{}/delete",
               "post_v2_setup_division_id_delete", "_handle_setup_v2"),
@@ -679,12 +709,12 @@ REGISTRY = (
     RouteSpec("POST", r"^/api/v2/setup/player/[^/]+/active$",
               "/api/v2/setup/player/{}/active",
               "post_v2_setup_player_id_active", "_handle_setup_v2"),
-    RouteSpec("POST", r"^/api/v2/setup/player/[^/]+/assign-\w+$",
-              "/api/v2/setup/player/{}/assign-{}",
-              "post_v2_setup_player_id_assign_target", "_handle_setup_v2",
-              note=("the target is narrowed downstream by "
-                    "_handle_reassign's combo table; the dispatch "
-                    "itself accepts any assign-<word>")),
+    RouteSpec("POST", r"^/api/v2/setup/player/[^/]+/assign-team$",
+              "/api/v2/setup/player/{}/assign-team",
+              "post_v2_setup_player_id_assign_team", "_handle_reassign_v2",
+              note=("#202 repair root cause 1: the concrete leaf. "
+                    "_V2_REASSIGN_SCHEMA/_V2_REASSIGN_CALL admit ONLY "
+                    "(player, team) for this entity")),
     RouteSpec("POST", r"^/api/v2/setup/player/[^/]+/delete$",
               "/api/v2/setup/player/{}/delete",
               "post_v2_setup_player_id_delete", "_handle_setup_v2"),
@@ -693,23 +723,24 @@ REGISTRY = (
               "post_v2_setup_player_id_update", "_handle_setup_v2"),
     RouteSpec("POST", r"^/api/v2/setup/program$", "/api/v2/setup/program",
               "post_v2_setup_program", "_handle_setup_v2"),
-    RouteSpec("POST", r"^/api/v2/setup/program/[^/]+/assign-\w+$",
-              "/api/v2/setup/program/{}/assign-{}",
-              "post_v2_setup_program_id_assign_target", "_handle_setup_v2",
-              note=("the target is narrowed downstream by "
-                    "_handle_reassign's combo table; the dispatch "
-                    "itself accepts any assign-<word>")),
+    RouteSpec("POST", r"^/api/v2/setup/program/[^/]+/assign-organization$",
+              "/api/v2/setup/program/{}/assign-organization",
+              "post_v2_setup_program_id_assign_organization",
+              "_handle_reassign_v2",
+              note=("#202 repair root cause 1: the concrete leaf. "
+                    "_V2_REASSIGN_SCHEMA/_V2_REASSIGN_CALL admit ONLY "
+                    "(program, organization) for this entity")),
     RouteSpec("POST", r"^/api/v2/setup/program/[^/]+/delete$",
               "/api/v2/setup/program/{}/delete",
               "post_v2_setup_program_id_delete", "_handle_setup_v2"),
     RouteSpec("POST", r"^/api/v2/setup/rink$", "/api/v2/setup/rink",
               "post_v2_setup_rink", "_handle_setup_v2"),
-    RouteSpec("POST", r"^/api/v2/setup/rink/[^/]+/assign-\w+$",
-              "/api/v2/setup/rink/{}/assign-{}",
-              "post_v2_setup_rink_id_assign_target", "_handle_setup_v2",
-              note=("the target is narrowed downstream by "
-                    "_handle_reassign's combo table; the dispatch "
-                    "itself accepts any assign-<word>")),
+    RouteSpec("POST", r"^/api/v2/setup/rink/[^/]+/assign-venue$",
+              "/api/v2/setup/rink/{}/assign-venue",
+              "post_v2_setup_rink_id_assign_venue", "_handle_reassign_v2",
+              note=("#202 repair root cause 1: the concrete leaf. "
+                    "_V2_REASSIGN_SCHEMA/_V2_REASSIGN_CALL admit ONLY "
+                    "(rink, venue) for this entity")),
     RouteSpec("POST", r"^/api/v2/setup/rink/[^/]+/delete$",
               "/api/v2/setup/rink/{}/delete", "post_v2_setup_rink_id_delete",
               "_handle_setup_v2"),
@@ -764,23 +795,33 @@ REGISTRY = (
               "post_v2_setup_seasons_id_venue_access", "_handle_setup_v2"),
     RouteSpec("POST", r"^/api/v2/setup/team$", "/api/v2/setup/team",
               "post_v2_setup_team", "_handle_setup_v2"),
-    RouteSpec("POST", r"^/api/v2/setup/team/[^/]+/assign-\w+$",
-              "/api/v2/setup/team/{}/assign-{}",
-              "post_v2_setup_team_id_assign_target", "_handle_setup_v2",
-              note=("the target is narrowed downstream by "
-                    "_handle_reassign's combo table; the dispatch "
-                    "itself accepts any assign-<word>")),
+    RouteSpec("POST", r"^/api/v2/setup/team/[^/]+/assign-club$",
+              "/api/v2/setup/team/{}/assign-club",
+              "post_v2_setup_team_id_assign_club", "_handle_reassign_v2",
+              note=("#202 repair root cause 1: one of TWO concrete "
+                    "leaves for this entity (see assign-league below) -- "
+                    "_V2_REASSIGN_SCHEMA/_V2_REASSIGN_CALL admit BOTH "
+                    "(team, club) and (team, league); a wildcard target "
+                    "silently conflated both into one over-broad spec")),
+    RouteSpec("POST", r"^/api/v2/setup/team/[^/]+/assign-league$",
+              "/api/v2/setup/team/{}/assign-league",
+              "post_v2_setup_team_id_assign_league", "_handle_reassign_v2",
+              note=("#202 repair root cause 1: the other of the two "
+                    "concrete leaves for this entity -- #283 Slice B, "
+                    "promotion/relegation/transfer to a different "
+                    "PERMANENT League")),
     RouteSpec("POST", r"^/api/v2/setup/team/[^/]+/delete$",
               "/api/v2/setup/team/{}/delete", "post_v2_setup_team_id_delete",
               "_handle_setup_v2"),
     RouteSpec("POST", r"^/api/v2/setup/venue$", "/api/v2/setup/venue",
               "post_v2_setup_venue", "_handle_setup_v2"),
-    RouteSpec("POST", r"^/api/v2/setup/venue/[^/]+/assign-\w+$",
-              "/api/v2/setup/venue/{}/assign-{}",
-              "post_v2_setup_venue_id_assign_target", "_handle_setup_v2",
-              note=("the target is narrowed downstream by "
-                    "_handle_reassign's combo table; the dispatch "
-                    "itself accepts any assign-<word>")),
+    RouteSpec("POST", r"^/api/v2/setup/venue/[^/]+/assign-organization$",
+              "/api/v2/setup/venue/{}/assign-organization",
+              "post_v2_setup_venue_id_assign_organization",
+              "_handle_reassign_v2",
+              note=("#202 repair root cause 1: the concrete leaf. "
+                    "_V2_REASSIGN_SCHEMA/_V2_REASSIGN_CALL admit ONLY "
+                    "(venue, organization) for this entity")),
     RouteSpec("POST", r"^/api/v2/setup/venue/[^/]+/delete$",
               "/api/v2/setup/venue/{}/delete",
               "post_v2_setup_venue_id_delete", "_handle_setup_v2"),
