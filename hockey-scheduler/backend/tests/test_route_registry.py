@@ -254,6 +254,7 @@ class RegistryInternalConsistencyTests(unittest.TestCase):
 _VALID_AUTH_VALUES = frozenset({
     "none",
     "operator_only",
+    "optional_session",
     "session",
     "session+MANAGE_ARENA",
     "session+MANAGE_ROSTER",
@@ -280,7 +281,7 @@ _EXPECTED_CLASSIFICATION = {
     ("GET", '/api/accounts'): ('operator_only', 'none'),  # get_accounts
     ("GET", '/api/accounts/{}/sessions'): ('operator_only', 'none'),  # get_accounts_id_sessions
     ("GET", '/api/auth/accounts'): ('none', 'none'),  # get_auth_accounts
-    ("GET", '/api/auth/me'): ('session', 'none'),  # get_auth_me
+    ("GET", '/api/auth/me'): ('optional_session', 'none'),  # get_auth_me
     ("GET", '/api/auth/roles'): ('none', 'none'),  # get_auth_roles
     ("GET", '/api/bootstrap/status'): ('none', 'none'),  # get_bootstrap_status
     ("GET", '/api/calendar-feeds'): ('session+MANAGE_SCHEDULE-or-self', 'none'),  # get_calendar_feeds
@@ -301,10 +302,10 @@ _EXPECTED_CLASSIFICATION = {
     ("GET", '/api/guardians/links'): ('operator_only', 'none'),  # get_guardians_links
     ("GET", '/api/health'): ('none', 'none'),  # get_health
     ("GET", '/api/import/hierarchy-codes'): ('operator_only', 'none'),  # get_import_hierarchy_codes
-    ("GET", '/api/me/assignments'): ('session', 'none'),  # get_me_assignments
+    ("GET", '/api/me/assignments'): ('optional_session', 'none'),  # get_me_assignments
     ("GET", '/api/me/guardian/home'): ('session+guardian-scope', 'none'),  # get_me_guardian_home
     ("GET", '/api/me/guardian/{}/substitute-opportunities/{}'): ('session+guardian-scope+verified-link', 'none'),  # get_me_guardian_id_substitute_opportunities_id
-    ("GET", '/api/me/player-home'): ('session', 'none'),  # get_me_player_home
+    ("GET", '/api/me/player-home'): ('optional_session', 'none'),  # get_me_player_home
     ("GET", '/api/me/substitute-opportunities/{}'): ('session+player-scope', 'none'),  # get_me_substitute_opportunities_id
     ("GET", '/api/notifications'): ('session', 'none'),  # get_notifications
     ("GET", '/api/notifications/contacts'): ('operator_only', 'none'),  # get_notifications_contacts

@@ -272,5 +272,145 @@ class ServerAuthzTest(unittest.TestCase):
         self.assertEqual(body["error"]["code"], "unauthorized")
 
 
+# --------------------------------------------------------------------------- #
+# #202 repair round 4, finding 5: /api/auth/me, /api/me/assignments, and       #
+# /api/me/player-home were labelled auth="session" in route_registry.py --    #
+# the SAME label used for a route that 401s outright with no cookie -- but    #
+# each of these three answers a NO-COOKIE request with an ANONYMOUS 200       #
+# (null/empty data), only 401ing for a cookie that IS present but invalid/    #
+# expired. Investigated first (server.py:2045-2057, 1827-1843, 1844-1863):    #
+# each is a deliberate, consistently-documented "who am I / my inbox / my     #
+# home screen" pattern -- explicitly NOT calling _resolve_role (which would   #
+# 401 on no cookie) and instead reading the cookie directly, matching the     #
+# exact contract every SPA needs on load to tell "signed out" from "signed    #
+# in" without an error. NOT a bug -- confirmed against real HTTP below,       #
+# across all three cookie states, for all three routes.                       #
+# --------------------------------------------------------------------------- #
+class OptionalSessionRouteTests(unittest.TestCase):
+    """Real-HTTP proof that route_registry.py's new 'optional_session' label
+    matches actual server behaviour for exactly these three routes, in all
+    three cookie states -- the demonstration this finding's own fix is
+    checked in against, not merely asserted in a commit message."""
+
+    @classmethod
+    def setUpClass(cls):
+        STATE.reset()
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        cls.port = cls.httpd.server_address[1]
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever, daemon=True)
+        cls.thread.start()
+        api = STATE.api
+        # A real, BOUND official account (#54) -- so the "valid cookie"
+        # case for /api/me/assignments proves a REAL inbox shape, not just
+        # "the same empty shape as no-cookie, via a different code path".
+        official_id = api.create_official("Finding5 Official")["id"]
+        api.create_user_account("finding5_official", "pw", "official",
+                                scope={"official_id": official_id})
+        cls.official_id = official_id
+        # A real, BOUND player account (#107) -- same reasoning for
+        # /api/me/player-home.
+        home_team = STATE.ids["home_team_id"]
+        player_id = api.create_player(home_team, "Finding5 Player", "forward")["id"]
+        api.create_user_account("finding5_player", "pw", "player",
+                                scope={"player_id": player_id})
+        cls.player_id = player_id
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.thread.join(timeout=5)
+        cls.httpd.server_close()
+
+    def _get_h(self, path, cookie=None):
+        url = f"http://127.0.0.1:{self.port}{path}"
+        req = urllib.request.Request(url, method="GET")
+        if cookie is not None:
+            req.add_header("Cookie", cookie)
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read() or b"{}")
+
+    def _login(self, username, password):
+        url = f"http://127.0.0.1:{self.port}/api/auth/login"
+        data = json.dumps({"username": username, "password": password}).encode()
+        req = urllib.request.Request(
+            url, data=data, method="POST",
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req) as r:
+            return r.headers.get("Set-Cookie", "").split(";", 1)[0]
+
+    # -- /api/auth/me --------------------------------------------------
+    def test_auth_me_no_cookie_is_anonymous_200(self):
+        status, body = self._get_h("/api/auth/me")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"user": None})
+
+    def test_auth_me_invalid_cookie_is_401(self):
+        status, body = self._get_h("/api/auth/me", cookie="hs_sid=bogus-session")
+        self.assertEqual(status, 401)
+        self.assertEqual(body["error"]["code"], "unauthorized")
+
+    def test_auth_me_valid_cookie_returns_the_real_user(self):
+        cookie = self._login("admin", "demo")
+        status, body = self._get_h("/api/auth/me", cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertIsNotNone(body["user"])
+        self.assertEqual(body["user"]["username"], "admin")
+
+    # -- /api/me/assignments --------------------------------------------
+    def test_me_assignments_no_cookie_is_anonymous_200(self):
+        status, body = self._get_h("/api/me/assignments")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"official_id": None, "assignments": []})
+
+    def test_me_assignments_invalid_cookie_is_401(self):
+        status, body = self._get_h("/api/me/assignments",
+                                   cookie="hs_sid=bogus-session")
+        self.assertEqual(status, 401)
+        self.assertEqual(body["error"]["code"], "unauthorized")
+
+    def test_me_assignments_valid_bound_cookie_returns_the_real_inbox(self):
+        cookie = self._login("finding5_official", "pw")
+        status, body = self._get_h("/api/me/assignments", cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["official_id"], self.official_id)
+        self.assertIn("assignments", body)
+
+    def test_me_assignments_valid_unbound_cookie_is_the_same_empty_shape(self):
+        """A valid session with NO official binding (e.g. an admin) gets the
+        SAME empty shape as no cookie at all -- but via _cookie/SESSIONS.
+        resolve succeeding, not the early no-cookie return. Distinguishes
+        'no session' from 'session but not an official' from the response
+        alone being intentionally identical for both -- exercised here so a
+        future change that made them diverge would be caught."""
+        cookie = self._login("admin", "demo")
+        status, body = self._get_h("/api/me/assignments", cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"official_id": None, "assignments": []})
+
+    # -- /api/me/player-home ---------------------------------------------
+    def test_me_player_home_no_cookie_is_anonymous_200(self):
+        status, body = self._get_h("/api/me/player-home")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {
+            "player_id": None, "next_game": None, "today_count": 0,
+            "substitute_offers": [], "substitute_opportunities": [],
+            "unread_notifications": 0})
+
+    def test_me_player_home_invalid_cookie_is_401(self):
+        status, body = self._get_h("/api/me/player-home",
+                                   cookie="hs_sid=bogus-session")
+        self.assertEqual(status, 401)
+        self.assertEqual(body["error"]["code"], "unauthorized")
+
+    def test_me_player_home_valid_bound_cookie_returns_the_real_home(self):
+        cookie = self._login("finding5_player", "pw")
+        status, body = self._get_h("/api/me/player-home", cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["player_id"], self.player_id)
+
+
 if __name__ == "__main__":
     unittest.main()

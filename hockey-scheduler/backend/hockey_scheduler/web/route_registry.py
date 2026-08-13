@@ -170,14 +170,24 @@ REGISTRY = (
                     "applicable.")),
     RouteSpec("GET", r"^/api/auth/me$", "/api/auth/me", "get_auth_me",
               "_dispatch_get",
-              auth="session", scope_axis="none",
-              note=("#202: direct cookie/session lookup (server.py:"
-                    "2045-2057, self._cookie(SESSION_COOKIE) + "
-                    "SESSIONS.resolve) -- NOT _resolve_role: no cookie -> "
-                    "signed-out view (200, {'user': None}), invalid/"
-                    "expired cookie -> 401, no X-Demo-Role/headerless-"
-                    "admin demo fallback. Returns only the caller's own "
-                    "account (user_view) -- no P/S/L concept, not "
+              auth="optional_session", scope_axis="none",
+              note=("#202 repair round 4, finding 5: relabelled from "
+                    "'session' -- that label means REFUSED with no "
+                    "session (401), which this route does NOT do. "
+                    "Investigated (not assumed): server.py:2045-2057 is a "
+                    "deliberate, documented 'who am I' pattern -- direct "
+                    "cookie/session lookup (self._cookie(SESSION_COOKIE) + "
+                    "SESSIONS.resolve), NOT _resolve_role. No cookie -> "
+                    "signed-out view (200, {'user': None}) -- the exact "
+                    "contract every SPA needs on load to tell signed-out "
+                    "from signed-in without an error. A PRESENT but "
+                    "invalid/expired cookie still -> 401 (must re-auth), "
+                    "so this is not a blanket public route either -- "
+                    "'optional_session' names that middle contract "
+                    "explicitly. Verified over real HTTP, all three cookie "
+                    "states, in test_server_authz.py's "
+                    "OptionalSessionRouteTests. Returns only the caller's "
+                    "own account (user_view) -- no P/S/L concept, not "
                     "applicable.")),
     RouteSpec("GET", r"^/api/auth/roles$", "/api/auth/roles",
               "get_auth_roles", "_dispatch_get",
@@ -366,14 +376,24 @@ REGISTRY = (
                     "filter.")),
     RouteSpec("GET", r"^/api/me/assignments$", "/api/me/assignments",
               "get_me_assignments", "_dispatch_get",
-              auth="session", scope_axis="none",
-              note=("#202: direct cookie lookup (server.py:1827-1843, "
+              auth="optional_session", scope_axis="none",
+              note=("#202 repair round 4, finding 5: relabelled from "
+                    "'session' -- same investigation and same reasoning as "
+                    "get_auth_me's own entry above (the SAME three-cookie-"
+                    "state contract, not a distinct pattern). Direct "
+                    "cookie lookup (server.py:1827-1843, "
                     "self._cookie(SESSION_COOKIE) + SESSIONS.resolve) -- "
                     "NOT _resolve_role: no cookie -> empty inbox shape "
-                    "(200), invalid/expired cookie -> 401. "
-                    "get_official_inbox(oid) is keyed by the caller's own "
-                    "bound official_id -- no P/S/L concept, not "
-                    "applicable.")),
+                    "(200, {'official_id': None, 'assignments': []}), "
+                    "invalid/expired cookie -> 401, a valid session with "
+                    "no official binding -> the SAME empty shape (verified "
+                    "as its own real-HTTP case, not merely assumed "
+                    "identical). get_official_inbox(oid) is keyed by the "
+                    "caller's own bound official_id -- no P/S/L concept, "
+                    "not applicable. Verified over real HTTP, all three "
+                    "cookie states plus the bound-vs-unbound valid-session "
+                    "distinction, in test_server_authz.py's "
+                    "OptionalSessionRouteTests.")),
     RouteSpec("GET", r"^/api/me/guardian/home$", "/api/me/guardian/home",
               "get_me_guardian_home", "_dispatch_get",
               auth="session+guardian-scope", scope_axis="none",
@@ -414,12 +434,17 @@ REGISTRY = (
                     "id -- no P/S/L concept, not applicable.")),
     RouteSpec("GET", r"^/api/me/player-home$", "/api/me/player-home",
               "get_me_player_home", "_dispatch_get",
-              auth="session", scope_axis="none",
-              note=("#202: direct cookie lookup (server.py:1844-1863) -- "
-                    "NOT _resolve_role: no cookie -> empty shape (200), "
-                    "invalid/expired cookie -> 401. get_player_home(pid, "
-                    "...) is keyed by the caller's own bound player_id -- "
-                    "no P/S/L concept, not applicable.")),
+              auth="optional_session", scope_axis="none",
+              note=("#202 repair round 4, finding 5: relabelled from "
+                    "'session' -- same investigation and reasoning as "
+                    "get_auth_me/get_me_assignments above. Direct cookie "
+                    "lookup (server.py:1844-1863) -- NOT _resolve_role: no "
+                    "cookie -> empty shape (200), invalid/expired cookie "
+                    "-> 401. get_player_home(pid, ...) is keyed by the "
+                    "caller's own bound player_id -- no P/S/L concept, not "
+                    "applicable. Verified over real HTTP, all three cookie "
+                    "states, in test_server_authz.py's "
+                    "OptionalSessionRouteTests.")),
     RouteSpec("GET", r"^/api/me/substitute-opportunities/[^/]+$",
               "/api/me/substitute-opportunities/{}",
               "get_me_substitute_opportunities_id", "_dispatch_get",
