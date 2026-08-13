@@ -2551,9 +2551,31 @@ class Handler(BaseHTTPRequestHandler):
         if oavs:
             if self._official_guard(oavs.group(1)):
                 return
+            # Strict body schema (#202), AFTER the authorization guard so a
+            # caller who may not touch this official learns nothing about the
+            # body shape. #271 hardened /api/games/<id>/availability but never
+            # reached this sibling, which built its kwargs from bare
+            # ``body.get`` calls: a ``note`` → ``notes`` typo wrote the window
+            # with note=None (the operator's note silently lost at 200), a
+            # ``status`` → ``staus`` typo refused only BY ACCIDENT because the
+            # enum then saw None — leaking that internal None into the
+            # operator-facing message with no ``details`` naming a field — and
+            # a missing ``start_time`` reached the service as None and crashed
+            # the comparison there (500 internal_error). Naming the fields here
+            # makes all three a stable, zero-write 400.
+            try:
+                check_body(body,
+                           allowed={"start_time", "end_time", "status", "note"},
+                           required=("start_time", "end_time", "status"),
+                           types={"start_time": str, "end_time": str,
+                                  "status": str, "note": str})
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
             # Attribute the change to the signed-in user, not a client-supplied
             # actor_id, so the audit trail (#88) cannot be forged. The guard
-            # above already established the session is valid.
+            # above already established the session is valid. ``actor_id`` is
+            # not in ``allowed`` above, so a forged one is now refused outright
+            # rather than accepted-and-ignored.
             _role, _scope, actor_uid, _err = self._resolve_role()
             return self._send_api(api.set_official_availability(
                 oavs.group(1), body.get("start_time"), body.get("end_time"),
@@ -2654,9 +2676,22 @@ class Handler(BaseHTTPRequestHandler):
             jid, gid = mga.group(1), mga.group(2)
             if self._guardian_link_or_403(guid, jid):
                 return
+            # Strict body schema (#202), AFTER the verified-link gate so the
+            # schema can never be used to tell "wrong shape" from "not your
+            # junior". This route hardcoded ``body.get("availability_status",
+            # "pending")``, so a guardian declaring their junior UNAVAILABLE
+            # with a typo'd key got 200 and a PENDING row — a silent WRONG
+            # write, not merely a dropped key. ``availability_status`` is
+            # required here rather than defaulted: an attendance record the
+            # guardian never asked for must not be invented from an empty body.
+            try:
+                check_body(body, allowed={"availability_status"},
+                           required=("availability_status",),
+                           types={"availability_status": str})
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
             return self._send_api(api.set_availability(
-                gid, jid, body.get("availability_status", "pending"),
-                "guardian", guid))
+                gid, jid, body.get("availability_status"), "guardian", guid))
         mgs = re.match(
             r"^/api/me/guardian/([^/]+)/substitute-opportunities/([^/]+)/"
             r"(accept-offer|decline-offer)$", path)
@@ -3312,6 +3347,20 @@ class Handler(BaseHTTPRequestHandler):
                 scope=body.get("scope"), actor_id=user_id))
         acc = re.match(r"^/api/accounts/([^/]+)/active$", path)
         if acc:
+            # Strict body schema (#202), same family as the account-create
+            # check above. ``bool(body.get("active"))`` collapses a MISSING key
+            # to False, so ``{"activ": false}`` — one transposed character —
+            # used to DEACTIVATE the account and revoke its live sessions at
+            # 200. The bool type check matters just as much: ``bool("false")``
+            # is True, so a JSON-typed client bug would ACTIVATE where it meant
+            # to deactivate. ``required`` (not ``present``) so an explicit null
+            # is refused too; a literal ``false`` passes, since it is neither
+            # None nor "".
+            try:
+                check_body(body, allowed={"active"}, required=("active",),
+                           types={"active": bool})
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
             res = api.set_user_account_active(acc.group(1), bool(body.get("active")))
             if isinstance(res, dict) and "error" not in res and not res.get("active"):
                 # Deactivating an account must end any session it already has,
@@ -3324,6 +3373,18 @@ class Handler(BaseHTTPRequestHandler):
             # the server-resolved signed-in admin, never a client body value.
             # The raw `scope` value is passed through UNCOERCED so the service
             # can reject a non-object shape as a stable 400.
+            #
+            # Strict body schema (#202): the binding must travel INSIDE
+            # `scope`, exactly as on the create route above. A misplaced
+            # top-level `team_id` already failed closed, but reported the
+            # misleading `scope_required` instead of naming the misplaced key,
+            # and any other stray key was dropped at 200. Only the key set is
+            # checked here — no `types` entry for `scope` — so a non-object
+            # scope keeps reaching the service and its `invalid_scope` answer.
+            try:
+                check_body(body, allowed={"scope"})
+            except BodyError as exc:
+                return self._send_json(exc.payload, exc.status)
             return self._send_api(api.rebind_user_account_scope(
                 scp.group(1), body.get("scope"), actor_id=user_id))
         rv = re.match(r"^/api/accounts/([^/]+)/sessions/([^/]+)/revoke$", path)
