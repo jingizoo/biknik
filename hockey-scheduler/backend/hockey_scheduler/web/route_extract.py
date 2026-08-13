@@ -1787,34 +1787,20 @@ class _DispatchWalker:
         while changed:
             changed = False
             for node in ast.walk(fn):
-                if isinstance(node, (ast.Assign, ast.AnnAssign)):
-                    value = node.value
-                    if value is None:
-                        continue
-                    targets = node.targets if isinstance(node, ast.Assign) \
-                        else [node.target]
-                elif isinstance(node, ast.NamedExpr):
-                    # #202 repair round 3, finding F: a walrus bind
-                    # (``n := EXPR``) is exactly the same "a local now
-                    # carries a path-derived value" event as an
-                    # ``ast.Assign`` -- just spelled inline inside an
-                    # expression, most often an if-test's own subject
-                    # (``if (n := path.split("/")[-1]) == "x":``). Being
-                    # neither ``ast.Assign`` nor ``ast.AnnAssign``, it was
-                    # invisible to this loop entirely: ``n`` never joined
-                    # ``tracked``, so nothing downstream that tested ``n`` --
-                    # in this SAME if-test (root_name's own NamedExpr branch
-                    # resolves the walrus operand to "n") or a LATER,
-                    # separate one -- could ever be recognised as touching
-                    # the path either. DEMONSTRATED: zero exception, zero
-                    # route. A walrus target is always a single ``ast.Name``
-                    # -- Python's grammar allows no other shape -- so there
-                    # is no ``ast.walk(target)`` needed the way a regular
-                    # assign's (possibly tuple/starred) target needs.
-                    value = node.value
-                    targets = [node.target]
-                else:
+                # #202 repair round 4, finding 2: every binding form this
+                # module tracks -- ``ast.Assign``/``ast.AnnAssign``, (round
+                # 3 finding F) ``ast.NamedExpr``, and (this round)
+                # ``ast.AugAssign``/``ast.For``/``ast.AsyncFor``/
+                # ``ast.comprehension``/``ast.withitem`` -- funnels through
+                # ONE extraction function so the propagation logic below
+                # (the actual taint question) is written once. See
+                # :func:`_binding_value_and_targets`'s own docstring for why
+                # each shape belongs here and what stays deliberately out of
+                # scope.
+                binding = _binding_value_and_targets(node)
+                if binding is None:
                     continue
+                value, targets = binding
                 leaves = [leaf for target in targets
                          for leaf in ast.walk(target)
                          if isinstance(leaf, ast.Name)]
@@ -2270,6 +2256,72 @@ def _tracked_mentions(node, tracked: set) -> set:
     for child in ast.iter_child_nodes(node):
         found |= _tracked_mentions(child, tracked)
     return found
+
+
+#: Every AST node shape :func:`_binding_value_and_targets` recognises as a
+#: NAME-BINDING EVENT, for the docstring below and for
+#: ``test_route_extract.py`` to assert against directly rather than
+#: hardcoding the list a second time.
+BINDING_NODE_TYPES = (ast.Assign, ast.AnnAssign, ast.NamedExpr, ast.AugAssign,
+                      ast.For, ast.AsyncFor, ast.comprehension, ast.withitem)
+
+
+def _binding_value_and_targets(node):
+    """``(value_expr, [target_nodes])`` for any node that binds a name FROM
+    an expression, or ``None`` for anything else.
+
+    #202 repair round 4, finding 2: :meth:`_DispatchWalker._audit_function`'s
+    fixed-point taint loop used to hardcode exactly two shapes --
+    ``ast.Assign``/``ast.AnnAssign`` and (#202 repair round 3, finding F)
+    ``ast.NamedExpr`` -- so ANY other binding form silently carried the path
+    into a new local with NOTHING added to ``tracked``: DEMONSTRATED for
+    ``for candidate in (path,):``, ``with holder(path) as candidate:`` and
+    ``candidate += path`` alike -- each produced zero exception and zero
+    recorded route for a literal branch keyed on the bound name. All four
+    (plus the pre-existing three) share the SAME shape once named
+    generically -- "a target receives a value FROM an expression" -- so one
+    extraction function, consulted by the SAME fixed-point loop, is what
+    lets a For/AsyncFor/comprehension/with/aug-assign target join ``tracked``
+    exactly the way an ordinary ``n = EXPR`` already does, rather than
+    re-deriving the propagation logic per binding form.
+
+    ``targets`` is always a LIST, even for the single-target forms, so the
+    caller's existing ``ast.walk(target)`` tuple/starred/list unpacking logic
+    (already needed for a plain ``a, b = ...`` assignment) covers a
+    ``for a, *rest in pairs:`` or ``with ctx() as (a, b):`` target for free,
+    with no separate unpacking rule needed per binding form.
+
+    Deliberately narrow, matching every other extraction function in this
+    module: a ``with`` item with no ``as`` clause (``optional_vars is
+    None``) binds nothing and is skipped, not raised on -- there is no
+    target for taint to reach. Binding forms this function does not list
+    (an ``except ... as name:`` handler, a function parameter default) stay
+    outside this module's tracked-set model entirely, the same documented,
+    accepted boundary the module's own KNOWN LIMITATIONS section already
+    draws for lexical scoping in general -- not a shape this round's finding
+    named, and not one #202's own dispatch-branch shapes use.
+    """
+    if isinstance(node, ast.Assign):
+        return (node.value, list(node.targets)) if node.value is not None else None
+    if isinstance(node, ast.AnnAssign):
+        return (node.value, [node.target]) if node.value is not None else None
+    if isinstance(node, (ast.NamedExpr, ast.AugAssign)):
+        return (node.value, [node.target])
+    if isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+        # A `for`/comprehension TARGET is bound from each ELEMENT of
+        # ``iter``, not from ``iter`` itself -- but this module's taint
+        # question is only ever "does the bound name still carry the
+        # path", and ``_propagates_taint``'s own fallback (any tracked
+        # Name anywhere in the expression's subtree) already answers that
+        # conservatively for a container literal like ``(path,)`` without
+        # needing to model *which* element ends up in the target on a
+        # given iteration -- the same over-approximation this module
+        # prefers everywhere (fail closed / re-raise-and-review beats a
+        # silent miss).
+        return (node.iter, [node.target])
+    if isinstance(node, ast.withitem) and node.optional_vars is not None:
+        return (node.context_expr, [node.optional_vars])
+    return None
 
 
 def _propagates_taint(value, tracked: set, fn_name: str = "",

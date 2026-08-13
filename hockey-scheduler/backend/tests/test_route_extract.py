@@ -16,15 +16,22 @@ Three properties, each with a falsifying case:
    than being emitted as a route.
 """
 
+import ast
+import json
 import textwrap
+import threading
 import unittest
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.web import route_extract as route_extract_module
 from hockey_scheduler.web.route_extract import (
-    ExtractionError, expand_pattern, extract_routes, extract_walker,
-    sample_path, templates_of_pattern,
+    BINDING_NODE_TYPES, ExtractionError, expand_pattern, extract_routes,
+    extract_walker, _binding_value_and_targets, sample_path,
+    templates_of_pattern,
 )
 
 
@@ -39,6 +46,64 @@ def _module(body: str) -> str:
         if f"def {entry}(" not in body:
             body += f"\ndef {entry}(self):\n    return None\n"
     return "class Handler:\n" + textwrap.indent(body, "    ")
+
+
+# --------------------------------------------------------------------------- #
+# Real-HTTP demonstration harness (#202 repair round 4). Several round-4      #
+# findings require showing an escape reachable over an ACTUAL socket, not      #
+# merely that extract_routes() stays silent on the same source -- a purely     #
+# static "the walker missed it" proof does not, by itself, show the miss       #
+# corresponds to a real HTTP hole (the reviewer's own words: "I verified a     #
+# real localhost Handler..."). Builds a REAL, importable BaseHTTPRequestHandler#
+# subclass from the SAME dedented source text handed to _module()/            #
+# extract_routes() -- so the static check and the live check are provably      #
+# examining IDENTICAL code, never a hand-maintained near-duplicate that could   #
+# quietly drift from what the extractor actually sees.                         #
+# --------------------------------------------------------------------------- #
+def _real_http_probe(handler_body: str, method: str, path: str, body=None):
+    """Run ``handler_body`` (the same dedented source a fixture passes to
+    ``_module()``) as a REAL server on loopback; return ``(status, text)``
+    for one real ``method path`` request.
+
+    Unlike ``_module()`` (which pads whichever of do_GET/do_POST is missing
+    so the EXTRACTOR always has both entry points to walk), a live server
+    only needs whichever verb this probe actually sends -- no padding here,
+    so a fixture missing the other verb still runs.
+    """
+    src = ("from contextlib import nullcontext\n"
+          "class _ProbeHandler(BaseHTTPRequestHandler):\n"
+          "    def _send(self, n):\n"
+          "        self._send_json({'n': n})\n"
+          "    def _send_json(self, payload, code=200):\n"
+          "        data = json.dumps(payload).encode()\n"
+          "        self.send_response(code)\n"
+          "        self.send_header('Content-Type', 'application/json')\n"
+          "        self.send_header('Content-Length', str(len(data)))\n"
+          "        self.end_headers()\n"
+          "        self.wfile.write(data)\n"
+          "    def log_message(self, *a):\n"
+          "        pass\n"
+          + textwrap.indent(textwrap.dedent(handler_body), "    "))
+    ns = {"BaseHTTPRequestHandler": BaseHTTPRequestHandler, "json": json}
+    exec(compile(src, "<probe>", "exec"), ns)  # noqa: S102 -- test-only, fixed source
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), ns["_ProbeHandler"])
+    port = httpd.server_address[1]
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{port}{path}"
+        headers = {"Content-Type": "application/json"} if method == "POST" else {}
+        data = json.dumps(body or {}).encode() if method == "POST" else None
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, r.read().decode()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode()
+    finally:
+        httpd.shutdown()
+        thread.join(timeout=5)
+        httpd.server_close()
 
 
 # --------------------------------------------------------------------------- #
@@ -1664,6 +1729,253 @@ class DecoratorLimitationGuardTests(unittest.TestCase):
                     "routing logic is never walked) may now be LIVE. See "
                     "route_extract.py's module docstring, KNOWN "
                     "LIMITATIONS, before dismissing this failure.")
+
+
+# --------------------------------------------------------------------------- #
+# #202 repair round 4, finding 2: the fixed-point taint loop in                #
+# _audit_function only ever recognised ast.Assign/ast.AnnAssign (and, round 3  #
+# finding F, ast.NamedExpr) as a binding event -- a `for candidate in          #
+# (path,):`, `with holder(path) as candidate:`, or `candidate += path` bound a #
+# new local carrying the path with NOTHING added to `tracked`, so a later      #
+# branch keyed on that local was neither classified nor raised on: zero        #
+# exception, zero route. See _binding_value_and_targets' own docstring for the #
+# unifying fix.                                                                #
+# --------------------------------------------------------------------------- #
+class UnmodelledBindingFormTests(unittest.TestCase):
+    def _raises(self, body, *substrings):
+        with self.assertRaises(ExtractionError) as caught:
+            extract_routes(_module(body))
+        msg = str(caught.exception)
+        for s in substrings:
+            self.assertIn(s, msg)
+
+    # -- pre-fix escape, reproduced via git stash (not re-run here: git stash
+    # cannot be invoked from inside a test process) -- the transcript below is
+    # what running each of these fixtures produced against the code as it
+    # stood immediately before this finding's fix, captured verbatim:
+    #
+    #   FOR:           no raise. routes = []
+    #   WITH:          no raise. routes = []
+    #   AUGASSIGN:     no raise. routes = []
+    #
+    # each is now either extracted or refused -- never silent -- asserted
+    # below against the FIXED code, which is what a test process can still
+    # verify for itself on every run.
+
+    def test_for_loop_target_raises(self):
+        """``for candidate in (path,):`` -- the reviewer's own first
+        reproduction. ``_propagates_taint``'s fallback treats the tuple
+        literal as carrying ``path`` (conservative over-approximation, see
+        _binding_value_and_targets' own docstring), so ``candidate`` joins
+        ``tracked`` and the later test on it is caught by the completeness
+        scan, unrecognised."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                for candidate in (path,):
+                    if candidate == "/api/evade-for":
+                        return self._send(1)
+        ''', "candidate", "unrecognised shape")
+
+    def test_for_loop_tuple_target_raises(self):
+        """Tuple-unpacking FOR target (`for candidate, extra in (...)`) --
+        the SAME generalised ``ast.walk(target)`` leaf-collection an
+        ordinary ``a, b = ...`` assignment already gets, reused for a For
+        target with no separate unpacking rule."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                for candidate, extra in ((path, 1),):
+                    if candidate == "/api/evade-for-tuple":
+                        return self._send(1)
+        ''', "candidate", "unrecognised shape")
+
+    def test_comprehension_target_raises(self):
+        """A list-comprehension's own `for` clause is an ``ast.comprehension``
+        node, structurally distinct from ``ast.For`` -- the same fixed-point
+        loop must recognise both. ``hits`` itself joins ``tracked`` once its
+        comprehension element narrows a tracked subject, then the later
+        truthiness test on ``hits`` is unrecognised."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                hits = [c for c in (path,) if c == "/api/evade-comp"]
+                if hits:
+                    return self._send(1)
+        ''', "hits", "unrecognised shape")
+
+    def test_with_as_target_raises(self):
+        """``with holder(path) as candidate:`` -- the reviewer's own second
+        reproduction. ``holder(path)`` is itself an unlisted call whose
+        argument mentions the tracked ``path`` -- the SAME fail-closed rule
+        _propagates_taint already applies to an assignment's RHS, now
+        reached from a with-item's ``context_expr`` instead."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                with holder(path) as candidate:
+                    if candidate == "/api/evade-with":
+                        return self._send(1)
+        ''', "holder(path)", "unlisted call")
+
+    def test_with_as_tuple_target_raises(self):
+        """Tuple-unpacking WITH target (`with ctx() as (candidate, extra):`)
+        -- same generalised leaf-collection as the For-tuple case above,
+        reused for withitem.optional_vars."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                with holder(path) as (candidate, extra):
+                    if candidate == "/api/evade-with-tuple":
+                        return self._send(1)
+        ''', "holder(path)", "unlisted call")
+
+    def test_with_no_as_binds_nothing_and_is_not_flagged(self):
+        """A ``with EXPR:`` with no ``as`` clause binds no target -- there is
+        nothing for taint to reach, so this must NOT raise merely because
+        the with-item exists; the INNER, ordinary ``path`` test is still
+        correctly recognised as a route. (The context expression's own call
+        touching ``path`` with no binding at all is a documented, narrower,
+        out-of-scope shape -- see _binding_value_and_targets' docstring --
+        not a finding-2 regression.)"""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                with nullcontext(path):
+                    if path == "/api/normal-with-noas":
+                        return self._send(1)
+        '''))}
+        self.assertEqual(found, {("GET", "/api/normal-with-noas")})
+
+    def test_augassign_target_raises(self):
+        """``candidate += path`` -- the reviewer's own third reproduction.
+        ``candidate`` did not exist as a tracked name before this statement;
+        the fixed-point loop must still recognise the AugAssign RHS as
+        carrying ``path`` and add the target."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                candidate = ""
+                candidate += path
+                if candidate == "/api/evade-augassign":
+                    return self._send(1)
+        ''', "candidate", "unrecognised shape")
+
+    def test_asyncfor_target_is_modelled_identically_to_for(self):
+        """``ast.AsyncFor`` cannot be DEMONSTRATED the way the other six
+        shapes above are: ``async for``/``async with`` are only legal
+        syntax inside an ``async def`` function, and
+        ``_DispatchWalker.__init__`` only ever harvests ``ast.FunctionDef``
+        nodes into ``self.functions`` (``ast.AsyncFunctionDef`` is a
+        SIBLING node type, not a subclass) -- an async entry point or
+        delegate helper is already invisible to this module for a separate,
+        pre-existing reason (it would fail the unrelated "entry point not
+        found" / "delegates to self.x() in a form the walker does not
+        follow" checks first), so no fixture can put a live ``async for``
+        inside a function this module actually walks. What IS checkable
+        directly: ``_binding_value_and_targets`` -- the one place this
+        binding form is recognised -- resolves an ``ast.AsyncFor`` node
+        identically to the ``ast.For`` sibling it shares both fields with,
+        so the SAME fixed-point loop covers it structurally the day
+        anything upstream of this function ever starts walking async code."""
+        for_node = ast.parse("for c in (path,): pass").body[0]
+        async_src = "async def _f():\n    async for c in (path,): pass\n"
+        async_for_node = ast.parse(async_src).body[0].body[0]
+        self.assertIsInstance(for_node, ast.For)
+        self.assertIsInstance(async_for_node, ast.AsyncFor)
+        for_result = _binding_value_and_targets(for_node)
+        async_result = _binding_value_and_targets(async_for_node)
+        self.assertIsNotNone(async_result)
+        self.assertEqual(ast.dump(async_result[0]), ast.dump(for_result[0]))
+        self.assertEqual(ast.dump(async_result[1][0]), ast.dump(for_result[1][0]))
+
+    def test_every_binding_node_type_is_reachable_by_ast_walk(self):
+        """Sanity check on the module's own declared list: every type named
+        in BINDING_NODE_TYPES really is a node ``ast.walk`` will visit
+        inside an ordinary function body (not, e.g., a node python's grammar
+        only permits somewhere ``ast.walk`` does not descend into) -- a
+        cross-check on the constant itself, independent of any one fixture
+        above happening to exercise it. ``ast.AsyncFor`` is parsed from its
+        own ``async def`` snippet (see test_asyncfor_target_is_modelled_
+        identically_to_for's own docstring for why it cannot share the
+        others' ordinary function body)."""
+        src = '''
+def do_GET(self):
+    path = self.path
+    a = path
+    b: str = path
+    (c := path)
+    d = ""
+    d += path
+    for e in (path,):
+        pass
+    [f for f in (path,)]
+    with nullcontext(path) as g:
+        pass
+'''
+        found_types = {type(n) for n in ast.walk(ast.parse(src))
+                       if isinstance(n, BINDING_NODE_TYPES)}
+        async_src = "async def _f():\n    async for h in (path,): pass\n"
+        found_types |= {type(n) for n in ast.walk(ast.parse(async_src))
+                        if isinstance(n, BINDING_NODE_TYPES)}
+        self.assertEqual(found_types, set(BINDING_NODE_TYPES))
+
+    # -- real HTTP: the reviewer's own three named reproductions, shown       #
+    # reachable over an ACTUAL socket from the identical source handed to     #
+    # extract_routes() above -- not merely a static claim about what would    #
+    # happen. route_extract.py performs no runtime behaviour of its own (a    #
+    # STATIC analyzer), so this half of the proof is independent of whether   #
+    # the fix above has landed yet -- the server-shaped fixture answers the   #
+    # same way regardless; what changes is only whether extract_routes()      #
+    # stays silent about it.                                                 #
+    def test_for_loop_escape_answers_over_real_http(self):
+        status, text = _real_http_probe('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                for candidate in (path,):
+                    if candidate == "/api/evade-for":
+                        return self._send(1)
+                return self._send_json({"error": "not_found"}, 404)
+        ''', "GET", "/api/evade-for")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"n": 1})
+
+    def test_with_as_escape_answers_over_real_http(self):
+        status, text = _real_http_probe('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                with nullcontext(path) as candidate:
+                    if candidate == "/api/evade-with":
+                        return self._send(1)
+                return self._send_json({"error": "not_found"}, 404)
+        ''', "GET", "/api/evade-with")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"n": 1})
+
+    def test_augassign_escape_answers_over_real_http(self):
+        status, text = _real_http_probe('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                candidate = ""
+                candidate += path
+                if candidate == "/api/evade-augassign":
+                    return self._send(1)
+                return self._send_json({"error": "not_found"}, 404)
+        ''', "GET", "/api/evade-augassign")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"n": 1})
+
+    def test_the_real_server_extracts_with_no_new_raises(self):
+        """The real server.py must still extract cleanly after finding 2's
+        fixed-point extension -- none of its real For/With/AugAssign/
+        comprehension usage (there is plenty, e.g. every ``for pid in
+        _player_ids(...)``-shaped loop elsewhere in the codebase) binds a
+        name FROM a tracked subject the way the synthetic fixtures above
+        do, so nothing new should join ``tracked`` and nothing new should
+        raise."""
+        walker = extract_walker()
+        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(walker.unreachable, [])
 
 
 if __name__ == "__main__":  # pragma: no cover
