@@ -564,13 +564,40 @@ class _DispatchWalker:
                 if grp is not None:
                     ctx.bind_subject(name_node.id, grp)
 
+    # Every regex entry point, not just the two this walker understands. A call
+    # to any of these ON A TRACKED SUBJECT that the walker cannot classify is an
+    # ERROR, never a skip: `re.search(...)` and a module-level precompiled
+    # `_RX.match(path)` were both DEMONSTRATED to add a live, publicly reachable
+    # route while the extractor's count stayed at 237 and every gate test passed.
+    # A gate that silently misses a shape is worse than no gate, because the next
+    # person trusts it.
+    _REGEX_METHODS = ("match", "fullmatch", "search", "findall", "finditer",
+                      "split", "sub", "subn")
+
+    def _touches_tracked(self, node, ctx: _Ctx) -> bool:
+        return any(isinstance(a, ast.Name) and a.id in ctx.subjects
+                   for a in ast.walk(node))
+
     def _as_regex_call(self, node, ctx: _Ctx):
-        if not (isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "re"
-                and node.func.attr in ("match", "fullmatch")
-                and len(node.args) == 2):
+        if not isinstance(node, ast.Call):
+            return None
+        recognised = (isinstance(node.func, ast.Attribute)
+                      and isinstance(node.func.value, ast.Name)
+                      and node.func.value.id == "re"
+                      and node.func.attr in ("match", "fullmatch")
+                      and len(node.args) == 2)
+        if not recognised:
+            # FAIL CLOSED. Anything regex-shaped that consumes a dispatch
+            # subject, in a form this walker does not model, stops the build.
+            if isinstance(node.func, ast.Attribute) \
+                    and node.func.attr in self._REGEX_METHODS \
+                    and self._touches_tracked(node, ctx):
+                raise ExtractionError(
+                    f"line {node.lineno}: regex call "
+                    f"`{ast.unparse(node)}` consumes a dispatch subject in a "
+                    f"shape route_extract does not model. Classify it here — "
+                    f"do not let it be skipped, or the route it guards becomes "
+                    f"invisible to the #202 gate.")
             return None
         pattern_node, subject_node = node.args
         if not (isinstance(pattern_node, ast.Constant)
@@ -579,6 +606,16 @@ class _DispatchWalker:
                                   f"{node.lineno}")
         if not (isinstance(subject_node, ast.Name)
                 and subject_node.id in ctx.subjects):
+            # A modelled re.match() whose subject we do not track: either the
+            # subject is genuinely unrelated to routing, or it is the path under
+            # a name we failed to taint. Only the first is safe, and we cannot
+            # tell them apart here — so raise unless the subject is provably
+            # untainted (not derived from self.path and not a tracked name).
+            if self._touches_tracked(subject_node, ctx) or _is_path_derived(subject_node):
+                raise ExtractionError(
+                    f"line {node.lineno}: re.match on `"
+                    f"{ast.unparse(subject_node)}`, which is path-derived but "
+                    f"not a tracked dispatch subject")
             return None
         return (subject_node.id, pattern_node.value,
                 expand_pattern(pattern_node.value))
@@ -898,10 +935,35 @@ class _DispatchWalker:
         helper. This is what makes "the extractor sees every branch" checkable
         rather than hopeful."""
         tracked = set(ctx.seen) | {"path"}
+        # TAINT PROPAGATION. Any local bound from the path — directly, sliced,
+        # or from another tainted local — joins the tracked set, so renaming it
+        # cannot hide a branch. Iterated to a fixed point because one rename can
+        # feed another.
+        changed = True
+        while changed:
+            changed = False
+            for node in ast.walk(fn):
+                if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    continue
+                value = node.value
+                if value is None:
+                    continue
+                derived = _propagates_taint(value, tracked)
+                if not derived:
+                    continue
+                targets = node.targets if isinstance(node, ast.Assign) \
+                    else [node.target]
+                for target in targets:
+                    for leaf in ast.walk(target):
+                        if isinstance(leaf, ast.Name) and leaf.id not in tracked:
+                            tracked.add(leaf.id)
+                            changed = True
         for node in ast.walk(fn):
             if isinstance(node, ast.If) and id(node) not in self._classified:
                 names = _direct_operand_names(node.test)
                 hit = names & tracked
+                if hit and (fn.name, ast.unparse(node.test)) in _AUDIT_WAIVERS:
+                    continue
                 if hit:
                     raise ExtractionError(
                         f"{fn.name}:{node.lineno} tests dispatch subject(s) "
@@ -926,6 +988,74 @@ class _DispatchWalker:
                     raise ExtractionError(
                         f"{fn.name}:{node.lineno} delegates to self.{name}() "
                         "in a form the walker does not follow")
+
+
+# Branches that DECIDE ON a path-derived name but are not routing decisions.
+#
+# Fail-closed is the rule: an unrecognised test on a dispatch subject stops the
+# build. These are the declared exceptions — each one reviewed, each one a
+# visible line in the diff. Adding a waiver is deliberately as conspicuous as
+# adding a route, because a waiver is how the gate would be quietly defeated.
+#
+# Keyed by (function name, the exact unparsed test). A drifted test no longer
+# matches its waiver and raises again, which is the intended behaviour.
+_AUDIT_WAIVERS = {
+    ("_serve_static",
+     "STATIC_DIR not in target.parents or not target.is_file()"):
+        "filesystem containment on the already-resolved static target -- it "
+        "decides whether to SERVE, not which route was chosen",
+    ("_serve_static", "target.suffix == '.html'"):
+        "content-type selection for the already-resolved static target",
+}
+
+
+_PATH_OPS = ("split", "rsplit", "strip", "lstrip", "rstrip", "lower", "upper",
+             "partition", "rpartition", "removeprefix", "removesuffix",
+             "replace", "format", "join", "casefold")
+
+
+def _propagates_taint(value, tracked: set) -> bool:
+    """Does this expression still CARRY the request path?
+
+    Deliberately narrow. `p2 = self.path.split("?", 1)[0]` carries it -- string
+    surgery on the path is still the path. `ics = api.calendar_feed_ics(
+    cal.group(1))` does NOT: a route capture handed to a service produces a
+    RESULT, and testing that result (`if ics is None`) is a post-dispatch
+    decision, not a route choice.
+
+    Getting this wrong in the permissive direction reopens the hole the taint
+    tracking exists to close. Getting it wrong the other way produced eleven
+    spurious failures, which I initially waived -- waiving an analysis defect
+    would have left eleven standing invitations to hide a route behind a service
+    call.
+    """
+    for node in ast.walk(value):
+        if isinstance(node, ast.Call):
+            func = node.func
+            manipulates = (isinstance(func, ast.Attribute)
+                           and func.attr in _PATH_OPS
+                           and _propagates_taint(func.value, tracked))
+            if not manipulates:
+                return False          # a call result is not the path
+    if _is_path_derived(value):
+        return True
+    return any(isinstance(x, ast.Name) and x.id in tracked
+               for x in ast.walk(value))
+
+
+def _is_path_derived(node) -> bool:
+    """Does this expression read the request path, however indirectly?
+
+    ``self.path``, ``self.path.split("?", 1)[0]``, ``p2`` bound from either —
+    all of it. Renaming the local was a DEMONSTRATED evasion: `p2 = self.path...`
+    then `if p2 == "/api/evade-rename"` produced a live 200 while the gate
+    stayed green, because the audit only ever tracked the literal name "path".
+    """
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Attribute) and sub.attr == "path" \
+                and isinstance(sub.value, ast.Name) and sub.value.id == "self":
+            return True
+    return False
 
 
 def _direct_operand_names(test) -> set:
