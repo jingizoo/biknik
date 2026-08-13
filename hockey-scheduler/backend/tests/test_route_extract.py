@@ -21,6 +21,7 @@ import unittest
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
+from hockey_scheduler.web import route_extract as route_extract_module
 from hockey_scheduler.web.route_extract import (
     ExtractionError, expand_pattern, extract_routes, extract_walker,
     sample_path, templates_of_pattern,
@@ -964,6 +965,109 @@ class SiblingOverlapTests(unittest.TestCase):
         walker = extract_walker()
         self.assertEqual(len(walker.routes), 239)
         self.assertEqual(walker.unreachable, [])
+
+
+# --------------------------------------------------------------------------- #
+# #202 repair round 2, finding D: nothing counted or checked that a declared   #
+# _AUDIT_WAIVERS entry was actually CONSULTED during a run. An orphaned entry  #
+# (matching no line anywhere) sat silently and extraction succeeded normally   #
+# -- directly contradicting "any future waiver must be exact-one-hit and       #
+# fingerprinted". _DispatchWalker.waiver_hits/verify_waiver_usage close it.    #
+# --------------------------------------------------------------------------- #
+class WaiverFingerprintTests(unittest.TestCase):
+    def _with_waivers(self, waivers: dict):
+        """Temporarily replace the module's real _AUDIT_WAIVERS with exactly
+        `waivers`, restored even if the test body raises -- these tests must
+        never leak a mutated waiver dict into any other test in the process."""
+        saved = dict(route_extract_module._AUDIT_WAIVERS)
+        route_extract_module._AUDIT_WAIVERS.clear()
+        route_extract_module._AUDIT_WAIVERS.update(waivers)
+        self.addCleanup(lambda: (
+            route_extract_module._AUDIT_WAIVERS.clear(),
+            route_extract_module._AUDIT_WAIVERS.update(saved)))
+
+    def test_every_real_waiver_is_hit_exactly_once(self):
+        """The real server.py, unmodified: each of the 10 declared waivers
+        (2 pre-existing + 2 pre-existing ternaries + 6 this round's findings
+        added) is consulted for precisely the one line it names -- proves
+        the instrumentation is wired all the way through _propagates_taint
+        AND the ast.If/ast.IfExp/ast.While scan, not just one of them."""
+        walker = extract_walker()
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 10)
+        for key in route_extract_module._AUDIT_WAIVERS:
+            with self.subTest(waiver=key):
+                self.assertEqual(len(walker.waiver_hits.get(key, ())), 1)
+
+    def test_a_dormant_waiver_matching_nothing_raises(self):
+        """The exact reproduced shape: an orphaned entry, matching no line
+        anywhere, used to sit silently with extraction succeeding normally."""
+        self._with_waivers({
+            ("do_GET", "this_never_matches_anything_in_the_fixture"): "orphaned",
+        })
+        walker = extract_walker(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if path == "/api/x":
+                    return self._send(1)
+        '''))
+        with self.assertRaises(ExtractionError) as caught:
+            walker.verify_waiver_usage()
+        msg = str(caught.exception)
+        self.assertIn("DORMANT", msg)
+        self.assertIn("this_never_matches_anything_in_the_fixture", msg)
+
+    def test_a_waiver_matching_two_distinct_locations_raises(self):
+        """"More than one hit" is a failure too -- a waiver text that
+        happens to match TWO sibling occurrences of the identical
+        unrecognised test cannot be trusted as pinned to the one line its
+        author reviewed."""
+        waiver_text = "path == '/api/x' or path == '/api/y'"
+        self._with_waivers({("do_GET", waiver_text): "matches two lines"})
+        walker = extract_walker(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if path == "/api/x" or path == "/api/y":
+                    return self._send(1)
+                if path == "/api/x" or path == "/api/y":
+                    return self._send(2)
+        '''))
+        with self.assertRaises(ExtractionError) as caught:
+            walker.verify_waiver_usage()
+        msg = str(caught.exception)
+        self.assertIn("TOO BROAD", msg)
+        self.assertIn("2 distinct locations", msg)
+
+    def test_a_waiver_matching_exactly_one_location_does_not_raise(self):
+        """The legitimate, single-hit case -- the control for the two
+        failure-mode tests above, proving they fail for the stated reason
+        and not merely because verify_waiver_usage always raises."""
+        waiver_text = "path == '/api/x' or path == '/api/y'"
+        self._with_waivers({("do_GET", waiver_text): "matches one line"})
+        walker = extract_walker(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if path == "/api/x" or path == "/api/y":
+                    return self._send(1)
+        '''))
+        walker.verify_waiver_usage()  # must not raise
+
+    def test_synthetic_fixtures_are_not_checked_against_real_waivers(self):
+        """extract_routes()/extract_walker() gate verify_waiver_usage() to
+        `source is None` (the real file) specifically -- a synthetic test
+        fixture legitimately consults none of server.py's own waivers, and
+        must NOT be forced to satisfy their fingerprint. Every OTHER test in
+        this file passes a synthetic `source`; this is the one asserting
+        that gate exists at all, not just relying on the rest happening not
+        to trip it."""
+        walker = extract_walker(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if path == "/api/x":
+                    return self._send(1)
+        '''))
+        # None of the real _AUDIT_WAIVERS were consulted -- would fail
+        # fingerprinting if checked, but extract_walker() must not have.
+        self.assertEqual(walker.waiver_hits, {})
 
 
 # --------------------------------------------------------------------------- #

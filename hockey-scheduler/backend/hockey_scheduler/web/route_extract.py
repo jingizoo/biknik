@@ -619,6 +619,19 @@ class _DispatchWalker:
         self._classified = set()   # id() of If nodes this walker understood
         self._followed = set()     # id() of delegation Calls this walker took
         self._walked = set()       # (function, subject shapes) already walked
+        #: #202 repair round 2, finding D. key -> {id(node), ...} for every
+        #: _AUDIT_WAIVERS entry actually consulted this run, recording the
+        #: DISTINCT AST NODES matched (not a raw hit count) so re-examining
+        #: the SAME source line more than once -- which _propagates_taint's
+        #: own taint fixed-point loop legitimately does, revisiting every
+        #: assignment on each pass until nothing new grows, an
+        #: implementation detail unrelated to how many SOURCE LOCATIONS a
+        #: waiver actually matches -- never masquerades as "matches two
+        #: different lines". See :meth:`verify_waiver_usage`.
+        self.waiver_hits = {}
+
+    def _record_waiver_hit(self, key: tuple, node) -> None:
+        self.waiver_hits.setdefault(key, set()).add(id(node))
 
     # -- public ------------------------------------------------------------
     def run(self, entry_points: dict) -> list:
@@ -632,6 +645,47 @@ class _DispatchWalker:
         self._audit_unwalked_verbs(set(entry_points.values()))
         return sorted(self.routes.values(),
                       key=lambda r: (r.method, r.template))
+
+    def verify_waiver_usage(self) -> None:
+        """#202 repair round 2, finding D: every declared ``_AUDIT_WAIVERS``
+        entry must be consulted EXACTLY ONCE by a completed run -- never
+        zero (a DORMANT/orphaned entry matching no line anywhere in the
+        parsed source, proof nothing depends on it and it is silently
+        rotting) and never more than one DISTINCT source location (too
+        broad to trust that it is really pinned to the one line it names).
+        This is the fingerprinting the original review required and is the
+        one check standing between a future waiver and it quietly
+        defeating the whole gate by matching something its author never
+        reviewed.
+
+        Call after a completed :meth:`run` -- callers gate this to the
+        REAL ``server.py`` (see :func:`extract_routes`/:func:`extract_walker`
+        with ``source=None``): a synthetic test fixture legitimately
+        consults none of server.py's own waivers, so enforcing this
+        unconditionally would fail every such fixture, not just a
+        genuinely orphaned or over-broad waiver.
+        """
+        orphaned = [key for key in _AUDIT_WAIVERS
+                   if len(self.waiver_hits.get(key, ())) == 0]
+        too_broad = [key for key in _AUDIT_WAIVERS
+                    if len(self.waiver_hits.get(key, ())) > 1]
+        if not orphaned and not too_broad:
+            return
+        lines = []
+        for fn_name, expr in orphaned:
+            lines.append(f"  DORMANT (0 hits): ({fn_name!r}, {expr!r})")
+        for fn_name, expr in too_broad:
+            hits = len(self.waiver_hits[(fn_name, expr)])
+            lines.append(f"  TOO BROAD ({hits} distinct locations): "
+                        f"({fn_name!r}, {expr!r})")
+        raise ExtractionError(
+            "_AUDIT_WAIVERS entries failed exact-one-hit fingerprinting:\n"
+            + "\n".join(lines) +
+            "\nA dormant waiver matches nothing and must be removed (it is "
+            "proof nothing depends on it); a too-broad waiver matches more "
+            "than the one reviewed line it names and must be narrowed or "
+            "split into one entry per location -- neither may be trusted "
+            "as-is.")
 
     def _audit_unwalked_verbs(self, walked: set):
         """No OTHER ``do_*`` verb may grow a dispatch of its own unnoticed.
@@ -1215,11 +1269,12 @@ class _DispatchWalker:
                 template = "/" + template
             self._emit(ctx, template, "static-tail", node.lineno, node.test)
 
-    @staticmethod
-    def _else_rederives_subject(orelse: list, subject: str, fn_name: str) -> bool:
+    def _else_rederives_subject(self, orelse: list, subject: str,
+                                fn_name: str) -> bool:
         for stmt in orelse:
             if isinstance(stmt, ast.Assign) \
-                    and _propagates_taint(stmt.value, {subject}, fn_name):
+                    and _propagates_taint(stmt.value, {subject}, fn_name,
+                                          self.waiver_hits):
                 return True
         return False
 
@@ -1675,7 +1730,8 @@ class _DispatchWalker:
                     # _record_binding already resolved rather than force
                     # this coarse, flat-namespace check to duplicate it.
                     continue
-                derived = _propagates_taint(value, tracked, fn.name)
+                derived = _propagates_taint(value, tracked, fn.name,
+                                            self.waiver_hits)
                 if not derived:
                     continue
                 for leaf in leaves:
@@ -1686,7 +1742,9 @@ class _DispatchWalker:
             if isinstance(node, ast.If) and id(node) not in self._classified:
                 names = _direct_operand_names(node.test)
                 hit = names & tracked
-                if hit and (fn.name, ast.unparse(node.test)) in _AUDIT_WAIVERS:
+                key = (fn.name, ast.unparse(node.test))
+                if hit and key in _AUDIT_WAIVERS:
+                    self._record_waiver_hit(key, node)
                     continue
                 if hit:
                     raise ExtractionError(
@@ -1709,7 +1767,9 @@ class _DispatchWalker:
                 # already exists for, so it goes through the SAME waivers.
                 names = _direct_operand_names(node.test)
                 hit = names & tracked
-                if hit and (fn.name, ast.unparse(node.test)) in _AUDIT_WAIVERS:
+                key = (fn.name, ast.unparse(node.test))
+                if hit and key in _AUDIT_WAIVERS:
+                    self._record_waiver_hit(key, node)
                     continue
                 if hit:
                     raise ExtractionError(
@@ -1729,7 +1789,9 @@ class _DispatchWalker:
                 # (none needed today -- server.py has no `while` at all).
                 names = _direct_operand_names(node.test)
                 hit = names & tracked
-                if hit and (fn.name, ast.unparse(node.test)) in _AUDIT_WAIVERS:
+                key = (fn.name, ast.unparse(node.test))
+                if hit and key in _AUDIT_WAIVERS:
+                    self._record_waiver_hit(key, node)
                     continue
                 if hit:
                     raise ExtractionError(
@@ -1970,7 +2032,8 @@ def _mentions_tracked(node, tracked: set) -> bool:
                for child in ast.iter_child_nodes(node))
 
 
-def _propagates_taint(value, tracked: set, fn_name: str = "") -> bool:
+def _propagates_taint(value, tracked: set, fn_name: str = "",
+                      waiver_hits: Optional[dict] = None) -> bool:
     """Does this expression still CARRY the request path?
 
     Deliberately narrow. `p2 = self.path.split("?", 1)[0]` carries it -- string
@@ -2028,11 +2091,13 @@ def _propagates_taint(value, tracked: set, fn_name: str = "") -> bool:
             func = node.func
             manipulates = (isinstance(func, ast.Attribute)
                            and func.attr in (_PATH_OPS + _PATH_METHODS)
-                           and _propagates_taint(func.value, tracked, fn_name))
+                           and _propagates_taint(func.value, tracked, fn_name,
+                                                 waiver_hits))
             if manipulates:
                 continue
             if _mentions_tracked(node, tracked):
-                if (fn_name, ast.unparse(node)) in _AUDIT_WAIVERS:
+                waiver_key = (fn_name, ast.unparse(node))
+                if waiver_key in _AUDIT_WAIVERS:
                     # Reviewed and declared not-a-routing-decision (see the
                     # waiver's own entry) -- like a provably-unrelated call,
                     # this must not propagate either, or the LHS would join
@@ -2042,6 +2107,12 @@ def _propagates_taint(value, tracked: set, fn_name: str = "") -> bool:
                     # here but left `parent` tracked moved this exact error
                     # onto `if parent is not None:`, unwaived, one line
                     # down).
+                    if waiver_hits is not None:
+                        # #202 repair round 2, finding D: record the exact
+                        # AST node this waiver matched, so a completed run
+                        # can verify every declared waiver was consulted
+                        # EXACTLY ONCE (see _DispatchWalker.verify_waiver_usage).
+                        waiver_hits.setdefault(waiver_key, set()).add(id(node))
                     return False
                 raise ExtractionError(
                     f"line {node.lineno}: `{ast.unparse(node)}` is an "
@@ -2060,10 +2131,10 @@ def _propagates_taint(value, tracked: set, fn_name: str = "") -> bool:
         # pathlib's own join operator: `STATIC_DIR / rel` is a Path built
         # from whichever operand carries the path -- the construction
         # analogue of the method calls handled above.
-        return (_propagates_taint(value.left, tracked, fn_name)
-                or _propagates_taint(value.right, tracked, fn_name))
+        return (_propagates_taint(value.left, tracked, fn_name, waiver_hits)
+                or _propagates_taint(value.right, tracked, fn_name, waiver_hits))
     if isinstance(value, ast.Attribute) and value.attr in _PATH_PROPERTIES:
-        return _propagates_taint(value.value, tracked, fn_name)
+        return _propagates_taint(value.value, tracked, fn_name, waiver_hits)
     return any(isinstance(x, ast.Name) and x.id in tracked
                for x in ast.walk(value))
 
@@ -2161,7 +2232,17 @@ def extract_routes(source: Optional[str] = None,
     """Every live dispatch branch in ``server.py`` (or in ``source``)."""
     text = source if source is not None else SERVER_PATH.read_text()
     walker = _DispatchWalker(ast.parse(text))
-    return walker.run(entry_points or ENTRY_POINTS)
+    routes = walker.run(entry_points or ENTRY_POINTS)
+    if source is None:
+        # #202 repair round 2, finding D: fingerprint-verify _AUDIT_WAIVERS
+        # against the REAL server.py specifically -- gated on `source is
+        # None` (the "give me the real file" convention every call site
+        # already uses) rather than unconditional, because a SYNTHETIC test
+        # fixture legitimately consults none of server.py's own waivers;
+        # enforcing this for every such fixture would fail all of them, not
+        # just a genuinely orphaned or over-broad waiver.
+        walker.verify_waiver_usage()
+    return routes
 
 
 def extract_walker(source: Optional[str] = None,
@@ -2170,6 +2251,8 @@ def extract_walker(source: Optional[str] = None,
     text = source if source is not None else SERVER_PATH.read_text()
     walker = _DispatchWalker(ast.parse(text))
     walker.run(entry_points or ENTRY_POINTS)
+    if source is None:
+        walker.verify_waiver_usage()  # see extract_routes' own comment
     return walker
 
 
