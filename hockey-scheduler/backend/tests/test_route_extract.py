@@ -987,13 +987,16 @@ class WaiverFingerprintTests(unittest.TestCase):
             route_extract_module._AUDIT_WAIVERS.update(saved)))
 
     def test_every_real_waiver_is_hit_exactly_once(self):
-        """The real server.py, unmodified: each of the 10 declared waivers
-        (2 pre-existing + 2 pre-existing ternaries + 6 this round's findings
-        added) is consulted for precisely the one line it names -- proves
-        the instrumentation is wired all the way through _propagates_taint
-        AND the ast.If/ast.IfExp/ast.While scan, not just one of them."""
+        """The real server.py, unmodified: each of the 18 declared waivers
+        (10 from round 2 -- 2 pre-existing + 2 pre-existing ternaries + 6
+        that round's findings added -- plus 8 round-3 finding E additions,
+        once a Call reached as a comparison operand had its arguments
+        scanned too) is consulted for precisely the one line it names --
+        proves the instrumentation is wired all the way through
+        _propagates_taint AND the ast.If/ast.IfExp/ast.While scan, not
+        just one of them."""
         walker = extract_walker()
-        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 10)
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 18)
         for key in route_extract_module._AUDIT_WAIVERS:
             with self.subTest(waiver=key):
                 self.assertEqual(len(walker.waiver_hits.get(key, ())), 1)
@@ -1258,18 +1261,51 @@ class UnknownShapesRaiseTests(unittest.TestCase):
         self.assertIn("does not follow", str(caught.exception))
 
     def test_a_guard_that_merely_passes_the_path_along_is_not_a_route(self):
+        """A BARE call (never reached as a comparison operand) that takes
+        the raw path as an argument stays exempt with NO waiver needed --
+        #202 repair round 3, finding E deliberately did not widen this
+        far (see _direct_operand_names' own docstring): ``path`` is an
+        ARGUMENT to ``_operator_only``, not that call's own comparison
+        operand, the same distinction ``_official_guard(oav.group(1))``
+        already draws for a captured group. Contrast
+        ``test_a_call_reached_as_a_comparison_operand_raises_even_when_
+        it_is_a_known_guard_shape`` immediately below: the SAME
+        ``_supported_methods`` guard, reached through ``not in`` instead
+        of bare truthiness, is a comparison operand and DOES now raise
+        without a waiver -- this is finding E's real boundary, not the
+        one this test used to assert."""
         routes = self._extract('''
             def do_GET(self):
                 path = self.path.split("?", 1)[0]
                 if self._operator_only(path):
                     return
-                if "GET" not in self._supported_methods(path):
-                    return self._unmatched_route("GET")
                 if path == "/api/x":
                     return self._send(1)
         ''')
         self.assertEqual([(r.method, r.template) for r in routes],
                          [("GET", "/api/x")])
+
+    def test_a_call_reached_as_a_comparison_operand_raises_even_when_it_is_a_known_guard_shape(self):
+        """#202 repair round 3, finding E: unlike the bare-call form above,
+        ``self._supported_methods(path)`` reached as a comparator of
+        ``not in`` DOES carry ``path`` into a comparison operand position,
+        so it raises -- mirroring the real do_POST's own first line
+        (``if "POST" not in self._supported_methods(path):``), which
+        needed a fresh, reviewed ``_AUDIT_WAIVERS`` entry once this
+        stopped being silent (see that entry's own comment). A being a
+        long-established, reviewed guard shape does not exempt it from
+        the SAME rule finding E applies generally -- it just means the
+        waiver, once declared, is a one-line, well-understood fix."""
+        with self.assertRaises(ExtractionError) as caught:
+            self._extract('''
+                def do_GET(self):
+                    path = self.path.split("?", 1)[0]
+                    if "GET" not in self._supported_methods(path):
+                        return self._unmatched_route("GET")
+                    if path == "/api/x":
+                        return self._send(1)
+            ''')
+        self.assertIn("unrecognised shape", str(caught.exception))
 
 
 # --------------------------------------------------------------------------- #
@@ -1305,6 +1341,329 @@ class UnreachableBranchTests(unittest.TestCase):
 
     def test_the_real_server_has_no_unreachable_dispatch_branches(self):
         self.assertEqual(extract_walker().unreachable, [])
+
+
+# --------------------------------------------------------------------------- #
+# #202 repair round 3, finding E: _direct_operand_names/root_name never       #
+# inspected a Call's ARGUMENTS, only its callee chain, so a Call wrapping the  #
+# tracked name and used AS A COMPARISON OPERAND (``len(path) == N``,          #
+# ``str(path) == lit``, any project-local wrapper reached the same way) was   #
+# invisible: zero ExtractionError, zero recorded route -- and, when the       #
+# branch is an earlier arm of a chain whose terminal else re-derives the      #
+# subject (root cause 6's unconditional static tail), it silently dropped     #
+# that chain's OWN static-tail route too, because an unclassified branch's    #
+# orelse never reaches _walk_terminal_else. Deliberately narrow, like round   #
+# 2's own additions: a BARE call (never reached as a comparison operand) that #
+# merely takes the tracked name as an argument stays exempt (see              #
+# UnknownShapesRaiseTests' own pair of tests just above) -- that boundary is  #
+# what finding E's own wording ("used as a comparison operand") draws, and    #
+# what keeps this from re-litigating round 2's already-reviewed blanket-gate  #
+# exemption for ``_operator_only``/``authorize``.                             #
+# --------------------------------------------------------------------------- #
+class CallWrappedOperandTests(unittest.TestCase):
+    def _raises(self, body, *substrings):
+        with self.assertRaises(ExtractionError) as caught:
+            extract_routes(_module(body))
+        msg = str(caught.exception)
+        for s in substrings:
+            self.assertIn(s, msg)
+
+    def test_len_of_path_compared_to_a_literal_raises(self):
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if len(path) == 21:
+                    return self._send(1)
+        ''', "unrecognised shape", "len(path) == 21")
+
+    def test_str_of_path_compared_to_a_literal_raises(self):
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if str(path) == "/api/evade":
+                    return self._send(1)
+        ''', "unrecognised shape")
+
+    def test_hash_of_path_compared_to_hash_of_a_literal_raises(self):
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if hash(path) == hash("/api/evade"):
+                    return self._send(1)
+        ''', "unrecognised shape")
+
+    def test_call_wrapped_operand_nested_inside_a_boolop_still_raises(self):
+        """``in_compare`` must survive passing through a BoolOp/UnaryOp on
+        its way to the actual Call, not reset to False -- ``(flag or
+        len(path)) == 5`` still reaches ``len(path)`` FROM a genuine
+        comparator position, just one layer further in."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                flag = False
+                if (flag or len(path)) == 5:
+                    return self._send(1)
+        ''', "unrecognised shape")
+
+    def test_project_local_wrapper_function_raises(self):
+        self._raises('''
+            def _wrap(p):
+                return p
+
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if _wrap(path) == "/api/evade":
+                    return self._send(1)
+        ''', "unrecognised shape")
+
+    def test_a_blanket_call_taking_the_raw_name_still_raises_when_compared(self):
+        """The general form of the gap, not just three hardcoded builtins:
+        mirrors the real do_POST's own ``authorize(role, path)`` gate --
+        but COMPARED this time, not bare -- to prove the rule is about the
+        SHAPE (comparison operand), not an allowlist of which call it is."""
+        self._raises('''
+            def do_POST(self):
+                path = self.path.split("?", 1)[0]
+                role = "whatever"
+                if authorize(role, path) == "denied":
+                    return self._send_status(403)
+                return self._send(1)
+        ''', "unrecognised shape")
+
+    def test_call_wrapped_test_no_longer_silently_drops_a_later_sibling(self):
+        """Round 3's own hunt reported a call-wrapped elif silently
+        dropping an entire GET route list when it preceded an otherwise
+        correctly-classified sibling. Whatever the precise mechanism, the
+        fix's fail-CLOSED contract makes the outcome unambiguous either
+        way: the whole extraction raises loudly the moment the call-
+        wrapped branch is reached, rather than possibly returning a
+        partial, silently-wrong route list."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if str(path) == "/api/evade":
+                    return self._send(1)
+                elif path == "/api/normal-sibling":
+                    return self._send(2)
+        ''', "unrecognised shape")
+
+    def test_call_wrapped_branch_no_longer_hides_the_chains_static_tail(self):
+        """Mirrors the real _serve_static shape (root cause 6): an earlier
+        call-wrapped arm used to make the walker skip _walk_terminal_else
+        for the WHOLE chain, silently dropping the unconditional-tail
+        route right along with the call-wrapped arm's own -- DEMONSTRATED
+        against the pre-round-3 code (not merely theorised): the fixture
+        below returned only ``{"/shell", "/shell/"}``, the static tail
+        silently missing, with no exception at all. Now raises instead of
+        silently narrowing the route set."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                return self._serve_static(path)
+
+            def _serve_static(self, path):
+                if path in ("/shell", "/shell/"):
+                    rel = "shell.html"
+                elif str(path) == "/api/evade":
+                    rel = "evade.html"
+                else:
+                    rel = path.lstrip("/")
+                target = (STATIC_DIR / rel).resolve()
+                return target
+        ''', "unrecognised shape")
+
+    def test_a_captured_group_handed_to_a_guard_call_still_does_not_raise(self):
+        """The design principle _direct_operand_names' own docstring states
+        must survive this fix: a captured group handed to an unrelated
+        guard is not a routing decision, even reached as a bare argument
+        (not just when compared) -- the opaque-extraction boundary
+        _tracked_mentions shares with _mentions_tracked is what keeps
+        ``oav`` itself from leaking out of ``oav.group(1)``."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                oav = re.match(r"^/officials/([^/]+)/availability$", path)
+                if oav:
+                    if self._official_guard(oav.group(1)) == "denied":
+                        return self._send_status(403)
+                    return self._send(1)
+
+            def _official_guard(self, official_id):
+                return "ok"
+        '''))}
+        self.assertEqual(found, {("GET", "/officials/{}/availability")})
+
+    def test_the_real_server_extracts_with_no_new_raises(self):
+        """The real server.py -- including _handle_reassign(_v2)'s own
+        authorisation-target-list construction (``targets.append((dest[0],
+        ...))``), its ``check_body(b, **SCHEMA[combo])`` validation, its
+        ``len(target) > 2`` name collision between the outer tracked
+        ``target`` parameter and the inner for-loop's own local of the
+        same name, and do_POST's own ``'POST' not in
+        self._supported_methods(path)`` 405/Allow admission check -- must
+        still extract cleanly: each is a reviewed, declared
+        _AUDIT_WAIVERS entry (see that dict's own round-3 comments), not
+        a scoping hole."""
+        walker = extract_walker()
+        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(walker.unreachable, [])
+
+
+# --------------------------------------------------------------------------- #
+# #202 repair round 3, finding F: neither root_name nor the fixed-point taint #
+# loop recognised ast.NamedExpr (the walrus operator) -- a decision bound     #
+# via ``(n := EXPR)`` and then compared, in the SAME if-test or a LATER one,  #
+# was invisible either way: zero exception, zero route.                       #
+# --------------------------------------------------------------------------- #
+class WalrusOperatorTests(unittest.TestCase):
+    def _raises(self, body, *substrings):
+        with self.assertRaises(ExtractionError) as caught:
+            extract_routes(_module(body))
+        msg = str(caught.exception)
+        for s in substrings:
+            self.assertIn(s, msg)
+
+    def test_walrus_bound_and_compared_in_the_same_if_test_raises(self):
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if (tail := path.split("/")[-1]) == "evade":
+                    return self._send(1)
+        ''', "unrecognised shape", "tail")
+
+    def test_walrus_bound_in_one_if_and_tested_in_a_later_if_raises(self):
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if (tail := path.split("/")[-1]):
+                    pass
+                if tail == "evade":
+                    return self._send(1)
+        ''', "unrecognised shape")
+
+    def test_a_walrus_not_derived_from_the_path_is_not_flagged(self):
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if path == "/api/count":
+                    if (n := len(KNOWN)) > 5:
+                        return self._send(1)
+                    return self._send(2)
+        '''))}
+        self.assertEqual(found, {("GET", "/api/count")})
+
+    def test_the_real_server_extracts_with_no_new_raises(self):
+        """server.py uses no walrus operator today; the two tests above are
+        not vacuous only because they are genuinely reproduced against a
+        fixture, exactly as WhileLoopGuardTests' own real-server control
+        documents for the analogous while-loop case."""
+        walker = extract_walker()
+        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(walker.unreachable, [])
+
+
+# --------------------------------------------------------------------------- #
+# #202 repair round 3, finding G: the fixed-point taint loop and              #
+# _audit_dispatch_helper_calls both, by design, only ever examined            #
+# ASSIGNMENT RHS values and self._handle_*/_dispatch_* ATTRIBUTE-call         #
+# syntax -- a class-level dispatch-table lookup invoked as a BARE,            #
+# UNASSIGNED statement was covered by neither, contrasted directly against    #
+# the ASSIGNED form of the identical expression, which already raised.       #
+# --------------------------------------------------------------------------- #
+class BareStatementDispatchCallTests(unittest.TestCase):
+    def _raises(self, body, *substrings):
+        with self.assertRaises(ExtractionError) as caught:
+            extract_routes(_module(body))
+        msg = str(caught.exception)
+        for s in substrings:
+            self.assertIn(s, msg)
+
+    def test_bare_dict_get_dispatch_statement_raises(self):
+        self._raises('''
+            _ROUTE_TABLE = {"/api/evade": "handler_one"}
+
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                self._maybe_dispatch(_ROUTE_TABLE.get(path))
+                return self._send(0)
+
+            def _maybe_dispatch(self, name):
+                return None
+        ''', "unlisted call")
+
+    def test_the_assigned_form_of_the_identical_expression_already_raised(self):
+        """The control: binding the SAME expression to a local first was
+        already caught by the fixed-point loop before this fix -- proves
+        the gap this closes is specifically the ASSIGNMENT-only
+        restriction, not the taint analysis itself."""
+        self._raises('''
+            _ROUTE_TABLE = {"/api/evade": "handler_one"}
+
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                outcome = _ROUTE_TABLE.get(path)
+                self._maybe_dispatch(outcome)
+                return self._send(0)
+
+            def _maybe_dispatch(self, name):
+                return None
+        ''', "unlisted call")
+
+    def test_bare_getattr_dispatch_statement_raises(self):
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                suffix = path.rsplit("/", 1)[-1]
+                getattr(self, "_handle_evade_" + suffix, self._noop)()
+
+            def _noop(self):
+                return None
+
+            def _handle_evade_target(self):
+                return self._send(1)
+        ''', "unlisted call")
+
+    def test_a_bare_call_unrelated_to_any_tracked_name_does_not_raise(self):
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if path == "/api/ping":
+                    api.record_ping()
+                    return self._send(1)
+        '''))}
+        self.assertEqual(found, {("GET", "/api/ping")})
+
+    def test_the_real_server_extracts_with_no_new_raises(self):
+        walker = extract_walker()
+        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(walker.unreachable, [])
+
+
+# --------------------------------------------------------------------------- #
+# #202 repair round 3, finding H (documented, NOT fixed -- see route_extract  #
+# .py's module docstring, KNOWN LIMITATIONS): the walker only harvests        #
+# FunctionDef nodes lexically inside class Handler, and walks do_GET/do_POST  #
+# as its two entry points. A decorator wrapping either with its OWN routing   #
+# logic (a separate module-level function) would never be walked -- nothing   #
+# here would notice. NOT exploitable against the real server.py today; this   #
+# test IS that proof, re-run every time. If it ever fails, the latent gap the #
+# docstring names may have just become live -- see that section before        #
+# dismissing this failure as routine.                                        #
+# --------------------------------------------------------------------------- #
+class DecoratorLimitationGuardTests(unittest.TestCase):
+    def test_do_get_and_do_post_carry_no_decorators_today(self):
+        walker = extract_walker()
+        for name in ("do_GET", "do_POST"):
+            with self.subTest(entry_point=name):
+                fn = walker.functions[name]
+                self.assertEqual(
+                    fn.decorator_list, [],
+                    f"{name} now has a decorator -- #202 repair round 3 "
+                    "finding H's documented, previously-undemonstrated gap "
+                    "(a decorator wrapping an entry point with its own "
+                    "routing logic is never walked) may now be LIVE. See "
+                    "route_extract.py's module docstring, KNOWN "
+                    "LIMITATIONS, before dismissing this failure.")
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -107,6 +107,91 @@ EXACT-ONE-HIT: consulted by the audit for precisely the one line it names,
 never zero times (dormant -- proof nothing depends on it) and never more than
 once (too broad to trust).
 
+KNOWN LIMITATIONS
+------------------
+#202 repair round 3, finding H (documented here deliberately, NOT fixed this
+round -- see ``tests/test_route_extract.py``'s ``DecoratorLimitationGuardTests``
+for the standing proof it stays true):
+
+* :attr:`_DispatchWalker.functions` only ever harvests ``ast.FunctionDef``
+  nodes that are LEXICALLY inside ``class Handler`` in ``server.py``'s own
+  source (see :meth:`_DispatchWalker.__init__`), and :func:`extract_routes`
+  walks exactly the two named in :data:`ENTRY_POINTS` (``do_GET``/
+  ``do_POST``) as its dispatch roots. A ``@decorator`` wrapping either of
+  those two methods with routing logic of its OWN -- implemented as a
+  separate, module-level function the decorator applies at class-body
+  execution time -- would never be walked: this module has no concept of
+  "resolve what a decorator does to the function it wraps", only "read the
+  function's own body". Any route such a decorator selected would be
+  reachable over real HTTP while being invisible to this entire inventory,
+  with no error of any kind -- the one outcome every OTHER check in this
+  module exists to prevent, reopened through a shape none of them inspects.
+* NOT exploitable against the real ``server.py`` today: a straightforward
+  ``grep`` for a decorator on either entry point finds none (both are
+  reached as plain, undecorated methods), and
+  ``tests/test_route_extract.py``'s ``DecoratorLimitationGuardTests`` asserts
+  this directly -- parses the real file, and fails LOUDLY the moment either
+  method's ``decorator_list`` stops being empty, rather than staying silent
+  while the gap this section describes quietly goes live. This is
+  architectural and latent, not a live hole today.
+* What would close it: walk ``ast.FunctionDef.decorator_list`` for
+  ``do_GET``/``do_POST`` and either (a) refuse ANY decorator on either
+  entry point outright -- the simplest fail-closed choice, since this
+  module cannot generally reason about what an arbitrary decorator does --
+  or (b) resolve a known, reviewed allowlist of decorator shapes (e.g. a
+  bare ``@functools.wraps``-style pass-through) and continue to refuse
+  everything else. Neither is implemented; the guard test above is the
+  tripwire that would force the choice to be made the day it first matters.
+
+On the soundness of this gate, honestly stated
+------------------------------------------------
+This module has been adversarially reviewed across FOUR rounds: the
+original repository-owner review (6 findings, all closed by the #202
+repair), a first self-directed adversarial hunt (findings A-D, round 2),
+and a second (findings E-H, round 3 -- E/F/G closed by this section's own
+revision, H documented directly above). Each round's own pattern repeats:
+fix what was found, and a FRESH hunt finds more. That is not a sign any
+individual round was careless -- it is the expected, unavoidable shape of a
+bespoke static analyzer over a general-purpose language: the class of
+Python constructs that could conceivably encode a routing decision is not
+finite, and this module recognises a specific, growing-but-always-partial
+list of them.
+
+So, stated plainly, NOT as an oversight but as a considered engineering
+trade-off:
+
+* this gate is NOT claimed to be exhaustively complete against arbitrary
+  future Python constructs. Finding H above is a known, DOCUMENTED,
+  currently-undemonstrated gap; there is no proof that no OTHER gap exists
+  beyond the ones four rounds of review happened to find. A fifth round
+  should be expected to find a fifth thing, on the same pattern as the
+  first four;
+* the actual soundness BACKSTOP for CORRECTNESS -- as distinct from
+  completeness of this module's own DETECTION -- is not this static walker
+  at all, but a RUNTIME proof already in place: the 405/Allow admission
+  wiring server.py now runs (the #202 wiring step referenced above) is
+  diffed BYTE-IDENTICAL against real HTTP behaviour across a full request
+  corpus, and the 13 ``post_v2_setup_*``/``assign-*`` endpoints this
+  repair's own classification pass touched were independently CONFIRMED
+  REACHABLE over real HTTP, not merely extracted by this module and taken
+  on faith. A gap in this file's detection is a gap in the INVENTORY; it is
+  not, by itself, a gap in what the server actually does or refuses;
+* for whoever picks up further #202 work: further investment may be
+  BETTER SPENT on a CORPUS-BASED RUNTIME reachability/uniqueness proof --
+  fuzzed or generated real requests fired at the live server, with the
+  actual (status, body-shape) response compared against what the registry
+  claims for that path -- than on continuing to harden this static walker
+  indefinitely. A runtime proof of that shape is immune to "one more
+  Python construct the walker didn't enumerate", because it does not care
+  HOW server.py arrived at its answer, only WHAT that answer was. This
+  static walker will keep being worth strengthening when a NEW escape is
+  actually found (as this round did for E/F/G) -- it is a good, cheap
+  first line of defence and a genuinely useful development-time inventory
+  -- but treating it as the LAST line, capable of eventually reaching
+  proven completeness by finding one more gap at a time, is not a
+  realistic goal for a hand-written analyzer over a general-purpose
+  language, and this module does not claim otherwise.
+
 Stdlib only (CLAUDE.md): ``ast``, ``dataclasses``. No ``re`` — the dispatch
 patterns are parsed by this module's own small recursive-descent parser
 (:class:`_RegexParser`), not interpreted as live regexes.
@@ -1702,13 +1787,34 @@ class _DispatchWalker:
         while changed:
             changed = False
             for node in ast.walk(fn):
-                if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                    value = node.value
+                    if value is None:
+                        continue
+                    targets = node.targets if isinstance(node, ast.Assign) \
+                        else [node.target]
+                elif isinstance(node, ast.NamedExpr):
+                    # #202 repair round 3, finding F: a walrus bind
+                    # (``n := EXPR``) is exactly the same "a local now
+                    # carries a path-derived value" event as an
+                    # ``ast.Assign`` -- just spelled inline inside an
+                    # expression, most often an if-test's own subject
+                    # (``if (n := path.split("/")[-1]) == "x":``). Being
+                    # neither ``ast.Assign`` nor ``ast.AnnAssign``, it was
+                    # invisible to this loop entirely: ``n`` never joined
+                    # ``tracked``, so nothing downstream that tested ``n`` --
+                    # in this SAME if-test (root_name's own NamedExpr branch
+                    # resolves the walrus operand to "n") or a LATER,
+                    # separate one -- could ever be recognised as touching
+                    # the path either. DEMONSTRATED: zero exception, zero
+                    # route. A walrus target is always a single ``ast.Name``
+                    # -- Python's grammar allows no other shape -- so there
+                    # is no ``ast.walk(target)`` needed the way a regular
+                    # assign's (possibly tuple/starred) target needs.
+                    value = node.value
+                    targets = [node.target]
+                else:
                     continue
-                value = node.value
-                if value is None:
-                    continue
-                targets = node.targets if isinstance(node, ast.Assign) \
-                    else [node.target]
                 leaves = [leaf for target in targets
                          for leaf in ast.walk(target)
                          if isinstance(leaf, ast.Name)]
@@ -1740,7 +1846,7 @@ class _DispatchWalker:
                         changed = True
         for node in ast.walk(fn):
             if isinstance(node, ast.If) and id(node) not in self._classified:
-                names = _direct_operand_names(node.test)
+                names = _direct_operand_names(node.test, tracked)
                 hit = names & tracked
                 key = (fn.name, ast.unparse(node.test))
                 if hit and key in _AUDIT_WAIVERS:
@@ -1765,7 +1871,7 @@ class _DispatchWalker:
                 # fully enumerates, not a new route -- exactly the
                 # "decides SERVE, not the route" shape the waiver list
                 # already exists for, so it goes through the SAME waivers.
-                names = _direct_operand_names(node.test)
+                names = _direct_operand_names(node.test, tracked)
                 hit = names & tracked
                 key = (fn.name, ast.unparse(node.test))
                 if hit and key in _AUDIT_WAIVERS:
@@ -1787,7 +1893,7 @@ class _DispatchWalker:
                 # DEMONSTRATED. Same shape as the ast.If case above, just a
                 # different statement type; goes through the SAME waivers
                 # (none needed today -- server.py has no `while` at all).
-                names = _direct_operand_names(node.test)
+                names = _direct_operand_names(node.test, tracked)
                 hit = names & tracked
                 key = (fn.name, ast.unparse(node.test))
                 if hit and key in _AUDIT_WAIVERS:
@@ -1798,6 +1904,31 @@ class _DispatchWalker:
                         f"{fn.name}:{node.lineno} a while loop tests "
                         f"dispatch subject(s) {sorted(hit)} in an "
                         f"unrecognised shape: {ast.unparse(node.test)}")
+            if isinstance(node, ast.Expr):
+                # #202 repair round 3, finding G: a class-level dispatch-
+                # table lookup invoked as a BARE, UNASSIGNED statement
+                # (``_ROUTE_TABLE.get(path, default)()``, ``getattr(self,
+                # "_handle_" + suffix, self._default)()``) joins nothing via
+                # the fixed-point loop above -- there is no assignment
+                # target to add to ``tracked`` -- and is not a
+                # ``self._handle_*``/``self._dispatch_*`` ATTRIBUTE call
+                # :meth:`_audit_dispatch_helper_calls` would recognise.
+                # DEMONSTRATED: contrasted directly against the ASSIGNED
+                # form of the IDENTICAL expression (``outcome =
+                # _ROUTE_TABLE.get(path); self._maybe_dispatch(outcome)``),
+                # which the fixed-point loop above already raises on via
+                # _propagates_taint's own unlisted-call check -- the bare
+                # form raised nothing at all. Reuse that SAME check here,
+                # merely without the assignment: whatever the statement's
+                # own expression calls, if unlisted and still touching a
+                # tracked name, is exactly as invisible a routing decision
+                # as if it had been bound to a name first (round 2 finding
+                # A's rule, applied without the assignment-only restriction
+                # that created this gap). The return value is unused --
+                # only the RAISE (or waiver) side effect matters here; a
+                # bare statement has no target to add to ``tracked``.
+                _propagates_taint(node.value, tracked, fn.name,
+                                  self.waiver_hits)
 
     def _audit_dispatch_helper_calls(self, fn: ast.FunctionDef) -> None:
         """Raise if ``fn`` calls an uncatalogued ``_handle_*``/``_dispatch_*``
@@ -1919,6 +2050,89 @@ _AUDIT_WAIVERS = {
         "branch is reached. Same blanket-gate shape as `required_"
         "permission(path)` immediately above -- refuses access to an "
         "already-identified resource, does not select a route",
+    # #202 repair round 3, finding E -- newly examined now that a Call
+    # reached AS A COMPARISON OPERAND has its arguments scanned too (see
+    # _direct_operand_names' own docstring). `_supported_methods(path)` is
+    # the SAME 405/Allow admission source route_registry.py's own gate is
+    # diffed byte-identical against (#202 wiring step) -- a DERIVED,
+    # POST-HOC check of which HTTP verbs an ALREADY-MATCHED path admits,
+    # not a selector between different templates. Membership against a
+    # small FIXED set of verb strings ("GET"/"POST"/...) can never pick a
+    # different route the way `len(path) == N`/`str(path) == lit` could.
+    ("do_POST", "'POST' not in self._supported_methods(path)"):
+        "#202 repair round 3, finding E -- the very first line of do_POST: "
+        "refuses (405/Allow) BEFORE any path-based dispatch branch, using "
+        "the SAME derived method-admission source the registry's own gate "
+        "is diffed against; see this waiver's own comment block above "
+        "for the general shape",
+    ("_handle_reassign_v2",
+     "targets.append((dest[0], b.get(dest[1]) or None))"):
+        "#202 repair round 3, finding E -- `targets` is the AUTHORISATION-"
+        "TARGET list fed to `_refuse_unchosen_context`/"
+        "`_reject_target_outside_scope` below, seeded from `(entity, "
+        "record_id)` (both tracked #369 write-side identifiers) -- which "
+        "is what makes `targets` ITSELF read as tracked once a Call (`."
+        "append`) reaches it undisguised. `dest` is `_V2_REASSIGN_DEST."
+        "get(combo)`, a richly-tracked tuple-dict lookup (#202 repair root "
+        "cause 1) keyed on the ALREADY-DECIDED `combo` -- appending its "
+        "components onto the target list only widens the AUTHORISATION "
+        "check (#369: the destination row must also be writable), it does "
+        "not choose a different template; the route was fully decided "
+        "upstream by `combo in _V2_REASSIGN_SCHEMA`",
+    ("_handle_reassign_v2",
+     "targets.append((parent[0], b.get(parent[1]) or None, "
+     "'writable_parent'))"):
+        "#202 repair round 3, finding E -- same `targets` list as the "
+        "immediately preceding waiver (this entry's own comment explains "
+        "why `targets` itself reads as tracked); `parent` is "
+        "`_REASSIGN_PARENTS.get(combo)`, already covered by its own "
+        "existing waiver above -- appending it extends the SAME "
+        "authorisation-target list with the write-side parent-ownership "
+        "check (#369), not a routing decision",
+    ("_handle_reassign_v2", "check_body(b, **_V2_REASSIGN_SCHEMA[combo])"):
+        "#202 repair round 3, finding E -- request-BODY field validation "
+        "against the schema for the ALREADY-DECIDED `combo` (`combo in "
+        "_V2_REASSIGN_SCHEMA` chose the route upstream); `check_body` "
+        "raises `BodyError` on a malformed body, it does not choose "
+        "between templates -- the same 'produces a RESULT for a "
+        "post-dispatch concern' shape as every other waiver in this "
+        "dict, just reached as a bare statement instead of an assignment",
+    ("_handle_reassign_v2", "len(target) > 2"):
+        "#202 repair round 3, finding E -- a NAME COLLISION this flat, "
+        "unscoped `tracked` set cannot see past: `target` is BOTH "
+        "_handle_reassign_v2's own tracked parameter (the reassignment "
+        "destination's ENTITY KIND, e.g. 'organization') AND, shadowing "
+        "it, the `for target in targets:` loop variable a few lines "
+        "below -- an authorisation-target TUPLE, `(kind, id[, "
+        "'writable_parent'])`. `len(target) > 2` asks whether THIS TUPLE "
+        "carries the optional third field, selecting the scope label "
+        "passed to `_reject_target_outside_scope` -- it has nothing to do "
+        "with the outer `target` parameter it happens to share a bare "
+        "name with. route_extract does not model lexical scoping (a "
+        "documented, accepted limitation -- see the module docstring's "
+        "KNOWN LIMITATIONS section), so a same-named inner shadow of an "
+        "outer tracked subject is indistinguishable from the real thing "
+        "without this kind of human review",
+    ("_handle_reassign", "targets.append((dest[0], b.get(dest[1]) or None))"):
+        "#202 repair round 3, finding E -- the v1 sibling of "
+        "_handle_reassign_v2's own identical-shape waiver above (see that "
+        "entry): `dest` is `_V1_REASSIGN_DEST.get(combo)`, a richly-"
+        "tracked tuple-dict lookup keyed on the already-decided `combo`; "
+        "appending it onto the authorisation-target list widens the #369 "
+        "write-side ownership check, it does not choose a route",
+    ("_handle_reassign", "check_body(b, **_V1_REASSIGN_SCHEMA[combo])"):
+        "#202 repair round 3, finding E -- the v1 sibling of "
+        "_handle_reassign_v2's own identical-shape waiver above (see that "
+        "entry): request-body field validation against the schema for "
+        "the already-decided `combo`, not a routing decision",
+    ("_handle_reassign", "len(target) > 2"):
+        "#202 repair round 3, finding E -- the v1 sibling of "
+        "_handle_reassign_v2's own identical-shape waiver above (see that "
+        "entry for the full name-collision explanation): `target` here is "
+        "the `for target in targets:` loop variable (an authorisation-"
+        "target tuple), shadowing _handle_reassign's own tracked `target` "
+        "parameter (the reassignment destination's entity kind) in name "
+        "only",
 }
 
 
@@ -2030,6 +2244,32 @@ def _mentions_tracked(node, tracked: set) -> bool:
         return False
     return any(_mentions_tracked(child, tracked)
                for child in ast.iter_child_nodes(node))
+
+
+def _tracked_mentions(node, tracked: set) -> set:
+    """Every tracked name reachable in ``node``'s subtree, stopping at an
+    opaque-extraction boundary the SAME way :func:`_mentions_tracked` does
+    (a captured group or Path property/consuming call stays opaque, so
+    ``self._official_guard(oav.group(1))``'s argument still does not
+    surface ``oav`` here even though this is the name-COLLECTING
+    counterpart of that bool-returning check, not a second, independent
+    rule).
+
+    #202 repair round 3, finding E: :func:`_direct_operand_names`'s
+    ``root_name`` needs to know not just "does this Call's argument/keyword
+    mention a tracked name" (:func:`_mentions_tracked` already answers
+    that) but WHICH name, so the caller's ``found`` set stays a set of
+    real dispatch-subject names -- reuses :func:`_is_opaque_extraction`,
+    the SAME boundary, rather than a second, independently-drifting rule.
+    """
+    if isinstance(node, ast.Name):
+        return {node.id} if node.id in tracked else set()
+    if _is_opaque_extraction(node):
+        return set()
+    found = set()
+    for child in ast.iter_child_nodes(node):
+        found |= _tracked_mentions(child, tracked)
+    return found
 
 
 def _propagates_taint(value, tracked: set, fn_name: str = "",
@@ -2154,7 +2394,7 @@ def _is_path_derived(node) -> bool:
     return False
 
 
-def _direct_operand_names(test) -> set:
+def _direct_operand_names(test, tracked: frozenset = frozenset({"path"})) -> set:
     """Names this test DECIDES ON, as opposed to names it merely passes along.
 
     ``if path.startswith("/api/")`` and ``if m.group(2) == "board"`` decide on
@@ -2162,10 +2402,36 @@ def _direct_operand_names(test) -> set:
     ``oav`` — it hands a captured id to a guard, and the guard's answer is about
     permissions, not about which route this is. So arguments of a call are NOT
     operand positions, while a call's own receiver is.
+
+    UNLESS the call is itself reached as a COMPARISON OPERAND -- the LEFT or a
+    comparator of an ``ast.Compare`` (``len(path) == N``, ``str(path) ==
+    lit``, ``hash(path) == hash(lit)``, any project-local wrapper reached the
+    same way) -- in which case an argument that still carries a tracked name
+    undisguised by an opaque extraction DOES count (#202 repair round 3,
+    finding E; see the ``root_name`` Call branch below, and ``in_compare``
+    throughout this function). Deliberately NOT widened to every call
+    position: a BARE call used directly as (or inside a ``not``/``and``/
+    ``or`` around) the whole test -- ``if not authorize(role, path):``, ``if
+    self._operator_only(path):`` -- is a reviewed, DELIBERATE exemption
+    (see ``test_a_guard_that_merely_passes_the_path_along_is_not_a_route``
+    and the ``required_permission(path)``/``scope_violation(...)``
+    ``_AUDIT_WAIVERS`` entries' own comments): a blanket per-request
+    authorisation gate that happens to take the raw path as an argument is
+    not, itself, a routing decision, and finding E's own examples are all
+    comparison-shaped -- widening past that would re-litigate an
+    already-reviewed round-2 design choice this round was not asked to
+    revisit, not close a new gap.
+
+    ``tracked`` defaults to just ``{"path"}`` for callers outside the
+    completeness audit's own ``ctx``-aware fixed point (e.g.
+    :meth:`_DispatchWalker._require_safe_verb_shape`, which only ever cared
+    about the literal name "path" even before this parameter existed);
+    :meth:`_DispatchWalker._audit_function` passes its own, fuller
+    ``tracked`` set explicitly.
     """
     found = set()
 
-    def root_name(node):
+    def root_name(node, in_compare):
         while True:
             # DIRECT ``self.path`` (#202 repair, invented-evasion track):
             # bypassing the local entirely (``if self.path == "/x":``, never
@@ -2178,27 +2444,78 @@ def _direct_operand_names(test) -> set:
                     and isinstance(node.value, ast.Name) \
                     and node.value.id == "self":
                 return "path"
+            # A WALRUS operand (#202 repair round 3, finding F):
+            # ``(n := EXPR) == "foo"`` decides on ``n``'s newly bound value.
+            # Resolving to the bind's own TARGET -- always a bare Name;
+            # Python's grammar allows no other shape for a walrus target --
+            # is what lets this be recognised once the fixed-point loop in
+            # _audit_function has (or has not) proven EXPR itself
+            # path-derived and joined ``n`` to ``tracked`` accordingly, the
+            # SAME two-part contract an ordinary ``n = EXPR`` assignment
+            # already gets. DEMONSTRATED: neither this nor the fixed-point
+            # loop recognised ``ast.NamedExpr`` before this fix, so a
+            # walrus-bound routing decision raised nothing and recorded
+            # nothing, whether tested in the SAME if-test or a later one.
+            # Unconditional (not gated by ``in_compare``): unlike the Call
+            # case below there is no round-2-established "bare walrus test
+            # is a reviewed exemption" precedent to preserve.
+            if isinstance(node, ast.NamedExpr):
+                return node.target.id
             if isinstance(node, ast.Name):
                 return node.id
             if isinstance(node, (ast.Attribute, ast.Subscript)):
                 node = node.value
             elif isinstance(node, ast.Call):
+                # A Call's ARGUMENTS, but ONLY when reached AS A COMPARISON
+                # OPERAND (#202 repair round 3, finding E -- see this
+                # function's own docstring for why ``in_compare`` gates
+                # this and not the callee-chain unwrap below): invisible
+                # before this fix, which only ever unwrapped the CALLEE
+                # chain (``path.startswith(...)``'s own receiver), never
+                # looked at what was PASSED to a call. DEMONSTRATED: zero
+                # exception, zero recorded route; when the branch is an
+                # earlier arm of a chain whose terminal else re-derives the
+                # subject (root cause 6's unconditional static tail), it
+                # also silently dropped THAT chain's own static-tail route,
+                # because walking an unclassified branch's orelse never
+                # reaches _walk_terminal_else. Fail closed the SAME WAY
+                # _propagates_taint does for an unlisted call's
+                # receiver/arguments: reuse _tracked_mentions (the
+                # name-collecting counterpart of _mentions_tracked, same
+                # opaque-extraction boundary) rather than duplicate that
+                # logic here. This only ADDS names to ``found`` -- it never
+                # suppresses the existing callee-chain resolution below, so
+                # ``path.startswith(...)`` (reached with ``in_compare``
+                # either way, since it is a call's own RECEIVER, not an
+                # argument) still resolves to "path" exactly as before.
+                if in_compare:
+                    for arg in list(node.args) + [kw.value for kw in node.keywords]:
+                        found.update(_tracked_mentions(arg, tracked))
                 node = node.func
             else:
                 return None
 
-    def visit_operand(node):
+    def visit_operand(node, in_compare=False):
         if isinstance(node, ast.BoolOp):
+            # Thread ``in_compare`` through unchanged (#202 repair round 3,
+            # finding E completeness): a BoolOp is not itself a comparison
+            # operand, but ``(a or len(path)) == 5`` still reaches
+            # ``len(path)`` FROM a genuine comparator position -- the flag
+            # must survive passing through the boolop, not reset to False,
+            # or this exact nesting would silently re-open the gap the
+            # in_compare gate elsewhere already believes it closed. Stays
+            # False for a BoolOp reached OUTSIDE any Compare (e.g. `if not
+            # authorize(...) and ...:`), preserving that exemption exactly.
             for value in node.values:
-                visit_operand(value)
+                visit_operand(value, in_compare)
             return
         if isinstance(node, ast.UnaryOp):
-            visit_operand(node.operand)
+            visit_operand(node.operand, in_compare)  # same reasoning as BoolOp above
             return
         if isinstance(node, ast.Compare):
-            visit_operand(node.left)
+            visit_operand(node.left, True)
             for comparator in node.comparators:
-                visit_operand(comparator)
+                visit_operand(comparator, True)
             return
         # any(...)/all(...) over a generator or list/set comprehension (#202
         # repair, invented-evasion track): the comprehension's own element
@@ -2216,7 +2533,7 @@ def _direct_operand_names(test) -> set:
                 for cond in generator.ifs:
                     visit_operand(cond)
             return
-        name = root_name(node)
+        name = root_name(node, in_compare)
         if name is not None:
             found.add(name)
 
