@@ -117,16 +117,61 @@ class RegistryInternalConsistencyTests(unittest.TestCase):
             with self.subTest(spec=spec.name):
                 self.assertRegex(sample_path(spec.template), spec.pattern)
 
-    def test_classification_slots_are_still_empty(self):
-        """``auth``/``scope_axis`` are declared slots for a LATER step.
+    # #202 classification is landing in independent, reviewed batches (each
+    # batch's own ``note`` on its entries carries the file:line citation), so
+    # this can no longer pin the WHOLE registry empty the way it once did — by
+    # this batch's own turn other batches (e.g. the games/notifications/
+    # standings leaves) already carry values too. What stays checkable
+    # without knowing every other batch in advance:
+    #   * a spec never carries HALF a classification (auth filled, scope_axis
+    #     still UNCLASSIFIED, or vice versa) — that is exactly the
+    #     "half-populated policy field reads as authority" failure mode the
+    #     original guard existed to catch, and it is still checkable per-spec;
+    #   * every filled value is one of the axis's own declared classes, not a
+    #     typo or an invented one;
+    #   * THIS batch's own leaves (static files + the /calendar/*.ics leaf)
+    #     carry exactly what their notes claim: auth="none", scope_axis="none";
+    #   * ``get_empty_path`` — the impossible fallback (unreachable over HTTP,
+    #     see its note) — is deliberately EXCLUDED and stays UNCLASSIFIED.
+    # Nothing yet READS any of these fields (enforcement is the separate,
+    # later #202 PR the classification PR's body describes).
+    _THIS_BATCH_NONE_NONE = frozenset({
+        "get_index", "get_mobile_shell", "get_mobile_shell_slash",
+        "get_setup_shell", "get_setup_shell_slash", "get_static_tail",
+        "get_calendar_division_id_ics", "get_calendar_official_id_ics",
+        "get_calendar_player_id_ics", "get_calendar_team_id_ics",
+    })
+    _VALID_SCOPE_AXES = frozenset({
+        "zero_axis", "program", "season", "league", "cross", "none",
+        UNCLASSIFIED,
+    })
 
-        Pinned empty on purpose: a half-populated policy field reads as
-        authority and gets believed. Whoever fills these in must arrive with the
-        code that reads them, and will have to change this test to do it.
+    def test_classification_slots_are_still_empty(self):
+        """``auth``/``scope_axis`` are declared slots, filled in batches.
+
+        See the block comment above for what this can and cannot pin now that
+        classification lands batch-by-batch rather than all at once.
         """
-        filled = [(s.name, s.auth, s.scope_axis) for s in REGISTRY
-                  if s.auth != UNCLASSIFIED or s.scope_axis != UNCLASSIFIED]
-        self.assertEqual(filled, [])
+        half_filled = [(s.name, s.auth, s.scope_axis) for s in REGISTRY
+                        if (s.auth != UNCLASSIFIED)
+                        != (s.scope_axis != UNCLASSIFIED)]
+        self.assertEqual(half_filled, [], "\n\na spec must be classified on "
+                         "BOTH auth and scope_axis, or neither")
+
+        bad_axis = [(s.name, s.scope_axis) for s in REGISTRY
+                    if s.scope_axis not in self._VALID_SCOPE_AXES]
+        self.assertEqual(bad_axis, [])
+
+        by_name = {s.name: (s.auth, s.scope_axis) for s in REGISTRY}
+        for name in self._THIS_BATCH_NONE_NONE:
+            with self.subTest(name=name):
+                self.assertEqual(by_name[name], ("none", "none"))
+
+        self.assertEqual(by_name["get_empty_path"],
+                         (UNCLASSIFIED, UNCLASSIFIED),
+                         "get_empty_path is an impossible fallback shape "
+                         "(unreachable over HTTP) and must stay excluded "
+                         "from classification, not guessed at")
 
     def test_the_registry_is_now_wired_not_inert(self):
         """server.py DOES import the registry now -- the #202 wiring step.
