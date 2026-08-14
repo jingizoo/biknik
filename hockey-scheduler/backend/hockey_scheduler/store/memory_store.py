@@ -25,6 +25,7 @@ from ..domain import (
     SchedulingPolicy,
     GameResult,
     ContactDestination,
+    DataAccessLog,
     DeliveryStatus,
     DeviceToken,
     FactoryResetChallenge,
@@ -107,6 +108,10 @@ class InMemoryStore:
         self.guardian_links: Dict[str, GuardianLink] = {}
         self.reschedule_requests: Dict[str, RescheduleRequest] = {}
         self.setup_audit: List[SetupAuditLog] = []
+        # Durable sensitive-read audit (#124). A plain list attribute so the
+        # generic transaction snapshot, clear_all_data() and row_counts()
+        # machinery all cover it exactly like the other audit surfaces.
+        self.data_access: List[DataAccessLog] = []
         # Never cleared by clear_all_data() (#256) — the durable record of a
         # production factory-reset attempt must survive the wipe it describes.
         self.factory_reset_events: List[FactoryResetEvent] = []
@@ -373,6 +378,24 @@ class InMemoryStore:
     def add_audit(self, entry: AuditLog) -> AuditLog:
         self.audit.append(entry)
         return entry
+
+    # -- sensitive-read audit (#124) ---------------------------------------
+    def add_data_access(self, entry: DataAccessLog) -> DataAccessLog:
+        self.data_access.append(entry)
+        return entry
+
+    def list_data_access(self, subject_type=None, subject_id=None,
+                         category=None) -> List[DataAccessLog]:
+        """Sensitive-read rows, optionally filtered to one subject and/or one
+        category — the "who read this person's data" query (#124)."""
+        rows = self.data_access
+        if subject_type is not None:
+            rows = [r for r in rows if r.subject_type == subject_type]
+        if subject_id is not None:
+            rows = [r for r in rows if r.subject_id == subject_id]
+        if category is not None:
+            rows = [r for r in rows if r.category == category]
+        return list(rows)
 
     def audit_for_game(self, game_id: str) -> List[AuditLog]:
         return [a for a in self.audit if a.game_id == game_id]

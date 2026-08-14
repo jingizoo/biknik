@@ -35,6 +35,7 @@ from ..domain import (
     LeagueSeason,
     Program,
     ContactDestination,
+    DataAccessLog,
     DeliveryStatus,
     DeviceToken,
     FactoryResetChallenge,
@@ -67,6 +68,7 @@ from ..domain import (
     InstallationState,
     RosterRole,
     Season,
+    SensitiveFieldCategory,
     ScheduleScenario,
     SeasonStatus,
     SeasonTeamRegistration,
@@ -226,6 +228,9 @@ SPECS = {
                             {"type": _enum(NotificationType), "at": _dt()}),
     SetupAuditLog: Spec(SetupAuditLog, "setup_audit_logs",
                         {"at": _dt(), "detail": _jsonc()}),
+    DataAccessLog: Spec(DataAccessLog, "data_access_logs",
+                        {"category": _enum(SensitiveFieldCategory),
+                         "at": _dt()}),
     FactoryResetEvent: Spec(
         FactoryResetEvent, "factory_reset_events",
         {"started_at": _dt(), "completed_at": _dt(),
@@ -1597,6 +1602,28 @@ class SqlStore:
 
     def add_setup_audit(self, entry): return self._insert(entry)
     def all_setup_audit(self): return self._query(SetupAuditLog, order="id")
+
+    # -- sensitive-read audit (#124) ---------------------------------------
+    def add_data_access(self, entry): return self._insert(entry)
+
+    def list_data_access(self, subject_type=None, subject_id=None,
+                         category=None):
+        """Sensitive-read rows, optionally filtered to one subject and/or one
+        category — the "who read this person's data" query (#124)."""
+        clauses, params = [], []
+        if subject_type is not None:
+            clauses.append("subject_type = ?")
+            params.append(subject_type)
+        if subject_id is not None:
+            clauses.append("subject_id = ?")
+            params.append(subject_id)
+        if category is not None:
+            clauses.append("category = ?")
+            params.append(category.value
+                          if isinstance(category, SensitiveFieldCategory)
+                          else category)
+        return self._query(DataAccessLog, " AND ".join(clauses) or None,
+                           tuple(params), order="id")
 
     def add_factory_reset_event(self, event): return self._insert(event)
     def all_factory_reset_events(self):
