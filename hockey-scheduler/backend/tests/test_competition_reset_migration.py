@@ -28,6 +28,7 @@ from hockey_scheduler.store.sql_store import migrate
 _VERSION = "028_competition_reset"
 _V035 = "035_competition_hierarchy_reset"
 _V050 = "050_schedule_scenarios"
+_V052 = "052_season_roster_membership"
 
 
 def _sql_backends():
@@ -115,6 +116,12 @@ def _downgrade_035(store):
         # itself does not come back after the replay below -- harmless, since
         # nothing in this migration-history suite reads or writes it.
         cur.execute("DROP TABLE IF EXISTS age_eligibility_rules")
+        # 052's membership tables (#205 Slice A) are later hierarchy children
+        # too; rewind them the same way, and un-record 052 below so the
+        # forward replay rebuilds them (proving 052 composes over the legacy
+        # upgrade path exactly as 050 does).
+        cur.execute("DROP TABLE IF EXISTS season_roster_membership_events")
+        cur.execute("DROP TABLE IF EXISTS season_roster_memberships")
         cur.execute("DROP INDEX IF EXISTS ix_teams_league")
         cur.execute("ALTER TABLE teams DROP COLUMN league_id")
         cur.execute("DROP INDEX IF EXISTS ux_team_league_season")
@@ -133,8 +140,8 @@ def _downgrade_035(store):
         cur.execute("DROP INDEX IF EXISTS ux_league_season")
         cur.execute("DROP TABLE IF EXISTS league_seasons")
         cur.execute(store.dialect.sql(
-            "DELETE FROM schema_migrations WHERE version IN (?, ?)"),
-            (_V035, _V050))
+            "DELETE FROM schema_migrations WHERE version IN (?, ?, ?)"),
+            (_V035, _V050, _V052))
 
 
 def _downgrade_028(store):
