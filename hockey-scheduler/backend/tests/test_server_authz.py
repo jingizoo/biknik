@@ -12,7 +12,7 @@ from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api.service import ApiService
 from hockey_scheduler.domain import Role
-from hockey_scheduler.store import InMemoryStore
+from hockey_scheduler.store import InMemoryStore, SqlStore
 from hockey_scheduler.web.server import STATE, Handler
 
 
@@ -500,37 +500,60 @@ class OptionalSessionProductionMatrixContract:
     and, before fix (a) above, ALSO left ``APP_MODE`` stuck at
     "production" afterward, compounding both bugs.
 
-    Closed with a fresh, UNIQUE per-class-run suffix
+    Closed (at the time) with a fresh, UNIQUE per-class-run suffix
     (``uuid.uuid4().hex[:10]``) on every fixture identifier this class
-    creates, so two runs' rows never collide REGARDLESS of whether either
-    run's own cleanup completes. Stated plainly, this class does NOT also
-    delete what it creates in cleanup -- INVESTIGATED, not assumed:
-    Official/Player DO have a real ``api.delete_*`` primitive, but each
-    one is a ``@catch``-wrapped API call that, on THIS exact fixture,
-    returns a SOFT ``{"error": {"code": "has_dependencies", ...}}`` dict
-    (never raises) refusing the delete, because the very User Account
-    this class just created for it is a live, undeleted dependent --
-    VERIFIED directly against a real Postgres database before writing
-    this comment, not assumed from reading the service code. There is no
+    creates, so two runs' rows never COLLIDE regardless of whether either
+    run's own cleanup completes -- this class does NOT also delete what
+    it creates in cleanup, INVESTIGATED, not assumed: Official/Player DO
+    have a real ``api.delete_*`` primitive, but each one is a
+    ``@catch``-wrapped API call that, on THIS exact fixture, returns a
+    SOFT ``{"error": {"code": "has_dependencies", ...}}`` dict (never
+    raises) refusing the delete, because the very User Account this
+    class just created for it is a live, undeleted dependent -- VERIFIED
+    directly against a real Postgres database before writing this
+    comment, not assumed from reading the service code. There is no
     ``delete_account`` at all in this codebase (only deactivation, which
     does not free the username and would not unblock the official/player
     delete above either), so this chain has no available bottom: nothing
     this class creates can actually be deleted through the public API
     surface, short of reaching around it into raw SQL, which no other
-    test in this file does either. The disposable-DATABASE approach this
-    repo's own established pattern for avoiding a bare, shared database
-    name would otherwise suggest does not fit here without a much larger
-    change (every OTHER Postgres test in this repo, including this
-    class's own PostgreSQL subclass, consumes ``TEST_DATABASE_URL`` as a
-    single already-provisioned database supplied by the runner, never
-    provisions its own). The unique suffix is therefore the WHOLE
-    isolation guarantee, not a defence-in-depth layered on top of
-    cleanup -- and it is sufficient on its own: two runs' rows are simply
-    DIFFERENT rows, never compared or deduplicated by name anywhere in
-    the app, so accumulating them harms nothing this or any other test
-    reads. Proven directly, not merely asserted, by
-    ``OptionalSessionProductionMatrixIsolationTests`` below (which also
-    covers the failure-injection requirements part (a) exists for).
+    test in this file did at the time either -- so the reasoning THEN
+    was: the unique suffix is sufficient on its own, since two runs' rows
+    are simply DIFFERENT rows, never compared or deduplicated by name
+    anywhere in the app.
+
+    #202 repair round 7, finding 2 (external review) found that reasoning
+    incomplete: it stops a NAME collision but not ROW accumulation --
+    DEMONSTRATED (that session's own repro, run/tearDown/run against one
+    real, persistent Postgres database): accounts/officials/players/
+    programs/teams growing 3/1/1/1/1 after run 1 to 6/2/2/2/2 after run
+    2. "Harms nothing this or any other test reads" undersold what a
+    WORKER-SHARED, long-lived ``TEST_DATABASE_URL`` actually is: every
+    OTHER test module in the SAME shard shares it for the shard's WHOLE
+    run (see ``backend/tests/run_parallel.py``'s own ``--postgres``
+    handling -- one database PER WORKER, not per test module), so
+    unbounded row growth across every CI run is a real, compounding cost
+    even though nothing MISBEHAVES from it. Closed for real by
+    ``PostgresOptionalSessionProductionTest`` (below) no longer consuming
+    the bare ``TEST_DATABASE_URL`` at all: it provisions its OWN
+    disposable, uniquely-NAMED database on the SAME server via
+    ``_provision_disposable_postgres_database`` (mirroring this repo's
+    OWN ``test_sql_ascii_encoding.py``, a pattern that in fact already
+    existed in this codebase when this docstring's ORIGINAL "does not fit
+    without a much larger change" conclusion was written -- an oversight
+    corrected here, not a new capability added for this purpose) and
+    drops it in a class cleanup -- so the "every OTHER Postgres test...
+    never provisions its own" premise the original conclusion rested on
+    was never actually true. The per-fixture unique suffix above is left
+    in place regardless (defence in depth costs nothing, and every OTHER
+    ``OptionalSessionProductionMatrixContract`` subclass, including the
+    ``OptionalSessionProductionMatrixIsolationTests`` probes below that
+    deliberately reuse ONE fixed url across repeated runs, still relies
+    on it to avoid a NAME collision within that reuse). Proven directly,
+    not merely asserted, by ``OptionalSessionProductionMatrixIsolationTests``
+    below (which also covers the failure-injection requirements part (a)
+    exists for, and round 7 finding 2's own "no residual rows after each
+    run" requirement).
     """
 
     def database_url(self):
@@ -848,12 +871,121 @@ class SqliteOptionalSessionProductionTest(OptionalSessionProductionMatrixContrac
         return path
 
 
+# --------------------------------------------------------------------------- #
+# #202 repair round 7, finding 2 (external review): the production SQL        #
+# contract leaked fixtures into the worker-shared TEST_DATABASE_URL database. #
+# Round 6's own unique-suffix fix (this class's own docstring, part (b))      #
+# prevents a NAME collision between two runs, but does nothing about ROW      #
+# accumulation: DEMONSTRATED (this session's own repro, run/tearDown/run      #
+# against one real, persistent Postgres database) accounts/officials/        #
+# players/programs/teams growing 3/1/1/1/1 after run 1 to 6/2/2/2/2 after     #
+# run 2 -- exactly the reviewer's own cited numbers.                          #
+#                                                                              #
+# Closed the way this repo's OWN test_sql_ascii_encoding.py already           #
+# establishes for exactly this problem (a test that needs a real, disposable  #
+# Postgres database on the SAME server TEST_DATABASE_URL names): provision a  #
+# uniquely-named database via CREATEDB, use it for ONE class's run, drop it   #
+# in a class cleanup. The bare, worker-shared TEST_DATABASE_URL database      #
+# itself is NEVER touched by this contract's own real (non-isolation-test)   #
+# subclass any more -- not merely emptied afterward, never written to at     #
+# all -- so nothing this contract creates can leak into it, regardless of    #
+# whether any later cleanup step also succeeds. ``_provision_disposable_     #
+# postgres_database``/``_drop_disposable_postgres_database`` are reused      #
+# directly (not merely mirrored) by ``OptionalSessionProductionMatrixIsolat  #
+# ionTests`` below for its own "run twice against the SAME url" required     #
+# regression proof.                                                          #
+# --------------------------------------------------------------------------- #
+def _provision_disposable_postgres_database(register_cleanup,
+                                             name_prefix="hs_prodmatrix"):
+    """Create a fresh, uniquely-named Postgres database on the SAME server
+    ``TEST_DATABASE_URL`` names, register its drop via ``register_cleanup``
+    (``cls.addClassCleanup`` from ``database_url`` -- called as ``cls.
+    database_url(cls)`` by ``OptionalSessionProductionMatrixContract.
+    setUpClass``, the SAME "``self`` is the class object" convention
+    ``SqliteOptionalSessionProductionTest.database_url`` already relies on,
+    so ``self.addClassCleanup`` there IS ``cls.addClassCleanup`` -- or
+    ``self.addCleanup`` from an ordinary test method), and return its url.
+
+    Reuses ``test_sql_ascii_encoding.py``'s OWN already-fixed structural URL
+    rewrite (``_with_database``/``_database_of``) rather than re-deriving
+    it a second time: #405's own fix was specifically about a naive
+    ``rsplit("/", 1)`` cutting INSIDE a socket URL's own ``?host=/tmp``
+    query string (exactly the URL shape this repo's local Postgres setup
+    uses), so duplicating that logic here would risk reintroducing the
+    identical bug in a second place.
+
+    Skips (``unittest.SkipTest``, the same way ``SqlAsciiEncodingTest``
+    does) if the connected role lacks ``CREATEDB`` -- a least-privileged
+    application role legitimately might not have it, and this fixture must
+    not ERROR out the whole run over a permissions gap it can name
+    precisely.
+    """
+    import psycopg
+    from test_sql_ascii_encoding import _database_of, _with_database
+
+    base = os.environ["TEST_DATABASE_URL"]
+    admin_url = _with_database(base, _database_of(base))
+    dbname = f"{name_prefix}_{uuid.uuid4().hex[:16]}"
+    with psycopg.connect(admin_url, autocommit=True) as conn:
+        row = conn.execute(
+            "SELECT rolsuper OR rolcreatedb AS may_create FROM pg_roles "
+            "WHERE rolname = current_user").fetchone()
+        may_create = bool(row and (row[0] if not isinstance(row, dict)
+                                   else row["may_create"]))
+        if not may_create:
+            raise unittest.SkipTest(
+                "the test role lacks CREATEDB, so a disposable "
+                "production-matrix database cannot be provisioned "
+                "(#202 repair round 7, finding 2)")
+        # No DROP first: the name is unique (uuid4), so a collision would
+        # mean something is badly wrong and must surface, never be
+        # silently dropped -- mirrors SqlAsciiEncodingTest.setUpClass.
+        conn.execute(f'CREATE DATABASE "{dbname}"')
+    register_cleanup(_drop_disposable_postgres_database, admin_url, dbname)
+    return _with_database(base, dbname)
+
+
+def _drop_disposable_postgres_database(admin_url, dbname):
+    """Terminate any lingering backend on ``dbname`` first -- this run's
+    own SQL store may or may not be closed yet depending on class-cleanup
+    ordering, and DROP DATABASE refuses while any connection remains open
+    -- then drop it. Mirrors ``test_sql_ascii_encoding.
+    SqlAsciiEncodingTest.tearDownClass`` exactly."""
+    import psycopg
+    with psycopg.connect(admin_url, autocommit=True) as conn:
+        conn.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            "WHERE datname = %s AND pid <> pg_backend_pid()", (dbname,))
+        conn.execute(f'DROP DATABASE IF EXISTS "{dbname}"')
+
+
+def _production_matrix_row_counts(url):
+    """``(accounts, officials, players, programs, teams)`` row counts on
+    ``url`` -- the exact five entities #202 repair round 7, finding 2
+    names -- via a FRESH, independent store, never whatever a just-torn-
+    -down (or still-running) contract run's own ``STATE.api`` happens to
+    reference at the moment this is called."""
+    store = SqlStore(url)
+    try:
+        return (len(store.all_user_accounts()), len(store.all_officials()),
+                len(store.all_players()), len(store.all_programs()),
+                len(store.all_teams()))
+    finally:
+        store.close()
+
+
 @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
                      "PostgreSQL not configured (TEST_DATABASE_URL)")
 class PostgresOptionalSessionProductionTest(OptionalSessionProductionMatrixContract,
                                             unittest.TestCase):
+    """#202 repair round 7, finding 2: a DISPOSABLE database of this
+    class's own -- created and dropped around ONE run -- never the bare,
+    worker-shared ``TEST_DATABASE_URL`` directly. See this module's own
+    ``_provision_disposable_postgres_database`` and this file's round-7
+    finding 2 comment block above for the leak this closes."""
+
     def database_url(self):
-        return os.environ["TEST_DATABASE_URL"]
+        return _provision_disposable_postgres_database(self.addClassCleanup)
 
 
 # --------------------------------------------------------------------------- #
@@ -866,10 +998,11 @@ class PostgresOptionalSessionProductionTest(OptionalSessionProductionMatrixContr
 # ``TestSuite._handleClassSetUp``/``doClassCleanups``, part of the SUITE      #
 # runner, not a side effect of calling ``setUpClass`` itself -- every test    #
 # below builds a real ``TestSuite`` and a real ``TestRunner`` for exactly     #
-# this reason, not a shortcut). Round 7 finding 3 (external review) extends   #
-# this SAME section rather than opening a new one: its own restore-side-      #
-# failure mutation proof is a failure scenario of EXACTLY this harness, just  #
-# as round 6 finding 3's own proofs already are.                             #
+# this reason, not a shortcut). Round 7 findings 2 and 3 (external review)    #
+# extend this SAME section rather than opening a new one: finding 2's own    #
+# "run twice against the same SQL url" proofs and finding 3's own restore-    #
+# side-failure mutation proof are both failure/repetition scenarios of        #
+# EXACTLY this harness, just as round 6 finding 3's own proofs already are.   #
 # --------------------------------------------------------------------------- #
 def _run_contract(contract_cls):
     """Run every test method of ``contract_cls`` through a REAL
@@ -885,8 +1018,9 @@ def _run_contract(contract_cls):
 class OptionalSessionProductionMatrixIsolationTests(unittest.TestCase):
     """Failure-injection and repeated-run proofs for
     ``OptionalSessionProductionMatrixContract``'s own harness -- #202
-    repair round 6, finding 3; extended by round 7's own finding 3 (a
-    restore-side ``STATE.reset()`` failure must surface, never be
+    repair round 6, finding 3; extended by round 7's own finding 2 (no
+    residual rows from a repeated run against one SQL url) and finding 3
+    (a restore-side ``STATE.reset()`` failure must surface, never be
     silently swallowed)."""
 
     def setUp(self):
@@ -1154,7 +1288,28 @@ class OptionalSessionProductionMatrixIsolationTests(unittest.TestCase):
         taken"); the underlying bug (fixed usernames, a production
         STATE.reset() that deliberately never wipes rows) is identical
         for any persistent SQL backend, SQLite included -- this is the
-        SAME regression, reproducible without Postgres."""
+        SAME regression, reproducible without Postgres.
+
+        #202 repair round 7, finding 2's own required regression
+        coverage, folded into this ALREADY-portable SQLite proof rather
+        than a separate test: round 6's unique-suffix fix alone stops a
+        USERNAME collision (proven above, unchanged) but not ROW
+        accumulation -- DEMONSTRATED (this session's own repro against a
+        real Postgres database, reproduced identically here without one):
+        accounts/officials/players/programs/teams growing 3/1/1/1/1 after
+        run 1 to 6/2/2/2/2 after run 2 when nothing cleans up between
+        runs. A SENTINEL Program (representing data that predates this
+        harness's own runs, unrelated to it) is seeded before run 1 and
+        confirmed to survive it UNTOUCHED -- production really does
+        preserve pre-existing data, unchanged from round 5/6 -- while an
+        EXPLICIT, test-owned wipe between runs (safe here: this whole
+        file is a throwaway this test alone owns and deletes at the end,
+        never the worker-shared TEST_DATABASE_URL a blanket wipe would be
+        unsafe against -- see PostgresOptionalSessionProductionTest's own
+        fix above for why the REAL contract class never needs to reach
+        for this at all) is what a REUSED SQL url, unlike a per-run
+        disposable one, actually requires to leave "no harness-created
+        residual rows after each run" -- the reviewer's own words."""
         fd, path = tempfile.mkstemp(suffix=".sqlite")
         os.close(fd)
         self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
@@ -1173,29 +1328,102 @@ class OptionalSessionProductionMatrixIsolationTests(unittest.TestCase):
             def test_noop(self):
                 pass
 
+        # Seed a sentinel BEFORE this harness ever touches the file --
+        # migrates it as a side effect (SqlStore.__init__ applies pending
+        # migrations), the same as any first real connection would.
+        sentinel_store = SqlStore(path)
+        try:
+            sentinel_id = ApiService(sentinel_store).create_program(
+                "Sentinel Program (pre-existing)", "US", "UTC")["id"]
+        finally:
+            sentinel_store.close()
+        harness_counts = (3, 1, 1, 1, 1)  # accounts/officials/players/programs/teams
+
         result1 = _run_contract(_FixedSqliteProbe)
         self.assertTrue(result1.wasSuccessful(), result1.errors + result1.failures)
         self.assertEqual(os.environ.get("APP_MODE"), self._prev_app_mode)
+        accounts, officials, players, programs, teams = \
+            _production_matrix_row_counts(path)
+        self.assertEqual((accounts, officials, players, teams),
+                         (3, 1, 1, 1))
+        self.assertEqual(programs, 2,  # the sentinel PLUS this run's own
+                         "expected the sentinel program plus this run's "
+                         "own harness-created one")
+        verify_store = SqlStore(path)
+        try:
+            self.assertIn(
+                sentinel_id, {p.id for p in verify_store.all_programs()},
+                "production mode must still preserve pre-existing data")
+        finally:
+            verify_store.close()
+
+        # Explicit, test-owned cleanup between runs -- see this test's
+        # own docstring for why this is safe ONLY because the file
+        # belongs to this test alone.
+        wipe_store = SqlStore(path)
+        try:
+            wipe_store.reset_schema()
+        finally:
+            wipe_store.close()
 
         result2 = _run_contract(_FixedSqliteProbe)
         self.assertTrue(result2.wasSuccessful(), result2.errors + result2.failures)
         self.assertEqual(os.environ.get("APP_MODE"), self._prev_app_mode)
+        self.assertEqual(
+            _production_matrix_row_counts(path), harness_counts,
+            "a second run against the SAME url left harness-created rows "
+            "behind instead of an exact restoration")
+
+        wipe_store = SqlStore(path)
+        try:
+            wipe_store.reset_schema()
+        finally:
+            wipe_store.close()
 
         result3 = _run_contract(_FixedSqliteProbe)
         self.assertTrue(result3.wasSuccessful(), result3.errors + result3.failures)
         self.assertEqual(os.environ.get("APP_MODE"), self._prev_app_mode)
+        self.assertEqual(
+            _production_matrix_row_counts(path), harness_counts,
+            "a third run against the SAME url left harness-created rows "
+            "behind instead of an exact restoration")
 
     @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
                          "PostgreSQL not configured (TEST_DATABASE_URL)")
     def test_running_the_contract_twice_against_the_same_postgres_url_both_succeed(self):
-        """The reviewer's own EXACT scenario, directly: setup/teardown/
-        setup TWICE against the real, worker-shared ``TEST_DATABASE_URL``
-        -- both must succeed. DEMONSTRATED broken pre-fix, this exact
-        way, in this finding's own PR-cited transcript."""
+        """The reviewer's own EXACT scenario, against a REAL PostgreSQL
+        server -- setup/teardown/setup TWICE against ONE fixed url --
+        both must succeed, AND (#202 repair round 7, finding 2's own
+        required regression coverage) leave no harness-created residual
+        rows after each run. DEMONSTRATED broken pre-fix, this exact way,
+        in this finding's own PR-cited transcript (accounts/officials/
+        players/programs/teams growing 3/1/1/1/1 -> 6/2/2/2/2).
+
+        Targets a database THIS TEST creates and drops itself via
+        ``_provision_disposable_postgres_database`` (never the bare,
+        worker-shared ``TEST_DATABASE_URL`` directly -- exactly like
+        ``PostgresOptionalSessionProductionTest`` above) precisely so the
+        explicit wipe between runs below -- safe here because nothing
+        else on the server shares this one-off database -- proves the
+        SAME "reused SQL url leaves no residue" claim
+        ``test_running_the_contract_twice_against_the_same_sql_url_both_
+        succeed`` above proves for SQLite, against real PostgreSQL too,
+        without EVER touching a database anything else in this test run
+        depends on."""
+        url = _provision_disposable_postgres_database(self.addCleanup)
+
+        sentinel_store = SqlStore(url)
+        try:
+            sentinel_id = ApiService(sentinel_store).create_program(
+                "Sentinel Program (pre-existing)", "US", "UTC")["id"]
+        finally:
+            sentinel_store.close()
+        harness_counts = (3, 1, 1, 1, 1)
+
         class _PgProbe(OptionalSessionProductionMatrixContract,
                       unittest.TestCase):
             def database_url(self):
-                return os.environ["TEST_DATABASE_URL"]
+                return url
 
             def test_noop(self):
                 pass
@@ -1203,10 +1431,32 @@ class OptionalSessionProductionMatrixIsolationTests(unittest.TestCase):
         result1 = _run_contract(_PgProbe)
         self.assertTrue(result1.wasSuccessful(), result1.errors + result1.failures)
         self.assertEqual(os.environ.get("APP_MODE"), self._prev_app_mode)
+        accounts, officials, players, programs, teams = \
+            _production_matrix_row_counts(url)
+        self.assertEqual((accounts, officials, players, teams),
+                         (3, 1, 1, 1))
+        self.assertEqual(programs, 2)
+        verify_store = SqlStore(url)
+        try:
+            self.assertIn(
+                sentinel_id, {p.id for p in verify_store.all_programs()},
+                "production mode must still preserve pre-existing data")
+        finally:
+            verify_store.close()
+
+        wipe_store = SqlStore(url)
+        try:
+            wipe_store.reset_schema()
+        finally:
+            wipe_store.close()
 
         result2 = _run_contract(_PgProbe)
         self.assertTrue(result2.wasSuccessful(), result2.errors + result2.failures)
         self.assertEqual(os.environ.get("APP_MODE"), self._prev_app_mode)
+        self.assertEqual(
+            _production_matrix_row_counts(url), harness_counts,
+            "a second run against the SAME url left harness-created rows "
+            "behind instead of an exact restoration")
 
 
 if __name__ == "__main__":
