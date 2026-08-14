@@ -190,9 +190,64 @@ exactly how far it goes):
   (``except ValueError:``) is unaffected by 6c (nothing to leak through),
   though the RAISE's own argument is still independently audited by 6b.
 
+#202 repair round 11, finding B (documented here deliberately, NOT fixed
+this round -- see ``tests/test_route_extract.py``'s
+``CapturedArgumentProvenanceTests.test_the_real_api_facade_exposes_no_callable_shaped_signature``
+for the standing tripwire):
+
+* PROVENANCE ALONE does not stop a provably-real ``api = STATE.api``
+  from being handed to a hypothetical FUTURE higher-order method on the
+  real facade. Round 10's fix (extended by round 11's own finding A to
+  also cover ``STATE`` itself) proves a name really IS bound from the
+  reviewed source expression -- but once that proof holds,
+  :func:`_captured_arg_safe_callee` trusts the name's WHOLE surface
+  (CLAUDE.md's own layering guarantee, see
+  ``_CAPTURED_ARG_SAFE_CALLEE_ROOTS``'s own docstring), not a per-method
+  allowlist. CONFIRMED still exempted, fresh against this round's own
+  fixed code: ``api = STATE.api`` followed directly by ``api.invoke(
+  api.get_item, action)`` raises nothing, the identical shape a genuine
+  future callback-taking method on the real facade would need to hide
+  routing/policy behaviour behind (see :func:`_captured_arg_safe_callee`'s
+  own docstring for why this module cannot generally tell such a method
+  apart from any other ``api.<method>()`` call without running the
+  program).
+* NOT exploitable against the real ``server.py`` today: independently
+  RE-confirmed fresh for this round (not copied forward from round 10)
+  by walking every PUBLIC method on the real ``ApiService`` and the 9
+  sub-facade classes it actually constructs (``AccountService``,
+  ``ContextService``, ``DeliveryLoop``, ``DeliveryWorker``,
+  ``FactoryResetService``, ``GuardianService``, ``InMemoryStore``,
+  ``RosterService``, ``SetupService`` -- discovered from a real instance,
+  never hand-listed) -- none declares a ``Callable``-typed parameter or
+  return value, the shape a genuine ``api.invoke(fn, target)`` would
+  need. ``test_the_real_api_facade_exposes_no_callable_shaped_signature``
+  asserts this directly and fails LOUDLY the moment a real callback-typed
+  signature is added anywhere on the facade, rather than staying silent
+  while the gap this section describes quietly goes live. This is
+  architectural and latent, not a live hole today.
+* What would close it, and why it is NOT implemented: an exhaustive
+  per-method allowlist was tried first and rejected -- the real facade
+  has 174 distinct ``api.<attr>`` names referenced in server.py today
+  (confirmed by direct AST count, not asserted from memory), and a
+  NAME-based heuristic (flagging methods merely SPELLED ``invoke``/
+  ``dispatch``/``execute``/...) produces real false positives
+  (``FactoryResetService.execute``, a plain domain operation -- wipe the
+  database given credentials -- that only happens to share a name with
+  the pattern) -- exactly the "spelling is not the same as provenance"
+  lesson finding A closes, one level deeper, so the SAME discipline that
+  rejects a spelling-based fix for finding A rejects one here too. What
+  stands in its place is a CONTRACT test pinning today's architecture,
+  not a static-analysis restriction: it fails the moment a real
+  ``Callable``-typed parameter or return value is added anywhere on the
+  facade, forcing exactly the individual review a NEW allowlist ROOT
+  name already requires (see ``_CAPTURED_ARG_SAFE_CALLEE_ROOTS``'s own
+  docstring) -- a continuously-verified monitoring/regression backstop,
+  not something that closes this gap by construction in
+  :mod:`route_extract` itself.
+
 On the soundness of this gate, honestly stated
 ------------------------------------------------
-This module has been adversarially reviewed across TEN rounds: the
+This module has been adversarially reviewed across ELEVEN rounds: the
 original repository-owner review (6 findings, all closed by the #202
 repair), a first self-directed adversarial hunt (findings A-D, round 2), a
 second (findings E-H, round 3 -- E/F/G closed by this section's own
@@ -238,7 +293,31 @@ function, only when that function's own body proves it is bound EXACTLY
 once, at a dominating, top-level, never-rebound ``name = STATE.api``
 assignment, the SAME "is this name really what it claims to be"
 discipline :func:`_is_self_call`/:func:`_is_self_path` already
-established for ``self`` -- see :func:`_captured_arg_trusted_roots`).
+established for ``self`` -- see :func:`_captured_arg_trusted_roots`),
+and a TENTH (round 11: 2 findings from that round's own independent
+verify track. Finding A: round 10's provenance check proved WHO binds
+``api``, but never asked the same question of ``STATE`` -- the free
+variable embedded in the trusted RHS text ``STATE.api`` itself -- so a
+same-spelled parameter or a preceding local reassignment of ``STATE``
+inherited the exemption exactly as a shadowed ``api`` did before round
+10, the identical spelling-not-provenance bug recurring one level up
+the same expression; DEMONSTRATED both statically and live over real
+HTTP, the SAME "static stays silent, live diverges 200/404" proof every
+prior round's finding required, and closed by extending
+:func:`_has_dominating_trusted_binding` to also require every free
+variable inside the trusted text to be provably unshadowed, via the
+SAME :func:`_name_rebinding_sites` machinery round 10 already built
+(see :func:`_trusted_source_free_roots`). Finding B: even a genuinely
+provenance-proven ``api = STATE.api`` still trusts the reviewed
+facade's WHOLE surface, not a per-method allowlist -- a hypothetical
+FUTURE ``api.invoke``-shaped method could hide routing behaviour behind
+a name this module cannot vet without running the program, precisely
+the residual concern round 10's own fix disclosed; a per-method
+allowlist was tried and rejected (174 distinct ``api.<attr>`` names in
+server.py today, and a name-based heuristic produced a real false
+positive), so this stays NOT fixed -- documented just below as a KNOWN
+LIMITATION, with the Callable-annotation contract test round 10 already
+added as its standing tripwire).
 Each round's own pattern repeats: fix what was found, and a FRESH hunt
 finds more. That is not a sign any individual round was careless -- it
 is the expected, unavoidable shape of a bespoke static analyzer over a
@@ -250,11 +329,13 @@ So, stated plainly, NOT as an oversight but as a considered engineering
 trade-off:
 
 * this gate is NOT claimed to be exhaustively complete against arbitrary
-  future Python constructs. Finding H above, and finding 6c's own
-  precisely-bounded residual gap above, are known, DOCUMENTED,
+  future Python constructs. Finding H above, finding 6c's own
+  precisely-bounded residual gap above, and round 11's own finding B
+  above (the captured-arg provenance gate trusts a proven name's WHOLE
+  surface, not a per-method allowlist) are known, DOCUMENTED,
   currently-undemonstrated-beyond-what-is-stated gaps; there is no proof
-  that no OTHER gap exists beyond the ones ten rounds of review happened
-  to find -- round 9's own finding is itself a clear illustration:
+  that no OTHER gap exists beyond the ones eleven rounds of review
+  happened to find -- round 9's own finding is itself a clear illustration:
   round 8 closed its specific category (transparent Tuple/List/IfExp
   composition) completely, and a NEW category (higher-order argument
   transfer) was found regardless. Round 10 confirms the pattern does not
@@ -264,9 +345,13 @@ trade-off:
   trust boundary being spelling-only rather than provenance-based -- a
   category of gap (WHO a mechanism trusts, not WHAT shape defeats it)
   none of rounds 6-9 needed to consider, because none of them had yet
-  introduced a mechanism that trusted a NAME at all. An eleventh round
-  should be expected to find an eleventh thing, on the same pattern as
-  the first ten;
+  introduced a mechanism that trusted a NAME at all -- and round 11 bore
+  this out again, though from WITHIN round 10's own fix rather than a
+  category no round had yet needed to consider: a free variable EMBEDDED
+  INSIDE an already-trusted expression turns out to need the identical
+  unshadowed-name proof the expression's own root did, one level up (see
+  round 11's finding A above). A twelfth round should be expected to
+  find a twelfth thing, on the same pattern as the first eleven;
 * the actual soundness BACKSTOP for CORRECTNESS -- as distinct from
   completeness of this module's own DETECTION -- is not this static walker
   at all, but a RUNTIME proof already in place: the 405/Allow admission
@@ -3812,6 +3897,19 @@ def _is_callee(node: ast.AST, parents: Optional[dict]) -> bool:
 #: ``_CAPTURED_ARG_SAFE_CALLEE_ROOTS`` used to be on its own -- the two are
 #: now meant to be extended TOGETHER, which is why ``ROOTS`` is derived
 #: from this dict rather than declared independently.
+#:
+#: #202 repair round 11 (this round's own independent verify track):
+#: matching this dict's TEXT is necessary but was not, until this round,
+#: SUFFICIENT either -- a trusted source expression can itself name a free
+#: variable (``STATE``, for the one entry here), and round 10's own check
+#: proved nothing about whether THAT name is what it claims to be in a
+#: given function. :func:`_has_dominating_trusted_binding` now also
+#: requires every such free variable to be provably unshadowed (see
+#: :func:`_trusted_source_free_roots`) before the exemption fires --
+#: extending a value in this dict to something with a MORE COMPLEX free-
+#: variable shape than a single bare name (``STATE.api``) stays within
+#: that same check's coverage automatically, since it walks the RHS's own
+#: parsed AST rather than special-casing this one shape.
 _CAPTURED_ARG_SAFE_CALLEE_TRUSTED_SOURCES = {"api": "STATE.api"}
 _CAPTURED_ARG_SAFE_CALLEE_ROOTS = frozenset(_CAPTURED_ARG_SAFE_CALLEE_TRUSTED_SOURCES)
 
@@ -3873,6 +3971,34 @@ def _name_rebinding_sites(name: str, fn: ast.FunctionDef) -> list:
     return sites
 
 
+def _trusted_source_free_roots(expr: ast.expr) -> frozenset:
+    """Every distinct NAME referenced, in Load context, anywhere in a
+    trusted source expression's own AST -- for ``STATE.api`` this is
+    ``{"STATE"}``: the free variable(s) the expression is rooted at.
+
+    #202 repair round 11 (this round's own independent verify track):
+    :func:`_has_dominating_trusted_binding` proves the LHS name (``api``)
+    is bound exactly once, dominating, unrebound -- but its final check is
+    a bare ``ast.unparse(stmt.value) == trusted_source`` TEXTUAL match,
+    which by itself says nothing about whether the free variables INSIDE
+    that trusted text (``STATE``) are themselves what they claim to be in
+    the audited function. This is what lets that caller ask the SAME
+    "is this free variable shadowed here" question of ``STATE`` that it
+    already asks of ``api`` -- one level up the same expression, and no
+    further (a trusted source that itself named something needing its
+    OWN provenance proof, rather than merely needing to be UNSHADOWED,
+    would be a new architectural question, not one this function begs).
+
+    Deliberately walks ``expr`` -- the ALREADY-PARSED ``stmt.value`` the
+    caller just compared by ``ast.unparse()``, never a fresh parse of the
+    trusted-source STRING -- so this can never disagree with what that
+    textual match already confirmed the expression's shape to be.
+    """
+    return frozenset(
+        node.id for node in ast.walk(expr)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load))
+
+
 def _has_dominating_trusted_binding(name: str, fn: ast.FunctionDef,
                                     parents: dict) -> bool:
     """Is ``name`` bound, in ``fn``, EXACTLY once -- at a plain, single-
@@ -3925,16 +4051,31 @@ def _has_dominating_trusted_binding(name: str, fn: ast.FunctionDef,
       discipline ``_DO_HEAD_SAFE_SHAPE``/``_DO_OPTIONS_SAFE_SHAPE`` already
       use for "the literal reviewed shape, not merely something shaped
       like it"), must match
-      ``_CAPTURED_ARG_SAFE_CALLEE_TRUSTED_SOURCES[name]`` exactly.
+      ``_CAPTURED_ARG_SAFE_CALLEE_TRUSTED_SOURCES[name]`` exactly;
+    * #202 repair round 11 (this round's own independent verify track):
+      matching the trusted TEXT is not the end of the proof either --
+      every free variable REFERENCED inside that text (``STATE``, for the
+      one entry this dict has today) must ALSO be provably unshadowed in
+      ``fn``: zero :func:`_name_rebinding_sites` hits, the SAME "no
+      rebinding site, no parameter of that name" bar this function already
+      holds ``name`` itself to, applied one level up the expression via
+      :func:`_trusted_source_free_roots`. Round 10 closed "who binds
+      ``api``"; a same-spelled parameter (with a default) or a preceding
+      local reassignment of ``STATE`` would otherwise inherit the
+      exemption exactly as a shadowed ``api`` did before round 10 -- the
+      identical spelling-not-provenance bug, recurring one level up the
+      same expression it trusts.
 
     Every real server.py site this exemption exists for -- ``_dispatch_get``,
     ``do_POST``, ``_handle_reassign``, ``_handle_reassign_v2``,
     ``_handle_setup``, ``_handle_setup_v2`` -- opens with exactly
     ``api = STATE.api`` as its own early statement, directly in the method
-    body, never reassigned again in that method, so this predicate is not
-    a NEW restriction on real code, only on code that does not actually
-    have the property the OLD check merely assumed from the name's
-    spelling.
+    body, never reassigned again in that method, and ``STATE`` itself is
+    NEVER bound as a parameter or local anywhere in server.py (confirmed by
+    direct AST inspection, the same methodology ``CapturedArgumentProvenanceTests``
+    already applies to the real file) -- so this predicate is not a NEW
+    restriction on real code, only on code that does not actually have the
+    property the OLD check merely assumed from the name's spelling.
     """
     trusted_source = _CAPTURED_ARG_SAFE_CALLEE_TRUSTED_SOURCES.get(name)
     if trusted_source is None:
@@ -3949,7 +4090,11 @@ def _has_dominating_trusted_binding(name: str, fn: ast.FunctionDef,
     if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
             and stmt.targets[0] is site and stmt in fn.body):
         return False
-    return ast.unparse(stmt.value) == trusted_source
+    if ast.unparse(stmt.value) != trusted_source:
+        return False
+    return all(not _name_rebinding_sites(root, fn)
+               for root in _trusted_source_free_roots(stmt.value)
+               if root != name)
 
 
 def _captured_arg_trusted_roots(fn: ast.FunctionDef, parents: dict) -> frozenset:

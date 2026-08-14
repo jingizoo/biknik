@@ -5971,6 +5971,170 @@ class CapturedArgumentProvenanceTests(unittest.TestCase):
             found,
             {("GET", "/api/items/{}"), ("GET", "/api/setup/{}/delete")})
 
+    # -- round 11, finding A: the trusted RHS TEXT ``STATE.api`` matching   -
+    # -- is not the end of the proof -- ``STATE``, the free variable        -
+    # -- EMBEDDED inside that text, must also be provably unshadowed, the   -
+    # -- SAME "no rebinding site, no parameter of that name" bar round 10   -
+    # -- already holds ``api`` itself to, applied one level up the          -
+    # -- expression. Mirrors round 10's own parameter-shadow and local-     -
+    # -- reassignment repros exactly, just shadowing ``STATE`` instead of   -
+    # -- ``api`` -------------------------------------------------------------
+
+    def test_state_parameter_shadow_raises(self):
+        """``STATE`` is never ASSIGNED anywhere in this function -- its
+        only binding is the function's own PARAMETER, exactly the
+        "parameter shadowing" shape round 10 already closed for ``api``
+        itself, one level up: the RHS text ``STATE.api`` still matches
+        ``_CAPTURED_ARG_SAFE_CALLEE_TRUSTED_SOURCES["api"]`` exactly, but
+        ``STATE`` is fully attacker-controlled here, so ``api`` is not
+        really the reviewed facade's own attribute at all."""
+        self._raises('''
+            def do_GET(self, STATE=evil_state):
+                path = self.path
+                api = STATE.api
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return api.invoke({"hidden": api.hidden, "other": api.other}[action], self)
+        ''', "unlisted call")
+
+    def test_state_parameter_shadow_escape_answers_over_real_http(self):
+        """The SAME source text as the static test above, driven live:
+        ``BaseHTTPRequestHandler`` calls ``self.do_GET()`` with NO
+        arguments, so the DEFAULT value is what a real request actually
+        reaches -- the same live-testability round 10's own parameter-
+        shadow repro relied on, one level up the expression."""
+        body = '''
+            def do_GET(self, STATE=evil_state):
+                path = self.path
+                api = STATE.api
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return api.invoke({"hidden": api.hidden, "other": api.other}[action], self)
+        '''
+        extra_globals = {
+            "re": re, "evil_state": types.SimpleNamespace(api=_EvilApiFacade()),
+        }
+        status, text = _real_http_probe_with_globals(
+            body, extra_globals, "GET", "/api/hidden")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"n": 1})
+        status2, text2 = _real_http_probe_with_globals(
+            body, extra_globals, "GET", "/api/other")
+        self.assertEqual(status2, 404)
+        self.assertEqual(json.loads(text2), {"error": "not_found"})
+
+    def test_state_local_reassignment_raises(self):
+        """A plain preceding local ``STATE = evil_state`` -- never a
+        parameter, never anywhere near the ``api = STATE.api`` line's own
+        single-assignment shape -- shadows the module-level singleton
+        before ``api = STATE.api`` ever reads it. ``api`` itself is still
+        bound EXACTLY once, at a dominating, top-level, never-rebound
+        assignment whose RHS text matches the trusted source exactly --
+        round 10's OWN check alone would accept this; only round 11's
+        free-root check catches that ``STATE`` does not resolve to the
+        reviewed singleton here."""
+        self._raises('''
+            def do_GET(self):
+                STATE = evil_state
+                path = self.path
+                api = STATE.api
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return api.invoke({"hidden": api.hidden, "other": api.other}[action], self)
+        ''', "unlisted call")
+
+    def test_state_local_reassignment_escape_answers_over_real_http(self):
+        """The SAME source text as the static test above, driven live --
+        the ONLY ``STATE`` assignment in this function is the evil one, so
+        a real request reaches it unconditionally."""
+        body = '''
+            def do_GET(self):
+                STATE = evil_state
+                path = self.path
+                api = STATE.api
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return api.invoke({"hidden": api.hidden, "other": api.other}[action], self)
+        '''
+        extra_globals = {
+            "re": re, "evil_state": types.SimpleNamespace(api=_EvilApiFacade()),
+        }
+        status, text = _real_http_probe_with_globals(
+            body, extra_globals, "GET", "/api/hidden")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"n": 1})
+        status2, text2 = _real_http_probe_with_globals(
+            body, extra_globals, "GET", "/api/other")
+        self.assertEqual(status2, 404)
+        self.assertEqual(json.loads(text2), {"error": "not_found"})
+
+    def test_disabling_the_free_root_check_restores_the_state_shadowing_escape(self):
+        """MUTATION: ``_trusted_source_free_roots`` replaced with a stub
+        that always returns an EMPTY set -- i.e. "this trusted expression
+        has no free variables to check" -- while leaving round 10's own
+        "exactly one dominating, text-matching assignment" check for
+        ``api`` itself completely intact. This exactly reproduces round
+        10's OWN (pre-round-11) behaviour for ``STATE``: proving the
+        free-root check (not merely round 10's pre-existing ``api``-only
+        check, held fixed here) is what independently closes finding A --
+        the parameter-shadow repro above, which correctly raises against
+        the real fix, goes back to being WRONGLY exempted under this
+        mutation."""
+        original = route_extract_module._trusted_source_free_roots
+        route_extract_module._trusted_source_free_roots = lambda expr: frozenset()
+        self.addCleanup(setattr, route_extract_module,
+                        "_trusted_source_free_roots", original)
+
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self, STATE=evil_state):
+                path = self.path
+                api = STATE.api
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return api.invoke({"hidden": api.hidden, "other": api.other}[action], self)
+        '''))}
+        self.assertEqual(found, {("GET", "/api/{}")},
+                         "mutation expected to WRONGLY exempt this shape")
+
+    # -- round 11, finding B (KNOWN LIMITATION, NOT fixed -- see           -
+    # -- route_extract.py's module docstring, KNOWN LIMITATIONS): even a   -
+    # -- GENUINELY, provenance-proven ``api = STATE.api`` (finding A's own -
+    # -- fix, directly above) still trusts the reviewed facade's WHOLE     -
+    # -- surface, not a per-method allowlist -- a hypothetical FUTURE      -
+    # -- ``api.invoke``-shaped method could hide routing behaviour behind  -
+    # -- a name this module cannot vet without running the program ---------
+
+    def test_genuine_state_provenance_does_not_restrict_which_api_methods_are_called(self):
+        """A dominating, unshadowed ``api = STATE.api`` -- passing BOTH
+        round 10's check and round 11's finding-A free-root check -- still
+        exempts ANY method called on ``api``, including a higher-order
+        ``api.invoke(callback, arg)`` shape indistinguishable, by this
+        module's own static reading, from the genuinely inert
+        ``api.get_item(gid)`` calls the real server.py uses today. This is
+        finding B, left deliberately UNFIXED (see the module docstring's
+        KNOWN LIMITATIONS section): it demonstrates the boundary the
+        Callable-annotation contract test
+        (``test_the_real_api_facade_exposes_no_callable_shaped_signature``,
+        just below) exists to continuously monitor, not a static check
+        this module claims to perform itself."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path
+                api = STATE.api
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return api.invoke(api.get_item, action)
+        '''))}
+        self.assertEqual(found, {("GET", "/api/{}")},
+                         "finding B: a genuinely-proven api still exempts "
+                         "ANY method call on it, higher-order or not")
+
     # -- "safe-name object/higher-order-method" cases: once a name's       -
     # -- provenance is proven, the exemption trusts the REVIEWED facade's  -
     # -- WHOLE surface (CLAUDE.md's own layering guarantee -- the SAME     -
