@@ -190,60 +190,34 @@ exactly how far it goes):
   (``except ValueError:``) is unaffected by 6c (nothing to leak through),
   though the RAISE's own argument is still independently audited by 6b.
 
-#202 repair round 11, finding B (documented here deliberately, NOT fixed
-this round -- see ``tests/test_route_extract.py``'s
-``CapturedArgumentProvenanceTests.test_the_real_api_facade_exposes_no_callable_shaped_signature``
-for the standing tripwire):
+#202 repair round 11, finding B -- CLOSED by round 13, finding 1 (was
+documented here as NOT fixed; kept only as a pointer for anyone who reads
+an old copy of this section, not as an open item):
 
-* PROVENANCE ALONE does not stop a provably-real ``api = STATE.api``
-  from being handed to a hypothetical FUTURE higher-order method on the
-  real facade. Round 10's fix (extended by round 11's own finding A to
-  also cover ``STATE`` itself) proves a name really IS bound from the
-  reviewed source expression -- but once that proof holds,
-  :func:`_captured_arg_safe_callee` trusts the name's WHOLE surface
-  (CLAUDE.md's own layering guarantee, see
-  ``_CAPTURED_ARG_SAFE_CALLEE_ROOTS``'s own docstring), not a per-method
-  allowlist. CONFIRMED still exempted, fresh against this round's own
-  fixed code: ``api = STATE.api`` followed directly by ``api.invoke(
-  api.get_item, action)`` raises nothing, the identical shape a genuine
-  future callback-taking method on the real facade would need to hide
-  routing/policy behaviour behind (see :func:`_captured_arg_safe_callee`'s
-  own docstring for why this module cannot generally tell such a method
-  apart from any other ``api.<method>()`` call without running the
-  program).
-* NOT exploitable against the real ``server.py`` today: independently
-  RE-confirmed fresh for this round (not copied forward from round 10)
-  by walking every PUBLIC method on the real ``ApiService`` and the 9
-  sub-facade classes it actually constructs (``AccountService``,
-  ``ContextService``, ``DeliveryLoop``, ``DeliveryWorker``,
-  ``FactoryResetService``, ``GuardianService``, ``InMemoryStore``,
-  ``RosterService``, ``SetupService`` -- discovered from a real instance,
-  never hand-listed) -- none declares a ``Callable``-typed parameter or
-  return value, the shape a genuine ``api.invoke(fn, target)`` would
-  need. ``test_the_real_api_facade_exposes_no_callable_shaped_signature``
-  asserts this directly and fails LOUDLY the moment a real callback-typed
-  signature is added anywhere on the facade, rather than staying silent
-  while the gap this section describes quietly goes live. This is
-  architectural and latent, not a live hole today.
-* What would close it, and why it is NOT implemented: an exhaustive
-  per-method allowlist was tried first and rejected -- the real facade
-  has 174 distinct ``api.<attr>`` names referenced in server.py today
-  (confirmed by direct AST count, not asserted from memory), and a
-  NAME-based heuristic (flagging methods merely SPELLED ``invoke``/
-  ``dispatch``/``execute``/...) produces real false positives
-  (``FactoryResetService.execute``, a plain domain operation -- wipe the
-  database given credentials -- that only happens to share a name with
-  the pattern) -- exactly the "spelling is not the same as provenance"
-  lesson finding A closes, one level deeper, so the SAME discipline that
-  rejects a spelling-based fix for finding A rejects one here too. What
-  stands in its place is a CONTRACT test pinning today's architecture,
-  not a static-analysis restriction: it fails the moment a real
-  ``Callable``-typed parameter or return value is added anywhere on the
-  facade, forcing exactly the individual review a NEW allowlist ROOT
-  name already requires (see ``_CAPTURED_ARG_SAFE_CALLEE_ROOTS``'s own
-  docstring) -- a continuously-verified monitoring/regression backstop,
-  not something that closes this gap by construction in
-  :mod:`route_extract` itself.
+* PROVENANCE ALONE did not stop a provably-real ``api = STATE.api`` from
+  being handed to a hypothetical FUTURE higher-order method on the real
+  facade -- round 10's fix (extended by round 11's own finding A) proved a
+  name really IS bound from the reviewed source expression, but once that
+  proof held, the exemption trusted the name's WHOLE surface (CLAUDE.md's
+  own layering guarantee), not a per-method allowlist: ``api = STATE.api``
+  followed directly by ``api.invoke(api.get_item, action)`` raised
+  nothing, the identical shape a genuine future callback-taking method on
+  the real facade would need to hide routing/policy behaviour behind.
+* CLOSED as a direct consequence of round 13's own finding 1 (see
+  ``_TRUSTED_BINDING_SOURCES``'s own module comment): the exemption this
+  finding describes -- ANY method call trusted once a name's binding is
+  proven -- no longer exists at all. A captured-only call/subscript is now
+  inert ONLY at its own individually reviewed, EXACT-TEXT-fingerprinted
+  ``_AUDIT_WAIVERS`` position; ``api.invoke(api.get_item, action)`` is not
+  one of the real, reviewed server.py sites this round's waivers name, so
+  it raises like any other unlisted call -- see
+  ``CapturedArgumentProvenanceTests.test_genuine_state_provenance_no_longer_exempts_arbitrary_api_methods``
+  (test_route_extract.py) for the direct proof. The real facade's own
+  ``Callable``-signature contract test
+  (``test_the_real_api_facade_exposes_no_callable_shaped_signature``,
+  just below) is KEPT regardless -- it is a genuinely independent
+  monitoring backstop on the real ``ApiService``'s architecture, not
+  merely a tripwire for this now-closed gap.
 
 #202 repair round 12, finding 1 -- CLOSED by round 13, finding 2 (was
 documented here as NOT fixed; kept only as a pointer for anyone who reads
@@ -337,31 +311,64 @@ prior round's finding required, and closed by extending
 variable inside the trusted text to be provably unshadowed, via the
 SAME :func:`_name_rebinding_sites` machinery round 10 already built
 (see :func:`_trusted_source_free_roots`). Finding B: even a genuinely
-provenance-proven ``api = STATE.api`` still trusts the reviewed
+provenance-proven ``api = STATE.api`` still trusted the reviewed
 facade's WHOLE surface, not a per-method allowlist -- a hypothetical
 FUTURE ``api.invoke``-shaped method could hide routing behaviour behind
 a name this module cannot vet without running the program, precisely
 the residual concern round 10's own fix disclosed; a per-method
-allowlist was tried and rejected (174 distinct ``api.<attr>`` names in
-server.py today, and a name-based heuristic produced a real false
-positive), so this stays NOT fixed -- documented just below as a KNOWN
-LIMITATION, with the Callable-annotation contract test round 10 already
-added as its standing tripwire), an ELEVENTH (round 12: 1 finding --
+allowlist was tried and rejected at the time (174 distinct
+``api.<attr>`` names in server.py, and a name-based heuristic produced
+a real false positive), so this stayed NOT fixed for two more rounds --
+documented as a KNOWN LIMITATION, with the Callable-annotation contract
+test round 10 already added as its standing tripwire -- until round 13
+finding 1 (below) CLOSED it as a direct consequence of retiring the
+provenance gate's blanket trust entirely, not a separate fix), an
+ELEVENTH (round 12: 1 finding --
 round 11's own finding A closed "is ``STATE`` shadowed" for a parameter-
 default and a local reassignment, but :func:`_name_rebinding_sites`'s
 binding-form enumeration missed a THIRD spelling structural pattern
 matching adds, a ``match``/``case`` capture -- documented rather than
 fixed, on the strength of "server.py has no ``match`` statement today"),
-and a TWELFTH (round 13: round 12's own "not exploitable today" call did
-not survive its own tripwire test actually being RUN -- the synthetic
-repro placed the trusted ``api = STATE.api`` read BEFORE the capture that
-was supposed to shadow it, an ordering Python itself refuses to execute
-(``UnboundLocalError``) once ANY statement in the function binds that
-name, capture included -- so the gap was live, not merely latent, and
-finding 2 fixes it outright: :func:`_name_rebinding_sites` now recognises
-``ast.MatchAs``/``ast.MatchMapping`` captures the exact same way it
-already recognises ``ast.arg``/``ExceptHandler``/``Global``/``Nonlocal``/
-``Import``).
+and a TWELFTH (round 13: 2 findings from this round's own external
+review, reached at the SAME exact head as round 12's own documentation-
+only commit. Finding 1: the FOURTH consecutive round finding "one more
+thing about the captured-arg provenance chain was never proven" --
+round 9 asked who the allowlist trusted by NAME; round 10, whether that
+name was really BOUND to the trusted expression; round 11, whether the
+trusted expression's own FREE VARIABLES were shadowed; round 13 asks
+whether the trusted expression's VALUE stays what it was proven to be
+at all, once mutation is in scope -- and answers no: DEMONSTRATED live,
+``STATE.api = evil_api`` (or ``setattr``/``delattr``/``del``/an ALIAS,
+before OR after the trusted ``api = STATE.api`` read) reassigns,
+deletes, or is reached through an alias to the SAME attribute this
+module's whole provenance chain existed to vouch for, and NONE of
+rounds 9-11's machinery -- built to answer "is the NAME rebound",
+never "is the ATTRIBUTE mutated" -- has any way to see it. Proving
+general immutability of a mutable Python attribute across an entire
+function (and everything it calls) is not something static analysis
+can soundly do -- Python has no ``const``/``final`` -- so, rather than
+chase a fifth shape, this round RETIRES the whole structural exemption
+(:func:`_captured_arg_safe_callee`, :func:`_captured_arg_trusted_roots`,
+``_is_callee``, and the ``captured``-tracking that fed them -- see
+:data:`_TRUSTED_BINDING_SOURCES`'s own module comment for the full
+account of what is removed and what is kept) in favour of the SAME
+exact-site-review discipline (``_AUDIT_WAIVERS``) this module already
+uses for every other case where a general soundness proof is
+infeasible: each of the real file's 37 captured-only call/subscript
+sites the retired exemption used to cover now carries its OWN
+individually reviewed, exact-text-fingerprinted waiver instead of a
+blanket, name-rooted trust -- closing round 11's own finding B (above)
+as a direct consequence, since NOTHING is trusted by a method's mere
+membership on a proven name's surface any more. Finding 2: round 12's
+own "not exploitable today" call did not survive its own tripwire test
+actually being RUN -- the synthetic repro placed the trusted ``api =
+STATE.api`` read BEFORE the capture that was supposed to shadow it, an
+ordering Python itself refuses to execute (``UnboundLocalError``) once
+ANY statement in the function binds that name, capture included -- so
+the gap was live, not merely latent, and this round fixes it outright:
+:func:`_name_rebinding_sites` now recognises ``ast.MatchAs``/
+``ast.MatchMapping`` captures the exact same way it already recognises
+``ast.arg``/``ExceptHandler``/``Global``/``Nonlocal``/``Import``).
 Each round's own pattern repeats: fix what was found, and a FRESH hunt
 finds more. That is not a sign any individual round was careless -- it
 is the expected, unavoidable shape of a bespoke static analyzer over a
@@ -373,11 +380,11 @@ So, stated plainly, NOT as an oversight but as a considered engineering
 trade-off:
 
 * this gate is NOT claimed to be exhaustively complete against arbitrary
-  future Python constructs. Finding H above, finding 6c's own
-  precisely-bounded residual gap above, and round 11's own finding B
-  above (the captured-arg provenance gate trusts a proven name's WHOLE
-  surface, not a per-method allowlist) are known, DOCUMENTED,
-  currently-undemonstrated-beyond-what-is-stated gaps; there is no proof
+  future Python constructs. Finding H above and finding 6c's own
+  precisely-bounded residual gap above are known, DOCUMENTED,
+  currently-undemonstrated-beyond-what-is-stated gaps (round 11's own
+  finding B, the third member of this list through round 12, is CLOSED
+  as of round 13 -- see that round's own finding 1, above); there is no proof
   that no OTHER gap exists beyond the ones thirteen rounds of review
   happened to find -- round 9's own finding is itself a clear illustration:
   round 8 closed its specific category (transparent Tuple/List/IfExp
@@ -403,7 +410,23 @@ trade-off:
   that round 12's own "not exploitable today" call rested on a repro that
   could not execute -- a reminder that "documented as latent" is only as
   good as the falsifiability of the tripwire proving it stays latent, not
-  a substitute for actually running the thing;
+  a substitute for actually running the thing. Round 13's OWN finding 1
+  is the sharpest instance of this section's whole point: the SAME
+  captured-arg provenance chain was the target of the finding in FOUR
+  CONSECUTIVE rounds (9, 10, 11, 13) -- WHO a mechanism trusts by name,
+  then whether the name is really bound, then whether a free variable
+  INSIDE the trusted expression is shadowed, then whether the trusted
+  expression's own VALUE stays what it was proven to be at all -- each
+  round's fix genuinely closed what it targeted, and each time a
+  DIFFERENT question about the SAME chain turned out not to have been
+  asked yet. Continuing to chase a fifth question along the same axis
+  was judged, this round, not to be a realistic path to soundness for a
+  MUTABLE Python attribute (general immutability across a whole function
+  is not something static analysis can prove), so this round generalises
+  instead of extending: retiring the structural exemption in favour of
+  exact-site review is what finally stops this SPECIFIC sequence, not by
+  finding a proof strong enough to survive a fifth question, but by no
+  longer asking a question a mutable attribute can never soundly answer;
 * the actual soundness BACKSTOP for CORRECTNESS -- as distinct from
   completeness of this module's own DETECTION -- is not this static walker
   at all, but a RUNTIME proof already in place: the 405/Allow admission
@@ -844,36 +867,32 @@ class _Ctx:
     #: Every path-bearing name bound ANYWHERE in this function walk, including
     #: inside nested branches. Shared (not copied) with children so the
     #: completeness audit below sees names a child ctx introduced.
+    #:
+    #: #202 repair round 5, finding 2b introduced a SECOND field here,
+    #: ``captured`` -- every name EVER bound via :meth:`bind_subject`
+    #: (a captured regex group, directly or carried across a delegation
+    #: boundary), fed to :func:`_propagates_taint` to exempt a non-``self.``
+    #: call whose only tracked mentions were already-captured data. #202
+    #: repair round 13, finding 1 (external review) retired that exemption
+    #: (proving a captured NAME was never rebound said nothing about
+    #: whether the ATTRIBUTE this module actually trusted off the object it
+    #: pointed to had since been mutated -- see
+    #: :data:`_TRUSTED_BINDING_SOURCES`'s own module comment) and, with it,
+    #: removed ``captured`` itself: grepped fresh against this module's own
+    #: source before deleting it, its ONE reader was that exemption, so it
+    #: was confirmed dead, not merely dormant, rather than left computed
+    #: and threaded through calls that no longer consult it.
     seen: set = field(default_factory=set)
-    #: Every name EVER bound via :meth:`bind_subject` ANYWHERE in this
-    #: function walk (#202 repair round 5, finding 2b) -- a captured regex
-    #: group, directly or a TAIL_DELEGATES/PARSED_DELEGATES parameter
-    #: carrying one across a delegation boundary. Shared (not copied) with
-    #: children the SAME way ``seen`` is, and DELIBERATELY NOT ``subjects``
-    #: itself (which IS copied per child, so it only reflects the CURRENT,
-    #: still-open narrowing scope): DEMONSTRATED that ``ctx.subjects`` goes
-    #: OUT OF SCOPE the moment the ``if <the regex match>:`` block that
-    #: introduced a captured name (the near-universal shape for a capture
-    #: -- ``mgo = re.match(...); if mgo: jid = mgo.group(1)``) closes, so a
-    #: name captured inside ANY nested branch -- the common case -- was
-    #: invisible to a check keyed on ``ctx.subjects`` by the time
-    #: ``_audit_function`` runs at the END of the whole walk, even though
-    #: the SAME name is very much still in ``tracked`` via ``ctx.seen``.
-    #: Read by :func:`_propagates_taint` (as ``captured``) to exempt a
-    #: non-``self.`` call whose only tracked mentions are already-captured
-    #: data -- see that function's own docstring for the full reasoning.
-    captured: set = field(default_factory=set)
 
     def child(self) -> "_Ctx":
         return _Ctx(self.method, self.handler, dict(self.subjects),
                     dict(self.matches), dict(self.dicts), dict(self.tuples),
                     dict(self.tuple_dicts), dict(self.tuple_lookups),
-                    dict(self.origins), self.seen, self.captured)
+                    dict(self.origins), self.seen)
 
     def bind_subject(self, name: str, alts) -> None:
         self.subjects[name] = tuple(alts)
         self.seen.add(name)
-        self.captured.add(name)
 
     def bind_match(self, name: str, info) -> None:
         self.matches[name] = info
@@ -2043,59 +2062,41 @@ class _DispatchWalker:
         # to run its scan first.
         self._audit_dispatch_helper_calls(fn)
         tracked = set(ctx.seen) | {"path"}
-        # #202 repair round 5, finding 2b: the SUBSET of `tracked` that is a
-        # CAPTURED SUBJECT ANYWHERE in this function's own walk --
-        # ``ctx.captured``, populated by ``bind_subject`` for a regex-group
-        # capture (directly, or a TAIL_DELEGATES/PARSED_DELEGATES parameter
-        # carrying one across a delegation boundary -- see ``_Ctx.captured``'s
-        # own docstring for why this is a DEDICATED, ``seen``-like SHARED
-        # field rather than reusing ``ctx.subjects`` itself, which is
-        # COPIED per nested scope and so goes empty the moment the
-        # enclosing ``if <the regex match>:`` block closes -- the near-
-        # universal shape a capture is actually written in) -- threaded
-        # into `_propagates_taint` so it can exempt a non-`self.` call
-        # whose only tracked mentions are already-captured data.
-        # Deliberately NOT ``ctx.origins`` (a narrower, positional-
-        # correlation record for PARSED_DELEGATES specifically, populated
-        # only when `_group_origin` additionally succeeds -- empty for an
-        # ordinary top-level capture like ``jid = mgo.group(1)``,
-        # DEMONSTRATED to leave the exemption below inert for exactly the
-        # common case it exists for) and deliberately NOT the broader
-        # ``ctx.seen`` (which also contains ``combo``-style tuples and
-        # ``dest``/``parent``-style tuple-dict lookups -- names whose OWN
-        # comparison genuinely IS a routing input, unlike a plain captured
-        # id -- see `_propagates_taint`'s own docstring for the full
-        # reasoning behind this exact set). ``- {"path"}`` UNCONDITIONALLY,
-        # even though ``bind_subject`` itself never binds the literal name
-        # "path" on purpose: DEMONSTRATED that a SAME_PATH_DELEGATES
-        # callee -- ``_serve_static``, whose own parameter happens to ALSO
-        # be named ``path`` -- receives it via exactly this mechanism
-        # (``child.bind_subject(param, alts)`` in
-        # :meth:`_delegate_same_path`, keyed on the CALLEE's parameter
-        # name, not on any "is this literally the request path" test), so
-        # ``ctx.captured`` DOES contain "path" for that function's own
-        # audit. ``tracked``'s primary subject must never be treated as
-        # merely-captured data under any circumstance, in ANY function --
-        # this subtraction is the explicit, unconditional guarantee of
-        # that, independent of whichever binding path put "path" in
-        # ``ctx.captured`` this time.
-        captured_names = set(ctx.captured) - {"path"}
         # #202 repair round 4, finding 3: built ONCE per audited function and
         # threaded into every waiver-key computation below (directly, and via
         # _propagates_taint) -- see _waiver_key's own docstring for what it
         # is for and why it costs one linear pass per function, not per node.
         parents = _build_parent_map(fn)
-        # #202 repair round 10 (external review): ALSO built ONCE per
-        # audited function, the SAME discipline as `parents` immediately
-        # above -- which _CAPTURED_ARG_SAFE_CALLEE_ROOTS names THIS
-        # function's own body proves are bound, dominating and unrebound,
-        # to the exact source expression each is allowlisted for (see
-        # _captured_arg_trusted_roots's own docstring). Threaded into every
-        # _propagates_taint call below the same way captured_names already
-        # is -- a name spelled "api" earns the captured-arg exemption in
-        # THIS function only when it is a member of THIS set, never merely
-        # by matching _CAPTURED_ARG_SAFE_CALLEE_ROOTS directly.
-        trusted_roots = _captured_arg_trusted_roots(fn, parents)
+        # #202 repair round 13, finding 1 (external review): two STRUCTURAL
+        # exemptions built specifically for a non-`self.` call/subscript
+        # whose only tracked mentions were already-CAPTURED data (round 5
+        # finding 2b introduced the concept; rounds 9-11 layered an
+        # allowlisted-callee, then provenance-proven, gate on top of it) are
+        # BOTH RETIRED this round -- neither is computed here any more:
+        # * the CAPTURED-SUBJECT tracking itself (`ctx.captured`, what used
+        #   to be threaded into `_propagates_taint` here as `captured`) --
+        #   its own field docstring said its ONE reader was that exemption;
+        #   with the exemption gone this module confirmed (grepping its own
+        #   source before removing it) nothing else ever read it either, so
+        #   it is dead rather than merely dormant, and is removed along
+        #   with the exemption it fed, not left computed-but-unconsulted;
+        # * the PROVENANCE gate (`trusted_roots`, `_captured_arg_trusted_
+        #   roots`) -- proving a name's own BINDING is never rebound says
+        #   nothing about whether the ATTRIBUTE this module actually reads
+        #   off it (`.api`) has since been reassigned, deleted, or reached
+        #   through an alias -- DEMONSTRATED live for direct assignment,
+        #   `del`, `setattr`, `delattr`, and an aliased receiver, both
+        #   before and after the trusted read
+        #   (`CapturedArgumentAttributeMutationTests`, test_route_extract.py).
+        # No general static check can soundly rule that out for a mutable
+        # Python attribute (there is no `const`/`final`), so this module no
+        # longer tries a STRUCTURAL rule for either question: a captured-
+        # only call/subscript site is inert ONLY when ITS OWN exact position
+        # carries a reviewed `_AUDIT_WAIVERS` entry, the SAME mechanism --
+        # and the SAME weight of review -- every other unmodelled shape in
+        # this module already requires. See the `_AUDIT_WAIVERS` entries
+        # below tagged "round 13 finding 1" for the 37 real server.py sites
+        # this covers.
         # TAINT PROPAGATION. Any local bound from the path — directly, sliced,
         # or from another tainted local — joins the tracked set, so renaming it
         # cannot hide a branch. Iterated to a fixed point because one rename can
@@ -2178,8 +2179,7 @@ class _DispatchWalker:
                     continue
                 derived = _propagates_taint(value, tracked, fn.name,
                                             self.waiver_hits, parents,
-                                            self._followed, captured_names,
-                                            trusted_roots)
+                                            self._followed)
                 if not derived:
                     continue
                 for leaf in leaves:
@@ -2420,8 +2420,7 @@ class _DispatchWalker:
                 # exactly this for its own, very real ``self._serve_
                 # static(path)`` case, and both scans share one code path.
                 _propagates_taint(node.value, tracked, fn.name,
-                                  self.waiver_hits, parents, self._followed,
-                                  captured_names, trusted_roots)
+                                  self.waiver_hits, parents, self._followed)
             if isinstance(node, ast.Return) and node.value is not None:
                 # #202 repair round 5, finding 2b: a bare ``return <expr>``
                 # is neither an assignment (the fixed-point loop above only
@@ -2454,8 +2453,7 @@ class _DispatchWalker:
                 # same node -- see _propagates_taint's own docstring for
                 # what ``followed`` skips and why.
                 _propagates_taint(node.value, tracked, fn.name,
-                                  self.waiver_hits, parents, self._followed,
-                                  captured_names, trusted_roots)
+                                  self.waiver_hits, parents, self._followed)
             if isinstance(node, ast.Raise) and node.exc is not None:
                 # #202 repair round 5, finding 6b: ``raise <expr>`` is a
                 # CONTROL-TRANSFER expression this module never inspected
@@ -2478,8 +2476,7 @@ class _DispatchWalker:
                 # control-flow edge (see finding 6c's own comment for why
                 # that precise a trace is out of reach for this module).
                 _propagates_taint(node.exc, tracked, fn.name,
-                                  self.waiver_hits, parents, self._followed,
-                                  captured_names, trusted_roots)
+                                  self.waiver_hits, parents, self._followed)
             if isinstance(node, (ast.With, ast.AsyncWith)):
                 # #202 repair round 6, finding 2: a ``with`` statement's
                 # CONTEXT EXPRESSION (``with CONTEXTS[path]:``) is a
@@ -2507,8 +2504,7 @@ class _DispatchWalker:
                 for item in node.items:
                     _propagates_taint(item.context_expr, tracked, fn.name,
                                       self.waiver_hits, parents,
-                                      self._followed, captured_names,
-                                      trusted_roots)
+                                      self._followed)
             if isinstance(node, ast.ExceptHandler) and node.name is not None:
                 # #202 repair round 5, finding 6c -- the HARD part, stated
                 # honestly rather than left silently unaddressed (matching
@@ -3658,6 +3654,175 @@ _AUDIT_WAIVERS = {
      "exc.status)", "try", "combo in _V2_REASSIGN_SCHEMA"):
         "the v2 sibling of `_handle_reassign`'s own identical-shape "
         "waiver immediately above -- same reasoning",
+    # #202 repair round 13, finding 1 (external review): the retired
+    # `_captured_arg_safe_callee` structural exemption (see
+    # `_TRUSTED_BINDING_SOURCES`'s own module comment, just above
+    # `_name_rebinding_sites`) used to cover exactly these 37 real
+    # server.py captured-only call/subscript sites -- confirmed the FULL
+    # set by direct instrumentation against this exact head (a temporary
+    # counter at the retired exemption's own call site, run once against
+    # the real file, removed before commit -- the SAME methodology round
+    # 8's and round 9's own docstrings used), and independently
+    # RE-confirmed by iteratively extracting the real file, waiving each
+    # newly-raised site in turn, until it extracts clean -- the two
+    # methods agree exactly. All 37 share the SAME underlying judgement,
+    # individually re-reviewed here rather than trusted by a blanket
+    # rule: each is `api.<method>(...)` (or, for the two dict-literal
+    # sites, a dict LITERAL of `api.<method>` values), reached in one of
+    # `_dispatch_get`/`do_POST`/`_handle_setup`/`_handle_setup_v2` --
+    # every one of which opens with `api = STATE.api` -- whose ONLY
+    # tracked argument(s) are already-CAPTURED ids (a regex group, or a
+    # nested match's group, never `path` itself and never a `combo`/
+    # `dest`/`parent`-style tuple) that some ENCLOSING, already-audited
+    # test (an `if action == "...":`/`if sub == "...":` branch, or the
+    # capturing regex's own alternation) has already turned into the
+    # route decision -- the call itself only produces the RESULT for a
+    # leaf chosen upstream, the same "produces a RESULT, not a routing
+    # decision" shape every other captured-argument waiver in this dict
+    # already uses.
+    ('_dispatch_get', 'api.get_substitute_opportunity(jid, mgo.group(2))', 'call_argument', 'mgo'):
+        "jid (mgo.group(1)) and mgo.group(2) are both captured groups off "
+        "the SAME regex match; the route (one substitute-opportunity "
+        "detail, for the signed-in guardian's junior) is already decided by "
+        "mgo's own alternation, this only fetches the record",
+    ('_dispatch_get', 'api.get_game(gid)', 'call_argument', 'sub is None'):
+        "gid is captured by the enclosing /api/games/{gid}[/<sub>] match; "
+        "`sub is None` (no sub-resource segment) is the bare game-detail "
+        "leaf, already a distinct route from every sibling below",
+    ('_dispatch_get', 'api.get_board(gid)', 'call_argument', "sub == 'board'"):
+        "gid captured off the SAME match as get_game above; `sub == "
+        "'board'` already selects this exact leaf",
+    ('_dispatch_get', 'api.get_lineups(gid)', 'call_argument', "sub == 'lineups'"):
+        "gid captured off the SAME match; `sub == 'lineups'` already "
+        "selects this exact leaf",
+    ('_dispatch_get', 'api.get_officials_for_game(gid)', 'dict_value', "sub == 'officials'"):
+        "gid captured off the SAME match; `sub == 'officials'` already "
+        "selects this leaf -- reached as a dict VALUE (`{'officials': "
+        "api.get_officials_for_game(gid), ...}.get(sub)`-shaped table one "
+        "line up), not a bare call, but the SAME captured-only argument "
+        "either way",
+    ('_dispatch_get', 'api.get_roster_status(gid)', 'call_argument', "sub == 'roster-status'"):
+        "gid captured off the SAME match; `sub == 'roster-status'` already "
+        "selects this exact leaf",
+    ('_dispatch_get', 'api.get_roster(gid)', 'call_argument', "sub == 'roster'"):
+        "gid captured off the SAME match; `sub == 'roster'` already selects "
+        "this exact leaf",
+    ('_dispatch_get', 'api.get_substitutes(gid)', 'call_argument', "sub == 'substitutes'"):
+        "gid captured off the SAME match; `sub == 'substitutes'` already "
+        "selects this exact leaf",
+    ('_dispatch_get', 'api.list_reschedule_requests(gid)', 'dict_value', "sub == 'reschedule'"):
+        "gid captured off the SAME match; `sub == 'reschedule'` already "
+        "selects this leaf -- reached as a dict VALUE, the same shape as "
+        "get_officials_for_game above",
+    ('do_POST', 'api.enroll_substitute(gid, ppid, actor_id=uid)', 'call_argument', "action == 'enroll'"):
+        "gid/ppid captured off the SAME /api/me/substitute- "
+        "opportunities/... match as `action`; `action == 'enroll'` already "
+        "selects this leaf",
+    ('do_POST', 'api.withdraw_substitute(gid, ppid, actor_id=uid)', 'call_argument', "action == 'withdraw'"):
+        "the withdraw sibling of enroll_substitute immediately above -- "
+        "same match, same reasoning, `action == 'withdraw'` already selects "
+        "this leaf",
+    ('do_POST', 'api.accept_substitute(gid, ppid, actor_id=uid)', 'call_argument', "action == 'accept-offer'"):
+        "the accept-offer sibling -- same match, `action == 'accept-offer'` "
+        "already selects this leaf",
+    ('do_POST', 'api.decline_substitute(gid, ppid, actor_id=uid)', 'call_argument', 'mso'):
+        "the terminal else of the SAME four-way action dispatch "
+        "(enroll/withdraw/accept-offer already returned above) -- mso's own "
+        "regex alternation admits only these four actions, so this is the "
+        "fourth, not an unconditional fallback",
+    ('do_POST', "api.set_availability(gid, jid, body.get('availability_status'), 'guardian', guid)", 'call_argument', 'mga'):
+        "jid/gid captured off mga's own regex groups, reached only after "
+        "the guardian-link gate a few lines up and a strict body-schema "
+        "check (both already independently reviewed/waived control flow) -- "
+        "mga's match alone already fully decides this one-leaf route",
+    ('do_POST', 'api.accept_substitute(gid, jid, actor_id=guid)', 'call_argument', "action == 'accept-offer'"):
+        "jid/gid/action captured off the SAME mgs match; `action == "
+        "'accept-offer'` already selects this leaf",
+    ('do_POST', 'api.decline_substitute(gid, jid, actor_id=guid)', 'call_argument', 'mgs'):
+        "the terminal else of mgs's own two-way action alternation (accept- "
+        "offer already returned above) -- the SAME 'regex alternation "
+        "already admits only these values' shape as decline_substitute "
+        "above",
+    ('do_POST', 'api.unassign_official(aid, user_id)', 'call_argument', "op == 'unassign'"):
+        "aid/op captured off the SAME oa match, reached only after the "
+        "empty-body schema check just above; `op == 'unassign'` already "
+        "selects this leaf",
+    ('do_POST', "api.respond_assignment(aid, op == 'accept', user_id)", 'call_argument', 'oa'):
+        "the terminal else of oa's own three-way alternation (unassign "
+        "already returned above); `op == 'accept'` here is a VALUE passed "
+        "to the service (True/False), not a further routing test -- oa's "
+        "own match already fully decided the route",
+    ('do_POST', "api.set_availability(gid, pid, status_val, body.get('response_source', 'player'), user_id)", 'call_argument', "action == 'availability'"):
+        "gid/action captured off the SAME /api/games/{gid}/<action> match "
+        "as every other action-dispatch entry below; `action == "
+        "'availability'` already selects this leaf, after its own strict "
+        "body-schema and enum-membership checks just above",
+    ('do_POST', "api.remind_unresponded(gid, body.get('team_id') or scope.get('team_id'), user_id)", 'call_argument', "action == 'availability/remind'"):
+        "gid/action captured off the SAME match; `action == "
+        "'availability/remind'` already selects this leaf",
+    ('do_POST', "api.auto_build_roster(gid, body.get('team_id'), user_id)", 'call_argument', "action == 'build-roster'"):
+        "gid/action captured off the SAME match; `action == 'build-roster'` "
+        "already selects this leaf",
+    ('do_POST', "api.select_roster(gid, body.get('player_ids', []), user_id)", 'call_argument', "action == 'roster/select'"):
+        "gid/action captured off the SAME match; `action == "
+        "'roster/select'` already selects this leaf",
+    ('do_POST', 'api.remove_player(gid, pid, user_id)', 'call_argument', "action == 'roster/remove'"):
+        "gid/action captured off the SAME match; `action == "
+        "'roster/remove'` already selects this leaf",
+    ('do_POST', "api.copy_previous_roster(gid, body.get('team_id'), user_id)", 'call_argument', "action == 'roster/copy-previous'"):
+        "gid/action captured off the SAME match; `action == 'roster/copy- "
+        "previous'` already selects this leaf",
+    ('do_POST', "api.assign_official(gid, body.get('official_id'), body.get('role', 'referee'), user_id, override_unavailable=bool(body.get('override_unavailable')))", 'call_argument', "action == 'officials/assign'"):
+        "gid/action captured off the SAME match; `action == "
+        "'officials/assign'` already selects this leaf",
+    ('do_POST', "api.record_result(gid, body.get('home_score'), body.get('away_score'), user_id)", 'call_argument', "action == 'result'"):
+        "gid/action captured off the SAME match; `action == 'result'` "
+        "already selects this leaf",
+    ('do_POST', 'api.approve_result(gid, user_id)', 'call_argument', "action == 'result/approve'"):
+        "gid/action captured off the SAME match; `action == "
+        "'result/approve'` already selects this leaf",
+    ('do_POST', 'api.publish_game(gid, user_id)', 'call_argument', "action == 'publish'"):
+        "gid/action captured off the SAME match; `action == 'publish'` "
+        "already selects this leaf",
+    ('do_POST', "api.move_game(gid, body.get('ice_slot_id'), body.get('reason', ''), user_id)", 'call_argument', "action == 'move'"):
+        "gid/action captured off the SAME match; `action == 'move'` already "
+        "selects this leaf",
+    ('do_POST', "api.request_reschedule(gid, body.get('team_id'), body.get('reason', ''), user_id)", 'call_argument', "action == 'reschedule/request'"):
+        "gid/action captured off the SAME match; `action == "
+        "'reschedule/request'` already selects this leaf",
+    ('do_POST', 'api.enroll_substitute(gid, pid, user_id)', 'call_argument', "action == 'substitutes/enroll'"):
+        "gid/action captured off the SAME match; `action == "
+        "'substitutes/enroll'` already selects this leaf (the "
+        "coach/operator side of enrollment -- distinct actor/permission "
+        "from the player self-service /api/me/substitute-opportunities/... "
+        "route above, same service call)",
+    ('do_POST', 'api.withdraw_substitute(gid, pid, user_id)', 'call_argument', "action == 'substitutes/withdraw'"):
+        "gid/action captured off the SAME match; `action == "
+        "'substitutes/withdraw'` already selects this leaf",
+    ('do_POST', 'api.add_substitute_candidate(gid, pid, user_id)', 'call_argument', "action == 'substitutes/add-candidate'"):
+        "gid/action captured off the SAME match; `action == "
+        "'substitutes/add-candidate'` already selects this leaf",
+    ('do_POST', "api.offer_substitute(gid, player_id, user_id, expires_at=body.get('expires_at'))", 'call_argument', "op == 'offer'"):
+        "gid captured off the outer action match, player_id/op off the "
+        "nested `sub` match on the SAME already-selected `action == "
+        "'substitutes/<player_id>/<op>'` shape; `op == 'offer'` already "
+        "selects this leaf",
+    ('do_POST', "{'accept': api.accept_substitute, 'decline': api.decline_substitute, 'add-to-roster': api.add_substitute_to_roster}[op]", 'assign_rhs', 'sub'):
+        "the terminal else of sub's own three-way alternation (offer "
+        "already returned above); a dict LITERAL of api.X values keyed on "
+        "the captured `op`, the SAME shape _handle_setup's own delete- "
+        "dispatch tables use below -- every value sub's own regex could "
+        "ever select is spelled out right here and independently safe",
+    ('_handle_setup', "{'organization': api.delete_organization, 'league': api.delete_program, 'season': api.delete_season, 'level': api.delete_league, 'division': api.delete_division, 'club': api.delete_club, 'team': api.delete_team, 'venue': api.delete_venue, 'rink': api.delete_rink, 'ice-slot': api.delete_ice_slot, 'game': api.delete_game}[kind]", 'assign_rhs', 'md'):
+        "the v1 delete-entity dispatch table: a dict LITERAL of "
+        "api.delete_X values keyed on `kind`, captured by md's own entity "
+        "alternation, which already produces one delete leaf PER entity -- "
+        "every value this subscript could ever select is spelled out right "
+        "here",
+    ('_handle_setup_v2', "{'organization': api.delete_organization, 'program': api.delete_program, 'season': api.delete_season, 'league': api.delete_league, 'division': api.delete_division, 'league-season': api.delete_league_season, 'club': api.delete_club, 'team': api.delete_team, 'venue': api.delete_venue, 'rink': api.delete_rink, 'ice-slot': api.delete_ice_slot, 'game': api.delete_game, 'official': api.delete_official, 'player': api.delete_player}[kind]", 'assign_rhs', 'md'):
+        "the v2 sibling of _handle_setup's own identical-shape delete- "
+        "entity dispatch table immediately above -- same reasoning, three "
+        "more entity kinds (league-season/official/player) v1 does not have",
 }
 
 
@@ -3761,209 +3926,45 @@ _PATH_CONSUMING_METHODS = ("read_bytes", "read_text", "open")
 #: mention when it is nested inside some OTHER unlisted call's arguments
 #: (e.g. a routing comparison hidden inside a genexpr) -- only an
 #: EXTRACTION/CONSUMPTION's receiver must not leak outward like that.
-def _is_callee(node: ast.AST, parents: Optional[dict]) -> bool:
-    """Is ``node`` -- however much transparent composition sits between it
-    and its eventual use -- about to be INVOKED somewhere in its enclosing
-    statement, rather than merely read as data?
-
-    #202 repair round 6, finding 2: the ``captured`` exemption (see
-    :func:`_propagates_taint`'s own docstring) is deliberately narrow --
-    "a NON-``self.`` call whose only tracked mentions are already-captured
-    names" -- but that test alone cannot tell apart ``api.get_x(gid)`` (a
-    captured id handed to a FIXED, KNOWN service function as inert DATA --
-    exactly the shape the exemption exists for) from ``handlers.get(action,
-    default)()`` (a captured id used to SELECT WHICH CALLABLE RUNS, then
-    immediately invoke it -- the SAME dispatch-table shape
-    ``PREDICATES[path]()``/``ROUTES[path]()`` already require full
-    scrutiny for, round 5 finding 2a and this round's own Subscript audit,
-    just with the tracked key replaced by a captured group). DEMONSTRATED:
-    a regex-captured ``action`` selecting ``handlers.get(action,
-    default_handler)(self)`` extracted as a single ``/api/{}`` wildcard
-    while the live handler answered 200 for one concrete value and 404 for
-    another -- the captured exemption accepted it because its ONLY
-    tracked mention (``action``) was captured, never asking whether the
-    call's own RESULT was about to be called. Introduced this function to
-    gate the ``captured`` exemption OFF for exactly this shape: a Call or
-    Subscript about to be invoked never qualifies, no matter how narrowly
-    its own tracked mentions are captured-only. A captured id used as a
-    plain ARGUMENT or receiver elsewhere (``deleter(md.group(2),
-    actor_id)``, ``mapper(deleter(...))`` -- real server.py shapes, see
-    ``_AUDIT_WAIVERS``) is UNAFFECTED by any round of this function's own
-    history, including this one: neither is ever part of what invokes it
-    (each is bound to a plain local NAME first via a separate assignment,
-    and a bare ``ast.Name`` callee is never independently examined by the
-    Call/Subscript-shaped checks this gates at all).
-
-    #202 repair round 7, finding 1: the original version only checked
-    ``node``'s own IMMEDIATE parent, so a call reached through a RECEIVER
-    CHAIN -- ``handlers.get(action, default_handler).serve(self)``, whose
-    dispatch-selecting Call's immediate parent is the ``.serve``
-    ``ast.Attribute``, never a Call directly -- answered False even though
-    ``.serve(self)`` invokes exactly what that Call returns. Widened to
-    walk UP through every ``ast.Attribute``/``ast.Subscript`` layer where
-    the node reached so far is that layer's own RECEIVER (``.value``)
-    before asking "is this a Call's callee". DEMONSTRATED the same way:
-    ``/api/{}`` wildcard, 200/404 live divergence.
-
-    #202 repair round 8, finding 1 (external review): round 7's climb
-    still only continues past TWO curated shapes -- Attribute and
-    Subscript, one hop at a time -- so it stops, returning False, the
-    INSTANT ``node``'s own immediate parent is anything else, before ever
-    asking what sits above THAT. A ``Tuple``, a ``List`` or an ``IfExp``
-    holding ``node`` is none of those two shapes. DEMONSTRATED, the
-    reviewer's own repro, verbatim: a regex-captured ``action`` selecting
-    ``(handlers.get(action, default_handler),)[0].serve(self)`` -- a
-    ONE-ELEMENT TUPLE immediately indexed by a literal ``0`` -- extracted
-    as a single ``/api/{}`` wildcard while a real live handler answered
-    200 for one concrete value and 404 for another; the SAME true of the
-    identical shape spelled as a ``List``
-    (``[handlers.get(...)][0].serve(self)``) or as a conditional
-    expression (``(handlers.get(...) if flag else default_handler)
-    (self)``) wrapping the captured-derived call before its receiver
-    chain or invocation. This exact category has now recurred three times
-    (round 5 finding 5's own default-deny expression-operand gap, round 6
-    finding 2's original narrowing, round 7 finding 1's receiver-chain
-    climb) across three different specific wrapper shapes each time --
-    enumerating one more transparent-wrapper shape as it is separately
-    discovered is not converging, so this round REPLACES the curated
-    upward climb entirely rather than extending its shape list a fourth
-    time.
-
-    The replacement needs no notion of "transparent wrapper" at all:
-    climb ``parents`` from ``node`` up to the nearest enclosing
-    ``ast.stmt`` (the smallest scope always cheaply available without
-    re-deriving it from the expression's own shape -- climbing any
-    FURTHER, e.g. to the whole enclosing function, would answer identically
-    since an AST node object is never shared or interned, so ``node`` can
-    structurally occur at only the one position it actually sits at,
-    however large a scope containing that position is searched), then,
-    for EVERY ``ast.Call`` anywhere in that statement, ask whether
-    ``node`` is present ANYWHERE inside that call's own ``.func``
-    subtree -- an ordinary, unrestricted ``ast.walk``, which recurses
-    through a Tuple, a List, an IfExp, a BoolOp, or any node shape
-    Python's grammar has or will ever add, none of which this function
-    needs to name to recognise. ``node`` can only be found there if it
-    really is, structurally, part of what that Call is about to invoke;
-    a plain ARGUMENT position (``deleter(md.group(2), actor_id)``,
-    ``mapper(deleter(...))``) is never inside any Call's own ``.func``
-    subtree, so both real server.py shapes the ``captured`` exemption
-    exists for stay exempt exactly as every prior round left them. This
-    is deliberately the MORE conservative of the two fixes the review
-    offered over a fourth curated shape: it now also refuses a captured
-    value found in a callee/receiver position through composition no
-    round of this function ever enumerated by name, which is the point.
-
-    #202 repair round 9 (external review): this function alone cannot
-    carry the whole "is a captured selector about to be invoked" question
-    any further -- see :func:`_captured_arg_safe_callee`'s own docstring
-    for why. The reviewer's own round-9 repro --
-    ``invoke(handlers.get(action, default_handler), self)`` with
-    ``invoke = lambda fn, h: fn.serve(h)`` -- hands the dispatch-selecting
-    call to ``invoke`` as a plain ARGUMENT; it never sits inside ANY
-    call's own ``.func`` subtree in this statement (``invoke`` itself is
-    invoked BY ITS CALLER, elsewhere, not by anything visible here), so
-    this function correctly -- and, after this round, PERMANENTLY --
-    answers False for it, exactly as it always correctly has for the
-    genuinely inert ``api.get_item(gid)``. That is not a bug in this
-    function: a purely SYNTACTIC, single-statement climb structurally
-    cannot see what an arbitrary function does with an argument inside
-    its own body, a different function entirely -- no further shape this
-    function could be taught to recognise closes that gap, only running
-    the callee's body would. The round-9 fix is therefore a SEPARATE,
-    additional gate in :func:`_propagates_taint` (`_captured_arg_safe_
-    callee`), not a further widening of this function's own climb; this
-    function's contract stays exactly "is this node about to be invoked,
-    syntactically, in this statement" -- unchanged, neither more nor less
-    conservative.
-    """
-    if parents is None:
-        return False
-    statement = node
-    while not isinstance(statement, ast.stmt):
-        parent = parents.get(id(statement))
-        if parent is None:
-            break
-        statement = parent
-    for candidate in ast.walk(statement):
-        if not isinstance(candidate, ast.Call):
-            continue
-        for sub in ast.walk(candidate.func):
-            if sub is node:
-                return True
-    return False
-
-
-#: #202 repair round 9 (external review): the ONLY call targets the
-#: ``captured``-only exemption in :func:`_propagates_taint` may ever treat
-#: a captured value handed to as inert DATA, now that "any non-``self.``
-#: call" is no longer good enough (see :func:`_captured_arg_safe_callee`'s
-#: own docstring for why). Deliberately ONE entry: ``api``, the module-
-#: level API FACADE this codebase's own layering (CLAUDE.md) guarantees
-#: performs no HTTP routing -- the SAME guarantee this module's docstrings
-#: have invoked since round 5 finding 2b introduced the ``captured``
-#: exemption in the first place. Confirmed (by the SAME instrumentation
-#: methodology round 8's own docstring used -- a temporary counter at each
-#: exemption site, run against the real file, removed before commit) to
-#: cover 37 of the real server.py's 39 captured-only call/subscript sites;
-#: the remaining two (a local dict of response-shape mappers, and a
-#: builtin string method called ON the captured value itself, both in
-#: ``_handle_setup``) do NOT fit this shape and are reviewed individually
-#: as their own ``_AUDIT_WAIVERS`` entries instead -- see those entries'
-#: own comments, just below ``_handle_setup``'s existing waivers.
-#: Extending this set is a REVIEW, exactly the weight of adding an
-#: ``_AUDIT_WAIVERS`` entry: do not add a second name merely to make some
-#: future call site pass without individually confirming it is a genuine
-#: service boundary that never invokes, stores, or forwards whatever it is
-#: handed -- that confirmation is the entire point of keeping this set
-#: small and explicit rather than defaulting to "anything not self.".
-#:
-#: #202 repair round 10 (external review): membership here is NECESSARY
-#: but, since this round, no longer SUFFICIENT for a name to earn the
-#: exemption at a given call site -- this set alone answers "which
-#: SPELLING may ever qualify", never "does THIS function's own body
-#: actually, provably bind that spelling to the reviewed object", and the
-#: round-10 finding proved those are not the same question. See
-#: ``_CAPTURED_ARG_SAFE_CALLEE_TRUSTED_SOURCES`` and
-#: :func:`_captured_arg_trusted_roots`, just below, for what closes the
-#: gap -- derived from that dict's keys so the two are never extended out
-#: of step with each other.
-#:
-#: #202 repair round 10 (external review): the EXACT source expression
-#: each name above must be proven -- by :func:`_captured_arg_trusted_roots`,
-#: never by spelling -- to be bound from, dominating and unrebound, before
-#: the exemption may fire for it in a GIVEN function. Matched by EXACT
-#: ``ast.unparse()`` text, the SAME "is this the literal reviewed shape,
-#: not merely something that LOOKS like it" discipline
-#: ``_DO_HEAD_SAFE_SHAPE``/``_DO_OPTIONS_SAFE_SHAPE`` already use elsewhere
-#: in this module -- ``getattr(STATE, "api")``, an aliased ``S = STATE;
-#: api = S.api``, or any other expression that only RESOLVES to the same
-#: object at runtime does NOT match, and stays outside the exemption
-#: exactly like everything else this module cannot prove without running
-#: the program. ``"api": "STATE.api"`` is the one entry today: the module
-#: singleton's own facade attribute, the SAME expression every real
-#: server.py call site (``_dispatch_get``, ``do_POST``,
-#: ``_handle_reassign``/``_handle_reassign_v2``,
-#: ``_handle_setup``/``_handle_setup_v2``) assigns ``api`` from (confirmed
-#: by direct AST inspection, all six sites, before this fix landed).
-#: Extending this dict is the SAME weight of review as extending
-#: ``_CAPTURED_ARG_SAFE_CALLEE_ROOTS`` used to be on its own -- the two are
-#: now meant to be extended TOGETHER, which is why ``ROOTS`` is derived
-#: from this dict rather than declared independently.
-#:
-#: #202 repair round 11 (this round's own independent verify track):
-#: matching this dict's TEXT is necessary but was not, until this round,
-#: SUFFICIENT either -- a trusted source expression can itself name a free
-#: variable (``STATE``, for the one entry here), and round 10's own check
-#: proved nothing about whether THAT name is what it claims to be in a
-#: given function. :func:`_has_dominating_trusted_binding` now also
-#: requires every such free variable to be provably unshadowed (see
-#: :func:`_trusted_source_free_roots`) before the exemption fires --
-#: extending a value in this dict to something with a MORE COMPLEX free-
-#: variable shape than a single bare name (``STATE.api``) stays within
-#: that same check's coverage automatically, since it walks the RHS's own
-#: parsed AST rather than special-casing this one shape.
-_CAPTURED_ARG_SAFE_CALLEE_TRUSTED_SOURCES = {"api": "STATE.api"}
-_CAPTURED_ARG_SAFE_CALLEE_ROOTS = frozenset(_CAPTURED_ARG_SAFE_CALLEE_TRUSTED_SOURCES)
+#: #202 repair round 13, finding 1 (external review) -- HISTORICAL NOTE,
+#: read alongside :func:`_has_dominating_trusted_binding`'s own docstring:
+#: rounds 9-11 built a STRUCTURAL exemption on top of this dict (a
+#: "captured-only" call/subscript whose receiver resolved, by PROVEN
+#: provenance, to a name bound from the trusted text here was treated as
+#: inert data -- see git history for :func:`_captured_arg_safe_callee`,
+#: removed this round). That exemption is RETIRED: proving a name's
+#: BINDING is never rebound says nothing about whether the OBJECT it is
+#: bound to has since had the attribute this dict names (``.api``)
+#: reassigned, deleted, or reached through an alias -- DEMONSTRATED, live
+#: over real HTTP, for direct assignment, ``del``, ``setattr``,
+#: ``delattr``, and an aliased receiver, both before and after the
+#: trusted local assignment (``CapturedArgumentAttributeMutationTests``,
+#: test_route_extract.py). No general static check can soundly prove a
+#: MUTABLE Python attribute stays whatever it was reviewed to be across an
+#: entire function and everything it calls -- Python has no
+#: ``const``/``final`` -- so this module no longer tries to; a captured-
+#: only call/subscript site is inert ONLY when ITS OWN exact position
+#: carries a reviewed ``_AUDIT_WAIVERS`` entry, same as every other
+#: unmodelled shape already requires. ``_has_dominating_trusted_binding``
+#: (below) is KEPT, fixed for round 13's own finding 2, and independently
+#: tested -- it answers a genuinely useful, narrower question ("is this
+#: name provably bound, once, dominating, unrebound, to this exact
+#: expression" -- a fact about BINDING, sound as far as it goes) -- but
+#: nothing in this module's own extraction logic consults it any more;
+#: :func:`_captured_arg_trusted_roots`, the function that used to turn its
+#: answer into a blanket trust decision, is removed along with
+#: :func:`_captured_arg_safe_callee`. ``_is_callee`` (rounds 6-8: "is a
+#: captured selector about to be INVOKED, as opposed to handed over as
+#: inert data") is ALSO removed, for the SAME reason, not a separate one:
+#: its ONE caller, in both branches of :func:`_propagates_taint`, was the
+#: captured-arg exemption's own "never when about to be invoked" guard --
+#: confirmed by grepping this module's own source before deleting it, the
+#: same discipline applied to ``captured`` above. Once EVERY captured-only
+#: call/subscript needs its own individual waiver regardless of position,
+#: "is this one about to be invoked" no longer changes the answer: a
+#: captured-only call in ANY position -- argument, receiver, or callee --
+#: is inert only when ITS OWN waiver says so.
+_TRUSTED_BINDING_SOURCES = {"api": "STATE.api"}
 
 
 def _name_rebinding_sites(name: str, fn: ast.FunctionDef) -> list:
@@ -3982,7 +3983,7 @@ def _name_rebinding_sites(name: str, fn: ast.FunctionDef) -> list:
     ``.rest`` set).
 
     #202 repair round 10 (external review): used by
-    :func:`_captured_arg_trusted_roots` to answer "is ``name`` bound
+    :func:`_has_dominating_trusted_binding` to answer "is ``name`` bound
     EXACTLY once in this function, at a dominating, never-rebound
     assignment" -- a STRICTLY BROADER question than
     :func:`_binding_value_and_targets` answers (that function only ever
@@ -4098,18 +4099,37 @@ def _has_dominating_trusted_binding(name: str, fn: ast.FunctionDef,
     binding of ``name`` anywhere else in the function to rebind, shadow,
     or race it?
 
-    #202 repair round 10 (external review): the provenance question
-    :func:`_captured_arg_safe_callee` alone could not answer -- see that
-    function's own updated docstring for the exploit this closes
-    (``api = evil_api`` before a call the OLD, spelling-only check still
-    trusted). Deliberately the narrow, purely SYNTACTIC discipline
-    :func:`_is_self_call`/:func:`_is_self_path` already established for
-    "is this name really what it claims to be" (no CFG, no alias analysis
-    -- just "does the SOURCE TEXT prove it"), extended to a name ``self``
-    never needs it for (Python's own calling convention already guarantees
-    ``self`` is bound exactly once, as the first parameter, before the
-    function body runs at all -- an ordinary local like ``api`` gets no
-    such guarantee for free, so THIS function is what supplies one):
+    #202 repair round 13, finding 1 (external review): as of this round,
+    this predicate's answer no longer FEEDS any exemption in
+    :func:`_propagates_taint` -- see :data:`_TRUSTED_BINDING_SOURCES`'s own
+    module comment for why (a proven, unrebound NAME binding says nothing
+    about whether the ATTRIBUTE this module actually reads off the bound
+    object has since been reassigned, deleted, or reached through an
+    alias, and no general static check can soundly rule that out for a
+    mutable Python attribute). This function is KEPT anyway, fixed for
+    round 13's OWN finding 2 (see :func:`_name_rebinding_sites`'s own
+    docstring) and independently exercised by
+    ``CapturedArgumentProvenanceTests``/``MatchCaptureBindingRecognitionTests``
+    (test_route_extract.py): "is this name provably bound, once,
+    dominating, unrebound, to exactly this reviewed expression" is a
+    sound, useful fact about BINDING on its own terms -- the discipline
+    below is unchanged from when round 10 introduced it -- it simply is
+    not, by itself, sufficient to answer the WIDER "can this call site be
+    trusted with a captured value" question any more, which is why that
+    question is no longer asked of it.
+
+    #202 repair round 10 (external review, HISTORICAL): the provenance
+    question the old, now-removed ``_captured_arg_safe_callee`` alone
+    could not answer -- ``api = evil_api`` before a call the OLDER,
+    spelling-only check still trusted. Deliberately the narrow, purely
+    SYNTACTIC discipline :func:`_is_self_call`/:func:`_is_self_path`
+    already established for "is this name really what it claims to be"
+    (no CFG, no alias analysis -- just "does the SOURCE TEXT prove it"),
+    extended to a name ``self`` never needs it for (Python's own calling
+    convention already guarantees ``self`` is bound exactly once, as the
+    first parameter, before the function body runs at all -- an ordinary
+    local like ``api`` gets no such guarantee for free, so THIS function
+    is what supplies one):
 
     * exactly ONE :func:`_name_rebinding_sites` hit -- zero means ``name``
       is never bound in this function at all (an opaque module global this
@@ -4141,7 +4161,7 @@ def _has_dominating_trusted_binding(name: str, fn: ast.FunctionDef,
       discipline ``_DO_HEAD_SAFE_SHAPE``/``_DO_OPTIONS_SAFE_SHAPE`` already
       use for "the literal reviewed shape, not merely something shaped
       like it"), must match
-      ``_CAPTURED_ARG_SAFE_CALLEE_TRUSTED_SOURCES[name]`` exactly;
+      ``_TRUSTED_BINDING_SOURCES[name]`` exactly;
     * #202 repair round 11 (this round's own independent verify track):
       matching the trusted TEXT is not the end of the proof either --
       every free variable REFERENCED inside that text (``STATE``, for the
@@ -4167,7 +4187,7 @@ def _has_dominating_trusted_binding(name: str, fn: ast.FunctionDef,
     restriction on real code, only on code that does not actually have the
     property the OLD check merely assumed from the name's spelling.
     """
-    trusted_source = _CAPTURED_ARG_SAFE_CALLEE_TRUSTED_SOURCES.get(name)
+    trusted_source = _TRUSTED_BINDING_SOURCES.get(name)
     if trusted_source is None:
         return False
     sites = _name_rebinding_sites(name, fn)
@@ -4185,145 +4205,6 @@ def _has_dominating_trusted_binding(name: str, fn: ast.FunctionDef,
     return all(not _name_rebinding_sites(root, fn)
                for root in _trusted_source_free_roots(stmt.value)
                if root != name)
-
-
-def _captured_arg_trusted_roots(fn: ast.FunctionDef, parents: dict) -> frozenset:
-    """Which names in :data:`_CAPTURED_ARG_SAFE_CALLEE_ROOTS` does THIS
-    function's own body actually, provably earn the exemption for -- round
-    10's replacement for trusting the bare allowlist directly (see
-    :func:`_captured_arg_safe_callee`'s own updated docstring). Computed
-    ONCE per audited function by :meth:`_DispatchWalker._audit_function`,
-    the SAME "one linear pass, not per node" discipline
-    :func:`_build_parent_map`'s own call site there already established,
-    and threaded into :func:`_propagates_taint` (as ``trusted_roots``)
-    exactly the way ``captured``/``waiver_hits``/``followed`` already are.
-    """
-    return frozenset(name for name in _CAPTURED_ARG_SAFE_CALLEE_ROOTS
-                     if _has_dominating_trusted_binding(name, fn, parents))
-
-
-def _captured_arg_safe_callee(node, trusted_roots: frozenset = frozenset()) -> bool:
-    """Does ``node`` -- a Call's own ``.func``, or the container a
-    Subscript/``.get()`` indexes -- resolve to a call target the
-    ``captured``-only exemption (see :func:`_propagates_taint`'s own
-    docstring) may trust with a captured value as plain data, rather than
-    an unmodelled receiver that might invoke, store, or forward it?
-
-    #202 repair round 9 (external review) -- the THIRD recurrence of "the
-    captured-value exemption is broader than it should be" (round 6:
-    direct-compare shapes; round 8: transparent tuple/list/IfExp
-    composition; this round: higher-order ARGUMENT transfer). Every prior
-    round narrowed the exemption by teaching :func:`_is_callee` one more
-    shape a captured selector's own call could sit inside on its way to
-    being invoked -- all of them SYNTACTIC, single-statement, "where does
-    this node sit relative to a Call it's inside" questions. The
-    reviewer's own round-9 repro defeats that whole strategy at once,
-    demonstrated over real HTTP (200 for one concrete value, 404 for
-    another) while extraction stayed silent:
-
-        return invoke(handlers.get(action, default_handler), self)
-
-    with ``invoke = lambda fn, h: fn.serve(h)`` (the reviewer's own
-    independent reproduction used ``operator.call(handlers.get(action,
-    default_handler).serve, self)`` instead -- the SAME shape, a stdlib
-    higher-order callable rather than a hand-written one). ``handlers.get(
-    action, default_handler)`` sits in ``invoke``'s ARGUMENT list -- never
-    inside ANY call's own ``.func`` subtree in this statement -- so
-    :func:`_is_callee` correctly, and PERMANENTLY, answers False for it,
-    the same as it does for the genuinely inert ``api.get_item(gid)``.
-    :func:`_is_callee` cannot tell these two apart because the difference
-    between them is not syntactic (where the captured value sits in THIS
-    expression) but SEMANTIC (what the receiving function DOES with it),
-    and ``invoke``'s own body -- the only place that answer lives -- is a
-    different function entirely, possibly not even defined in this file.
-    Chasing one more transfer shape (a keyword argument, ``operator.
-    call``, a callback stashed via ``setattr`` or a container and invoked
-    later) would only rename the same unbounded problem: ANY unmodelled
-    callee could invoke, store, or forward whatever it is handed, and
-    this module cannot run the callee's own body to find out -- exactly
-    the review's own diagnosis: "shape-by-shape closure is not
-    converging".
-
-    So this function does not add another shape. It inverts the DEFAULT
-    instead: rather than trusting any non-``self.`` call unless proven
-    otherwise (the OLD rule this round removes), a captured value handed
-    to a call is inert ONLY when the call target is on the small,
-    explicit, reviewed allowlist above
-    (``_CAPTURED_ARG_SAFE_CALLEE_ROOTS``) -- currently just the API
-    facade, ``api``. ``invoke``, ``operator.call``, ``setattr``, and
-    ``list.append`` are all, correctly, NOT on it, so a captured selector
-    handed to any of them now falls through to the SAME unlisted-call
-    raise (or a dedicated, individually reviewed ``_AUDIT_WAIVERS``
-    entry) any other unmodelled call already gets -- see
-    ``CapturedArgumentCalleeAllowlistTests`` (test_route_extract.py) for
-    all five named repros (invoke positional, invoke keyword, operator.
-    call, a callback stashed via ``setattr``, one stashed via
-    ``list.append``), each proven BOTH as a live-HTTP 200/404 divergence
-    (the underlying shape really is exploitable Python, independent of
-    this module) and as a static ``ExtractionError`` raise against the
-    fixed code.
-
-    #202 repair round 10 (external review): membership in
-    ``_CAPTURED_ARG_SAFE_CALLEE_ROOTS`` -- a bare SPELLING match -- is no
-    longer sufficient either. DEMONSTRATED, with the round-9 fix above
-    otherwise untouched:
-
-        api = evil_api
-        return api.invoke({"hidden": api.hidden, "other": api.other}[action], self)
-
-    resolves ``api.invoke``'s root to the ``ast.Name`` ``"api"`` exactly
-    the same way the genuinely inert ``api.get_item(gid)`` does -- this
-    function had no way to tell a LOCAL variable that merely HAPPENS to be
-    spelled ``api`` apart from the one reviewed module-level facade the
-    allowlist exists to trust, because it never asked what ``api``
-    actually, provably IS at this point in the function. Live over real
-    HTTP: ``/api/hidden`` answers 200, ``/api/other`` answers 404, while
-    static extraction stayed silent -- the SAME "static and live examine
-    identical code" proof every prior round's finding in this function
-    required. ``root.id in trusted_roots`` -- the caller's OWN, per-
-    function-computed :func:`_captured_arg_trusted_roots` result, NEVER
-    the bare module-level allowlist directly -- closes it: ``trusted_
-    roots`` contains ``"api"`` for a GIVEN function only when
-    :func:`_has_dominating_trusted_binding` has independently proven that
-    function's own ``api`` is bound, once, dominating, unrebound, to
-    exactly ``STATE.api`` -- see that function's own docstring for the
-    full discipline, and ``CapturedArgumentProvenanceTests``
-    (test_route_extract.py) for the regression coverage: the reviewer's
-    own repro (static AND live), parameter shadowing, rebinding before/
-    after a valid assignment (both orders), the nested-dict-literal
-    selector reproduced above, genuine ``STATE.api``-bound facade calls as
-    negative controls, and a load-bearing mutation that degrades this
-    check back to spelling-only and reproduces the escape.
-
-    Resolves a plain ``ast.Attribute`` chain to its ROOT name the same
-    way :func:`_is_self_call` resolves a ``self.`` chain (any depth --
-    ``api.x``, ``self.api.x`` would resolve to ``self`` first and never
-    reach this function at all, since the caller only ever invokes this
-    for a call :func:`_is_self_call` has already ruled out). A plain
-    ``ast.Dict`` LITERAL gets its own rule: ``{...}[kind]`` or ``{...}.
-    get(kind, default)`` can only ever select one of the VALUES written
-    right there in the source -- the real ``_handle_setup``/
-    ``_handle_setup_v2`` delete-dispatch tables and ``do_POST``'s
-    substitute-action table are exactly this shape, each a dict literal
-    of ``api.X`` references -- so a dict literal is safe iff EVERY one of
-    its values independently is, checked recursively AGAINST THE SAME
-    ``trusted_roots`` (a dict of dicts is not a real server.py shape
-    today, but costs nothing extra to handle correctly rather than assume
-    away). Anything else -- a bare ``Name`` like ``handlers``/``invoke``/
-    ``operator`` (an opaque external variable or function this module
-    cannot see the contents or body of), a further Call or Subscript, ...
-    -- is NOT safe: there is no way to confirm what it resolves to, or
-    does with what it is handed, without running the program.
-    """
-    if isinstance(node, ast.Attribute):
-        root = node
-        while isinstance(root, (ast.Attribute, ast.Subscript)):
-            root = root.value
-        return isinstance(root, ast.Name) and root.id in trusted_roots
-    if isinstance(node, ast.Dict):
-        return all(_captured_arg_safe_callee(v, trusted_roots)
-                   for v in node.values)
-    return False
 
 
 def _is_self_call(node: ast.Call) -> bool:
@@ -4520,9 +4401,7 @@ def _binding_value_and_targets(node):
 def _propagates_taint(value, tracked: set, fn_name: str = "",
                       waiver_hits: Optional[dict] = None,
                       parents: Optional[dict] = None,
-                      followed: Optional[set] = None,
-                      captured: Optional[set] = None,
-                      trusted_roots: frozenset = frozenset()) -> bool:
+                      followed: Optional[set] = None) -> bool:
     """Does this expression still CARRY the request path?
 
     Deliberately narrow. `p2 = self.path.split("?", 1)[0]` carries it -- string
@@ -4620,97 +4499,98 @@ def _propagates_taint(value, tracked: set, fn_name: str = "",
     expression -- so a followed delegate nested inside something larger
     still lets the REST of that expression be examined normally.
 
-    ``captured`` (#202 repair round 5, finding 2b) is the audited function's
-    own ``set(ctx.captured)`` -- names EVER bound as a REGEX-CAPTURE
-    dispatch subject ANYWHERE in this function's walk (:meth:`_Ctx.
+    #202 repair round 5, finding 2b through round 13, finding 1
+    (HISTORICAL -- see round 13, finding 1 below for the CURRENT rule; kept
+    because the reasoning it walks through is still exactly why a captured
+    id handed to the API facade is not itself a routing decision, even
+    though the STRUCTURAL exemption this reasoning originally motivated is
+    retired): round 5 finding 2b introduced ``captured`` -- a parameter
+    fed the audited function's own set of names EVER bound as a REGEX-
+    CAPTURE dispatch subject ANYWHERE in its walk (:meth:`_Ctx.
     bind_subject`: a direct ``gid = m.group(1)``, or a TAIL_DELEGATES/
-    PARSED_DELEGATES parameter carrying one across a delegation boundary --
-    see ``_Ctx.captured``'s own docstring for why this must be a DEDICATED,
-    function-wide-SHARED field and not ``ctx.subjects`` itself, which goes
-    out of scope the moment the ``if <the regex match>:`` block that
-    introduced the name closes), deliberately narrower than ``tracked``
-    itself -- excludes ``path``, and excludes ``combo``/``dest``/
-    ``parent``-style names bound via :meth:`_Ctx.bind_tuple`/
-    ``bind_tuple_dict``/``bind_tuple_lookup``, whose own comparison
-    genuinely IS a routing input, unlike a plain captured id. Reaching
-    Return.value with the SAME
-    "unlisted call raises" rule the fixed-point loop and bare-Expr scan
-    already use surfaced a real, LOUD pattern in server.py: dozens of
-    ``return self._send_api(api.get_x(gid, ...))``-shaped statements,
-    where a captured id was bound to a local FIRST (``gid = m.group(1)``)
-    rather than inlined (``api.get_x(m.group(1))``) -- semantically the
-    SAME "a route capture handed to a service produces a RESULT" case
+    PARSED_DELEGATES parameter carrying one across a delegation boundary),
+    deliberately narrower than ``tracked`` itself -- excludes ``path``, and
+    excludes ``combo``/``dest``/``parent``-style names bound via
+    :meth:`_Ctx.bind_tuple`/``bind_tuple_dict``/``bind_tuple_lookup``,
+    whose own comparison genuinely IS a routing input, unlike a plain
+    captured id. Reaching Return.value with the SAME "unlisted call
+    raises" rule the fixed-point loop and bare-Expr scan already use
+    surfaced a real, LOUD pattern in server.py: dozens of ``return
+    self._send_api(api.get_x(gid, ...))``-shaped statements, where a
+    captured id was bound to a local FIRST (``gid = m.group(1)``) rather
+    than inlined (``api.get_x(m.group(1))``) -- semantically the SAME "a
+    route capture handed to a service produces a RESULT" case
     ``_is_known_capture_extraction`` already exempts for the INLINE form,
     just not recognised for the bound-first one, since a bare ``ast.Name``
     was never treated as an extraction boundary the way ``X.group(N)`` is.
     Reviewing each of these individually would be 40+ near-identical
     "waivers" recording the SAME judgement, not 40+ distinct reviews --
     exactly the "if a fix needs that, the design is wrong" shape a
-    case-by-case waiver is meant to avoid. The narrower, PRINCIPLED fix: a
-    NON-``self.`` call (``api.X``, or a local bound from one via a dict
-    lookup, e.g. ``fn = {"accept": api.accept_substitute, ...}[op];
-    fn(gid, ...)`` -- never a routing table, always the API FACADE this
-    codebase's own layering (CLAUDE.md) guarantees performs no HTTP
-    routing) whose ONLY tracked mentions are already-CAPTURED names is
-    exempt, the SAME way an inline capture already is. Deliberately NOT
-    extended to ``self.`` calls: an arbitrary, uncatalogued ``self.``
-    method is exactly where a HIDDEN dispatcher (the reviewer's own
-    ``self._route(path)``) would live in this class, so those stay under
-    FULL scrutiny regardless of whether their arguments are capture-only --
-    each real one still needs (and, below, has) its own reviewed waiver. A
-    comparison/dispatch TEST on a captured name is UNAFFECTED by this --
+    case-by-case waiver is meant to avoid; round 5 finding 2b's answer was
+    a STRUCTURAL rule instead: a NON-``self.`` call (``api.X``, or a local
+    bound from one via a dict lookup, e.g. ``fn = {"accept":
+    api.accept_substitute, ...}[op]; fn(gid, ...)`` -- never a routing
+    table, always the API FACADE this codebase's own layering (CLAUDE.md)
+    guarantees performs no HTTP routing) whose ONLY tracked mentions are
+    already-CAPTURED names was exempt, the SAME way an inline capture
+    already is. Deliberately NOT extended to ``self.`` calls: an
+    arbitrary, uncatalogued ``self.`` method is exactly where a HIDDEN
+    dispatcher (the reviewer's own ``self._route(path)``) would live in
+    this class, so those stay under FULL scrutiny regardless of whether
+    their arguments are capture-only -- each real one still needs (and,
+    below, has) its own reviewed waiver. A comparison/dispatch TEST on a
+    captured name is UNAFFECTED by any of this history --
     ``_direct_operand_names``/``root_name`` (the If/IfExp/While/match-case
-    completeness scan) uses ``_tracked_mentions``, a separate function this
-    change does not touch, so ``if self._is_hidden(gid):`` still raises
+    completeness scan) uses ``_tracked_mentions``, a separate function
+    none of this touches, so ``if self._is_hidden(gid):`` still raises
     exactly as finding 1 (round 4) already made it.
 
-    #202 repair round 9 (external review): "a NON-``self.`` call" is no
-    longer sufficient on its own -- narrowed further to "a NON-``self.``
-    call whose own callee ALSO resolves to the small, explicit, reviewed
-    allowlist :func:`_captured_arg_safe_callee` checks" (both the Call
-    branch below and the parallel Subscript branch). Round 6's own
-    narrowing (``_is_callee``: never when the call is itself about to be
-    invoked) answers a SYNTACTIC question -- where does the captured value
-    sit in THIS statement -- that a captured selector handed to an
-    arbitrary function AS AN ARGUMENT, and invoked from INSIDE that
-    function's own body, simply does not trip: ``invoke(handlers.get(
-    action, default_handler), self)`` (the reviewer's own repro,
-    ``invoke = lambda fn, h: fn.serve(h)``) never places the selector in
-    any call's own ``.func`` subtree, so ``_is_callee`` correctly answers
-    False, and -- before this round -- nothing else asked whether
-    ``invoke`` itself was a call this module has any basis to trust.
-    DEMONSTRATED live (200/404 divergence, extraction silent) for that
-    repro, its keyword-argument form, the reviewer's own
-    ``operator.call(...)`` variant, and two independently invented
-    transfer shapes -- a callback stashed via ``setattr`` and one via
-    ``list.append`` -- each invoked in a later statement. Fixing this by
-    teaching :func:`_is_callee` about ``invoke`` specifically would only
-    be a fourth curated shape in a series that has not converged (round
-    6, round 7, round 8 each closed exactly what they targeted and each
-    time review found a materially different composition); INSTEAD of
-    that, or of attempting general data-flow analysis to trace what an
-    arbitrary function does with its own arguments, this round flips the
-    default: a captured value handed to a call is inert ONLY when the
-    call target is on the allowlist, not whenever it merely fails to be
-    ``self.`` -- see :func:`_captured_arg_safe_callee`'s own docstring for
-    the full reasoning and :class:`CapturedArgumentCalleeAllowlistTests`
-    (test_route_extract.py) for the regression coverage.
+    #202 repair round 9 (external review, HISTORICAL -- see round 13 finding
+    1 below for the CURRENT rule): "a NON-``self.`` call" turned out not to
+    be sufficient on its own. Round 6's own narrowing (``_is_callee``:
+    never when the call is itself about to be invoked) answers a SYNTACTIC
+    question -- where does the captured value sit in THIS statement -- that
+    a captured selector handed to an arbitrary function AS AN ARGUMENT, and
+    invoked from INSIDE that function's own body, simply does not trip:
+    ``invoke(handlers.get(action, default_handler), self)`` (the
+    reviewer's own repro, ``invoke = lambda fn, h: fn.serve(h)``) never
+    places the selector in any call's own ``.func`` subtree, so
+    ``_is_callee`` correctly answers False, and -- before round 9 -- nothing
+    else asked whether ``invoke`` itself was a call this module has any
+    basis to trust. DEMONSTRATED live (200/404 divergence, extraction
+    silent) for that repro, its keyword-argument form, the reviewer's own
+    ``operator.call(...)`` variant, and two independently invented transfer
+    shapes -- a callback stashed via ``setattr`` and one via
+    ``list.append`` -- each invoked in a later statement. Round 9 closed
+    this with an ALLOWLIST of trusted call targets (later tightened by
+    round 10/11 to require PROVEN provenance, not mere spelling, for a
+    name to earn it); round 13 finding 1 retired that whole mechanism in
+    favour of the rule below.
 
-    ``trusted_roots`` (#202 repair round 10, external review) is the
-    audited function's own :func:`_captured_arg_trusted_roots` result --
-    which :data:`_CAPTURED_ARG_SAFE_CALLEE_ROOTS` names THIS function's
-    own body proves are bound, dominating and unrebound, to the exact
-    source expression each is allowlisted for. Round 9's allowlist
-    trusted a NAME's spelling alone, so a same-spelled LOCAL --
-    ``api = evil_api`` -- inherited the SAME trust as the one reviewed
-    facade; see :func:`_captured_arg_safe_callee`'s own updated docstring
-    for the exploit this closes. Threaded through to both
-    :func:`_captured_arg_safe_callee` call sites below exactly the way
-    ``captured`` already is; defaults to the empty set, so a caller that
-    does not compute it (:meth:`_DispatchWalker._else_rederives_subject`,
-    which also never passes ``captured`` and so never reaches either call
-    site at all) gets the same fail-closed behaviour as passing no
-    ``captured`` set already does.
+    #202 repair round 13, finding 1 (external review): rounds 9-11's
+    allowlist -- however tightly it proved a NAME's own binding -- could
+    never prove the ATTRIBUTE this module actually reads off that name's
+    value (``.api``) had not since been reassigned, deleted, or reached
+    through an alias; DEMONSTRATED live for every one of those mutation
+    forms (``CapturedArgumentAttributeMutationTests``,
+    test_route_extract.py). No general static check can soundly rule that
+    out for a mutable Python attribute, so this module no longer tries a
+    STRUCTURAL exemption for a captured value handed to a non-``self.``
+    call at all: it falls through, exactly like any other unmodelled call
+    reaching this point, to the ``_AUDIT_WAIVERS`` check just below --
+    inert ONLY when ITS OWN exact position carries a reviewed,
+    individually fingerprinted entry, the SAME discipline every other
+    unrecognised shape in this module already requires. The 37 real
+    server.py call/subscript sites this covers (of the 39 total
+    captured-only sites; the remaining two never fit this shape and
+    already carried their own individual waivers, see the comments below
+    ``_handle_setup``'s existing entries) are each named in
+    ``_AUDIT_WAIVERS`` with their own "round 13 finding 1" comment. The
+    ``captured``/``trusted_roots`` PARAMETERS this exemption used to read
+    are removed from this function's own signature along with it (see
+    :class:`_Ctx`'s own field docstring for ``captured`` specifically --
+    confirmed, by re-grepping this module's own source, to have had no
+    OTHER reader before it was removed).
     """
     for node in ast.walk(value):
         if isinstance(node, ast.Call):
@@ -4724,8 +4604,7 @@ def _propagates_taint(value, tracked: set, fn_name: str = "",
                            and func.attr in (_PATH_OPS + _PATH_METHODS)
                            and _propagates_taint(func.value, tracked, fn_name,
                                                  waiver_hits, parents,
-                                                 followed, captured,
-                                                 trusted_roots))
+                                                 followed))
             if manipulates:
                 continue
             if _mentions_tracked(node, tracked):
@@ -4758,35 +4637,29 @@ def _propagates_taint(value, tracked: set, fn_name: str = "",
                     # arguments is still reached and examined on its own,
                     # separately, by this SAME walk.
                     continue
-                if (captured and not is_self_call
-                        and not _is_callee(node, parents)
-                        and _tracked_mentions(node, tracked) <= captured
-                        and _captured_arg_safe_callee(func, trusted_roots)):
-                    # See this function's own docstring: a NON-self call
-                    # whose only tracked mentions are already-captured
-                    # names is the bound-first counterpart of
-                    # ``_is_known_capture_extraction``'s inline exemption.
-                    # #202 repair round 6, finding 2: ALSO never when this
-                    # call is itself about to be INVOKED as an enclosing
-                    # call's own callee (see ``_is_callee``'s own
-                    # docstring) -- selecting WHICH callable runs is a
-                    # dispatch decision even when the selector is a
-                    # captured id, not the inert-data case this exemption
-                    # exists for.
-                    # #202 repair round 9, finding 1 (external review):
-                    # ALSO never when this call's own callee (``func``) is
-                    # not on the small, explicit, reviewed allowlist (see
-                    # ``_captured_arg_safe_callee``'s own docstring) --
-                    # "not a captured/receiver position" (round 6) is
-                    # necessary but no longer sufficient, because a
-                    # captured selector handed to an ARBITRARY unmodelled
-                    # function as a plain argument can be invoked from
-                    # INSIDE that function's own body, never appearing in
-                    # any call's own ``.func`` subtree in THIS statement
-                    # at all (``invoke(handlers.get(action,
-                    # default_handler), self)``, DEMONSTRATED live 200/404
-                    # while every prior round's checks stayed silent).
-                    continue
+                # #202 repair round 13, finding 1 (external review): a
+                # captured value handed to a NON-self call USED TO be
+                # trusted as inert data here, ONCE, when the call's own
+                # callee resolved (by proven provenance, see the module
+                # comment above :data:`_TRUSTED_BINDING_SOURCES`) to a
+                # name bound from a reviewed source expression -- rounds
+                # 9-11's own allowlist/provenance chain. That structural
+                # exemption is RETIRED: it could prove a NAME was never
+                # rebound, never that the ATTRIBUTE this module actually
+                # trusts (``.api``) had not since been reassigned,
+                # deleted, or reached through an alias -- DEMONSTRATED
+                # live for each of those mutation forms
+                # (``CapturedArgumentAttributeMutationTests``,
+                # test_route_extract.py). There is no replacement
+                # STRUCTURAL rule here on purpose: every real captured-
+                # only call site (``_is_callee``'s own docstring already
+                # ruled out "about to be invoked" positions; ``captured``,
+                # above, already ruled out anything but an already-
+                # captured tracked mention) now falls straight through to
+                # the SAME ``_AUDIT_WAIVERS`` check every other unmodelled
+                # call in this module already needs -- inert only at its
+                # own individually reviewed, exact-text-fingerprinted
+                # position, never by a name's spelling or binding alone.
                 waiver_key = _waiver_key(fn_name, node, parents)
                 if waiver_key in _AUDIT_WAIVERS:
                     # Reviewed and declared not-a-routing-decision for THIS
@@ -4859,39 +4732,19 @@ def _propagates_taint(value, tracked: set, fn_name: str = "",
             # function fallback, which still sees the whole Subscript.
             mentioned = _tracked_mentions(node.slice, tracked)
             if mentioned:
-                if captured and mentioned <= captured \
-                        and not _is_callee(node, parents) \
-                        and _captured_arg_safe_callee(node.value, trusted_roots):
-                    # The SAME captured-only exemption a Call's arguments
-                    # get, several lines above (see this function's own
-                    # docstring on ``captured``): a lookup keyed on an
-                    # already-CAPTURED id (``CACHE[gid]``) is the subscript
-                    # form of the identical "produces a RESULT, not a
-                    # routing decision" shape ``api.get_x(gid)`` already
-                    # is -- never the primary ``path`` itself, and never a
-                    # ``combo``/``dest``/``parent``-style tuple, both
-                    # unconditionally excluded from ``captured`` upstream
-                    # (see ``_Ctx.captured``'s own docstring), so this
-                    # cannot be used to smuggle a real dispatch table past
-                    # review. #202 repair round 6, finding 2: ALSO never
-                    # when this Subscript is itself about to be INVOKED as
-                    # an enclosing call's own callee (``HANDLERS[action]
-                    # ()``, see ``_is_callee``'s own docstring) -- the
-                    # Subscript-callee analogue of the SAME dispatch-
-                    # selection concern the Call-branch's own exemption,
-                    # above, is narrowed for. #202 repair round 9, finding
-                    # 1 (external review): ALSO never when the CONTAINER
-                    # (``node.value``) is not on the same small, explicit,
-                    # reviewed allowlist the Call-branch now requires (see
-                    # ``_captured_arg_safe_callee``'s own docstring) -- an
-                    # opaque external dict (``HANDLERS[action]`` used as a
-                    # plain argument, never itself a callee) is no more
-                    # provably inert than an opaque external function is;
-                    # only a dict LITERAL of already-safe values (the real
-                    # ``_handle_setup``/``_handle_setup_v2``/``do_POST``
-                    # delete- and action-dispatch tables, each spelled
-                    # inline right here) is.
-                    continue
+                # #202 repair round 13, finding 1 (external review): the
+                # SAME retirement as the Call branch above -- a lookup
+                # keyed on an already-captured id (``CACHE[gid]``, or a
+                # dict LITERAL of ``api.X`` values, the real
+                # ``_handle_setup``/``_handle_setup_v2``/``do_POST``
+                # delete- and action-dispatch shape) used to be trusted
+                # structurally once its container's root resolved to a
+                # proven-provenance name; that trust is retired for the
+                # same reason (a proven NAME binding says nothing about
+                # whether the ATTRIBUTE this module reads off it has
+                # since been mutated). Falls straight through to the SAME
+                # ``_AUDIT_WAIVERS`` check the Call branch above does --
+                # never by the container's spelling or binding alone.
                 waiver_key = _waiver_key(fn_name, node, parents)
                 if waiver_key in _AUDIT_WAIVERS:
                     if waiver_hits is not None:
@@ -4913,13 +4766,12 @@ def _propagates_taint(value, tracked: set, fn_name: str = "",
         # from whichever operand carries the path -- the construction
         # analogue of the method calls handled above.
         return (_propagates_taint(value.left, tracked, fn_name, waiver_hits,
-                                  parents, followed, captured, trusted_roots)
+                                  parents, followed)
                 or _propagates_taint(value.right, tracked, fn_name,
-                                     waiver_hits, parents, followed, captured,
-                                     trusted_roots))
+                                     waiver_hits, parents, followed))
     if isinstance(value, ast.Attribute) and value.attr in _PATH_PROPERTIES:
         return _propagates_taint(value.value, tracked, fn_name, waiver_hits,
-                                 parents, followed, captured, trusted_roots)
+                                 parents, followed)
     # #202 repair round 6, finding 1: ``_mentions_tracked`` -- which
     # recognises ``self.path`` at any depth (see its own docstring) and
     # stops at an opaque-extraction boundary -- not a blind ``ast.walk``
