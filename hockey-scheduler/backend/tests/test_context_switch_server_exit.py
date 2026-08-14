@@ -159,8 +159,14 @@ class _Park:
         self.release.set()
 
 
-class ContextSwitchServerExitBase:
-    """Shared fixture. Subclasses set ``STORE_URL`` (None => InMemoryStore)."""
+class ContextGateFixtureBase:
+    """Shared FIXTURE ONLY — a real ``ThreadingHTTPServer``, real sessions, the
+    Program/Season fixtures, the park seams and the gate assertions. It carries
+    NO test methods, so a sibling suite can reuse the machinery without
+    silently re-running (and re-timing) every case below on its own classes;
+    ``tests/test_context_read_cancel_handoff.py`` does exactly that.
+
+    Subclasses set ``STORE_URL`` (None => InMemoryStore)."""
 
     STORE_URL = None
 
@@ -216,12 +222,21 @@ class ContextSwitchServerExitBase:
         return urllib.request.build_opener(
             urllib.request.HTTPCookieProcessor(CookieJar()))
 
-    def _req(self, opener, method, path, body=None, timeout=PATIENCE):
+    def _req(self, opener, method, path, body=None, timeout=PATIENCE,
+             headers=None):
         url = f"http://127.0.0.1:{self.port}{path}"
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(url, data=data, method=method)
         if data is not None:
             req.add_header("Content-Type", "application/json")
+        # ADDITIVE and defaulted (#159 late-arrival follow-up): a scoped read
+        # echoes the context epoch it was rendered under in a REQUEST HEADER, so
+        # the sibling suite in tests/test_context_read_cancel_handoff.py needs
+        # to set one. Every existing call site passes none and is byte-identical
+        # — and "passes none" is itself a case there, since an absent epoch must
+        # behave exactly as it did before the epoch existed.
+        for name, value in (headers or {}).items():
+            req.add_header(name, value)
         try:
             with opener.open(req, timeout=timeout) as r:
                 raw = r.read()
@@ -446,6 +461,12 @@ class ContextSwitchServerExitBase:
                     sink["committed_at"] = time.monotonic()
             return wrapper
         self._wrap(self.api, "set_active_context", factory)
+
+
+class ContextSwitchServerExitBase(ContextGateFixtureBase):
+    """The cases themselves. Split from the fixture above only so the fixture
+    can be reused elsewhere; every case, every assertion and every store class
+    below is unchanged."""
 
     # ======================================================================
     # THE DEFECT

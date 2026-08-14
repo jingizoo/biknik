@@ -1388,6 +1388,183 @@ and a POST on replica B are not ordered by it, and the fix would have to be
 re-expressed at the database — which the existing advisory lock cannot do, for
 the first reason above.
 
+### The residue the gate leaves: a read dispatched before the switch, arriving after it
+
+The gate orders participants **by arrival at `do_GET`**. `app.js` orders them
+**by fetch dispatch**. Between those two instants lies an interval that neither
+process owns — the browser's own request queue and the wire — and a scoped read
+can sit in it across an entire switch:
+
+```
+render() dispatches      GET .../seasons/season_3/venue-candidates
+the operator switches  → cancelContextScopedReads() aborts it, the JS promise
+                         SETTLES, awaitContextScopedReadSettlement() RETURNS
+POST /api/context        reaches the server FIRST, takes gate seq W, commits
+the GET                  finally reaches do_GET, takes seq R > W
+```
+
+At R every component is correct. The read arrived after the writer, so the gate
+correctly makes it wait behind that writer and correctly runs it against the
+**new** tuple; the untouched ceiling then compares `season_3` against the new
+selection and answers the generic 404. No wait expires and no `[context-gate]`
+line is logged — this is not a gate defect and #415 is not to be reverted for
+it. It is a correct answer to a question the operator had already withdrawn. CI
+recorded it on `main@1de50d7` and `main@e385bfb`, `setup-state-matrix`,
+**desktop** leg, with the app's own ledger showing that read as
+`generation=5 dispatched=true`. Before the gate the same read either won the
+race (200) or died at the transport as `net::ERR_ABORTED`, which the journey
+forgives — which is why a dozen pre-gate runs were green.
+
+**A client abort is not a transport cancellation.** `AbortController.abort()`
+settles our promise. It cannot un-send a dispatched request and cannot stop the
+server answering one it has not yet read. So the missing fact — *which selection
+this read was rendered under* — travels **on the read itself**.
+
+| what | where | carries |
+| --- | --- | --- |
+| `context_epoch` | `GET /api/context`, `GET /api/context/options`, the `POST /api/context` response | the opaque epoch of the caller's currently persisted `ActiveContext` row **and the selected Season's persisted lifecycle** (below) |
+| `X-Context-Epoch` | every context-scoped GET the client enrols | the epoch that read was **rendered under** |
+
+`services/context_epoch.py` derives the token; `Handler._read_under_context_gate`
+compares it, **after** the gate's shared hold and **before** the service call:
+
+* **mismatch** → `204 No Content`, no body, ceiling never evaluated;
+* **match** → proceed exactly as today, ceiling included;
+* **absent** → proceed exactly as today, so no client is required to
+  participate and none is penalised for not doing so.
+
+204 rather than a 4xx because this is not a refusal: the operator superseded the
+request themselves, and it must not surface as a page error.
+
+#### Why an epoch and not a cancellation ledger
+
+The first attempt gave each read a client-minted id, had the switch's POST
+declare the ids it cancelled, and kept those ids in a bounded per-user registry
+with a 30 s TTL and two capacity caps. The repository owner rejected it:
+
+> Eviction/TTL must never turn a declared cancellation back into a 404. "TTL
+> exceeds the gate wait" is insufficient because network arrival can exceed
+> both. The design needs proof that retention lasts through claim, or fail the
+> switch before committing, or use non-evictable epoch/tombstone semantics.
+
+The rejection is exact rather than stylistic. Every way an id could leave that
+registry — claimed, expired, evicted by the per-user FIFO, evicted by the
+per-process LRU — collapsed to one answer, which fell through to the ceiling and
+back to the 404. A read's arrival time is bounded by the **network**, so no
+retention window can be proven long enough.
+
+**Nothing is retained here.** No registry, no TTL, no cache, no eviction, no
+configuration. The epoch is derived on demand from state the application
+already persists — the `ActiveContext` row plus the selected Season's
+lifecycle — so the rejected failure mode is *unconstructible* rather than
+unlikely: an arrival delayed by an hour compares exactly as correctly as one
+delayed by a millisecond, and the comparison survives a process restart because
+its input is persisted state rather than process memory.
+
+#### What the token is, and what it is not
+
+* **Stable** for a given row — the same row hashes identically in any process,
+  which a per-process counter or nonce could not do.
+* **Moves on every switch, including a switch back to the same tuple**, because
+  `set_with_league` rewrites `updated_at` on every commit. A tuple-derived token
+  would have silently readmitted a read from before an A → B → A round trip.
+* **Moves on the selected Season's lifecycle** — archive and reopen each move
+  it, though the row is untouched, because the material also carries
+  `season_guard.season_is_read_only` for the selected Season plus its raw
+  `status` and `archived_at` (§ below). Archive → reopen → archive is three
+  distinct tokens; a full archive → reopen round trip **restores** the token,
+  deliberately — `archived_at` returns to `None`, so a read rendered before the
+  archive is readmitted to the exact ceiling it was rendered under.
+* **Opaque**: BLAKE2s over the length-prefixed row, so no user, Program, Season,
+  League or timestamp can be read out of it. Honest limit — it is a keyless
+  digest, so a party who already holds the whole row can recompute and confirm
+  it; that party supplied everything the token could disclose, and confirming it
+  buys nothing (below).
+* **Confers no authority.** A comparison can only ever *discard*. Echo a stale
+  token and you throw away your own read; echo the current token on a genuinely
+  stale question and you get today's 404, unchanged; echo garbage and you throw
+  away your own read; echo another operator's token and you throw away your own
+  read. It cannot widen scope, cannot identify, and cannot serve a byte the
+  ceiling would have refused.
+* **One honest degradation:** two switches inside a single clock tick would
+  share an `updated_at` and therefore a token, and a read rendered under the
+  first would not be discarded. It would then be judged by the ceiling — the
+  pre-#159 behaviour: a missed improvement, never a wrong answer.
+
+**The ceiling is untouched, again.** `api/service.py` is not in this change at
+all; the epoch is attached to the three context payloads and compared in
+`web/server.py`. The sibling-Season and nonexistent-Season refusals stay
+byte-identical to each other and to `main`.
+
+**Not a per-process limit, unlike the gate.** The epoch holds no locks and no
+memory, so a token issued by one replica compares correctly on another.
+
+#### The SECOND source of the same 404 — the Season lifecycle — and why it is in the material
+
+`GET .../seasons/season_3/venue-candidates -> 404` in `setup-state-matrix` had
+**two** causes, and the switch race was only one of them. The second was found
+by capturing the epoch header on the wire during a failing run of an earlier,
+row-only build of this mechanism:
+
+* the failing request carried a **current** epoch and was correctly admitted;
+* one millisecond earlier the **same Season** answered `venue-access` **200**
+  under the **same** epoch.
+
+Exactly one rule distinguishes those two routes: `get_venue_grant_candidates`
+refuses an **archived** selected Season with the generic 404 (#369 follow-up —
+that read exists solely to feed a grant, and a grant on an archived Season fails
+`season_archived`). So the selection really *was* the one the read named. The
+Season had been **archived between the context read and the scoped read** — a
+transition that writes `Season.status`/`archived_at` and touches **no**
+`ActiveContext` row, so a row-only token was measured byte-identical either
+side of it. The client half of that incident (a stale cached `read_only` gate)
+was fixed by publishing a per-Season `read_only` fact in the hierarchy DTO; the
+test file that landed with it records the deliberate residue this section now
+closes: *"closing that window needs a server-side binding (a version/epoch on
+the follow-up read), which is deliberately NOT in this change."*
+
+**The lifecycle is now part of the material** (`_selected_season_lifecycle`,
+`services/context_epoch.py`), and the objection that stopped it the first time
+— "that turns the epoch into a general *everything-this-render-depends-on*
+stamp" — is answered by what, exactly, is hashed:
+
+* **the decision, first:** `season_guard.season_is_read_only` for the selected
+  Season — the ONE predicate the write refusal, the candidate-read refusal and
+  the hierarchy's published `read_only` already answer to. Not a second
+  definition of "archived" that could drift: whenever the refusal's answer
+  could change, the material it is computed from has changed, and the token has
+  therefore already moved. Nothing else a render depends on is stamped.
+* **then the raw `status` and `archived_at`,** deliberately wider than the
+  decision. It costs nothing and it buys the reopen direction twice over:
+  archive → reopen → archive returns the decision to its starting value, and
+  only `archived_at` distinguishes the two archived states. A field that moves
+  without the refusal moving can only cause a **discard** — a read thrown away
+  and re-issued — never a serve, so erring wide fails in the safe direction.
+* **sentinels for the states a Season id cannot spell:** "no Season selected"
+  (a legitimate Program-only selection) and "the selected id no longer
+  resolves" (a deleted Season) are distinct, well-defined material — a read
+  rendered under a since-deleted Season is not admitted just because the
+  lookup came back empty.
+
+The BLAKE2s personalization was bumped (`hsctxep1` → `hsctxep2`) when the
+lifecycle joined the material, so a token issued by a row-only build can never
+coincidentally equal a lifecycle-aware one: in-flight reads across a deploy
+discard once and re-issue, which is the safe direction.
+
+**The deliberate round trip.** `reopen_season` clears `archived_at`, so
+active → archived → active is byte-identical at both ends and a read rendered
+before the archive is **readmitted** after the reopen — to the exact ceiling it
+was rendered under, which now answers exactly what the render expected. That is
+a decision, not a hole, and `tests/test_context_epoch_lifecycle.py` pins it so
+it can only change on the record.
+
+**What a fresh epoch buys after an archive: nothing the ceiling refuses.** A
+client that re-reads its context learns `read_only: true`, the new epoch beside
+it in ONE payload, and its next reads are admitted to the unchanged ceilings —
+candidates for an archived selected Season still answer the same generic 404,
+and standings still answer THAT Season's rows, because archived history stays
+readable (owner contract 1).
+
 ## Coverage
 
 - `tests/test_league_filtered_setup_progress.py`,
@@ -1446,3 +1623,49 @@ the first reason above.
   `#ctx-select` switch is made, and the POST is required not to commit until the
   handler exits. Zero 404s, zero console errors, and the same sibling-Season 404
   control asserted in the same run.
+- `tests/test_context_read_cancel_handoff.py` — the **context epoch**, across
+  Memory / SQLite / PostgreSQL over authenticated HTTP, plus a store-free class
+  for the derivation itself (stability, movement on a switch back to the same
+  tuple, per-axis and per-owner sensitivity, opacity, and the fail-closed
+  verdict). The interleaving is *forced*, not raced: an in-process arrival park
+  shadows `Handler.do_GET` and blocks the target GET **above**
+  `CONTEXT_GATE.arrive()`, which is asserted by `stats()["readers"] == 0` while
+  it is held — so the switch waits for nothing and commits, exactly as it does
+  when a browser is still holding the request in its own queue. Carries the
+  **eviction-impossibility** case the redesign exists for: the same interleaving
+  under 300 other operators' switches, a second operator's real POSTs, 80
+  further scoped reads and an env-tunable elapsed delay, with the *compared
+  value* asserted byte-identical before and after — so there is no quantity of
+  time or churn the outcome could depend on. Also: the cross-user case (A's
+  switching cannot discard B's read), another operator's current epoch
+  discarding only your own request, the absent-header no-regression case, forged
+  and garbage epochs discarding rather than serving, a current epoch buying
+  nothing the ceiling refuses (with the sibling/nonexistent refusals still
+  indistinguishable), all four listed routes, gate counters back to zero over 40
+  discards with no timeout, and a direct re-assertion of #415's ordering for a
+  read that *was* already inside the server.
+- `e2e/context-switch-late-arrival.js` — the browser half, at desktop 1440×900
+  **and** 390×844, both venue routes. Uses `server-park-harness.py`'s arrival
+  park (`/arm-late`), reads the answer from *inside* the server (an aborted
+  fetch may have taken its socket with it, so the wire cannot always be asked),
+  and requires 204 with `ApiService` never reached. Its control leg strips
+  `X-Context-Epoch` off the held read in flight and requires the 404 back —
+  simultaneously the falsifier for every other leg and the proof that a client
+  which sends no epoch is exactly as well off as it was on `main`. No
+  `waitForTimeout` anywhere: every wait is a polled predicate that fails loudly
+  if it never becomes true.
+- `tests/test_context_epoch_lifecycle.py` — the **Season-lifecycle dimension**,
+  Memory / SQLite / PostgreSQL over authenticated HTTP through the same fixture
+  as the switch dimension, plus a store-free derivation class. An archive
+  between the context read and the scoped read discards (204, service never
+  reached) instead of admitting the stale read to the archived-Season 404 or
+  serving standings as-if-fresh; an in-flight read parked above the gate is
+  discarded by an archive that commits while it is parked; the epoch moves on
+  archive and again on reopen, with a full round trip **restoring** it (the
+  deliberate readmission, pinned at both the derivation and the HTTP level);
+  a FRESH epoch after the archive proceeds to the unchanged ceilings —
+  candidates still 404 generically, standings still serve THAT Season's rows;
+  an absent header behaves exactly as main either side of an archive; two
+  archives of one Season are distinct states; no-Season and vanished-Season
+  are distinct well-defined material; and a store that cannot answer
+  `get_season` fails loudly rather than issuing a lifecycle-blind token.

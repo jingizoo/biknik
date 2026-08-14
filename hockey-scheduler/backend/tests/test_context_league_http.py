@@ -56,8 +56,16 @@ from hockey_scheduler.web.server import STATE, Handler
 PASSWORD = "demo"
 # The exact key set the wired payload must expose — asserted whole so an
 # accidental extra field is a failure, not a silent contract widening.
+#
+# ``context_epoch`` (#159 late-arrival follow-up) is a DELIBERATE widening, and
+# it is listed here rather than exempted so it stays one: the payload must be
+# exactly this set, and the next field still has to be argued for. It is the
+# opaque token a scoped read echoes in ``X-Context-Epoch`` so the server can
+# tell a read rendered under this selection from one rendered under the
+# selection before it; it is added in ``web/server.py`` and carries no id — see
+# services/context_epoch.py.
 CONTEXT_KEYS = {"program_id", "season_id", "league_id", "read_only",
-                "program", "season", "league"}
+                "program", "season", "league", "context_epoch"}
 
 
 class LeagueContextHttpContract:

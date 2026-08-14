@@ -531,7 +531,70 @@ let contextScopedReadController = null;
 // failed.
 const contextScopedReadsInFlight = new Set();
 // The app's own statement of intent, read by the regression journey.
-const contextScopedReadAborts = [];   // {method, url, generation, at}
+const contextScopedReadAborts = [];   // {method, url, generation, dispatched,
+                                      //  discarded, at}
+
+// ===== THE CONTEXT EPOCH (#159 follow-up to #415) ========================
+//
+// WHY THE BARRIER ABOVE AND THE SERVER GATE BELOW IT ARE NOT ENOUGH. The gate
+// orders by ARRIVAL AT `do_GET`. This file orders by FETCH DISPATCH. Between
+// those two instants sits an interval neither process owns -- the browser's
+// request queue and the wire -- and a scoped read can sit in it across a whole
+// switch:
+//
+//     render() dispatches GET .../seasons/season_3/venue-candidates
+//     the operator switches; cancelContextScopedReads() aborts it, the promise
+//       SETTLES, and awaitContextScopedReadSettlement() therefore RETURNS
+//     POST /api/context reaches the server FIRST and commits
+//     only THEN does the GET reach do_GET -- and, having arrived after the
+//       writer, is correctly judged against the NEW tuple and correctly
+//       refused 404 by the unchanged exact-Season ceiling
+//
+// Nothing there is a bug: it is a correct answer to a question the operator
+// already withdrew. CI records it on main@1de50d7 and main@e385bfb, DESKTOP
+// leg of setup-state-matrix, with this file's own ledger showing that read as
+// generation=5 dispatched=true.
+//
+// AN ABORT IS NOT A CANCELLATION ON THE WIRE. `AbortController.abort()`
+// settles OUR promise. It does not un-send a request already dispatched and it
+// cannot stop the server answering one it has not yet read. So the missing
+// fact travels ON THE READ ITSELF: every scoped read echoes the SERVER-ISSUED
+// epoch of the selection it was rendered under, and the server discards
+// (204, no body, no ceiling) any read whose echo no longer matches the
+// persisted selection.
+//
+// NOTHING IS STORED ANYWHERE to make that work -- not here and not on the
+// server, which derives the epoch from the row it already persists. There is no
+// ledger to evict from and no TTL to expire, so a read delayed by an hour is
+// judged exactly as correctly as one delayed by a millisecond. See
+// backend/hockey_scheduler/services/context_epoch.py.
+//
+// IT GIVES THE CLIENT NO POWER IT DID NOT HAVE. Echoing a stale epoch throws
+// away YOUR OWN read; echoing the current one on a genuinely stale question
+// gets today's 404, unchanged; echoing garbage throws away your own read. The
+// header can never widen scope, never identify, and never serve a byte the
+// ceiling would have refused.
+//
+// THE ONE INVARIANT, and both halves of it were learned the hard way:
+//
+//   1. IT IS WRITTEN ONLY WHERE `contextOptions.selected` IS WRITTEN -- the
+//      whole-payload adoption in loadContextOptions() and the POST echo in
+//      sendContextSwitch(), and nowhere else. Both come from ONE server
+//      response, so the tuple and its epoch can never straddle a switch.
+//      It is also deliberately NOT cleared where `contextOptions` survives:
+//      see resetTransientUiState(), where clearing it left a tuple with no
+//      epoch and brought the CI 404 straight back.
+//   2. IT IS READ ONCE PER RENDER PASS, beside the Season id that pass will
+//      ask about, and passed DOWN to getJSONContextScoped -- never read at
+//      fetch time. A render captures its Season id and then awaits many times
+//      before issuing these reads; reading the epoch at the end of that would
+//      pair an old Season with a new epoch, the server would find the echo
+//      CURRENT, admit the read, and refuse it at the ceiling. That is the 404,
+//      reintroduced by the mechanism meant to remove it.
+//
+// Both rules say the same thing: the epoch must describe the tuple this file
+// is RENDERING, at the instant it decided what to render.
+let contextEpoch = null;
 
 function contextScopedReadSignal() {
   if (!contextScopedReadController) {
@@ -554,7 +617,16 @@ function contextScopedReadSignal() {
 // reason the gate exists), so enrolment here is a UX nicety -- it stops a stale
 // answer from being rendered -- and never the ordering guarantee. Do not read
 // "not enrolled here" as "not context-scoped"; read the server table.
-async function getJSONContextScoped(p) {
+//
+// `renderedEpoch` is the epoch the CALLER captured beside the tuple it is
+// asking about, and it is a REQUIRED argument in spirit rather than a
+// convenience: this function must never read `contextEpoch` itself. The whole
+// point is that the caller's Season id and the echoed epoch come from the SAME
+// instant, and a fetch happens many awaits after that instant. Omitting it
+// sends no header, which the server treats exactly as a pre-#159 client — the
+// old 404 is then possible again, so a new call site that forgets this forfeits
+// the protection rather than silently getting a wrong-but-plausible one.
+async function getJSONContextScoped(p, renderedEpoch) {
   const generation = contextScopedReadGeneration;
   const signal = contextScopedReadSignal();
   let markSettled;
@@ -575,9 +647,19 @@ async function getJSONContextScoped(p) {
   //            the correct answer if the controller ever outlives a
   //            cancellation, and because a silently-dispatched read would be
   //            the one failure mode this whole barrier exists to prevent.
-  const abortedResult = (dispatched) => {
+  //   `discarded` marks the third shape, added with the epoch: the request was
+  //            delivered AND answered, but the server recognised it as one the
+  //            operator had superseded and answered 204 with no body. There is
+  //            no `requestfailed` for it and no 404 either -- which is the
+  //            entire point -- so it is recorded here as an abort (it is one)
+  //            with the extra field saying which kind. `dispatched` stays true
+  //            because it was; the settlement journey reconciles FAILURES
+  //            against dispatched aborts, so an extra abort with no matching
+  //            failure is inert there.
+  const abortedResult = (dispatched, discarded) => {
     contextScopedReadAborts.push({ method: "GET", url: p, generation,
-                                   dispatched, at: Date.now() });
+                                   dispatched, discarded: !!discarded,
+                                   at: Date.now() });
     return CONTEXT_READ_ABORTED;
   };
   try {
@@ -586,7 +668,37 @@ async function getJSONContextScoped(p) {
     // correct answer: do not dispatch it, so the server never sees a request
     // the ceiling would have to refuse.
     if (signal.aborted) return abortedResult(false);
-    const response = await fetch(p, { credentials: "same-origin", signal });
+    // THE EPOCH THIS READ WAS RENDERED UNDER — the caller's, captured with the
+    // tuple, never this function's view of `contextEpoch` at fetch time (see
+    // the note on the signature). Omitted entirely when there is none yet, e.g.
+    // before the first contextOptions load: the server treats an absent epoch
+    // as today's behaviour, so an un-epoched read is never WORSE off than it
+    // was before this existed — only unimproved.
+    const response = await fetch(p, { credentials: "same-origin", signal,
+      headers: renderedEpoch ? { "X-Context-Epoch": renderedEpoch } : {} });
+    // THE SERVER DISCARDED IT, because the selection moved while this request
+    // was in transport. A 204 carries no body, so there is nothing to drain and
+    // nothing to parse; classifying it as an abort is not a convenience but the
+    // literal truth -- it is the withdrawal we already made, finally taking
+    // effect at the only place that could apply it.
+    //
+    // WHEN THIS IS ACTUALLY REACHED, because it is not the common case and
+    // saying otherwise would be false. A read that cancelContextScopedReads()
+    // aborted never sees any response at all: Chromium tears the request down
+    // and the `catch` below classifies it. This branch is for the read the
+    // client CANNOT cancel -- one enrolled AFTER that cancellation, by a
+    // render() that ran while the switch's POST was still in flight. It is
+    // dispatched under the old epoch on a fresh, un-aborted controller, and the
+    // commit lands while it is still on the wire. `e2e/context-switch-late-
+    // arrival.js`'s held-POST leg drives exactly that.
+    //
+    // Checked BEFORE readApiResponse(): that helper maps an empty 2xx to `{}`,
+    // a SUCCESS-shaped value with no `error` key, which is indistinguishable to
+    // a caller from a real empty answer. Returning the abort sentinel instead
+    // keeps `result === CONTEXT_READ_ABORTED` a legitimate test and puts the
+    // read in the abort ledger the journeys reconcile, rather than leaving a
+    // discard looking like data.
+    if (response.status === 204) return abortedResult(true, true);
     // Drains the body -- see SETTLEMENT MEANS THE BODY IS DRAINED above.
     const body = await readApiResponse(response);
     // Delivered in full, but the tuple moved while it was arriving. The body
@@ -10487,6 +10599,25 @@ async function render() {
       // the ruling removed, one HTTP hop further down.
       const selectedSeasonId = (contextOptions && contextOptions.selected
         && contextOptions.selected.season_id) || null;
+      // THE EPOCH IS CAPTURED HERE, IN THE SAME STATEMENT GROUP AS THE TUPLE
+      // IT DESCRIBES (#159 follow-up), and passed down to the two scoped reads
+      // below rather than read at their fetch.
+      //
+      // `selectedSeasonId` is a LOCAL, captured once at the top of this block
+      // and then used many awaits later — that is the whole reason the reads
+      // can name a Season the page has since left. Reading `contextEpoch` at
+      // fetch time instead would pair THAT Season with an epoch from a later
+      // instant, and if a switch had landed in between the server would find
+      // the echo CURRENT, admit the read, and refuse it at the ceiling: the
+      // 404, reintroduced by the mechanism meant to remove it. Captured here,
+      // the pair is consistent by construction and the answer to a superseded
+      // read is a discard.
+      //
+      // The `contextRevision !== myRenderContext` guards below make the same
+      // read unreachable in most interleavings, but they are a SUPERSET signal
+      // owned by other concerns and they are not what this correctness argument
+      // should rest on. This makes the pairing a fact rather than a consequence.
+      const renderedContextEpoch = contextEpoch;
       // ...and an ARCHIVED selection fetches no candidates at all (#369 owner
       // ruling, follow-up). An archived Season is read-only history: the grant
       // this list feeds fails `season_archived`, so asking for candidates both
@@ -10558,7 +10689,8 @@ async function render() {
             // stays exactly as it was: it is a discard-after-arrival check and
             // was never the thing that stopped the request.
             const va = await getJSONContextScoped(
-              `/api/v2/setup/seasons/${s.id}/venue-access`);
+              `/api/v2/setup/seasons/${s.id}/venue-access`,
+              renderedContextEpoch);
             if (contextRevision !== myRenderContext) return;  // superseded
             seasonVenueAccess[s.id] = (va && va.venue_access) || [];
             // Grant CANDIDATES for this Season (#369 review): its own
@@ -10604,7 +10736,8 @@ async function render() {
               // Scoped for the same reason as venue-access above -- and this is
               // the exact request CI shard 1 recorded 404ing at 390px.
               const vc = await getJSONContextScoped(
-                `/api/v2/setup/seasons/${s.id}/venue-candidates`);
+                `/api/v2/setup/seasons/${s.id}/venue-candidates`,
+                renderedContextEpoch);
               if (contextRevision !== myRenderContext) return;  // superseded
               seasonVenueCandidates[s.id] = (vc && vc.candidates) || [];
             }
@@ -13155,6 +13288,18 @@ async function loadContextOptions() {
   const o = await getJSON("/api/context/options");
   if (mySeq !== contextOptionsLoadSeq) return;  // superseded by a newer load
   contextOptions = (o && !o.error) ? o : null;
+  // THE EPOCH AND THE TUPLE ARE ADOPTED TOGETHER, from the same payload, under
+  // the same supersession guard. That is the invariant the whole mechanism
+  // rests on: what this file echoes on a scoped read must be the epoch of the
+  // tuple this file is rendering. Two separate assignments -- or adopting the
+  // epoch from a response that did not also carry `selected` -- would let the
+  // pair straddle a switch, which either discards live reads or admits dead
+  // ones. A failed/superseded load leaves the previous epoch in place rather
+  // than clearing it, so a transient options failure does not silently turn the
+  // page's reads back into un-epoched ones.
+  if (contextOptions && contextOptions.context_epoch) {
+    contextEpoch = contextOptions.context_epoch;
+  }
 }
 // Restore on load: the persisted context is already loaded above; if the URL
 // carries a DIFFERENT context, adopt it — delegating the authorization decision
@@ -13589,6 +13734,17 @@ async function sendContextSwitch(mySeq, programId, seasonId, leagueId) {
     // refetch below.
     contextOptions.saved = { program_id: r.program_id,
       season_id: r.season_id, league_id: r.league_id };
+    // ...and the EPOCH moves with them, from the same echo, in the same block
+    // (#159 follow-up). The rule is one line long and this is the second and
+    // last place that obeys it: the epoch is adopted exactly where
+    // `contextOptions.selected` is written, never anywhere else. Adopting it a
+    // statement earlier -- as soon as the POST answered, before `selected` was
+    // patched -- would leave a window in which the page renders the OLD tuple
+    // while echoing the NEW epoch, and every scoped read issued in that window
+    // would be ADMITTED and then judged against a selection it was not
+    // rendered under, which is precisely the 404 this whole mechanism exists
+    // to prevent. Guarded by the same `if (contextOptions)` for that reason.
+    if (r.context_epoch) contextEpoch = r.context_epoch;
   }
   // Second bump (#331 review round 8): the FIRST bump above only made the
   // PRIOR selection's mutations uncommittable at intent time, before
@@ -14202,6 +14358,27 @@ function resetTransientUiState() {
   // superseded switch already does.
   contextSwitchQueued = null;
   contextSwitchSeq += 1;
+  // `contextEpoch` IS DELIBERATELY NOT CLEARED HERE (#159 follow-up), and this
+  // is the one place that looks like it should be. It was, in the first cut of
+  // this change, and that reintroduced the very 404 the epoch exists to
+  // prevent: `contextOptions` deliberately SURVIVES an identity change (see the
+  // paragraph below — it is the last server-confirmed selection, and the hash
+  // is rewound to it), so clearing the epoch beside it leaves the page holding
+  // a tuple with no epoch. The next render then issues scoped reads for the
+  // DEPARTING identity's Season with no header at all, the server treats that
+  // as "no epoch supplied" and applies the ceiling, and the answer is the CI
+  // 404 — reproduced locally in `setup-state-matrix`'s phone leg as
+  // `GET .../seasons/season_3/venue-candidates -> 404` with the abort ledger
+  // showing `generation=5 dispatched=true`.
+  //
+  // THE RULE IS THE PAIRING, not the lifetime: the epoch must travel with
+  // whatever tuple this file is rendering, and go stale exactly when that tuple
+  // does. Kept here, those same reads echo the departing identity's epoch, the
+  // server compares it against the ARRIVING session's own row, it cannot match,
+  // and they are discarded (204) instead of refused. Nothing is disclosed by
+  // keeping it: it is an opaque digest that identifies nothing and authorizes
+  // nothing, and `contextOptions` beside it holds actual Program and Season
+  // names.
   // ...and the same for a switch whose POST has already LEFT but has not yet
   // been ANSWERED. #369 made sendContextSwitch() publish the intended
   // selection into location.hash BEFORE its POST, so the hash can never lag

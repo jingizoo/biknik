@@ -72,8 +72,15 @@ ADMIN_USER = "user_admin"          # the demo seed's deterministic account id
 ACTOR = "test_seed"
 # The whole rendered key set, asserted as a SET so a silently widened payload
 # fails here instead of at some client.
+#
+# ``context_epoch`` (#159 late-arrival follow-up) is a DELIBERATE widening and
+# is listed rather than exempted, so the assertion stays exactly as strict as it
+# was: the payload must be this set and no other. It is the opaque token a
+# context-scoped read echoes in ``X-Context-Epoch``, added in ``web/server.py``
+# (never in ``api/service.py``), and it encodes no identifier — see
+# services/context_epoch.py.
 CONTEXT_KEYS = {"program_id", "season_id", "league_id", "read_only",
-                "program", "season", "league"}
+                "program", "season", "league", "context_epoch"}
 # The ONE reason every League refusal must carry (#364 owner ruling).
 REFUSED = (404, "not_found", "league_not_accessible")
 # Every persisted field of the context row. Asserted as a SET before the
@@ -302,8 +309,26 @@ class CanonicalLeagueContextHttpContract:
             {"program_id": pid, "season_id": s1, "league_id": None},
             opener=admin)
         self.assertEqual(s_null, 200, explicit)
-        self.assertEqual(explicit, legacy,
-                         "omitting league_id must render exactly as null")
+        # ``context_epoch`` (#159 late-arrival follow-up) is compared SEPARATELY
+        # and in the OPPOSITE direction, because it is the one key in this
+        # payload that is not part of the rendered context. It names WHICH
+        # COMMIT produced the row, and these are two distinct commits a moment
+        # apart — so requiring it to be equal here would be requiring two
+        # different writes to be indistinguishable, which is exactly the
+        # property the epoch must NOT have. Every field that existed before it
+        # is still compared whole, so this case is no weaker than it was: it
+        # still fails if the two dialects render one byte of the CONTEXT
+        # differently.
+        epoch_key = "context_epoch"
+        self.assertEqual(
+            {k: v for k, v in explicit.items() if k != epoch_key},
+            {k: v for k, v in legacy.items() if k != epoch_key},
+            "omitting league_id must render exactly as null")
+        self.assertNotEqual(
+            explicit.get(epoch_key), legacy.get(epoch_key),
+            "two separate commits handed back the SAME epoch, so a scoped read "
+            "rendered under the first would be admitted after the second — the "
+            "epoch has stopped detecting a switch")
         self._assert_agrees(admin, explicit, "explicit-null")
 
     # -- the #364 headline: the exact canonical tuple ----------------------
