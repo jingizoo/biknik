@@ -68,6 +68,12 @@ def _downgrade_to_pre028(store):
     # the dependent table to go before league_seasons can be removed; these
     # read-only preflight tests never exercise later scenario persistence.
     cur.execute("DROP TABLE IF EXISTS schedule_scenarios")
+    # 052's membership tables (#205 Slice A) are later children of this same
+    # hierarchy (league_seasons/seasons/teams/players); PostgreSQL likewise
+    # requires the dependents to go first, and these read-only preflight
+    # tests never exercise membership persistence.
+    cur.execute("DROP TABLE IF EXISTS season_roster_membership_events")
+    cur.execute("DROP TABLE IF EXISTS season_roster_memberships")
     cur.execute("DROP INDEX IF EXISTS ux_team_league_season")
     cur.execute("DROP INDEX IF EXISTS ix_reg_league_season_division")
     cur.execute("ALTER TABLE season_team_registrations DROP COLUMN league_season_id")
