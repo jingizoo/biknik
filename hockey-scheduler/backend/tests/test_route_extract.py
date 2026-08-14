@@ -1122,7 +1122,7 @@ class WaiverFingerprintTests(unittest.TestCase):
             route_extract_module._AUDIT_WAIVERS.update(saved)))
 
     def test_every_real_waiver_is_hit_exactly_once(self):
-        """The real server.py, unmodified: each of the 73 declared waivers
+        """The real server.py, unmodified: each of the 75 declared waivers
         (18 from rounds 2-3 -- 2 pre-existing + 2 pre-existing ternaries + 6
         round-2 finding A additions + 8 round-3 finding E additions -- plus
         11 round-4 finding 1 additions, once a Call reached DIRECTLY as the
@@ -1156,17 +1156,25 @@ class WaiverFingerprintTests(unittest.TestCase):
         same way finding 6c's function-wide raise check already was: the
         two `_handle_reassign`/`_handle_reassign_v2` `except BodyError as
         exc:` handlers for `check_body`'s own already-reviewed
-        `_V{1,2}_REASSIGN_SCHEMA[combo]`-keyed validation) is consulted
+        `_V{1,2}_REASSIGN_SCHEMA[combo]`-keyed validation) -- plus 2
+        round-7 finding 1 additions, once a For/AsyncFor loop's own
+        `.iter` is audited as an execution-control sink independent of
+        target binding: `_handle_reassign`/`_handle_reassign_v2`'s own
+        `for target in targets:` loop is the SAME already-reviewed
+        `targets` authorisation-target list (see this dict's round-3/
+        round-5 `targets`-related waiver groups) examined at one more
+        position, its own loop statement -- is consulted
         for precisely the one line it names -- proves the instrumentation
         is wired all the way through _propagates_taint AND the ast.If/
-        ast.IfExp/ast.While/ast.match_case scan, not just one of them.
+        ast.IfExp/ast.While/ast.For/ast.AsyncFor/ast.match_case scan, not
+        just one of them.
         Each key is now a 4-tuple (#202 repair round 4, finding 3:
         function, text, parent shape, enclosing if) rather than the
         original 2-tuple -- WaiverRelocationFingerprintTests below is the
         dedicated proof for what the extra two parts catch that this
         exact-one-hit check alone would not."""
         walker = extract_walker()
-        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 73)
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 75)
         for key in route_extract_module._AUDIT_WAIVERS:
             with self.subTest(waiver=key):
                 self.assertEqual(len(walker.waiver_hits.get(key, ())), 1)
@@ -2281,6 +2289,18 @@ class UnmodelledBindingFormTests(unittest.TestCase):
         for s in substrings:
             self.assertIn(s, msg)
 
+    def _with_waivers(self, waivers: dict):
+        """As ``ExecutionControlAndDataFlowTests._with_waivers``: temporarily
+        ADDS `waivers` on top of the real ``_AUDIT_WAIVERS`` (not a full
+        replacement -- this class's other tests still need the real
+        server.py's own waivers to stay absent so THEIR fixtures raise
+        correctly), restored even if the test body raises."""
+        saved = dict(route_extract_module._AUDIT_WAIVERS)
+        route_extract_module._AUDIT_WAIVERS.update(waivers)
+        self.addCleanup(lambda: (
+            route_extract_module._AUDIT_WAIVERS.clear(),
+            route_extract_module._AUDIT_WAIVERS.update(saved)))
+
     # -- pre-fix escape, reproduced via git stash (not re-run here: git stash
     # cannot be invoked from inside a test process) -- the transcript below is
     # what running each of these fixtures produced against the code as it
@@ -2300,27 +2320,94 @@ class UnmodelledBindingFormTests(unittest.TestCase):
         literal as carrying ``path`` (conservative over-approximation, see
         _binding_value_and_targets' own docstring), so ``candidate`` joins
         ``tracked`` and the later test on it is caught by the completeness
-        scan, unrecognised."""
+        scan, unrecognised.
+
+        #202 repair round 7, finding 1: the loop's OWN ``.iter`` is now
+        ALSO audited directly, as an execution-control sink in its own
+        right (see ``_audit_function``'s new ``ast.For``/``ast.AsyncFor``
+        branch) -- and a bare tuple literal falls to
+        ``_direct_operand_names``'s own default-deny fallback (round 5
+        finding 5) the SAME way it would for an ``ast.If``'s ``.test``, so
+        THIS check now fires FIRST, before the fixed-point loop's
+        SEPARATE conclusion about ``candidate`` is ever reached by the
+        completeness scan below -- naming ``path`` (found directly in
+        ``.iter``), not ``candidate``. A waiver on the iterable position
+        stands in for a real, reviewed shape with no execution-control
+        meaning of its own (see ``ExecutionControlAndDataFlowTests``' own
+        "for/async for iterables" section for the genuinely
+        execution-control-relevant shapes this round's finding is
+        actually about), isolating THIS test's original claim -- a For's
+        TARGET gets taint propagated from its iterable (round 4 finding
+        2) -- from round 7 finding 1's newer, independent check on the
+        SAME position: waiving the newer check does not silently disable
+        the older one, proven directly below rather than merely assumed."""
+        src = _module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                for candidate in (path,):
+                    if candidate == "/api/evade-for":
+                        return self._send(1)
+        ''')
+        self._with_waivers({
+            ("do_GET", "(path,)", "for", ""):
+                "test-only: isolates round 4 finding 2's own target-taint "
+                "claim (this fixture's whole point) from round 7 finding "
+                "1's newer, unrelated execution-control audit of the SAME "
+                "position -- see this test's own docstring",
+        })
+        with self.assertRaises(ExtractionError) as caught:
+            extract_routes(src)
+        msg = str(caught.exception)
+        self.assertIn("candidate", msg)
+        self.assertIn("unrecognised shape", msg)
+
+    def test_for_loop_iterable_itself_raises_before_any_waiver(self):
+        """The UNWAIVED counterpart of the test above: without a waiver on
+        the iterable position, round 7 finding 1's new check is what
+        actually raises for this exact fixture -- naming the ITERABLE
+        (``path``, found directly in ``(path,)``), never reaching
+        ``candidate`` at all. Pins the CURRENT, earlier-firing message so
+        a regression that silently stopped auditing ``.iter`` here would
+        show up as a message change, not just a vanished raise."""
         self._raises('''
             def do_GET(self):
                 path = self.path.split("?", 1)[0]
                 for candidate in (path,):
                     if candidate == "/api/evade-for":
                         return self._send(1)
-        ''', "candidate", "unrecognised shape")
+        ''', "path", "unrecognised shape", "(path,)")
 
     def test_for_loop_tuple_target_raises(self):
         """Tuple-unpacking FOR target (`for candidate, extra in (...)`) --
         the SAME generalised ``ast.walk(target)`` leaf-collection an
         ordinary ``a, b = ...`` assignment already gets, reused for a For
-        target with no separate unpacking rule."""
-        self._raises('''
+        target with no separate unpacking rule.
+
+        #202 repair round 7, finding 1: as ``test_for_loop_target_raises``
+        above, a waiver on the iterable position isolates this test's
+        original target-taint claim from the newer, independent
+        execution-control check that would otherwise fire first (see that
+        test's own docstring for the full reasoning)."""
+        src = _module('''
             def do_GET(self):
                 path = self.path.split("?", 1)[0]
                 for candidate, extra in ((path, 1),):
                     if candidate == "/api/evade-for-tuple":
                         return self._send(1)
-        ''', "candidate", "unrecognised shape")
+        ''')
+        self._with_waivers({
+            ("do_GET", "((path, 1),)", "for", ""):
+                "test-only: isolates round 4 finding 2's own target-taint "
+                "claim (this fixture's whole point) from round 7 finding "
+                "1's newer, unrelated execution-control audit of the SAME "
+                "position -- see test_for_loop_target_raises' own "
+                "docstring",
+        })
+        with self.assertRaises(ExtractionError) as caught:
+            extract_routes(src)
+        msg = str(caught.exception)
+        self.assertIn("candidate", msg)
+        self.assertIn("unrecognised shape", msg)
 
     def test_comprehension_target_raises(self):
         """A list-comprehension's own `for` clause is an ``ast.comprehension``
@@ -2658,7 +2745,7 @@ class WaiverTaintPropagationTests(unittest.TestCase):
         walker = extract_walker()
         self.assertEqual(len(walker.routes), 239)
         self.assertEqual(walker.unreachable, [])
-        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 73)
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 75)
 
 
 # --------------------------------------------------------------------------- #
@@ -2876,7 +2963,7 @@ class SubscriptCalleeAndReturnDispatchTests(unittest.TestCase):
         walker = extract_walker()
         self.assertEqual(len(walker.routes), 239)
         self.assertEqual(walker.unreachable, [])
-        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 73)
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 75)
 
 
 # --------------------------------------------------------------------------- #
@@ -3032,7 +3119,7 @@ class DefaultDenyExpressionOperandTests(unittest.TestCase):
         walker = extract_walker()
         self.assertEqual(len(walker.routes), 239)
         self.assertEqual(walker.unreachable, [])
-        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 73)
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 75)
 
 
 # --------------------------------------------------------------------------- #
@@ -3274,7 +3361,7 @@ class ExceptionDrivenRoutingTests(unittest.TestCase):
         walker = extract_walker()
         self.assertEqual(len(walker.routes), 239)
         self.assertEqual(walker.unreachable, [])
-        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 73)
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 75)
 
 
 # --------------------------------------------------------------------------- #
@@ -3581,7 +3668,7 @@ class CompositionalTaintTests(unittest.TestCase):
         walker = extract_walker()
         self.assertEqual(len(walker.routes), 239)
         self.assertEqual(walker.unreachable, [])
-        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 73)
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 75)
 
 
 # --------------------------------------------------------------------------- #
@@ -4139,17 +4226,376 @@ class ExecutionControlAndDataFlowTests(unittest.TestCase):
         """The real server.py has no local closure that reads a tracked
         free variable, no ``with``/``async with`` statement at all, and
         no captured id used to select-then-immediately-invoke a callable
-        -- the ONLY real new sites this finding reaches are the two
+        -- the ONLY real new sites round 6 finding 2 reaches are the two
         `_handle_reassign`/`_handle_reassign_v2` `except BodyError as
         exc:` handlers (their own enclosing try body's `check_body(b,
         **_V{1,2}_REASSIGN_SCHEMA[combo])` is a tracked operation, round 3
-        finding E's own pre-existing waiver) -- must still extract
-        cleanly: 239 routes, 73 waivers (see WaiverFingerprintTests' own
-        pinned count and docstring for the exact accounting)."""
+        finding E's own pre-existing waiver); round 7 finding 1's own new
+        For/AsyncFor execution-control audit (see
+        ``LoopIterableAndReceiverChainDispatchTests`` below for that
+        mechanism's own isolated proof) reaches exactly the SAME two
+        functions' `for target in targets:` loop, both already reviewed
+        (this dict's own round-7 finding 1 waiver group) -- must still
+        extract cleanly: 239 routes, 75 waivers (see
+        WaiverFingerprintTests' own pinned count and docstring for the
+        exact accounting)."""
         walker = extract_walker()
         self.assertEqual(len(walker.routes), 239)
         self.assertEqual(walker.unreachable, [])
-        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 73)
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 75)
+
+
+# --------------------------------------------------------------------------- #
+# #202 repair round 7, finding 1 (external review): loop execution control    #
+# and captured dispatch selection both remained fail-open, TWO independent    #
+# gaps closed together since the review reported them together:               #
+#                                                                              #
+# RULE 1 -- a For/AsyncFor's OWN ``.iter`` was consulted ONLY to decide        #
+# whether the loop's TARGET becomes tainted (round 4 finding 2's own fixed-    #
+# point mechanism); nothing consumed a true taint result there as a           #
+# path-dependent condition on whether the BODY executes at all. Closed by a   #
+# new, independent ``ast.For``/``ast.AsyncFor`` branch in                     #
+# ``_DispatchWalker._audit_function`` (route_extract.py) that runs ``.iter``  #
+# through ``_direct_operand_names`` -- the SAME name-resolving walk           #
+# If/While/Assert/match-case already use, INCLUDING its own default-deny      #
+# fallback (round 5 finding 5) for a shape (here, ``ast.BinOp``) none of its   #
+# explicit branches special-case -- exactly the way ``ast.While``'s own       #
+# ``.test`` is already audited, just for a different statement type.          #
+#                                                                              #
+# RULE 2 -- ``_is_callee`` (route_extract.py) checked only a node's IMMEDIATE  #
+# parent, so a dispatch-selecting Call reached through a RECEIVER CHAIN       #
+# (``handlers.get(action, default_handler).serve(self)`` -- the inner Call's  #
+# own parent is the ``.serve`` Attribute, never a Call directly) answered     #
+# False, letting the round 5 finding 2b ``captured``-only exemption accept it #
+# as harmless. Closed by walking UP through every enclosing                   #
+# Attribute/Subscript layer where the node reached so far is that layer's     #
+# OWN receiver (``.value``), before asking whether the result is a Call's     #
+# callee -- mirrors the SAME receiver-chain unwrapping ``_is_self_call``/     #
+# ``_direct_operand_names``'s own ``root_name`` already do, just walking the  #
+# opposite direction (up toward an eventual callee, not down toward a root).  #
+#                                                                              #
+# Reproduced via git stash (not re-run here: git stash cannot be invoked      #
+# from inside a test process; ``git stash push -- ...route_extract.py`` then  #
+# ``git stash pop``, isolating JUST the production fix from this file's own   #
+# new tests) against the code as it stood immediately before this finding's   #
+# fix, captured verbatim:                                                     #
+#                                                                              #
+#   repro1-tuple-repeat-count-loop-gate: NO RAISE. routes = []. live: 200/404 #
+#   repro2-attribute-wrapped-selector:   NO RAISE. routes = [('GET',          #
+#     '/api/{}')] (a single wildcard, never flagged). live: 200/404           #
+#   repro2b-subscript-hop-variant:       NO RAISE. routes = [('GET',          #
+#     '/api/{}')]. live: 200/404                                              #
+#                                                                              #
+# every LoopIterableAndReceiverChainDispatchTests test asserting a raise      #
+# FAILED against that pre-fix code (``test_tuple_repeat_count_loop_gate_      #
+# raises``, ``test_async_variant_of_the_loop_gate_raises_on_its_own_once_     #
+# the_closure_escape_is_waived``, ``test_attribute_wrapped_selector_          #
+# raises``, ``test_a_deeper_subscript_mediated_receiver_chain_also_           #
+# raises`` -- each a genuine "ExtractionError not raised" AssertionError, not #
+# a vacuous pass) -- the live-HTTP and negative-control tests in this same    #
+# class do NOT (by design: the live tests assert nothing about               #
+# ``extract_routes`` at all, and the negative controls must pass either way,  #
+# proving THEMSELVES only, not this finding's fix) -- each now raises (or,    #
+# for the negative controls, still correctly does not) against the FIXED     #
+# code, asserted below, which a test process can still verify for itself on   #
+# every run.                                                                  #
+# --------------------------------------------------------------------------- #
+class _ServeHandler:
+    """A tiny stand-in dispatch target for the receiver-chain tests below --
+    exposes exactly the ``.serve(request_handler)`` shape the reviewer's own
+    repro invokes through an Attribute hop, and (``__call__``) the bare
+    ``(request_handler)`` shape a Subscript-mediated variant invokes
+    directly, so ONE fixture class serves both."""
+
+    def __init__(self, action):
+        self._action = action
+
+    def serve(self, request_handler):
+        self._action(request_handler)
+
+    __call__ = serve
+
+
+class LoopIterableAndReceiverChainDispatchTests(unittest.TestCase):
+    def _raises(self, body, *substrings):
+        with self.assertRaises(ExtractionError) as caught:
+            extract_routes(_module(body))
+        msg = str(caught.exception)
+        for s in substrings:
+            self.assertIn(s, msg)
+
+    def _with_waivers(self, waivers: dict):
+        """As ``ExecutionControlAndDataFlowTests._with_waivers``: temporarily
+        ADDS `waivers` on top of the real ``_AUDIT_WAIVERS``, restored even
+        if the test body raises."""
+        saved = dict(route_extract_module._AUDIT_WAIVERS)
+        route_extract_module._AUDIT_WAIVERS.update(waivers)
+        self.addCleanup(lambda: (
+            route_extract_module._AUDIT_WAIVERS.clear(),
+            route_extract_module._AUDIT_WAIVERS.update(saved)))
+
+    # -- rule 1: a For/AsyncFor's OWN .iter as an execution-control sink ----
+
+    def test_tuple_repeat_count_loop_gate_raises(self):
+        """The reviewer's own first repro, verbatim: a path-derived boolean
+        used as a tuple REPEAT COUNT -- ``(1,) * (path == "/api/hidden")``
+        -- so the loop body runs zero or one times depending on ``path``,
+        with NO Subscript anywhere (unlike round 6's own
+        ``ROUTES[path]``-shaped coverage, see
+        ``ExecutionControlAndDataFlowTests``' own "for/async for iterables"
+        section above) to incidentally catch it. ``_direct_operand_names``
+        has no explicit branch for ``ast.BinOp``, so this reaches its own
+        default-deny fallback (round 5 finding 5) -- the SAME "an
+        unrecognised shape mentioning a tracked name is reviewed, never
+        silently trusted" rule as everywhere else in this module, just
+        reached from ``.iter`` instead of ``.test``."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path
+                for _ in (1,) * (path == "/api/hidden"):
+                    return self._send(1)
+                return self._send_json({"error": "not_found"}, 404)
+        ''', "path", "unrecognised shape", "loop's iterable")
+
+    def test_tuple_repeat_count_loop_gate_escape_answers_over_real_http(self):
+        """The SAME source text as the static test above -- a real
+        localhost Handler answers 200 for the hidden path and 404 for
+        every other one, exactly the divergence ``extract_routes`` must
+        not stay silent about."""
+        status, text = _real_http_probe('''
+            def do_GET(self):
+                path = self.path
+                for _ in (1,) * (path == "/api/hidden"):
+                    return self._send(1)
+                return self._send_json({"error": "not_found"}, 404)
+        ''', "GET", "/api/hidden")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"n": 1})
+        status2, text2 = _real_http_probe('''
+            def do_GET(self):
+                path = self.path
+                for _ in (1,) * (path == "/api/hidden"):
+                    return self._send(1)
+                return self._send_json({"error": "not_found"}, 404)
+        ''', "GET", "/api/other")
+        self.assertEqual(status2, 404)
+        self.assertEqual(json.loads(text2), {"error": "not_found"})
+
+    def test_async_variant_of_the_loop_gate_still_raises(self):
+        """``async for`` gets the SAME audit as ``for`` (one shared
+        ``isinstance(node, (ast.For, ast.AsyncFor))`` branch) -- exercised
+        via a nested ``async def``, static-only, for the same reason
+        ``test_async_for_over_a_tracked_subscript_raises`` above is
+        (``do_GET`` itself must stay a plain, synchronous handler method).
+        In THIS arrangement round 6 finding 2's own closure audit
+        (``helper`` reads ``path`` as a free variable) catches it FIRST --
+        a fine outcome (the escape closes either way, see
+        ``test_async_with_context_expression_touching_path_raises``' own
+        docstring for the identical situation) -- so the message below
+        names ``helper()``, not the tuple-repeat expression directly; the
+        async-for check's OWN, independent message is proven in isolation,
+        with the closure escape waived out of the way, by the next test."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path
+                async def helper():
+                    async for _ in (1,) * (path == "/api/hidden"):
+                        return True
+                    return False
+                if helper():
+                    return self._send(1)
+        ''', "unrecognised shape", "helper()")
+
+    def test_async_variant_of_the_loop_gate_raises_on_its_own_once_the_closure_escape_is_waived(self):
+        """As the test above, but with round 6 finding 2's OWN closure
+        escape (``helper()`` itself) explicitly waived -- isolating THIS
+        round's ``ast.AsyncFor`` branch, proving it independently
+        recognises the SAME tuple-repeat-count shape
+        ``test_tuple_repeat_count_loop_gate_raises`` proves for plain
+        ``ast.For``, not merely inferred from the shared ``isinstance``
+        check."""
+        src = _module('''
+            def do_GET(self):
+                path = self.path
+                async def helper():
+                    async for _ in (1,) * (path == "/api/hidden"):
+                        return True
+                    return False
+                if helper():
+                    return self._send(1)
+        ''')
+        self._with_waivers({
+            ("do_GET", "helper()", "if_test", ""):
+                "test-only: isolates round 7 finding 1's OWN ast.AsyncFor "
+                "branch from round 6 finding 2's closure audit, which "
+                "would otherwise catch this fixture first -- see the "
+                "test above",
+        })
+        with self.assertRaises(ExtractionError) as caught:
+            extract_routes(src)
+        msg = str(caught.exception)
+        self.assertIn("async for", msg)
+        self.assertIn("unrecognised shape", msg)
+        self.assertIn("path", msg)
+
+    def test_a_boolean_derived_repeat_count_unrelated_to_path_is_unaffected(self):
+        """A control precisely targeting THIS round's own repro shape: a
+        tuple-repeat-count loop whose boolean is NOT derived from ``path``
+        at all must not raise, and must not manufacture a route either."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                for _ in (1,) * bool(some_unrelated_flag):
+                    pass
+                if path == "/api/real":
+                    return self._send(2)
+        '''))}
+        self.assertEqual(found, {("GET", "/api/real")})
+
+    def test_an_unrelated_for_loop_iterable_remains_unaffected(self):
+        """A control for the general rule (not just this round's own repro
+        shape): an ordinary for-loop over a fixed, untracked iterable is
+        untouched by this finding. ``ExecutionControlAndDataFlowTests``'
+        own "for/async for iterables" section above
+        (``test_a_for_loop_over_something_unrelated_is_unaffected``)
+        already covers the identical fixture; repeated here anyway so this
+        round's own section proves its negative control self-contained,
+        without depending on a DIFFERENT class staying unchanged."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                for item in FIXED_LIST:
+                    if item == "whatever":
+                        return self._send(1)
+                if path == "/api/real":
+                    return self._send(2)
+        '''))}
+        self.assertEqual(found, {("GET", "/api/real")})
+
+    # -- rule 2: a receiver chain between a dispatch-selecting Call and -----
+    # -- its enclosing invocation --------------------------------------
+
+    def test_attribute_wrapped_selector_raises(self):
+        """The reviewer's own second repro, verbatim: a regex-captured
+        ``action`` selects ``handlers.get(action, default_handler).serve(
+        self)`` -- ONE Attribute hop (``.serve``) between the dispatch-
+        selecting ``handlers.get(...)`` Call and the Call that actually
+        invokes it. The OLD, single-hop ``_is_callee`` looked only at
+        ``handlers.get(...)``'s OWN immediate parent (the ``.serve``
+        Attribute, never a Call directly) and answered False, so the
+        ``captured``-only exemption (round 5 finding 2b) accepted this as
+        harmless -- it is not: ``.serve(self)`` invokes exactly what the
+        lookup returns."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return handlers.get(action, default_handler).serve(self)
+        ''', "unlisted call", "handlers.get(action, default_handler)")
+
+    def test_attribute_wrapped_selector_escape_answers_over_real_http(self):
+        """The SAME source text as the static test above, driven over a
+        real socket -- 200 for the hidden action, 404 for every other
+        one, via the ``.serve(self)`` receiver-chain shape
+        ``_is_callee``'s single-hop version could not see."""
+        body = '''
+            def do_GET(self):
+                path = self.path
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return handlers.get(action, default_handler).serve(self)
+        '''
+        extra_globals = {
+            "re": re,
+            "handlers": {"hidden": _ServeHandler(lambda h: h._send(1))},
+            "default_handler": _ServeHandler(
+                lambda h: h._send_json({"error": "not_found"}, 404)),
+        }
+        status, text = _real_http_probe_with_globals(
+            body, extra_globals, "GET", "/api/hidden")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"n": 1})
+        status2, text2 = _real_http_probe_with_globals(
+            body, extra_globals, "GET", "/api/other")
+        self.assertEqual(status2, 404)
+        self.assertEqual(json.loads(text2), {"error": "not_found"})
+
+    def test_a_deeper_subscript_mediated_receiver_chain_also_raises(self):
+        """A receiver-chain variant reached through a Subscript hop
+        instead of an Attribute one -- ``REGISTRY.get(action, DEFAULT)[0]
+        (self)`` -- proving ``_is_callee``'s climb recognises
+        ``isinstance(parent, (ast.Attribute, ast.Subscript))`` generally,
+        not merely the ONE Attribute shape the reviewer's own repro
+        happened to use."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return REGISTRY.get(action, DEFAULT)[0](self)
+        ''', "unlisted call", "REGISTRY.get(action, DEFAULT)")
+
+    def test_a_deeper_subscript_mediated_receiver_chain_escape_answers_over_real_http(self):
+        """As ``test_attribute_wrapped_selector_escape_answers_over_real_
+        http`` above, for the Subscript-hop variant."""
+        body = '''
+            def do_GET(self):
+                path = self.path
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return REGISTRY.get(action, DEFAULT)[0](self)
+        '''
+        extra_globals = {
+            "re": re,
+            "REGISTRY": {"hidden": (_ServeHandler(lambda h: h._send(1)), "meta")},
+            "DEFAULT": (_ServeHandler(
+                lambda h: h._send_json({"error": "not_found"}, 404)), "meta"),
+        }
+        status, text = _real_http_probe_with_globals(
+            body, extra_globals, "GET", "/api/hidden")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"n": 1})
+        status2, text2 = _real_http_probe_with_globals(
+            body, extra_globals, "GET", "/api/other")
+        self.assertEqual(status2, 404)
+        self.assertEqual(json.loads(text2), {"error": "not_found"})
+
+    def test_a_fixed_service_receiver_chain_not_derived_from_path_is_unaffected(self):
+        """A control proving the receiver-chain climb is precise, not a
+        blanket "any ``.method()`` call now raises": a chain selected by a
+        FIXED, untracked key stays exempt exactly as an ordinary reviewed
+        service call already is -- the real server.py's own zero new
+        raises (below) is the SAME claim proven at scale."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if path == "/api/real":
+                    return SERVICES.get("fixed_action", default_handler).serve(self)
+                return self._send(2)
+        '''))}
+        self.assertEqual(found, {("GET", "/api/real")})
+
+    def test_the_real_server_extracts_with_no_new_raises(self):
+        """The real server.py has no For/AsyncFor whose ``.iter`` mentions
+        a tracked name in an unrecognised shape (its own six real For
+        loops each name a fixed module constant/parameter, or -- the two
+        ``_handle_reassign``/``_handle_reassign_v2`` ``for target in
+        targets:`` loops -- an already-reviewed, waived authorisation-
+        target list; see this module's own ``_AUDIT_WAIVERS`` comment for
+        that pair), and no dispatch selector reached through a receiver
+        chain this round's ``_is_callee`` climb newly exposes -- must
+        still extract cleanly: 239 routes, 75 waivers (see
+        WaiverFingerprintTests' own pinned count and docstring for the
+        exact accounting)."""
+        walker = extract_walker()
+        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(walker.unreachable, [])
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 75)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -2053,6 +2053,60 @@ class _DispatchWalker:
                         f"{fn.name}:{node.lineno} a while loop tests "
                         f"dispatch subject(s) {sorted(hit)} in an "
                         f"unrecognised shape: {ast.unparse(node.test)}")
+            if isinstance(node, (ast.For, ast.AsyncFor)):
+                # #202 repair round 7, finding 1: a for/async-for loop's OWN
+                # `.iter` can decide whether its body executes AT ALL -- zero
+                # iterations vs one or more -- exactly the same "does this
+                # gate a branch" question `ast.If`/`ast.While`'s own `.test`
+                # already answers for, just spelled as a loop instead of a
+                # conditional. `_binding_value_and_targets` (see its own
+                # docstring) already threads `.iter` through the fixed-point
+                # taint loop ABOVE this scan -- but ONLY to decide whether
+                # the loop's TARGET becomes tainted, a genuinely SEPARATE
+                # question from "is EXECUTION of the body gated on a tracked
+                # name", which nothing anywhere in this module asked before
+                # now: a target that is never read again (a throwaway `_`)
+                # leaves that taint-propagation use with nothing to trip any
+                # LATER check, even though the loop's own presence/absence
+                # of iterations already decided the response.
+                # DEMONSTRATED (the reviewer's own repro): `for _ in (1,) *
+                # (path == "/api/hidden"): return 200` -- a path-derived
+                # boolean used as a tuple REPEAT COUNT, so the loop body
+                # runs zero or one times depending on `path` -- answered
+                # live HTTP 200 for the hidden path and 404 for every other
+                # one, while `extract_routes` recorded ZERO routes and
+                # raised nothing. Reuses `_direct_operand_names` -- the SAME
+                # name-resolving walk the If/While/Assert/match-case cases
+                # above already use, including its own default-deny fallback
+                # (round 5 finding 5) for a node shape (here, an
+                # `ast.BinOp`) none of its explicit branches special-case --
+                # over `.iter` in place of `.test`, so a comparison, a
+                # boolop, a helper-predicate call, or any other shape those
+                # checks already recognise is recognised here identically.
+                # Same shape as the ast.While case above, just a different
+                # statement type (covering AsyncFor for the identical
+                # reason no other check in this module special-cases sync
+                # vs async); goes through the SAME waivers (none needed
+                # today -- server.py's own six real For loops either name a
+                # fixed module constant/parameter never derived from a
+                # tracked name, or -- see `_audit_dispatch_helper_calls` and
+                # this function's own fixed-point loop above -- iterate a
+                # local this module already tracks through the ordinary
+                # taint mechanism with no ADDITIONAL execution-control
+                # meaning of its own).
+                names = _direct_operand_names(node.iter, tracked)
+                hit = names & tracked
+                key = _waiver_key(fn.name, node.iter, parents)
+                if hit and key in _AUDIT_WAIVERS:
+                    self._record_waiver_hit(key, node)
+                    continue
+                if hit:
+                    kind = ("an async for" if isinstance(node, ast.AsyncFor)
+                            else "a for")
+                    raise ExtractionError(
+                        f"{fn.name}:{node.lineno} {kind} loop's iterable "
+                        f"tests dispatch subject(s) {sorted(hit)} in an "
+                        f"unrecognised shape: {ast.unparse(node.iter)}")
             if isinstance(node, ast.Assert):
                 # #202 repair round 5, finding 6a: an ``assert`` is a
                 # CONTROL-TRANSFER expression exactly like an ``ast.If``'s
@@ -3028,6 +3082,40 @@ _AUDIT_WAIVERS = {
      ""):
         "the v1 sibling of _handle_reassign_v2's own identical-shape "
         "waiver immediately above; see that entry",
+    # -- #202 repair round 7, finding 1 -- newly examined now that a
+    # For/AsyncFor loop's OWN `.iter` is audited as an execution-control
+    # sink in its own right (see _audit_function's own new comment block),
+    # independent of whether the loop's TARGET ends up tracked. Both
+    # `_handle_reassign`/`_handle_reassign_v2`'s `for target in targets:`
+    # loop already has EVERY other position touching `targets` reviewed
+    # and waived above (the `targets.append(...)` builds, the
+    # `_refuse_unchosen_context(targets, ...)`/`_guarded_mutation(targets,
+    # ...)` calls, and the loop BODY's own `_reject_target_outside_scope`
+    # call) -- this is the SAME `targets` list, examined at its one
+    # remaining position, the loop statement's own `.iter`. Genuinely
+    # NOT the shape this round's finding demonstrates: `targets` is not a
+    # boolean-derived REPEAT COUNT standing in for a hidden if/else (the
+    # reviewer's own `(1,) * (path == "/api/hidden")` repro) -- it is an
+    # ordinary, ALWAYS-at-least-one-element list of (kind, id[, scope
+    # label]) authorisation targets (`targets = [(entity, record_id)]`,
+    # optionally lengthened by the already-reviewed `dest`/`parent`
+    # appends above), and the loop merely runs an identical, already-
+    # audited per-target scope check over each one in turn. The route was
+    # fully decided upstream by `combo in _V{1,2}_REASSIGN_SCHEMA`
+    # (round 3, finding E's own waivers); nothing about WHICH response
+    # this handler sends depends on `targets` having one, two or three
+    # elements -- only on which authorisation checks run, each already
+    # independently reviewed.
+    ("_handle_reassign_v2", "targets", "for", ""):
+        "the for-loop's own `.iter` position for the SAME `targets` "
+        "authorisation-target list every other position already waives "
+        "in this dict (see the comment block immediately above) -- an "
+        "ordinary bounded per-target authorisation loop, not a "
+        "path-dependent iteration-count gate",
+    ("_handle_reassign", "targets", "for", ""):
+        "the v1 sibling of _handle_reassign_v2's own identical-shape "
+        "waiver immediately above; see that entry and the comment block "
+        "above it",
     ("do_POST", "not authorize(role, path)", "if_test", ""):
         "do_POST's own generic per-request authorisation gate (#24/#50), "
         "the SAME blanket check `required_permission(path)`/"
@@ -3491,11 +3579,44 @@ def _is_callee(node: ast.AST, parents: Optional[dict]) -> bool:
     examined by the Call/Subscript-shaped checks this gates at all), so
     this only narrows the exemption for the shape it was never meant to
     cover in the first place.
+
+    #202 repair round 7, finding 1: walks UP through every ``ast.Attribute``/
+    ``ast.Subscript`` layer where the node reached SO FAR is the RECEIVER
+    (``.value``) of that layer -- not only ``node``'s own IMMEDIATE parent
+    -- before asking "is this the callee of an enclosing Call". The
+    original, single-hop version missed a call reached through a RECEIVER
+    CHAIN: ``handlers.get(action, default_handler).serve(self)`` -- the
+    dispatch-selecting ``handlers.get(action, default_handler)`` Call's own
+    immediate parent is the ``.serve`` ``ast.Attribute``, never a Call
+    directly, so the one-hop test answered False for it even though
+    ``.serve(self)`` invokes exactly what that Call returns. DEMONSTRATED:
+    a regex-captured ``action`` selecting a handler this exact way
+    extracted as a single ``/api/{}`` wildcard while a real live handler
+    answered 200 for one concrete value and 404 for another -- the
+    ``captured`` exemption above accepted it because THIS check, looking
+    only one hop up, never saw the enclosing ``.serve(self)`` invocation at
+    all. Climbing through Attribute/Subscript layers (never through a
+    Call -- a call's RESULT being later used as someone else's receiver is
+    a completely different, already-handled question, not another hop to
+    climb) mirrors the SAME receiver-chain unwrapping ``_is_self_call`` and
+    ``_direct_operand_names``'s own ``root_name`` already do, just walking
+    the opposite direction (up from a node toward its eventual callee,
+    rather than down from a callee toward its root).
     """
     if parents is None:
         return False
-    parent = parents.get(id(node))
-    return isinstance(parent, ast.Call) and parent.func is node
+    current = node
+    while True:
+        parent = parents.get(id(current))
+        if parent is None:
+            return False
+        if isinstance(parent, ast.Call) and parent.func is current:
+            return True
+        if (isinstance(parent, (ast.Attribute, ast.Subscript))
+                and parent.value is current):
+            current = parent
+            continue
+        return False
 
 
 def _is_self_call(node: ast.Call) -> bool:
