@@ -1316,3 +1316,122 @@ def assert_no_duplicate_rink_external_refs(conn):
             f"{len(duplicates)} rink_code value(s) already back more than "
             f"one Rink: {shown}{more}. Merge or retag the duplicate Rink(s) "
             "before upgrading.")
+
+
+# --------------------------------------------------------------------------- #
+# 052 season roster membership (#205 Slice A): deterministic backfill of      #
+# active Players into SeasonRosterMembership rows on the Team + LeagueSeason  #
+# spine. Every shape of source data the backfill cannot translate             #
+# deterministically is REPORTED here (row-level, bounded) and aborts the      #
+# upgrade — never guessed through, never silently skipped.                    #
+# --------------------------------------------------------------------------- #
+def find_active_players_with_missing_team(conn):
+    """Active Players whose ``team_id`` resolves to no Team row.
+
+    Migration 052's backfill derives a membership from the player's Team's
+    active Season registrations, so a dangling ``team_id`` has NO deterministic
+    target. Skipping such a player silently would strand them with no
+    membership at the consumer cutover — a silent eligibility loss — so the
+    row is reported instead. Inactive players are not backfilled and so are
+    not reported."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT p.id AS player_id, p.team_id AS team_id FROM players p "
+        "LEFT JOIN teams t ON t.id = p.team_id "
+        "WHERE p.is_active = 1 AND t.id IS NULL")
+    return sorted((row["player_id"], row["team_id"]) for row in cur.fetchall())
+
+
+def find_teams_with_duplicate_active_season_registrations(conn):
+    """Teams holding MORE THAN ONE active registration that resolves to the
+    same non-archived Season.
+
+    The spine guarantees at most one (a Team has one permanent League, and a
+    League has at most one LeagueSeason per Season), so a duplicate can only
+    be legacy/corrupted data predating full enforcement. Backfilling through
+    one would mint two ``active`` memberships per (player, Season) — exactly
+    what migration 052's partial unique index forbids — so which registration
+    the players' Season participation "means" is ambiguous and must be
+    resolved by an operator, not guessed. Archived Seasons are exempt: the
+    backfill never writes into them."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT r.team_id AS team_id, ls.season_id AS season_id "
+        "FROM season_team_registrations r "
+        "JOIN league_seasons ls ON ls.id = r.league_season_id "
+        "JOIN seasons s ON s.id = ls.season_id AND s.status = 'active' "
+        "WHERE r.active = 1 "
+        "GROUP BY r.team_id, ls.season_id HAVING COUNT(*) > 1")
+    return sorted((row["team_id"], row["season_id"]) for row in cur.fetchall())
+
+
+def find_backfill_candidate_jersey_duplicates(conn):
+    """Active (team, jersey) duplicates among the players migration 052 will
+    actually backfill — teams with an active registration in a non-archived
+    Season.
+
+    Migration 038's partial unique index makes this state impossible on a
+    correctly-migrated database, but 052 inserts into a NEW
+    (league_season, team, jersey) unique scope and must never trust another
+    migration's constraint as its own preflight (#201 discipline: report the
+    offending rows, don't surface an opaque driver error). Deliberately
+    scoped to backfill candidates only, so an upgrade is never blocked by a
+    duplicate on a team the backfill would not touch."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT p.team_id AS team_id, p.jersey_number AS jersey_number "
+        "FROM players p "
+        "WHERE p.is_active = 1 AND p.jersey_number IS NOT NULL "
+        "AND EXISTS (SELECT 1 FROM season_team_registrations r "
+        "            JOIN league_seasons ls ON ls.id = r.league_season_id "
+        "            JOIN seasons s ON s.id = ls.season_id "
+        "            WHERE r.team_id = p.team_id AND r.active = 1 "
+        "            AND s.status = 'active') "
+        "GROUP BY p.team_id, p.jersey_number HAVING COUNT(*) > 1")
+    return sorted((row["team_id"], row["jersey_number"])
+                  for row in cur.fetchall())
+
+
+def assert_season_roster_membership_backfill_ready(conn):
+    """Abort migration 052 (#205 Slice A) unless the membership backfill is
+    fully deterministic for every row it would derive.
+
+    Read-only: raises :class:`MigrationDataError` with bounded row-level
+    diagnostics and leaves all data unchanged, so re-running the upgrade after
+    the operator resolves each named row applies cleanly (same idempotent
+    re-run contract as migrations 029/035)."""
+    dangling = find_active_players_with_missing_team(conn)
+    dup_regs = find_teams_with_duplicate_active_season_registrations(conn)
+    dup_jerseys = find_backfill_candidate_jersey_duplicates(conn)
+    if not dangling and not dup_regs and not dup_jerseys:
+        return
+
+    problems = []
+    if dangling:
+        shown = ", ".join(
+            f"player {p} (team_id={t!r})" for p, t in dangling[:20])
+        more = "" if len(dangling) <= 20 else f" (+{len(dangling) - 20} more)"
+        problems.append(
+            f"{len(dangling)} active player(s) reference a Team that does "
+            f"not exist, so no membership target can be derived: {shown}{more}")
+    if dup_regs:
+        shown = ", ".join(
+            f"team {t} in season {s}" for t, s in dup_regs[:20])
+        more = "" if len(dup_regs) <= 20 else f" (+{len(dup_regs) - 20} more)"
+        problems.append(
+            f"{len(dup_regs)} team(s) hold more than one active registration "
+            f"resolving to the same Season, so a single membership per "
+            f"(player, Season) cannot be chosen: {shown}{more}")
+    if dup_jerseys:
+        shown = ", ".join(
+            f"team {t}/#{j}" for t, j in dup_jerseys[:20])
+        more = ("" if len(dup_jerseys) <= 20
+                else f" (+{len(dup_jerseys) - 20} more)")
+        problems.append(
+            f"{len(dup_jerseys)} active (team, jersey) pair(s) among backfill "
+            f"candidates are duplicated: {shown}{more}")
+    raise MigrationDataError(
+        "Cannot backfill Season roster memberships (#205 Slice A): "
+        + "; ".join(problems)
+        + ". Fix or deactivate the named rows before upgrading — the backfill "
+          "reports ambiguity rather than guessing.")
