@@ -192,26 +192,43 @@ exactly how far it goes):
 
 On the soundness of this gate, honestly stated
 ------------------------------------------------
-This module has been adversarially reviewed across SIX rounds: the
+This module has been adversarially reviewed across NINE rounds: the
 original repository-owner review (6 findings, all closed by the #202
 repair), a first self-directed adversarial hunt (findings A-D, round 2), a
 second (findings E-H, round 3 -- E/F/G closed by this section's own
 revision, H documented directly above), a THIRD external repository-owner
 review (round 4: 5 findings -- a helper-call/match-case call escape, more
 unmodelled binding forms, waiver-relocation, gated-but-unenforced
-classification, and three mislabelled auth routes -- all closed), and a
+classification, and three mislabelled auth routes -- all closed), a
 FOURTH (round 5: 6 findings across two further external review passes at
 the SAME exact head -- a taint-erasing waiver architecture flaw, a
 Subscript-callee/Return-statement gap, test-coverage-only, a stale
 docstring, an unrecognised-expression-operand gap, and the exception-
 driven routing this very section documents -- all closed or, for finding
 6c specifically, honestly bounded rather than claimed complete, directly
-above). Each round's own pattern repeats: fix what was found, and a FRESH
-hunt finds more. That is not a sign any individual round was careless --
-it is the expected, unavoidable shape of a bespoke static analyzer over a
-general-purpose language: the class of Python constructs that could
-conceivably encode a routing decision is not finite, and this module
-recognises a specific, growing-but-always-partial list of them.
+above), a FIFTH (round 6: 4 findings -- non-compositional expression
+taint, a still-fail-open execution-control inventory, a worker-poisoning
+test contract, and incomplete documentation -- all closed), a SIXTH
+(round 7: 3 findings -- loop execution control and receiver-chain
+dispatch selection both fail-open, continued production-database fixture
+leakage, and a silently-swallowed restore-side failure -- all closed), a
+SEVENTH (round 8: 1 finding -- ``_is_callee``'s curated upward climb
+missed a Tuple/List/IfExp wrapper between a captured selector and its
+eventual invocation -- closed by replacing the curated climb with a
+generic downward scan), and an EIGHTH (round 9: 1 finding -- the SAME
+``captured``-only exemption escaped a THIRD way, an arbitrary higher-
+order call invoking a captured selector handed to it as a plain
+argument, e.g. ``invoke(handlers.get(action, default_handler), self)``
+-- closed not by teaching ``_is_callee`` a fourth shape but by inverting
+the exemption's own default: a captured value handed to a call is inert
+only when the call target is on a small, explicit, reviewed allowlist,
+see :func:`_captured_arg_safe_callee`). Each round's own pattern
+repeats: fix what was found, and a FRESH hunt finds more. That is not a
+sign any individual round was careless -- it is the expected, unavoidable
+shape of a bespoke static analyzer over a general-purpose language: the
+class of Python constructs that could conceivably encode a routing
+decision is not finite, and this module recognises a specific,
+growing-but-always-partial list of them.
 
 So, stated plainly, NOT as an oversight but as a considered engineering
 trade-off:
@@ -220,9 +237,12 @@ trade-off:
   future Python constructs. Finding H above, and finding 6c's own
   precisely-bounded residual gap above, are known, DOCUMENTED,
   currently-undemonstrated-beyond-what-is-stated gaps; there is no proof
-  that no OTHER gap exists beyond the ones six rounds of review happened
-  to find. A seventh round should be expected to find a seventh thing, on
-  the same pattern as the first six;
+  that no OTHER gap exists beyond the ones nine rounds of review happened
+  to find -- round 9's own finding is itself the clearest illustration:
+  round 8 closed its specific category (transparent Tuple/List/IfExp
+  composition) completely, and a NEW category (higher-order argument
+  transfer) was found regardless. A tenth round should be expected to
+  find a tenth thing, on the same pattern as the first nine;
 * the actual soundness BACKSTOP for CORRECTNESS -- as distinct from
   completeness of this module's own DETECTION -- is not this static walker
   at all, but a RUNTIME proof already in place: the 405/Allow admission
