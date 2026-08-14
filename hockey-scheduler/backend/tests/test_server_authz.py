@@ -10,7 +10,9 @@ from http.server import ThreadingHTTPServer
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
+from hockey_scheduler.api.service import ApiService
 from hockey_scheduler.domain import Role
+from hockey_scheduler.store import InMemoryStore
 from hockey_scheduler.web.server import STATE, Handler
 
 
@@ -622,7 +624,60 @@ class OptionalSessionProductionMatrixContract:
         ``_restore_environment``). Registered via ``addClassCleanup``
         BEFORE this class's own first mutation (#202 repair round 6,
         finding 3) -- see this class's own docstring for the failure mode
-        that closes."""
+        that closes.
+
+        #202 repair round 7, finding 3: the ``STATE.reset()`` call below
+        used to be wrapped in a bare ``try/except Exception: pass`` --
+        ANY failure of THIS SPECIFIC call (as opposed to the ORIGINAL
+        ``STATE.reset()`` inside ``setUpClass``, already covered by round
+        6's own ``test_mutation_proof_failing_reset_no_longer_leaves_
+        env_stuck``) was silently swallowed, converting a real cleanup
+        failure into a green suite. MUTATION-PROVED (the reviewer's own
+        words, reproduced directly by this session -- see
+        ``OptionalSessionProductionMatrixIsolationTests.test_mutation_
+        proof_failing_reset_at_the_restore_step_still_fails_the_suite``
+        below): patching ``STATE.reset`` to raise ONLY on this restore-
+        side call (the ORIGINAL call inside ``setUpClass``, made while
+        ``APP_MODE == "production"``, still succeeds) left
+        ``wasSuccessful() == True`` with zero recorded errors, while
+        ``STATE.ids`` stayed at the ``{}`` this class's own production
+        ``setUpClass`` sets (server.py's ``DemoState.reset()``: the
+        production branch's FIRST statement swaps ``self.api`` -- and
+        sets ``self.ids = {}`` -- unconditionally, before anything that
+        could still fail) and ``STATE.api`` kept referencing the store
+        THIS class's ``setUpClass`` built (server.py's own NON-production
+        branch -- the one this restore-side call runs under, since env
+        vars are restored to their PRE-run values just above -- leaves
+        ``self.api``/``self.game_id``/``self.ids`` completely UNTOUCHED
+        on failure, by explicit design: "a mid-build failure leaves the
+        previous dataset... untouched"), poisoning STATE for every LATER
+        test module in this same process with a store this run's own
+        earlier, PRODUCTION-mode ``STATE.reset()`` had already scheduled
+        for closure.
+
+        Required correction (the reviewer's own words): "surface the
+        reset as a cleanup error or restore a saved known-usable
+        singleton; do not swallow it" -- read as needing BOTH, not
+        either/or, since the required regression coverage demands
+        proving BOTH "the suite cannot succeed" AND "STATE is usable
+        afterward" from ONE injected failure. Closed by HEALING first,
+        THEN re-raising: on a caught failure, ``STATE`` is forced onto a
+        fresh, in-memory, no-external-dependency ``ApiService`` --
+        deliberately NOT a retry of ``STATE.reset()`` itself (which would
+        either re-hit the SAME mocked failure, or, for a genuine
+        unmocked failure, offer no reason to expect success the second
+        time) and deliberately NOT a reused reference to whatever
+        ``STATE.api`` pointed at before THIS class's own ``setUpClass``
+        ran (that store was already closed -- ``SqlStore.close()``
+        latches ``_closed`` "for good", see sql_store.py's own docstring
+        -- by this class's OWN earlier, SUCCESSFUL production-mode
+        ``STATE.reset()`` call, the moment it swapped ``self.api`` onto
+        the NEW store) -- before the caught exception is re-raised
+        unchanged, so ``doClassCleanups()`` records it as a genuine
+        cleanup error (each ``addClassCleanup`` callback is independent,
+        so re-raising here does not stop the httpd/thread/env-var
+        cleanups already run, nor the tmp-path removal in the ``finally``
+        below) rather than a silent, incorrectly green pass."""
         if prev_app_mode is None:
             os.environ.pop("APP_MODE", None)
         else:
@@ -634,17 +689,35 @@ class OptionalSessionProductionMatrixContract:
         # Rebuild on the RESTORED url, the same reason
         # LeagueContextHttpContract's own version does: this both drops
         # the store this run pointed at and leaves the module-level
-        # singleton usable for whatever runs next. A failure here must not
-        # mask the real teardown's other steps.
+        # singleton usable for whatever runs next.
         try:
             STATE.reset()
         except Exception:
-            pass
-        if cls._tmp_path:
+            # #202 repair round 7, finding 3 -- see this method's own
+            # docstring: heal STATE onto a store with no external
+            # dependency of its own, THEN surface the failure -- never
+            # swallow it silently. Close whatever STATE.api's PREVIOUS
+            # store was first (best-effort: STATE.api may not even be in
+            # a fully well-formed state here) -- otherwise the healing
+            # reassignment below simply drops that reference, leaking a
+            # live SQLite/Postgres connection the failed STATE.reset()
+            # call never got the chance to close itself.
             try:
-                os.remove(cls._tmp_path)
-            except OSError:
+                STATE.api.store.close()
+            except Exception:
                 pass
+            STATE.api = ApiService(InMemoryStore())
+            STATE.game_id = None
+            STATE.ids = {}
+            raise
+        finally:
+            # Always attempted, even when STATE.reset() above raised --
+            # a restore-side failure must not ALSO leak a temp file.
+            if cls._tmp_path:
+                try:
+                    os.remove(cls._tmp_path)
+                except OSError:
+                    pass
 
     @staticmethod
     def _stop_serving(httpd, thread):
@@ -793,7 +866,10 @@ class PostgresOptionalSessionProductionTest(OptionalSessionProductionMatrixContr
 # ``TestSuite._handleClassSetUp``/``doClassCleanups``, part of the SUITE      #
 # runner, not a side effect of calling ``setUpClass`` itself -- every test    #
 # below builds a real ``TestSuite`` and a real ``TestRunner`` for exactly     #
-# this reason, not a shortcut).                                               #
+# this reason, not a shortcut). Round 7 finding 3 (external review) extends   #
+# this SAME section rather than opening a new one: its own restore-side-      #
+# failure mutation proof is a failure scenario of EXACTLY this harness, just  #
+# as round 6 finding 3's own proofs already are.                             #
 # --------------------------------------------------------------------------- #
 def _run_contract(contract_cls):
     """Run every test method of ``contract_cls`` through a REAL
@@ -809,7 +885,9 @@ def _run_contract(contract_cls):
 class OptionalSessionProductionMatrixIsolationTests(unittest.TestCase):
     """Failure-injection and repeated-run proofs for
     ``OptionalSessionProductionMatrixContract``'s own harness -- #202
-    repair round 6, finding 3."""
+    repair round 6, finding 3; extended by round 7's own finding 3 (a
+    restore-side ``STATE.reset()`` failure must surface, never be
+    silently swallowed)."""
 
     def setUp(self):
         # #202 repair round 6, finding 3's own fix pattern, applied here
@@ -866,8 +944,103 @@ class OptionalSessionProductionMatrixIsolationTests(unittest.TestCase):
         finally:
             STATE.reset = real_reset
         self.assertFalse(result.wasSuccessful())
-        self.assertIsNone(os.environ.get("APP_MODE"))
-        self.assertIsNone(os.environ.get("DATABASE_URL"))
+        self.assertEqual(os.environ.get("APP_MODE"), self._prev_app_mode)
+        self.assertEqual(os.environ.get("DATABASE_URL"), self._prev_db)
+
+    def test_mutation_proof_failing_reset_at_the_restore_step_still_fails_the_suite(self):
+        """#202 repair round 7, finding 3's own required regression
+        coverage, reproduced directly: patch ``STATE.reset`` to SUCCEED
+        the FIRST time (the ORIGINAL call inside ``setUpClass``, under
+        ``APP_MODE == "production"`` -- the test above's own concern,
+        unchanged here) and RAISE on the SECOND (the restore-side call
+        inside ``_restore_environment``, made once env vars are already
+        back to their pre-run values) -- "only the cleanup reset" failing,
+        the reviewer's own words, the exact inverse of the test above.
+
+        A REAL SQLite-backed store (not the in-memory contract the other
+        failure-injection tests above use) is deliberately used here: it
+        is what makes "STATE is usable afterward" an actually falsifiable
+        claim rather than a vacuous one. ``InMemoryStore.close()`` is a
+        no-op (memory_store.py), so a memory-backed run would look
+        "usable" whether or not this finding's fix actually healed
+        anything; a SQLite-backed run's OWN successful, production-mode
+        ``setUpClass`` call closes its store for good the moment it
+        swaps ``self.api`` onto it (``SqlStore.close()`` latches
+        ``_closed``, sql_store.py's own docstring), so ``STATE.api``
+        continuing to work afterward is only possible if this finding's
+        fix actually replaced it with something new.
+
+        Pre-fix (this session's own repro, temporarily reverting
+        ``_restore_environment`` to its bare ``try: STATE.reset() except
+        Exception: pass`` and running just this test): this exact
+        assertion --
+        ``self.assertFalse(result.wasSuccessful(), ...)`` -- FAILED with
+        ``AssertionError: True is not false``, i.e. ``wasSuccessful()``
+        really was ``True``, zero errors recorded, the restore-side
+        failure silently converted into a green suite; ``STATE.api``/
+        ``STATE.ids`` were left exactly as this run's OWN production
+        ``setUpClass`` last set them (``self.ids = {}``, ``self.api`` on
+        the by-then-already-closed SQLite store) -- captured verbatim, a
+        test process can still reproduce it for itself by making the
+        SAME temporary edit. Post-fix: the suite is reported as failed
+        (never silently swallowed) AND ``STATE`` ends up on a fresh,
+        in-memory, no-external-dependency store, genuinely usable -- both
+        asserted below, from the SAME single injected failure, matching
+        the reviewer's own "prove BOTH" call."""
+        fd, path = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+
+        class _SqliteProbe(OptionalSessionProductionMatrixContract,
+                           unittest.TestCase):
+            def database_url(self):
+                self._tmp_path = None  # this test's own cleanup owns `path`
+                return path
+
+            def test_noop(self):
+                pass
+
+        real_reset = STATE.reset
+        calls = []
+
+        def _boom():
+            calls.append(None)
+            if len(calls) == 1:
+                real_reset()          # the ORIGINAL setUpClass call: OK
+                return
+            raise RuntimeError("simulated restore-side STATE.reset() "
+                              "failure")
+
+        STATE.reset = _boom
+        try:
+            result = _run_contract(_SqliteProbe)
+        finally:
+            STATE.reset = real_reset
+        self.assertEqual(
+            len(calls), 2,
+            "expected exactly one setUpClass call and one restore-side "
+            "call to STATE.reset() -- a different count means this "
+            "mutation is not isolating the restore step the way this "
+            "test intends")
+        self.assertFalse(
+            result.wasSuccessful(),
+            "a restore-side STATE.reset() failure must be reported, "
+            "never silently converted into a green suite")
+        self.assertTrue(
+            result.errors or result.failures,
+            "the restore-side failure must be recorded as a real "
+            "error/failure, not merely inferred from wasSuccessful()")
+        self.assertEqual(os.environ.get("APP_MODE"), self._prev_app_mode)
+        self.assertEqual(os.environ.get("DATABASE_URL"), self._prev_db)
+        # STATE must be genuinely usable afterward -- healed onto a
+        # fresh in-memory store (see this test's own docstring for why
+        # THAT specifically is what makes this claim falsifiable), never
+        # left referencing the SQLite store this run's own successful
+        # production setUpClass had already closed for good.
+        self.assertIsInstance(STATE.api.store, InMemoryStore)
+        self.assertEqual(STATE.api.accounts.list_accounts(), [])
+        self.assertIsNone(STATE.game_id)
+        self.assertEqual(STATE.ids, {})
 
     def test_failure_during_fixture_creation_still_restores_environment(self):
         """Inject a failure PARTWAY through fixture creation (after the
@@ -887,8 +1060,8 @@ class OptionalSessionProductionMatrixIsolationTests(unittest.TestCase):
         finally:
             ApiService.create_program = real_create_program
         self.assertFalse(result.wasSuccessful())
-        self.assertIsNone(os.environ.get("APP_MODE"))
-        self.assertIsNone(os.environ.get("DATABASE_URL"))
+        self.assertEqual(os.environ.get("APP_MODE"), self._prev_app_mode)
+        self.assertEqual(os.environ.get("DATABASE_URL"), self._prev_db)
 
     def test_failure_during_server_start_still_restores_environment(self):
         """Inject a failure at server CONSTRUCTION (before the thread
@@ -906,8 +1079,8 @@ class OptionalSessionProductionMatrixIsolationTests(unittest.TestCase):
         finally:
             http_server_module.ThreadingHTTPServer.__init__ = real_init
         self.assertFalse(result.wasSuccessful())
-        self.assertIsNone(os.environ.get("APP_MODE"))
-        self.assertIsNone(os.environ.get("DATABASE_URL"))
+        self.assertEqual(os.environ.get("APP_MODE"), self._prev_app_mode)
+        self.assertEqual(os.environ.get("DATABASE_URL"), self._prev_db)
         # STATE must still be usable -- reset() must not itself raise.
         STATE.reset()
 
@@ -926,8 +1099,8 @@ class OptionalSessionProductionMatrixIsolationTests(unittest.TestCase):
         finally:
             threading.Thread.start = real_start
         self.assertFalse(result.wasSuccessful())
-        self.assertIsNone(os.environ.get("APP_MODE"))
-        self.assertIsNone(os.environ.get("DATABASE_URL"))
+        self.assertEqual(os.environ.get("APP_MODE"), self._prev_app_mode)
+        self.assertEqual(os.environ.get("DATABASE_URL"), self._prev_db)
         STATE.reset()
 
     def test_a_temp_sqlite_file_is_removed_even_when_setup_fails_after_it(self):
@@ -1002,15 +1175,15 @@ class OptionalSessionProductionMatrixIsolationTests(unittest.TestCase):
 
         result1 = _run_contract(_FixedSqliteProbe)
         self.assertTrue(result1.wasSuccessful(), result1.errors + result1.failures)
-        self.assertIsNone(os.environ.get("APP_MODE"))
+        self.assertEqual(os.environ.get("APP_MODE"), self._prev_app_mode)
 
         result2 = _run_contract(_FixedSqliteProbe)
         self.assertTrue(result2.wasSuccessful(), result2.errors + result2.failures)
-        self.assertIsNone(os.environ.get("APP_MODE"))
+        self.assertEqual(os.environ.get("APP_MODE"), self._prev_app_mode)
 
         result3 = _run_contract(_FixedSqliteProbe)
         self.assertTrue(result3.wasSuccessful(), result3.errors + result3.failures)
-        self.assertIsNone(os.environ.get("APP_MODE"))
+        self.assertEqual(os.environ.get("APP_MODE"), self._prev_app_mode)
 
     @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
                          "PostgreSQL not configured (TEST_DATABASE_URL)")
@@ -1029,11 +1202,11 @@ class OptionalSessionProductionMatrixIsolationTests(unittest.TestCase):
 
         result1 = _run_contract(_PgProbe)
         self.assertTrue(result1.wasSuccessful(), result1.errors + result1.failures)
-        self.assertIsNone(os.environ.get("APP_MODE"))
+        self.assertEqual(os.environ.get("APP_MODE"), self._prev_app_mode)
 
         result2 = _run_contract(_PgProbe)
         self.assertTrue(result2.wasSuccessful(), result2.errors + result2.failures)
-        self.assertIsNone(os.environ.get("APP_MODE"))
+        self.assertEqual(os.environ.get("APP_MODE"), self._prev_app_mode)
 
 
 if __name__ == "__main__":
