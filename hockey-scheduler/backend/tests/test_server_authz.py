@@ -5,6 +5,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+import uuid
 from http.server import ThreadingHTTPServer
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
@@ -445,7 +446,84 @@ class OptionalSessionProductionMatrixContract:
     """Shared body; each subclass supplies the store the server runs on.
     Never itself a TestCase (mirrors LeagueContextHttpContract exactly, for
     the same reason: instantiating the mixin alone would run with no
-    ``database_url()``)."""
+    ``database_url()``).
+
+    #202 repair round 6, finding 3 -- two independent bugs, closed
+    together since both live in this class's own harness:
+
+    (a) ``setUpClass`` used to mutate ``APP_MODE``/``DATABASE_URL`` (both
+    process-global, shared with every OTHER test module in the same run)
+    and rebuild the process-global ``STATE`` singleton, all BEFORE any
+    failure-safe cleanup was registered -- a single ``tearDownClass`` at
+    the very end, which unittest SKIPS ENTIRELY the moment ``setUpClass``
+    raises past ANY point (unlike a per-test ``setUp``/``tearDown`` pair,
+    where ``addCleanup`` already covers exactly this class of failure --
+    see ``LeagueContextHttpContract.setUp``'s own ``addCleanup``, the
+    established pattern this fix now mirrors at the class level).
+    MUTATION-PROVED (the reviewer's own words, reproduced directly by this
+    session): patching ``STATE.reset`` to raise while ``APP_MODE ==
+    "production"`` and calling ``setUpClass`` left
+    ``os.environ["APP_MODE"] == "production"`` with ``tearDownClass``
+    never invoked -- poisoning every later test module in the same
+    process. Closed by registering ``addClassCleanup`` for EACH resource
+    IMMEDIATELY after acquiring/mutating it (the very first one, restoring
+    the environment, registered BEFORE its own first mutation), in the
+    order acquired -- so a failure at ANY later point still unwinds
+    everything already done. ``addClassCleanup`` callbacks run even when
+    ``setUpClass`` raises (unlike ``tearDownClass``), each independently
+    (one callback raising does not stop the others from running), and in
+    LIFO order -- registering ``server_close`` right after the listening
+    socket is opened and ``_stop_serving`` (shutdown + thread join) right
+    after the thread starts is what makes shutdown-then-close the actual
+    execution order below, without a single monolithic teardown method.
+
+    (b) the PostgreSQL subclass targets the worker-shared
+    ``TEST_DATABASE_URL``, and production's own ``STATE.reset()``
+    deliberately PRESERVES existing rows (server.py: "Production (#71):
+    NEVER reset the schema or seed demo data") -- exactly the behaviour
+    this class exists to exercise, but it also means the FIXED
+    ``finding3_admin``/``finding3_official``/``finding3_player`` usernames
+    this class used to create collide with whatever a PRIOR run of this
+    SAME class already committed to that SAME persistent URL.
+    DEMONSTRATED (this session's own repro, run/tearDown/run against one
+    real Postgres database): the first run's ``setUpClass`` succeeds; an
+    immediately-following second run's ``setUpClass`` fails with
+    ``ValidationError: Username 'finding3_admin' is already taken.`` --
+    and, before fix (a) above, ALSO left ``APP_MODE`` stuck at
+    "production" afterward, compounding both bugs.
+
+    Closed with a fresh, UNIQUE per-class-run suffix
+    (``uuid.uuid4().hex[:10]``) on every fixture identifier this class
+    creates, so two runs' rows never collide REGARDLESS of whether either
+    run's own cleanup completes. Stated plainly, this class does NOT also
+    delete what it creates in cleanup -- INVESTIGATED, not assumed:
+    Official/Player DO have a real ``api.delete_*`` primitive, but each
+    one is a ``@catch``-wrapped API call that, on THIS exact fixture,
+    returns a SOFT ``{"error": {"code": "has_dependencies", ...}}`` dict
+    (never raises) refusing the delete, because the very User Account
+    this class just created for it is a live, undeleted dependent --
+    VERIFIED directly against a real Postgres database before writing
+    this comment, not assumed from reading the service code. There is no
+    ``delete_account`` at all in this codebase (only deactivation, which
+    does not free the username and would not unblock the official/player
+    delete above either), so this chain has no available bottom: nothing
+    this class creates can actually be deleted through the public API
+    surface, short of reaching around it into raw SQL, which no other
+    test in this file does either. The disposable-DATABASE approach this
+    repo's own established pattern for avoiding a bare, shared database
+    name would otherwise suggest does not fit here without a much larger
+    change (every OTHER Postgres test in this repo, including this
+    class's own PostgreSQL subclass, consumes ``TEST_DATABASE_URL`` as a
+    single already-provisioned database supplied by the runner, never
+    provisions its own). The unique suffix is therefore the WHOLE
+    isolation guarantee, not a defence-in-depth layered on top of
+    cleanup -- and it is sufficient on its own: two runs' rows are simply
+    DIFFERENT rows, never compared or deduplicated by name anywhere in
+    the app, so accumulating them harms nothing this or any other test
+    reads. Proven directly, not merely asserted, by
+    ``OptionalSessionProductionMatrixIsolationTests`` below (which also
+    covers the failure-injection requirements part (a) exists for).
+    """
 
     def database_url(self):
         raise NotImplementedError
@@ -453,9 +531,15 @@ class OptionalSessionProductionMatrixContract:
     # -- harness -------------------------------------------------------
     @classmethod
     def setUpClass(cls):
-        cls._prev_app_mode = os.environ.get("APP_MODE")
-        cls._prev_db = os.environ.get("DATABASE_URL")
+        prev_app_mode = os.environ.get("APP_MODE")
+        prev_db = os.environ.get("DATABASE_URL")
         cls._tmp_path = None
+        # Registered BEFORE this method's own FIRST mutation (the very
+        # next line) -- see this class's own docstring, part (a). Every
+        # later ``addClassCleanup`` call in this method is likewise
+        # registered immediately after the acquisition/mutation it
+        # undoes, never batched at the end.
+        cls.addClassCleanup(cls._restore_environment, prev_app_mode, prev_db)
         # Set BEFORE reset() so production's own branch in STATE.reset()
         # runs (server.py: "Production (#71): NEVER reset the schema or
         # seed demo data") rather than the demo seed path -- the whole
@@ -468,11 +552,24 @@ class OptionalSessionProductionMatrixContract:
             os.environ.pop("DATABASE_URL", None)
         STATE.reset()
         cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        # Registered immediately after the listening socket opens -- safe
+        # even if the thread below never starts. LIFO with the cleanup
+        # registered just below means _stop_serving (shutdown + join)
+        # actually runs BEFORE this one on teardown, the correct order.
+        cls.addClassCleanup(cls.httpd.server_close)
         cls.port = cls.httpd.server_address[1]
         cls.thread = threading.Thread(target=cls.httpd.serve_forever,
                                       daemon=True)
         cls.thread.start()
+        cls.addClassCleanup(cls._stop_serving, cls.httpd, cls.thread)
+
         api = STATE.api
+        # #202 repair round 6, finding 3, part (b) -- see this class's own
+        # docstring for the full reasoning (including why NOTHING created
+        # below is deleted in cleanup: investigated and found genuinely
+        # unavailable through the public API, not merely skipped).
+        suffix = uuid.uuid4().hex[:10]
+        cls._fixture_suffix = suffix
         # Production seeds NOTHING (no demo personas, no X-Demo-Role
         # fallback) -- every account and the official/player it binds to
         # must be built from scratch here, unlike OptionalSessionRoute
@@ -480,48 +577,59 @@ class OptionalSessionProductionMatrixContract:
         # home_team_id. Passwords are 10+ chars (the account service's own
         # policy minimum) rather than OptionalSessionRouteTests' demo-only
         # "pw", which that policy would reject outside the demo seed path.
+        cls.admin_username = f"finding3_admin_{suffix}"
         api.accounts.create_account(
-            "finding3_admin", "finding3-admin-pw", Role.LEAGUE_ADMIN,
+            cls.admin_username, "finding3-admin-pw", Role.LEAGUE_ADMIN,
             actor_id="test_seed")
-        official = api.create_official("Finding3 Official")
+        official = api.create_official(f"Finding3 Official {suffix}")
         cls.official_id = official["id"]
+        cls.official_username = f"finding3_official_{suffix}"
         api.create_user_account(
-            "finding3_official", "finding3-official-pw", "official",
+            cls.official_username, "finding3-official-pw", "official",
             scope={"official_id": cls.official_id})
         # A Player needs a real Team, which (unlike Official) needs a real
         # permanent League -- the minimal Program -> Season -> League ->
         # Team -> Player chain, built the same way test_context_league_
         # http.py's own _program_season_league fixture does.
-        program_id = api.create_program("Finding3 Program", "US", "UTC")["id"]
-        season_id = api.create_season(program_id, "Finding3 Season")["id"]
-        league_id = api.create_league(season_id, "Finding3 League")["id"]
-        team = api.create_team(name="Finding3 Team", league_id=league_id)
-        player = api.create_player(team["id"], "Finding3 Player", "forward")
+        program_id = api.create_program(
+            f"Finding3 Program {suffix}", "US", "UTC")["id"]
+        season_id = api.create_season(
+            program_id, f"Finding3 Season {suffix}")["id"]
+        league_id = api.create_league(
+            season_id, f"Finding3 League {suffix}")["id"]
+        team = api.create_team(name=f"Finding3 Team {suffix}",
+                               league_id=league_id)
+        player = api.create_player(team["id"], f"Finding3 Player {suffix}",
+                                   "forward")
         cls.player_id = player["id"]
+        cls.player_username = f"finding3_player_{suffix}"
         api.create_user_account(
-            "finding3_player", "finding3-player-pw", "player",
+            cls.player_username, "finding3-player-pw", "player",
             scope={"player_id": cls.player_id})
 
     @classmethod
-    def tearDownClass(cls):
-        cls.httpd.shutdown()
-        cls.thread.join(timeout=5)
-        cls.httpd.server_close()
-        # Undo every process-global effect, in reverse order -- APP_MODE
-        # and DATABASE_URL are process-global env vars and STATE is a
-        # module-level singleton, all shared with every OTHER test module
-        # in this run (mirrors LeagueContextHttpContract's own
-        # _restore_environment, adapted to setUpClass/tearDownClass since
-        # this matrix rebuilds the store once per CLASS, not once per
-        # test method).
-        if cls._prev_app_mode is None:
+    def _restore_environment(cls, prev_app_mode, prev_db):
+        """Undo every process-global effect, in reverse order -- APP_MODE
+        and DATABASE_URL are process-global env vars and STATE is a
+        module-level singleton, all shared with every OTHER test module
+        in this run (mirrors LeagueContextHttpContract's own
+        ``_restore_environment``). Registered via ``addClassCleanup``
+        BEFORE this class's own first mutation (#202 repair round 6,
+        finding 3) -- see this class's own docstring for the failure mode
+        that closes."""
+        if prev_app_mode is None:
             os.environ.pop("APP_MODE", None)
         else:
-            os.environ["APP_MODE"] = cls._prev_app_mode
-        if cls._prev_db is None:
+            os.environ["APP_MODE"] = prev_app_mode
+        if prev_db is None:
             os.environ.pop("DATABASE_URL", None)
         else:
-            os.environ["DATABASE_URL"] = cls._prev_db
+            os.environ["DATABASE_URL"] = prev_db
+        # Rebuild on the RESTORED url, the same reason
+        # LeagueContextHttpContract's own version does: this both drops
+        # the store this run pointed at and leaves the module-level
+        # singleton usable for whatever runs next. A failure here must not
+        # mask the real teardown's other steps.
         try:
             STATE.reset()
         except Exception:
@@ -531,6 +639,16 @@ class OptionalSessionProductionMatrixContract:
                 os.remove(cls._tmp_path)
             except OSError:
                 pass
+
+    @staticmethod
+    def _stop_serving(httpd, thread):
+        """Shut the server down and join its thread -- registered via
+        ``addClassCleanup`` right after the thread starts (#202 repair
+        round 6, finding 3), so it runs (LIFO) BEFORE ``server_close``,
+        the correct order, without depending on a single method to get
+        both steps right at the end."""
+        httpd.shutdown()
+        thread.join(timeout=5)
 
     def _get_h(self, path, cookie=None):
         url = f"http://127.0.0.1:{self.port}{path}"
@@ -564,11 +682,11 @@ class OptionalSessionProductionMatrixContract:
         self.assertEqual(body["error"]["code"], "unauthorized")
 
     def test_auth_me_valid_cookie_returns_the_real_user(self):
-        cookie = self._login("finding3_admin", "finding3-admin-pw")
+        cookie = self._login(self.admin_username, "finding3-admin-pw")
         status, body = self._get_h("/api/auth/me", cookie=cookie)
         self.assertEqual(status, 200)
         self.assertIsNotNone(body["user"])
-        self.assertEqual(body["user"]["username"], "finding3_admin")
+        self.assertEqual(body["user"]["username"], self.admin_username)
 
     # -- /api/me/assignments ----------------------------------------------
     def test_me_assignments_no_cookie_is_anonymous_200(self):
@@ -583,7 +701,7 @@ class OptionalSessionProductionMatrixContract:
         self.assertEqual(body["error"]["code"], "unauthorized")
 
     def test_me_assignments_valid_bound_cookie_returns_the_real_inbox(self):
-        cookie = self._login("finding3_official", "finding3-official-pw")
+        cookie = self._login(self.official_username, "finding3-official-pw")
         status, body = self._get_h("/api/me/assignments", cookie=cookie)
         self.assertEqual(status, 200)
         self.assertEqual(body["official_id"], self.official_id)
@@ -595,7 +713,7 @@ class OptionalSessionProductionMatrixContract:
         OptionalSessionRouteTests' own identically-named test for why this
         distinction (rather than merely "some 200") is what is being
         proven."""
-        cookie = self._login("finding3_admin", "finding3-admin-pw")
+        cookie = self._login(self.admin_username, "finding3-admin-pw")
         status, body = self._get_h("/api/me/assignments", cookie=cookie)
         self.assertEqual(status, 200)
         self.assertEqual(body, {"official_id": None, "assignments": []})
@@ -616,7 +734,7 @@ class OptionalSessionProductionMatrixContract:
         self.assertEqual(body["error"]["code"], "unauthorized")
 
     def test_me_player_home_valid_bound_cookie_returns_the_real_home(self):
-        cookie = self._login("finding3_player", "finding3-player-pw")
+        cookie = self._login(self.player_username, "finding3-player-pw")
         status, body = self._get_h("/api/me/player-home", cookie=cookie)
         self.assertEqual(status, 200)
         self.assertEqual(body["player_id"], self.player_id)
@@ -646,6 +764,259 @@ class PostgresOptionalSessionProductionTest(OptionalSessionProductionMatrixContr
                                             unittest.TestCase):
     def database_url(self):
         return os.environ["TEST_DATABASE_URL"]
+
+
+# --------------------------------------------------------------------------- #
+# #202 repair round 6, finding 3 (external review, 03:59:55): the new         #
+# production tri-store contract can poison the worker and leak SQL fixtures.  #
+# See OptionalSessionProductionMatrixContract's own docstring for the full    #
+# fix; this section is its DEMONSTRATION -- run through unittest's OWN real   #
+# TestSuite machinery (a direct ``SomeClass.setUpClass()`` call bypasses      #
+# ``addClassCleanup`` entirely: its callbacks are invoked by                  #
+# ``TestSuite._handleClassSetUp``/``doClassCleanups``, part of the SUITE      #
+# runner, not a side effect of calling ``setUpClass`` itself -- every test    #
+# below builds a real ``TestSuite`` and a real ``TestRunner`` for exactly     #
+# this reason, not a shortcut).                                               #
+# --------------------------------------------------------------------------- #
+def _run_contract(contract_cls):
+    """Run every test method of ``contract_cls`` through a REAL
+    ``TestSuite``/``TestRunner`` -- see this section's own module comment
+    for why a direct ``setUpClass()`` call would not exercise
+    ``addClassCleanup`` at all."""
+    suite = unittest.TestLoader().loadTestsFromTestCase(contract_cls)
+    with open(os.devnull, "w") as devnull:
+        runner = unittest.TextTestRunner(verbosity=0, stream=devnull)
+        return runner.run(suite)
+
+
+class OptionalSessionProductionMatrixIsolationTests(unittest.TestCase):
+    """Failure-injection and repeated-run proofs for
+    ``OptionalSessionProductionMatrixContract``'s own harness -- #202
+    repair round 6, finding 3."""
+
+    def setUp(self):
+        # #202 repair round 6, finding 3's own fix pattern, applied here
+        # too: register the restore BEFORE touching anything, so a bug in
+        # THIS test class cannot ALSO leak into whatever runs after it.
+        self._prev_app_mode = os.environ.get("APP_MODE")
+        self._prev_db = os.environ.get("DATABASE_URL")
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        if self._prev_app_mode is None:
+            os.environ.pop("APP_MODE", None)
+        else:
+            os.environ["APP_MODE"] = self._prev_app_mode
+        if self._prev_db is None:
+            os.environ.pop("DATABASE_URL", None)
+        else:
+            os.environ["DATABASE_URL"] = self._prev_db
+        try:
+            STATE.reset()
+        except Exception:
+            pass
+
+    def _memory_contract(self):
+        class _MemoryProbe(OptionalSessionProductionMatrixContract,
+                           unittest.TestCase):
+            def database_url(self):
+                return None
+
+            def test_noop(self):
+                pass
+        return _MemoryProbe
+
+    # -- (a): failure injection at each risky step ---------------------
+
+    def test_mutation_proof_failing_reset_no_longer_leaves_env_stuck(self):
+        """The reviewer's own mutation-proof, reproduced directly: patch
+        ``STATE.reset`` to raise the FIRST time it is called under
+        ``APP_MODE == "production"`` (i.e. exactly the call inside
+        ``setUpClass``) and confirm both env vars are back to their
+        pre-run values afterward -- DEMONSTRATED broken pre-fix (see this
+        finding's own PR-cited transcript); this is the standing
+        regression proof."""
+        real_reset = STATE.reset
+
+        def _boom():
+            if os.environ.get("APP_MODE") == "production":
+                raise RuntimeError("simulated STATE.reset() failure")
+            real_reset()
+
+        STATE.reset = _boom
+        try:
+            result = _run_contract(self._memory_contract())
+        finally:
+            STATE.reset = real_reset
+        self.assertFalse(result.wasSuccessful())
+        self.assertIsNone(os.environ.get("APP_MODE"))
+        self.assertIsNone(os.environ.get("DATABASE_URL"))
+
+    def test_failure_during_fixture_creation_still_restores_environment(self):
+        """Inject a failure PARTWAY through fixture creation (after the
+        account and official exist, before the Program/Season/League/Team/
+        Player chain) -- the environment must still be fully restored,
+        proving the fix is not merely "works when STATE.reset() itself is
+        the only thing that can fail"."""
+        from hockey_scheduler.api.service import ApiService
+        real_create_program = ApiService.create_program
+
+        def _boom(self, *a, **kw):
+            raise RuntimeError("simulated create_program() failure")
+
+        ApiService.create_program = _boom
+        try:
+            result = _run_contract(self._memory_contract())
+        finally:
+            ApiService.create_program = real_create_program
+        self.assertFalse(result.wasSuccessful())
+        self.assertIsNone(os.environ.get("APP_MODE"))
+        self.assertIsNone(os.environ.get("DATABASE_URL"))
+
+    def test_failure_during_server_start_still_restores_environment(self):
+        """Inject a failure at server CONSTRUCTION (before the thread
+        exists at all) -- the environment must still be restored, and the
+        (never-started) httpd cleanup must not itself raise."""
+        import http.server as http_server_module
+        real_init = http_server_module.ThreadingHTTPServer.__init__
+
+        def _boom(self, *a, **kw):
+            raise OSError("simulated bind failure")
+
+        http_server_module.ThreadingHTTPServer.__init__ = _boom
+        try:
+            result = _run_contract(self._memory_contract())
+        finally:
+            http_server_module.ThreadingHTTPServer.__init__ = real_init
+        self.assertFalse(result.wasSuccessful())
+        self.assertIsNone(os.environ.get("APP_MODE"))
+        self.assertIsNone(os.environ.get("DATABASE_URL"))
+        # STATE must still be usable -- reset() must not itself raise.
+        STATE.reset()
+
+    def test_failure_during_thread_start_still_restores_environment(self):
+        """Inject a failure at thread START (the socket IS open by this
+        point) -- the socket cleanup (``server_close``) must still run
+        even though the thread that would have served on it never did."""
+        real_start = threading.Thread.start
+
+        def _boom(self, *a, **kw):
+            raise RuntimeError("simulated thread start failure")
+
+        threading.Thread.start = _boom
+        try:
+            result = _run_contract(self._memory_contract())
+        finally:
+            threading.Thread.start = real_start
+        self.assertFalse(result.wasSuccessful())
+        self.assertIsNone(os.environ.get("APP_MODE"))
+        self.assertIsNone(os.environ.get("DATABASE_URL"))
+        STATE.reset()
+
+    def test_a_temp_sqlite_file_is_removed_even_when_setup_fails_after_it(self):
+        """The SQLite subclass's own temp file (created by
+        ``database_url()``, BEFORE any of the failure points above) must
+        still be removed on cleanup even when a LATER step fails."""
+        class _SqliteProbe(OptionalSessionProductionMatrixContract,
+                           unittest.TestCase):
+            def database_url(self):
+                # NOTE: ``setUpClass`` calls this as ``cls.database_url
+                # (cls)`` (see OptionalSessionProductionMatrixContract's
+                # own setUpClass) -- ``self`` here IS the class object
+                # itself, not an instance, so ``self._tmp_path = path``
+                # already sets the CLASS attribute the harness's own
+                # cleanup reads; no separate attribute needed.
+                fd, path = tempfile.mkstemp(suffix=".sqlite")
+                os.close(fd)
+                self._tmp_path = path
+                return path
+
+            def test_noop(self):
+                pass
+
+        from hockey_scheduler.api.service import ApiService
+        real_create_official = ApiService.create_official
+
+        def _boom(self, *a, **kw):
+            raise RuntimeError("simulated create_official() failure")
+
+        ApiService.create_official = _boom
+        try:
+            result = _run_contract(_SqliteProbe)
+        finally:
+            ApiService.create_official = real_create_official
+        self.assertFalse(result.wasSuccessful())
+        tmp_path = getattr(_SqliteProbe, "_tmp_path", None)
+        self.assertIsNotNone(tmp_path)
+        self.assertFalse(os.path.exists(tmp_path),
+                         f"temp SQLite file {tmp_path} was not cleaned up")
+
+    # -- (b): repeated runs against the SAME persistent SQL URL ---------
+
+    def test_running_the_contract_twice_against_the_same_sql_url_both_succeed(self):
+        """The reviewer's own required proof, portable (SQLite, no
+        TEST_DATABASE_URL needed so this runs in every CI environment):
+        setup/teardown/setup TWICE against ONE fixed, persistent database
+        file -- both must succeed, with no username collision.
+        DEMONSTRATED broken pre-fix against a real PostgreSQL database
+        (this finding's own PR-cited transcript: the first run succeeds,
+        the second fails with "Username 'finding3_admin' is already
+        taken"); the underlying bug (fixed usernames, a production
+        STATE.reset() that deliberately never wipes rows) is identical
+        for any persistent SQL backend, SQLite included -- this is the
+        SAME regression, reproducible without Postgres."""
+        fd, path = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+
+        class _FixedSqliteProbe(OptionalSessionProductionMatrixContract,
+                                unittest.TestCase):
+            def database_url(self):
+                # Deliberately NOT tempfile.mkstemp()-per-call (unlike
+                # SqliteOptionalSessionProductionTest's own subclass) --
+                # the whole point here is exercising ONE PERSISTENT file
+                # across multiple independent runs, the SAME shape a
+                # long-lived, worker-shared TEST_DATABASE_URL has.
+                self._tmp_path = None  # this test's own cleanup owns `path`
+                return path
+
+            def test_noop(self):
+                pass
+
+        result1 = _run_contract(_FixedSqliteProbe)
+        self.assertTrue(result1.wasSuccessful(), result1.errors + result1.failures)
+        self.assertIsNone(os.environ.get("APP_MODE"))
+
+        result2 = _run_contract(_FixedSqliteProbe)
+        self.assertTrue(result2.wasSuccessful(), result2.errors + result2.failures)
+        self.assertIsNone(os.environ.get("APP_MODE"))
+
+        result3 = _run_contract(_FixedSqliteProbe)
+        self.assertTrue(result3.wasSuccessful(), result3.errors + result3.failures)
+        self.assertIsNone(os.environ.get("APP_MODE"))
+
+    @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                         "PostgreSQL not configured (TEST_DATABASE_URL)")
+    def test_running_the_contract_twice_against_the_same_postgres_url_both_succeed(self):
+        """The reviewer's own EXACT scenario, directly: setup/teardown/
+        setup TWICE against the real, worker-shared ``TEST_DATABASE_URL``
+        -- both must succeed. DEMONSTRATED broken pre-fix, this exact
+        way, in this finding's own PR-cited transcript."""
+        class _PgProbe(OptionalSessionProductionMatrixContract,
+                      unittest.TestCase):
+            def database_url(self):
+                return os.environ["TEST_DATABASE_URL"]
+
+            def test_noop(self):
+                pass
+
+        result1 = _run_contract(_PgProbe)
+        self.assertTrue(result1.wasSuccessful(), result1.errors + result1.failures)
+        self.assertIsNone(os.environ.get("APP_MODE"))
+
+        result2 = _run_contract(_PgProbe)
+        self.assertTrue(result2.wasSuccessful(), result2.errors + result2.failures)
+        self.assertIsNone(os.environ.get("APP_MODE"))
 
 
 if __name__ == "__main__":
