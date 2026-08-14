@@ -310,7 +310,19 @@ EVERY_SHAPE = _module('''
                 return self._send(11)
             table = {"lock": 12, "unlock": 13}.get(action)
             if table:
-                return self._send(table)
+                # #202 repair round 5, finding 2b: a literal marker, NOT
+                # `table` itself -- `self._send(table)` would pass the
+                # DICT-LOOKUP RESULT (a `self.`-call argument, so
+                # DELIBERATELY out of `_propagates_taint`'s ``captured``
+                # exemption's reach -- see that function's own docstring)
+                # into a self-call now reached by the Return scan; that is
+                # a real, reviewable-in-server.py shape (see
+                # WaiverTaintPropagationTests' `fn`/`coach` waivers for the
+                # genuine article), not what THIS fixture means to
+                # exercise -- this branch is about `{...}.get(action)`
+                # being recognised as a dispatch shape at all, unrelated
+                # to what value the already-selected branch reports back.
+                return self._send(12)
 
     def _handle_setup(self, entity, body):
         rid = re.match(r"^(team|player)/([^/]+)/delete$", entity)
@@ -1109,23 +1121,32 @@ class WaiverFingerprintTests(unittest.TestCase):
             route_extract_module._AUDIT_WAIVERS.update(saved)))
 
     def test_every_real_waiver_is_hit_exactly_once(self):
-        """The real server.py, unmodified: each of the 39 declared waivers
+        """The real server.py, unmodified: each of the 51 declared waivers
         (18 from rounds 2-3 -- 2 pre-existing + 2 pre-existing ternaries + 6
         round-2 finding A additions + 8 round-3 finding E additions -- plus
         11 round-4 finding 1 additions, once a Call reached DIRECTLY as the
         whole test had its arguments scanned too, plus 10 round-5 finding 1
         additions, once a WAIVED call's result stopped losing its taint --
         see _propagates_taint's own docstring, "A WAIVER SILENCES THE CALL,
-        NOT THE RESULT") is consulted for precisely the one line it names --
-        proves the instrumentation is wired all the way through
-        _propagates_taint AND the ast.If/ast.IfExp/ast.While/ast.match_case
-        scan, not just one of them. Each key is now a 4-tuple (#202 repair
-        round 4, finding 3: function, text, parent shape, enclosing if)
-        rather than the original 2-tuple -- WaiverRelocationFingerprintTests
-        below is the dedicated proof for what the extra two parts catch that
-        this exact-one-hit check alone would not."""
+        NOT THE RESULT" -- plus 13 round-5 finding 2b additions MINUS 1
+        finding-2b removal, once Return statements were audited at all and
+        exposed a class of self-owned mutation helpers
+        (`_guarded_mutation`) and locally-selected callables (`call`/
+        `mapper`/`deleter`/`fn`/`coach`) that needed their own review, and
+        made one PRE-EXISTING waiver -- `_to_v1.get(kind, lambda r: r)` --
+        redundant with finding 2b's own new `captured` exemption in
+        `_propagates_taint` (see that function's own docstring) rather
+        than needing its own entry any more) is consulted for precisely
+        the one line it names -- proves the instrumentation is wired all
+        the way through _propagates_taint AND the ast.If/ast.IfExp/
+        ast.While/ast.match_case scan, not just one of them. Each key is
+        now a 4-tuple (#202 repair round 4, finding 3: function, text,
+        parent shape, enclosing if) rather than the original 2-tuple --
+        WaiverRelocationFingerprintTests below is the dedicated proof for
+        what the extra two parts catch that this exact-one-hit check alone
+        would not."""
         walker = extract_walker()
-        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 39)
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 51)
         for key in route_extract_module._AUDIT_WAIVERS:
             with self.subTest(waiver=key):
                 self.assertEqual(len(walker.waiver_hits.get(key, ())), 1)
@@ -2613,7 +2634,224 @@ class WaiverTaintPropagationTests(unittest.TestCase):
         walker = extract_walker()
         self.assertEqual(len(walker.routes), 239)
         self.assertEqual(walker.unreachable, [])
-        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 39)
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 51)
+
+
+# --------------------------------------------------------------------------- #
+# #202 repair round 5, finding 2 (external review, 19:36 + 19:48): "direct    #
+# subscript and return dispatch remain silent" -- two sub-shapes. (a) a Call  #
+# whose ``.func`` is itself an ``ast.Subscript`` indexed by a tracked name    #
+# (``PREDICATES[path]()``) -- the existing scans look at a Call's arguments   #
+# or receiver name CHAIN, never at a Subscript used AS the callee. (b) a bare #
+# ``return <expr>`` -- neither the fixed-point loop (assignment-only) nor the #
+# bare-Expr scan (round 3, finding G; non-Return statements) ever visits      #
+# ``Return.value`` at all, so ``return ROUTES[path]()`` and the "broader      #
+# returned-helper form", ``return self._route(path)`` (an ARBITRARY,          #
+# uncatalogued ``self.`` method -- not a ``_handle_*``/``_dispatch_*`` name   #
+# ``_audit_dispatch_helper_calls`` would ever flag), both went unexamined.    #
+# --------------------------------------------------------------------------- #
+class SubscriptCalleeAndReturnDispatchTests(unittest.TestCase):
+    # -- pre-fix escapes, reproduced via git stash (not re-run here: git
+    # stash cannot be invoked from inside a test process) -- the transcript
+    # below is what running each of the three fixtures below produced
+    # against the code as it stood immediately before this finding's fix
+    # (i.e. round 5, finding 1's own commit), captured verbatim:
+    #
+    #   2a-subscript-callee:      NO RAISE. routes = []
+    #   2b-return-subscript-call: NO RAISE. routes = []
+    #   2b-return-self-route:     NO RAISE. routes = []
+    #
+    # each now raises against the FIXED code, asserted below, which a test
+    # process can still verify for itself on every run.
+
+    def _raises(self, body, *substrings):
+        with self.assertRaises(ExtractionError) as caught:
+            extract_routes(_module(body))
+        msg = str(caught.exception)
+        for s in substrings:
+            self.assertIn(s, msg)
+
+    def test_subscript_callee_indexed_by_tracked_name_raises(self):
+        """Finding 2a, the reviewer's own reproduction: a Call whose own
+        CALLEE is a Subscript keyed on the tracked path
+        (``PREDICATES[path]()``), reached directly as the whole if-test.
+        Before this fix, ``root_name``'s generic Subscript-unwrapping
+        (``node = node.value``, meant for a receiver CHAIN like
+        ``SOME_DICT[key].attr``) discarded the ``.slice`` -- exactly the
+        piece that decides which callable gets invoked here -- so the
+        walk resolved straight past ``path`` to ``PREDICATES`` and found
+        nothing tracked."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if PREDICATES[path]():
+                    return self._send(1)
+        ''', "unrecognised shape", "PREDICATES[path]()")
+
+    def test_return_of_subscript_call_raises(self):
+        """Finding 2b, sub-shape (a) combined with the reviewer's own
+        ``ROUTES[path]()`` repro, reached as a bare ``return`` -- neither
+        the fixed-point loop (assignment-only) nor the round-3 bare-Expr
+        scan (non-Return statements) ever visited ``Return.value``."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                return ROUTES[path]()
+        ''', "unlisted call", "ROUTES[path]()")
+
+    def test_return_of_arbitrary_self_method_raises(self):
+        """Finding 2b, sub-shape (b) -- the reviewer's "broader returned-
+        helper form": ``self._route`` is an ARBITRARY, uncatalogued
+        ``self.`` method (not ``_handle_*``/``_dispatch_*``-prefixed, so
+        ``_audit_dispatch_helper_calls``'s delegation detector never even
+        looks at it) that can itself serve a hidden route."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                return self._route(path)
+
+            def _route(self, path):
+                if path == "/api/hidden":
+                    return self._send(1)
+                return self._send(2)
+        ''', "unlisted call", "self._route(path)")
+
+    def test_subscript_callee_escape_answers_over_real_http(self):
+        status, text = _real_http_probe_with_globals('''
+            def do_GET(self):
+                path = self.path
+                if PREDICATES[path]():
+                    return self._send(1)
+                return self._send_json({"error": "not_found"}, 404)
+        ''', {"PREDICATES": {"/api/hidden": lambda: True}},
+                                                     "GET", "/api/hidden")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"n": 1})
+
+    def test_return_of_subscript_call_escape_answers_over_real_http(self):
+        status, text = _real_http_probe_with_globals('''
+            def do_GET(self):
+                path = self.path
+                return ROUTES[path](self)
+        ''', {"ROUTES": {"/api/hidden": lambda handler: handler._send(1)}},
+                                                     "GET", "/api/hidden")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"n": 1})
+
+    def test_return_of_arbitrary_self_method_escape_answers_over_real_http(self):
+        status, text = _real_http_probe_with_globals('''
+            def do_GET(self):
+                path = self.path
+                return self._route(path)
+
+            def _route(self, path):
+                if path == "/api/hidden":
+                    return self._send(1)
+                return self._send_json({"error": "not_found"}, 404)
+        ''', {}, "GET", "/api/hidden")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"n": 1})
+
+    def test_an_already_followed_delegation_reached_via_return_still_does_not_raise(self):
+        """The design principle this finding does NOT touch: a Return
+        whose value is a KNOWN, ALREADY-FOLLOWED delegation call
+        (``return self._serve_static(path)``, a real, ordinary
+        SAME_PATH_DELEGATES call server.py itself makes) must not be
+        treated as an unlisted call over the SAME node the delegation
+        detector already resolved -- ``_propagates_taint``'s own
+        ``followed`` parameter is what prevents that double-flagging."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if path.startswith("/api/"):
+                    return self._unmatched_route("GET")
+                return self._serve_static(path)
+
+            def _serve_static(self, path):
+                if path in ("/shell", "/shell/"):
+                    return self._send(1)
+        '''))}
+        self.assertIn(("GET", "/shell"), found)
+
+    def test_a_non_self_call_consuming_only_captured_data_in_a_return_does_not_raise(self):
+        """The design principle finding 2b's ``captured`` exemption exists
+        for: a captured id, bound to a local FIRST rather than inlined,
+        handed to an ORDINARY (non-``self.``) service call as part of the
+        function's own terminal answer -- semantically identical to the
+        SAME capture inlined (``api.get_x(m.group(1))``, already exempt),
+        just spelled with the bind split out. Mirrors the real server.py
+        shape ``return self._send_api(api.get_game(gid))`` -- see this
+        class's own test_the_real_server_extracts_with_no_new_raises
+        below for the genuine, at-scale article, reached dozens of times
+        over."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                m = re.match(r"^/api/items/([^/]+)$", path)
+                if m:
+                    gid = m.group(1)
+                    return self._send_api(api.get_item(gid))
+        '''))}
+        self.assertEqual(found, {("GET", "/api/items/{}")})
+
+    def test_a_self_call_consuming_only_captured_data_in_a_return_still_raises(self):
+        """The OTHER half of the same design principle: the ``captured``
+        exemption is deliberately narrower than "any call whose arguments
+        are all captured ids" -- it excludes EVERY ``self.`` call,
+        regardless of what its arguments are, because an arbitrary
+        ``self.`` method (however deep the attribute chain reaching it,
+        see ``_is_self_call``) is exactly where a hidden dispatcher could
+        live in this class. A captured id handed to an uncatalogued
+        ``self.`` method must still raise."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                m = re.match(r"^/api/items/([^/]+)$", path)
+                if m:
+                    gid = m.group(1)
+                    return self._maybe_hidden_route(gid)
+
+            def _maybe_hidden_route(self, gid):
+                return self._send(1)
+        ''', "unlisted call", "self._maybe_hidden_route(gid)")
+
+    def test_the_real_servers_own_named_exemption_stays_clean(self):
+        """The real server.py's own instance of the pattern the previous
+        two tests isolate: ``_serve_static``'s ``ctype = CONTENT_TYPES.get(
+        target.suffix, ...)`` (an opaque Path-PROPERTY extraction,
+        unaffected by this finding) followed by
+        ``self.send_header('Content-Type', ctype)`` (a bare-Expr
+        statement, NOT this finding's own new Return scan, but reached by
+        the SAME `_propagates_taint` call and so a real regression risk
+        for the SAME reason) -- DEMONSTRATED to regress during this
+        finding's own development: an earlier draft's ``captured``/
+        ``_TERMINAL_RESPONSE_SENDERS`` exemptions were checked BEFORE
+        ``_mentions_tracked`` fired, which let a call `_mentions_tracked`
+        would have called "provably unrelated" anyway (this one) instead
+        fall through to `_propagates_taint`'s cruder bottom-of-function
+        fallback (which does not honour any opaque-extraction boundary),
+        newly finding `target` tracked INSIDE `target.suffix` and wrongly
+        deriving `ctype` as tainted -- fixed by gating both new exemptions
+        on `_mentions_tracked` having already fired (see
+        `_propagates_taint`'s own inline comment at that exact point)."""
+        walker = extract_walker()
+        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(walker.unreachable, [])
+
+    def test_the_real_server_extracts_with_no_new_raises(self):
+        """The real server.py -- including the ~13 new self-owned mutation
+        helper (`_guarded_mutation`) and locally-selected-callable
+        (`call`/`mapper`/`deleter`/`fn`/`coach`) Return sites this
+        finding's fix newly reaches, and the removal of one PRE-EXISTING
+        waiver the new `captured` exemption made redundant -- must still
+        extract cleanly: each newly-reached call site is a reviewed,
+        declared ``_AUDIT_WAIVERS`` entry (51 total -- see
+        WaiverFingerprintTests' own pinned count and docstring for the
+        exact accounting), not a scoping hole."""
+        walker = extract_walker()
+        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(walker.unreachable, [])
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 51)
 
 
 if __name__ == "__main__":  # pragma: no cover

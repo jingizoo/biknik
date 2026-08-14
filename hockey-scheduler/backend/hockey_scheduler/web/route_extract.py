@@ -607,16 +607,35 @@ class _Ctx:
     #: inside nested branches. Shared (not copied) with children so the
     #: completeness audit below sees names a child ctx introduced.
     seen: set = field(default_factory=set)
+    #: Every name EVER bound via :meth:`bind_subject` ANYWHERE in this
+    #: function walk (#202 repair round 5, finding 2b) -- a captured regex
+    #: group, directly or a TAIL_DELEGATES/PARSED_DELEGATES parameter
+    #: carrying one across a delegation boundary. Shared (not copied) with
+    #: children the SAME way ``seen`` is, and DELIBERATELY NOT ``subjects``
+    #: itself (which IS copied per child, so it only reflects the CURRENT,
+    #: still-open narrowing scope): DEMONSTRATED that ``ctx.subjects`` goes
+    #: OUT OF SCOPE the moment the ``if <the regex match>:`` block that
+    #: introduced a captured name (the near-universal shape for a capture
+    #: -- ``mgo = re.match(...); if mgo: jid = mgo.group(1)``) closes, so a
+    #: name captured inside ANY nested branch -- the common case -- was
+    #: invisible to a check keyed on ``ctx.subjects`` by the time
+    #: ``_audit_function`` runs at the END of the whole walk, even though
+    #: the SAME name is very much still in ``tracked`` via ``ctx.seen``.
+    #: Read by :func:`_propagates_taint` (as ``captured``) to exempt a
+    #: non-``self.`` call whose only tracked mentions are already-captured
+    #: data -- see that function's own docstring for the full reasoning.
+    captured: set = field(default_factory=set)
 
     def child(self) -> "_Ctx":
         return _Ctx(self.method, self.handler, dict(self.subjects),
                     dict(self.matches), dict(self.dicts), dict(self.tuples),
                     dict(self.tuple_dicts), dict(self.tuple_lookups),
-                    dict(self.origins), self.seen)
+                    dict(self.origins), self.seen, self.captured)
 
     def bind_subject(self, name: str, alts) -> None:
         self.subjects[name] = tuple(alts)
         self.seen.add(name)
+        self.captured.add(name)
 
     def bind_match(self, name: str, info) -> None:
         self.matches[name] = info
@@ -1365,7 +1384,8 @@ class _DispatchWalker:
         for stmt in orelse:
             if isinstance(stmt, ast.Assign) \
                     and _propagates_taint(stmt.value, {subject}, fn_name,
-                                          self.waiver_hits):
+                                          self.waiver_hits, None,
+                                          self._followed):
                 return True
         return False
 
@@ -1785,6 +1805,43 @@ class _DispatchWalker:
         # to run its scan first.
         self._audit_dispatch_helper_calls(fn)
         tracked = set(ctx.seen) | {"path"}
+        # #202 repair round 5, finding 2b: the SUBSET of `tracked` that is a
+        # CAPTURED SUBJECT ANYWHERE in this function's own walk --
+        # ``ctx.captured``, populated by ``bind_subject`` for a regex-group
+        # capture (directly, or a TAIL_DELEGATES/PARSED_DELEGATES parameter
+        # carrying one across a delegation boundary -- see ``_Ctx.captured``'s
+        # own docstring for why this is a DEDICATED, ``seen``-like SHARED
+        # field rather than reusing ``ctx.subjects`` itself, which is
+        # COPIED per nested scope and so goes empty the moment the
+        # enclosing ``if <the regex match>:`` block closes -- the near-
+        # universal shape a capture is actually written in) -- threaded
+        # into `_propagates_taint` so it can exempt a non-`self.` call
+        # whose only tracked mentions are already-captured data.
+        # Deliberately NOT ``ctx.origins`` (a narrower, positional-
+        # correlation record for PARSED_DELEGATES specifically, populated
+        # only when `_group_origin` additionally succeeds -- empty for an
+        # ordinary top-level capture like ``jid = mgo.group(1)``,
+        # DEMONSTRATED to leave the exemption below inert for exactly the
+        # common case it exists for) and deliberately NOT the broader
+        # ``ctx.seen`` (which also contains ``combo``-style tuples and
+        # ``dest``/``parent``-style tuple-dict lookups -- names whose OWN
+        # comparison genuinely IS a routing input, unlike a plain captured
+        # id -- see `_propagates_taint`'s own docstring for the full
+        # reasoning behind this exact set). ``- {"path"}`` UNCONDITIONALLY,
+        # even though ``bind_subject`` itself never binds the literal name
+        # "path" on purpose: DEMONSTRATED that a SAME_PATH_DELEGATES
+        # callee -- ``_serve_static``, whose own parameter happens to ALSO
+        # be named ``path`` -- receives it via exactly this mechanism
+        # (``child.bind_subject(param, alts)`` in
+        # :meth:`_delegate_same_path`, keyed on the CALLEE's parameter
+        # name, not on any "is this literally the request path" test), so
+        # ``ctx.captured`` DOES contain "path" for that function's own
+        # audit. ``tracked``'s primary subject must never be treated as
+        # merely-captured data under any circumstance, in ANY function --
+        # this subtraction is the explicit, unconditional guarantee of
+        # that, independent of whichever binding path put "path" in
+        # ``ctx.captured`` this time.
+        captured_names = set(ctx.captured) - {"path"}
         # #202 repair round 4, finding 3: built ONCE per audited function and
         # threaded into every waiver-key computation below (directly, and via
         # _propagates_taint) -- see _waiver_key's own docstring for what it
@@ -1834,7 +1891,8 @@ class _DispatchWalker:
                     # this coarse, flat-namespace check to duplicate it.
                     continue
                 derived = _propagates_taint(value, tracked, fn.name,
-                                            self.waiver_hits, parents)
+                                            self.waiver_hits, parents,
+                                            self._followed, captured_names)
                 if not derived:
                     continue
                 for leaf in leaves:
@@ -1930,6 +1988,34 @@ class _DispatchWalker:
                         f"{fn.name}:{node.guard.lineno} a match-case guard "
                         f"tests dispatch subject(s) {sorted(hit)} in an "
                         f"unrecognised shape: {ast.unparse(node.guard)}")
+        # #202 repair round 5, finding 2b: the bare-Expr/Return scan below
+        # runs as its OWN, SEPARATE walk, AFTER the If/IfExp/While/
+        # match-case scan above has finished over the WHOLE function --
+        # deliberately not folded into the SAME loop any more (it used to
+        # be). `_propagates_taint`'s "unlisted call" check is a coarse,
+        # GENERIC diagnosis; If/IfExp/While/match-case each have their OWN
+        # more SPECIFIC message (e.g. the ternary-specific "route_extract
+        # does not model ternaries" a bare ``ast.If`` scan can't produce).
+        # A ternary directly inside a ``return``/bare-Expr statement --
+        # ``return self._send(1 if self._is_hidden(path) else 2)``, an
+        # entirely ordinary Python idiom -- has BOTH an outer Return node
+        # AND a nested IfExp node in the SAME subtree; a single combined
+        # ``ast.walk`` visits the OUTER Return first (BFS visits parents
+        # before children), so the coarse Return scan used to raise its
+        # own generic message before the walk ever reached the ternary's
+        # OWN, dedicated check -- DEMONSTRATED to break
+        # InventedEvasionTests' own pinned ternary-message assertions the
+        # moment Return scanning was added in the SAME loop. The general
+        # principle already has precedent in this module:
+        # :meth:`_audit_dispatch_helper_calls` runs BEFORE taint
+        # propagation for the identical reason ("the former names the
+        # actual mistake and must win the race, not be pre-empted by the
+        # latter, coarser diagnosis" -- see that method's own docstring);
+        # this is the same rule applied to a second race the Return scan's
+        # addition newly created. Running the specific scan to completion
+        # FIRST, over the WHOLE function, before the generic one starts,
+        # makes the outcome independent of ``ast.walk``'s node order.
+        for node in ast.walk(fn):
             if isinstance(node, ast.Expr):
                 # #202 repair round 3, finding G: a class-level dispatch-
                 # table lookup invoked as a BARE, UNASSIGNED statement
@@ -1953,8 +2039,51 @@ class _DispatchWalker:
                 # that created this gap). The return value is unused --
                 # only the RAISE (or waiver) side effect matters here; a
                 # bare statement has no target to add to ``tracked``.
+                # ``self._followed`` passed through (#202 repair round 5,
+                # finding 2b) so an already-recognised delegation reached
+                # this way is not ALSO flagged as an unlisted call -- see
+                # _propagates_taint's own docstring for the ``followed``
+                # parameter; no real bare-Expr delegate call exists in
+                # server.py today, but the Return scan just below needs
+                # exactly this for its own, very real ``self._serve_
+                # static(path)`` case, and both scans share one code path.
                 _propagates_taint(node.value, tracked, fn.name,
-                                  self.waiver_hits, parents)
+                                  self.waiver_hits, parents, self._followed,
+                                  captured_names)
+            if isinstance(node, ast.Return) and node.value is not None:
+                # #202 repair round 5, finding 2b: a bare ``return <expr>``
+                # is neither an assignment (the fixed-point loop above only
+                # ever adds a leaf to ``tracked``, it never inspects a
+                # Return) nor an ``ast.Expr`` (the round-3 finding G scan
+                # immediately above this one) -- so NEITHER existing scan
+                # ever visits ``Return.value`` at all. DEMONSTRATED:
+                # ``return ROUTES[path]()`` (a live dispatch-table lookup,
+                # keyed on the tracked path, invoked and returned in one
+                # statement) and ``return self._route(path)`` (an
+                # ARBITRARY, uncatalogued ``self.`` method call -- not a
+                # ``_handle_*``/``_dispatch_*`` name
+                # :meth:`_audit_dispatch_helper_calls` would ever flag, so
+                # its own delegation-detector stays silent too) both
+                # answered live HTTP while extraction recorded zero routes
+                # and raised nothing. Reuses the exact SAME
+                # _propagates_taint check the bare-Expr scan above already
+                # runs, purely for its raise-if-unlisted-and-tracked side
+                # effect (round 2 finding A's rule, extended to a THIRD
+                # statement shape rather than duplicated for it) -- the
+                # return value is unused, and a Return has no assignment
+                # target to add to ``tracked`` any more than a bare Expr
+                # does. ``self._followed`` passed through so an ALREADY-
+                # recognised delegation (``return self._serve_static(
+                # path)``, ordinary and common -- ``_serve_static`` is a
+                # real ``SAME_PATH_DELEGATES`` entry, independently walked
+                # with its own tracked set by :meth:`_maybe_delegate`
+                # during the walk phase, well before this audit runs) is
+                # not ALSO flagged here as an unlisted call over the very
+                # same node -- see _propagates_taint's own docstring for
+                # what ``followed`` skips and why.
+                _propagates_taint(node.value, tracked, fn.name,
+                                  self.waiver_hits, parents, self._followed,
+                                  captured_names)
 
     def _audit_dispatch_helper_calls(self, fn: ast.FunctionDef) -> None:
         """Raise if ``fn`` calls an uncatalogued ``_handle_*``/``_dispatch_*``
@@ -2220,16 +2349,36 @@ _AUDIT_WAIVERS = {
         "by the regex + combo/schema dispatch upstream; this reshapes an "
         "authorisation-check argument, the same 'produces a RESULT' shape "
         "as a captured group handed to a service",
-    ("_handle_setup", "_to_v1.get(kind, lambda r: r)", "assign_rhs", "md"):
-        "#202 repair round 2 finding A -- selects the RESPONSE mapper "
-        "(canonical entity -> its legacy v1 wire shape) for the delete "
-        "route's already-decided entity kind (`kind = md.group(1)`, "
-        "itself matched against a fixed literal alternation). NOT a "
-        "routing decision: every kind in `md`'s pattern already yields "
-        "the SAME `/api/setup/<entity>/{}/delete` leaf (see "
-        "route_registry.py); this only reshapes the response body, the "
-        "same 'produces a RESULT' shape as the two _handle_setup_v2 "
-        "ternary waivers above",
+    ("_handle_setup", "self._V1_SETUP_KIND.get(kind, kind)",
+     "tuple_element", "md"):
+        "#202 repair round 5, finding 2b -- the SAME legacy-name-alias "
+        "lookup as _handle_reassign's own identical-shape waiver "
+        "immediately above (see that entry), reached from the v1 delete "
+        "route's `_guarded_mutation` authorisation-target list instead of "
+        "`_handle_reassign`'s `targets`; newly reached now that a Return "
+        "statement's own value is audited at all (see this dict's own "
+        "round-5, finding-2b comment block below `_handle_reassign_v2`'s "
+        "own guardian-link waivers, above `deleter`/`mapper`) -- NOT a "
+        "routing decision, the route was already decided by `md`'s own "
+        "entity alternation",
+    # REMOVED (#202 repair round 5, finding 2b): this dict used to carry
+    # its own waiver here for ("_handle_setup", "_to_v1.get(kind, lambda
+    # r: r)", "assign_rhs", "md") -- selecting the v1 wire-shape RESPONSE
+    # mapper for the delete route's already-decided entity `kind` (#202
+    # repair round 2, finding A's own original reasoning: every kind in
+    # `md`'s pattern already yields the SAME `/api/setup/<entity>/{}/
+    # delete` leaf, so this only reshapes the response body). Finding 2b's
+    # new `captured` exemption in `_propagates_taint` (see that function's
+    # own docstring) now handles this shape GENERALLY: `_to_v1.get(...)`
+    # is a NON-`self.` call whose only tracked mention (`kind`) is an
+    # already-captured id, so it is exempt the same way `_is_known_
+    # capture_extraction`'s inline form always was, without needing its
+    # own per-call-site waiver. DEMONSTRATED dormant (0 hits,
+    # WaiverFingerprintTests' own real-server exact-one-hit check) once
+    # this finding's fix landed -- removed per this module's own
+    # discipline ("a dormant waiver matches nothing and must be removed:
+    # proof nothing depends on it") rather than left as a stale entry a
+    # future reader would have no way to tell apart from a live one.
     ("do_POST", "required_permission(path)", "assign_rhs",
      "not authorize(role, path)"):
         "#202 repair round 2 finding A -- builds the human-readable "
@@ -2497,6 +2646,41 @@ _AUDIT_WAIVERS = {
         "stays tracked in v1 too, for the reasons this dict's round-5, "
         "finding-1 waiver group above explains -- the route here is fully "
         "decided upstream by `combo in _V1_REASSIGN_SCHEMA`",
+    # -- #202 repair round 5, finding 2b -- newly reached now that Return
+    # statements are audited at all (see _propagates_taint's own
+    # docstring's "captured" paragraph): `_guarded_mutation` is the OTHER
+    # #369 gate alongside `_refuse_unchosen_context`/
+    # `_reject_target_outside_scope` (both waived above) -- it takes the
+    # SAME authorisation-target list `targets` PLUS a zero-argument
+    # MUTATION CALLABLE, runs the target check, the row locks, the write
+    # and the audit inside ONE transaction (server.py:1049-1075), and is
+    # reached here as `return self._guarded_mutation(...)`, the function's
+    # own terminal statement. Not a routing decision either: the route was
+    # fully decided upstream by `combo in _V{1,2}_REASSIGN_SCHEMA`;
+    # `_guarded_mutation` decides whether THIS caller may WRITE to the
+    # already-identified target(s), the same authorisation question as
+    # its two siblings, just running the actual mutation once that
+    # question is answered yes.
+    ("_handle_reassign",
+     "self._guarded_mutation(targets, call, actor_id, role, scope)",
+     "return_value", "call is not None"):
+        "#202 repair round 5, finding 2b -- see the comment block "
+        "immediately above this entry: `_guarded_mutation` is the #369 "
+        "write gate for the ALREADY-DECIDED `combo`; `call` is "
+        "`_V1_REASSIGN_CALL.get(combo)`, a local tuple-keyed-dict lookup "
+        "(#202 repair root cause 1) already structurally recognised as an "
+        "optional dispatch subject -- `if call is not None:` needed no "
+        "waiver of its own for the same reason `dest is not None` never "
+        "did (see round 5, finding 1's own comment block: a LOCAL "
+        "tuple-dict lookup is classified during the walk, unlike a "
+        "module-level one)",
+    ("_handle_reassign_v2",
+     "self._guarded_mutation(targets, call, actor_id, role, scope)",
+     "return_value", "call is not None"):
+        "the v2 sibling of _handle_reassign's own identical-shape waiver "
+        "immediately above; `call` is `_V2_REASSIGN_CALL.get(combo)`, the "
+        "same local tuple-dict-lookup shape, and the route here is fully "
+        "decided upstream by `combo in _V2_REASSIGN_SCHEMA`",
     ("_handle_reassign_v2",
      "self._reject_target_outside_scope(target[0], target[1], actor_id, "
      "role, scope, target[2] if len(target) > 2 else 'scope')", "if_test",
@@ -2541,8 +2725,131 @@ _AUDIT_WAIVERS = {
         "separate, individually exact-one-hit entries rather than one "
         "waiver silently also covering a second, independently-reviewed "
         "call site it was never written against",
+    # -- #202 repair round 5, finding 2b -- newly reached now that Return
+    # statements are audited at all. Every entry below shares ONE shape:
+    # a LOCAL CALLABLE, selected from a small set of already-imported API
+    # functions by a captured id whose alternation ALREADY produces one
+    # leaf per outcome upstream (a dict keyed by a captured `kind`/`op`/
+    # `action`, or -- `call`/`mapper` (v2) -- a ternary on a captured
+    # group already covered by this dict's own PRE-EXISTING ternary
+    # waivers: `mar.group(2) == 'archive'` and `kind == 'venue'`, both
+    # several entries above), then INVOKED. `_propagates_taint`'s
+    # `captured` exemption (see its own docstring) does not reach these
+    # automatically because none of `fn`/`coach`/`mapper`/`deleter`/`call`
+    # is itself a captured id -- each is a NAME BOUND FROM a dict
+    # lookup/ternary keyed on one, the SAME "derived, not captured"
+    # category `perm`/`violation`/`targets` (finding 1) and `call`
+    # (this finding, `_handle_setup_v2`'s own archive/reopen selector,
+    # immediately below) are in. NOT a routing decision in any of these:
+    # the route is fully decided upstream by the SAME alternation that
+    # picks the callable; invoking it merely runs the already-selected
+    # implementation.
+    ("_handle_setup_v2",
+     "self._guarded_mutation([('season', mar.group(1))], lambda: "
+     "call(mar.group(1), reason=b.get('reason'), actor_id=actor_id), "
+     "actor_id, role, scope)", "return_value", "mar"):
+        "#202 repair round 5, finding 2b -- the #369 write gate for the "
+        "season archive/reopen route; `call` is `api.archive_season` or "
+        "`api.reopen_season`, selected by the ternary this dict already "
+        "waives (`mar.group(2) == 'archive'`, several entries above) -- "
+        "see this section's own comment block for the general shape",
+    ("_handle_setup_v2",
+     "call(mar.group(1), reason=b.get('reason'), actor_id=actor_id)",
+     "lambda", "mar"):
+        "the mutation callable itself, reached as the lambda's own body "
+        "instead of as `_guarded_mutation`'s bare argument (this dict's "
+        "immediately preceding entry) -- same call, same reasoning",
+    ("_handle_setup_v2",
+     "self._guarded_mutation([(kind, md.group(2))], lambda: "
+     "mapper(deleter(md.group(2), actor_id)), actor_id, role, scope)",
+     "return_value", "md"):
+        "#202 repair round 5, finding 2b -- the #369 write gate for the "
+        "v2 setup-entity delete route; `deleter` is one of eleven "
+        "`api.delete_<entity>` functions selected by a dict keyed on the "
+        "captured `kind` (`md.group(1)`, already-decided entity "
+        "alternation); `mapper` is `_v2p.venue_to_v2` or identity, "
+        "selected by the SAME `kind == 'venue'` ternary this dict already "
+        "waives (several entries above) -- see this section's own "
+        "comment block for the general shape",
+    ("_handle_setup_v2", "mapper(deleter(md.group(2), actor_id))",
+     "lambda", "md"):
+        "the response-mapping callable, reached as the lambda's own body "
+        "instead of as `_guarded_mutation`'s bare argument (this dict's "
+        "immediately preceding entry) -- same selectors, same reasoning",
+    ("_handle_setup_v2", "deleter(md.group(2), actor_id)",
+     "call_argument", "md"):
+        "the delete callable itself, reached as `mapper`'s own argument -- "
+        "same eleven-way `kind`-keyed dict selection, same reasoning as "
+        "the two entries immediately above",
+    ("_handle_setup",
+     "self._guarded_mutation([(self._V1_SETUP_KIND.get(kind, kind), "
+     "md.group(2))], lambda: mapper(deleter(md.group(2), actor_id)), "
+     "actor_id, role, scope)", "return_value", "md"):
+        "the v1 sibling of _handle_setup_v2's own identical-shape delete "
+        "waiver above: `deleter` is one of ten `api.delete_<entity>` "
+        "functions keyed on the captured `kind`; `mapper` is "
+        "`_to_v1.get(kind, lambda r: r)`, a v1-wire-shape response mapper "
+        "for the same already-decided `kind` (a LOCAL, non-tuple-keyed "
+        "dict `.get()` -- structurally unlike the tuple-keyed dicts this "
+        "module's walker recognises, so `mapper` reaches `tracked` only "
+        "via the generic fallback, same as `deleter`) -- not a routing "
+        "decision, the route was already decided by `md`'s own entity "
+        "alternation",
+    ("_handle_setup", "mapper(deleter(md.group(2), actor_id))",
+     "lambda", "md"):
+        "the response-mapping callable, reached as the lambda's own body "
+        "instead of as `_guarded_mutation`'s bare argument (this dict's "
+        "immediately preceding entry) -- same selectors, same reasoning",
+    ("_handle_setup", "deleter(md.group(2), actor_id)",
+     "call_argument", "md"):
+        "the delete callable itself, reached as `mapper`'s own argument -- "
+        "same ten-way `kind`-keyed dict selection, same reasoning as the "
+        "two entries immediately above",
+    ("do_POST", "fn(gid, player_id, user_id)", "call_argument", "sub"):
+        "#202 repair round 5, finding 2b -- `fn` is one of three "
+        "`api.{accept,decline,add_substitute_to_roster}` functions, "
+        "selected by `{...}[op]` keyed on `op` (`sub.group(2)`, captured "
+        "by the ALREADY-DECIDED `substitutes/(offer|accept|decline|"
+        "add-to-roster)` alternation `sub` matches) -- a dict SUBSCRIPT, "
+        "not `.get()`, so `fn` reaches `tracked` only via the generic "
+        "fallback rather than this module's `.get()`-shaped recogniser. "
+        "Not a routing decision: `gid`/`player_id` are already-captured "
+        "ids handed to the already-selected implementation, the route "
+        "was decided upstream by `sub`'s own regex alternation",
+    ("do_POST", "coach(gid, user_id)", "call_argument", "coach"):
+        "#202 repair round 5, finding 2b -- `coach` is one of "
+        "`api.{lock_roster,unlock_roster,cancel_game}`, selected by "
+        "`{...}.get(action)` keyed on the ALREADY-DECIDED `action` -- not "
+        "a routing decision, the route was decided upstream by the "
+        "literal `action` alternation this dict-`.get()` merely narrows "
+        "an implementation for",
 }
 
+
+#: ``self.`` methods that only WRITE the HTTP response -- ``send_response``/
+#: ``send_header``/``end_headers``/``self.wfile.write``, nothing else --
+#: never a dispatch decision (#202 repair round 5, finding 2b). Verified
+#: against server.py's own four definitions: none contains an ``if``/
+#: ``elif`` on anything path-derived; ``_send_api``'s only branch is a
+#: PAYLOAD-SHAPE check (``"error" in payload``) mapping a domain error to
+#: an HTTP status, not a routing choice. A ``self._send_json(...)``/
+#: ``self._send_api(...)``/``self._send_ics(...)``/``self._send_status(...)``
+#: call reached from a Return is the SAME 'produces the final answer for an
+#: ALREADY-decided route' shape as a waived call (see _propagates_taint's
+#: own docstring) -- checked at that SAME point, only once
+#: ``_mentions_tracked`` has already fired (never any earlier -- an
+#: unconditional skip here would swap this function's precise, opaque-
+#: extraction-aware "provably unrelated" verdict for the cruder fallback
+#: at the bottom of ``_propagates_taint``, which does not honour that
+#: boundary; see the exact regression this caused, documented at that
+#: call site): skip judging the wrapper call itself and let ``ast.walk``
+#: keep examining whatever is nested inside its arguments on its own
+#: merits (a genuinely hidden dispatch table nested INSIDE one of these
+#: calls, e.g.
+#: ``self._send_json(ROUTES[path](), 200)``, is still reached as its own,
+#: separate Call node and still raises).
+_TERMINAL_RESPONSE_SENDERS = {"_send_json", "_send_api", "_send_ics",
+                              "_send_status"}
 
 _PATH_OPS = ("split", "rsplit", "strip", "lstrip", "rstrip", "lower", "upper",
              "partition", "rpartition", "removeprefix", "removesuffix",
@@ -2619,6 +2926,30 @@ _PATH_CONSUMING_METHODS = ("read_bytes", "read_text", "open")
 #: mention when it is nested inside some OTHER unlisted call's arguments
 #: (e.g. a routing comparison hidden inside a genexpr) -- only an
 #: EXTRACTION/CONSUMPTION's receiver must not leak outward like that.
+def _is_self_call(node: ast.Call) -> bool:
+    """Is ``node``'s callee rooted at ``self`` -- ``self.method(...)``,
+    ``self.attr.method(...)``, or any deeper ``self.a.b.c(...)`` chain?
+
+    #202 repair round 5, finding 2b: :func:`_propagates_taint`'s ``captured``
+    exemption (see its own docstring) must NEVER fire for a call this
+    codebase's OWN class defines or owns, since an arbitrary ``self.``
+    method -- however deep the attribute chain reaching it -- is exactly
+    where a hidden dispatcher could live. DEMONSTRATED: checking only the
+    single-level ``self.method(...)`` shape (``func.value`` a bare
+    ``Name("self")``) missed ``self._V1_SETUP_KIND.get(entity, entity)``
+    (``func.value`` is ITSELF an ``Attribute`` -- ``self._V1_SETUP_KIND``,
+    not a bare ``self``) -- silently exempting it and driving an existing,
+    reviewed waiver dormant (0 hits) instead of raising into it. Walks
+    through every ``ast.Attribute``/``ast.Subscript`` layer (the same
+    receiver-chain unwrapping :func:`_direct_operand_names`'s own
+    ``root_name`` already does) to find the chain's ultimate root.
+    """
+    root = node.func
+    while isinstance(root, (ast.Attribute, ast.Subscript)):
+        root = root.value
+    return isinstance(root, ast.Name) and root.id == "self"
+
+
 def _is_opaque_extraction(node) -> bool:
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
         if _is_known_capture_extraction(node):
@@ -2748,7 +3079,9 @@ def _binding_value_and_targets(node):
 
 def _propagates_taint(value, tracked: set, fn_name: str = "",
                       waiver_hits: Optional[dict] = None,
-                      parents: Optional[dict] = None) -> bool:
+                      parents: Optional[dict] = None,
+                      followed: Optional[set] = None,
+                      captured: Optional[set] = None) -> bool:
     """Does this expression still CARRY the request path?
 
     Deliberately narrow. `p2 = self.path.split("?", 1)[0]` carries it -- string
@@ -2827,19 +3160,121 @@ def _propagates_taint(value, tracked: set, fn_name: str = "",
     waiver mechanism itself: the call site still raises, unwaived, the
     exact same way it always did; only what happens to its RESULT
     changed, from "silently forgotten" to "tracked like everything else".
+
+    ``followed`` (#202 repair round 5, finding 2b) is the walker's own
+    ``self._followed`` -- ``id()`` of every Call this run already resolved
+    as a KNOWN delegation (``TAIL_DELEGATES``/``SAME_PATH_DELEGATES``/
+    ``PARSED_DELEGATES``, recognised by :meth:`_DispatchWalker.
+    _maybe_delegate` during the WALK, independently walked with its own
+    tracked set) and CONSUMED as such, rather than an unlisted call this
+    function should reason about. Needed once a bare ``return
+    self._serve_static(path)`` -- ordinary, common, and ALREADY correctly
+    followed -- is reached by :meth:`_DispatchWalker._audit_function`'s new
+    Return scan: without this, ``_serve_static`` (in ``SAME_PATH_DELEGATES``
+    but NOT ``_handle_*``/``_dispatch_*``-prefixed, so
+    :meth:`_audit_dispatch_helper_calls` never looks at it either) would be
+    treated as an unlisted call mentioning the tracked `path` and raise on
+    its own, already-reviewed delegation. Skipped the SAME way a
+    ``manipulates`` call is -- ``continue``, not a verdict on the whole
+    expression -- so a followed delegate nested inside something larger
+    still lets the REST of that expression be examined normally.
+
+    ``captured`` (#202 repair round 5, finding 2b) is the audited function's
+    own ``set(ctx.captured)`` -- names EVER bound as a REGEX-CAPTURE
+    dispatch subject ANYWHERE in this function's walk (:meth:`_Ctx.
+    bind_subject`: a direct ``gid = m.group(1)``, or a TAIL_DELEGATES/
+    PARSED_DELEGATES parameter carrying one across a delegation boundary --
+    see ``_Ctx.captured``'s own docstring for why this must be a DEDICATED,
+    function-wide-SHARED field and not ``ctx.subjects`` itself, which goes
+    out of scope the moment the ``if <the regex match>:`` block that
+    introduced the name closes), deliberately narrower than ``tracked``
+    itself -- excludes ``path``, and excludes ``combo``/``dest``/
+    ``parent``-style names bound via :meth:`_Ctx.bind_tuple`/
+    ``bind_tuple_dict``/``bind_tuple_lookup``, whose own comparison
+    genuinely IS a routing input, unlike a plain captured id. Reaching
+    Return.value with the SAME
+    "unlisted call raises" rule the fixed-point loop and bare-Expr scan
+    already use surfaced a real, LOUD pattern in server.py: dozens of
+    ``return self._send_api(api.get_x(gid, ...))``-shaped statements,
+    where a captured id was bound to a local FIRST (``gid = m.group(1)``)
+    rather than inlined (``api.get_x(m.group(1))``) -- semantically the
+    SAME "a route capture handed to a service produces a RESULT" case
+    ``_is_known_capture_extraction`` already exempts for the INLINE form,
+    just not recognised for the bound-first one, since a bare ``ast.Name``
+    was never treated as an extraction boundary the way ``X.group(N)`` is.
+    Reviewing each of these individually would be 40+ near-identical
+    "waivers" recording the SAME judgement, not 40+ distinct reviews --
+    exactly the "if a fix needs that, the design is wrong" shape a
+    case-by-case waiver is meant to avoid. The narrower, PRINCIPLED fix: a
+    NON-``self.`` call (``api.X``, or a local bound from one via a dict
+    lookup, e.g. ``fn = {"accept": api.accept_substitute, ...}[op];
+    fn(gid, ...)`` -- never a routing table, always the API FACADE this
+    codebase's own layering (CLAUDE.md) guarantees performs no HTTP
+    routing) whose ONLY tracked mentions are already-CAPTURED names is
+    exempt, the SAME way an inline capture already is. Deliberately NOT
+    extended to ``self.`` calls: an arbitrary, uncatalogued ``self.``
+    method is exactly where a HIDDEN dispatcher (the reviewer's own
+    ``self._route(path)``) would live in this class, so those stay under
+    FULL scrutiny regardless of whether their arguments are capture-only --
+    each real one still needs (and, below, has) its own reviewed waiver. A
+    comparison/dispatch TEST on a captured name is UNAFFECTED by this --
+    ``_direct_operand_names``/``root_name`` (the If/IfExp/While/match-case
+    completeness scan) uses ``_tracked_mentions``, a separate function this
+    change does not touch, so ``if self._is_hidden(gid):`` still raises
+    exactly as finding 1 (round 4) already made it.
     """
     for node in ast.walk(value):
         if isinstance(node, ast.Call):
+            if followed is not None and id(node) in followed:
+                continue
             if _is_opaque_extraction(node):
                 continue
             func = node.func
+            is_self_call = _is_self_call(node)
             manipulates = (isinstance(func, ast.Attribute)
                            and func.attr in (_PATH_OPS + _PATH_METHODS)
                            and _propagates_taint(func.value, tracked, fn_name,
-                                                 waiver_hits, parents))
+                                                 waiver_hits, parents,
+                                                 followed, captured))
             if manipulates:
                 continue
             if _mentions_tracked(node, tracked):
+                # #202 repair round 5, finding 2b: BOTH exemptions below are
+                # gated on _mentions_tracked already having fired (i.e. on
+                # this call being one that WOULD otherwise need a waiver or
+                # raise) -- deliberately NOT evaluated any earlier. Checking
+                # either one BEFORE this point -- reachable even when
+                # ``_mentions_tracked`` is False, e.g. `CONTENT_TYPES.get(
+                # target.suffix, ...)` (`target.suffix` is itself an opaque
+                # Path-property extraction _mentions_tracked already looks
+                # straight through) -- would swap this function's ORIGINAL
+                # `return False` (a HARD, immediate "not tainted" verdict)
+                # for a `continue` that lets the loop fall through to the
+                # cruder bottom-of-function fallback below, which does NOT
+                # respect any opaque-extraction boundary (`any(isinstance(x,
+                # ast.Name) and x.id in tracked for x in ast.walk(value))`
+                # walks blindly) -- DEMONSTRATED: exactly this reordering
+                # made `ctype = CONTENT_TYPES.get(target.suffix, ...)`
+                # wrongly derive True (`target` itself is tracked; the
+                # fallback finds it INSIDE `target.suffix` where
+                # `_mentions_tracked` correctly does not), producing a
+                # brand new, spurious raise on `_serve_static`'s
+                # `self.send_header('Content-Type', ctype)` two lines later
+                # -- a real regression this exact placement fixes.
+                if is_self_call and func.attr in _TERMINAL_RESPONSE_SENDERS:
+                    # See _TERMINAL_RESPONSE_SENDERS' own comment: a call
+                    # that only WRITES the HTTP response is never a
+                    # routing decision. Whatever is nested in its
+                    # arguments is still reached and examined on its own,
+                    # separately, by this SAME walk.
+                    continue
+                if (captured and not is_self_call
+                        and _tracked_mentions(node, tracked) <= captured):
+                    # See this function's own docstring: a NON-self call
+                    # whose only tracked mentions are already-captured
+                    # names is the bound-first counterpart of
+                    # ``_is_known_capture_extraction``'s inline exemption.
+                    continue
                 waiver_key = _waiver_key(fn_name, node, parents)
                 if waiver_key in _AUDIT_WAIVERS:
                     # Reviewed and declared not-a-routing-decision for THIS
@@ -2876,12 +3311,12 @@ def _propagates_taint(value, tracked: set, fn_name: str = "",
         # from whichever operand carries the path -- the construction
         # analogue of the method calls handled above.
         return (_propagates_taint(value.left, tracked, fn_name, waiver_hits,
-                                  parents)
+                                  parents, followed, captured)
                 or _propagates_taint(value.right, tracked, fn_name,
-                                     waiver_hits, parents))
+                                     waiver_hits, parents, followed, captured))
     if isinstance(value, ast.Attribute) and value.attr in _PATH_PROPERTIES:
         return _propagates_taint(value.value, tracked, fn_name, waiver_hits,
-                                 parents)
+                                 parents, followed, captured)
     return any(isinstance(x, ast.Name) and x.id in tracked
                for x in ast.walk(value))
 
@@ -3015,6 +3450,32 @@ def _direct_operand_names(test, tracked: frozenset = frozenset({"path"})) -> set
                 # resolves to "path" exactly as before either way.
                 for arg in list(node.args) + [kw.value for kw in node.keywords]:
                     found.update(_tracked_mentions(arg, tracked))
+                # #202 repair round 5, finding 2a: a Subscript used AS THE
+                # CALLEE (``PREDICATES[path]()``, ``ROUTES[path]()``) is a
+                # DIFFERENT case from the plain ``ast.Subscript`` unwrapping
+                # two branches above (``node = node.value``, walking a
+                # receiver CHAIN like ``SOME_DICT[key].attr`` up toward its
+                # root name) -- that branch DISCARDS ``.slice`` on purpose,
+                # correct for a chain where the slice is not what decides
+                # anything, but WRONG here: which callable a Subscript-
+                # callee invokes depends on the WHOLE subscript expression,
+                # slice included, and ``node = node.func`` below would
+                # otherwise walk straight past it the very same way (this
+                # loop reaches ``PREDICATES`` as its eventual root name,
+                # never ``path`` sitting inside the ``[...]``).
+                # DEMONSTRATED: ``if PREDICATES[path](): ...`` answered live
+                # HTTP 200 for a hidden route while ``extract_routes``
+                # recorded zero routes and raised nothing -- ``path`` is
+                # not one of the Call's own ``.args`` here (the call takes
+                # none), so even THIS round's own args-scan just above
+                # never saw it. Scanned the SAME way call arguments are:
+                # this call is only ever reached from ``visit_operand`` as
+                # (or boolop/not-ed into) the whole tested condition or a
+                # comparison operand of it, so the callee's own subscript
+                # is still an operand position, never a case where scanning
+                # it would reach past what the test actually decides on.
+                if isinstance(node.func, ast.Subscript):
+                    found.update(_tracked_mentions(node.func, tracked))
                 node = node.func
             else:
                 return None
