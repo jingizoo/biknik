@@ -42,15 +42,45 @@ Game ──< AuditLog
 | --- | --- | --- |
 | id | str | `player_…` |
 | team_id | str | owning team |
-| name | str | fictional in seed data |
+| name | str | flattened DISPLAY name; **derived** ("first last") whenever the structured names below are set (#273), free-typed only on legacy rows |
 | position | Position | `GOALIE` / `DEFENSE` / `FORWARD` / `SKATER` |
 | shoots | str? | "L" / "R" (optional) |
 | jersey_number | int? | 1–98, or unset; unique among a team's **active** players (#269) |
 | is_active | bool | inactive players are not eligible |
-| guardian_person_id | str? | set for junior players |
+| external_ref | str? | stable import-matching `player_code` (#93) |
+| first_name | str? | structured name (#273); never guessed by splitting `name` |
+| last_name | str? | set/cleared together with `first_name` |
+| preferred_name | str? | optional preferred given name |
+| birthdate | str? | **private** `YYYY-MM-DD`; stripped from default facade payloads, operator opt-in only |
+| registration_number | str? | **private** stable governing-body id; same-team duplicates refused, cross-team duplicates warned |
+| skill_rating | int? | 1–7 coach rating (#287 ruling → #273); `None` = unrated, ranked last but never excluded |
 
 `position` maps to a **slot type**: `GOALIE` → goalie slot; everything else →
 skater slot.
+
+The guardian relationship is `GuardianLink` (verified, consent-recorded —
+#26/#35). The legacy `guardian_person_id` field was removed from the model
+and every payload in #273 (nothing ever read it); its dead DB column is
+retained until an explicit follow-up drop migration.
+
+## AgeEligibilityRule (#273)
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| id | str | `agerule_…` |
+| league_season_id | str | the LeagueSeason the rule governs |
+| version | int | append-only; (league_season_id, version) unique — rows are immutable history |
+| cutoff_month / cutoff_day | int | age is measured on this month/day in the Season's start year (Feb 29 refused) |
+| tiers | list | `{"code": "U10", "max_age": 10}`; `max_age: null` = open tier; eligible iff age at cutoff is strictly under `max_age` |
+| enforcement | str | `warn` (default) / `block`; warn-first — no consumer hard-blocks yet |
+| created_at | datetime | |
+| actor_id | str? | |
+
+A Division declares its tier via its existing `age_group` text, matched
+case-insensitively against the rule's tier codes. Evaluation answers
+eligible / ineligible / indeterminate (`no_rule`, `no_birthdate`,
+`unknown_tier`, `no_season_start`, …) and always names the exact rule
+version used; the result never contains the birthdate itself.
 
 ## Game
 
