@@ -245,72 +245,38 @@ for the standing tripwire):
   not something that closes this gap by construction in
   :mod:`route_extract` itself.
 
-#202 repair round 12, finding 1 (documented here deliberately, NOT fixed
-this round -- see ``tests/test_route_extract.py``'s
-``MatchCaptureShadowLimitationGuardTests`` for the standing tripwire):
+#202 repair round 12, finding 1 -- CLOSED by round 13, finding 2 (was
+documented here as NOT fixed; kept only as a pointer for anyone who reads
+an old copy of this section, not as an open item):
 
 * Round 11's own finding A bounded itself explicitly to "is ``STATE``
   shadowed here", not to chasing ``STATE``'s own module-level definition
-  further -- but even within that narrower, already-accepted scope, the
-  fix is not complete: :func:`_name_rebinding_sites` (see its own
-  docstring and body, just below) enumerates the SPELLINGS Python's
-  grammar uses for a binding -- an ``ast.Name`` in Store/Del context, an
-  ``ast.arg``, an ``ExceptHandler.name``, a ``global``/``nonlocal``
-  declaration, an ``import ... as`` alias -- but Python's structural
-  pattern matching (``match``/``case``) adds binding forms this list does
-  not enumerate: a bare capture pattern (``case STATE:``, parsed as an
-  ``ast.MatchAs`` with ``pattern=None`` and ``name="STATE"``) and a
-  mapping-rest capture (``case {**STATE}:``, an ``ast.MatchMapping`` with
-  ``rest="STATE"``) each bind their own name for the REST of the
-  enclosing function exactly as a plain ``name = ...`` assignment would
-  (a ``match`` statement introduces no new scope of its own), yet neither
-  ``ast.MatchAs`` nor ``ast.MatchMapping`` appears among the node types
-  :func:`_name_rebinding_sites` walks for (route_extract.py:4019-4034).
-  CONFIRMED directly, not asserted from memory: for a synthetic function
-  body containing ``api = STATE.api`` followed by ``match x: case
-  STATE: pass``, ``_name_rebinding_sites("STATE", fn)`` returns ``[]``
-  (an empty list) -- so :func:`_trusted_source_free_roots`'s zero-hits
-  check (route_extract.py:4158-4160) never observes the shadow at all,
-  and ``_has_dominating_trusted_binding("api", fn, parents)`` still
-  answers ``True`` for the shadowed function. This is the exact same
-  class of escape round 11's own finding A closed for a parameter-default
-  or a preceding local reassignment of ``STATE`` (documented above),
-  reopening through a THIRD, distinct binding spelling neither round 10
-  nor round 11 enumerated -- not a new category of gap, but the SAME
-  "spelling/binding-form enumeration is not exhaustive" regress this
-  module's own docstring already predicts below ("a twelfth round should
-  be expected to find a twelfth thing").
-* NOT exploitable against the real ``server.py`` today: independently
-  RE-confirmed fresh for this round (not copied forward from any prior
-  verify track's own claim) by parsing the real file and walking its
-  FULL parsed AST for any ``ast.Match`` node -- zero, anywhere in the
-  file, a strictly BROADER check than "only inside ``class Handler``" or
-  "only inside the two entry points" since a module with no ``match``
-  statement anywhere has none reachable from anywhere either.
-  ``MatchCaptureShadowLimitationGuardTests`` asserts this directly
-  against the real file and fails LOUDLY the moment a ``match`` statement
-  is introduced anywhere in ``server.py``, rather than staying silent
-  while the gap this section describes quietly goes live. This is
-  architectural and latent, not a live hole today.
-* What would close it, and why it is NOT implemented now: teach
-  :func:`_name_rebinding_sites` two more node shapes to watch for --
-  an ``ast.MatchAs`` node whose ``.name`` is not ``None``, and an
-  ``ast.MatchMapping`` node whose ``.rest`` is not ``None`` -- the SAME
-  reason that function already special-cases ``ast.arg``/
-  ``ExceptHandler``/``Global``/``Nonlocal``/``Import`` individually
-  rather than relying on ``ast.Name`` Store/Del context alone: each is a
-  binding Python's grammar does not spell as an ``ast.Name`` at all. This
-  is a bounded, mechanical extension of an EXISTING function's EXISTING
-  enumeration strategy, not a new architectural question -- but,
-  mirroring finding H's and finding B's own treatment above, it is
-  deliberately NOT implemented this round: ``server.py`` has no ``match``
-  statement anywhere for it to matter against today, and the standing
-  tripwire above is what would force the extension to be made the day it
-  first does, rather than this gap quietly going live unnoticed.
+  further -- and, within that narrower scope, round 12 found the fix was
+  not yet complete: :func:`_name_rebinding_sites` enumerated the SPELLINGS
+  Python's grammar uses for a binding -- an ``ast.Name`` in Store/Del
+  context, an ``ast.arg``, an ``ExceptHandler.name``, a ``global``/
+  ``nonlocal`` declaration, an ``import ... as`` alias -- but not the two
+  binding forms Python's structural pattern matching adds: a bare capture
+  pattern (``case STATE:``, ``ast.MatchAs``) and a mapping-rest capture
+  (``case {**STATE}:``, ``ast.MatchMapping``). Round 12 documented this
+  rather than fixing it, on the strength of "server.py has no ``match``
+  statement today" -- round 13's own review rejected that reasoning: the
+  ORIGINAL round-12 tripwire test exercised the gap with the capture
+  textually BEFORE the trusted ``api = STATE.api`` read, an ordering that
+  is not merely unexploited today but literally cannot execute (Python's
+  own per-function scoping makes ``STATE`` local to the WHOLE function
+  the moment ANY statement in it binds ``STATE``, capture included, so
+  that ordering raises ``UnboundLocalError`` before the trusted read is
+  ever reached) -- the "not exploitable today" claim rested on a repro
+  that could not run, not on the underlying Python semantics being safe.
+  See :func:`_name_rebinding_sites`'s own docstring for the fix and
+  ``CapturedArgumentProvenanceTests``'s match-capture cases
+  (test_route_extract.py) for the corrected, EXECUTABLE (capture-before-
+  read) repro, proven both statically and over real HTTP.
 
 On the soundness of this gate, honestly stated
 ------------------------------------------------
-This module has been adversarially reviewed across ELEVEN rounds: the
+This module has been adversarially reviewed across THIRTEEN rounds: the
 original repository-owner review (6 findings, all closed by the #202
 repair), a first self-directed adversarial hunt (findings A-D, round 2), a
 second (findings E-H, round 3 -- E/F/G closed by this section's own
@@ -380,7 +346,22 @@ allowlist was tried and rejected (174 distinct ``api.<attr>`` names in
 server.py today, and a name-based heuristic produced a real false
 positive), so this stays NOT fixed -- documented just below as a KNOWN
 LIMITATION, with the Callable-annotation contract test round 10 already
-added as its standing tripwire).
+added as its standing tripwire), an ELEVENTH (round 12: 1 finding --
+round 11's own finding A closed "is ``STATE`` shadowed" for a parameter-
+default and a local reassignment, but :func:`_name_rebinding_sites`'s
+binding-form enumeration missed a THIRD spelling structural pattern
+matching adds, a ``match``/``case`` capture -- documented rather than
+fixed, on the strength of "server.py has no ``match`` statement today"),
+and a TWELFTH (round 13: round 12's own "not exploitable today" call did
+not survive its own tripwire test actually being RUN -- the synthetic
+repro placed the trusted ``api = STATE.api`` read BEFORE the capture that
+was supposed to shadow it, an ordering Python itself refuses to execute
+(``UnboundLocalError``) once ANY statement in the function binds that
+name, capture included -- so the gap was live, not merely latent, and
+finding 2 fixes it outright: :func:`_name_rebinding_sites` now recognises
+``ast.MatchAs``/``ast.MatchMapping`` captures the exact same way it
+already recognises ``ast.arg``/``ExceptHandler``/``Global``/``Nonlocal``/
+``Import``).
 Each round's own pattern repeats: fix what was found, and a FRESH hunt
 finds more. That is not a sign any individual round was careless -- it
 is the expected, unavoidable shape of a bespoke static analyzer over a
@@ -397,7 +378,7 @@ trade-off:
   above (the captured-arg provenance gate trusts a proven name's WHOLE
   surface, not a per-method allowlist) are known, DOCUMENTED,
   currently-undemonstrated-beyond-what-is-stated gaps; there is no proof
-  that no OTHER gap exists beyond the ones eleven rounds of review
+  that no OTHER gap exists beyond the ones thirteen rounds of review
   happened to find -- round 9's own finding is itself a clear illustration:
   round 8 closed its specific category (transparent Tuple/List/IfExp
   composition) completely, and a NEW category (higher-order argument
@@ -414,7 +395,15 @@ trade-off:
   INSIDE an already-trusted expression turns out to need the identical
   unshadowed-name proof the expression's own root did, one level up (see
   round 11's finding A above). A twelfth round should be expected to
-  find a twelfth thing, on the same pattern as the first eleven;
+  find a twelfth thing, on the same pattern as the first eleven -- and it
+  did: round 12 found a THIRD unmodelled binding spelling
+  (:func:`_name_rebinding_sites` had not been taught structural pattern
+  matching's own capture forms), the same category as round 11's finding
+  A one binding-form further out, not a new category. Round 13 then found
+  that round 12's own "not exploitable today" call rested on a repro that
+  could not execute -- a reminder that "documented as latent" is only as
+  good as the falsifiability of the tripwire proving it stays latent, not
+  a substitute for actually running the thing;
 * the actual soundness BACKSTOP for CORRECTNESS -- as distinct from
   completeness of this module's own DETECTION -- is not this static walker
   at all, but a RUNTIME proof already in place: the 405/Allow admission
@@ -3986,7 +3975,11 @@ def _name_rebinding_sites(name: str, fn: ast.FunctionDef) -> list:
     grammar does not spell as an ``ast.Name`` at all: a function/lambda
     PARAMETER (``ast.arg``), an ``except ... as name:`` handler (a plain
     ``str`` on ``ExceptHandler.name``, never a Name node), ``global``/
-    ``nonlocal name``, and ``import ... as name``.
+    ``nonlocal name``, ``import ... as name``, and (#202 repair round 13,
+    finding 2 -- see below) a ``match``/``case`` CAPTURE pattern: a bare
+    capture (``case name:``, ``ast.MatchAs`` with ``.name`` set) or a
+    mapping-rest capture (``case {**name}:``, ``ast.MatchMapping`` with
+    ``.rest`` set).
 
     #202 repair round 10 (external review): used by
     :func:`_captured_arg_trusted_roots` to answer "is ``name`` bound
@@ -4001,6 +3994,35 @@ def _name_rebinding_sites(name: str, fn: ast.FunctionDef) -> list:
     unrebound binding" exactly as hard as an explicit ``api = evil_api``
     reassignment does -- the reviewer's own required "parameter shadowing"
     coverage is exactly this case.
+
+    #202 repair round 13, finding 2 (external review): round 12 finding 1
+    documented, but deliberately did NOT fix, that this enumeration missed
+    two more binding spellings Python's structural pattern matching adds --
+    ``ast.MatchAs`` (a bare ``case NAME:`` capture) and ``ast.MatchMapping``
+    (a mapping-rest ``case {**NAME}:`` capture) -- each binds its own name
+    for the REST of the enclosing function exactly as a plain assignment
+    would (a ``match`` statement introduces no scope of its own), the SAME
+    "spelling Python's grammar does not write as an ``ast.Name``" shape
+    ``ast.arg``/``ExceptHandler``/``Global``/``Nonlocal``/``Import`` are
+    already special-cased for, just a THIRD binding form neither round 10
+    nor round 11 had reason to enumerate at the time. FIXED here rather
+    than left as a documented gap: round 12's own "not exploitable today"
+    argument (server.py has no ``match`` statement) rested on treating this
+    as merely latent, but a corrected, EXECUTABLE repro (the capture
+    textually BEFORE the trusted ``api = STATE.api`` read, so Python's
+    static per-function scoping -- which makes ``STATE`` local to the
+    WHOLE function the instant ANY statement in it binds ``STATE``, capture
+    included -- does not raise ``UnboundLocalError`` before the read is
+    even reached) shows the underlying Python semantics are exploitable
+    NOW, independent of whether server.py happens to use this construct
+    today; see ``CapturedArgumentProvenanceTests``'s match-capture cases
+    (test_route_extract.py) for the live-HTTP proof and
+    :func:`_has_dominating_trusted_binding`'s own docstring for how this
+    closes the exemption. A ``getattr(ast, ..., ())`` fallback keeps this
+    a no-op (never an ``AttributeError``) on a Python old enough to lack
+    structural pattern matching, the same defensive style
+    ``_ROLE_ATTRS``'s own ``hasattr(ast, "match_case")`` guard already
+    uses elsewhere in this module.
 
     Deliberately counts a binding inside a NESTED closure (a ``def``/
     ``lambda`` inside ``fn``) too, even though such a closure's own local
@@ -4031,6 +4053,11 @@ def _name_rebinding_sites(name: str, fn: ast.FunctionDef) -> list:
             for alias in node.names:
                 if (alias.asname or alias.name.split(".")[0]) == name:
                     sites.append(node)
+        elif isinstance(node, getattr(ast, "MatchAs", ())) and node.name == name:
+            sites.append(node)
+        elif isinstance(node, getattr(ast, "MatchMapping", ())) \
+                and node.rest == name:
+            sites.append(node)
     return sites
 
 

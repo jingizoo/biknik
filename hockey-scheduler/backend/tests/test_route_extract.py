@@ -6101,6 +6101,135 @@ class CapturedArgumentProvenanceTests(unittest.TestCase):
         self.assertEqual(found, {("GET", "/api/{}")},
                          "mutation expected to WRONGLY exempt this shape")
 
+    # -- round 13, finding 2: the SAME "is STATE shadowed here" question    -
+    # -- round 11's finding A already closed for a parameter-default and a  -
+    # -- local reassignment, reopened through a THIRD binding spelling      -
+    # -- neither round 10 nor round 11 enumerated -- a match/case CAPTURE   -
+    # -- pattern. Round 12 documented this without fixing it, reasoning     -
+    # -- from a synthetic repro that placed the capture AFTER the trusted   -
+    # -- ``api = STATE.api`` read -- an ordering that cannot actually       -
+    # -- execute (Python's own per-function scoping makes a name bound by   -
+    # -- a capture anywhere in the function LOCAL for the WHOLE function,   -
+    # -- so reading it before the capture runs raises ``UnboundLocalError``,-
+    # -- never reaching the real global ``STATE``). These fixtures use the  -
+    # -- CORRECTED ordering -- capture first, trusted read second -- so the -
+    # -- live probes below exercise a repro that genuinely runs -----------------
+
+    def test_state_bare_capture_shadow_raises(self):
+        """A bare ``case STATE:`` capture pattern (``ast.MatchAs``) ahead of
+        ``api = STATE.api`` shadows ``STATE`` for the rest of the function
+        exactly as a parameter default or a local reassignment already do
+        (round 11's finding A) -- :func:`_name_rebinding_sites` now finds
+        this ``ast.MatchAs`` site (round 13 finding 2's fix), so the
+        free-root check refuses the ``api`` exemption here too."""
+        self._raises('''
+            def do_GET(self, x=evil_state):
+                path = self.path
+                match x:
+                    case STATE:
+                        pass
+                api = STATE.api
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return api.invoke({"hidden": api.hidden, "other": api.other}[action], self)
+        ''', "unlisted call")
+
+    def test_state_bare_capture_shadow_escape_answers_over_real_http(self):
+        """The SAME source text as the static test above, driven live: the
+        parameter default (``x=evil_state``) is what a real request with no
+        arguments reaches, the match statement UNCONDITIONALLY captures it
+        into ``STATE`` (a bare capture pattern has no test to fail), and
+        that capture runs BEFORE ``api = STATE.api`` reads it -- so this
+        genuinely executes, unlike round 12's own repro. ``/api/hidden``
+        answers 200, ``/api/other`` answers 404, the SAME "static stays
+        silent [before this round's fix], live diverges 200/404" proof
+        every prior finding in this class required."""
+        body = '''
+            def do_GET(self, x=evil_state):
+                path = self.path
+                match x:
+                    case STATE:
+                        pass
+                api = STATE.api
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return api.invoke({"hidden": api.hidden, "other": api.other}[action], self)
+        '''
+        extra_globals = {
+            "re": re, "evil_state": types.SimpleNamespace(api=_EvilApiFacade()),
+        }
+        status, text = _real_http_probe_with_globals(
+            body, extra_globals, "GET", "/api/hidden")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"n": 1})
+        status2, text2 = _real_http_probe_with_globals(
+            body, extra_globals, "GET", "/api/other")
+        self.assertEqual(status2, 404)
+        self.assertEqual(json.loads(text2), {"error": "not_found"})
+
+    def test_state_mapping_rest_capture_shadow_raises(self):
+        """A mapping-rest ``case {**STATE}:`` capture pattern (``ast.
+        MatchMapping``) is the SAME kind of shadow as the bare-capture case
+        above, just a different binding spelling -- :func:`_name_rebinding_
+        sites` now finds this ``ast.MatchMapping`` site too."""
+        self._raises('''
+            def do_GET(self, x=evil_state):
+                path = self.path
+                match x:
+                    case {**STATE}:
+                        pass
+                api = STATE.api
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return api.invoke({"hidden": api.hidden, "other": api.other}[action], self)
+        ''', "unlisted call")
+
+    def test_state_mapping_rest_capture_shadow_escape_answers_over_real_http(self):
+        """The SAME source text as the static test above, driven live --
+        with one HONEST difference from every other live repro in this
+        class, stated plainly rather than glossed over: a mapping-rest
+        capture ALWAYS binds a freshly-constructed, plain ``dict`` (CPython
+        never preserves the subject's own type, or attaches any of its
+        attributes, to the ``**rest`` capture -- confirmed directly against
+        the interpreter, not assumed), so ``STATE.api`` cannot resolve to
+        ``evil_state``'s facade the way the bare-capture case's ``STATE``
+        does -- it raises ``AttributeError: 'dict' object has no attribute
+        'api'`` INSIDE the handler instead. That is still a live divergence
+        from what the (pre-fix) static analysis claims: extraction used to
+        treat this function as safe to exempt, yet no real request against
+        it can even REACH the reviewed facade at all -- it never gets past
+        the shadowed read. ``http.server``'s threading dispatch has no
+        handler for an exception escaping ``do_GET`` (see
+        ``BaseServer.handle_error``): it logs a traceback server-side and
+        the connection simply closes with no HTTP response, which
+        ``urllib`` surfaces client-side as ``ConnectionError`` (concretely
+        ``http.client.RemoteDisconnected``, itself a ``ConnectionError``
+        subclass -- confirmed directly, not assumed) rather than any status
+        code. The shape differs from the 200/404 split elsewhere in this
+        class only in WHICH observable signals the shadow -- the shadow
+        itself, and the fact that (pre-fix) static analysis stayed silent
+        about it, are identical."""
+        body = '''
+            def do_GET(self, x=evil_state):
+                path = self.path
+                match x:
+                    case {**STATE}:
+                        pass
+                api = STATE.api
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return api.invoke({"hidden": api.hidden, "other": api.other}[action], self)
+        '''
+        extra_globals = {
+            "re": re, "evil_state": types.SimpleNamespace(api=_EvilApiFacade()),
+        }
+        with self.assertRaises(ConnectionError):
+            _real_http_probe_with_globals(body, extra_globals, "GET", "/api/hidden")
+
     # -- round 11, finding B (KNOWN LIMITATION, NOT fixed -- see           -
     # -- route_extract.py's module docstring, KNOWN LIMITATIONS): even a   -
     # -- GENUINELY, provenance-proven ``api = STATE.api`` (finding A's own -
@@ -6272,82 +6401,98 @@ class CapturedArgumentProvenanceTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# #202 repair round 12, finding 1 (documented, NOT fixed this round -- see     #
-# route_extract.py's module docstring, KNOWN LIMITATIONS): round 11's own      #
-# finding A bounded itself to "is STATE shadowed here", and closed that for a  #
-# parameter-default and a local reassignment -- but _name_rebinding_sites      #
-# does not recognise a match-statement CAPTURE PATTERN (a bare `case STATE:`,  #
-# ast.MatchAs, or a mapping-rest `case {**STATE}:`, ast.MatchMapping) as a      #
-# binding site for the name it captures, so the SAME class of escape reopens   #
-# through this third, unmodelled binding spelling. NOT exploitable against     #
-# the real server.py today -- it contains no match statement anywhere -- and   #
-# this round's own decision is to document rather than extend                  #
-# _name_rebinding_sites, mirroring finding H's and finding B's own treatment.  #
+# #202 repair round 12, finding 1 -- CLOSED by round 13, finding 2. Round 11's #
+# own finding A bounded itself to "is STATE shadowed here", and closed that    #
+# for a parameter-default and a local reassignment; round 12 found (but did    #
+# not fix) a THIRD binding spelling that also shadows a name -- a match/case   #
+# CAPTURE pattern (a bare `case STATE:`, ast.MatchAs, or a mapping-rest        #
+# `case {**STATE}:`, ast.MatchMapping) -- on the strength of "server.py has    #
+# no match statement today". Round 13's review rejected that "not exploitable  #
+# today" call: round 12's OWN tripwire test placed the capture AFTER the       #
+# trusted `api = STATE.api` read, an ordering that cannot execute at all       #
+# (Python's per-function scoping makes a captured name LOCAL for the WHOLE     #
+# function, so reading it before the capture runs raises UnboundLocalError),   #
+# so the "gap is merely latent" conclusion rested on an unrunnable repro, not  #
+# on the underlying Python semantics being safe. This class now proves the     #
+# FIX (see _name_rebinding_sites's own docstring, route_extract.py) with the   #
+# CORRECTED (capture-before-read) ordering -- see CapturedArgumentProvenance-  #
+# Tests's own match-capture cases, this file, for the end-to-end static+live   #
+# proof; this class covers the _name_rebinding_sites/_has_dominating_trusted_  #
+# binding mechanism directly, plus the negative controls and load-bearing      #
+# mutations that show the fix -- not merely the fixture -- is what closes it.  #
 # --------------------------------------------------------------------------- #
-class MatchCaptureShadowLimitationGuardTests(unittest.TestCase):
+class MatchCaptureBindingRecognitionTests(unittest.TestCase):
     def test_the_real_server_has_no_match_statement_anywhere(self):
-        """#202 repair round 12, finding 1's own standing tripwire: parses
-        the real server.py FRESH from disk and walks its ENTIRE AST for an
-        ``ast.Match`` node -- Python 3.10+'s ``match``/``case`` statement,
-        the one shape whose two capture-pattern binding forms
-        (``ast.MatchAs``'s bare ``case NAME:``, ``ast.MatchMapping``'s
-        mapping-rest ``case {**NAME}:``) :func:`_name_rebinding_sites`
-        does not recognise as binding sites (see route_extract.py's module
-        docstring, KNOWN LIMITATIONS, round 12 finding 1, and that
-        function's own body, route_extract.py:4019-4034). Deliberately
-        scans the WHOLE file rather than only ``class Handler`` or only
-        the two entry points -- a strictly BROADER check than "reachable
-        from the audited entry points" (a file with no match statement
-        anywhere has none reachable from anywhere either), the same
-        over-inclusive-is-safe bias this module already applies elsewhere
-        (e.g. finding 6c's function-wide except-handler over-
-        approximation). Zero today -- this is what turns "not exploitable
-        today" from a claim into something that fails LOUDLY, not
-        silently, the moment it stops being true, the SAME contract
-        ``DecoratorLimitationGuardTests`` and
-        ``CapturedArgumentProvenanceTests.
-        test_the_real_api_facade_exposes_no_callable_shaped_signature``
-        already hold their own respective documented gaps to."""
+        """Informational, not a limitation guard (the gap this originally
+        pinned is closed -- see this class's own module comment): parses
+        the real server.py FRESH from disk and confirms it still contains
+        no ``ast.Match`` node anywhere. Kept as a cheap regression sanity
+        check and because ``test_the_real_server_extracts_with_no_new_raises``-
+        style tests elsewhere in this module rely on the same "walk the
+        real file fresh" discipline -- not because a match statement
+        appearing would reopen anything: :func:`_name_rebinding_sites` now
+        recognises both of structural pattern matching's capture forms
+        the same way it recognises every other binding spelling."""
         server_src = (BACKEND / "hockey_scheduler" / "web" / "server.py").read_text()
         match_nodes = [
             node for node in ast.walk(ast.parse(server_src))
             if isinstance(node, getattr(ast, "Match", ()))
         ]
-        self.assertEqual(
-            match_nodes, [],
-            "server.py now contains a match statement -- #202 repair "
-            "round 12 finding 1's documented, previously-undemonstrated "
-            "gap (a match-statement capture pattern shadowing a trusted "
-            "free variable like STATE is invisible to "
-            "_name_rebinding_sites, so the captured-arg provenance gate "
-            "can be defeated through it) may now be LIVE. See "
-            "route_extract.py's module docstring, KNOWN LIMITATIONS, "
-            "round 12 finding 1, before dismissing this failure.")
+        self.assertEqual(match_nodes, [])
 
-    def test_name_rebinding_sites_does_not_see_a_bare_capture_pattern_shadow(self):
-        """Direct, minimal reproduction of the gap itself (not merely the
-        real-file absence check above): a synthetic ``do_GET`` containing
-        a genuine, dominating ``api = STATE.api`` assignment followed by
-        ``match x: case STATE: pass`` -- a bare capture pattern that
-        SHADOWS ``STATE`` for the rest of the function, since Python's
-        match statement introduces no scope of its own. If
-        :func:`_name_rebinding_sites` recognised this binding, it would
-        report exactly one hit for ``"STATE"`` and
-        :func:`_has_dominating_trusted_binding` would refuse the ``api``
-        exemption -- the SAME "STATE shadowed" outcome round 11's finding
-        A already proves for a parameter-default or a local reassignment
-        of ``STATE`` (see ``CapturedArgumentProvenanceTests.
-        test_state_parameter_shadow_raises``, this file). CONFIRMED it
-        does not: this pins the GAP itself, directly against the real
-        production functions, not a restatement of the docstring's claim.
-        This assertion is expected to keep passing (the gap stays open)
-        until a future round teaches ``_name_rebinding_sites`` the two
-        match-pattern node shapes the module docstring already describes
-        and deliberately does not implement this round -- at which point
-        this test (and the module docstring's KNOWN LIMITATIONS entry)
-        should be updated to match, not left describing a gap that no
-        longer exists."""
-        src = _module('''
+    # -- the fix itself, at the provenance-helper level -- both binding    -
+    # -- orders, since _name_rebinding_sites walks the WHOLE function via  -
+    # -- ast.walk and does not reason about statement order at all, so a   -
+    # -- capture textually BEFORE or AFTER the trusted read is found       -
+    # -- identically (only the BEFORE order is executable over real HTTP;  -
+    # -- see CapturedArgumentProvenanceTests for that proof and, mirroring -
+    # -- test_rebinding_before_a_valid_facade_assignment_raises's own      -
+    # -- documented asymmetry, the AFTER order stays static-only here) -----
+
+    def _sites_and_trust(self, body: str):
+        src = _module(body)
+        tree = ast.parse(src)
+        handler = next(n for n in tree.body
+                       if isinstance(n, ast.ClassDef) and n.name == "Handler")
+        fn = next(n for n in handler.body
+                 if isinstance(n, ast.FunctionDef) and n.name == "do_GET")
+        sites = route_extract_module._name_rebinding_sites("STATE", fn)
+        parents = route_extract_module._build_parent_map(fn)
+        trusted = route_extract_module._has_dominating_trusted_binding(
+            "api", fn, parents)
+        return sites, trusted
+
+    def test_name_rebinding_sites_recognizes_a_bare_capture_before_the_read(self):
+        """The CORRECTED ordering (capture, then the trusted read) -- the
+        one a real request can actually reach; see
+        ``CapturedArgumentProvenanceTests.test_state_bare_capture_shadow_escape_answers_over_real_http``
+        for the live proof of this exact source."""
+        sites, trusted = self._sites_and_trust('''
+            def do_GET(self, x=1):
+                path = self.path
+                match x:
+                    case STATE:
+                        pass
+                api = STATE.api
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return api.invoke({"hidden": api.hidden}[action], self)
+        ''')
+        self.assertEqual(len(sites), 1)
+        self.assertIsInstance(sites[0], getattr(ast, "MatchAs", ()))
+        self.assertFalse(trusted)
+
+    def test_name_rebinding_sites_recognizes_a_bare_capture_after_the_read(self):
+        """The MIRROR ordering (the trusted read, then the capture) --
+        round 12's own (unrunnable) fixture shape. Static analysis has no
+        control-flow/dominance model to distinguish "read, then shadowed"
+        from "shadowed, then read" any more than
+        ``test_rebinding_before_a_valid_facade_assignment_raises`` does for
+        a plain reassignment of ``api`` itself -- both orders must raise,
+        not merely the executable one, since a text-only walk cannot tell
+        them apart."""
+        sites, trusted = self._sites_and_trust('''
             def do_GET(self, x=1):
                 path = self.path
                 api = STATE.api
@@ -6359,30 +6504,181 @@ class MatchCaptureShadowLimitationGuardTests(unittest.TestCase):
                     action = m.group(1)
                     return api.invoke({"hidden": api.hidden}[action], self)
         ''')
-        tree = ast.parse(src)
-        handler = next(n for n in tree.body
-                       if isinstance(n, ast.ClassDef) and n.name == "Handler")
-        fn = next(n for n in handler.body
-                 if isinstance(n, ast.FunctionDef) and n.name == "do_GET")
+        self.assertEqual(len(sites), 1)
+        self.assertIsInstance(sites[0], getattr(ast, "MatchAs", ()))
+        self.assertFalse(trusted)
 
-        sites = route_extract_module._name_rebinding_sites("STATE", fn)
-        self.assertEqual(
-            sites, [],
-            "_name_rebinding_sites now sees the match-capture shadow of "
-            "STATE -- round 12 finding 1 appears to be fixed. Update (or "
-            "remove) this pin and the module docstring's matching KNOWN "
-            "LIMITATIONS entry to describe the new, closed state rather "
-            "than leaving them claiming an open gap that no longer "
-            "exists.")
+    def test_name_rebinding_sites_recognizes_a_mapping_rest_before_the_read(self):
+        """The mapping-rest capture's own CORRECTED ordering; see
+        ``CapturedArgumentProvenanceTests.test_state_mapping_rest_capture_shadow_escape_answers_over_real_http``
+        for the live proof of this exact source."""
+        sites, trusted = self._sites_and_trust('''
+            def do_GET(self, x=1):
+                path = self.path
+                match x:
+                    case {**STATE}:
+                        pass
+                api = STATE.api
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return api.invoke({"hidden": api.hidden}[action], self)
+        ''')
+        self.assertEqual(len(sites), 1)
+        self.assertIsInstance(sites[0], getattr(ast, "MatchMapping", ()))
+        self.assertFalse(trusted)
 
-        parents = route_extract_module._build_parent_map(fn)
-        self.assertTrue(
-            route_extract_module._has_dominating_trusted_binding(
-                "api", fn, parents),
-            "the provenance gate is expected to WRONGLY still trust "
-            "`api` here, since it never saw STATE's match-capture "
-            "shadow above -- this IS the gap round 12 finding 1 "
-            "documents, not a false positive in this test.")
+    def test_name_rebinding_sites_recognizes_a_mapping_rest_after_the_read(self):
+        """The mapping-rest capture's own MIRROR ordering -- static-only,
+        the same asymmetry as the bare-capture "after" case above."""
+        sites, trusted = self._sites_and_trust('''
+            def do_GET(self, x=1):
+                path = self.path
+                api = STATE.api
+                match x:
+                    case {**STATE}:
+                        pass
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return api.invoke({"hidden": api.hidden}[action], self)
+        ''')
+        self.assertEqual(len(sites), 1)
+        self.assertIsInstance(sites[0], getattr(ast, "MatchMapping", ()))
+        self.assertFalse(trusted)
+
+    # -- negative controls: a pattern that binds NOTHING, or binds a       -
+    # -- DIFFERENT name, must not be mistaken for a "STATE" rebinding site -
+    # -- (a too-broad implementation -- e.g. flagging every MatchAs/       -
+    # -- MatchMapping regardless of name/rest -- would pass the tests      -
+    # -- above but fail these) ----------------------------------------------
+
+    def test_non_binding_value_class_and_or_patterns_are_not_rebinding_sites(self):
+        """None of a VALUE pattern (a dotted name, ``ast.MatchValue``), a
+        CLASS pattern with no captures (``ast.MatchClass``), or an OR
+        pattern of two non-binding alternatives (``ast.MatchOr``) binds any
+        name at all -- ``STATE`` stays whatever it already was outside the
+        match statement, so none of these may register as a rebinding
+        site. Still exercises the genuine ``api = STATE.api`` exemption
+        (the params/locals/attribute-mutation baseline this fix must not
+        regress) by asserting the function stays PROVABLY trusted, not
+        merely that its own ``STATE`` site list is empty."""
+        sites, trusted = self._sites_and_trust('''
+            def do_GET(self, x=1):
+                path = self.path
+                api = STATE.api
+                match x:
+                    case re.IGNORECASE:
+                        pass
+                    case dict():
+                        pass
+                    case 1 | 2:
+                        pass
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return api.invoke({"hidden": api.hidden}[action], self)
+        ''')
+        self.assertEqual(sites, [])
+        self.assertTrue(trusted)
+
+    def test_unrelated_capture_name_is_not_a_state_rebinding_site(self):
+        """A bare capture pattern for a DIFFERENT name (``case OTHER:``)
+        binds ``OTHER``, never ``STATE`` -- confirms the fix matches on
+        the captured NAME, the same discipline every other branch of
+        :func:`_name_rebinding_sites` already applies (an ``ast.arg``
+        named ``x`` is not a rebinding site for ``"y"`` either), not
+        merely "is this an ``ast.MatchAs``/``ast.MatchMapping`` node
+        anywhere in the function"."""
+        sites, trusted = self._sites_and_trust('''
+            def do_GET(self, x=1):
+                path = self.path
+                api = STATE.api
+                match x:
+                    case OTHER:
+                        pass
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return api.invoke({"hidden": api.hidden}[action], self)
+        ''')
+        self.assertEqual(sites, [])
+        self.assertTrue(trusted)
+
+    # -- load-bearing mutations: each of the two new arms is             -
+    # -- INDEPENDENTLY necessary, not merely redundant with the other or  -
+    # -- with round 10/11's pre-existing checks -- removing just ONE arm  -
+    # -- (via a stub that calls the real, fixed function and then filters -
+    # -- out exactly the site shape under test) must reopen exactly the   -
+    # -- escape that arm closes, and no other -------------------------------
+
+    def test_disabling_matchas_recognition_restores_the_bare_capture_escape(self):
+        """MUTATION: ``_name_rebinding_sites`` replaced with a stub that
+        calls the real (fixed) function and then drops every
+        ``ast.MatchAs`` hit -- i.e. "as if this round never taught it that
+        shape" -- while leaving the ``ast.MatchMapping`` recognition
+        (added in the SAME commit) intact. The bare-capture repro, which
+        correctly raises against the real fix (see
+        ``CapturedArgumentProvenanceTests.test_state_bare_capture_shadow_raises``
+        above), goes back to being WRONGLY exempted under this mutation."""
+        original = route_extract_module._name_rebinding_sites
+
+        def stub(name, fn):
+            return [site for site in original(name, fn)
+                   if not isinstance(site, getattr(ast, "MatchAs", ()))]
+
+        route_extract_module._name_rebinding_sites = stub
+        self.addCleanup(setattr, route_extract_module,
+                        "_name_rebinding_sites", original)
+
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self, x=evil_state):
+                path = self.path
+                match x:
+                    case STATE:
+                        pass
+                api = STATE.api
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return api.invoke({"hidden": api.hidden, "other": api.other}[action], self)
+        '''))}
+        self.assertEqual(found, {("GET", "/api/{}")},
+                         "mutation expected to WRONGLY exempt this shape")
+
+    def test_disabling_matchmapping_recognition_restores_the_mapping_rest_escape(self):
+        """MUTATION: the mirror image of the mutation above -- drops every
+        ``ast.MatchMapping`` hit while leaving ``ast.MatchAs`` recognition
+        intact. The mapping-rest repro, which correctly raises against the
+        real fix (see ``CapturedArgumentProvenanceTests.
+        test_state_mapping_rest_capture_shadow_raises`` above), goes back
+        to being WRONGLY exempted under this mutation -- proving this arm
+        is independently load-bearing too, not merely along for the ride
+        with the ``ast.MatchAs`` arm above."""
+        original = route_extract_module._name_rebinding_sites
+
+        def stub(name, fn):
+            return [site for site in original(name, fn)
+                   if not isinstance(site, getattr(ast, "MatchMapping", ()))]
+
+        route_extract_module._name_rebinding_sites = stub
+        self.addCleanup(setattr, route_extract_module,
+                        "_name_rebinding_sites", original)
+
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self, x=evil_state):
+                path = self.path
+                match x:
+                    case {**STATE}:
+                        pass
+                api = STATE.api
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return api.invoke({"hidden": api.hidden, "other": api.other}[action], self)
+        '''))}
+        self.assertEqual(found, {("GET", "/api/{}")},
+                         "mutation expected to WRONGLY exempt this shape")
 
 
 if __name__ == "__main__":  # pragma: no cover
