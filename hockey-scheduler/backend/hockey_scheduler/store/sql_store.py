@@ -69,10 +69,13 @@ from ..domain import (
     GuardianLink,
     InstallationState,
     RosterRole,
+    MembershipStatus,
     Season,
     SensitiveFieldCategory,
     ScheduleScenario,
     SeasonCopyForwardCommit,
+    SeasonRosterMembership,
+    SeasonRosterMembershipEvent,
     SeasonStatus,
     SeasonTeamRegistration,
     SeasonVenueAccess,
@@ -97,6 +100,7 @@ from .db_errors import (
     translate_db_exception,
     translate_ice_slot_conflict_exception,
     translate_ice_slot_time_conflict_exception,
+    translate_membership_conflict_exception,
     translate_player_jersey_exception,
     translate_program_org_fk_exception,
     translate_reassignment_fk_exception,
@@ -123,6 +127,7 @@ from .integrity_checks import (
     assert_roster_refs_exist,
     assert_venue_season_access_backfill_ready,
     assert_player_jersey_constraints_ready,
+    assert_season_roster_membership_backfill_ready,
 )
 
 
@@ -193,8 +198,16 @@ class Spec:
 
 
 SPECS = {
-    # Child of the permanent scheduling hierarchy; keep it before its parents
-    # so SQLite factory-reset deletion follows child-first FK order.
+    # Children of the permanent scheduling hierarchy; keep them before their
+    # parents so SQLite factory-reset deletion follows child-first FK order
+    # (events before memberships, memberships before players/teams/seasons).
+    SeasonRosterMembershipEvent: Spec(
+        SeasonRosterMembershipEvent, "season_roster_membership_events",
+        {"at": _dt(), "detail": _jsonc()}),
+    SeasonRosterMembership: Spec(
+        SeasonRosterMembership, "season_roster_memberships",
+        {"status": _enum(MembershipStatus), "position": _enum(Position),
+         "effective_from": _dt(), "effective_to": _dt()}),
     ScheduleScenario: Spec(
         ScheduleScenario, "schedule_scenarios",
         {"request_input": _jsonc(), "proposal": _jsonc(),
@@ -454,6 +467,8 @@ _PRE_MIGRATION_CHECKS = {
     "047_official_import_unique_keys":
         assert_officials_availability_import_constraints_ready,
     "048_rink_external_ref_unique": assert_no_duplicate_rink_external_refs,
+    "052_season_roster_membership":
+        assert_season_roster_membership_backfill_ready,
 }
 
 # Migrations whose pre-check must be ATOMIC with their own DDL with respect
@@ -1833,6 +1848,68 @@ class SqlStore:
             "(SELECT id FROM league_seasons WHERE season_id = ?)",
             (team_id, season_id))
         return rows[0] if rows else None
+
+    # -- season roster memberships (#205 Slice A) --------------------------
+    def _write_season_roster_membership(self, write, m):
+        # A race lost to either 052 partial unique index (authoritative
+        # active membership per (player, Season); active jersey per
+        # (LeagueSeason, Team)) surfaces as the SAME stable conflict the
+        # service pre-checks raise — mirrors _write_player exactly.
+        try:
+            return write(m)
+        except Exception as exc:
+            translated = translate_membership_conflict_exception(exc, m)
+            if translated is not None:
+                raise translated from exc
+            raise
+    def add_season_roster_membership(self, m):
+        return self._write_season_roster_membership(self._insert, m)
+    def get_season_roster_membership(self, membership_id):
+        return self._get(SeasonRosterMembership, membership_id)
+    def get_season_roster_membership_for_update(self, membership_id):
+        return self._get_for_update(SeasonRosterMembership, membership_id)
+    def save_season_roster_membership(self, m):
+        return self._write_season_roster_membership(self._update, m)
+    def all_season_roster_memberships(self):
+        return self._query(SeasonRosterMembership, order="id")
+    def memberships_for_player(self, player_id):
+        return self._query(SeasonRosterMembership, "player_id = ?",
+                           (player_id,), order="id")
+    def memberships_for_season(self, season_id):
+        return self._query(SeasonRosterMembership, "season_id = ?",
+                           (season_id,), order="id")
+    def memberships_for_league_season_team(self, league_season_id, team_id):
+        return self._query(
+            SeasonRosterMembership, "league_season_id = ? AND team_id = ?",
+            (league_season_id, team_id), order="id")
+    def active_memberships_for_player_in_season(self, player_id, season_id):
+        """Every AUTHORITATIVE (status = 'active') membership at this
+        (player, Season) key. Always 0 or 1 here — migration 052's
+        ``ux_srm_active_player_season`` makes a second impossible to insert —
+        but returning a list gives InMemoryStore's own (unenforced)
+        equivalent a uniform contract callers can share, mirroring
+        ``registrations_for_team_in_league_season`` (#331 round 19)."""
+        return self._query(
+            SeasonRosterMembership,
+            "player_id = ? AND season_id = ? AND status = ?",
+            (player_id, season_id, MembershipStatus.ACTIVE.value), order="id")
+    def open_memberships_for_player_in_league_season(self, player_id,
+                                                     league_season_id):
+        """Every NON-terminal membership at this (player, LeagueSeason) key —
+        the open stint(s). Terminal rows (released/transferred) are history
+        and excluded, so a new stint after a release/transfer is creatable."""
+        return self._query(
+            SeasonRosterMembership,
+            "player_id = ? AND league_season_id = ? AND status NOT IN (?, ?)",
+            (player_id, league_season_id, MembershipStatus.RELEASED.value,
+             MembershipStatus.TRANSFERRED.value), order="id")
+
+    # Append-only (#205): events have add + list only — no update, no delete.
+    def add_season_roster_membership_event(self, event):
+        return self._insert(event)
+    def events_for_membership(self, membership_id):
+        return self._query(SeasonRosterMembershipEvent, "membership_id = ?",
+                           (membership_id,), order="id")
 
     # -- team → permanent League migration decisions (#283 migration 035) ---
     def add_team_league_migration_decision(self, decision):
