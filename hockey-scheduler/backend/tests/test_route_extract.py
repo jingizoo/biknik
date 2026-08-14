@@ -17,10 +17,12 @@ Three properties, each with a falsifying case:
 """
 
 import ast
+import inspect
 import json
 import re
 import textwrap
 import threading
+import types
 import unittest
 import urllib.error
 import urllib.request
@@ -2907,10 +2909,12 @@ class SubscriptCalleeAndReturnDispatchTests(unittest.TestCase):
         shape ``return self._send_api(api.get_game(gid))`` -- see this
         class's own test_the_real_server_extracts_with_no_new_raises
         below for the genuine, at-scale article, reached dozens of times
-        over."""
+        over. ``api = STATE.api`` (#202 repair round 10) is the real,
+        provenance-provable binding this exemption now requires."""
         found = {(r.method, r.template) for r in extract_routes(_module('''
             def do_GET(self):
                 path = self.path.split("?", 1)[0]
+                api = STATE.api
                 m = re.match(r"^/api/items/([^/]+)$", path)
                 if m:
                     gid = m.group(1)
@@ -3645,10 +3649,13 @@ class CompositionalTaintTests(unittest.TestCase):
         one resolving to the reviewed ``api`` facade (see
         ``_captured_arg_safe_callee``'s own docstring); an opaque
         ``CACHE[gid]`` needs its own individual review after this round,
-        exactly like any other unmodelled call/subscript now does."""
+        exactly like any other unmodelled call/subscript now does.
+        ``api = STATE.api`` (#202 repair round 10) is the real,
+        provenance-provable binding this exemption now requires."""
         found = {(r.method, r.template) for r in extract_routes(_module('''
             def do_GET(self):
                 path = self.path.split("?", 1)[0]
+                api = STATE.api
                 m = re.match(r"^/api/items/([^/]+)$", path)
                 if m:
                     gid = m.group(1)
@@ -3879,10 +3886,12 @@ class ExecutionControlAndDataFlowTests(unittest.TestCase):
         (external review): reached via ``api.LOCKS`` rather than a bare
         opaque ``LOCKS`` -- see the identical note on
         ``test_a_subscript_keyed_on_an_already_captured_id_does_not_raise``
-        just above."""
+        just above. ``api = STATE.api`` (#202 repair round 10) is the
+        real, provenance-provable binding this exemption now requires."""
         found = {(r.method, r.template) for r in extract_routes(_module('''
             def do_GET(self):
                 path = self.path.split("?", 1)[0]
+                api = STATE.api
                 m = re.match(r"^/api/items/([^/]+)$", path)
                 if m:
                     gid = m.group(1)
@@ -4215,10 +4224,13 @@ class ExecutionControlAndDataFlowTests(unittest.TestCase):
         bound from a table lookup FIRST via a separate assignment, then
         invoked through a bare Name that is never itself a Call/Subscript
         node needing this exemption at all) is the SAME thing, verified
-        at scale by this class's own real-server test below."""
+        at scale by this class's own real-server test below. ``api =
+        STATE.api`` (#202 repair round 10) is the real, provenance-
+        provable binding this exemption now requires."""
         found = {(r.method, r.template) for r in extract_routes(_module('''
             def do_GET(self):
                 path = self.path.split("?", 1)[0]
+                api = STATE.api
                 m = re.match(r"^/api/items/([^/]+)$", path)
                 if m:
                     gid = m.group(1)
@@ -4256,10 +4268,18 @@ class ExecutionControlAndDataFlowTests(unittest.TestCase):
         `CapturedArgumentCalleeAllowlistTests`'s own Dict-literal
         coverage), so the assignment stays exempt exactly as `HANDLERS.
         get(...)` did pre-round-9, and `fn(self)` is, once again, the
-        ONLY thing this test is actually about."""
+        ONLY thing this test is actually about.
+
+        #202 repair round 10 (external review): `api = STATE.api` is now
+        ALSO needed for the assignment to stay exempt -- a bare, unbound
+        `api` no longer qualifies (see `_captured_arg_safe_callee`'s own
+        updated docstring) -- without it this fixture would raise at the
+        ASSIGNMENT again, for a different reason than round 9's own
+        HANDLERS case, once more failing to isolate this test's point."""
         src = _module('''
             def do_GET(self):
                 path = self.path
+                api = STATE.api
                 m = re.match(r"^/api/([^/]+)$", path)
                 if m:
                     action = m.group(1)
@@ -4924,10 +4944,13 @@ class TransparentCompositionCalleeTests(unittest.TestCase):
     def test_captured_id_as_a_plain_argument_is_still_unaffected(self):
         """Round 5 finding 2b's own control, unchanged: a captured id
         handed to a FIXED, KNOWN service as a plain ARGUMENT (never a
-        callee) stays exempt."""
+        callee) stays exempt. ``api = STATE.api`` (#202 repair round 10)
+        is the real, provenance-provable binding this exemption now
+        requires."""
         found = {(r.method, r.template) for r in extract_routes(_module('''
             def do_GET(self):
                 path = self.path.split("?", 1)[0]
+                api = STATE.api
                 m = re.match(r"^/api/items/([^/]+)$", path)
                 if m:
                     gid = m.group(1)
@@ -4942,10 +4965,13 @@ class TransparentCompositionCalleeTests(unittest.TestCase):
         tuple-index composition the vulnerable repro used, but the result
         is handed to a fixed service as DATA, never invoked -- proving the
         new scan is sensitive to POSITION (does this land in some Call's
-        ``.func``), not merely to "was a tuple involved somewhere"."""
+        ``.func``), not merely to "was a tuple involved somewhere". ``api
+        = STATE.api`` (#202 repair round 10) is the real, provenance-
+        provable binding this exemption now requires."""
         found = {(r.method, r.template) for r in extract_routes(_module('''
             def do_GET(self):
                 path = self.path.split("?", 1)[0]
+                api = STATE.api
                 m = re.match(r"^/api/items/([^/]+)$", path)
                 if m:
                     gid = m.group(1)
@@ -4958,6 +4984,7 @@ class TransparentCompositionCalleeTests(unittest.TestCase):
         found = {(r.method, r.template) for r in extract_routes(_module('''
             def do_GET(self):
                 path = self.path.split("?", 1)[0]
+                api = STATE.api
                 m = re.match(r"^/api/items/([^/]+)$", path)
                 if m:
                     gid = m.group(1)
@@ -4972,6 +4999,7 @@ class TransparentCompositionCalleeTests(unittest.TestCase):
         found = {(r.method, r.template) for r in extract_routes(_module('''
             def do_GET(self):
                 path = self.path.split("?", 1)[0]
+                api = STATE.api
                 m = re.match(r"^/api/items/([^/]+)$", path)
                 if m:
                     gid = m.group(1)
@@ -5023,7 +5051,8 @@ class TransparentCompositionCalleeTests(unittest.TestCase):
         .test_disabling_the_safe_callee_allowlist_restores_every_named_
         escape`` holds ``_is_callee`` fixed and mutates THIS gate instead."""
         original = route_extract_module._captured_arg_safe_callee
-        route_extract_module._captured_arg_safe_callee = lambda node: True
+        route_extract_module._captured_arg_safe_callee = \
+            lambda node, trusted_roots=frozenset(): True
         self.addCleanup(setattr, route_extract_module,
                         "_captured_arg_safe_callee", original)
 
@@ -5471,10 +5500,15 @@ class CapturedArgumentCalleeAllowlistTests(unittest.TestCase):
         this test's point), which would stop this fixture from isolating
         the thing it actually demonstrates: that binding first never
         exempts the LATER bare-name call, regardless of how the
-        assignment itself is judged."""
+        assignment itself is judged. ``api = STATE.api`` (#202 repair
+        round 10) is the real, provenance-provable binding the dict-
+        literal assignment now needs to stay exempt in the first place --
+        without it this fixture would raise at the ASSIGNMENT instead,
+        no longer isolating this test's own point."""
         self._raises('''
             def do_GET(self):
                 path = self.path
+                api = STATE.api
                 m = re.match(r"^/api/([^/]+)$", path)
                 if m:
                     action = m.group(1)
@@ -5489,10 +5523,15 @@ class CapturedArgumentCalleeAllowlistTests(unittest.TestCase):
         39 real captured-only sites, by direct instrumentation): a
         captured id handed to the API FACADE as a plain argument. Must
         remain exempt -- this is precisely what ``_captured_arg_safe_
-        callee``'s allowlist exists to keep passing without a waiver."""
+        callee``'s allowlist exists to keep passing without a waiver.
+        ``api = STATE.api`` (#202 repair round 10) is the real, provenance
+        -provable binding every real server.py call site opens with --
+        see ``CapturedArgumentProvenanceTests`` for what happens WITHOUT
+        it."""
         found = {(r.method, r.template) for r in extract_routes(_module('''
             def do_GET(self):
                 path = self.path.split("?", 1)[0]
+                api = STATE.api
                 m = re.match(r"^/api/items/([^/]+)$", path)
                 if m:
                     gid = m.group(1)
@@ -5506,10 +5545,14 @@ class CapturedArgumentCalleeAllowlistTests(unittest.TestCase):
         right here, of ``api.X`` values, keyed by a captured id. Every
         value the captured key could ever select is visible in this same
         expression and independently safe, so ``_captured_arg_safe_
-        callee``'s ``ast.Dict`` recursion must keep this exempt."""
+        callee``'s ``ast.Dict`` recursion must keep this exempt.
+        ``api = STATE.api`` (#202 repair round 10) is the real,
+        provenance-provable binding every real server.py call site opens
+        with."""
         found = {(r.method, r.template) for r in extract_routes(_module('''
             def do_GET(self):
                 path = self.path.split("?", 1)[0]
+                api = STATE.api
                 m = re.match(r"^/api/setup/([^/]+)/delete$", path)
                 if m:
                     kind = m.group(1)
@@ -5543,7 +5586,7 @@ class CapturedArgumentCalleeAllowlistTests(unittest.TestCase):
         back to being WRONGLY exempted under this mutation, proving the
         allowlist gate (not the pre-existing ``_is_callee``/``captured``
         machinery alone) is what closes them."""
-        self._patch_safe_callee(lambda node: True)
+        self._patch_safe_callee(lambda node, trusted_roots=frozenset(): True)
 
         for body in (
             '''
@@ -5588,28 +5631,31 @@ class CapturedArgumentCalleeAllowlistTests(unittest.TestCase):
 
     def test_disabling_only_the_dict_literal_recursion_still_raises_on_the_real_dispatch_table_shape(self):
         """NARROWER mutation: ``_captured_arg_safe_callee`` replaced with
-        a version that still resolves an ``ast.Attribute`` chain to the
-        ``api`` root correctly, but no longer recurses into an
-        ``ast.Dict``'s own values -- proving the Dict-recursion rule is
-        INDEPENDENTLY load-bearing for the real ``_handle_setup``-shaped
-        dispatch tables, not merely redundant with the Attribute rule."""
-        def attribute_only(node):
+        a version that still resolves an ``ast.Attribute`` chain to a
+        PROVEN-trusted root correctly (the SAME ``trusted_roots`` the real
+        fixed function now consults, round 10's own provenance gate held
+        intact), but no longer recurses into an ``ast.Dict``'s own values
+        -- proving the Dict-recursion rule is INDEPENDENTLY load-bearing
+        for the real ``_handle_setup``-shaped dispatch tables, not merely
+        redundant with the Attribute rule."""
+        def attribute_only(node, trusted_roots):
             if isinstance(node, ast.Attribute):
                 root = node
                 while isinstance(root, (ast.Attribute, ast.Subscript)):
                     root = root.value
-                return (isinstance(root, ast.Name)
-                       and root.id in route_extract_module
-                       ._CAPTURED_ARG_SAFE_CALLEE_ROOTS)
+                return isinstance(root, ast.Name) and root.id in trusted_roots
             return False
 
         self._patch_safe_callee(attribute_only)
 
         # An ordinary api.X(gid) call is UNAFFECTED (still resolves via
-        # the Attribute rule this mutation keeps intact).
+        # the Attribute rule this mutation keeps intact) -- `api = STATE.api`
+        # is the real, provenance-provable binding (#202 repair round 10)
+        # every fixture exercising the allowlist now needs.
         found = {(r.method, r.template) for r in extract_routes(_module('''
             def do_GET(self):
                 path = self.path.split("?", 1)[0]
+                api = STATE.api
                 m = re.match(r"^/api/items/([^/]+)$", path)
                 if m:
                     gid = m.group(1)
@@ -5622,6 +5668,7 @@ class CapturedArgumentCalleeAllowlistTests(unittest.TestCase):
             extract_routes(_module('''
                 def do_GET(self):
                     path = self.path.split("?", 1)[0]
+                    api = STATE.api
                     m = re.match(r"^/api/setup/([^/]+)/delete$", path)
                     if m:
                         kind = m.group(1)
@@ -5640,6 +5687,424 @@ class CapturedArgumentCalleeAllowlistTests(unittest.TestCase):
         self.assertEqual(len(walker.routes), 239)
         self.assertEqual(walker.unreachable, [])
         self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 77)
+
+
+class _EvilApiFacade:
+    """A stand-in for whatever a shadowed/parameter-shadowed ``api`` name
+    actually resolves to -- exposes exactly the higher-order-invoker shape
+    the round-10 reviewer's own repro needs (``invoke(fn, target)`` calls
+    ``fn(target)``), plus two selectable actions keyed the same way the
+    real ``_handle_setup``-style dispatch tables this module already
+    exempts are (see ``CapturedArgumentCalleeAllowlistTests``'s own
+    Dict-literal coverage) -- so the SAME dict-literal-selection shape
+    that is genuinely safe when it never leaves the allowlisted root is
+    reused here to show it is NOT safe once the root itself is not
+    provably the reviewed facade."""
+
+    def invoke(self, fn, target):
+        return fn(target)
+
+    def hidden(self, h):
+        h._send(1)
+
+    def other(self, h):
+        h._send_json({"error": "not_found"}, 404)
+
+
+class CapturedArgumentProvenanceTests(unittest.TestCase):
+    """#202 repair round 10 (external review): ``_captured_arg_safe_callee``
+    authenticates the SPELLING ``"api"``, not the actual facade binding or
+    method -- ``_CAPTURED_ARG_SAFE_CALLEE_ROOTS``/``_captured_arg_safe_
+    callee`` alone accepted every attribute chain rooted at
+    ``ast.Name("api")`` regardless of what that name was actually bound to
+    at the use site. DEMONSTRATED by the reviewer, live over real HTTP:
+
+        api = evil_api
+        return api.invoke({"hidden": api.hidden, "other": api.other}[action], self)
+
+    -- ``/api/hidden`` answers 200, ``/api/other`` answers 404, while
+    static extraction (round 9's own fix, otherwise untouched) stayed
+    silent, reporting only the wildcard ``GET /api/{}``. Both the
+    higher-order invoker (``api.invoke``) and the dict-literal selector's
+    own values (``api.hidden``/``api.other``) passed because their roots
+    are lexically named ``api``, never asking what ``api`` actually,
+    provably IS at that point in the function.
+
+    Round 10 ties the exemption to PROVENANCE instead
+    (``_captured_arg_trusted_roots``/``_has_dominating_trusted_binding``/
+    ``_name_rebinding_sites``, see their own docstrings): a name earns the
+    exemption, for a GIVEN function, only when that function's own body
+    proves it is bound EXACTLY once, at a dominating, top-level,
+    never-rebound ``name = STATE.api`` assignment -- the SAME "is this
+    name really what it claims to be" discipline ``_is_self_call``/
+    ``_is_self_path`` already established for ``self`` (see those
+    functions' own docstrings), extended to an ORDINARY local Python's own
+    calling convention does not bind for free the way the first parameter
+    always is.
+    """
+
+    def _raises(self, body, *substrings):
+        with self.assertRaises(ExtractionError) as caught:
+            extract_routes(_module(body))
+        msg = str(caught.exception)
+        for s in substrings:
+            self.assertIn(s, msg)
+
+    # -- the reviewer's own named repro: IDENTICAL source, static AND    -
+    # -- live -- shadowed api, nested dict-literal selection, and a      -
+    # -- higher-order invoker all in one statement --------------------------
+
+    def test_shadowed_api_dict_literal_higher_order_invoke_raises(self):
+        """The reviewer's own round-10 repro, verbatim. ``api = evil_api``
+        rebinds the name one line before it is used; ``{"hidden": api.
+        hidden, "other": api.other}[action]`` is the SAME "nested
+        dict-literal selection" shape the real ``_handle_setup``-style
+        dispatch tables use (round 9's own reviewed-safe shape); and
+        ``api.invoke(...)`` is the SAME higher-order-transfer shape round
+        9's own ``invoke``/``operator.call`` repros used, just spelled as
+        an attribute of a name that HAPPENS to be on the allowlist.
+        Before this round both passed because their roots are lexically
+        named ``api`` -- this must now raise."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    api = evil_api
+                    return api.invoke({"hidden": api.hidden, "other": api.other}[action], self)
+        ''', "unlisted call")
+
+    def test_shadowed_api_dict_literal_higher_order_invoke_escape_answers_over_real_http(self):
+        """The SAME source text as the static test above, driven over a
+        real socket -- 200 for the hidden action, 404 for every other one
+        -- proving the shape is genuinely exploitable Python, independent
+        of this module, exactly the divergence the reviewer's own report
+        cites."""
+        body = '''
+            def do_GET(self):
+                path = self.path
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    api = evil_api
+                    return api.invoke({"hidden": api.hidden, "other": api.other}[action], self)
+        '''
+        extra_globals = {"re": re, "evil_api": _EvilApiFacade()}
+        status, text = _real_http_probe_with_globals(
+            body, extra_globals, "GET", "/api/hidden")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"n": 1})
+        status2, text2 = _real_http_probe_with_globals(
+            body, extra_globals, "GET", "/api/other")
+        self.assertEqual(status2, 404)
+        self.assertEqual(json.loads(text2), {"error": "not_found"})
+
+    # -- parameter shadowing: the ONLY binding is not an assignment at   -
+    # -- all, so there is no RHS for _has_dominating_trusted_binding to  -
+    # -- even compare against ------------------------------------------------
+
+    def test_parameter_shadowing_raises(self):
+        """``api`` is never ASSIGNED anywhere in this function -- its
+        only binding is the function's own PARAMETER, one of the binding
+        forms :func:`_name_rebinding_sites` watches for precisely because
+        it can never be an ``ast.Assign`` :func:`_has_dominating_trusted_
+        binding` could accept: whoever calls ``do_GET`` fully controls
+        what ``api`` is inside it. (A NESTED closure's own parameter was
+        tried first and rejected as this test's shape: a closure that
+        also mentions a tracked name in its own body gets its NAME
+        implicitly tainted by the round-6 finding-2 rule, which raises
+        at the OUTER call to the closure for an unrelated, pre-existing
+        reason -- correctly, but not in a way that isolates round 10's
+        OWN mechanism, confirmed by re-running this class's own
+        falsifiability check with that shape. Shadowing the entry
+        point's own parameter directly avoids that confound: nothing
+        else in this fixture would raise if this mechanism did not.)"""
+        self._raises('''
+            def do_GET(self, api=evil_api):
+                path = self.path
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return api.invoke({"hidden": api.hidden, "other": api.other}[action], self)
+        ''', "unlisted call")
+
+    def test_parameter_shadowing_escape_answers_over_real_http(self):
+        """The SAME source text as the static test above, driven live:
+        ``BaseHTTPRequestHandler`` itself calls ``self.do_GET()`` with NO
+        arguments, so the DEFAULT value is what a real request actually
+        reaches -- ``api=evil_api`` is simultaneously realistic (a
+        parameter shadowing a name via its own default is ordinary
+        Python) and live-testable via completely normal HTTP dispatch,
+        with no extra plumbing needed to drive the parameter's value."""
+        body = '''
+            def do_GET(self, api=evil_api):
+                path = self.path
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return api.invoke({"hidden": api.hidden, "other": api.other}[action], self)
+        '''
+        extra_globals = {"re": re, "evil_api": _EvilApiFacade()}
+        status, text = _real_http_probe_with_globals(
+            body, extra_globals, "GET", "/api/hidden")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"n": 1})
+        status2, text2 = _real_http_probe_with_globals(
+            body, extra_globals, "GET", "/api/other")
+        self.assertEqual(status2, 404)
+        self.assertEqual(json.loads(text2), {"error": "not_found"})
+
+    # -- rebinding AFTER a valid facade assignment: the LATER, evil       -
+    # -- assignment is the one that actually reaches the use at runtime --
+
+    def test_rebinding_after_a_valid_facade_assignment_raises(self):
+        """A genuine ``api = STATE.api`` is NOT the end of the story if a
+        SECOND assignment follows it -- :func:`_name_rebinding_sites`
+        finds TWO Store-context sites for ``"api"`` here, so
+        :func:`_has_dominating_trusted_binding`'s "exactly one" test
+        fails regardless of which one is real: at the point of use,
+        ``api`` really is ``evil_api``, not ``STATE.api``."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path
+                api = STATE.api
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    api = evil_api
+                    return api.invoke({"hidden": api.hidden, "other": api.other}[action], self)
+        ''', "unlisted call")
+
+    def test_rebinding_after_a_valid_facade_assignment_escape_answers_over_real_http(self):
+        """The SAME source text as the static test above, driven live --
+        the LATER assignment is the one a real request actually reaches,
+        so ``STATE`` itself only needs an ``.api`` attribute to satisfy
+        the (dead, never-reached-at-runtime) first assignment; what it
+        holds is irrelevant to the outcome, exactly as the static
+        analysis question ("is there exactly one binding") does not
+        depend on which one is real either."""
+        body = '''
+            def do_GET(self):
+                path = self.path
+                api = STATE.api
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    api = evil_api
+                    return api.invoke({"hidden": api.hidden, "other": api.other}[action], self)
+        '''
+        extra_globals = {
+            "re": re, "evil_api": _EvilApiFacade(),
+            "STATE": types.SimpleNamespace(api=object()),
+        }
+        status, text = _real_http_probe_with_globals(
+            body, extra_globals, "GET", "/api/hidden")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"n": 1})
+        status2, text2 = _real_http_probe_with_globals(
+            body, extra_globals, "GET", "/api/other")
+        self.assertEqual(status2, 404)
+        self.assertEqual(json.loads(text2), {"error": "not_found"})
+
+    # -- rebinding BEFORE a valid facade assignment: textually ambiguous, -
+    # -- so this raises too, even though at RUNTIME only the LAST         -
+    # -- assignment (the genuine one) ever reaches a use --------------------
+
+    def test_rebinding_before_a_valid_facade_assignment_raises(self):
+        """The mirror image of the "after" case: a throwaway ``api =
+        evil_api`` is IMMEDIATELY overwritten by a genuine ``api =
+        STATE.api`` before any use. At RUNTIME this specific written
+        form is harmless (the LAST assignment always wins), so unlike the
+        "after" case there is no live 200/404 divergence to demonstrate
+        here -- only the static shape is ambiguous. Static extraction
+        still raises: :func:`_name_rebinding_sites` counts TWO sites
+        regardless of order, and this module has no control-flow/
+        dominance analysis to distinguish "rebound, then fixed" from
+        "fixed, then rebound" -- exactly the reviewer's own "reasonable
+        design" ("assigned exactly once ... and it is never reassigned
+        afterward"), applied SYMMETRICALLY rather than only to the
+        direction that happens to be exploitable in this exact fixture.
+        Pairing this test with the "after" test above (both fail the
+        SAME "exactly one site" gate, in either order) is what rules out
+        a narrower, buggier implementation that only checks "is the LAST
+        assignment trusted" and would silently pass this direction."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path
+                api = evil_api
+                api = STATE.api
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return self._send_api(api.get_item(action))
+        ''', "unlisted call")
+
+    # -- negative control: a genuine, provably-dominating STATE.api        -
+    # -- binding remains exempt, on BOTH the Call branch and the           -
+    # -- Subscript/Dict-literal branch, in the SAME function ----------------
+
+    def test_genuine_dominating_state_api_binding_remains_exempt(self):
+        """The real server.py shape this exemption exists for -- ``api =
+        STATE.api`` as a single, dominating, top-level, never-rebound
+        assignment -- must stay clean under the round-10 provenance gate
+        exactly as it did before this round. Exercises BOTH the
+        Call-branch (``api.get_item``) and the Subscript/Dict-literal
+        branch (``{"team": ..., "venue": ...}[kind]``, the SAME shape the
+        round-10 repro abuses when the root is NOT provenance-checked) in
+        the SAME function, proving the fix is precise -- "raise when
+        provenance fails", not "raise on any use of api henceforth"."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                api = STATE.api
+                m = re.match(r"^/api/items/([^/]+)$", path)
+                if m:
+                    gid = m.group(1)
+                    return self._send_api(api.get_item(gid))
+                mv = re.match(r"^/api/setup/([^/]+)/delete$", path)
+                if mv:
+                    kind = mv.group(1)
+                    return self._send_api({"team": api.delete_team, "venue": api.delete_venue}[kind])
+        '''))}
+        self.assertEqual(
+            found,
+            {("GET", "/api/items/{}"), ("GET", "/api/setup/{}/delete")})
+
+    # -- "safe-name object/higher-order-method" cases: once a name's       -
+    # -- provenance is proven, the exemption trusts the REVIEWED facade's  -
+    # -- WHOLE surface (CLAUDE.md's own layering guarantee -- the SAME     -
+    # -- guarantee _CAPTURED_ARG_SAFE_CALLEE_ROOTS's own docstring already -
+    # -- invokes), not a per-method allowlist: the real facade has 174+    -
+    # -- distinct methods (direct AST count against server.py today, see  -
+    # -- the test below), and hand-enumerating them would be exactly the  -
+    # -- "curated shape-by-shape closure [that] is not converging" this   -
+    # -- module's own round-9 docstring already rejected as a strategy,   -
+    # -- at 174-times the scale. That architectural trust is CONTINUOUSLY -
+    # -- VERIFIED, not merely assumed on faith -----------------------------
+
+    def test_the_real_api_facade_exposes_no_callable_shaped_signature(self):
+        """#202 repair round 10 (external review): "a future callback-
+        taking method added under that name can again hide executable
+        route/policy/Allow behavior" -- the reviewer's own stated residual
+        concern once provenance ALONE is fixed. This module cannot prove
+        a HYPOTHETICAL future ``api.invoke``-shaped method is safe any
+        more than it can prove what an arbitrary unlisted function does
+        (see :func:`_captured_arg_safe_callee`'s own docstring: "there is
+        no way to confirm what it resolves to, or does with what it is
+        handed, without running the program") -- there is no way to
+        verify a method's BODY never forwards or invokes whatever it is
+        handed by reading server.py's own source, and this module does
+        not attempt to for ANY call, ``api.`` included.
+
+        What IS checked here, empirically, against the REAL facade: no
+        PUBLIC method on ``ApiService`` or any sub-facade it constructs
+        (``store``/``roster``/``setup``/``delivery``/``delivery_loop``/
+        ``accounts``/``factory_reset``/``guardians``/``context`` today --
+        discovered from a real instance rather than hand-listed a second
+        time here, so this stays accurate as new ones are added) declares
+        a ``Callable``-typed parameter or return value -- the shape a
+        genuine ``api.invoke(fn, target)`` would need. A name-based
+        heuristic (flagging methods merely NAMED ``invoke``/``dispatch``/
+        ``execute``/...) was tried first and rejected: it flagged
+        ``FactoryResetService.execute`` (a plain, ordinary domain
+        operation -- wipe the database given credentials -- that merely
+        happens to be a common English verb), a real false positive
+        proving name-matching is the wrong signal here, exactly the
+        "spelling is not the same as provenance" lesson this whole round
+        is about, applied one level deeper.
+
+        This is a CONTRACT test pinning today's architecture, not a
+        static-analysis code path -- it fails loudly the moment a real
+        callback-typed parameter is added anywhere on the facade,
+        forcing exactly the individual review a NEW allowlist ROOT name
+        already requires (see ``_CAPTURED_ARG_SAFE_CALLEE_ROOTS``'s own
+        docstring) -- applied at the method-signature level, without the
+        174-entry, ever-drifting list an exhaustive per-method allowlist
+        would otherwise force this module to hand-maintain. KNOWN LIMIT:
+        an UNANNOTATED parameter that accepts and invokes a callable
+        without ever being typed ``Callable`` would not be caught by
+        this heuristic either -- the same honestly-documented boundary
+        this module already draws elsewhere (see e.g.
+        ``_binding_value_and_targets``'s own KNOWN LIMITATIONS note)
+        rather than a claim of exhaustive proof."""
+        from hockey_scheduler.api.service import ApiService
+        api = ApiService()
+        facades = {ApiService: api}
+        for _, value in vars(api).items():
+            cls = type(value)
+            if cls.__module__.startswith("hockey_scheduler"):
+                facades.setdefault(cls, value)
+        self.assertGreaterEqual(
+            len(facades), 5,
+            "sanity: this should discover several real sub-facade classes, "
+            "not merely ApiService itself -- a collapse to 1 would mean "
+            "the discovery loop above stopped finding sub-facades and this "
+            "test would be silently checking far less than it claims to")
+        offenders = []
+        for cls in facades:
+            for name, member in vars(cls).items():
+                if name.startswith("_") or not inspect.isfunction(member):
+                    continue
+                try:
+                    sig = inspect.signature(member)
+                except (TypeError, ValueError):
+                    continue
+                for pname, param in sig.parameters.items():
+                    if "callable" in str(param.annotation).lower():
+                        offenders.append(f"{cls.__name__}.{name}({pname})")
+                if "callable" in str(sig.return_annotation).lower():
+                    offenders.append(f"{cls.__name__}.{name} return")
+        self.assertEqual(offenders, [])
+
+        # Count the REAL, distinct api.<attr> attribute names actually
+        # referenced in server.py's Handler class -- the "174+" figure
+        # this test's own docstring cites, kept HONEST rather than
+        # asserted from memory.
+        server_src = (BACKEND / "hockey_scheduler" / "web" / "server.py").read_text()
+        names = {
+            node.attr for node in ast.walk(ast.parse(server_src))
+            if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+               and node.value.id == "api"
+        }
+        self.assertGreaterEqual(len(names), 150)
+
+    # -- load-bearing mutation: the provenance gate is independently       -
+    # -- necessary, not merely redundant with the pre-existing allowlist ---
+
+    def test_disabling_the_provenance_check_restores_the_name_shadowing_escape(self):
+        """MUTATION: ``_captured_arg_trusted_roots`` replaced with a stub
+        that trusts every allowlisted root NAME regardless of provenance
+        -- exactly reproducing round 9's OWN (pre-round-10) behaviour,
+        "spelling alone is enough". The reviewer's own round-10 repro --
+        correctly raising against the real fix (see
+        ``test_shadowed_api_dict_literal_higher_order_invoke_raises``
+        above) -- goes back to being WRONGLY exempted under this
+        mutation, proving the provenance gate (not merely the pre-
+        existing round-9 allowlist, held fixed here) is what closes it.
+        ``_captured_arg_trusted_roots`` is resolved by ``_audit_function``
+        as a bare module-global name at CALL time (the SAME resolution
+        discipline ``_patch_safe_callee``'s own docstring documents for
+        ``_captured_arg_safe_callee``), so patching the module attribute
+        here changes what the NEXT ``extract_routes()`` call sees, no
+        reimport needed."""
+        original = route_extract_module._captured_arg_trusted_roots
+        route_extract_module._captured_arg_trusted_roots = (
+            lambda fn, parents: route_extract_module._CAPTURED_ARG_SAFE_CALLEE_ROOTS)
+        self.addCleanup(setattr, route_extract_module,
+                        "_captured_arg_trusted_roots", original)
+
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    api = evil_api
+                    return api.invoke({"hidden": api.hidden, "other": api.other}[action], self)
+        '''))}
+        self.assertEqual(found, {("GET", "/api/{}")},
+                         "mutation expected to WRONGLY exempt this shape")
 
 
 if __name__ == "__main__":  # pragma: no cover

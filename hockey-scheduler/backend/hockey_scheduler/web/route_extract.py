@@ -192,7 +192,7 @@ exactly how far it goes):
 
 On the soundness of this gate, honestly stated
 ------------------------------------------------
-This module has been adversarially reviewed across NINE rounds: the
+This module has been adversarially reviewed across TEN rounds: the
 original repository-owner review (6 findings, all closed by the #202
 repair), a first self-directed adversarial hunt (findings A-D, round 2), a
 second (findings E-H, round 3 -- E/F/G closed by this section's own
@@ -222,13 +222,29 @@ argument, e.g. ``invoke(handlers.get(action, default_handler), self)``
 -- closed not by teaching ``_is_callee`` a fourth shape but by inverting
 the exemption's own default: a captured value handed to a call is inert
 only when the call target is on a small, explicit, reviewed allowlist,
-see :func:`_captured_arg_safe_callee`). Each round's own pattern
-repeats: fix what was found, and a FRESH hunt finds more. That is not a
-sign any individual round was careless -- it is the expected, unavoidable
-shape of a bespoke static analyzer over a general-purpose language: the
-class of Python constructs that could conceivably encode a routing
-decision is not finite, and this module recognises a specific,
-growing-but-always-partial list of them.
+see :func:`_captured_arg_safe_callee`), and a NINTH (round 10: 1 finding
+-- a genuinely DIFFERENT category from any of rounds 6-9's own transfer-
+shape findings: not WHAT shape defeats the allowlist, but WHO the
+allowlist actually trusts. Round 9's allowlist authenticated the
+SPELLING ``"api"``, accepting every attribute chain rooted at
+``ast.Name("api")`` regardless of what that name was actually bound to
+-- ``api = evil_api`` (a local reassignment, or a parameter of the same
+name) inherited the identical trust as the one reviewed module-level
+facade, DEMONSTRATED live over real HTTP with the SAME "static stays
+silent, live diverges 200/404" proof every prior round's finding
+required -- closed not by widening or re-shaping the allowlist but by
+tying it to PROVEN PROVENANCE: a name earns the exemption, in a GIVEN
+function, only when that function's own body proves it is bound EXACTLY
+once, at a dominating, top-level, never-rebound ``name = STATE.api``
+assignment, the SAME "is this name really what it claims to be"
+discipline :func:`_is_self_call`/:func:`_is_self_path` already
+established for ``self`` -- see :func:`_captured_arg_trusted_roots`).
+Each round's own pattern repeats: fix what was found, and a FRESH hunt
+finds more. That is not a sign any individual round was careless -- it
+is the expected, unavoidable shape of a bespoke static analyzer over a
+general-purpose language: the class of Python constructs that could
+conceivably encode a routing decision is not finite, and this module
+recognises a specific, growing-but-always-partial list of them.
 
 So, stated plainly, NOT as an oversight but as a considered engineering
 trade-off:
@@ -237,12 +253,20 @@ trade-off:
   future Python constructs. Finding H above, and finding 6c's own
   precisely-bounded residual gap above, are known, DOCUMENTED,
   currently-undemonstrated-beyond-what-is-stated gaps; there is no proof
-  that no OTHER gap exists beyond the ones nine rounds of review happened
-  to find -- round 9's own finding is itself the clearest illustration:
+  that no OTHER gap exists beyond the ones ten rounds of review happened
+  to find -- round 9's own finding is itself a clear illustration:
   round 8 closed its specific category (transparent Tuple/List/IfExp
   composition) completely, and a NEW category (higher-order argument
-  transfer) was found regardless. A tenth round should be expected to
-  find a tenth thing, on the same pattern as the first nine;
+  transfer) was found regardless. Round 10 confirms the pattern does not
+  stop once a round closes its OWN category completely, either: round
+  9's own fix (the allowlist) was itself found insufficient by round 10,
+  not through a further transfer shape, but through the allowlist's
+  trust boundary being spelling-only rather than provenance-based -- a
+  category of gap (WHO a mechanism trusts, not WHAT shape defeats it)
+  none of rounds 6-9 needed to consider, because none of them had yet
+  introduced a mechanism that trusted a NAME at all. An eleventh round
+  should be expected to find an eleventh thing, on the same pattern as
+  the first ten;
 * the actual soundness BACKSTOP for CORRECTNESS -- as distinct from
   completeness of this module's own DETECTION -- is not this static walker
   at all, but a RUNTIME proof already in place: the 405/Allow admission
@@ -1924,6 +1948,17 @@ class _DispatchWalker:
         # _propagates_taint) -- see _waiver_key's own docstring for what it
         # is for and why it costs one linear pass per function, not per node.
         parents = _build_parent_map(fn)
+        # #202 repair round 10 (external review): ALSO built ONCE per
+        # audited function, the SAME discipline as `parents` immediately
+        # above -- which _CAPTURED_ARG_SAFE_CALLEE_ROOTS names THIS
+        # function's own body proves are bound, dominating and unrebound,
+        # to the exact source expression each is allowlisted for (see
+        # _captured_arg_trusted_roots's own docstring). Threaded into every
+        # _propagates_taint call below the same way captured_names already
+        # is -- a name spelled "api" earns the captured-arg exemption in
+        # THIS function only when it is a member of THIS set, never merely
+        # by matching _CAPTURED_ARG_SAFE_CALLEE_ROOTS directly.
+        trusted_roots = _captured_arg_trusted_roots(fn, parents)
         # TAINT PROPAGATION. Any local bound from the path — directly, sliced,
         # or from another tainted local — joins the tracked set, so renaming it
         # cannot hide a branch. Iterated to a fixed point because one rename can
@@ -2006,7 +2041,8 @@ class _DispatchWalker:
                     continue
                 derived = _propagates_taint(value, tracked, fn.name,
                                             self.waiver_hits, parents,
-                                            self._followed, captured_names)
+                                            self._followed, captured_names,
+                                            trusted_roots)
                 if not derived:
                     continue
                 for leaf in leaves:
@@ -2248,7 +2284,7 @@ class _DispatchWalker:
                 # static(path)`` case, and both scans share one code path.
                 _propagates_taint(node.value, tracked, fn.name,
                                   self.waiver_hits, parents, self._followed,
-                                  captured_names)
+                                  captured_names, trusted_roots)
             if isinstance(node, ast.Return) and node.value is not None:
                 # #202 repair round 5, finding 2b: a bare ``return <expr>``
                 # is neither an assignment (the fixed-point loop above only
@@ -2282,7 +2318,7 @@ class _DispatchWalker:
                 # what ``followed`` skips and why.
                 _propagates_taint(node.value, tracked, fn.name,
                                   self.waiver_hits, parents, self._followed,
-                                  captured_names)
+                                  captured_names, trusted_roots)
             if isinstance(node, ast.Raise) and node.exc is not None:
                 # #202 repair round 5, finding 6b: ``raise <expr>`` is a
                 # CONTROL-TRANSFER expression this module never inspected
@@ -2306,7 +2342,7 @@ class _DispatchWalker:
                 # that precise a trace is out of reach for this module).
                 _propagates_taint(node.exc, tracked, fn.name,
                                   self.waiver_hits, parents, self._followed,
-                                  captured_names)
+                                  captured_names, trusted_roots)
             if isinstance(node, (ast.With, ast.AsyncWith)):
                 # #202 repair round 6, finding 2: a ``with`` statement's
                 # CONTEXT EXPRESSION (``with CONTEXTS[path]:``) is a
@@ -2334,7 +2370,8 @@ class _DispatchWalker:
                 for item in node.items:
                     _propagates_taint(item.context_expr, tracked, fn.name,
                                       self.waiver_hits, parents,
-                                      self._followed, captured_names)
+                                      self._followed, captured_names,
+                                      trusted_roots)
             if isinstance(node, ast.ExceptHandler) and node.name is not None:
                 # #202 repair round 5, finding 6c -- the HARD part, stated
                 # honestly rather than left silently unaddressed (matching
@@ -3742,10 +3779,195 @@ def _is_callee(node: ast.AST, parents: Optional[dict]) -> bool:
 #: service boundary that never invokes, stores, or forwards whatever it is
 #: handed -- that confirmation is the entire point of keeping this set
 #: small and explicit rather than defaulting to "anything not self.".
-_CAPTURED_ARG_SAFE_CALLEE_ROOTS = frozenset({"api"})
+#:
+#: #202 repair round 10 (external review): membership here is NECESSARY
+#: but, since this round, no longer SUFFICIENT for a name to earn the
+#: exemption at a given call site -- this set alone answers "which
+#: SPELLING may ever qualify", never "does THIS function's own body
+#: actually, provably bind that spelling to the reviewed object", and the
+#: round-10 finding proved those are not the same question. See
+#: ``_CAPTURED_ARG_SAFE_CALLEE_TRUSTED_SOURCES`` and
+#: :func:`_captured_arg_trusted_roots`, just below, for what closes the
+#: gap -- derived from that dict's keys so the two are never extended out
+#: of step with each other.
+#:
+#: #202 repair round 10 (external review): the EXACT source expression
+#: each name above must be proven -- by :func:`_captured_arg_trusted_roots`,
+#: never by spelling -- to be bound from, dominating and unrebound, before
+#: the exemption may fire for it in a GIVEN function. Matched by EXACT
+#: ``ast.unparse()`` text, the SAME "is this the literal reviewed shape,
+#: not merely something that LOOKS like it" discipline
+#: ``_DO_HEAD_SAFE_SHAPE``/``_DO_OPTIONS_SAFE_SHAPE`` already use elsewhere
+#: in this module -- ``getattr(STATE, "api")``, an aliased ``S = STATE;
+#: api = S.api``, or any other expression that only RESOLVES to the same
+#: object at runtime does NOT match, and stays outside the exemption
+#: exactly like everything else this module cannot prove without running
+#: the program. ``"api": "STATE.api"`` is the one entry today: the module
+#: singleton's own facade attribute, the SAME expression every real
+#: server.py call site (``_dispatch_get``, ``do_POST``,
+#: ``_handle_reassign``/``_handle_reassign_v2``,
+#: ``_handle_setup``/``_handle_setup_v2``) assigns ``api`` from (confirmed
+#: by direct AST inspection, all six sites, before this fix landed).
+#: Extending this dict is the SAME weight of review as extending
+#: ``_CAPTURED_ARG_SAFE_CALLEE_ROOTS`` used to be on its own -- the two are
+#: now meant to be extended TOGETHER, which is why ``ROOTS`` is derived
+#: from this dict rather than declared independently.
+_CAPTURED_ARG_SAFE_CALLEE_TRUSTED_SOURCES = {"api": "STATE.api"}
+_CAPTURED_ARG_SAFE_CALLEE_ROOTS = frozenset(_CAPTURED_ARG_SAFE_CALLEE_TRUSTED_SOURCES)
 
 
-def _captured_arg_safe_callee(node) -> bool:
+def _name_rebinding_sites(name: str, fn: ast.FunctionDef) -> list:
+    """Every AST node ANYWHERE in ``fn`` that binds (or unbinds) ``name`` --
+    an ``ast.Name`` in Store or Del context (an ordinary assignment target,
+    however deeply nested inside a tuple/list/starred unpack, a
+    ``for``/comprehension target, a ``with ... as`` target, a walrus, an
+    aug-assign, a ``del``), PLUS the handful of binding forms Python's own
+    grammar does not spell as an ``ast.Name`` at all: a function/lambda
+    PARAMETER (``ast.arg``), an ``except ... as name:`` handler (a plain
+    ``str`` on ``ExceptHandler.name``, never a Name node), ``global``/
+    ``nonlocal name``, and ``import ... as name``.
+
+    #202 repair round 10 (external review): used by
+    :func:`_captured_arg_trusted_roots` to answer "is ``name`` bound
+    EXACTLY once in this function, at a dominating, never-rebound
+    assignment" -- a STRICTLY BROADER question than
+    :func:`_binding_value_and_targets` answers (that function only ever
+    needs "does a VALUE flow into this name", so it correctly leaves a
+    parameter or an ``except``-handler out of ITS OWN model, per its own
+    docstring's documented boundary). Here the opposite bias is correct: a
+    parameter or an except-handler binds a value this module can prove
+    NOTHING about, and must count against "exactly one, provably-trusted,
+    unrebound binding" exactly as hard as an explicit ``api = evil_api``
+    reassignment does -- the reviewer's own required "parameter shadowing"
+    coverage is exactly this case.
+
+    Deliberately counts a binding inside a NESTED closure (a ``def``/
+    ``lambda`` inside ``fn``) too, even though such a closure's own local
+    is, by Python's actual lexical scoping, a SEPARATE variable that
+    leaves an outer binding of the same name untouched -- over-
+    conservative on paper (a hypothetical function with both a legitimate
+    outer ``api = STATE.api`` and an unrelated inner closure parameter
+    also spelled ``api`` would lose the exemption for its own, unaffected
+    outer uses too), but no such closure exists anywhere in server.py
+    today (``CapturedArgumentProvenanceTests`` pins the real-file check
+    unaffected), and "occasionally over-flag a safe function, review it
+    explicitly" is the same accepted cost this module's fail-closed
+    philosophy already pays everywhere else rather than risk under-
+    flagging a genuinely shadowed one.
+    """
+    sites = []
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Name) and node.id == name \
+                and not isinstance(node.ctx, ast.Load):
+            sites.append(node)
+        elif isinstance(node, ast.arg) and node.arg == name:
+            sites.append(node)
+        elif isinstance(node, ast.ExceptHandler) and node.name == name:
+            sites.append(node)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)) and name in node.names:
+            sites.append(node)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if (alias.asname or alias.name.split(".")[0]) == name:
+                    sites.append(node)
+    return sites
+
+
+def _has_dominating_trusted_binding(name: str, fn: ast.FunctionDef,
+                                    parents: dict) -> bool:
+    """Is ``name`` bound, in ``fn``, EXACTLY once -- at a plain, single-
+    target, TOP-LEVEL (directly in ``fn.body``, so it unconditionally runs
+    before anything else in the function, on every path through it)
+    ``name = <the reviewed source expression>`` assignment, with no OTHER
+    binding of ``name`` anywhere else in the function to rebind, shadow,
+    or race it?
+
+    #202 repair round 10 (external review): the provenance question
+    :func:`_captured_arg_safe_callee` alone could not answer -- see that
+    function's own updated docstring for the exploit this closes
+    (``api = evil_api`` before a call the OLD, spelling-only check still
+    trusted). Deliberately the narrow, purely SYNTACTIC discipline
+    :func:`_is_self_call`/:func:`_is_self_path` already established for
+    "is this name really what it claims to be" (no CFG, no alias analysis
+    -- just "does the SOURCE TEXT prove it"), extended to a name ``self``
+    never needs it for (Python's own calling convention already guarantees
+    ``self`` is bound exactly once, as the first parameter, before the
+    function body runs at all -- an ordinary local like ``api`` gets no
+    such guarantee for free, so THIS function is what supplies one):
+
+    * exactly ONE :func:`_name_rebinding_sites` hit -- zero means ``name``
+      is never bound in this function at all (an opaque module global this
+      module has no basis to trust); more than one means it is rebound,
+      shadowed by a parameter, or bound in more than one place, in EITHER
+      order (a later ``api = evil_api`` after a genuine assignment, or a
+      genuine assignment after an earlier throwaway one) -- the reviewer's
+      own "rebinding before/after a valid facade assignment" coverage;
+    * that one site must be a plain ``ast.Name`` in Store context, not one
+      of the non-Name forms :func:`_name_rebinding_sites` also watches for
+      (a parameter, an ``except``-handler, ...) -- the "parameter
+      shadowing" case, where the ONLY binding is not an assignment at all;
+    * its immediate parent (:func:`_build_parent_map`, the SAME map
+      :meth:`_DispatchWalker._audit_function` already builds once per
+      function for every other waiver/parent lookup) must be an
+      ``ast.Assign`` with THIS site as its one and only target -- rules
+      out chained assignment (``api = other = STATE.api``, two targets)
+      and tuple/list unpacking (``api, x = STATE.api, 5`` -- the target's
+      immediate parent is the ``ast.Tuple``, not the ``ast.Assign``, so
+      this test already excludes it with no separate case needed) as
+      AMBIGUOUS rather than trying to reason about them;
+    * that ``ast.Assign`` must be a DIRECT statement of ``fn.body`` --
+      never nested inside an ``if``/``try``/``with``/loop/nested closure
+      -- which is what makes it DOMINATING: a statement directly in the
+      function's own top-level body runs unconditionally, before any
+      nested block, on every path through the function, with no CFG
+      needed to prove it;
+    * and its value, compared by EXACT ``ast.unparse()`` text (the SAME
+      discipline ``_DO_HEAD_SAFE_SHAPE``/``_DO_OPTIONS_SAFE_SHAPE`` already
+      use for "the literal reviewed shape, not merely something shaped
+      like it"), must match
+      ``_CAPTURED_ARG_SAFE_CALLEE_TRUSTED_SOURCES[name]`` exactly.
+
+    Every real server.py site this exemption exists for -- ``_dispatch_get``,
+    ``do_POST``, ``_handle_reassign``, ``_handle_reassign_v2``,
+    ``_handle_setup``, ``_handle_setup_v2`` -- opens with exactly
+    ``api = STATE.api`` as its own early statement, directly in the method
+    body, never reassigned again in that method, so this predicate is not
+    a NEW restriction on real code, only on code that does not actually
+    have the property the OLD check merely assumed from the name's
+    spelling.
+    """
+    trusted_source = _CAPTURED_ARG_SAFE_CALLEE_TRUSTED_SOURCES.get(name)
+    if trusted_source is None:
+        return False
+    sites = _name_rebinding_sites(name, fn)
+    if len(sites) != 1:
+        return False
+    site = sites[0]
+    if not (isinstance(site, ast.Name) and isinstance(site.ctx, ast.Store)):
+        return False
+    stmt = parents.get(id(site))
+    if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1
+            and stmt.targets[0] is site and stmt in fn.body):
+        return False
+    return ast.unparse(stmt.value) == trusted_source
+
+
+def _captured_arg_trusted_roots(fn: ast.FunctionDef, parents: dict) -> frozenset:
+    """Which names in :data:`_CAPTURED_ARG_SAFE_CALLEE_ROOTS` does THIS
+    function's own body actually, provably earn the exemption for -- round
+    10's replacement for trusting the bare allowlist directly (see
+    :func:`_captured_arg_safe_callee`'s own updated docstring). Computed
+    ONCE per audited function by :meth:`_DispatchWalker._audit_function`,
+    the SAME "one linear pass, not per node" discipline
+    :func:`_build_parent_map`'s own call site there already established,
+    and threaded into :func:`_propagates_taint` (as ``trusted_roots``)
+    exactly the way ``captured``/``waiver_hits``/``followed`` already are.
+    """
+    return frozenset(name for name in _CAPTURED_ARG_SAFE_CALLEE_ROOTS
+                     if _has_dominating_trusted_binding(name, fn, parents))
+
+
+def _captured_arg_safe_callee(node, trusted_roots: frozenset = frozenset()) -> bool:
     """Does ``node`` -- a Call's own ``.func``, or the container a
     Subscript/``.get()`` indexes -- resolve to a call target the
     ``captured``-only exemption (see :func:`_propagates_taint`'s own
@@ -3806,6 +4028,38 @@ def _captured_arg_safe_callee(node) -> bool:
     this module) and as a static ``ExtractionError`` raise against the
     fixed code.
 
+    #202 repair round 10 (external review): membership in
+    ``_CAPTURED_ARG_SAFE_CALLEE_ROOTS`` -- a bare SPELLING match -- is no
+    longer sufficient either. DEMONSTRATED, with the round-9 fix above
+    otherwise untouched:
+
+        api = evil_api
+        return api.invoke({"hidden": api.hidden, "other": api.other}[action], self)
+
+    resolves ``api.invoke``'s root to the ``ast.Name`` ``"api"`` exactly
+    the same way the genuinely inert ``api.get_item(gid)`` does -- this
+    function had no way to tell a LOCAL variable that merely HAPPENS to be
+    spelled ``api`` apart from the one reviewed module-level facade the
+    allowlist exists to trust, because it never asked what ``api``
+    actually, provably IS at this point in the function. Live over real
+    HTTP: ``/api/hidden`` answers 200, ``/api/other`` answers 404, while
+    static extraction stayed silent -- the SAME "static and live examine
+    identical code" proof every prior round's finding in this function
+    required. ``root.id in trusted_roots`` -- the caller's OWN, per-
+    function-computed :func:`_captured_arg_trusted_roots` result, NEVER
+    the bare module-level allowlist directly -- closes it: ``trusted_
+    roots`` contains ``"api"`` for a GIVEN function only when
+    :func:`_has_dominating_trusted_binding` has independently proven that
+    function's own ``api`` is bound, once, dominating, unrebound, to
+    exactly ``STATE.api`` -- see that function's own docstring for the
+    full discipline, and ``CapturedArgumentProvenanceTests``
+    (test_route_extract.py) for the regression coverage: the reviewer's
+    own repro (static AND live), parameter shadowing, rebinding before/
+    after a valid assignment (both orders), the nested-dict-literal
+    selector reproduced above, genuine ``STATE.api``-bound facade calls as
+    negative controls, and a load-bearing mutation that degrades this
+    check back to spelling-only and reproduces the escape.
+
     Resolves a plain ``ast.Attribute`` chain to its ROOT name the same
     way :func:`_is_self_call` resolves a ``self.`` chain (any depth --
     ``api.x``, ``self.api.x`` would resolve to ``self`` first and never
@@ -3817,23 +4071,23 @@ def _captured_arg_safe_callee(node) -> bool:
     ``_handle_setup_v2`` delete-dispatch tables and ``do_POST``'s
     substitute-action table are exactly this shape, each a dict literal
     of ``api.X`` references -- so a dict literal is safe iff EVERY one of
-    its values independently is, checked recursively (a dict of dicts is
-    not a real server.py shape today, but costs nothing extra to handle
-    correctly rather than assume away). Anything else -- a bare ``Name``
-    like ``handlers``/``invoke``/``operator`` (an opaque external
-    variable or function this module cannot see the contents or body of),
-    a further Call or Subscript, ... -- is NOT safe: there is no way to
-    confirm what it resolves to, or does with what it is handed, without
-    running the program.
+    its values independently is, checked recursively AGAINST THE SAME
+    ``trusted_roots`` (a dict of dicts is not a real server.py shape
+    today, but costs nothing extra to handle correctly rather than assume
+    away). Anything else -- a bare ``Name`` like ``handlers``/``invoke``/
+    ``operator`` (an opaque external variable or function this module
+    cannot see the contents or body of), a further Call or Subscript, ...
+    -- is NOT safe: there is no way to confirm what it resolves to, or
+    does with what it is handed, without running the program.
     """
     if isinstance(node, ast.Attribute):
         root = node
         while isinstance(root, (ast.Attribute, ast.Subscript)):
             root = root.value
-        return (isinstance(root, ast.Name)
-                and root.id in _CAPTURED_ARG_SAFE_CALLEE_ROOTS)
+        return isinstance(root, ast.Name) and root.id in trusted_roots
     if isinstance(node, ast.Dict):
-        return all(_captured_arg_safe_callee(v) for v in node.values)
+        return all(_captured_arg_safe_callee(v, trusted_roots)
+                   for v in node.values)
     return False
 
 
@@ -4032,7 +4286,8 @@ def _propagates_taint(value, tracked: set, fn_name: str = "",
                       waiver_hits: Optional[dict] = None,
                       parents: Optional[dict] = None,
                       followed: Optional[set] = None,
-                      captured: Optional[set] = None) -> bool:
+                      captured: Optional[set] = None,
+                      trusted_roots: frozenset = frozenset()) -> bool:
     """Does this expression still CARRY the request path?
 
     Deliberately narrow. `p2 = self.path.split("?", 1)[0]` carries it -- string
@@ -4205,6 +4460,22 @@ def _propagates_taint(value, tracked: set, fn_name: str = "",
     ``self.`` -- see :func:`_captured_arg_safe_callee`'s own docstring for
     the full reasoning and :class:`CapturedArgumentCalleeAllowlistTests`
     (test_route_extract.py) for the regression coverage.
+
+    ``trusted_roots`` (#202 repair round 10, external review) is the
+    audited function's own :func:`_captured_arg_trusted_roots` result --
+    which :data:`_CAPTURED_ARG_SAFE_CALLEE_ROOTS` names THIS function's
+    own body proves are bound, dominating and unrebound, to the exact
+    source expression each is allowlisted for. Round 9's allowlist
+    trusted a NAME's spelling alone, so a same-spelled LOCAL --
+    ``api = evil_api`` -- inherited the SAME trust as the one reviewed
+    facade; see :func:`_captured_arg_safe_callee`'s own updated docstring
+    for the exploit this closes. Threaded through to both
+    :func:`_captured_arg_safe_callee` call sites below exactly the way
+    ``captured`` already is; defaults to the empty set, so a caller that
+    does not compute it (:meth:`_DispatchWalker._else_rederives_subject`,
+    which also never passes ``captured`` and so never reaches either call
+    site at all) gets the same fail-closed behaviour as passing no
+    ``captured`` set already does.
     """
     for node in ast.walk(value):
         if isinstance(node, ast.Call):
@@ -4218,7 +4489,8 @@ def _propagates_taint(value, tracked: set, fn_name: str = "",
                            and func.attr in (_PATH_OPS + _PATH_METHODS)
                            and _propagates_taint(func.value, tracked, fn_name,
                                                  waiver_hits, parents,
-                                                 followed, captured))
+                                                 followed, captured,
+                                                 trusted_roots))
             if manipulates:
                 continue
             if _mentions_tracked(node, tracked):
@@ -4254,7 +4526,7 @@ def _propagates_taint(value, tracked: set, fn_name: str = "",
                 if (captured and not is_self_call
                         and not _is_callee(node, parents)
                         and _tracked_mentions(node, tracked) <= captured
-                        and _captured_arg_safe_callee(func)):
+                        and _captured_arg_safe_callee(func, trusted_roots)):
                     # See this function's own docstring: a NON-self call
                     # whose only tracked mentions are already-captured
                     # names is the bound-first counterpart of
@@ -4354,7 +4626,7 @@ def _propagates_taint(value, tracked: set, fn_name: str = "",
             if mentioned:
                 if captured and mentioned <= captured \
                         and not _is_callee(node, parents) \
-                        and _captured_arg_safe_callee(node.value):
+                        and _captured_arg_safe_callee(node.value, trusted_roots):
                     # The SAME captured-only exemption a Call's arguments
                     # get, several lines above (see this function's own
                     # docstring on ``captured``): a lookup keyed on an
@@ -4406,12 +4678,13 @@ def _propagates_taint(value, tracked: set, fn_name: str = "",
         # from whichever operand carries the path -- the construction
         # analogue of the method calls handled above.
         return (_propagates_taint(value.left, tracked, fn_name, waiver_hits,
-                                  parents, followed, captured)
+                                  parents, followed, captured, trusted_roots)
                 or _propagates_taint(value.right, tracked, fn_name,
-                                     waiver_hits, parents, followed, captured))
+                                     waiver_hits, parents, followed, captured,
+                                     trusted_roots))
     if isinstance(value, ast.Attribute) and value.attr in _PATH_PROPERTIES:
         return _propagates_taint(value.value, tracked, fn_name, waiver_hits,
-                                 parents, followed, captured)
+                                 parents, followed, captured, trusted_roots)
     # #202 repair round 6, finding 1: ``_mentions_tracked`` -- which
     # recognises ``self.path`` at any depth (see its own docstring) and
     # stops at an opaque-extraction boundary -- not a blind ``ast.walk``
