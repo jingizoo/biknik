@@ -105,15 +105,30 @@ against. The only thing a comparison can produce is "discard this request".
   never serve a byte the ceiling would have refused. It is strictly a way to
   throw your own request away.
 
-NON-DISCLOSURE, stated precisely rather than rounded up. The token is a keyless
-digest, so it is not a secret and is not claimed to be one: a party who ALREADY
-holds the complete material — the user id, all three axis ids, and the exact
-microsecond of the last switch — can recompute it and confirm a guess. That
-party has learned nothing, because they had to supply everything the token
-could have told them, and confirming a guess buys no capability (see the
-paragraph above). What the token does guarantee is the direction that matters:
-a party who holds ONLY a token cannot invert it, so an epoch leaked into a log,
-a proxy trace or a browser history entry discloses no id and no timestamp.
+NON-DISCLOSURE, stated precisely rather than rounded up. The token confers no
+AUTHORITY either way (see above) — but a party who holds ONLY a leaked token
+and does not hold the deployment secret must also be unable to CORRELATE it
+back to an identity, which is a property the material's shape alone cannot
+buy for a low-entropy id space (#159 review finding 4). A public,
+non-identity-bearing sentinel and a small sequential ``user_id`` space (an
+early installation's accounts, or any deployment that mints ids sequentially)
+is a dictionary of a few hundred candidates; an UNKEYED digest is a pure
+function of that material, so hashing every candidate and comparing against a
+leaked token recovers the identity with no authority gained and no request
+sent — exactly the attack the fixed
+``test_a_leaked_token_cannot_be_correlated_to_an_identity_without_the_
+deployment_secret`` case mounts and confirms fails against this module.
+``hashlib.blake2s``'s ``key`` therefore carries a deployment secret (see
+:func:`epoch_secret`) THE SAME EVERY REPLICA HOLDS: the digest is a keyed MAC,
+so recomputing it — confirming a guess, or enumerating a whole candidate space
+— requires the secret, not merely the material. A party who already holds the
+complete material (the effective tuple, the persisted generation, and the
+selected Season's lifecycle) but NOT the secret learns nothing new by
+recomputing, exactly as the keyless version intended; the difference is that
+now nobody else can recompute it either. An epoch leaked into a log, a proxy
+trace or a browser history entry therefore discloses no id, no tuple and no
+generation, AND cannot be correlated back to the account that produced it
+without the secret.
 
 WHERE IT IS COMPARED, and why that placement is load-bearing in both
 directions. ``Handler._read_under_context_gate`` compares AFTER the gate's
@@ -197,6 +212,7 @@ is the safe direction.
 """
 
 import hashlib
+import os
 import re
 from datetime import datetime
 from enum import Enum
@@ -204,7 +220,7 @@ from enum import Enum
 from .season_guard import season_is_read_only
 
 __all__ = ["CONTEXT_EPOCH_HEADER", "EPOCH_ABSENT", "EPOCH_MATCH",
-           "EPOCH_MISMATCH", "context_epoch", "epoch_verdict",
+           "EPOCH_MISMATCH", "context_epoch", "epoch_secret", "epoch_verdict",
            "is_epoch_token"]
 
 # The request header a context-scoped GET echoes its rendered-under epoch in.
@@ -237,6 +253,102 @@ _EPOCH_RE = re.compile(r"^[0-9a-f]{32}$")
 # collide only for rows whose Season happens to hash to the same suffix, i.e.
 # it would fail in a way nobody could predict.
 _PERSON = b"hsctxep2"
+
+# -- the deployment secret (#159 review finding 4) --------------------------
+#
+# Sourced the SAME WAY this repository's other deployment secrets are —
+# ``services/passwords.py``'s ``APP_MODE``-conditional pattern and
+# ``bootstrap.py``'s ``INITIAL_SETUP_CODE``: an environment variable, REQUIRED
+# and validated in production, defaulted outside it so the stdlib-only,
+# no-configuration test suite and local/demo runs keep working with zero setup.
+_SECRET_ENV = "HS_CONTEXT_EPOCH_SECRET"
+
+# A floor, not a target: 32 raw bytes is 256 bits before folding through
+# ``_derived_key``, comfortably above what BLAKE2s's 32-byte keyspace can even
+# use. Rejects a short/placeholder value outright rather than accepting it and
+# quietly running with a weak key — the same shape as the PBKDF2-iteration and
+# minimum-password-length floors in ``services/passwords.py``, which also never
+# let a stray override weaken a production default.
+_MIN_SECRET_BYTES = 32
+
+# The demo/dev/test fallback key, used ONLY when APP_MODE is not "production"
+# and HS_CONTEXT_EPOCH_SECRET is unset. Committed in the open, deliberately: it
+# buys nothing by being secret — a demo/dev deployment has no real account
+# population worth correlating, and anyone who can read this source file
+# already has it. What it buys is that EVERY code path is keyed, never
+# conditionally unkeyed while configuration is pending; see :func:`epoch_secret`
+# for the production-only enforcement that makes this fallback unreachable
+# where it would matter.
+_DEMO_SECRET = (b"hs-context-epoch-demo-key-do-not-use-in-production-"
+               b"9f3c2a7e1b5d4f6089ac")
+
+
+def _is_production() -> bool:
+    return (os.environ.get("APP_MODE") or "demo").strip().lower() == "production"
+
+
+def epoch_secret() -> bytes:
+    """The deployment secret :func:`context_epoch` keys its digest with.
+
+    FAILS CLOSED rather than degrading to an unkeyed hash (#159 review
+    finding 4's explicit fix requirement): a PRODUCTION process with
+    ``HS_CONTEXT_EPOCH_SECRET`` unset, empty, or shorter than
+    :data:`_MIN_SECRET_BYTES` raises immediately. Called eagerly at process
+    startup (``web/server.py``'s ``serve()``), before the socket binds and
+    before any request can be answered — a misconfigured production
+    deployment must not boot at all, not merely 500 on its first
+    context-scoped request. Every non-production environment (demo, dev, the
+    test suite) gets the fixed, openly-documented :data:`_DEMO_SECRET` when
+    the variable is unset, so nothing outside production requires setup.
+
+    ROTATION. Changing the value invalidates every outstanding token: a
+    request in flight when the secret rotates lands on
+    :data:`EPOCH_MISMATCH` exactly as a genuinely stale epoch does — a
+    ``204`` discard, never an error and never a wrong serve (the module's
+    "confers no authority" property is unaffected by which key produced the
+    comparison value). Deploy the SAME value to every replica: a token issued
+    by one process must verify on another (see the module docstring's "PER
+    PROCESS? NO" — this preserves that property rather than reintroducing a
+    per-process concept), so rotating means updating the configured secret
+    everywhere at once, not staggering it.
+    """
+    raw = os.environ.get(_SECRET_ENV)
+    production = _is_production()
+    if raw:
+        secret = raw.encode("utf-8")
+        if len(secret) < _MIN_SECRET_BYTES:
+            raise RuntimeError(
+                f"{_SECRET_ENV} is set but too short ({len(secret)} bytes; "
+                f"{_MIN_SECRET_BYTES}+ required). Generate a high-entropy "
+                f"value, e.g. `python3 -c \"import secrets; "
+                f"print(secrets.token_hex(32))\"`, and deploy it identically "
+                f"to every replica.")
+        return secret
+    if production:
+        raise RuntimeError(
+            f"{_SECRET_ENV} must be set when APP_MODE=production — the "
+            f"context epoch would otherwise fall back to an unkeyed hash, "
+            f"which lets a leaked token be correlated back to an account by "
+            f"dictionary-hashing candidate ids. Generate a high-entropy "
+            f"value, e.g. `python3 -c \"import secrets; "
+            f"print(secrets.token_hex(32))\"`, and deploy it identically to "
+            f"every replica.")
+    return _DEMO_SECRET
+
+
+def _derived_key(secret: bytes) -> bytes:
+    """Fold an arbitrary-length deployment secret down to the exactly-32-byte
+    key BLAKE2s accepts (``hashlib.blake2s`` rejects a longer one outright).
+
+    A reshaping step, not a second security boundary: whatever entropy
+    ``secret`` carries is what the derived key carries. Using BLAKE2s itself
+    (unkeyed, full 32-byte digest) keeps this module's only dependency
+    ``hashlib`` and is deterministic, so the same configured secret always
+    folds to the same key — required for property 1 (stable across restarts
+    and replicas) to survive this step.
+    """
+    return hashlib.blake2s(secret, digest_size=32).digest()
+
 
 # Field separator, and a marker for "this field has no value".
 #
@@ -371,7 +483,13 @@ def context_epoch(store, user_id) -> str:
             *_selected_season_lifecycle(
                 store, getattr(row, "season_id", None)),
         )
+    # KEYED (#159 review finding 4): the digest is now a MAC, not a plain
+    # hash, so recovering it — including by enumerating a small candidate
+    # space of ids, the finding's exact PoC — requires the deployment secret,
+    # not merely the material. See `epoch_secret` and the module docstring's
+    # NON-DISCLOSURE section.
     return hashlib.blake2s(material.encode("utf-8"),
+                           key=_derived_key(epoch_secret()),
                            digest_size=_DIGEST_BYTES,
                            person=_PERSON).hexdigest()
 

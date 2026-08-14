@@ -85,6 +85,9 @@ can assert one expected value for every backend.
 import importlib
 import os
 import re
+import secrets
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -97,9 +100,10 @@ from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.domain import Role
 from hockey_scheduler.domain.setup_models import ActiveContext
+from hockey_scheduler.services import context_epoch as _context_epoch_module
 from hockey_scheduler.services.context_epoch import (
     CONTEXT_EPOCH_HEADER, EPOCH_ABSENT, EPOCH_MATCH, EPOCH_MISMATCH,
-    context_epoch, epoch_verdict, is_epoch_token)
+    context_epoch, epoch_secret, epoch_verdict, is_epoch_token)
 
 from test_context_switch_server_exit import (
     PATIENCE, ContextGateFixtureBase, _Park, _wait)
@@ -126,6 +130,30 @@ CHURN_READS = 80
 CHURN_HTTP_SWITCHES = 12
 
 _HEX32 = re.compile(r"^[0-9a-f]{32}$")
+
+
+@contextmanager
+def _env(**overrides):
+    """Temporarily set/clear environment variables, restoring exactly the
+    prior state afterward — including ABSENCE, which a plain assignment (or
+    ``patch.dict`` with ``clear=False``) cannot tell apart from "was set to
+    the empty string". A value of ``None`` means "ensure this key is unset
+    for the duration"."""
+    sentinel = object()
+    previous = {k: os.environ.get(k, sentinel) for k in overrides}
+    try:
+        for k, v in overrides.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        yield
+    finally:
+        for k, v in previous.items():
+            if v is sentinel:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 
 
 class _FakeRow:
@@ -347,6 +375,207 @@ class ContextEpochDerivationTest(unittest.TestCase):
         with self.assertRaises(ModuleNotFoundError):
             importlib.import_module(
                 "hockey_scheduler.services.context_read_cancellations")
+
+
+# ==========================================================================
+# THE KEYED MAC (#159 review finding 4) — no HTTP, no store, no threads.
+# ==========================================================================
+class ContextEpochSecretTest(unittest.TestCase):
+    """``epoch_secret`` and the now-KEYED digest. Store-free for the same
+    reason as ``ContextEpochDerivationTest``: these are claims about a pure
+    function (given a configured secret) and about ``epoch_secret``'s own
+    sourcing/fail-closed logic, not about a server.
+
+    THE FINDING, restated precisely. The pre-fix digest was UNKEYED: a public
+    personalization constant plus material that, for a fresh account with no
+    saved selection, is just a sentinel and the account's own id. A deployment
+    that mints ids sequentially (or any low-entropy id space) turns "I hold one
+    leaked token" into "I know which account issued it" — hash every candidate
+    id and compare, no request sent, no authority gained or needed. The reviewer
+    demonstrated it concretely: token ``20e11328d4f20b6b28b1e150a2cdd961``
+    recovered as ``user_37`` by hashing ``user_1``..``user_100``.
+
+    THE FIX does not touch the material (that is findings 2/5's territory) —
+    it keys the SAME digest with a deployment secret, so recomputing it, for
+    one candidate or for a hundred, requires the secret and not merely the
+    material.
+    """
+
+    def test_outside_production_the_demo_secret_applies_and_never_raises(self):
+        """Zero configuration required outside production — the stdlib-only,
+        no-setup test/demo/dev experience is unaffected by this finding's
+        fix. Checked with APP_MODE both unset and explicitly 'demo'."""
+        with _env(APP_MODE=None, HS_CONTEXT_EPOCH_SECRET=None):
+            self.assertEqual(epoch_secret(), _context_epoch_module._DEMO_SECRET)
+        with _env(APP_MODE="demo", HS_CONTEXT_EPOCH_SECRET=None):
+            self.assertEqual(epoch_secret(), _context_epoch_module._DEMO_SECRET)
+
+    def test_production_without_the_secret_fails_closed(self):
+        """THE REQUIRED FAIL-CLOSED BEHAVIOUR. Production with the variable
+        unset must refuse outright rather than silently degrade to the demo
+        key (which is committed in the open) or to an unkeyed hash."""
+        with _env(APP_MODE="production", HS_CONTEXT_EPOCH_SECRET=None):
+            with self.assertRaises(RuntimeError):
+                epoch_secret()
+
+    def test_production_with_a_too_short_secret_fails_closed(self):
+        """A configured-but-weak secret is refused just as loudly as a
+        missing one — silently accepting it would be the same failure
+        wearing a different cause. Checked exactly one byte under the floor
+        too, so an off-by-one in the comparison cannot pass unnoticed."""
+        with _env(APP_MODE="production", HS_CONTEXT_EPOCH_SECRET="short"):
+            with self.assertRaises(RuntimeError):
+                epoch_secret()
+        just_under = "x" * (_context_epoch_module._MIN_SECRET_BYTES - 1)
+        with _env(APP_MODE="production", HS_CONTEXT_EPOCH_SECRET=just_under):
+            with self.assertRaises(RuntimeError):
+                epoch_secret()
+
+    def test_production_with_a_sufficient_secret_boots_and_uses_it_verbatim(self):
+        at_floor = "x" * _context_epoch_module._MIN_SECRET_BYTES
+        with _env(APP_MODE="production", HS_CONTEXT_EPOCH_SECRET=at_floor):
+            self.assertEqual(epoch_secret(), at_floor.encode("utf-8"))
+
+    def test_serve_sources_the_secret_before_binding_the_socket(self):
+        """THE 'AT STARTUP' HALF, proven rather than asserted from reading the
+        source: a fresh subprocess started with ``serve()`` in PRODUCTION and
+        no secret configured must exit quickly and non-zero — never hang
+        (which is what happens if the check is missing and ``serve_forever``
+        is reached) and never print a stack trace from inside a request
+        handler (which is what happens if the check is only reached lazily,
+        on the first context-scoped request)."""
+        env = dict(os.environ)
+        env["APP_MODE"] = "production"
+        env.pop("HS_CONTEXT_EPOCH_SECRET", None)
+        # DATABASE_URL unset -> InMemoryStore, so this cannot fail for any
+        # reason OTHER than the secret check: no real database, no migration,
+        # nothing else for a production boot to trip over first.
+        env.pop("DATABASE_URL", None)
+        code = (
+            "from hockey_scheduler.web.server import serve\n"
+            "serve('127.0.0.1', 0)\n"
+            "print('SERVED_FOREVER_UNREACHABLE')\n")
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", code], env=env, cwd=str(BACKEND),
+                capture_output=True, text=True, timeout=15)
+        except subprocess.TimeoutExpired:
+            self.fail(
+                "serve() did not exit within 15s under APP_MODE=production "
+                "with no HS_CONTEXT_EPOCH_SECRET -- it reached "
+                "serve_forever() instead of failing closed at startup")
+        self.assertNotEqual(
+            result.returncode, 0,
+            f"serve() exited 0 without ever binding — expected a fail-closed "
+            f"non-zero exit. stdout={result.stdout!r}")
+        self.assertNotIn("SERVED_FOREVER_UNREACHABLE", result.stdout)
+        self.assertIn(_context_epoch_module._SECRET_ENV, result.stderr,
+                     f"the failure did not name the missing variable: "
+                     f"{result.stderr}")
+
+    def test_a_configured_secret_changes_the_token_and_stays_stable(self):
+        """The digest IS a function of the secret (two different configured
+        secrets over the SAME material produce different tokens), and PROPERTY
+        1 survives keying (the same configured secret, called repeatedly,
+        produces the same token)."""
+        store = _FakeStore({"user_a": ContextEpochDerivationTest.ROW})
+        with _env(HS_CONTEXT_EPOCH_SECRET="a" * 32):
+            token_a1 = context_epoch(store, "user_a")
+            token_a2 = context_epoch(store, "user_a")
+        with _env(HS_CONTEXT_EPOCH_SECRET="b" * 32):
+            token_b = context_epoch(store, "user_a")
+        self.assertEqual(
+            token_a1, token_a2,
+            "the same configured secret produced two different tokens for "
+            "the identical row — keying broke property 1")
+        self.assertNotEqual(
+            token_a1, token_b,
+            "two different deployment secrets produced the SAME token for "
+            "identical material — the digest is not actually keyed")
+
+    def test_cross_process_stability_with_the_same_configured_secret(self):
+        """REPLICA STABILITY, proven across a REAL second interpreter rather
+        than asserted from reading the code: a token computed here and one
+        computed in a fresh ``python3`` process, given the identical
+        configured secret and the identical material, must agree — the
+        module docstring's 'PER PROCESS? NO' claim, now that the digest also
+        depends on a secret rather than only on the row."""
+        secret = "cross-process-" + secrets.token_hex(16)
+        row = ContextEpochDerivationTest.ROW
+        with _env(HS_CONTEXT_EPOCH_SECRET=secret):
+            here = context_epoch(_FakeStore({"user_a": row}), "user_a")
+
+        script = (
+            "from datetime import datetime, timezone\n"
+            "from hockey_scheduler.services.context_epoch import context_epoch\n"
+            "class R:\n"
+            "    id = 'user_a'; program_id = 'program_1'; "
+            "season_id = 'season_1'; league_id = 'league_1'\n"
+            "    updated_at = datetime(2026, 8, 12, 9, 30, 15, 123456, "
+            "tzinfo=timezone.utc)\n"
+            "class S:\n"
+            "    def get_active_context(self, uid):\n"
+            "        return R() if uid == 'user_a' else None\n"
+            "    def get_season(self, sid):\n"
+            "        return None\n"
+            "print(context_epoch(S(), 'user_a'))\n")
+        env = dict(os.environ)
+        env["HS_CONTEXT_EPOCH_SECRET"] = secret
+        result = subprocess.run([sys.executable, "-c", script],
+                                env=env, cwd=str(BACKEND),
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        there = result.stdout.strip()
+        self.assertRegex(there, _HEX32, result.stdout)
+        self.assertEqual(
+            here, there,
+            "the same configured secret and the same row hashed differently "
+            "in a fresh process — token issuance would not survive a "
+            "restart or agree across replicas")
+
+    def test_a_leaked_token_cannot_be_correlated_to_an_identity_without_the_secret(self):
+        """THE FINDING 4 POC, reproduced and closed.
+
+        THE POSITIVE CONTROL comes first and must succeed, or the negative
+        result below would be vacuous: a party who DOES hold the deployment
+        secret brute-forces the exact same 100-candidate dictionary the
+        reviewer used (a fresh account, no saved selection — the lowest-
+        entropy material this module ever hashes) and DOES recover the
+        target token. That proves the attack methodology still works and the
+        digest is still a deterministic function of (material, secret).
+
+        THE FIX: the same dictionary, run by a party who does NOT hold the
+        deployment's configured secret — here, simply no override at all, so
+        the demo/dev fallback key applies instead of whatever the (simulated)
+        deployment configured — recovers NOTHING. Not "recovers it more
+        slowly": recovers zero of the hundred candidates, because the digest
+        is now a MAC and an unkeyed (or wrong-keyed) brute force is not a
+        weaker attack on a MAC, it is a non-attack.
+        """
+        real_secret = "prod-" + secrets.token_hex(32)
+        target_user = "user_37"
+        empty = _FakeStore()          # no ActiveContext row for anyone
+        with _env(HS_CONTEXT_EPOCH_SECRET=real_secret, APP_MODE="production"):
+            leaked = context_epoch(empty, target_user)
+        self.assertRegex(leaked, _HEX32)
+
+        with _env(HS_CONTEXT_EPOCH_SECRET=real_secret, APP_MODE="production"):
+            found_with_secret = [n for n in range(1, 101)
+                                 if context_epoch(empty, f"user_{n}") == leaked]
+        self.assertEqual(
+            found_with_secret, [37],
+            "the brute force did not recover the token even WITH the "
+            "correct secret — the positive control is broken, so the "
+            "negative result below would prove nothing")
+
+        with _env(HS_CONTEXT_EPOCH_SECRET=None, APP_MODE=None):
+            found_without_secret = [
+                n for n in range(1, 101)
+                if context_epoch(empty, f"user_{n}") == leaked]
+        self.assertEqual(
+            found_without_secret, [],
+            "the leaked token was recovered by a party WITHOUT the "
+            "deployment secret — finding 4 is not closed")
 
 
 # ==========================================================================
@@ -1234,6 +1463,65 @@ class ContextReadCancelHandoffCases(ContextReadEpochBase):
         row = self.api.store.get_active_context(user_id)
         self.assertIsInstance(row, ActiveContext)
         self.assertEqual(row.season_id, fx["s1"])
+
+    # ======================================================================
+    # 8. THE KEYED MAC (#159 review finding 4), end to end over real HTTP
+    # ======================================================================
+    def test_rotating_the_deployment_secret_discards_outstanding_tokens_like_any_mismatch(self):
+        """Rotation is not a new code path — it is the SAME comparison
+        against a token that no longer matches, so it must produce EXACTLY
+        the ordinary mismatch answer: 204, empty body, service never
+        reached. Also the auth-independence half of finding 4's required
+        coverage: rotating never locks the account out (a FRESH token
+        learned after rotation is honored normally) and never turns into a
+        distinguishable error (a bare request with no header at all gets the
+        same unimproved answer it always has)."""
+        fx = self._program_with_two_seasons("Rotate")
+        username, user_id = self._operator("rotate")
+        client = self._login(username)
+        self._select(client, fx["program_id"], fx["s1"])
+        division = self._division_with_teams(fx, fx["s1"])
+        epoch = self._epoch_from_api(client)
+
+        # The positive control: BEFORE rotation, this exact token is honored.
+        status, raw, _ = self._req(
+            client, "GET", f"/api/standings/{division}",
+            headers={CONTEXT_EPOCH_HEADER: epoch})
+        self.assertEqual(status, 200, raw)
+
+        with _env(HS_CONTEXT_EPOCH_SECRET="rotated-" + secrets.token_hex(16)):
+            service = self._watch_service("get_standings")
+            status, raw, _ = self._req(
+                client, "GET", f"/api/standings/{division}",
+                headers={CONTEXT_EPOCH_HEADER: epoch})
+            self.assertEqual(
+                status, 204,
+                f"a token issued under the pre-rotation secret was still "
+                f"honored after rotation: {raw!r}")
+            self.assertEqual(raw, "", "a discard must carry no body")
+            self.assertEqual(
+                [s for s in service if s == division], [],
+                "the post-rotation mismatch reached ApiService — it did not "
+                "short-circuit in front of the ceiling")
+
+            # AUTH-INDEPENDENCE, control 1: no header at all is unimproved.
+            bare_status, bare_raw, _ = self._req(
+                client, "GET", f"/api/standings/{division}")
+            self.assertNotEqual(bare_status, 204, bare_raw)
+
+            # AUTH-INDEPENDENCE, control 2: a FRESH token learned AFTER the
+            # rotation is honored normally — rotation discards what was
+            # already in flight, it does not lock the account out.
+            fresh = self._epoch_from_api(client)
+            self.assertNotEqual(
+                fresh, epoch,
+                "the fixture is vacuous: rotation must change the current "
+                "epoch or this control proves nothing")
+            status, raw, _ = self._req(
+                client, "GET", f"/api/standings/{division}",
+                headers={CONTEXT_EPOCH_HEADER: fresh})
+            self.assertEqual(status, 200, raw)
+        self._assert_gate_is_clean("after the rotation discard")
 
 
 class MemoryContextReadEpochTest(ContextReadCancelHandoffCases, unittest.TestCase):

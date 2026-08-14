@@ -40,7 +40,8 @@ from ..services import (
     push_transport_from_env,
 )
 from ..services.context_epoch import (
-    CONTEXT_EPOCH_HEADER, EPOCH_MISMATCH, context_epoch, epoch_verdict)
+    CONTEXT_EPOCH_HEADER, EPOCH_MISMATCH, context_epoch, epoch_secret,
+    epoch_verdict)
 from ..services.context_gate import ContextSwitchGate
 from ..store import SqlStore, create_store
 from .auth import (
@@ -4973,6 +4974,14 @@ class Server(ThreadingHTTPServer):
 
 
 def serve(host: str = "127.0.0.1", port: int = 8000) -> None:
+    # FAIL CLOSED HERE, before anything else (#159 review finding 4): a
+    # production deployment with HS_CONTEXT_EPOCH_SECRET unset or too short
+    # must refuse to boot outright, not silently fall back to an unkeyed hash
+    # and not serve even one request before the misconfiguration is found.
+    # Outside production this returns the documented demo key and never
+    # raises, so a plain `python3 -m hockey_scheduler.web.server` keeps
+    # working with zero configuration.
+    epoch_secret()
     # Configure the delivery worker loop from env and start it if enabled (#79).
     # ApiService keeps a disabled loop by default (safe for tests); only the
     # running server process reads env and may spin the background thread.
