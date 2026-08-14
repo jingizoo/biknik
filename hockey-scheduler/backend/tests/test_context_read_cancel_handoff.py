@@ -433,6 +433,41 @@ class ContextReadEpochBase(ContextGateFixtureBase):
     _SERVICE_FOR = {"venue-candidates": "get_venue_grant_candidates",
                     "venue-access": "list_season_venue_access"}
 
+    def _all_scoped_route_cases(self, fx):
+        """One case per entry in ``CONTEXT_SCOPED_READ_ROUTES`` (#159 review
+        finding 1) -- label, the exact path to hit, the ``ApiService`` method
+        the ceiling reaches, and the id ``_watch_service`` should watch for on
+        that method. Built fresh under ``fx['s1']`` so every target genuinely
+        exists and answers non-204 there, the same discipline
+        ``_program_with_two_seasons`` fixtures already use.
+
+        A TABLE, not a hand-picked subset: the whole point is that a route
+        added to ``CONTEXT_SCOPED_READ_ROUTES`` later shows up here too,
+        rather than this file silently testing yesterday's membership.
+        """
+        division_id = self._division_with_teams(fx, fx["s1"], tag="Tbl")
+        scenario_id = self._scenario_in(fx, fx["s1"], name="Table run")
+        ls_ids = self._league_with_teams(fx, fx["s1"], tag="TblLs")
+        return [
+            {"label": "venue-candidates",
+             "path": f"/api/v2/setup/seasons/{fx['s1']}/venue-candidates",
+             "service": "get_venue_grant_candidates", "watch": fx["s1"]},
+            {"label": "venue-access",
+             "path": f"/api/v2/setup/seasons/{fx['s1']}/venue-access",
+             "service": "list_season_venue_access", "watch": fx["s1"]},
+            {"label": "scenario",
+             "path": f"/api/scheduler/scenarios/{scenario_id}",
+             "service": "get_schedule_scenario", "watch": scenario_id},
+            {"label": "standings-division",
+             "path": f"/api/standings/{division_id}",
+             "service": "get_standings", "watch": division_id},
+            {"label": "standings-league-season",
+             "path": (f"/api/standings/league-season/"
+                      f"{ls_ids['league_id']}/{fx['s1']}"),
+             "service": "get_league_season_standings",
+             "watch": ls_ids["league_id"]},
+        ]
+
     # -- helpers ------------------------------------------------------------
     def _epoch(self, user_id):
         """The epoch of the row as it stands NOW, derived the same way the
@@ -898,41 +933,105 @@ class ContextReadCancelHandoffCases(ContextReadEpochBase):
         self.assertEqual(current, 200, raw2)
 
     # ======================================================================
-    # 6. EVERY LISTED ROUTE, NOT ONLY THE TWO CI HIT
+    # 6. EVERY REGISTERED ROUTE, TABLE-DRIVEN — not a hand-picked subset
     # ======================================================================
-    def test_the_other_two_listed_routes_discard_on_a_stale_epoch_too(self):
+    def test_every_registered_scoped_read_route_discards_on_a_stale_epoch(self):
         """``CONTEXT_SCOPED_READ_ROUTES`` is the authoritative definition of a
-        context-scoped read, and every entry gets the same treatment.
-        ``app.js`` does not enrol these two today, so no shipped request
-        carries the header on them — this case is what stops the four routes
-        drifting apart while that is true."""
-        fx = self._program_with_two_seasons("Routes")
-        username, user_id = self._operator("routes")
+        context-scoped read, and every entry gets the SAME treatment — driven
+        off the table itself (``_all_scoped_route_cases``), not a hand-picked
+        pair (#159 review finding 1).
+
+        THE GAP THIS REPLACES A NARROWER TEST FOR: the previous version of
+        this case exercised only the Division standings route and the
+        scenario route — "the other two" the #415 CI incident had not hit.
+        The FIFTH registered route, ``GET /api/standings/league-season/<l>/
+        <s>``, used ``Handler._context_read_hold`` directly instead of
+        ``_read_under_context_gate`` and so skipped the epoch comparison
+        entirely: a stale echo reached ``ApiService.get_league_season_
+        standings`` and answered whatever the ceiling says (its ordinary
+        ``not_found``) rather than the contract's empty ``204``/no-service-
+        call discard. A test built from the table would have caught it; one
+        that named two routes by hand could not.
+
+        Required coverage, per route, per the review: a CURRENT epoch reaches
+        the service and reproduces the no-header answer (``current epoch =
+        existing response``); a STALE epoch is ``204`` with an EMPTY body and
+        a service-call SPY proving the service was never reached (a discard
+        must be measured, not inferred from the status code); an ABSENT
+        header is never a discard (legacy behavior, unimproved but not worse).
+        """
+        fx = self._program_with_two_seasons("AllRoutes")
+        username, user_id = self._operator("allroutes")
         client = self._login(username)
         self._select(client, fx["program_id"], fx["s1"])
-        division = self._division_with_teams(fx, fx["s1"])
-        scenario = self._scenario_in(fx, fx["s1"])
+        cases = self._all_scoped_route_cases(fx)
+        self.assertEqual(
+            len(cases), len(self.srv.CONTEXT_SCOPED_READ_ROUTES),
+            "this table has drifted out of sync with "
+            "CONTEXT_SCOPED_READ_ROUTES — every registered route needs a "
+            "case here, or this test is silently back to hand-picking")
+
+        # The no-header baseline, captured BEFORE any epoch enters play, so
+        # "current epoch = existing response" below has something honest to
+        # match against rather than a status-code guess.
+        baselines = {}
+        for case in cases:
+            status, raw, _ = self._req(client, "GET", case["path"])
+            self.assertNotEqual(
+                status, 204, f"{case['label']}: the fixture route itself "
+                f"discards with no epoch involved at all: {raw}")
+            baselines[case["label"]] = (status, raw)
+
         stale = self._epoch_from_api(client)
 
-        for path in (f"/api/standings/{division}",
-                     f"/api/scheduler/scenarios/{scenario}"):
-            ok, raw, _ = self._req(client, "GET", path,
-                                   headers={CONTEXT_EPOCH_HEADER: stale})
-            self.assertEqual(ok, 200, f"{path} under a current epoch: {raw}")
+        for case in cases:
+            with self.subTest(route=case["label"], phase="current-epoch"):
+                service = self._watch_service(case["service"])
+                status, raw, _ = self._req(
+                    client, "GET", case["path"],
+                    headers={CONTEXT_EPOCH_HEADER: stale})
+                self.assertEqual(
+                    (status, raw), baselines[case["label"]],
+                    f"{case['label']}: echoing the CURRENT epoch changed the "
+                    f"answer — a match must reproduce the existing response "
+                    f"byte for byte")
+                self.assertIn(
+                    case["watch"], service,
+                    f"{case['label']}: a current-epoch read never reached "
+                    f"the service at all, so the match above proves nothing")
 
         self._select(client, fx["program_id"], fx["s2"])
-        for path in (f"/api/standings/{division}",
-                     f"/api/scheduler/scenarios/{scenario}"):
-            status, raw, _ = self._req(client, "GET", path,
-                                       headers={CONTEXT_EPOCH_HEADER: stale})
-            self.assertEqual(
-                status, 204,
-                f"{path} was judged against the new tuple instead of being "
-                f"discarded: {raw}")
-            self.assertEqual(raw, "", raw)
-            # ...and with no epoch it is the untouched pre-#159 answer.
-            bare, bare_raw, _ = self._req(client, "GET", path)
-            self.assertNotEqual(bare, 204, bare_raw)
+
+        for case in cases:
+            with self.subTest(route=case["label"], phase="stale-epoch"):
+                service = self._watch_service(case["service"])
+                status, raw, _ = self._req(
+                    client, "GET", case["path"],
+                    headers={CONTEXT_EPOCH_HEADER: stale})
+                self.assertEqual(
+                    status, 204,
+                    f"{case['label']}: a STALE epoch reached the ceiling "
+                    f"({status}) instead of the contract's empty "
+                    f"204/no-service-call discard: {raw}")
+                self.assertEqual(
+                    raw, "", f"{case['label']}: a discard must carry no "
+                    f"body: {raw}")
+                self.assertEqual(
+                    service, [],
+                    f"{case['label']}: the stale-epoch read reached the "
+                    f"service ({service}) — the ceiling WAS evaluated for "
+                    f"it, so the discard did not short-circuit in front of "
+                    f"it")
+
+            with self.subTest(route=case["label"], phase="absent-header"):
+                bare_status, bare_raw, _ = self._req(
+                    client, "GET", case["path"])
+                self.assertNotEqual(
+                    bare_status, 204,
+                    f"{case['label']}: an ABSENT header must never produce "
+                    f"a discard — no client is required to participate: "
+                    f"{bare_raw}")
+        self._assert_gate_is_clean("after the full-route-table stale sweep")
 
     # ======================================================================
     # 7. NOTHING LEAKS, NOTHING BLOCKS

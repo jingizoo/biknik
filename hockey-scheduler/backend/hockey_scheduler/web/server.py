@@ -2224,9 +2224,21 @@ class Handler(BaseHTTPRequestHandler):
             # PHASE B, for the same reason the sibling takes it: now that this
             # route resolves the active tuple, a switch committing mid-read
             # turns a legitimately-requested table into the generic not_found.
-            with self._context_read_hold(user_id):
-                payload = api.get_league_season_standings(
-                    lss.group(1), lss.group(2), user_id, role, scope)
+            # THROUGH THE COMMON EPOCH GATE (#159 review finding 1), not the
+            # bare hold: this route is listed in `CONTEXT_SCOPED_READ_ROUTES`
+            # alongside its per-Division sibling immediately above, and a bare
+            # `_context_read_hold` gives it PHASE B's ordering against an
+            # in-flight switch but skips the late-arrival epoch comparison
+            # entirely — a read dispatched before a switch but arriving after
+            # it reached the ceiling and answered the ordinary `not_found`
+            # instead of the contract's empty 204/no-service-call discard the
+            # other four listed routes already give it.
+            payload = self._read_under_context_gate(
+                user_id,
+                lambda: api.get_league_season_standings(
+                    lss.group(1), lss.group(2), user_id, role, scope))
+            if payload is DISCARDED_READ:
+                return self._send_discarded_read()
             return self._send_api(payload)
         # Public, no-auth surface (#83): schedule / standings / game detail,
         # public-safe fields only. Reachable unauthenticated in production.
