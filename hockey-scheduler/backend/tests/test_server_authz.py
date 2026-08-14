@@ -472,10 +472,16 @@ class OptionalSessionProductionMatrixContract:
     everything already done. ``addClassCleanup`` callbacks run even when
     ``setUpClass`` raises (unlike ``tearDownClass``), each independently
     (one callback raising does not stop the others from running), and in
-    LIFO order -- registering ``server_close`` right after the listening
-    socket is opened and ``_stop_serving`` (shutdown + thread join) right
-    after the thread starts is what makes shutdown-then-close the actual
-    execution order below, without a single monolithic teardown method.
+    LIFO order -- registering a bare ``server_close`` right after the
+    listening socket is opened (a safety net for the narrow case where the
+    THREAD below never gets to start at all) and ``_stop_serving``
+    (shutdown + thread join + its OWN ``server_close``, satisfying this
+    repo's own ``ListeningSocketLeakTest`` structural guard against a
+    ``shutdown()`` with no nearby ``server_close()``, #382) right after
+    the thread starts is what makes shutdown-then-close the actual
+    execution order below, without a single monolithic teardown method
+    (``server_close()`` is idempotent, so running it via both paths in the
+    ordinary case is harmless).
 
     (b) the PostgreSQL subclass targets the worker-shared
     ``TEST_DATABASE_URL``, and production's own ``STATE.reset()``
@@ -642,13 +648,24 @@ class OptionalSessionProductionMatrixContract:
 
     @staticmethod
     def _stop_serving(httpd, thread):
-        """Shut the server down and join its thread -- registered via
-        ``addClassCleanup`` right after the thread starts (#202 repair
-        round 6, finding 3), so it runs (LIFO) BEFORE ``server_close``,
-        the correct order, without depending on a single method to get
-        both steps right at the end."""
+        """Shut the server down, join its thread, THEN release the
+        listening socket -- registered via ``addClassCleanup`` right
+        after the thread starts (#202 repair round 6, finding 3), so it
+        runs (LIFO) before the SEPARATE, earlier ``server_close``
+        cleanup below. ``shutdown()`` only stops the ``serve_forever``
+        loop; it does not free the file descriptor
+        (``ListeningSocketLeakTest`` in test_run_parallel_report.py is
+        this repo's own standing guard against exactly that gap, #382)
+        -- ``server_close()`` here closes it as soon as the thread has
+        actually stopped using it, and the separate cleanup registered
+        immediately after the socket opens (below) is a safety net for
+        the narrower case where the THREAD itself never got to start at
+        all (``server_close()`` is idempotent, so running both is
+        harmless -- see ``OptionalSessionProductionMatrixIsolationTests.
+        test_failure_during_thread_start_still_restores_environment``)."""
         httpd.shutdown()
         thread.join(timeout=5)
+        httpd.server_close()
 
     def _get_h(self, path, cookie=None):
         url = f"http://127.0.0.1:{self.port}{path}"
