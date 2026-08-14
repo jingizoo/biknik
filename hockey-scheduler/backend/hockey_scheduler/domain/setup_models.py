@@ -363,6 +363,16 @@ class SeasonRosterMembershipEvent:
     here). Backfilled memberships (migration 052) start with an EMPTY
     history rather than a fabricated "created" event, because the migration
     has no honest timestamp or actor for one.
+
+    ``seq`` (#205 review round 1 finding 4) is a real monotonic integer
+    ordering key, minted alongside ``id`` from the same counter
+    (``store.next_seq("srme")`` — ``id`` is ``f"srme_{seq}"``). ``at`` alone
+    cannot order history: an injected clock (tests) or a fast operator can
+    produce several events with an IDENTICAL timestamp, and ``id`` cannot
+    stand in either — it is TEXT, so a lexical ``ORDER BY id`` puts
+    ``srme_10`` before ``srme_2``. ``events_for_membership`` orders by
+    ``seq`` so Memory/SQLite/PostgreSQL agree on true creation order past 9
+    events, durably (persisted, survives a restart).
     """
     id: str
     membership_id: str
@@ -371,6 +381,7 @@ class SeasonRosterMembershipEvent:
     actor_id: Optional[str] = None
     reason: Optional[str] = None
     detail: dict = field(default_factory=dict)
+    seq: int = 0
 
 
 @dataclass

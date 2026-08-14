@@ -35,6 +35,24 @@
 -- migration has no honest timestamp or actor to write, and inventing either
 -- would be exactly the fabricated history #205 forbids.
 --
+-- ``seq`` (#205 review round 1 finding 4) is a real monotonic integer, minted
+-- from ``store.next_seq("srme")`` — the SAME per-prefix counter
+-- ``next_id("srme")`` formats into the row's own id — so it is perfectly
+-- aligned with that id
+-- (``srme_7`` <-> ``seq=7``) and costs no extra counter row. It exists because
+-- ``id`` is TEXT: SQL's ``ORDER BY id`` is a LEXICAL sort, so
+-- ``srme_10`` < ``srme_2`` there even though 10 events were created after 2 —
+-- while InMemoryStore's dict preserves real insertion order, so the two
+-- stores silently disagreed on history order past 9 events for one
+-- membership. Neither ``at`` (timestamp) nor ``id`` alone is sufficient: an
+-- injected clock used across a whole test (or a busy operator moving faster
+-- than clock resolution) can legitimately produce EQUAL timestamps for
+-- several events, and ``id`` is exactly the string that sorts wrong. ``seq``
+-- is compared as an INTEGER by every engine, so ``events_for_membership``
+-- orders by it and gets the true creation order on Memory, SQLite AND
+-- PostgreSQL alike, surviving a restart/reopen (it is persisted, never
+-- recomputed).
+--
 -- Uniqueness (both engines support partial unique indexes, migration 022/
 -- 029/038 precedent):
 --   * one AUTHORITATIVE (status = 'active') membership per (player, Season).
@@ -44,6 +62,23 @@
 --   * one active (jersey) per (league_season, team) among concrete numbers —
 --     the season-Team-scoped successor of 038's per-team index, which stays
 --     in place for the legacy Player fields until the consumer cutover.
+--   * one OPEN stint (status NOT IN ('released', 'transferred')) per
+--     (player, LeagueSeason), regardless of Team — the DB-expressible half of
+--     the service's "one open stint" pre-check (#205 review round 1 finding
+--     1). Before this index, only the ACTIVE status had a database backstop;
+--     a direct-store write (or any future write path that skips the
+--     service's row locks) could land TWO applicant/affiliate/inactive/
+--     injured rows for the same (player, LeagueSeason) on different Teams —
+--     proved empirically via two real bypassing PostgreSQL connections
+--     (test_season_roster_membership.py's MembershipOpenStintRaceTest). The
+--     service ALSO now row-locks the Player (create_season_roster_membership)
+--     before its own open-rows re-read, so an ordinary service-level create
+--     race is closed twice over: this index is the engine-level backstop for
+--     whatever bypasses that lock, translated to the SAME stable
+--     ``membership_open_conflict`` reason the pre-check raises (db_errors.py).
+--     'affiliate' is exempt from the ACTIVE-per-Season rule above (the
+--     call-up exception) but is NOT exempt from this one: a call-up is still
+--     exactly one stint on ITS OWN LeagueSeason at a time.
 --
 -- Deterministic backfill (no guessing; pre-migration check
 -- assert_season_roster_membership_backfill_ready aborts on anything else):
@@ -91,6 +126,7 @@ CREATE TABLE IF NOT EXISTS season_roster_membership_events (
     actor_id TEXT,
     reason TEXT,
     detail TEXT NOT NULL,
+    seq INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (membership_id) REFERENCES season_roster_memberships(id)
 );
 
@@ -102,6 +138,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_srm_active_team_jersey
     ON season_roster_memberships (league_season_id, team_id, jersey_number)
     WHERE status = 'active' AND jersey_number IS NOT NULL;
 
+CREATE UNIQUE INDEX IF NOT EXISTS ux_srm_open_player_league_season
+    ON season_roster_memberships (player_id, league_season_id)
+    WHERE status NOT IN ('released', 'transferred');
+
 CREATE INDEX IF NOT EXISTS ix_srm_player
     ON season_roster_memberships (player_id);
 CREATE INDEX IF NOT EXISTS ix_srm_league_season_team
@@ -110,6 +150,8 @@ CREATE INDEX IF NOT EXISTS ix_srm_season
     ON season_roster_memberships (season_id);
 CREATE INDEX IF NOT EXISTS ix_srme_membership
     ON season_roster_membership_events (membership_id);
+CREATE INDEX IF NOT EXISTS ix_srme_membership_seq
+    ON season_roster_membership_events (membership_id, seq);
 
 INSERT INTO season_roster_memberships
     (id, player_id, league_season_id, season_id, team_id, status,

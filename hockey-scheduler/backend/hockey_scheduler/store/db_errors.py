@@ -66,6 +66,8 @@ _ACTIVE_TEAM_JERSEY_CONSTRAINT = "ux_players_active_team_jersey"
 # Migration 052 (#205 Slice A) partial unique indexes.
 _SRM_ACTIVE_PLAYER_SEASON_CONSTRAINT = "ux_srm_active_player_season"
 _SRM_ACTIVE_TEAM_JERSEY_CONSTRAINT = "ux_srm_active_team_jersey"
+# #205 review round 1 finding 1.
+_SRM_OPEN_PLAYER_LEAGUE_SEASON_CONSTRAINT = "ux_srm_open_player_league_season"
 _ACTIVE_ICE_SLOT_CONSTRAINT = "ux_games_active_ice_slot"
 _ICE_SLOT_TIME_CONSTRAINT = "ux_ice_slots_rink_time"
 _COPY_FORWARD_FINGERPRINT_CONSTRAINT = \
@@ -128,10 +130,12 @@ def translate_membership_conflict_exception(
     context (#205 Slice A).
 
     The membership store write site knows the attempted row, so a race lost to
-    either index — one authoritative active membership per (player, Season), or
-    one active jersey per (LeagueSeason, Team) — surfaces as the SAME stable
-    conflict the service pre-checks raise, without exposing driver text, SQL,
-    or constraint names. Mirrors :func:`translate_player_jersey_exception`.
+    any of the three indexes — one authoritative active membership per
+    (player, Season); one active jersey per (LeagueSeason, Team); one OPEN
+    (non-terminal) stint per (player, LeagueSeason), #205 review round 1
+    finding 1 — surfaces as the SAME stable conflict the service pre-checks
+    raise, without exposing driver text, SQL, or constraint names. Mirrors
+    :func:`translate_player_jersey_exception`.
     """
     if isinstance(exc, DomainError):
         return None
@@ -155,6 +159,16 @@ def translate_membership_conflict_exception(
                      "league_season_id": membership.league_season_id,
                      "team_id": membership.team_id,
                      "jersey_number": membership.jersey_number})
+    if _is_unique_violation_on(
+            exc, _SRM_OPEN_PLAYER_LEAGUE_SEASON_CONSTRAINT,
+            ("season_roster_memberships.player_id",
+             "season_roster_memberships.league_season_id")):
+        return IntegrityConflictError(
+            "Player already has an open membership on this league season; "
+            "update or end it instead of creating another.",
+            details={"reason": "membership_open_conflict",
+                     "player_id": membership.player_id,
+                     "league_season_id": membership.league_season_id})
     return None
 
 

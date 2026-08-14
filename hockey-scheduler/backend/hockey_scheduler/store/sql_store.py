@@ -1527,7 +1527,13 @@ class SqlStore:
         return rows[0] if rows else None
 
     # -- id generation -----------------------------------------------------
-    def next_id(self, prefix: str) -> str:
+    def next_seq(self, prefix: str) -> int:
+        """Increment and return the RAW per-prefix counter (#205 review round
+        1 finding 4) — the same counter :meth:`next_id` formats into a
+        string id, exposed here so a caller that also needs a genuinely
+        sortable integer (e.g. ``SeasonRosterMembershipEvent.seq``) can mint
+        both from ONE atomic step rather than drawing two different
+        numbers."""
         with self._lock:
             cur = self._exec(
                 "INSERT INTO counters(prefix, value) VALUES (?, 1) "
@@ -1535,7 +1541,10 @@ class SqlStore:
                 "RETURNING value", (prefix,))
             row = cur.fetchone()
         # sqlite3.Row and psycopg dict_row both support key access.
-        return f"{prefix}_{row['value']}"
+        return row["value"]
+
+    def next_id(self, prefix: str) -> str:
+        return f"{prefix}_{self.next_seq(prefix)}"
 
     # -- teams / players ---------------------------------------------------
     def _write_team(self, write, team):
@@ -1908,8 +1917,14 @@ class SqlStore:
     def add_season_roster_membership_event(self, event):
         return self._insert(event)
     def events_for_membership(self, membership_id):
+        # ORDER BY seq (#205 review round 1 finding 4), never id: id is TEXT,
+        # so a lexical sort puts "srme_10" before "srme_2" past 9 events for
+        # one membership, and the injected-clock tests (and a fast operator)
+        # can produce IDENTICAL "at" timestamps too. seq is a real integer
+        # minted from the same counter as id, so it is the one column that
+        # both engines compare numerically and that always breaks a tie.
         return self._query(SeasonRosterMembershipEvent, "membership_id = ?",
-                           (membership_id,), order="id")
+                           (membership_id,), order="seq")
 
     # -- team → permanent League migration decisions (#283 migration 035) ---
     def add_team_league_migration_decision(self, decision):

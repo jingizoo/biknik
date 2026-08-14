@@ -2458,16 +2458,25 @@ class SetupService:
                           ) -> SeasonRosterMembershipEvent:
         """Append one immutable history event for a membership. Called by
         every membership mutation in this service — never skipped, so the
-        per-membership history and the audit trail can only move together."""
+        per-membership history and the audit trail can only move together.
+
+        ``seq`` (#205 review round 1 finding 4) is minted from the SAME
+        counter step as ``id`` (one ``next_seq("srme")`` call, formatted into
+        both) rather than a second ``next_id`` draw, so the numeric id suffix
+        and the ordering key never drift apart. It is what
+        ``events_for_membership`` orders by — never ``id`` (TEXT, sorts
+        lexically) or ``at`` alone (an injected/shared clock can tie)."""
+        n = self.store.next_seq("srme")
         return self.store.add_season_roster_membership_event(
             SeasonRosterMembershipEvent(
-                id=self.store.next_id("srme"),
+                id=f"srme_{n}",
                 membership_id=membership_id,
                 action=action,
                 at=self.clock(),
                 actor_id=actor_id,
                 reason=reason,
                 detail=detail or {},
+                seq=n,
             ))
 
     def _validate_membership_status(self, status) -> MembershipStatus:
@@ -2540,7 +2549,7 @@ class SetupService:
         (#205 Slice A).
 
         Spine rules, mirroring register_team_for_season: the Team is
-        row-locked FIRST (canonical Team → League → Season lock order, so a
+        row-locked FIRST (canonical Team → Season → Player lock order, so a
         concurrent League transfer can't strand the membership on a foreign
         LeagueSeason), the Team must belong to the LeagueSeason's League
         (rule 7 analog), hold an ACTIVE SeasonTeamRegistration there, and the
@@ -2555,6 +2564,18 @@ class SetupService:
         override. A terminal status can't be born (``released``/
         ``transferred`` rows exist only as ended stints), and an ``active``
         create enforces the one-active-per-(player, Season) rule.
+
+        The Player row is locked (#205 review round 1 finding 1) BEFORE the
+        open-stint/active-conflict re-reads below, not just the Team: two
+        concurrent creates for the SAME player on DIFFERENT Teams of the SAME
+        LeagueSeason take DIFFERENT Team locks, so without a lock keyed on
+        the one thing they share (the player) both could observe "no open
+        row" and both insert. The Player lock is that common lock — an
+        under-lock re-read, mirroring the Team lock's own #201 discipline —
+        and migration 052's ``ux_srm_open_player_league_season`` partial
+        unique index is the engine-level backstop for any write that still
+        reaches the table without it (translated to this SAME
+        ``membership_open_conflict`` reason by ``db_errors.py``).
         """
         for field_name, value in (("player_id", player_id),
                                   ("league_season_id", league_season_id),
@@ -2570,7 +2591,12 @@ class SetupService:
         if ls is None:
             raise NotFoundError(f"League season {league_season_id} not found.")
         season = self._require_active_season(ls.season_id)  # #159 guard
-        player = self.store.get_player(player_id)
+        # #205 review round 1 finding 1 — row-lock the Player, the ONE thing
+        # two concurrent creates on DIFFERENT Teams of the same LeagueSeason
+        # share (their Team locks differ). Held to commit, so the open-stint
+        # and active-conflict re-reads below are a genuine under-lock check,
+        # not a stale snapshot a concurrent create raced past.
+        player = self.store.get_player_for_update(player_id)
         if player is None:
             raise NotFoundError(f"Player {player_id} not found.")
         if team.league_id and ls.league_id != team.league_id:

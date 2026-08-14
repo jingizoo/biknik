@@ -332,16 +332,25 @@ class InMemoryStore:
                 "current": True}
 
     # -- id generation -----------------------------------------------------
+    def next_seq(self, prefix: str) -> int:
+        """Increment and return the RAW per-prefix counter (#205 review round
+        1 finding 4) — the same counter :meth:`next_id` formats into a
+        string id, exposed here so a caller that also needs a genuinely
+        sortable integer (e.g. ``SeasonRosterMembershipEvent.seq``) can mint
+        both from ONE atomic step rather than drawing two different
+        numbers."""
+        with self._lock:
+            value = self._counters.get(prefix, 0) + 1
+            self._counters[prefix] = value
+            return value
+
     def next_id(self, prefix: str) -> str:
         # itertools.count's next() was a single atomic step; a plain
         # read-modify-write is not, and next_id() may be called outside a
         # transaction on the threaded server, so serialize it to avoid two
         # requests handing out the same id. The lock is the same re-entrant one
         # transaction() holds, so calling this from within a transaction is safe.
-        with self._lock:
-            value = self._counters.get(prefix, 0) + 1
-            self._counters[prefix] = value
-            return f"{prefix}_{value}"
+        return f"{prefix}_{self.next_seq(prefix)}"
 
     # -- teams / players ---------------------------------------------------
     def add_team(self, team: Team) -> Team:
@@ -910,8 +919,15 @@ class InMemoryStore:
 
     def events_for_membership(
             self, membership_id: str) -> List[SeasonRosterMembershipEvent]:
-        return [e for e in self.season_roster_membership_events.values()
-                if e.membership_id == membership_id]
+        # Ordered by the real monotonic ``seq`` (#205 review round 1 finding
+        # 4), not dict insertion order: the two happen to coincide today, but
+        # sorting explicitly makes this store's contract match SqlStore's
+        # (``ORDER BY seq``) instead of relying on an incidental Python
+        # dict-ordering guarantee no docstring here actually promised.
+        return sorted(
+            (e for e in self.season_roster_membership_events.values()
+             if e.membership_id == membership_id),
+            key=lambda e: e.seq)
 
     # -- team → permanent League migration decisions (#283 migration 035) ---
     def add_team_league_migration_decision(
