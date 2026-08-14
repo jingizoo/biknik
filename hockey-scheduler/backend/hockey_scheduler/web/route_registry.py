@@ -62,10 +62,21 @@ What is NOT here
   leaf, #202 repair root cause 1's own lesson), and every non-``"route"``
   entry is pinned by name so retagging even one is a conspicuous, reviewed
   diff line, the same discipline ``_AUDIT_WAIVERS`` uses in route_extract.py.
-* ``auth`` and ``scope_axis`` are declared slots for that later work and are
-  ``UNCLASSIFIED`` on every entry. They are deliberately NOT filled in with
-  guesses: a half-populated policy field reads as authority and would be
-  believed. Nothing reads either field.
+* ``auth`` and ``scope_axis`` were declared slots for that later work when
+  this section was first written; they are NOT ANY MORE (#202 repair round
+  4, finding 4). Every REACHABLE spec now carries a real classification --
+  238 of them, as of this writing -- and ``tests/test_route_registry.py``'s
+  ``_VALID_AUTH_VALUES``/``_EXPECTED_CLASSIFICATION`` CI-GATES both fields
+  for every reachable spec: an unclassified reachable entry, a value outside
+  the declared vocabulary, or a classification that drifts from what
+  ``_EXPECTED_CLASSIFICATION`` independently expects all fail CI. What
+  remains true from the ORIGINAL design intent is only "nothing reads
+  either field AT RUNTIME" -- classification and CI-gating are done;
+  wiring auth/scope enforcement into the request path itself is still
+  LATER #202 work, not this repair round's. The one entry that stays
+  ``UNCLASSIFIED``, deliberately, is ``get_empty_path`` -- an impossible
+  fallback shape (unreachable over HTTP; see its own note below) with no
+  real request ever able to reach it to classify.
 * ``do_POST``'s tail (``_unmatched_route("POST")``) is an UNCONDITIONAL
   fallthrough, not a branch, and so has no spec. ``_dispatch_get``'s
   equivalent tail hands any non-``/api/`` path to ``_serve_static`` -- which
@@ -106,7 +117,12 @@ class RouteSpec:
              than the real routes under it), ``fallthrough`` (an answer for
              paths no route claimed) or ``static`` (a file/shell).
     auth / scope_axis
-             INERT slots for a later step of #202. Nothing reads them.
+             CLASSIFIED and CI-GATED for every reachable spec (#202 repair
+             round 4, finding 4; see tests/test_route_registry.py's
+             ``_VALID_AUTH_VALUES``/``_EXPECTED_CLASSIFICATION``) but NOT
+             YET runtime-enforced -- nothing in server.py reads either
+             field while dispatching a request. Only ``get_empty_path``
+             (an unreachable-over-HTTP fallback shape) stays UNCLASSIFIED.
     note     free text; provenance for the odd entries.
     """
 
