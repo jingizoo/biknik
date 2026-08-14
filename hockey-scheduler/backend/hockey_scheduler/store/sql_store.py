@@ -66,6 +66,7 @@ from ..domain import (
     GuardianLink,
     InstallationState,
     RosterRole,
+    LeagueRankingPolicy,
     MembershipStatus,
     Season,
     ScheduleScenario,
@@ -145,6 +146,11 @@ def _jsonc():
             lambda v: json.loads(v) if v else {})
 
 
+def _jsonlist():
+    return (lambda v: json.dumps(v or []),
+            lambda v: json.loads(v) if v else [])
+
+
 class Col:
     __slots__ = ("name", "to_db", "from_db")
 
@@ -194,6 +200,10 @@ SPECS = {
     Season: Spec(Season, "seasons", {"start_date": _dt(), "end_date": _dt(),
                                      "status": _enum(SeasonStatus),
                                      "archived_at": _dt()}),
+    # Child of leagues; keep it before League for child-first deletes.
+    LeagueRankingPolicy: Spec(
+        LeagueRankingPolicy, "league_ranking_policies",
+        {"rules": _jsonlist(), "notice_window_enabled": _bool()}),
     League: Spec(League, "leagues"),
     LeagueSeason: Spec(LeagueSeason, "league_seasons"),
     Division: Spec(Division, "divisions"),
@@ -1484,6 +1494,25 @@ class SqlStore:
     def events_for_membership(self, membership_id):
         return self._query(SeasonRosterMembershipEvent, "membership_id = ?",
                            (membership_id,), order="id")
+
+    # -- league ranking policies (#287 slice 1, migration 054) -------------
+    def add_league_ranking_policy(self, policy):
+        return self._insert(policy)
+    def get_league_ranking_policy(self, policy_id):
+        return self._get(LeagueRankingPolicy, policy_id)
+    def save_league_ranking_policy(self, policy):
+        return self._update(policy)
+    def delete_league_ranking_policy(self, policy_id):
+        self._delete(LeagueRankingPolicy, policy_id)
+    def all_league_ranking_policies(self):
+        return self._query(LeagueRankingPolicy, order="id")
+    def ranking_policy_for_league(self, league_id):
+        """The one stored row for this League, or None (unconfigured — the
+        caller resolves the in-code default); 054's unique index makes a
+        second row unrepresentable."""
+        rows = self._query(LeagueRankingPolicy, "league_id = ?",
+                           (league_id,), order="id")
+        return rows[0] if rows else None
 
     # -- team → permanent League migration decisions (#283 migration 035) ---
     def add_team_league_migration_decision(self, decision):

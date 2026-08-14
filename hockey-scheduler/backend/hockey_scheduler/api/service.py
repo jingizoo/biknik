@@ -24,6 +24,7 @@ from ..domain import (
     IceSlotStatus,
     IceSlotType,
     MembershipStatus,
+    default_league_ranking_policy,
     NotificationAudience,
     NotificationChannel,
     NotificationKind,
@@ -10884,6 +10885,52 @@ class ApiService:
             raise NotFoundError(f"Membership {membership_id} not found.")
         return {"events": [_serialize(e) for e in
                            self.store.events_for_membership(membership_id)]}
+
+    # -- league ranking policies (#287 slice 1) -----------------------------
+    # Facade only, exactly like the membership block above: no HTTP routes
+    # yet (endpoint wiring is a later slice per the project layering rule),
+    # and — deliberately — no consumer: the ranking engine is a separate
+    # in-flight PR, and wiring policy + engine into the substitute
+    # candidate list is the next #287 slice, deferred until it merges.
+
+    @catch
+    def get_league_ranking_policy(self, league_id: str) -> dict:
+        """The League's EFFECTIVE substitute-matching configuration: the
+        stored row (``source: "league"``) or, for an unconfigured League,
+        the well-defined default (``source: "default"``, ``id: None`` — a
+        default is not a stored row and must not masquerade as one)."""
+        stored = self.setup.get_league_ranking_policy(league_id)
+        if stored is not None:
+            return {**_serialize(stored), "source": "league"}
+        return {**_serialize(default_league_ranking_policy(league_id)),
+                "id": None, "source": "default"}
+
+    @catch
+    def set_league_ranking_policy(
+            self, league_id: str, *, rules=_SETUP_UNSET,
+            notice_window_enabled=_SETUP_UNSET, random_seed=_SETUP_UNSET,
+            offer_response_deadline_minutes=_SETUP_UNSET,
+            actor_id: Optional[str] = None) -> dict:
+        """Partial upsert (the service's _UNSET contract, as with
+        memberships above): only the provided fields change; the rest keep
+        their current effective values."""
+        policy = self.setup.set_league_ranking_policy(
+            league_id, rules=rules,
+            notice_window_enabled=notice_window_enabled,
+            random_seed=random_seed,
+            offer_response_deadline_minutes=offer_response_deadline_minutes,
+            actor_id=actor_id)
+        return {**_serialize(policy), "source": "league"}
+
+    @catch
+    def reset_league_ranking_policy(self, league_id: str,
+                                    actor_id: Optional[str] = None) -> dict:
+        """Back to the default (audited when a stored row was actually
+        removed); returns the now-effective policy plus what happened."""
+        removed = self.setup.reset_league_ranking_policy(
+            league_id, actor_id=actor_id)
+        return {"reset": removed,
+                **self.get_league_ranking_policy(league_id)}
 
     @catch
     def roll_forward_registrations(self, from_season_id: str, to_season_id: str,

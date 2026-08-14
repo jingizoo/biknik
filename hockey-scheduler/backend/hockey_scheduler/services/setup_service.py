@@ -42,13 +42,16 @@ from ..domain import (
     RescheduleStatus,
     Organization,
     PolicyScopeType,
+    LeagueRankingPolicy,
     MembershipStatus,
+    RankingRuleKind,
     Rink,
     SchedulingPolicy,
     Season,
     SeasonRosterMembership,
     SeasonRosterMembershipEvent,
     SeasonStatus,
+    default_league_ranking_policy,
     SeasonTeamRegistration,
     SeasonVenueAccess,
     SetupAuditLog,
@@ -3700,6 +3703,167 @@ class SetupService:
         validates the scope exists so a typo'd id is a 404, not a null)."""
         st = self._require_policy_scope(scope_type, scope_id)
         return self.store.find_scheduling_policy(st, scope_id)
+
+    # -- league ranking policies (#287 slice 1, migration 054) --------------
+    #
+    # PURE PERSISTENCE + CRUD. Nothing here (or anywhere else on this
+    # branch) feeds a ranking computation: the deterministic ranking engine
+    # is its own in-flight PR, and wiring policy + engine into the
+    # candidate list is the next #287 slice, deliberately deferred until
+    # that engine merges. Absence of configuration is well-defined — an
+    # unconfigured League resolves to default_league_ranking_policy()
+    # (issue order, all enabled, notice window on, seed 0, 24 h deadline).
+
+    def _require_league(self, league_id):
+        if not league_id or not isinstance(league_id, str):
+            raise ValidationError(
+                "league_id is required.",
+                {"reason": "field_required", "field": "league_id"})
+        league = self.store.get_league(league_id)
+        if league is None:
+            raise NotFoundError(f"League {league_id} not found.")
+        return league
+
+    def _validate_ranking_rules(self, rules) -> list:
+        """The ordered rule list, normalized: every RankingRuleKind exactly
+        once, each entry ``{"kind": ..., "enabled": bool}``. Disabling is an
+        explicit flag, never omission — so a missing kind is a named error,
+        not a silent policy hole (and a duplicate cannot smuggle a second
+        priority for the same rule)."""
+        if not isinstance(rules, list):
+            raise ValidationError(
+                "rules must be an ordered list of {kind, enabled} entries.",
+                {"reason": "invalid_ranking_rules", "field": "rules"})
+        normalized, seen = [], set()
+        for entry in rules:
+            if not isinstance(entry, dict):
+                raise ValidationError(
+                    "Each rules entry must be a {kind, enabled} object.",
+                    {"reason": "invalid_ranking_rule_entry", "field": "rules"})
+            unknown_keys = set(entry) - {"kind", "enabled"}
+            if unknown_keys:
+                raise ValidationError(
+                    "Unknown rules entry field(s): "
+                    + ", ".join(sorted(unknown_keys)) + ".",
+                    {"reason": "invalid_ranking_rule_entry", "field": "rules",
+                     "unknown_fields": sorted(unknown_keys)})
+            try:
+                kind = RankingRuleKind(entry.get("kind"))
+            except (ValueError, TypeError):
+                raise ValidationError(
+                    "rules entry kind must be one of "
+                    + ", ".join(k.value for k in RankingRuleKind) + ".",
+                    {"reason": "unknown_ranking_rule_kind",
+                     "field": "rules", "kind": entry.get("kind")})
+            if kind.value in seen:
+                raise ValidationError(
+                    f"Rule kind {kind.value} appears more than once.",
+                    {"reason": "duplicate_ranking_rule_kind",
+                     "field": "rules", "kind": kind.value})
+            enabled = entry.get("enabled", True)
+            if not isinstance(enabled, bool):
+                raise ValidationError(
+                    "rules entry enabled must be true or false.",
+                    {"reason": "invalid_ranking_rule_enabled",
+                     "field": "rules", "kind": kind.value})
+            seen.add(kind.value)
+            normalized.append({"kind": kind.value, "enabled": enabled})
+        missing = [k.value for k in RankingRuleKind if k.value not in seen]
+        if missing:
+            raise ValidationError(
+                "rules must contain every rule kind exactly once "
+                "(disable with enabled=false, never by omission); missing: "
+                + ", ".join(missing) + ".",
+                {"reason": "missing_ranking_rule_kinds", "field": "rules",
+                 "missing_kinds": missing})
+        return normalized
+
+    @staticmethod
+    def _validate_policy_flag(value, field):
+        if not isinstance(value, bool):
+            raise ValidationError(
+                f"{field} must be true or false.",
+                {"reason": f"invalid_{field}", "field": field})
+        return value
+
+    @staticmethod
+    def _validate_policy_int(value, field, minimum=None):
+        if not isinstance(value, int) or isinstance(value, bool) or (
+                minimum is not None and value < minimum):
+            bound = (f" >= {minimum}" if minimum is not None else "")
+            raise ValidationError(
+                f"{field} must be an integer{bound}.",
+                {"reason": f"invalid_{field}", "field": field})
+        return value
+
+    def get_league_ranking_policy(self, league_id):
+        """The stored row for this League, or ``None`` when unconfigured
+        (read-only; a missing League is a 404, never a default — a typo'd
+        id must not look like a configured-by-default League)."""
+        self._require_league(league_id)
+        return self.store.ranking_policy_for_league(league_id)
+
+    @_transactional
+    def set_league_ranking_policy(self, league_id, *, rules=_UNSET,
+                                  notice_window_enabled=_UNSET,
+                                  random_seed=_UNSET,
+                                  offer_response_deadline_minutes=_UNSET,
+                                  actor_id: Optional[str] = None):
+        """Upsert this League's substitute-matching configuration (#287
+        slice 1), audited.
+
+        Partial like ``update_player``: a field left ``_UNSET`` keeps its
+        current EFFECTIVE value — the stored one, or the default for a
+        League configured for the first time — so a form that only reorders
+        rules cannot silently reset the deadline. None is not a meaningful
+        value for any field here, so explicit ``None`` is a validation
+        error, not a clear."""
+        self._require_league(league_id)
+        existing = self.store.ranking_policy_for_league(league_id)
+        base = existing if existing is not None else \
+            default_league_ranking_policy(league_id)
+        values = {
+            "rules": self._validate_ranking_rules(rules)
+            if rules is not _UNSET else base.rules,
+            "notice_window_enabled": self._validate_policy_flag(
+                notice_window_enabled, "notice_window_enabled")
+            if notice_window_enabled is not _UNSET
+            else base.notice_window_enabled,
+            "random_seed": self._validate_policy_int(
+                random_seed, "random_seed")
+            if random_seed is not _UNSET else base.random_seed,
+            "offer_response_deadline_minutes": self._validate_policy_int(
+                offer_response_deadline_minutes,
+                "offer_response_deadline_minutes", minimum=1)
+            if offer_response_deadline_minutes is not _UNSET
+            else base.offer_response_deadline_minutes,
+        }
+        if existing is None:
+            policy = self.store.add_league_ranking_policy(LeagueRankingPolicy(
+                id=self.store.next_id("lrp"), league_id=league_id, **values))
+        else:
+            for field_name, value in values.items():
+                setattr(existing, field_name, value)
+            policy = self.store.save_league_ranking_policy(existing)
+        self._audit("league_ranking_policy_set", "league_ranking_policy",
+                    policy.id, actor_id, {"league_id": league_id, **values})
+        return policy
+
+    @_transactional
+    def reset_league_ranking_policy(self, league_id,
+                                    actor_id: Optional[str] = None) -> bool:
+        """Delete this League's stored row (audited) so it resolves to the
+        default again. Returns whether a row existed — resetting an
+        unconfigured League is a no-op, not an error, and writes no audit
+        entry for a change that didn't happen."""
+        self._require_league(league_id)
+        existing = self.store.ranking_policy_for_league(league_id)
+        if existing is None:
+            return False
+        self.store.delete_league_ranking_policy(existing.id)
+        self._audit("league_ranking_policy_reset", "league_ranking_policy",
+                    existing.id, actor_id, {"league_id": league_id})
+        return True
 
     def _cascade_scheduling_policy(self, scope_type, scope_id, actor_id):
         """Delete (and audit) a scope's policy row when the scope entity

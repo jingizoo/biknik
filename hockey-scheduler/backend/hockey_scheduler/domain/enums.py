@@ -67,6 +67,33 @@ class MembershipStatus(str, Enum):
                         MembershipStatus.TRANSFERRED}
 
 
+class RankingRuleKind(str, Enum):
+    """A League-configurable substitute-matching rule (#287 slice 1).
+
+    Exactly the ordering rules issue #287 decided — each League may enable
+    and PRIORITIZE them (order + enabled flag live in
+    :class:`LeagueRankingPolicy`):
+
+    * ``fairness`` — prefer players with fewer completed substitute games;
+    * ``skill_proximity`` — match the absent player's 1-7 skill rating as
+      closely as possible;
+    * ``position_preference`` — for skaters: exact position first, then a
+      player who can play both forward and defence, then the alternate;
+    * ``random`` — seeded random selection, usable as a rule or (in last
+      place, the default) as the tiebreaker.
+
+    Two decided behaviors are deliberately NOT rule kinds: the goalie/skater
+    separation is a HARD GATE (never matched across, not disable-able, so
+    making it reorderable data would misstate the contract), and the
+    notice-window is an EXCLUSION filter rather than an ordering rule — it
+    is the policy's own ``notice_window_enabled`` flag.
+    """
+    FAIRNESS = "fairness"
+    SKILL_PROXIMITY = "skill_proximity"
+    POSITION_PREFERENCE = "position_preference"
+    RANDOM = "random"
+
+
 class SlotStatus(str, Enum):
     FULL = "full"
     OPEN = "open"

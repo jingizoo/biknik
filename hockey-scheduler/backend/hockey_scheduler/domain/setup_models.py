@@ -22,6 +22,7 @@ from .enums import (
     OfficialRole,
     PolicyScopeType,
     Position,
+    RankingRuleKind,
     RescheduleStatus,
     ResultStatus,
     SeasonStatus,
@@ -225,6 +226,58 @@ class SeasonRosterMembership:
     shoots: Optional[str] = None
     effective_from: Optional[datetime] = None
     effective_to: Optional[datetime] = None
+
+
+@dataclass
+class LeagueRankingPolicy:
+    """One League's substitute-matching configuration (#287 slice 1,
+    migration 054) — pure persistence: nothing reads it for ranking yet
+    (that consumer arrives with the #287 slice-2 wiring, after the ranking
+    module lands).
+
+    ``rules`` is the ORDERED list the League prioritized: plain
+    ``{"kind": <RankingRuleKind value>, "enabled": bool}`` dicts, order
+    meaning priority, carrying EVERY kind exactly once — disabling is
+    ``enabled: False``, never omission, so an absent kind is unrepresentable
+    rather than ambiguous. ``notice_window_enabled`` is the decided
+    exclusion filter (drop candidates needing more notice than remains);
+    ``random_seed`` makes the random rule/tiebreaker reproducible;
+    ``offer_response_deadline_minutes`` is the configurable response window
+    of the offer workflow. How a deadline interacts with a game that is
+    already close (#287 open question 5) and cross-boundary eligibility
+    (question 4) stay unruled — this record deliberately encodes neither.
+
+    One row per League (unique in 054); a League without a row uses
+    :func:`default_league_ranking_policy`, so absence of configuration is
+    well-defined rather than a null case every consumer re-invents.
+    """
+    id: str
+    league_id: str
+    rules: list
+    notice_window_enabled: bool = True
+    random_seed: int = 0
+    offer_response_deadline_minutes: int = 1440
+
+
+# The issue's own listing order, random in last place as the tiebreaker,
+# everything enabled — the well-defined meaning of "this League never
+# configured matching". A function (not a shared constant) so no caller can
+# mutate the default in place for everyone else.
+def default_league_ranking_rules() -> list:
+    return [{"kind": kind.value, "enabled": True}
+            for kind in (RankingRuleKind.FAIRNESS,
+                         RankingRuleKind.SKILL_PROXIMITY,
+                         RankingRuleKind.POSITION_PREFERENCE,
+                         RankingRuleKind.RANDOM)]
+
+
+def default_league_ranking_policy(league_id: str) -> LeagueRankingPolicy:
+    """The effective policy of an unconfigured League. ``id`` is empty — the
+    default is not a stored row, and serializing it as one would let a
+    reader mistake "never configured" for "someone chose exactly the
+    defaults"."""
+    return LeagueRankingPolicy(id="", league_id=league_id,
+                               rules=default_league_ranking_rules())
 
 
 @dataclass

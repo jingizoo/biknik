@@ -31,6 +31,7 @@ from ..domain import (
     FactoryResetEvent,
     FactoryResetLock,
     League,
+    LeagueRankingPolicy,
     LeagueSeason,
     MembershipStatus,
     Program,
@@ -83,6 +84,7 @@ class InMemoryStore:
         self.league_seasons: Dict[str, LeagueSeason] = {}
         self.divisions: Dict[str, Division] = {}
         self.season_team_registrations: Dict[str, SeasonTeamRegistration] = {}
+        self.league_ranking_policies: Dict[str, LeagueRankingPolicy] = {}
         self.season_roster_memberships: Dict[str, SeasonRosterMembership] = {}
         self.season_roster_membership_events: Dict[
             str, SeasonRosterMembershipEvent] = {}
@@ -679,6 +681,35 @@ class InMemoryStore:
             self, membership_id: str) -> List[SeasonRosterMembershipEvent]:
         return [e for e in self.season_roster_membership_events.values()
                 if e.membership_id == membership_id]
+
+    # -- league ranking policies (#287 slice 1, migration 054) -------------
+    def add_league_ranking_policy(
+            self, policy: LeagueRankingPolicy) -> LeagueRankingPolicy:
+        self.league_ranking_policies[policy.id] = policy
+        return policy
+
+    def get_league_ranking_policy(
+            self, policy_id: str) -> Optional[LeagueRankingPolicy]:
+        return self.league_ranking_policies.get(policy_id)
+
+    def save_league_ranking_policy(
+            self, policy: LeagueRankingPolicy) -> LeagueRankingPolicy:
+        self.league_ranking_policies[policy.id] = policy
+        return policy
+
+    def delete_league_ranking_policy(self, policy_id: str) -> None:
+        self.league_ranking_policies.pop(policy_id, None)
+
+    def all_league_ranking_policies(self) -> List[LeagueRankingPolicy]:
+        return list(self.league_ranking_policies.values())
+
+    def ranking_policy_for_league(
+            self, league_id: str) -> Optional[LeagueRankingPolicy]:
+        """The one stored row for this League, or None (unconfigured — the
+        caller resolves the in-code default). Uniqueness is enforced by the
+        service upsert here and by 054's unique index on SQL."""
+        return next((p for p in self.league_ranking_policies.values()
+                     if p.league_id == league_id), None)
 
     # -- team → permanent League migration decisions (#283 migration 035) ---
     def add_team_league_migration_decision(
