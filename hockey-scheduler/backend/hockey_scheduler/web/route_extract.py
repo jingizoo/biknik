@@ -2179,6 +2179,38 @@ _AUDIT_WAIVERS = {
         "same authorisation-parent lookup as _handle_reassign's own "
         "waiver above, reached from the v2 handler -- the route is already "
         "decided upstream by the v2 combo/schema dispatch; see that entry",
+    # -- #202 repair round 5, finding 1 -- newly REACHED now that a waived
+    # call's RESULT keeps propagating through the ordinary fixed-point
+    # mechanism instead of being erased the instant its call site is
+    # waived (see _propagates_taint's own docstring, "A WAIVER SILENCES
+    # THE CALL, NOT THE RESULT"). `parent` (bound two waiver entries above,
+    # from the SAME module-level `_REASSIGN_PARENTS.get(combo)` this
+    # dict already reviews) now joins `tracked`, so the `is not None`
+    # check on it -- previously invisible, because `parent` never reached
+    # `tracked` at all -- is examined for the first time. NOT a routing
+    # decision: `parent` is `None` exactly when `combo` has no #369
+    # write-side parent-ownership rule to enforce (most reassign combos
+    # don't need one), so this only decides whether to APPEND that one
+    # extra authorisation-target entry -- the SAME `targets` list this
+    # dict's own `targets.append((parent[0], ...))` waiver already
+    # reviews below, reached here as the bare `is not None` guard around
+    # it instead of the append itself. The route was fully decided
+    # upstream by `combo in _V1_REASSIGN_SCHEMA`, unchanged by this branch
+    # either way.
+    ("_handle_reassign", "parent is not None", "if_test", ""):
+        "#202 repair round 5, finding 1 -- guards whether the module-level "
+        "`_REASSIGN_PARENTS.get(combo)` lookup (waived two entries above) "
+        "found a #369 write-side parent-ownership rule for the already-"
+        "decided combo; append-or-not, not a routing decision -- see the "
+        "comment block immediately above this entry for the full "
+        "reasoning, and the sibling `targets.append(...)` waiver below "
+        "for the SAME `targets` list reached as a bare statement instead",
+    ("_handle_reassign_v2", "parent is not None", "if_test", ""):
+        "the v2 sibling of _handle_reassign's own identical-shape waiver "
+        "immediately above (same module-level `_REASSIGN_PARENTS.get(combo)` "
+        "lookup, same #369 append-or-not guard, same reasoning) -- the "
+        "route here is already decided upstream by `combo in "
+        "_V2_REASSIGN_SCHEMA`",
     ("_handle_reassign", "self._V1_SETUP_KIND.get(entity, entity)",
      "tuple_element", ""):
         "#202 repair round 2 finding A -- a legacy-name-alias lookup "
@@ -2209,6 +2241,26 @@ _AUDIT_WAIVERS = {
         "request. A blanket per-verb authorisation gate, not a route "
         "selector -- see test_a_guard_that_merely_passes_the_path_along_"
         "is_not_a_route for the same shape via `_operator_only`",
+    ("do_POST", "perm", "ifexp_test",
+     "not authorize(role, path)"):
+        "#202 repair round 5, finding 1 -- `perm.value if perm else None` "
+        "(the 403 body's `details.required` field): `perm` is `required_"
+        "permission(path)`, waived two entries above; this ternary only "
+        "decides whether the human-readable permission NAME is present or "
+        "null in the error body -- it does not choose a route, `authorize"
+        "(role, path)` (waived below) already refused the request before "
+        "this line runs. Newly reached because `perm` now stays tracked "
+        "past its own waived call -- see _propagates_taint's own "
+        "docstring, 'A WAIVER SILENCES THE CALL, NOT THE RESULT'",
+    ("do_POST", "violation is not None", "if_test", ""):
+        "#202 repair round 5, finding 1 -- guards whether `scope_violation"
+        "(...)` (waived below) found a #51 resource-scoping problem for "
+        "the ALREADY-AUTHORISED request; `violation` is either `None` or a "
+        "human-readable message string, never a route selector -- refuses "
+        "with that message or falls through to dispatch, the SAME blanket-"
+        "gate shape as `scope_violation(...)`'s own waiver immediately "
+        "below. Newly reached because `violation` now stays tracked past "
+        "its own waived call, the same way `perm` does two entries above",
     ("do_POST",
      "scope_violation(role, scope, path, body, api.store, "
      "allow_unscoped_dev_fallback=allow_dev_fallback)", "assign_rhs", ""):
@@ -2309,6 +2361,69 @@ _AUDIT_WAIVERS = {
         "target tuple), shadowing _handle_reassign's own tracked `target` "
         "parameter (the reassignment destination's entity kind) in name "
         "only",
+    # -- #202 repair round 5, finding 1 -- newly REACHED, all four, for the
+    # SAME reason as this dict's two new "parent is not None" entries above:
+    # a waived call's RESULT no longer stops propagating the instant its
+    # call site is waived (see _propagates_taint's own docstring). Two
+    # consequences, both here:
+    #   (a) `_handle_reassign`'s SECOND `targets.append(...)` (the
+    #       "writable_parent" one) was previously never even examined --
+    #       `parent` wasn't tracked pre-round-5, so `_mentions_tracked`
+    #       found nothing in it -- unlike its v2 sibling and unlike this
+    #       same function's FIRST append (`dest`-based), both of which
+    #       were ALREADY reviewed pre-round-5 because `dest` reaches
+    #       `tracked` a DIFFERENT way (a LOCAL tuple-keyed dict literal,
+    #       recognised by the walker's own tuple-dict-lookup shape during
+    #       the walk, independent of _propagates_taint entirely) that
+    #       `parent`'s MODULE-LEVEL dict never gets;
+    #   (b) `_propagates_taint`'s scan of ANY bare statement/assignment no
+    #       longer stops at the FIRST waived call it meets -- it used to
+    #       `return False` for the WHOLE expression there, which incidentally
+    #       also hid every OTHER, unrelated call nested alongside it. Once a
+    #       `targets.append((X[0], b.get(X[1]) or None))` statement's outer
+    #       `.append(...)` call is (correctly) waived, the walk now
+    #       continues into its ARGUMENTS and reaches the previously-
+    #       unexamined `b.get(X[1])` inline call too -- `b` is the request
+    #       BODY dict (`b = body`, both handlers' own top line), and
+    #       `X[1]` (`dest[1]`/`parent[1]`) is a BODY KEY NAME the
+    #       already-decided combo/dest/parent lookup chose, e.g.
+    #       "organization_id" -- reading that one field's value to append
+    #       onto the SAME authorisation-target list the enclosing
+    #       `.append(...)` waiver already reviews. Not a routing decision
+    #       either: the route was fully decided upstream by `combo in
+    #       _V{1,2}_REASSIGN_SCHEMA`, unchanged by which body field gets
+    #       read here.
+    ("_handle_reassign",
+     "targets.append((parent[0], b.get(parent[1]) or None, "
+     "'writable_parent'))", "bare_stmt", "parent is not None"):
+        "#202 repair round 5, finding 1, consequence (a) -- the v1 sibling "
+        "of _handle_reassign_v2's own identical-shape 'writable_parent' "
+        "append waiver (this dict, round 3 finding E section); newly "
+        "reached because `parent` now stays tracked past its own waived "
+        "lookup -- see the comment block immediately above this entry",
+    ("_handle_reassign", "b.get(dest[1])", "boolop", "dest is not None"):
+        "#202 repair round 5, finding 1, consequence (b) -- reads the "
+        "request-body field the ALREADY-DECIDED `dest` (`_V1_REASSIGN_DEST."
+        "get(combo)`) names, to append onto the `targets` authorisation "
+        "list this dict's enclosing `targets.append(...)` waiver already "
+        "reviews (round 3, finding E); not a routing decision -- see the "
+        "comment block above this entry's group for the general shape",
+    ("_handle_reassign", "b.get(parent[1])", "boolop", "parent is not None"):
+        "same shape as this function's `b.get(dest[1])` waiver immediately "
+        "above, for the `parent`-keyed (\"writable_parent\") append instead "
+        "of the `dest`-keyed one",
+    ("_handle_reassign_v2", "b.get(dest[1])", "boolop", "dest is not None"):
+        "the v2 sibling of _handle_reassign's own identical-shape "
+        "`b.get(dest[1])` waiver above; same request-body field read for "
+        "the same already-decided `dest`, feeding the SAME `targets` list "
+        "_handle_reassign_v2's own `targets.append(...)` waiver (round 3, "
+        "finding E) already reviews",
+    ("_handle_reassign_v2", "b.get(parent[1])", "boolop", "parent is not None"):
+        "the v2 sibling of _handle_reassign's own identical-shape "
+        "`b.get(parent[1])` waiver above; same request-body field read for "
+        "the same already-decided `parent`, feeding the SAME `targets` "
+        "list _handle_reassign_v2's own 'writable_parent' append waiver "
+        "(round 3, finding E) already reviews",
     # -- #202 repair round 4, finding 1 -- newly examined now that a Call
     # reached DIRECTLY AS (or and/or/not-ed into) the WHOLE test has its
     # arguments scanned too, the same way finding E already did for a
@@ -2372,6 +2487,16 @@ _AUDIT_WAIVERS = {
         "decided upstream by `combo in _V2_REASSIGN_SCHEMA`); this is the "
         "SAME `targets` list, now examined as a bare if-test instead of "
         "an assignment/append",
+    ("_handle_reassign",
+     "self._refuse_unchosen_context(targets, actor_id, role, scope)",
+     "if_test", ""):
+        "#202 repair round 5, finding 1 -- the v1 sibling of "
+        "_handle_reassign_v2's own identical-shape waiver immediately "
+        "above (same #369 write-side context check on the SAME kind of "
+        "authorisation-target list); newly reached because `targets` now "
+        "stays tracked in v1 too, for the reasons this dict's round-5, "
+        "finding-1 waiver group above explains -- the route here is fully "
+        "decided upstream by `combo in _V1_REASSIGN_SCHEMA`",
     ("_handle_reassign_v2",
      "self._reject_target_outside_scope(target[0], target[1], actor_id, "
      "role, scope, target[2] if len(target) > 2 else 'scope')", "if_test",
@@ -2661,18 +2786,47 @@ def _propagates_taint(value, tracked: set, fn_name: str = "",
     "manipulates" (the whitelist), is provably UNRELATED to any tracked
     name (see `_mentions_tracked`, which treats a nested capture-group or
     Path-property/consuming extraction as opaque so `cal.group(1)` handed
-    to a service still does NOT trip this), or matches a reviewed
-    ``_AUDIT_WAIVERS`` entry the SAME way an unrecognised ``if`` test does
-    (e.g. ``_handle_reassign``'s own `_REASSIGN_PARENTS.get(combo)`: a
-    module-level authorisation-parent lookup keyed on an already-tracked
-    combo, consulted AFTER the route itself was decided by `combo in
-    _V1_REASSIGN_SCHEMA` -- the same "produces a RESULT, not a routing
-    decision" shape as the calendar feed, just not a MECHANICAL one a
-    blanket rule can recognise, so it goes through the same declared,
-    reviewed, one-hit-fingerprinted escape hatch as everything else that
-    needs human judgement rather than a shape rule) are the only ways to
-    end this function quietly now; anything else raises rather than
-    guessing.
+    to a service still does NOT trip this), or is a reviewed
+    ``_AUDIT_WAIVERS`` entry -- see the next paragraph for what a waiver
+    means now -- are the only ways this function does not simply raise on
+    an unlisted call; anything else raises rather than guessing.
+
+    A WAIVER SILENCES THE CALL, NOT THE RESULT (#202 repair round 5,
+    finding 1). A waiver answers exactly one question -- "is THIS call
+    EXPRESSION, at THIS reviewed position, allowed to appear without
+    raising" -- never the SEPARATE question "does the value this call
+    RETURNS still carry taint if it is assigned to a name". Those two used
+    to be conflated: hitting a waived call inside the loop below used to
+    ``return False`` for the WHOLE expression immediately, the same
+    "definitely untainted" verdict as a call provably unrelated to any
+    tracked name -- so `perm = required_permission(path)` (waived, because
+    the CALL is a reviewed blanket-permission lookup, not a route
+    selector) left `perm` OUT of `tracked` entirely, and a LATER
+    `if perm == Permission.MANAGE_SCHEDULE:` reached neither this function
+    nor the completeness scan that consults it: a live route, zero
+    routes recorded, zero exception -- DEMONSTRATED, both over real HTTP
+    and via `extract_routes`, in ``tests/test_route_extract.py``'s
+    ``WaiverTaintPropagationTests``. The fix: a waived call's own node
+    now falls through (``continue``, not ``return False``) to the SAME
+    walk/fallback that decides every other expression's taint, exactly as
+    if the call were not there to examine at all -- so `perm` joins
+    `tracked` through the ordinary fixed-point mechanism precisely because
+    `required_permission(path)`'s own argument (`path`) is still plainly
+    present in the expression, the same as it would be for ANY OTHER
+    call's argument. A subsequent routing-relevant use of that name then
+    raises through the SAME existing machinery as any other tracked name,
+    unless IT separately earns its own waiver at ITS OWN position (round
+    4 finding 3's parent-shape/enclosing-if fingerprint already makes a
+    relocated or newly-reached use of the same name a FRESH key, so this
+    costs no new machinery). A waived call whose result truly never
+    escapes into a routing decision -- e.g. `perm.value` only ever
+    interpolated into a 403 message string -- stays clean under this
+    change for the mundane reason every other untested tracked name
+    does: nothing ever tests it in a shape the completeness scan
+    recognises, so nothing raises. This is NOT a relaxation of the
+    waiver mechanism itself: the call site still raises, unwaived, the
+    exact same way it always did; only what happens to its RESULT
+    changed, from "silently forgotten" to "tracked like everything else".
     """
     for node in ast.walk(value):
         if isinstance(node, ast.Call):
@@ -2688,22 +2842,22 @@ def _propagates_taint(value, tracked: set, fn_name: str = "",
             if _mentions_tracked(node, tracked):
                 waiver_key = _waiver_key(fn_name, node, parents)
                 if waiver_key in _AUDIT_WAIVERS:
-                    # Reviewed and declared not-a-routing-decision (see the
-                    # waiver's own entry) -- like a provably-unrelated call,
-                    # this must not propagate either, or the LHS would join
-                    # `tracked` anyway via the fallback below and simply
-                    # relocate the raise to whatever `if` tests it next
-                    # (DEMONSTRATED: `_REASSIGN_PARENTS.get(combo)` waived
-                    # here but left `parent` tracked moved this exact error
-                    # onto `if parent is not None:`, unwaived, one line
-                    # down).
+                    # Reviewed and declared not-a-routing-decision for THIS
+                    # CALL SITE (see the waiver's own entry) -- #202 repair
+                    # round 5, finding 1: this no longer also erases the
+                    # RESULT's taint. Record the hit (exact-one-hit
+                    # verification, unchanged) and fall through to the
+                    # SAME walk/fallback logic below that decides every
+                    # other node's taint, exactly as if this Call were
+                    # simply absent -- see this function's own docstring,
+                    # "A WAIVER SILENCES THE CALL, NOT THE RESULT", for why.
                     if waiver_hits is not None:
                         # #202 repair round 2, finding D: record the exact
                         # AST node this waiver matched, so a completed run
                         # can verify every declared waiver was consulted
                         # EXACTLY ONCE (see _DispatchWalker.verify_waiver_usage).
                         waiver_hits.setdefault(waiver_key, set()).add(id(node))
-                    return False
+                    continue
                 raise ExtractionError(
                     f"line {node.lineno}: `{ast.unparse(node)}` is an "
                     "unlisted call whose receiver or argument(s) include a "

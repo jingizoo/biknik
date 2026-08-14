@@ -106,6 +106,56 @@ def _real_http_probe(handler_body: str, method: str, path: str, body=None):
         httpd.server_close()
 
 
+def _real_http_probe_with_globals(handler_body: str, extra_globals: dict,
+                                  method: str, path: str, body=None):
+    """As :func:`_real_http_probe`, but with ``extra_globals`` merged into the
+    exec namespace BEFORE the class body runs -- for a fixture whose
+    reviewed waiver text calls a bare, module-level name (``authorize(role,
+    path)``, ``required_permission(path)``, the SAME shape server.py's own
+    ``from .authz import authorize, required_permission`` produces) rather
+    than a ``self.`` method. Keeping these as real free functions, not
+    ``self.`` stand-ins defined inline, is what lets the do_POST BODY TEXT
+    stay byte-identical to what the static ``_module()``-based test hands
+    ``extract_routes`` -- the same "static and live examine identical code"
+    guarantee ``_real_http_probe``'s own docstring describes, extended to a
+    fixture that needs bare globals ``_real_http_probe`` does not supply.
+    """
+    src = ("class _ProbeHandler(BaseHTTPRequestHandler):\n"
+          "    def _send(self, n):\n"
+          "        self._send_json({'n': n})\n"
+          "    def _send_json(self, payload, code=200):\n"
+          "        data = json.dumps(payload).encode()\n"
+          "        self.send_response(code)\n"
+          "        self.send_header('Content-Type', 'application/json')\n"
+          "        self.send_header('Content-Length', str(len(data)))\n"
+          "        self.end_headers()\n"
+          "        self.wfile.write(data)\n"
+          "    def log_message(self, *a):\n"
+          "        pass\n"
+          + textwrap.indent(textwrap.dedent(handler_body), "    "))
+    ns = {"BaseHTTPRequestHandler": BaseHTTPRequestHandler, "json": json,
+         **extra_globals}
+    exec(compile(src, "<probe>", "exec"), ns)  # noqa: S102 -- test-only, fixed source
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), ns["_ProbeHandler"])
+    port = httpd.server_address[1]
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{port}{path}"
+        headers = {"Content-Type": "application/json"} if method == "POST" else {}
+        data = json.dumps(body or {}).encode() if method == "POST" else None
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, r.read().decode()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode()
+    finally:
+        httpd.shutdown()
+        thread.join(timeout=5)
+        httpd.server_close()
+
+
 # --------------------------------------------------------------------------- #
 # The regex subset -> canonical templates                                      #
 # --------------------------------------------------------------------------- #
@@ -1059,20 +1109,23 @@ class WaiverFingerprintTests(unittest.TestCase):
             route_extract_module._AUDIT_WAIVERS.update(saved)))
 
     def test_every_real_waiver_is_hit_exactly_once(self):
-        """The real server.py, unmodified: each of the 29 declared waivers
+        """The real server.py, unmodified: each of the 39 declared waivers
         (18 from rounds 2-3 -- 2 pre-existing + 2 pre-existing ternaries + 6
         round-2 finding A additions + 8 round-3 finding E additions -- plus
         11 round-4 finding 1 additions, once a Call reached DIRECTLY as the
-        whole test had its arguments scanned too) is consulted for precisely
-        the one line it names -- proves the instrumentation is wired all the
-        way through _propagates_taint AND the ast.If/ast.IfExp/ast.While/
-        ast.match_case scan, not just one of them. Each key is now a 4-tuple
-        (#202 repair round 4, finding 3: function, text, parent shape,
-        enclosing if) rather than the original 2-tuple -- WaiverRelocation
-        FingerprintTests below is the dedicated proof for what the extra two
-        parts catch that this exact-one-hit check alone would not."""
+        whole test had its arguments scanned too, plus 10 round-5 finding 1
+        additions, once a WAIVED call's result stopped losing its taint --
+        see _propagates_taint's own docstring, "A WAIVER SILENCES THE CALL,
+        NOT THE RESULT") is consulted for precisely the one line it names --
+        proves the instrumentation is wired all the way through
+        _propagates_taint AND the ast.If/ast.IfExp/ast.While/ast.match_case
+        scan, not just one of them. Each key is now a 4-tuple (#202 repair
+        round 4, finding 3: function, text, parent shape, enclosing if)
+        rather than the original 2-tuple -- WaiverRelocationFingerprintTests
+        below is the dedicated proof for what the extra two parts catch that
+        this exact-one-hit check alone would not."""
         walker = extract_walker()
-        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 29)
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 39)
         for key in route_extract_module._AUDIT_WAIVERS:
             with self.subTest(waiver=key):
                 self.assertEqual(len(walker.waiver_hits.get(key, ())), 1)
@@ -2414,6 +2467,153 @@ def do_GET(self):
         walker = extract_walker()
         self.assertEqual(len(walker.routes), 239)
         self.assertEqual(walker.unreachable, [])
+
+
+# --------------------------------------------------------------------------- #
+# #202 repair round 5, finding 1 (external review, 19:36): a waiver used to   #
+# answer TWO questions at once -- "may this call expression appear without    #
+# raising" AND "does the value it returns still carry taint" -- by returning  #
+# False (the SAME verdict a provably-unrelated call gets) the instant a       #
+# waived call was reached inside _propagates_taint's scan. The reviewer's     #
+# own repro: `perm = required_permission(path)` left EXACTLY where round 2    #
+# finding A's own waiver reviews it, PLUS a brand new                         #
+# `if perm == Permission.MANAGE_SCHEDULE: return ...` immediately after --    #
+# extraction stayed silent (same 239 routes, all 29 waivers still exactly-    #
+# one-hit) while a synthetic live branch answered real HTTP 200. See          #
+# _propagates_taint's own docstring, "A WAIVER SILENCES THE CALL, NOT THE     #
+# RESULT", for the fix and why it is the narrower one (continued propagation  #
+# through the SAME existing machinery, not a new "safe result" system).       #
+# --------------------------------------------------------------------------- #
+class WaiverTaintPropagationTests(unittest.TestCase):
+    # -- pre-fix escape, reproduced via git stash (not re-run here: git
+    # stash cannot be invoked from inside a test process) -- the transcript
+    # below is what running the fixture in test_waived_call_result_is_no_
+    # longer_silently_untracked produced against the code as it stood
+    # immediately before this finding's fix, captured verbatim:
+    #
+    #   NO RAISE. routes = []
+    #
+    # against the FIXED code (asserted below, which a test process can
+    # still verify for itself on every run) the SAME source raises.
+
+    def test_waived_call_result_is_no_longer_silently_untracked(self):
+        """The reviewer's own reproduction, via the static extractor: the
+        REAL waiver's own fingerprint (function ``do_POST``, exact text
+        ``required_permission(path)``, ``assign_rhs``, enclosing
+        ``not authorize(role, path)``) reached verbatim, with a NEW
+        routing-relevant use of the assigned ``perm`` added immediately
+        after -- exactly the reviewer's own repro shape, just with a
+        string literal standing in for the real ``Permission`` enum
+        (irrelevant to the extractor, which never executes this source)."""
+        with self.assertRaises(ExtractionError) as caught:
+            extract_routes(_module('''
+                def do_POST(self):
+                    path = self.path.split("?", 1)[0]
+                    role = "x"
+                    if not authorize(role, path):
+                        perm = required_permission(path)
+                        if perm == "manage_schedule":
+                            return self._send(1)
+                        return self._send_status(403)
+                    return self._send(2)
+            '''))
+        msg = str(caught.exception)
+        self.assertIn("perm", msg)
+        self.assertIn("unrecognised shape", msg)
+
+    def test_waived_call_result_escape_answers_over_real_http(self):
+        """The SAME ``do_POST`` body text as the static test above --
+        byte-identical, via :func:`_real_http_probe_with_globals` -- run as
+        a real loopback server with working ``authorize``/
+        ``required_permission`` supplied as real module-level globals (the
+        same free-function shape server.py's own
+        ``from .authz import authorize, required_permission`` produces, not
+        ``self.`` stand-ins, which would change the waiver-fingerprint text
+        the static test depends on): a request that ``authorize`` refuses,
+        for a path whose ``required_permission`` is the probed value,
+        reaches the hidden branch and answers 200 -- proving the static
+        miss (demonstrated in the previous test, pre-fix) corresponded to a
+        genuine, answering HTTP route. route_extract.py performs no runtime
+        behaviour of its own, so this half of the proof holds regardless of
+        the extractor fix's own presence."""
+        status, text = _real_http_probe_with_globals('''
+            def do_POST(self):
+                path = self.path.split("?", 1)[0]
+                role = "x"
+                if not authorize(role, path):
+                    perm = required_permission(path)
+                    if perm == "manage_schedule":
+                        return self._send(1)
+                    return self._send_status(403)
+                return self._send(2)
+
+            def _send_status(self, code):
+                self._send_json({"error": "forbidden"}, code)
+        ''', {
+            "authorize": lambda role, path: False,
+            "required_permission": lambda path: "manage_schedule",
+        }, "POST", "/api/anything", {})
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"n": 1})
+
+    def test_a_call_provably_unrelated_to_any_tracked_name_is_still_untainted(self):
+        """The design principle this finding does NOT touch: a call whose
+        arguments never mention a tracked name at all (not merely a
+        waived one) still leaves its target OUT of ``tracked`` -- this
+        finding only changes what happens when the call DOES mention a
+        tracked name AND is waived, never the "provably unrelated" path
+        one branch below it in ``_propagates_taint``."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                ics = api.calendar_feed_ics("static-token")
+                if ics == "special":
+                    return self._send(1)
+                if path == "/api/x":
+                    return self._send(2)
+        '''))}
+        self.assertEqual(found, {("GET", "/api/x")})
+
+    def test_the_real_servers_own_named_exemption_stays_clean(self):
+        """The reviewer's own required confirmation: a waived call whose
+        result truly never escapes into routing must stay clean, not
+        start raising. server.py:2653's real, UNMODIFIED
+        ``perm = required_permission(path)`` -- the exact call the round-2
+        finding A waiver above reviews -- is used only two ways anywhere
+        in ``do_POST``: interpolated into a 403 message string
+        (``f"...{perm.value}..."``) and a ternary picking the error body's
+        ``details.required`` field (``perm.value if perm else None``,
+        server.py:2659). Neither compares ``perm`` for ROUTING, so neither
+        is a routing decision -- both are reviewed, dedicated round-5
+        waivers (see ``_AUDIT_WAIVERS``'s own round-5, finding-1 entries
+        for ``do_POST``), and the real file extracts cleanly with them."""
+        walker = extract_walker()
+        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(walker.unreachable, [])
+        # The two round-5 do_POST waivers this docstring names are each
+        # consulted for precisely the one line they name -- not zero
+        # (dormant), not more than one (too broad) -- proving THIS
+        # specific exemption, not merely "the whole file extracted".
+        for key in (("do_POST", "perm", "ifexp_test",
+                    "not authorize(role, path)"),
+                   ("do_POST", "violation is not None", "if_test", "")):
+            with self.subTest(waiver=key):
+                self.assertEqual(len(walker.waiver_hits.get(key, ())), 1)
+
+    def test_the_real_server_extracts_with_no_new_raises(self):
+        """The real server.py -- including the four ``_handle_reassign``/
+        ``_handle_reassign_v2`` authorisation-target bookkeeping call
+        chains this finding's fix newly reaches (``parent``/``dest``
+        lookups, the request-body field reads that feed them, and the
+        #369 context/scope checks over the now-tracked ``targets`` list)
+        -- must still extract cleanly: each newly-reached call site is a
+        reviewed, declared ``_AUDIT_WAIVERS`` entry (10 new ones, taking
+        the total from 29 to 39 -- see WaiverFingerprintTests' own pinned
+        count), not a scoping hole."""
+        walker = extract_walker()
+        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(walker.unreachable, [])
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 39)
 
 
 if __name__ == "__main__":  # pragma: no cover
