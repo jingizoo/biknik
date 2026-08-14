@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import tempfile
+import threading
 from datetime import datetime, timedelta, timezone
 from http.cookies import SimpleCookie
 from pathlib import Path
@@ -177,6 +178,109 @@ def end_membership_directly(store, membership_id, status="released"):
     m.status = MembershipStatus(status)
     store.save_season_roster_membership(m)
     return m
+
+
+def race_with_forced_order(url, gate_method, first, second, timeout=5):
+    """Run ``first(store)`` and ``second(store)`` concurrently, each on its
+    OWN new real-PostgreSQL ``SqlStore(url)`` connection/thread, but force
+    ``first``'s call to store method ``gate_method`` to reach PostgreSQL
+    strictly BEFORE ``second``'s call to the SAME method — deterministically,
+    on EVERY run (#205 review round 2: owner ruling + review finding 3).
+
+    Replaces "launch both simultaneously and hope OS/DB scheduling samples
+    both orderings across N rounds" (every real-Postgres race test in this
+    PR's round 1 shape, including the already-superseded round-1
+    CreateVsUnregisterRaceTest fix that tried to patch that approach by
+    widening 8 rounds to 80 rather than making the ordering itself
+    deterministic — a correct implementation could still flake without ever
+    exercising the reverse order, and an incorrect one could hide behind
+    whichever ordering happened to sample less). Calling this ONCE per
+    desired ordering — with the callables in one order, then swapped —
+    deterministically forces BOTH orderings, once each, and each call's
+    result is fully attributable to that specific forced ordering: no
+    round-count, no "both orderings occurred across N samples" statistics.
+
+    Mechanism: ``first``'s connection has ``gate_method`` wrapped so the
+    REAL underlying call runs immediately, and a ``threading.Event`` is set
+    the instant it returns. ``second``'s connection has the SAME method
+    wrapped to wait on that Event BEFORE ever invoking the real call. Since
+    ``gate_method`` is always a ``..._for_update`` row lock (``SELECT ...
+    FOR UPDATE``, held until the surrounding ``@_transactional``
+    transaction commits/rolls back — see ``SqlStore._get_for_update``) or
+    the exact write statement contending on a unique index, ``second``'s
+    call cannot even be DISPATCHED to PostgreSQL until ``first``'s own call
+    to the identical statement has already returned — which, for a row
+    lock, cannot happen until ``first``'s ENTIRE transaction has already
+    resolved (Postgres holds a FOR UPDATE lock across the whole
+    transaction, not just the one statement). So by the time ``second``'s
+    gated call unblocks, ``first`` has not merely "gone first" in call
+    order — its whole operation, commit included, has ALREADY happened;
+    ``second`` deterministically observes ``first``'s fully-committed
+    effect, with no residual timing ambiguity of the kind the old barrier-
+    based approach had (see the module/class docstrings this replaces).
+
+    ``first``/``second`` each receive their own wrapped ``SqlStore`` and are
+    responsible for constructing whatever they call it through (a bare
+    store write, or an ``ApiService``) and returning/raising whatever their
+    own assertions need to see. This helper only controls ordering and
+    connection lifecycle (both stores are always closed). Any exception
+    ``first``/``second`` raises is CAPTURED, not propagated — returned in
+    place of a normal result — so a raising callable (e.g. a raw store
+    write hitting a real ``IntegrityConflictError``) is handled the same
+    way a normal return value is, and both threads are always joined
+    before this returns. Raises ``AssertionError`` if either thread fails
+    to terminate within ``timeout`` seconds of the join deadline (a stuck
+    thread is a bug in the test or the code under test, never silently
+    treated as "no result")."""
+    from hockey_scheduler.store import SqlStore
+
+    gate = threading.Event()
+    results = {}
+
+    def _wrap_release(store):
+        original = getattr(store, gate_method)
+
+        def wrapped(*args, **kwargs):
+            result = original(*args, **kwargs)
+            gate.set()
+            return result
+
+        setattr(store, gate_method, wrapped)
+
+    def _wrap_wait(store):
+        original = getattr(store, gate_method)
+
+        def wrapped(*args, **kwargs):
+            if not gate.wait(timeout=timeout):
+                raise AssertionError(
+                    f"race_with_forced_order: 'first' side never reached "
+                    f"{gate_method!r} within {timeout}s")
+            return original(*args, **kwargs)
+
+        setattr(store, gate_method, wrapped)
+
+    def _run(role, fn, wrap):
+        store = SqlStore(url)
+        wrap(store)
+        try:
+            results[role] = fn(store)
+        except BaseException as exc:  # noqa: BLE001 - captured, never swallowed
+            results[role] = exc
+        finally:
+            store.close()
+
+    threads = [threading.Thread(target=_run, args=("first", first, _wrap_release)),
+              threading.Thread(target=_run, args=("second", second, _wrap_wait))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=timeout + 10)
+    still_alive = [t for t in threads if t.is_alive()]
+    if still_alive:
+        raise AssertionError(
+            f"race_with_forced_order: {len(still_alive)} thread(s) did not "
+            f"terminate")
+    return results["first"], results["second"]
 
 
 def cookie_from_set_cookie(set_cookie_header, name):

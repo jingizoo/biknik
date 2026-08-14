@@ -33,11 +33,11 @@ UNCHANGED — a caught exception alone does not prove nothing was written.
 """
 
 import os
-import threading
 import unittest
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 from helpers import end_membership_directly as _end_membership_directly
+from helpers import race_with_forced_order
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.domain import MembershipStatus, Position, SeasonRosterMembership
@@ -476,211 +476,97 @@ def _pg_fixture(url):
 @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"), _PG_SKIP)
 class CreateVsUnregisterRaceTest(unittest.TestCase):
     """Real TWO-CONNECTION PostgreSQL race: create_season_roster_membership
-    vs unregister_team_from_season on the SAME registration, both commit
-    orders. Both lock the Season row (create via _require_active_season,
-    unregister via the identical guard), so the engine always linearizes
-    them — the required outcome is that the two NEVER both succeed in a way
-    that leaves an active membership on an unregistered Team; the loser
-    always observes the winner's committed state and fails closed with a
-    stable reason."""
+    vs unregister_team_from_season on the SAME registration. Both lock the
+    Season row (create via _require_active_season, unregister via the
+    identical guard) — the SAME row — so the engine always linearizes them:
+    the required outcome is that the two NEVER both succeed in a way that
+    leaves an active membership on an unregistered Team; the loser always
+    observes the winner's committed state and fails closed with a stable
+    reason.
+
+    #205 review round 2 (owner ruling + review finding 3) — REDESIGNED,
+    replacing the round-1 approach entirely (a start-of-thread barrier that
+    measurably handicapped one side, then a shared-prefix barrier that
+    still left a real per-round cost-asymmetry skew, "fixed" by widening 8
+    rounds to 80 so both orderings occurred often enough not to flake): two
+    test methods, each calling helpers.race_with_forced_order to
+    DETERMINISTICALLY force one specific ordering at the shared Season-row
+    lock (``get_season_for_update``), once each, rather than launching both
+    simultaneously and hoping N rounds sample both orderings. See that
+    helper's docstring for why the forcing is exact (not just "probably
+    first"): because the lock is held for the whole transaction, the
+    LOSER's gated call cannot even be dispatched until the WINNER's entire
+    operation — commit included — has already resolved, so which side
+    "wins" is no longer a race at all once forced; it is a fact established
+    by construction, checked here."""
 
     def setUp(self):
         self.url = os.environ["TEST_DATABASE_URL"]
 
-    @staticmethod
-    def _sync_at_shared_prefix(store, lock_barrier):
-        """Make ``store``'s ``get_league_season`` call the rendezvous, for
-        exactly its ONE race-relevant invocation, instead of only
-        synchronizing thread start.
-
-        Root-caused with direct instrumentation (see the PR body/commit) in
-        two stages — a plain start-of-thread ``threading.Barrier(2)`` (the
-        pattern the other three real-Postgres race tests in this PR already
-        get away with) is not enough here, and neither is the first, more
-        obvious attempt to fix it:
-
-        1. Unlike ``CreateVsTransferRaceTest`` (both sides' FIRST statement
-           is the identical ``get_team_for_update`` call, so a start-of-
-           thread barrier already puts them shoulder-to-shoulder at the real
-           contention point), this race's two operations reach their SHARED
-           lock (``_require_active_season`` -> ``get_season_for_update``,
-           both via the identical guard — see the class docstring) via
-           UNEQUAL-COST prior work: ``create_season_roster_membership``'s
-           first statement is ``get_team_for_update`` (a
-           ``SELECT ... FOR UPDATE`` row lock, a heavier round trip) plus a
-           plain read; ``unregister_team_from_season``'s is two plain reads.
-           Measured directly (10/10 rounds), the cheaper side (unregister)
-           consistently reached a start-of-thread barrier FIRST and
-           therefore BLOCKED on it, while create arrived last and
-           consequently proceeded WITHOUT blocking — CPython's
-           ``threading.Barrier`` releases whichever thread's ``wait()`` call
-           completes the party count immediately, still holding the GIL,
-           while the other waiter needs a real OS-level wakeup to resume —
-           so create's lock statement reached Postgres first in all 10/10
-           measured rounds purely from that handicap, not real DB/OS
-           scheduling: the flake this test showed.
-        2. The obvious fix — synchronize at the lock statement itself
-           (``get_season_for_update``) instead of thread start — swaps WHO
-           the handicap favors but does not remove it (measured: ~85-90% of
-           rounds still won by one fixed side across repeated process runs,
-           still well within a single 8-round run's failure zone). The
-           actual lever that makes the other three tests fair isn't barrier
-           PLACEMENT by itself — it's that their shared statement has ZERO
-           divergent work before it on either side, so which thread the
-           barrier's own release-order quirk favors is incidental, not tied
-           to a structural cost difference. ``create`` and ``unregister``
-           genuinely share a statement with that same property: their
-           SECOND call is the identical ``get_league_season`` (create calls
-           ``self.store.get_league_season`` directly; unregister's
-           ``_season_of_league_season`` is exactly that same call) — and
-           from there, BOTH paths take the SAME next step (one negligible
-           in-Python truthy check, then ``_require_active_season``) with NO
-           further asymmetric work before the real lock. Synchronizing
-           there removes the structural handicap the same way the other
-           tests' natural first-statement symmetry does.
-        3. Naively wrapping ``get_league_season`` for the store's whole
-           lifetime, though, reintroduces a DIFFERENT, correctness-breaking
-           bug: ``ApiService.unregister_team_from_season``'s facade wrapper
-           calls ``self._registration_dict(...)`` on the result, which makes
-           its OWN unguarded ``get_league_season`` call to resolve
-           ``season_id``/``league_id`` for the legacy v1 response shape —
-           AFTER the transaction, with no matching call on create's side
-           (``create_season_roster_membership``'s facade wrapper is a plain
-           ``_serialize(...)``). A barrier wrap left in place sees
-           unregister call ``get_league_season`` TWICE per round while
-           create calls it once, and the unmatched second call blocks until
-           the barrier's timeout, raising ``BrokenBarrierError``
-           (reproduced directly).
-
-        The fix: un-wrap immediately on first use, so the barrier only ever
-        gates the ONE race-relevant, in-transaction, matched call on each
-        side — any later call (the facade's post-transaction serialization)
-        runs the plain, unwrapped method.
-        """
-        original = store.get_league_season
-
-        def synced(league_season_id):
-            store.get_league_season = original  # one-shot: never re-gate
-            lock_barrier.wait(timeout=5)
-            return original(league_season_id)
-
-        store.get_league_season = synced
-
-    def _race_once(self, fx):
-        start_barrier = threading.Barrier(2)
-        lock_barrier = threading.Barrier(2)
-        results = {}
-
-        def do_create():
-            store = SqlStore(self.url)
-            self._sync_at_shared_prefix(store, lock_barrier)
+    def _create_op(self, fx):
+        def op(store):
             api = ApiService(store)
-            try:
-                start_barrier.wait(timeout=5)
-                results["create"] = api.create_season_roster_membership(
-                    fx["player"]["id"], fx["ls_id"], fx["team"]["id"],
-                    status="applicant", jersey_number=None, actor_id=ADMIN)
-            finally:
-                store.close()
+            return api.create_season_roster_membership(
+                fx["player"]["id"], fx["ls_id"], fx["team"]["id"],
+                status="applicant", jersey_number=None, actor_id=ADMIN)
+        return op
 
-        def do_unregister():
-            store = SqlStore(self.url)
-            self._sync_at_shared_prefix(store, lock_barrier)
+    def _unregister_op(self, fx):
+        def op(store):
             api = ApiService(store)
-            try:
-                start_barrier.wait(timeout=5)
-                results["unregister"] = api.unregister_team_from_season(
-                    fx["reg"]["id"], actor_id=ADMIN)
-            finally:
-                store.close()
+            return api.unregister_team_from_season(
+                fx["reg"]["id"], actor_id=ADMIN)
+        return op
 
-        threads = [threading.Thread(target=do_create),
-                  threading.Thread(target=do_unregister)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=15)
-        return results
+    def test_create_forced_first_wins_unregister_loses(self):
+        fx = _pg_fixture(self.url)
+        create_res, unregister_res = race_with_forced_order(
+            self.url, "get_season_for_update",
+            self._create_op(fx), self._unregister_op(fx))
+        # Winner: create committed a live membership.
+        self.assertNotIn("error", create_res, create_res)
+        # Loser: unregister's under-lock re-read sees that FRESH, committed
+        # membership and refuses — the exact stable reason, zero write.
+        self.assertIn("error", unregister_res, unregister_res)
+        self.assertEqual(unregister_res["error"]["details"]["reason"],
+                         "team_has_live_memberships", unregister_res)
+        checker = SqlStore(self.url)
+        try:
+            reg = checker.get_season_team_registration(fx["reg"]["id"])
+            self.assertTrue(reg.active)
+            memberships = [
+                m for m in checker.all_season_roster_memberships()
+                if m.player_id == fx["player"]["id"]
+                and not m.status.is_terminal]
+            self.assertEqual(len(memberships), 1, memberships)
+            events = checker.events_for_membership(memberships[0].id)
+            self.assertEqual([e.action for e in events], ["created"])
+        finally:
+            checker.close()
 
-    def test_never_leaves_active_membership_on_unregistered_team(self):
-        winners = {"create": 0, "unregister": 0}
-        # 80 rounds, not 8 (a DELIBERATE, DOCUMENTED gap from this file's
-        # other race tests, which all use 8-10) — a stated limitation, not
-        # an oversight. _sync_at_shared_prefix (above) synchronizes the two
-        # racers on their genuinely shared statement, which measurably fixed
-        # the WORST failure mode this test originally had: a start-of-thread-
-        # only barrier let ``create`` win the Season-row-lock race 8/8 EVERY
-        # observed round (confirmed by direct instrumentation — see that
-        # method's docstring), because its heavier first statement
-        # (``get_team_for_update``, a row lock) made it consistently the
-        # LAST thread to reach a 2-party barrier, and CPython releases the
-        # last arriver without blocking. That specific, deterministic
-        # mechanism is now removed.
-        # What remains, even after that fix, is a REAL residual skew — not a
-        # Python synchronization artifact, but two structurally different
-        # operations (create locks a Team row before the shared LeagueSeason
-        # read; unregister does not) whose actual PostgreSQL-side costs
-        # differ enough that even a matched, shared release point does not
-        # land the two sides at the Season-row lock at genuinely equal odds.
-        # Measured directly, over many independent 30-round samples on real
-        # PostgreSQL: ``create`` won roughly 70-93% of individual rounds
-        # (never 100%, so the underlying contest is real, not fixed) — i.e.
-        # a per-round skew, not a per-run one. At 8 rounds that skew still
-        # produces an all-one-side sweep often enough to flake. Forcing
-        # genuinely equal PER-ROUND odds between two operations with
-        # different real costs, without touching production code, was tried
-        # multiple ways (synchronizing at the lock statement itself; a
-        # 3-party rendezvous removing the "last arrival" advantage entirely,
-        # at both the lock statement and the shared prefix) and every
-        # variant left a comparable double-digit-percent residual skew, just
-        # favoring whichever side a given mechanism's own release-order
-        # quirk happened to help — evidence the remaining gap is genuine
-        # DB/OS scheduling noise on top of a real cost asymmetry, not
-        # something more synchronization engineering removes. So this falls
-        # back to (b): keep the real fix above, and raise the round count
-        # far enough that "both orderings occur" holds with overwhelming
-        # probability despite that residual skew, rather than dropping the
-        # requirement. Even at a conservative 90% single-side skew, 80
-        # rounds puts the chance of an all-one-side sweep under 0.03% (was
-        # ~100% at 8 rounds pre-fix); this was verified empirically with 20
-        # consecutive full runs at this round count (see the PR body) before
-        # landing.
-        for i in range(80):
-            fx = _pg_fixture(self.url)
-            results = self._race_once(fx)
-            create_ok = "error" not in results["create"]
-            unregister_ok = "error" not in results["unregister"]
-            winners["create"] += create_ok
-            winners["unregister"] += unregister_ok
-            checker = SqlStore(self.url)
-            try:
-                reg = checker.get_season_team_registration(fx["reg"]["id"])
-                memberships = [
-                    m for m in checker.all_season_roster_memberships()
-                    if m.player_id == fx["player"]["id"]
-                    and not m.status.is_terminal]
-                if create_ok:
-                    # create committed: unregister MUST have lost and the
-                    # registration MUST still be active (or unregister also
-                    # "succeeded" as a no-op AFTER seeing the fresh
-                    # membership block it — either way never both truly won).
-                    self.assertEqual(len(memberships), 1, (i, results))
-                    if not unregister_ok:
-                        self.assertEqual(
-                            results["unregister"]["error"]["details"]
-                            ["reason"], "team_has_live_memberships",
-                            (i, results))
-                else:
-                    self.assertEqual(
-                        results["create"]["error"]["details"]["reason"],
-                        "team_not_registered", (i, results))
-                    self.assertFalse(reg.active, (i, results))
-                    self.assertEqual(len(memberships), 0, (i, results))
-            finally:
-                checker.close()
-        # Both orderings actually happened across the 80 rounds.
-        self.assertGreater(winners["create"], 0, winners)
-        self.assertGreater(winners["unregister"], 0, winners)
+    def test_unregister_forced_first_wins_create_loses(self):
+        fx = _pg_fixture(self.url)
+        unregister_res, create_res = race_with_forced_order(
+            self.url, "get_season_for_update",
+            self._unregister_op(fx), self._create_op(fx))
+        # Winner: unregister committed — the registration is now inactive.
+        self.assertNotIn("error", unregister_res, unregister_res)
+        # Loser: create's under-lock re-read sees the FRESH, committed
+        # inactive registration and refuses — the exact stable reason, zero
+        # write (never a dangling active membership on an unregistered Team).
+        self.assertIn("error", create_res, create_res)
+        self.assertEqual(create_res["error"]["details"]["reason"],
+                         "team_not_registered", create_res)
+        checker = SqlStore(self.url)
+        try:
+            reg = checker.get_season_team_registration(fx["reg"]["id"])
+            self.assertFalse(reg.active)
+            memberships = [
+                m for m in checker.all_season_roster_memberships()
+                if m.player_id == fx["player"]["id"]]
+            self.assertEqual(memberships, [])
+        finally:
+            checker.close()
 
 
 @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"), _PG_SKIP)
@@ -690,94 +576,86 @@ class CreateVsTransferRaceTest(unittest.TestCase):
     starting from NO existing membership (so, unlike reactivating an
     ALREADY-live row, either side can genuinely commit first). Both lock the
     Team row (create via get_team_for_update; transfer via the identical
-    call), so the engine linearizes them — required outcome: never an
-    active membership whose league_season_id disagrees with the Team's
-    CURRENT League, regardless of which commits first."""
+    call) — the SAME row — so the engine linearizes them: required outcome
+    is never an active membership whose league_season_id disagrees with the
+    Team's CURRENT League, regardless of which commits first.
+
+    #205 review round 2 (owner ruling + review finding 3) — REDESIGNED: two
+    test methods, each calling helpers.race_with_forced_order to
+    DETERMINISTICALLY force one ordering at the shared Team-row lock
+    (``get_team_for_update``), once each, instead of a single simultaneous-
+    start barrier sampled across 10 rounds. See CreateVsUnregisterRaceTest's
+    docstring (this file) and race_with_forced_order's for why the forcing
+    is exact, not probabilistic."""
 
     def setUp(self):
         self.url = os.environ["TEST_DATABASE_URL"]
 
-    def _race_once(self, fx):
-        barrier = threading.Barrier(2)
-        results = {}
-
-        def do_create():
-            store = SqlStore(self.url)
+    def _create_op(self, fx):
+        def op(store):
             api = ApiService(store)
-            try:
-                barrier.wait(timeout=5)
-                results["create"] = api.create_season_roster_membership(
-                    fx["player"]["id"], fx["ls_id"], fx["team"]["id"],
-                    status="applicant", jersey_number=None, actor_id=ADMIN)
-            finally:
-                store.close()
+            return api.create_season_roster_membership(
+                fx["player"]["id"], fx["ls_id"], fx["team"]["id"],
+                status="applicant", jersey_number=None, actor_id=ADMIN)
+        return op
 
-        def do_transfer():
-            store = SqlStore(self.url)
+    def _transfer_op(self, fx):
+        def op(store):
             api = ApiService(store)
-            try:
-                barrier.wait(timeout=5)
-                results["transfer"] = api.transfer_team_to_league(
-                    fx["team"]["id"], fx["other_league_id"], actor_id=ADMIN)
-            finally:
-                store.close()
+            return api.transfer_team_to_league(
+                fx["team"]["id"], fx["other_league_id"], actor_id=ADMIN)
+        return op
 
-        threads = [threading.Thread(target=do_create),
-                  threading.Thread(target=do_transfer)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=15)
-        return results
+    def _assert_team_league_coherent(self, fx):
+        checker = SqlStore(self.url)
+        try:
+            team = checker.get_team(fx["team"]["id"])
+            memberships = [m for m in checker.all_season_roster_memberships()
+                          if m.player_id == fx["player"]["id"]]
+            for m in memberships:
+                ls = checker.get_league_season(m.league_season_id)
+                self.assertEqual(
+                    ls.league_id, team.league_id,
+                    (fx, "Team<->LeagueSeason League disagreement", m.id))
+            return memberships
+        finally:
+            checker.close()
 
-    def test_never_leaves_active_membership_disagreeing_with_team_league(self):
-        winners = {"create": 0, "transfer": 0}
-        for i in range(10):
-            fx = _pg_fixture(self.url)
-            results = self._race_once(fx)
-            create_ok = "error" not in results["create"]
-            transfer_ok = "error" not in results["transfer"]
-            winners["create"] += create_ok
-            winners["transfer"] += transfer_ok
+    def test_create_forced_first_wins_transfer_loses(self):
+        fx = _pg_fixture(self.url)
+        create_res, transfer_res = race_with_forced_order(
+            self.url, "get_team_for_update",
+            self._create_op(fx), self._transfer_op(fx))
+        # Winner: create committed a live membership on the Team's
+        # (unchanged) League.
+        self.assertNotIn("error", create_res, create_res)
+        # Loser: transfer's under-lock candidate scan sees that FRESH,
+        # committed membership blocking the move — the exact stable
+        # reason, zero Team/registration mutation.
+        self.assertIn("error", transfer_res, transfer_res)
+        self.assertEqual(transfer_res["error"]["details"]["reason"],
+                         "team_transfer_strands_memberships", transfer_res)
+        memberships = self._assert_team_league_coherent(fx)
+        self.assertEqual(len(memberships), 1, memberships)
 
-            checker = SqlStore(self.url)
-            try:
-                team = checker.get_team(fx["team"]["id"])
-                memberships = [
-                    m for m in checker.all_season_roster_memberships()
-                    if m.player_id == fx["player"]["id"]]
-                for m in memberships:
-                    ls = checker.get_league_season(m.league_season_id)
-                    self.assertEqual(
-                        ls.league_id, team.league_id,
-                        (i, results, "Team<->LeagueSeason League "
-                         "disagreement", m.id))
-                if create_ok and transfer_ok:
-                    # Only reachable if create committed BEFORE transfer's
-                    # candidate scan ran — transfer then legitimately found
-                    # the fresh membership and must have blocked, not both
-                    # truly "succeeded" independently.
-                    self.fail((i, "create and transfer both reported "
-                              "success", results))
-                elif not create_ok:
-                    # Transfer won first: Team.league_id now names the NEW
-                    # League while the (unchanged) ls_id this create still
-                    # targets names the OLD one — the league-mismatch check
-                    # fires before create even reaches the registration
-                    # lookup (create_season_roster_membership checks League
-                    # coherence first).
-                    self.assertEqual(
-                        results["create"]["error"]["details"]["reason"],
-                        "membership_league_mismatch", (i, results))
-                elif not transfer_ok:
-                    self.assertEqual(
-                        results["transfer"]["error"]["details"]["reason"],
-                        "team_transfer_strands_memberships", (i, results))
-            finally:
-                checker.close()
-        # Both orderings actually happened across the 10 rounds.
-        self.assertGreater(winners["create"], 0, winners)
-        self.assertGreater(winners["transfer"], 0, winners)
+    def test_transfer_forced_first_wins_create_loses(self):
+        fx = _pg_fixture(self.url)
+        transfer_res, create_res = race_with_forced_order(
+            self.url, "get_team_for_update",
+            self._transfer_op(fx), self._create_op(fx))
+        # Winner: transfer committed — Team.league_id now names the NEW
+        # League.
+        self.assertNotIn("error", transfer_res, transfer_res)
+        # Loser: create's under-lock re-read of the Team sees the FRESH,
+        # committed League change; the (unchanged) league_season_id this
+        # create still targets now names the OLD League — the coherence
+        # check fires before create even reaches the registration lookup
+        # (create_season_roster_membership checks League agreement first).
+        self.assertIn("error", create_res, create_res)
+        self.assertEqual(create_res["error"]["details"]["reason"],
+                         "membership_league_mismatch", create_res)
+        memberships = self._assert_team_league_coherent(fx)
+        self.assertEqual(memberships, [])
 
 
 if __name__ == "__main__":  # pragma: no cover

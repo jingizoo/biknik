@@ -41,12 +41,11 @@ FALSIFIERS (each measured while developing this slice):
 
 import os
 import tempfile
-import threading
 import unittest
 from datetime import datetime, timezone
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
-from helpers import end_membership_directly, fresh_sql_store
+from helpers import end_membership_directly, fresh_sql_store, race_with_forced_order
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.domain import (
@@ -1399,87 +1398,75 @@ class MembershipOpenStintRaceTest(unittest.TestCase):
     same statuses THROUGH the service (where the Player lock added to
     ``create_season_roster_membership`` also protects it).
 
+    #205 review round 2 (owner ruling + review finding 3) — REDESIGNED: for
+    EACH status, two forced orderings via helpers.race_with_forced_order,
+    gated on the exact contested write (``add_season_roster_membership``),
+    instead of 8 simultaneous-start rounds hoping both commit orders
+    occurred. The two racers write to the SAME (player_id,
+    league_season_id) unique-index scope, so forcing which side's INSERT
+    reaches PostgreSQL first deterministically decides the winner: real
+    PostgreSQL unique-index semantics make a second, concurrent, competing
+    INSERT block until the first's transaction resolves, then raise once it
+    sees the committed row (see race_with_forced_order's docstring).
+
     Falsifier: `git stash` migration 052's new index (keep db_errors.py's
-    translation) and every iteration below regresses to 2 winners / 0
-    IntegrityConflictError.
+    translation) and both forced orderings below regress to the SECOND
+    insert also succeeding (0 IntegrityConflictError) instead of raising.
     """
 
     def setUp(self):
         self.url = os.environ["TEST_DATABASE_URL"]
 
-    def _race_once(self, status: MembershipStatus, team1, team2, ls_id,
-                   season_id, player_id, run_label):
-        barrier = threading.Barrier(2)
-        results = {}
+    def _op(self, team_id, status, ls_id, season_id, player_id, name):
+        def op(store):
+            with store.transaction():
+                store.add_season_roster_membership(SeasonRosterMembership(
+                    id=f"srm_race_{name}", player_id=player_id,
+                    league_season_id=ls_id, season_id=season_id,
+                    team_id=team_id, status=status, position=Position.FORWARD,
+                    jersey_number=None))
+            return "ok"
+        return op
 
-        def attempt(name, team_id):
-            store = SqlStore(self.url)
-            try:
-                barrier.wait(timeout=5)
-                with store.transaction():
-                    store.add_season_roster_membership(
-                        SeasonRosterMembership(
-                            id=f"srm_race_{run_label}_{name}",
-                            player_id=player_id, league_season_id=ls_id,
-                            season_id=season_id, team_id=team_id,
-                            status=status, position=Position.FORWARD,
-                            jersey_number=None))
-                results[name] = "ok"
-            except IntegrityConflictError as exc:
-                results[name] = exc
-            finally:
-                store.close()
-
-        threads = [threading.Thread(target=attempt, args=("A", team1)),
-                  threading.Thread(target=attempt, args=("B", team2))]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=15)
-        return results
+    def _assert_ordering(self, status, team1_first, ordering_label):
+        store = SqlStore(self.url)
+        store.reset_schema()
+        team1, team2, ls_id, player_id = _race_fixture(self.url)
+        season_id = store.get_league_season(ls_id).season_id
+        store.close()
+        first_team, second_team = (
+            (team1, team2) if team1_first else (team2, team1))
+        first_res, second_res = race_with_forced_order(
+            self.url, "add_season_roster_membership",
+            self._op(first_team, status, ls_id, season_id, player_id,
+                     f"{status.value}_{ordering_label}_first"),
+            self._op(second_team, status, ls_id, season_id, player_id,
+                     f"{status.value}_{ordering_label}_second"))
+        self.assertEqual(first_res, "ok",
+                         (status.value, ordering_label, first_res))
+        self.assertIsInstance(second_res, IntegrityConflictError,
+                              (status.value, ordering_label, second_res))
+        self.assertEqual(second_res.details["reason"],
+                         "membership_open_conflict",
+                         (status.value, ordering_label))
+        self.assertEqual(second_res.details["player_id"], player_id,
+                         (status.value, ordering_label))
+        self.assertEqual(second_res.details["league_season_id"], ls_id,
+                         (status.value, ordering_label))
+        # Zero-write proof: exactly one row landed for this player.
+        checker = SqlStore(self.url)
+        try:
+            rows = [m for m in checker.all_season_roster_memberships()
+                   if m.player_id == player_id]
+            self.assertEqual(len(rows), 1,
+                             (status.value, ordering_label,
+                              [r.id for r in rows]))
+        finally:
+            checker.close()
 
     def _assert_race_holds(self, status):
-        # Run several rounds so BOTH commit orders (whichever connection's
-        # transaction the engine admits first) are actually exercised, not
-        # just whichever happened to win once.
-        winners_seen = set()
-        for i in range(8):
-            store = SqlStore(self.url)
-            store.reset_schema()
-            team1, team2, ls_id, player_id = _race_fixture(self.url)
-            season_id = store.get_league_season(ls_id).season_id
-            store.close()
-            results = self._race_once(status, team1, team2, ls_id, season_id,
-                                      player_id, f"{status.value}_{i}")
-            winners = [k for k, v in results.items() if v == "ok"]
-            losers = {k: v for k, v in results.items() if v != "ok"}
-            self.assertEqual(len(winners), 1,
-                             (status.value, i, results))
-            self.assertEqual(len(losers), 1, (status.value, i, results))
-            winners_seen.add(winners[0])
-            loser_exc = next(iter(losers.values()))
-            self.assertIsInstance(loser_exc, IntegrityConflictError,
-                                  (status.value, i, loser_exc))
-            self.assertEqual(loser_exc.details["reason"],
-                             "membership_open_conflict", (status.value, i))
-            self.assertEqual(loser_exc.details["player_id"], player_id,
-                             (status.value, i))
-            self.assertEqual(loser_exc.details["league_season_id"], ls_id,
-                             (status.value, i))
-            # Zero-write proof: exactly one row landed for this player.
-            checker = SqlStore(self.url)
-            try:
-                rows = [m for m in checker.all_season_roster_memberships()
-                       if m.player_id == player_id]
-                self.assertEqual(len(rows), 1, (status.value, i,
-                                                [r.id for r in rows]))
-            finally:
-                checker.close()
-        # Both A and B must have won at least once across the 8 rounds —
-        # "both commit orders" the review requires, not just one direction.
-        self.assertEqual(winners_seen, {"A", "B"},
-                         (status.value, "did not observe both commit orders",
-                          winners_seen))
+        self._assert_ordering(status, True, "team1_first")
+        self._assert_ordering(status, False, "team2_first")
 
     def test_applicant_on_different_teams_exactly_one_wins(self):
         self._assert_race_holds(MembershipStatus.APPLICANT)
@@ -1495,79 +1482,76 @@ class MembershipOpenStintRaceTest(unittest.TestCase):
 class MembershipServiceCreateRaceTest(unittest.TestCase):
     """Real TWO-CONNECTION PostgreSQL races THROUGH the service
     (``create_season_roster_membership``), proving the full defended path —
-    the new Player row lock plus migration 052's new index as backstop
-    (#205 review round 1 finding 1) — for applicant/affiliate/inactive on
-    DIFFERENT registered Teams of the SAME LeagueSeason, both commit orders,
-    exactly one success, and ZERO membership/event/audit rows for the loser
-    (the required coverage the review names).
+    the Season row lock, the new Player row lock, and migration 052's new
+    index as backstop (#205 review round 1 finding 1) — for applicant/
+    affiliate/inactive on DIFFERENT registered Teams of the SAME
+    LeagueSeason, both orderings, exactly one success, and ZERO membership/
+    event/audit rows for the loser (the required coverage the review
+    names).
+
+    #205 review round 2 (owner ruling + review finding 3) — REDESIGNED: two
+    forced orderings per status via helpers.race_with_forced_order, gated
+    on ``get_season_for_update`` — the FIRST lock BOTH calls contend for
+    (both Teams register under the SAME LeagueSeason/Season, per
+    _race_fixture below), held for the whole ``@_transactional``
+    transaction, so forcing who acquires it first deterministically
+    decides the whole race: the loser's own under-lock re-read, once its
+    gated call unblocks, ALWAYS observes the winner's already-committed
+    membership (real PostgreSQL FOR UPDATE semantics — see
+    race_with_forced_order's docstring) — not 8 simultaneous-start rounds
+    hoping both commit orders occurred.
     """
 
     def setUp(self):
         self.url = os.environ["TEST_DATABASE_URL"]
 
-    def _race_once(self, status, team1, team2, ls_id, player_id, run_label):
-        barrier = threading.Barrier(2)
-        results = {}
-
-        def attempt(name, team_id):
-            store = SqlStore(self.url)
+    def _op(self, status, team_id, ls_id, player_id, name):
+        def op(store):
             api = ApiService(store)
-            try:
-                barrier.wait(timeout=5)
-                res = api.create_season_roster_membership(
-                    player_id, ls_id, team_id, status=status.value,
-                    jersey_number=None, reason=f"race-{run_label}",
-                    actor_id=f"actor_{name}")
-                results[name] = res
-            finally:
-                store.close()
+            return api.create_season_roster_membership(
+                player_id, ls_id, team_id, status=status.value,
+                jersey_number=None, reason=f"race-{name}",
+                actor_id=f"actor_{name}")
+        return op
 
-        threads = [threading.Thread(target=attempt, args=("A", team1)),
-                  threading.Thread(target=attempt, args=("B", team2))]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=15)
-        return results
+    def _assert_ordering(self, status, team1_first, ordering_label):
+        team1, team2, ls_id, player_id = _race_fixture(self.url)
+        first_team, second_team = (
+            (team1, team2) if team1_first else (team2, team1))
+        first_res, second_res = race_with_forced_order(
+            self.url, "get_season_for_update",
+            self._op(status, first_team, ls_id, player_id,
+                     f"{status.value}_{ordering_label}_first"),
+            self._op(status, second_team, ls_id, player_id,
+                     f"{status.value}_{ordering_label}_second"))
+        self.assertNotIn("error", first_res,
+                         (status.value, ordering_label, first_res))
+        self.assertIn("error", second_res,
+                      (status.value, ordering_label, second_res))
+        self.assertEqual(second_res["error"]["details"]["reason"],
+                         "membership_open_conflict",
+                         (status.value, ordering_label))
+        # Zero-write proof, service-level: exactly one membership, one
+        # "created" event, one setup_audit_logs row for this player — the
+        # loser's @_transactional rollback left NOTHING behind.
+        checker = SqlStore(self.url)
+        try:
+            members = [m for m in checker.all_season_roster_memberships()
+                      if m.player_id == player_id]
+            self.assertEqual(len(members), 1, (status.value, ordering_label))
+            events = checker.events_for_membership(members[0].id)
+            self.assertEqual([e.action for e in events], ["created"],
+                             (status.value, ordering_label))
+            audits = [a for a in checker.all_setup_audit()
+                     if a.entity_type == "season_roster_membership"
+                     and a.entity_id == members[0].id]
+            self.assertEqual(len(audits), 1, (status.value, ordering_label))
+        finally:
+            checker.close()
 
     def _assert_race_holds(self, status):
-        winners_seen = set()
-        for i in range(8):
-            team1, team2, ls_id, player_id = _race_fixture(self.url)
-            run_label = f"{status.value}_{i}"
-            results = self._race_once(status, team1, team2, ls_id, player_id,
-                                      run_label)
-            winners = [k for k, v in results.items()
-                      if isinstance(v, dict) and "error" not in v]
-            losers = {k: v for k, v in results.items()
-                     if not (isinstance(v, dict) and "error" not in v)}
-            self.assertEqual(len(winners), 1, (status.value, i, results))
-            self.assertEqual(len(losers), 1, (status.value, i, results))
-            winners_seen.add(winners[0])
-            loser = next(iter(losers.values()))
-            self.assertIn("error", loser, (status.value, i, loser))
-            self.assertEqual(loser["error"]["details"]["reason"],
-                             "membership_open_conflict", (status.value, i))
-            # Zero-write proof, service-level: exactly one membership, one
-            # "created" event, one setup_audit_logs row for this player —
-            # the loser's @_transactional rollback left NOTHING behind.
-            checker = SqlStore(self.url)
-            try:
-                members = [m for m in checker.all_season_roster_memberships()
-                          if m.player_id == player_id]
-                self.assertEqual(len(members), 1, (status.value, i))
-                events = checker.events_for_membership(members[0].id)
-                self.assertEqual([e.action for e in events], ["created"],
-                                 (status.value, i))
-                audits = [a for a in checker.all_setup_audit()
-                         if a.entity_type == "season_roster_membership"
-                         and a.entity_id == members[0].id]
-                self.assertEqual(len(audits), 1, (status.value, i))
-            finally:
-                checker.close()
-        self.assertEqual(winners_seen, {"A", "B"},
-                         (status.value, "did not observe both commit orders",
-                          winners_seen))
+        self._assert_ordering(status, True, "team1_first")
+        self._assert_ordering(status, False, "team2_first")
 
     def test_applicant_on_different_teams_exactly_one_succeeds(self):
         self._assert_race_holds(MembershipStatus.APPLICANT)
