@@ -110,6 +110,12 @@ from .jersey import (
     jersey_number_error,
     parse_jersey_cell,
 )
+from .privacy import (
+    ACCESS_ALLOWED,
+    ACCESS_DENIED,
+    DataAccessLog,
+    SensitiveFieldCategory,
+)
 from .time_utils import intervals_overlap
 
 __all__ = [
@@ -202,6 +208,11 @@ __all__ = [
     "ScheduleScenario",
     "Season",
     "SetupAuditLog",
+    # privacy foundation (#124)
+    "ACCESS_ALLOWED",
+    "ACCESS_DENIED",
+    "DataAccessLog",
+    "SensitiveFieldCategory",
     "TeamLeagueMigrationDecision",
     "FactoryResetEvent",
     "FactoryResetChallenge",
