@@ -113,7 +113,7 @@ class UnregisterStrandingTest(unittest.TestCase):
                                      before_audit, (label, status))
                     # Clean up for the next status in this loop.
                     api.set_season_roster_membership_status(
-                        m["id"], "released", actor_id=ADMIN)
+                        m["id"], "released", reason="test", actor_id=ADMIN)
 
     def test_terminal_membership_does_not_block_unregister(self):
         for label, store in _each_store():
@@ -122,7 +122,7 @@ class UnregisterStrandingTest(unittest.TestCase):
                 fx = _fixture(api)
                 m = _make_membership(api, fx, "applicant")
                 api.set_season_roster_membership_status(
-                    m["id"], "released", actor_id=ADMIN)
+                    m["id"], "released", reason="test", actor_id=ADMIN)
                 res = api.unregister_team_from_season(
                     fx["reg"]["id"], actor_id=ADMIN)
                 self.assertNotIn("error", res, (label, res))
@@ -150,7 +150,7 @@ class RegistrationDeleteStrandingTest(unittest.TestCase):
                 m = _make_membership(api, fx, "applicant")
                 self.assertNotIn("error", m, (label, m))
                 released = api.set_season_roster_membership_status(
-                    m["id"], "released", actor_id=ADMIN)
+                    m["id"], "released", reason="test", actor_id=ADMIN)
                 self.assertNotIn("error", released, (label, released))
                 unreg = api.unregister_team_from_season(
                     fx["reg"]["id"], actor_id=ADMIN)
@@ -310,7 +310,7 @@ class TransferStrandingTest(unittest.TestCase):
                 fx = _fixture(api)
                 m = _make_membership(api, fx, "applicant")
                 api.set_season_roster_membership_status(
-                    m["id"], "released", actor_id=ADMIN)
+                    m["id"], "released", reason="test", actor_id=ADMIN)
                 res = api.transfer_team_to_league(
                     fx["team"]["id"], fx["other_league_id"], actor_id=ADMIN)
                 self.assertNotIn("error", res, (label, res))

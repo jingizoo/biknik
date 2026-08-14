@@ -2810,7 +2810,21 @@ class SetupService:
         (player, Season) and the season-Team jersey). Entering a terminal
         status stamps ``effective_to``. A no-op transition is rejected, not
         silently absorbed, so the event history never lies about a change
-        that didn't happen."""
+        that didn't happen.
+
+        Entering a TERMINAL status requires a non-blank ``actor_id`` AND
+        ``reason`` (#205 review round 1 finding 5) — a floor, not the full
+        authorized transfer/release/deadline-policy/override workflow #212
+        places in a LATER #205 slice. This PR is scoped to "schema and
+        migration" (#212's Slice A), so it deliberately does not build
+        principal-authorization, deadline enforcement, or an override
+        workflow here — it narrows the already-shipped facade surface back
+        to that boundary by refusing the one thing an entirely unauthored,
+        unreasoned terminal transition would otherwise let slip through
+        silently. ``released``/``transferred`` remain valid ENUM values (the
+        schema stays capable of representing them, including for a future
+        backfill/migration path) — only setting one through this facade
+        method without an actor and a reason is refused."""
         membership = self.store.get_season_roster_membership_for_update(
             membership_id)
         if membership is None:
@@ -2842,6 +2856,22 @@ class SetupService:
                 membership.league_season_id, membership.team_id,
                 membership.jersey_number,
                 exclude_membership_id=membership.id)
+        elif status.is_terminal:
+            # #205 review round 1 finding 5 — narrowed floor: an
+            # unauthenticated or unreasoned terminal transition is refused
+            # with zero mutation/event/audit, checked BEFORE any write.
+            if not actor_id or not isinstance(actor_id, str) or not actor_id.strip():
+                raise ValidationError(
+                    "A terminal transition (released/transferred) requires "
+                    "an authenticated actor.",
+                    {"reason": "terminal_transition_requires_actor",
+                     "membership_id": membership.id, "status": status.value})
+            if not reason or not isinstance(reason, str) or not reason.strip():
+                raise ValidationError(
+                    "A terminal transition (released/transferred) requires "
+                    "a reason.",
+                    {"reason": "terminal_transition_requires_reason",
+                     "membership_id": membership.id, "status": status.value})
         previous = membership.status
         membership.status = status
         if status.is_terminal:
