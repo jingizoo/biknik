@@ -2065,6 +2065,193 @@ class ContextReadCancelHandoffCases(ContextReadEpochBase):
             "evaluated for it")
         self._assert_gate_is_clean("after the archive-parked-first sweep")
 
+    # ======================================================================
+    # 11b. THE OTHER LIFECYCLE DIRECTION (#159 review finding 3's explicit
+    #      "archive AND reopen in the other request" coverage requirement).
+    #      `LIFECYCLE_GATE.exclusive` wraps `archive_season` and
+    #      `reopen_season` through the identical `with` block in
+    #      `web/server.py` (only the `call` function pointer differs), so
+    #      these two cases are the SAME races as the pair above with the
+    #      lifecycle direction reversed — proven rather than assumed from
+    #      that symmetry, the same discipline finding 1 needed: "this route
+    #      is basically its sibling" was exactly the belief that let the
+    #      LeagueSeason standings branch skip the epoch gate undetected.
+    # ======================================================================
+    def test_a_reopen_dispatched_while_a_read_is_parked_mid_service_waits_for_it(self):
+        """THE MID-SERVICE PARK, reopen direction: the Season starts
+        ARCHIVED (selected as read-only history, same as any deliberately
+        chosen archived Season), the read's epoch matches that archived
+        state, and it parks INSIDE ``get_venue_grant_candidates`` — after
+        the epoch check already matched, before the service body (including
+        its own archived-destination refusal, #369 owner ruling) runs. A
+        second request reopens the same Season while the read is held
+        there.
+
+        MEASURED, not inferred: while the read remains parked, the Season's
+        live status is polled and asserted still ARCHIVED — the reopen has
+        not committed. Only once the park releases does the read complete,
+        entirely against PRE-reopen state, so it must reproduce the
+        pre-reopen (archived) baseline exactly — here, the archived-season
+        refusal (#369) — never a torn answer computed against a Season that
+        became active partway through. The reopen's own request then
+        returns once unblocked.
+        """
+        fx = self._program_with_two_seasons("ReopenToctou")
+        username, user_id = self._operator("reopentoctou")
+        client = self._login(username)
+        self._select(client, fx["program_id"], fx["s1"])
+        self._archive(client, fx["s1"])
+        epoch = self._epoch_from_api(client)
+        baseline, base_raw, _ = self._req(
+            client, "GET",
+            f"/api/v2/setup/seasons/{fx['s1']}/venue-candidates",
+            headers={CONTEXT_EPOCH_HEADER: epoch})
+        self.assertNotEqual(
+            baseline, 204, f"the fixture route itself discards with no "
+            f"race involved at all: {base_raw}")
+
+        out = {}
+
+        def do_read():
+            out["result"] = self._req(
+                client, "GET",
+                f"/api/v2/setup/seasons/{fx['s1']}/venue-candidates",
+                headers={CONTEXT_EPOCH_HEADER: epoch})
+
+        with self._read_parked_in(
+                "get_venue_grant_candidates", fx["s1"]) as (park, _exited):
+            rt = threading.Thread(target=do_read, daemon=True)
+            rt.start()
+            self.assertTrue(
+                park.arrived.wait(PATIENCE),
+                "the read never reached its service call")
+
+            reopen_out = {}
+
+            def do_reopen():
+                reopen_out["result"] = self._req(
+                    client, "POST", f"/api/v2/setup/seasons/{fx['s1']}/reopen",
+                    {"reason": "Late roster correction approved by the "
+                               "League."})
+
+            ot = threading.Thread(target=do_reopen, daemon=True)
+            ot.start()
+
+            # THE MEASUREMENT: while the read remains parked between its
+            # epoch match and its service call, the reopen must NOT have
+            # committed — it is BLOCKED behind the read's LIFECYCLE_GATE
+            # hold, not racing ahead of it.
+            time.sleep(COMMIT_WINDOW)
+            mid_season = self.api.store.get_season(fx["s1"])
+            self.assertEqual(
+                mid_season.status, SeasonStatus.ARCHIVED,
+                "the reopen committed WHILE the read was still parked "
+                "between its epoch match and its service call — "
+                "LIFECYCLE_GATE did not order it, and finding 3's TOCTOU "
+                "is still open for the reopen direction")
+
+            park.let_go()
+            rt.join(PATIENCE)
+            ot.join(PATIENCE)
+
+        self.assertIn("result", out, "the parked read never returned")
+        status, raw, _ = out["result"]
+        self.assertEqual(
+            status, baseline,
+            f"a read parked ENTIRELY pre-reopen must be answered exactly "
+            f"as the pre-reopen (archived) baseline was: {raw!r}")
+
+        self.assertIn("result", reopen_out,
+                      "the reopen request never returned — it may still "
+                      "be blocked")
+        reopen_status, reopen_raw, _ = reopen_out["result"]
+        self.assertEqual(
+            reopen_status, 200,
+            f"the reopen, unblocked after the read finished, must still "
+            f"succeed: {reopen_raw}")
+        final_season = self.api.store.get_season(fx["s1"])
+        self.assertEqual(
+            final_season.status, SeasonStatus.ACTIVE,
+            "the reopen never actually took effect once unblocked")
+        self._assert_gate_is_clean(
+            "after the reopen check->service TOCTOU sweep")
+
+    def test_a_reopen_parked_mid_commit_makes_a_later_read_see_only_its_result(self):
+        """THE OTHER COMMIT ORDER, reopen direction: the reopen's EXCLUSIVE
+        hold on ``LIFECYCLE_GATE`` registers BEFORE a read that is
+        dispatched while the reopen is still in flight. The read's SHARED
+        hold must wait behind it, so the read's OWN EPOCH CHECK observes the
+        POST-reopen state: the read is echoing the PRE-reopen (archived)
+        epoch it was rendered under, and by the time its (delayed) check
+        runs that epoch has moved, so the correct answer is the SAME 204
+        discard any other stale echo produces — never a 200 admitted
+        against a ceiling that has moved out from under it.
+        """
+        fx = self._program_with_two_seasons("ReopenToctouOrder")
+        username, user_id = self._operator("reopentoctouorder")
+        client = self._login(username)
+        self._select(client, fx["program_id"], fx["s1"])
+        self._archive(client, fx["s1"])
+        epoch = self._epoch_from_api(client)
+
+        reopen_out = {}
+
+        def do_reopen():
+            reopen_out["result"] = self._req(
+                client, "POST", f"/api/v2/setup/seasons/{fx['s1']}/reopen",
+                {"reason": "Late roster correction approved by the League."})
+
+        read_out = {}
+        with self._lifecycle_exclusive_parked() as park:
+            ot = threading.Thread(target=do_reopen, daemon=True)
+            ot.start()
+            self.assertTrue(park.arrived.wait(PATIENCE),
+                            "the reopen's exclusive hold was never granted")
+
+            service = self._watch_service("get_venue_grant_candidates")
+
+            def do_read():
+                read_out["result"] = self._scoped_read(
+                    client, fx["s1"], "venue-candidates", epoch)
+
+            rt = threading.Thread(target=do_read, daemon=True)
+            rt.start()
+            # The read's SHARED hold must be seen to be WAITING (never
+            # admitted) while the reopener's EXCLUSIVE hold — registered
+            # first — is still held. Measured via the gate's own stats
+            # rather than inferred from timing.
+            self.assertTrue(
+                _wait(lambda:
+                     self.srv.LIFECYCLE_GATE.stats()["waiting_readers"] >= 1,
+                     PATIENCE),
+                "the read never showed up as waiting behind the parked "
+                "reopen's exclusive hold")
+            self.assertNotIn("result", read_out,
+                            "the read was admitted WHILE the reopen still "
+                            "held the exclusive lock — the two orders "
+                            "interleaved")
+
+            park.let_go()
+            ot.join(PATIENCE)
+            rt.join(PATIENCE)
+
+        self.assertIn("result", reopen_out, "the reopen never returned")
+        self.assertEqual(reopen_out["result"][0], 200, reopen_out["result"][1])
+        self.assertIn("result", read_out, "the read never returned")
+        status, raw, _ = read_out["result"]
+        self.assertEqual(
+            status, 204,
+            f"a read whose SHARED hold waited behind the reopener's "
+            f"EXCLUSIVE one must have its (now-delayed) epoch check "
+            f"observe the moved epoch and discard — never be admitted to "
+            f"a ceiling straddling two states: {raw!r}")
+        self.assertEqual(raw, "", "a discard must carry no body")
+        self.assertEqual(
+            service, [],
+            "the discarded read reached ApiService — the ceiling WAS "
+            "evaluated for it")
+        self._assert_gate_is_clean("after the reopen-parked-first sweep")
+
 
 class MemoryContextReadEpochTest(ContextReadCancelHandoffCases, unittest.TestCase):
     STORE_URL = None
