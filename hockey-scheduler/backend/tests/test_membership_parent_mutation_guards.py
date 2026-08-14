@@ -454,15 +454,96 @@ class CreateVsUnregisterRaceTest(unittest.TestCase):
     def setUp(self):
         self.url = os.environ["TEST_DATABASE_URL"]
 
+    @staticmethod
+    def _sync_at_shared_prefix(store, lock_barrier):
+        """Make ``store``'s ``get_league_season`` call the rendezvous, for
+        exactly its ONE race-relevant invocation, instead of only
+        synchronizing thread start.
+
+        Root-caused with direct instrumentation (see the PR body/commit) in
+        two stages — a plain start-of-thread ``threading.Barrier(2)`` (the
+        pattern the other three real-Postgres race tests in this PR already
+        get away with) is not enough here, and neither is the first, more
+        obvious attempt to fix it:
+
+        1. Unlike ``CreateVsTransferRaceTest`` (both sides' FIRST statement
+           is the identical ``get_team_for_update`` call, so a start-of-
+           thread barrier already puts them shoulder-to-shoulder at the real
+           contention point), this race's two operations reach their SHARED
+           lock (``_require_active_season`` -> ``get_season_for_update``,
+           both via the identical guard — see the class docstring) via
+           UNEQUAL-COST prior work: ``create_season_roster_membership``'s
+           first statement is ``get_team_for_update`` (a
+           ``SELECT ... FOR UPDATE`` row lock, a heavier round trip) plus a
+           plain read; ``unregister_team_from_season``'s is two plain reads.
+           Measured directly (10/10 rounds), the cheaper side (unregister)
+           consistently reached a start-of-thread barrier FIRST and
+           therefore BLOCKED on it, while create arrived last and
+           consequently proceeded WITHOUT blocking — CPython's
+           ``threading.Barrier`` releases whichever thread's ``wait()`` call
+           completes the party count immediately, still holding the GIL,
+           while the other waiter needs a real OS-level wakeup to resume —
+           so create's lock statement reached Postgres first in all 10/10
+           measured rounds purely from that handicap, not real DB/OS
+           scheduling: the flake this test showed.
+        2. The obvious fix — synchronize at the lock statement itself
+           (``get_season_for_update``) instead of thread start — swaps WHO
+           the handicap favors but does not remove it (measured: ~85-90% of
+           rounds still won by one fixed side across repeated process runs,
+           still well within a single 8-round run's failure zone). The
+           actual lever that makes the other three tests fair isn't barrier
+           PLACEMENT by itself — it's that their shared statement has ZERO
+           divergent work before it on either side, so which thread the
+           barrier's own release-order quirk favors is incidental, not tied
+           to a structural cost difference. ``create`` and ``unregister``
+           genuinely share a statement with that same property: their
+           SECOND call is the identical ``get_league_season`` (create calls
+           ``self.store.get_league_season`` directly; unregister's
+           ``_season_of_league_season`` is exactly that same call) — and
+           from there, BOTH paths take the SAME next step (one negligible
+           in-Python truthy check, then ``_require_active_season``) with NO
+           further asymmetric work before the real lock. Synchronizing
+           there removes the structural handicap the same way the other
+           tests' natural first-statement symmetry does.
+        3. Naively wrapping ``get_league_season`` for the store's whole
+           lifetime, though, reintroduces a DIFFERENT, correctness-breaking
+           bug: ``ApiService.unregister_team_from_season``'s facade wrapper
+           calls ``self._registration_dict(...)`` on the result, which makes
+           its OWN unguarded ``get_league_season`` call to resolve
+           ``season_id``/``league_id`` for the legacy v1 response shape —
+           AFTER the transaction, with no matching call on create's side
+           (``create_season_roster_membership``'s facade wrapper is a plain
+           ``_serialize(...)``). A barrier wrap left in place sees
+           unregister call ``get_league_season`` TWICE per round while
+           create calls it once, and the unmatched second call blocks until
+           the barrier's timeout, raising ``BrokenBarrierError``
+           (reproduced directly).
+
+        The fix: un-wrap immediately on first use, so the barrier only ever
+        gates the ONE race-relevant, in-transaction, matched call on each
+        side — any later call (the facade's post-transaction serialization)
+        runs the plain, unwrapped method.
+        """
+        original = store.get_league_season
+
+        def synced(league_season_id):
+            store.get_league_season = original  # one-shot: never re-gate
+            lock_barrier.wait(timeout=5)
+            return original(league_season_id)
+
+        store.get_league_season = synced
+
     def _race_once(self, fx):
-        barrier = threading.Barrier(2)
+        start_barrier = threading.Barrier(2)
+        lock_barrier = threading.Barrier(2)
         results = {}
 
         def do_create():
             store = SqlStore(self.url)
+            self._sync_at_shared_prefix(store, lock_barrier)
             api = ApiService(store)
             try:
-                barrier.wait(timeout=5)
+                start_barrier.wait(timeout=5)
                 results["create"] = api.create_season_roster_membership(
                     fx["player"]["id"], fx["ls_id"], fx["team"]["id"],
                     status="applicant", jersey_number=None, actor_id=ADMIN)
@@ -471,9 +552,10 @@ class CreateVsUnregisterRaceTest(unittest.TestCase):
 
         def do_unregister():
             store = SqlStore(self.url)
+            self._sync_at_shared_prefix(store, lock_barrier)
             api = ApiService(store)
             try:
-                barrier.wait(timeout=5)
+                start_barrier.wait(timeout=5)
                 results["unregister"] = api.unregister_team_from_season(
                     fx["reg"]["id"], actor_id=ADMIN)
             finally:
@@ -489,7 +571,48 @@ class CreateVsUnregisterRaceTest(unittest.TestCase):
 
     def test_never_leaves_active_membership_on_unregistered_team(self):
         winners = {"create": 0, "unregister": 0}
-        for i in range(8):
+        # 80 rounds, not 8 (a DELIBERATE, DOCUMENTED gap from this file's
+        # other race tests, which all use 8-10) — a stated limitation, not
+        # an oversight. _sync_at_shared_prefix (above) synchronizes the two
+        # racers on their genuinely shared statement, which measurably fixed
+        # the WORST failure mode this test originally had: a start-of-thread-
+        # only barrier let ``create`` win the Season-row-lock race 8/8 EVERY
+        # observed round (confirmed by direct instrumentation — see that
+        # method's docstring), because its heavier first statement
+        # (``get_team_for_update``, a row lock) made it consistently the
+        # LAST thread to reach a 2-party barrier, and CPython releases the
+        # last arriver without blocking. That specific, deterministic
+        # mechanism is now removed.
+        # What remains, even after that fix, is a REAL residual skew — not a
+        # Python synchronization artifact, but two structurally different
+        # operations (create locks a Team row before the shared LeagueSeason
+        # read; unregister does not) whose actual PostgreSQL-side costs
+        # differ enough that even a matched, shared release point does not
+        # land the two sides at the Season-row lock at genuinely equal odds.
+        # Measured directly, over many independent 30-round samples on real
+        # PostgreSQL: ``create`` won roughly 70-93% of individual rounds
+        # (never 100%, so the underlying contest is real, not fixed) — i.e.
+        # a per-round skew, not a per-run one. At 8 rounds that skew still
+        # produces an all-one-side sweep often enough to flake. Forcing
+        # genuinely equal PER-ROUND odds between two operations with
+        # different real costs, without touching production code, was tried
+        # multiple ways (synchronizing at the lock statement itself; a
+        # 3-party rendezvous removing the "last arrival" advantage entirely,
+        # at both the lock statement and the shared prefix) and every
+        # variant left a comparable double-digit-percent residual skew, just
+        # favoring whichever side a given mechanism's own release-order
+        # quirk happened to help — evidence the remaining gap is genuine
+        # DB/OS scheduling noise on top of a real cost asymmetry, not
+        # something more synchronization engineering removes. So this falls
+        # back to (b): keep the real fix above, and raise the round count
+        # far enough that "both orderings occur" holds with overwhelming
+        # probability despite that residual skew, rather than dropping the
+        # requirement. Even at a conservative 90% single-side skew, 80
+        # rounds puts the chance of an all-one-side sweep under 0.03% (was
+        # ~100% at 8 rounds pre-fix); this was verified empirically with 20
+        # consecutive full runs at this round count (see the PR body) before
+        # landing.
+        for i in range(80):
             fx = _pg_fixture(self.url)
             results = self._race_once(fx)
             create_ok = "error" not in results["create"]
@@ -522,7 +645,7 @@ class CreateVsUnregisterRaceTest(unittest.TestCase):
                     self.assertEqual(len(memberships), 0, (i, results))
             finally:
                 checker.close()
-        # Both orderings actually happened across the 8 rounds.
+        # Both orderings actually happened across the 80 rounds.
         self.assertGreater(winners["create"], 0, winners)
         self.assertGreater(winners["unregister"], 0, winners)
 
