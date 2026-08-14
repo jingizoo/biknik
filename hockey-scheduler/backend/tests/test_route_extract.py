@@ -3010,5 +3010,246 @@ class DefaultDenyExpressionOperandTests(unittest.TestCase):
         self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 51)
 
 
+# --------------------------------------------------------------------------- #
+# #202 repair round 5, finding 6 (external review, 19:48): exception-driven   #
+# routing is uninspected. Three parts: (a) an ``ast.Assert``'s own ``.test``  #
+# was never audited the way an ``ast.If``'s already is; (b) an ``ast.Raise``  #
+# whose exception ARGUMENT mentions tracked data was never audited; (c) the   #
+# binding model omits ``ExceptHandler.name`` entirely, so a name bound from   #
+# ``except ... as name:`` can carry exception-payload taint into routing-     #
+# relevant code with no error of any kind. (c) is the HARD part -- true       #
+# cross-statement data-flow (which raise site feeds which handler) is out of  #
+# reach for this kind of walker without a much larger rework -- so it is      #
+# fixed with a reasonably-scoped, HONEST, deliberately fail-closed COARSE     #
+# over-approximation instead (see route_extract.py's own KNOWN LIMITATIONS    #
+# section, finding 6c's entry, for exactly how precise this is and is not),   #
+# the same honesty standard finding H (round 3) already set for a residual    #
+# gap this module chose not to fully close.                                   #
+# --------------------------------------------------------------------------- #
+class ExceptionDrivenRoutingTests(unittest.TestCase):
+    # -- pre-fix escapes, reproduced via git stash (not re-run here: git
+    # stash cannot be invoked from inside a test process) -- the transcript
+    # below is what running each of the reviewer's own two fixtures below
+    # produced against the code as it stood immediately before this
+    # finding's fix (round 5, finding 5's own commit), captured verbatim:
+    #
+    #   assert / except AssertionError:            NO RAISE. routes = []
+    #   raise ValueError(path) / except ... as candidate: NO RAISE. routes = []
+    #
+    # both now raise against the FIXED code, asserted below, which a test
+    # process can still verify for itself on every run.
+
+    def _with_waivers(self, waivers: dict):
+        """As WaiverFingerprintTests' own helper of the same name (kept
+        local rather than shared -- this is the only class in this module
+        that needs it outside that one) -- temporarily replace the
+        module's real _AUDIT_WAIVERS with exactly `waivers`, restored even
+        if the test body raises."""
+        saved = dict(route_extract_module._AUDIT_WAIVERS)
+        route_extract_module._AUDIT_WAIVERS.clear()
+        route_extract_module._AUDIT_WAIVERS.update(waivers)
+        self.addCleanup(lambda: (
+            route_extract_module._AUDIT_WAIVERS.clear(),
+            route_extract_module._AUDIT_WAIVERS.update(saved)))
+
+    def _raises(self, body, *substrings):
+        with self.assertRaises(ExtractionError) as caught:
+            extract_routes(_module(body))
+        msg = str(caught.exception)
+        for s in substrings:
+            self.assertIn(s, msg)
+
+    def test_assert_tests_a_tracked_subject_raises(self):
+        """Finding 6a, the reviewer's own first reproduction: an assert
+        inside a try, its failure caught by ``except AssertionError:`` --
+        a real, live routing decision (assert succeeds -> one answer,
+        fails -> the except's answer) reached via a statement type this
+        module's completeness scan never inspected."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                try:
+                    assert path == "/api/hidden"
+                except AssertionError:
+                    return self._send_status(404)
+                return self._send(1)
+        ''', "unrecognised shape", "path")
+
+    def test_raise_of_tracked_value_raises(self):
+        """Finding 6b: ``raise ValueError(path)`` hands the tracked path
+        DIRECTLY to an unlisted exception constructor -- the SAME
+        unlisted-call rule ``_propagates_taint`` already applies to a
+        Return/bare-Expr value, now also reached from a Raise."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                raise ValueError(path)
+        ''', "unlisted call", "ValueError(path)")
+
+    def test_except_as_binding_after_a_tracked_raise_raises(self):
+        """Finding 6c, the reviewer's own second reproduction, combined:
+        ``raise ValueError(path)`` (already caught by 6b alone here, since
+        the raise is itself unwaived) followed by ``except ValueError as
+        candidate: if str(candidate) == "/api/hidden": ...`` -- either
+        mechanism raising closes the escape; see
+        test_a_waived_raise_still_flags_its_named_handler below for 6c's
+        OWN, independent value when 6b's mechanism alone would not fire."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                try:
+                    raise ValueError(path)
+                except ValueError as candidate:
+                    if str(candidate) == "/api/hidden":
+                        return self._send(1)
+                    return self._send(2)
+        ''')
+
+    def test_assert_escape_answers_over_real_http_both_ways(self):
+        """Both sides of the reviewer's own assert repro answer for real:
+        the assert succeeding and failing are two DIFFERENT live routes,
+        not a hypothetical branch extraction merely failed to prove
+        unreachable."""
+        hit_status, hit_text = _real_http_probe('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                try:
+                    assert path == "/api/hidden"
+                except AssertionError:
+                    return self._send_json({"error": "not_found"}, 404)
+                return self._send(1)
+        ''', "GET", "/api/hidden")
+        self.assertEqual(hit_status, 200)
+        self.assertEqual(json.loads(hit_text), {"n": 1})
+        miss_status, _ = _real_http_probe('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                try:
+                    assert path == "/api/hidden"
+                except AssertionError:
+                    return self._send_json({"error": "not_found"}, 404)
+                return self._send(1)
+        ''', "GET", "/api/other")
+        self.assertEqual(miss_status, 404)
+
+    def test_raise_except_as_escape_answers_over_real_http_both_ways(self):
+        """Both sides of the reviewer's own raise/except-as repro answer
+        for real: the exception payload genuinely selects the response."""
+        hit_status, hit_text = _real_http_probe('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                try:
+                    raise ValueError(path)
+                except ValueError as candidate:
+                    if str(candidate) == "/api/hidden":
+                        return self._send(1)
+                    return self._send(2)
+        ''', "GET", "/api/hidden")
+        self.assertEqual(hit_status, 200)
+        self.assertEqual(json.loads(hit_text), {"n": 1})
+        miss_status, miss_text = _real_http_probe('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                try:
+                    raise ValueError(path)
+                except ValueError as candidate:
+                    if str(candidate) == "/api/hidden":
+                        return self._send(1)
+                    return self._send(2)
+        ''', "GET", "/api/other")
+        self.assertEqual(miss_status, 200)
+        self.assertEqual(json.loads(miss_text), {"n": 2})
+
+    def test_a_waived_raise_still_flags_its_named_handler(self):
+        """Finding 6c's OWN independent value, isolated: even when the
+        raise site itself is waived (judged, on review, not itself a
+        routing decision -- 6b's own mechanism stays silent), the named
+        except handler downstream is STILL flagged, because 6c's
+        function-wide over-approximation does not depend on 6b having
+        fired. This is the coarse, deliberately-conservative design the
+        module's own KNOWN LIMITATIONS section (finding 6c's entry)
+        describes: it cannot prove `candidate` is safe just because the
+        raise that produced it was reviewed, so it does not try to."""
+        src = _module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                try:
+                    raise ValueError(path)
+                except ValueError as candidate:
+                    if str(candidate) == "/api/hidden":
+                        return self._send(1)
+                    return self._send(2)
+        ''')
+        self._with_waivers({
+            ("do_GET", "ValueError(path)", "raise", ""):
+                "test-only: pretend this raise site was reviewed and "
+                "judged not a routing decision, to isolate finding 6c's "
+                "OWN check from finding 6b's",
+        })
+        with self.assertRaises(ExtractionError) as caught:
+            extract_routes(src)
+        msg = str(caught.exception)
+        self.assertIn("except", msg)
+        self.assertIn("candidate", msg)
+
+    def test_a_non_path_exception_with_a_named_handler_does_not_raise(self):
+        """The design principle finding 6c does NOT touch: a function
+        whose only raise mentions nothing tracked leaves its named except
+        handler(s) alone, exactly as before this finding."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if path == "/api/real":
+                    try:
+                        raise ValueError("unrelated, no path involved")
+                    except ValueError as err:
+                        return self._send_status(500)
+                    return self._send(1)
+                return self._send(2)
+        '''))}
+        self.assertEqual(found, {("GET", "/api/real")})
+
+    def test_an_except_with_no_as_binding_is_unaffected_by_finding_6c(self):
+        """``except ValueError:`` (no name bound) has nothing for finding
+        6c to flag -- there is no alias a payload could leak through.
+        Isolated from finding 6b (which would otherwise ALSO raise on
+        this fixture's own `ValueError(path)` argument) via the SAME
+        `_with_waivers` technique the dormant-check test above uses, so
+        this test proves 6c SPECIFICALLY stays quiet for a no-name
+        handler, not merely that the fixture as a whole fails to raise
+        for some other reason."""
+        src = _module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if path == "/api/real":
+                    try:
+                        raise ValueError(path)
+                    except ValueError:
+                        return self._send_status(404)
+                    return self._send(1)
+                return self._send(2)
+        ''')
+        self._with_waivers({
+            ("do_GET", "ValueError(path)", "raise", "path == '/api/real'"):
+                "test-only: silence finding 6b so this test isolates "
+                "finding 6c's own behaviour for a handler with NO name "
+                "binding",
+        })
+        found = {(r.method, r.template) for r in extract_routes(src)}
+        self.assertEqual(found, {("GET", "/api/real")})
+
+    def test_the_real_server_extracts_with_no_new_raises(self):
+        """The real server.py has no assert on a tracked subject, no raise
+        whose argument mentions one, and so no named except handler this
+        finding's coarse, function-wide over-approximation needs to flag
+        -- must still extract cleanly: 239 routes, the SAME 51 waivers
+        (see WaiverFingerprintTests' own pinned count) -- no new waiver
+        needed for this finding."""
+        walker = extract_walker()
+        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(walker.unreachable, [])
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 51)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

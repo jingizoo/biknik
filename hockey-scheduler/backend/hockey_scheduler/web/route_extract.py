@@ -143,29 +143,86 @@ for the standing proof it stays true):
   everything else. Neither is implemented; the guard test above is the
   tripwire that would force the choice to be made the day it first matters.
 
+#202 repair round 5, finding 6c (documented here deliberately, PARTIALLY
+fixed this round -- see ``tests/test_route_extract.py``'s
+``ExceptionDrivenRoutingTests`` for both the fix and the standing proof of
+exactly how far it goes):
+
+* TRUE cross-statement data-flow -- proving, for a GIVEN ``except ... as
+  name:`` handler, WHICH specific ``raise`` site (if any) its ``name`` binds
+  the payload of -- is out of reach for this module's kind of walker without
+  a much larger rework (real type/control-flow analysis, not an AST shape
+  scan). This module does not claim to do it, and finding 6c's own fix is
+  DELIBERATELY not an attempt at it.
+* What IS implemented: (a) an ``ast.Assert``'s own ``.test`` is audited the
+  same way an ``ast.If``'s is -- a path-tainted assert is a routing
+  decision, full stop, the same shape as every other branching statement
+  this module already inspects; (b) an ``ast.Raise``'s own exception
+  argument is audited through the SAME unlisted-call/tracked-expression
+  rules ``_propagates_taint`` already applies to a Return/bare-Expr value;
+  (c) for ``except ... as name:`` SPECIFICALLY, a COARSE, DELIBERATELY
+  OVER-INCLUSIVE stand-in: the handler is flagged the moment its ENCLOSING
+  FUNCTION contains ANY raise whose own argument mentions a tracked name
+  ANYWHERE in that function, regardless of the handler's own declared
+  exception type(s) or where in the function the raise sits relative to the
+  handler. This is intentionally NOT "does this handler's type match that
+  raise's type" -- inheritance, aliasing, and multi-type ``except (A, B) as
+  name:`` tuples all make simple textual type-matching UNRELIABLE in
+  exactly the direction this module must never guess in (a false "no
+  match" would silently miss a live handler); a function-wide
+  over-approximation cannot make that mistake, at the cost of also
+  flagging a named handler that turns out, on review, to be genuinely
+  unconnected to the tracked raise elsewhere in the same function --
+  reviewable via the SAME ``_AUDIT_WAIVERS`` escape hatch as everything
+  else in this module, not a silent pass.
+* Precisely what is STILL NOT covered, honestly: an except handler that
+  binds a tracked exception payload to a name is caught (that is finding
+  6c's whole point), but what that name is SUBSEQUENTLY tested against, or
+  passed to, is examined by NONE of this module's existing mechanisms --
+  ``except ... as name:`` is still absent from
+  :func:`_binding_value_and_targets`'s recognised binding forms (a
+  DELIBERATE choice: teaching the fixed-point loop to treat an exception
+  alias as an ordinary tracked local would need to know it is BOUND FROM
+  something tracked in the first place, which is exactly the cross-
+  statement trace this bullet's first point says is out of reach) -- the
+  handler being flagged AT ALL is what stands in for that, not a precise
+  model of what happens after. A raise/except pair with NO name binding
+  (``except ValueError:``) is unaffected by 6c (nothing to leak through),
+  though the RAISE's own argument is still independently audited by 6b.
+
 On the soundness of this gate, honestly stated
 ------------------------------------------------
-This module has been adversarially reviewed across FOUR rounds: the
+This module has been adversarially reviewed across SIX rounds: the
 original repository-owner review (6 findings, all closed by the #202
-repair), a first self-directed adversarial hunt (findings A-D, round 2),
-and a second (findings E-H, round 3 -- E/F/G closed by this section's own
-revision, H documented directly above). Each round's own pattern repeats:
-fix what was found, and a FRESH hunt finds more. That is not a sign any
-individual round was careless -- it is the expected, unavoidable shape of a
-bespoke static analyzer over a general-purpose language: the class of
-Python constructs that could conceivably encode a routing decision is not
-finite, and this module recognises a specific, growing-but-always-partial
-list of them.
+repair), a first self-directed adversarial hunt (findings A-D, round 2), a
+second (findings E-H, round 3 -- E/F/G closed by this section's own
+revision, H documented directly above), a THIRD external repository-owner
+review (round 4: 5 findings -- a helper-call/match-case call escape, more
+unmodelled binding forms, waiver-relocation, gated-but-unenforced
+classification, and three mislabelled auth routes -- all closed), and a
+FOURTH (round 5: 6 findings across two further external review passes at
+the SAME exact head -- a taint-erasing waiver architecture flaw, a
+Subscript-callee/Return-statement gap, test-coverage-only, a stale
+docstring, an unrecognised-expression-operand gap, and the exception-
+driven routing this very section documents -- all closed or, for finding
+6c specifically, honestly bounded rather than claimed complete, directly
+above). Each round's own pattern repeats: fix what was found, and a FRESH
+hunt finds more. That is not a sign any individual round was careless --
+it is the expected, unavoidable shape of a bespoke static analyzer over a
+general-purpose language: the class of Python constructs that could
+conceivably encode a routing decision is not finite, and this module
+recognises a specific, growing-but-always-partial list of them.
 
 So, stated plainly, NOT as an oversight but as a considered engineering
 trade-off:
 
 * this gate is NOT claimed to be exhaustively complete against arbitrary
-  future Python constructs. Finding H above is a known, DOCUMENTED,
-  currently-undemonstrated gap; there is no proof that no OTHER gap exists
-  beyond the ones four rounds of review happened to find. A fifth round
-  should be expected to find a fifth thing, on the same pattern as the
-  first four;
+  future Python constructs. Finding H above, and finding 6c's own
+  precisely-bounded residual gap above, are known, DOCUMENTED,
+  currently-undemonstrated-beyond-what-is-stated gaps; there is no proof
+  that no OTHER gap exists beyond the ones six rounds of review happened
+  to find. A seventh round should be expected to find a seventh thing, on
+  the same pattern as the first six;
 * the actual soundness BACKSTOP for CORRECTNESS -- as distinct from
   completeness of this module's own DETECTION -- is not this static walker
   at all, but a RUNTIME proof already in place: the 405/Allow admission
@@ -1959,6 +2016,37 @@ class _DispatchWalker:
                         f"{fn.name}:{node.lineno} a while loop tests "
                         f"dispatch subject(s) {sorted(hit)} in an "
                         f"unrecognised shape: {ast.unparse(node.test)}")
+            if isinstance(node, ast.Assert):
+                # #202 repair round 5, finding 6a: an ``assert`` is a
+                # CONTROL-TRANSFER expression exactly like an ``ast.If``'s
+                # own test -- a failing assert raises ``AssertionError``,
+                # transferring control away from the rest of the block,
+                # the same branch-shaped decision an ``if`` makes by
+                # returning early instead. `_walk_stmt`'s own ``Try``
+                # handling walks a try BODY (so a route nested further
+                # inside one is still found), but neither that walk nor
+                # this scan (which, until now, only matched ast.If/
+                # ast.IfExp/ast.While/match-case guards) ever looked at an
+                # Assert's OWN `.test`. DEMONSTRATED (the reviewer's own
+                # repro): ``try: assert path == "/api/hidden" \n except
+                # AssertionError: return 404 \n return 200`` answered live
+                # HTTP 200/404 on the two sides of that assert while
+                # extraction recorded zero routes and raised nothing. Same
+                # shape as the ast.If/ast.While cases above, just a
+                # different statement type; goes through the SAME waivers
+                # (none needed today -- server.py has no ``assert`` on any
+                # tracked subject).
+                names = _direct_operand_names(node.test, tracked)
+                hit = names & tracked
+                key = _waiver_key(fn.name, node.test, parents)
+                if hit and key in _AUDIT_WAIVERS:
+                    self._record_waiver_hit(key, node)
+                    continue
+                if hit:
+                    raise ExtractionError(
+                        f"{fn.name}:{node.lineno} an assert tests "
+                        f"dispatch subject(s) {sorted(hit)} in an "
+                        f"unrecognised shape: {ast.unparse(node.test)}")
             if hasattr(ast, "match_case") and isinstance(node, ast.match_case) \
                     and node.guard is not None:
                 # #202 repair round 4, finding 1: a ``match``/``case`` GUARD
@@ -2084,6 +2172,104 @@ class _DispatchWalker:
                 _propagates_taint(node.value, tracked, fn.name,
                                   self.waiver_hits, parents, self._followed,
                                   captured_names)
+            if isinstance(node, ast.Raise) and node.exc is not None:
+                # #202 repair round 5, finding 6b: ``raise <expr>`` is a
+                # CONTROL-TRANSFER expression this module never inspected
+                # at all -- neither the fixed-point loop (assignment-
+                # only), the bare-Expr scan, nor the Return scan (finding
+                # 2b) visits a Raise's own exception argument.
+                # DEMONSTRATED (half of the reviewer's own combined
+                # repro): ``raise ValueError(path)`` -- the tracked path,
+                # handed DIRECTLY to an unlisted exception constructor --
+                # answered live HTTP while extraction stayed silent.
+                # Reuses the exact SAME _propagates_taint check the
+                # Return/bare-Expr scans already run, purely for its
+                # raise-if-unlisted-and-tracked side effect (the SAME
+                # "unlisted call/tracked-expression" rules already applied
+                # everywhere else in this module, per the reviewer's own
+                # required-correction wording) -- the raised exception's
+                # eventual DESTINATION (which except clause, if any, ends
+                # up catching it) is a SEPARATE concern, handled
+                # conservatively below rather than by tracing the actual
+                # control-flow edge (see finding 6c's own comment for why
+                # that precise a trace is out of reach for this module).
+                _propagates_taint(node.exc, tracked, fn.name,
+                                  self.waiver_hits, parents, self._followed,
+                                  captured_names)
+            if isinstance(node, ast.ExceptHandler) and node.name is not None:
+                # #202 repair round 5, finding 6c -- the HARD part, stated
+                # honestly rather than left silently unaddressed (matching
+                # the standard #202 repair round 3, finding H already set:
+                # fix what is tractable, document the rest). TRUE cross-
+                # statement data-flow -- proving WHICH raise site's
+                # payload a GIVEN except clause actually catches -- is out
+                # of reach for a walker with no type/control-flow
+                # analysis, and this module does not claim to do it. What
+                # IS tractable, and implemented here: a COARSE, DELIBERATELY
+                # CONSERVATIVE over-approximation -- ``except ... as
+                # name:`` binds a name this module's binding model has
+                # never listed (see :func:`_binding_value_and_targets`'s
+                # own KNOWN LIMITATIONS note), so if it were TESTED for
+                # routing later, that test would be invisible; rather than
+                # attempt (and likely get wrong) a precise "does this
+                # handler's exception TYPE match that raise's exception
+                # TYPE" check -- inheritance, aliasing and multi-type
+                # ``except (A, B) as name:`` tuples all make simple textual
+                # matching UNRELIABLE in the permissive direction, which
+                # is exactly the direction this module must never guess in
+                # -- this fails closed on ANY named handler the moment the
+                # ENCLOSING FUNCTION contains ANY raise whose own argument
+                # mentions a tracked name ANYWHERE, regardless of the
+                # handler's own declared type(s). DELIBERATELY
+                # OVER-INCLUSIVE: a function with an unrelated tracked
+                # raise and a genuinely-unconnected named handler will be
+                # flagged too, reviewable via the SAME declared
+                # ``_AUDIT_WAIVERS`` escape hatch as everything else in
+                # this module -- "occasionally over-flag a genuinely-safe
+                # except clause" is the accepted cost of not "silently
+                # miss[ing] a live one". DEMONSTRATED (the other half of
+                # the reviewer's own combined repro): ``raise
+                # ValueError(path)`` followed by ``except ValueError as
+                # candidate: if str(candidate) == "/api/hidden": ...``
+                # answered live HTTP while extraction stayed silent --
+                # `candidate` carries the raised path as its exception
+                # payload, invisible to every check in this module until
+                # now.
+                if self._function_has_tracked_raise(fn, tracked):
+                    key = _waiver_key(fn.name, node, parents)
+                    if key in _AUDIT_WAIVERS:
+                        self._record_waiver_hit(key, node)
+                        continue
+                    raise ExtractionError(
+                        f"{fn.name}:{node.lineno} `except ... as "
+                        f"{node.name}:` binds a name that MAY carry "
+                        "exception-payload taint -- this function "
+                        "contains a raise whose argument mentions a "
+                        "tracked dispatch name, and route_extract cannot "
+                        "prove this handler does not receive it (a "
+                        "conservative, function-wide over-approximation: "
+                        "see _audit_function's own finding-6c comment). "
+                        "Rewrite to avoid depending on the exception "
+                        "payload, or classify here.")
+
+    def _function_has_tracked_raise(self, fn: ast.FunctionDef,
+                                    tracked: set) -> bool:
+        """Does ``fn`` contain ANY ``raise <expr>`` whose argument mentions
+        a tracked name? (#202 repair round 5, finding 6c's own coarse,
+        function-wide "could plausibly reach" stand-in -- see that
+        branch's comment in :meth:`_audit_function` for why a precise,
+        per-handler match is not attempted.) Uses the SAME
+        ``_mentions_tracked`` boundary every other check in this module
+        does, so a raise whose only tracked mention is a genuinely opaque
+        extraction (a captured group, a Path property) does not trigger
+        this either -- consistent with, not a special case of, the rest
+        of the module's taint model.
+        """
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Raise) and node.exc is not None \
+                    and _mentions_tracked(node.exc, tracked):
+                return True
+        return False
 
     def _audit_dispatch_helper_calls(self, fn: ast.FunctionDef) -> None:
         """Raise if ``fn`` calls an uncatalogued ``_handle_*``/``_dispatch_*``
