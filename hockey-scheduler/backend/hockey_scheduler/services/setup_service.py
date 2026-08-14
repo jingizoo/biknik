@@ -4201,6 +4201,19 @@ class SetupService:
         if player.is_active:
             self._assert_jersey_available(team_id, player.jersey_number,
                                           exclude_player_id=player.id)
+        # #273 review round 2 finding 2: the same same-team duplicate check
+        # create/update already run, now BEFORE the destination-team move —
+        # this method used to check ONLY jersey availability, so a player
+        # carrying a registration number could be moved onto a team that
+        # already had another player with that same number, landing two
+        # rows with one governing-body id on one team. Unlike the jersey
+        # check this is NOT conditioned on ``player.is_active``: the
+        # existing same-team check includes inactive players (deactivating a
+        # row must not free the identity for an accidental duplicate), so a
+        # move must honor the same rule regardless of the mover's active
+        # state.
+        self._assert_registration_number_available(
+            team_id, player.registration_number, exclude_player_id=player.id)
         player.team_id = team_id
         self.store.save_player(player)
         self._audit("player_team_assigned", "player", player.id, actor_id,
@@ -6768,12 +6781,29 @@ class SetupService:
                   **identity_values}
         # Same-team duplicate governing-body id (#273): refuse BEFORE any
         # write, excluding the row's own player when this is an update.
+        #
+        # #273 review round 2 finding 2: check the EFFECTIVE registration
+        # number the row will carry after this write, not just a
+        # newly-supplied one. The previous version only checked when
+        # ``new_registration is not None`` and it differed from the
+        # existing row's stored value, so a blank cell (``registration_number``
+        # stays unset in ``identity_values`` here -- "leave as-is" on update,
+        # per this method's own contract) or an explicitly re-supplied
+        # UNCHANGED value skipped the check entirely, even though ``team_id``
+        # may be moving the player onto a team that already holds that same
+        # number. Now it always runs against the value the row will actually
+        # carry -- ``new_registration`` when the sheet supplied one, else the
+        # existing row's own retained value -- exactly like the unconditional
+        # jersey check just above. ``exclude_player_id`` keeps a same-team
+        # no-op (or a same-team re-import) from colliding with itself.
         new_registration = identity_values.get("registration_number")
-        if new_registration is not None and (
-                existing is None
-                or existing.registration_number != new_registration):
+        effective_registration = (
+            new_registration if new_registration is not None
+            else (existing.registration_number if existing is not None
+                 else None))
+        if effective_registration is not None:
             self._assert_registration_number_available(
-                team_id, new_registration,
+                team_id, effective_registration,
                 exclude_player_id=None if existing is None else existing.id)
         if existing is None:
             # #331 review round 14 finding 3: same mechanism as
@@ -8759,11 +8789,34 @@ class SetupService:
                                 player.shoots = shoots_cell
                             if birthdate_cell is not None:
                                 player.birthdate = birthdate_cell
+                            # #273 review round 2 finding 2: check the
+                            # EFFECTIVE registration number the row will
+                            # carry after this write, not just a
+                            # newly-supplied cell. The previous version
+                            # only checked ``registration_cell is not
+                            # None and registration_cell !=
+                            # player.registration_number``, so a BLANK
+                            # cell (registration_cell is None -- "leave
+                            # as-is", the same rule every other optional
+                            # cell in this loop follows) or an explicitly
+                            # re-supplied UNCHANGED value skipped the
+                            # check entirely, even though ``team_id`` a
+                            # few lines up may already have moved this
+                            # player onto a team that holds that same
+                            # number on another row. Always check the
+                            # value the row will actually end up
+                            # carrying, exactly like the unconditional
+                            # jersey check above; exclude_player_id keeps
+                            # a same-team re-import from colliding with
+                            # itself.
+                            effective_registration = (
+                                registration_cell if registration_cell is not None
+                                else player.registration_number)
+                            if effective_registration is not None:
+                                self._assert_registration_number_available(
+                                    team_id, effective_registration,
+                                    exclude_player_id=player.id)
                             if registration_cell is not None:
-                                if registration_cell != player.registration_number:
-                                    self._assert_registration_number_available(
-                                        team_id, registration_cell,
-                                        exclude_player_id=player.id)
                                 player.registration_number = registration_cell
                             if skill_cell is not None:
                                 player.skill_rating = skill_cell

@@ -100,6 +100,7 @@ from .db_errors import (
     translate_player_jersey_exception,
     translate_program_org_fk_exception,
     translate_reassignment_fk_exception,
+    translate_registration_number_exception,
     translate_venue_hierarchy_fk_exception,
 )
 from .integrity_checks import (
@@ -1549,6 +1550,14 @@ class SqlStore:
         except Exception as exc:
             translated = translate_player_jersey_exception(
                 exc, player.team_id, player.jersey_number)
+            # ux_players_team_registration_number (migration 051, #273 review
+            # round 2 finding 2): the database backstop for the same-team
+            # registration-number invariant, checked after the jersey
+            # violation (a different unique index on this same table) so a
+            # non-match falls through cleanly to it.
+            if translated is None:
+                translated = translate_registration_number_exception(
+                    exc, player.team_id, player.registration_number)
             # players.team_id → teams(id) (migration 040): a race-losing write
             # onto a concurrently-deleted team surfaces as the same stable
             # conflict the service raises when it validates the team (#201 Slice 2).
