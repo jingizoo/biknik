@@ -1121,7 +1121,7 @@ class WaiverFingerprintTests(unittest.TestCase):
             route_extract_module._AUDIT_WAIVERS.update(saved)))
 
     def test_every_real_waiver_is_hit_exactly_once(self):
-        """The real server.py, unmodified: each of the 51 declared waivers
+        """The real server.py, unmodified: each of the 71 declared waivers
         (18 from rounds 2-3 -- 2 pre-existing + 2 pre-existing ternaries + 6
         round-2 finding A additions + 8 round-3 finding E additions -- plus
         11 round-4 finding 1 additions, once a Call reached DIRECTLY as the
@@ -1136,17 +1136,30 @@ class WaiverFingerprintTests(unittest.TestCase):
         made one PRE-EXISTING waiver -- `_to_v1.get(kind, lambda r: r)` --
         redundant with finding 2b's own new `captured` exemption in
         `_propagates_taint` (see that function's own docstring) rather
-        than needing its own entry any more) is consulted for precisely
-        the one line it names -- proves the instrumentation is wired all
-        the way through _propagates_taint AND the ast.If/ast.IfExp/
-        ast.While/ast.match_case scan, not just one of them. Each key is
-        now a 4-tuple (#202 repair round 4, finding 3: function, text,
-        parent shape, enclosing if) rather than the original 2-tuple --
-        WaiverRelocationFingerprintTests below is the dedicated proof for
-        what the extra two parts catch that this exact-one-hit check alone
-        would not."""
+        than needing its own entry any more -- plus 23 round-6 finding 1
+        additions MINUS 3 finding-1 removals, once `self.path` was
+        recognised at any depth (not only as the bare operand) and the
+        bottom-of-function fallback in `_propagates_taint` stopped
+        reaching past the opaque-extraction boundary: the additions are
+        GET query-string filter/scope parameters `_dispatch_get`'s own
+        `parse_qs(urlparse(self.path).query)` idiom newly makes visible,
+        plus two `SCHEMA[combo]` keyword-unpack Subscripts now
+        independently audited the same way an unlisted Call already was;
+        the removals are three waivers -- `self._operator_only(guard)` and
+        two `_handle_setup_v2` `call(...)` entries -- that turned out to
+        have been needed only because the OLD blind-scan fallback wrongly
+        read straight through an opaque capture, not because the
+        expressions they covered were ever genuinely tracked) is consulted
+        for precisely the one line it names -- proves the instrumentation
+        is wired all the way through _propagates_taint AND the ast.If/
+        ast.IfExp/ast.While/ast.match_case scan, not just one of them.
+        Each key is now a 4-tuple (#202 repair round 4, finding 3:
+        function, text, parent shape, enclosing if) rather than the
+        original 2-tuple -- WaiverRelocationFingerprintTests below is the
+        dedicated proof for what the extra two parts catch that this
+        exact-one-hit check alone would not."""
         walker = extract_walker()
-        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 51)
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 71)
         for key in route_extract_module._AUDIT_WAIVERS:
             with self.subTest(waiver=key):
                 self.assertEqual(len(walker.waiver_hits.get(key, ())), 1)
@@ -2634,7 +2647,7 @@ class WaiverTaintPropagationTests(unittest.TestCase):
         walker = extract_walker()
         self.assertEqual(len(walker.routes), 239)
         self.assertEqual(walker.unreachable, [])
-        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 51)
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 71)
 
 
 # --------------------------------------------------------------------------- #
@@ -2845,13 +2858,14 @@ class SubscriptCalleeAndReturnDispatchTests(unittest.TestCase):
         finding's fix newly reaches, and the removal of one PRE-EXISTING
         waiver the new `captured` exemption made redundant -- must still
         extract cleanly: each newly-reached call site is a reviewed,
-        declared ``_AUDIT_WAIVERS`` entry (51 total -- see
+        declared ``_AUDIT_WAIVERS`` entry (51 total as of THIS finding --
+        later rounds' own waivers grow the count further; see
         WaiverFingerprintTests' own pinned count and docstring for the
-        exact accounting), not a scoping hole."""
+        CURRENT exact accounting), not a scoping hole."""
         walker = extract_walker()
         self.assertEqual(len(walker.routes), 239)
         self.assertEqual(walker.unreachable, [])
-        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 51)
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 71)
 
 
 # --------------------------------------------------------------------------- #
@@ -3007,7 +3021,7 @@ class DefaultDenyExpressionOperandTests(unittest.TestCase):
         walker = extract_walker()
         self.assertEqual(len(walker.routes), 239)
         self.assertEqual(walker.unreachable, [])
-        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 51)
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 71)
 
 
 # --------------------------------------------------------------------------- #
@@ -3242,13 +3256,320 @@ class ExceptionDrivenRoutingTests(unittest.TestCase):
         """The real server.py has no assert on a tracked subject, no raise
         whose argument mentions one, and so no named except handler this
         finding's coarse, function-wide over-approximation needs to flag
-        -- must still extract cleanly: 239 routes, the SAME 51 waivers
-        (see WaiverFingerprintTests' own pinned count) -- no new waiver
-        needed for this finding."""
+        -- must still extract cleanly: 239 routes, the SAME 51 waivers as
+        of THIS finding's own landing (see WaiverFingerprintTests' own
+        pinned count for the CURRENT total -- later rounds grow it
+        further) -- no new waiver needed for finding 6 itself."""
         walker = extract_walker()
         self.assertEqual(len(walker.routes), 239)
         self.assertEqual(walker.unreachable, [])
-        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 51)
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 71)
+
+
+# --------------------------------------------------------------------------- #
+# #202 repair round 6, finding 1 (external review, 03:59:55): expression      #
+# taint is non-compositional. Four root causes behind five reviewer-supplied  #
+# same-source, live-HTTP-before/static-silent-after repros, each independently#
+# demonstrated below (transcript in each test's own docstring) before being   #
+# shown closed the same way:                                                  #
+#                                                                              #
+#   (A) ``root_name`` discarded a plain Subscript's own SLICE while           #
+#       unwrapping a receiver chain -- fine for ``SOME_DICT[key].attr``       #
+#       (the slice does not decide the CHAIN's root name), wrong for          #
+#       ``FLAGS[path]`` used directly as (or boolop/not-ed into) the whole    #
+#       test, where the slice IS what the test decides on. Round 5, finding   #
+#       2a already special-cased this for a Subscript reached as a Call's     #
+#       own CALLEE; this generalises that fix to every Subscript this loop    #
+#       ever unwraps through, and removes the now-redundant special case.    #
+#   (B) ``_propagates_taint`` audited only ``ast.Call`` nodes -- a bare       #
+#       ``ast.Subscript`` with no Call anywhere around it (``RESPONSES       #
+#       [path]``, ``ERRORS[path]``) was invisible to it, Return/Raise/       #
+#       bare-Expr scans included, no matter how directly it carried the      #
+#       path.                                                                 #
+#   (C) the SAME function's per-node walk ``return False``'d the INSTANT     #
+#       the FIRST Call it found turned out unrelated to any tracked name --   #
+#       a SHORT-CIRCUIT, not a missing-shape gap: ``candidate = path or       #
+#       fallback()`` has an entirely independent tracked SIBLING             #
+#       (``path``) right next to the unrelated call, discarded anyway.       #
+#   (D) ``_mentions_tracked``/``_tracked_mentions`` only ever matched a bare  #
+#       ``ast.Name`` against ``tracked`` -- ``self.path``, an                #
+#       ``ast.Attribute``, was invisible to both NO MATTER HOW DEEP it sat    #
+#       (``str(self.path).split(...)``), even though ``root_name`` already   #
+#       recognised it when it was the bare operand directly.                 #
+#                                                                              #
+# All four are fixed via a SMALL number of targeted, reviewed changes rather  #
+# than a full rewrite of this module's taint model (see route_extract.py's    #
+# own docstring on the soundness trade-off this represents) -- a shared       #
+# ``_is_self_path`` helper closes (D) everywhere at once; (A) and (B) each    #
+# get one new, narrowly-scoped branch; (C) is the removal of one wrong line.  #
+# Fixing (D) and (C) together surfaced 23 real new call/subscript sites in    #
+# server.py needing their own reviewed waiver, and (independently) proved 3   #
+# PRE-EXISTING waivers dormant -- each was needed only because the OLD        #
+# bottom-of-function fallback did not honour the opaque-extraction boundary   #
+# and so wrongly read a captured group's OWN name as "tracked" (the exact     #
+# regression class round 5 finding 2b fought for two OTHER exemptions, not    #
+# yet closed at the fallback's own final line) -- see WaiverFingerprintTests' #
+# own pinned count and docstring for the full accounting of both.             #
+# --------------------------------------------------------------------------- #
+class CompositionalTaintTests(unittest.TestCase):
+    # -- pre-fix escapes, reproduced via git stash (not re-run here: git
+    # stash cannot be invoked from inside a test process) -- the transcript
+    # below is what running each of the five fixtures below produced against
+    # the code as it stood immediately before this finding's fix (head
+    # 15ff6b1618a47135fab5e867bab3e89eaaf25034, round 5's own final head),
+    # captured verbatim, real HTTP alongside the static verdict for every
+    # one exactly as the reviewer's own report did:
+    #
+    #   repro1-FLAGS-subscript-if:            NO RAISE. routes = [].  live: 200
+    #   repro2-return-send_json-subscript:    NO RAISE. routes = [].  live: 200
+    #   repro3-raise-subscript-caught:        NO RAISE. routes = [].  live: 200
+    #   repro4-boolop-or-fallback:            NO RAISE. routes = [].  live: 200
+    #   repro5-str-self-path-split:           NO RAISE. routes = [].  live: 200
+    #
+    # each now raises against the FIXED code, asserted below, which a test
+    # process can still verify for itself on every run; each live-HTTP probe
+    # (still 200 on the SAME unmodified source -- server.py is untouched by
+    # this finding) is reproduced directly in this class too, not merely
+    # asserted in this comment.
+
+    def _raises(self, body, *substrings):
+        with self.assertRaises(ExtractionError) as caught:
+            extract_routes(_module(body))
+        msg = str(caught.exception)
+        for s in substrings:
+            self.assertIn(s, msg)
+
+    # -- root cause A: a bare Subscript's slice, discarded while unwrapping ----
+
+    def test_subscript_used_directly_as_the_test_raises(self):
+        """Root cause A, the reviewer's own first repro: ``FLAGS[path]``
+        used directly as the whole if-test. ``root_name``'s receiver-chain
+        unwrap (``node = node.value``) used to discard ``.slice``
+        unconditionally -- correct for resolving ``SOME_DICT[key].attr``
+        toward its own root name, wrong here, where the slice IS what the
+        test decides on."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path
+                if FLAGS[path]:
+                    return self._send(1)
+                return self._send_json({"error": "not_found"}, 404)
+        ''', "unrecognised shape", "path")
+
+    def test_subscript_test_escape_answers_over_real_http(self):
+        status, text = _real_http_probe_with_globals('''
+            def do_GET(self):
+                path = self.path
+                if FLAGS[path]:
+                    return self._send(1)
+                return self._send_json({"error": "not_found"}, 404)
+        ''', {"FLAGS": {"/api/hidden": True}}, "GET", "/api/hidden")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"n": 1})
+
+    # -- root cause B: a bare Subscript, no Call anywhere around it ------------
+
+    def test_return_of_bare_subscript_raises(self):
+        """Root cause B, the reviewer's own second repro: ``return
+        self._send_json(RESPONSES[path], 200)``. ``_send_json`` is a
+        reviewed ``_TERMINAL_RESPONSE_SENDERS`` exemption -- correctly, on
+        its own terms -- but its own comment's claim ("whatever is nested
+        in its arguments is still reached... by this SAME walk") was only
+        ever true for a nested CALL; ``RESPONSES[path]`` is a bare
+        Subscript, which nothing in the per-node loop inspected at all
+        before this finding."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path
+                return self._send_json(RESPONSES[path], 200)
+        ''', "indexes a container", "RESPONSES[path]")
+
+    def test_return_of_bare_subscript_escape_answers_over_real_http(self):
+        status, text = _real_http_probe_with_globals('''
+            def do_GET(self):
+                path = self.path
+                return self._send_json(RESPONSES[path], 200)
+        ''', {"RESPONSES": {"/api/hidden": {"n": 1}}}, "GET", "/api/hidden")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"n": 1})
+
+    def test_raise_of_bare_subscript_raises(self):
+        """Root cause B, the reviewer's own third repro: ``raise
+        ERRORS[path]``, caught by an enclosing handler -- the SAME bare-
+        Subscript gap as the Return case immediately above, reached via
+        the Raise scan instead. No name binding on the ``except`` clause
+        (unlike round 5 finding 6c's own repro), so finding 6c's
+        function-wide except-as-name mechanism is not what would catch
+        this -- isolates root cause B specifically."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path
+                try:
+                    raise ERRORS[path]
+                except LookupError:
+                    return self._send(1)
+                except Exception:
+                    return self._send_json({"error": "not_found"}, 404)
+        ''', "indexes a container", "ERRORS[path]")
+
+    def test_raise_of_bare_subscript_escape_answers_over_real_http(self):
+        status, text = _real_http_probe_with_globals('''
+            def do_GET(self):
+                path = self.path
+                try:
+                    raise ERRORS[path]
+                except LookupError:
+                    return self._send(1)
+                except Exception:
+                    return self._send_json({"error": "not_found"}, 404)
+        ''', {"ERRORS": {"/api/hidden": LookupError("boom")}},
+                                                     "GET", "/api/hidden")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"n": 1})
+
+    # -- root cause C: an unrelated Call short-circuiting the WHOLE walk -------
+
+    def test_tracked_sibling_of_an_unrelated_call_still_raises(self):
+        """Root cause C, the reviewer's own fourth repro: ``candidate =
+        path or fallback()``. ``fallback()`` mentions nothing tracked, so
+        the OLD code's ``return False`` fired the instant it was examined
+        -- discarding the WHOLE expression's verdict, including the
+        entirely independent, plainly tracked ``path`` sitting right next
+        to it in the SAME ``BoolOp``. Not a missing-shape gap: a
+        SHORT-CIRCUIT, in the reviewer's own words ("lets any unrelated
+        nested Call clear taint for the whole expression")."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path
+                candidate = path or fallback()
+                if candidate == "/api/hidden":
+                    return self._send(1)
+                return self._send_json({"error": "not_found"}, 404)
+        ''', "unrecognised shape", "candidate")
+
+    def test_boolop_short_circuit_escape_answers_over_real_http(self):
+        status, text = _real_http_probe_with_globals('''
+            def do_GET(self):
+                path = self.path
+                candidate = path or fallback()
+                if candidate == "/api/hidden":
+                    return self._send(1)
+                return self._send_json({"error": "not_found"}, 404)
+        ''', {"fallback": lambda: "/never"}, "GET", "/api/hidden")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"n": 1})
+
+    # -- root cause D: self.path unrecognised below the top level --------------
+
+    def test_nested_self_path_inside_an_unlisted_call_raises(self):
+        """Root cause D, the reviewer's own fifth repro: ``candidate =
+        str(self.path).split("?", 1)[0]``. ``str(...)`` is not a
+        recognised ``_PATH_OPS``/``_PATH_METHODS`` manipulation, so its
+        one argument -- ``self.path`` -- needed to be SEEN as tracked for
+        this to raise as an unlisted call; before this finding, neither
+        ``_mentions_tracked`` nor ``_tracked_mentions`` ever matched
+        anything but a bare ``ast.Name``, so ``self.path`` (an
+        ``ast.Attribute``) was invisible to both, no matter how deep it
+        sat."""
+        self._raises('''
+            def do_GET(self):
+                candidate = str(self.path).split("?", 1)[0]
+                if candidate == "/api/hidden":
+                    return self._send(1)
+                return self._send_json({"error": "not_found"}, 404)
+        ''', "unlisted call", "str(self.path)")
+
+    def test_nested_self_path_escape_answers_over_real_http(self):
+        status, text = _real_http_probe('''
+            def do_GET(self):
+                candidate = str(self.path).split("?", 1)[0]
+                if candidate == "/api/hidden":
+                    return self._send(1)
+                return self._send_json({"error": "not_found"}, 404)
+        ''', "GET", "/api/hidden")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"n": 1})
+
+    # -- negative controls: ordinary code stays accepted ------------------------
+
+    def test_an_unrelated_call_sibling_of_nothing_tracked_is_unaffected(self):
+        """A control for root cause C: when NEITHER side of the BoolOp
+        mentions a tracked name, the fixed compositional walk must still
+        say so -- the fix is not "assume tracked the moment any Call
+        looks unrelated", it is "keep checking every child independently"."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                candidate = unrelated_one() or unrelated_two()
+                if candidate == "/whatever":
+                    return self._send(1)
+                if path == "/api/real":
+                    return self._send(2)
+        '''))}
+        self.assertEqual(found, {("GET", "/api/real")})
+
+    def test_an_unrelated_subscript_is_unaffected(self):
+        """A control for root cause B: a Subscript keyed on something NOT
+        tracked must not raise -- the new check fires on the SLICE
+        mentioning a tracked name, not on every Subscript."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                x = CONSTANTS["some_fixed_key"]
+                if path == "/api/real":
+                    return self._send_json({"x": x}, 200)
+        '''))}
+        self.assertEqual(found, {("GET", "/api/real")})
+
+    def test_a_subscript_keyed_on_an_already_captured_id_does_not_raise(self):
+        """A control for root cause B's own ``captured``-only exemption:
+        a dict/sequence lookup keyed on an already-CAPTURED id
+        (``CACHE[gid]``) is the Subscript form of the identical "produces
+        a RESULT, not a routing decision" shape ``api.get_x(gid)``
+        already is (round 5, finding 2b) -- must stay clean, the same way
+        that call-argument shape does."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                m = re.match(r"^/api/items/([^/]+)$", path)
+                if m:
+                    gid = m.group(1)
+                    return self._send_json(CACHE[gid], 200)
+        '''))}
+        self.assertEqual(found, {("GET", "/api/items/{}")})
+
+    def test_an_opaque_capture_still_does_not_leak_through_the_fallback(self):
+        """A control for the bottom-of-function fallback's own fix (now
+        ``_mentions_tracked``, not a blind ``ast.walk`` Name-scan): the
+        module's own canonical "does NOT carry taint" example --
+        ``api.calendar_feed_ics(cal.group(1))`` -- must stay clean even
+        though it CONTAINS a tracked match-object name (``cal``) two
+        levels down, behind the opaque-extraction boundary. A blind scan
+        would wrongly find `cal` here; this is the regression the
+        `_mentions_tracked`-based fallback exists to prevent."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                cal = re.match(r"^/officials/([^/]+)/calendar$", path)
+                if cal:
+                    ics = api.calendar_feed_ics(cal.group(1))
+                    return self._send_ics(ics)
+        '''))}
+        self.assertEqual(found, {("GET", "/officials/{}/calendar")})
+
+    def test_the_real_server_extracts_with_no_new_raises(self):
+        """The real server.py -- including the GET query-string filter/
+        scope idiom (`parse_qs(urlparse(self.path).query)`) this finding's
+        self.path fix newly reaches throughout `_dispatch_get`, and the
+        two `SCHEMA[combo]` keyword-unpack Subscripts this finding's own
+        new Subscript audit newly reaches -- must still extract cleanly:
+        239 routes, 71 waivers (23 new minus 3 proven dormant -- see
+        WaiverFingerprintTests' own pinned count and docstring for the
+        exact accounting)."""
+        walker = extract_walker()
+        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(walker.unreachable, [])
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 71)
 
 
 if __name__ == "__main__":  # pragma: no cover

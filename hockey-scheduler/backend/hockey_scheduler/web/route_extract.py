@@ -2770,15 +2770,27 @@ _AUDIT_WAIVERS = {
     # harmless. Each is fingerprinted the SAME way as every entry above
     # (parent shape + enclosing if-text), verified exact-one-hit by
     # WaiverFingerprintTests' own real-server test.
-    ("_dispatch_get", "self._operator_only(guard)", "if_test", "mvc"):
-        "get_v2_setup_seasons_id_venue_candidates: `guard` is an f-string "
-        "built from the ALREADY-DECIDED `mvc` regex match "
-        "(f'/api/v2/setup/seasons/{mvc.group(1)}/venue-candidates'), fed "
-        "into the SAME blanket `_operator_only` operator-permission gate "
-        "used ~24 times elsewhere in server.py (see the do_POST "
-        "`required_permission(path)`/`scope_violation(...)` waivers above "
-        "for the same shape) -- not a routing decision, the route was "
-        "already selected by `mvc`",
+    # REMOVED (#202 repair round 6, finding 1): this dict used to carry its
+    # own waiver here for ("_dispatch_get", "self._operator_only(guard)",
+    # "if_test", "mvc") -- `guard` is an f-string built from the ALREADY-
+    # DECIDED `mvc` regex match (f'/api/v2/setup/seasons/{mvc.group(1)}/
+    # venue-candidates'). It was ONLY ever a "hit" needing this waiver
+    # because of the exact bug this round's finding 1 fixes: the OLD
+    # bottom-of-function fallback in `_propagates_taint` was a blind
+    # `ast.walk` Name-scan that did not honour the opaque-extraction
+    # boundary, so it wrongly found `mvc` "tracked" reaching straight
+    # THROUGH `mvc.group(1)` (a captured group, provably opaque) merely
+    # because the f-string CONTAINED that call somewhere in its subtree --
+    # the SAME class of bug round 5 finding 2b fought for `_TERMINAL_
+    # RESPONSE_SENDERS`/`captured`, just not yet closed at the fallback's
+    # own final line. `guard` is genuinely NOT tracked once that boundary
+    # is respected (see `_mentions_tracked`, now this fallback's own
+    # replacement) -- DEMONSTRATED dormant (0 hits, WaiverFingerprintTests'
+    # own real-server exact-one-hit check) once this round's fix landed --
+    # removed per this module's own discipline ("a dormant waiver matches
+    # nothing and must be removed: proof nothing depends on it") rather
+    # than left as a stale entry a future reader would have no way to tell
+    # apart from a live one.
     ("_dispatch_get", "self._operator_only(path)", "if_test", "ms"):
         "get_accounts_id_sessions: the SAME blanket `_operator_only` gate, "
         "this call site passes the raw `path` directly rather than a "
@@ -2930,21 +2942,24 @@ _AUDIT_WAIVERS = {
     # the route is fully decided upstream by the SAME alternation that
     # picks the callable; invoking it merely runs the already-selected
     # implementation.
-    ("_handle_setup_v2",
-     "self._guarded_mutation([('season', mar.group(1))], lambda: "
-     "call(mar.group(1), reason=b.get('reason'), actor_id=actor_id), "
-     "actor_id, role, scope)", "return_value", "mar"):
-        "#202 repair round 5, finding 2b -- the #369 write gate for the "
-        "season archive/reopen route; `call` is `api.archive_season` or "
-        "`api.reopen_season`, selected by the ternary this dict already "
-        "waives (`mar.group(2) == 'archive'`, several entries above) -- "
-        "see this section's own comment block for the general shape",
-    ("_handle_setup_v2",
-     "call(mar.group(1), reason=b.get('reason'), actor_id=actor_id)",
-     "lambda", "mar"):
-        "the mutation callable itself, reached as the lambda's own body "
-        "instead of as `_guarded_mutation`'s bare argument (this dict's "
-        "immediately preceding entry) -- same call, same reasoning",
+    # REMOVED (#202 repair round 6, finding 1): this dict used to carry two
+    # waivers here, for ("_handle_setup_v2", "self._guarded_mutation([
+    # ('season', mar.group(1))], lambda: call(mar.group(1), reason=b.get(
+    # 'reason'), actor_id=actor_id), actor_id, role, scope)", "return_value",
+    # "mar") and its "lambda"-shaped sibling immediately below it. `call` is
+    # bound by `call = (api.archive_season if mar.group(2) == "archive" else
+    # api.reopen_season)` (server.py) -- BOTH ternary branches are bare
+    # module-attribute references with NO tracked name in them at all; only
+    # the ternary's own TEST touches a tracked name, through the provably
+    # opaque `mar.group(2)` capture. `call` was ONLY ever a "hit" needing
+    # these two waivers because of the exact bug this round's finding 1
+    # fixes -- see the REMOVED `self._operator_only(guard)` waiver's own
+    # comment, several entries above, for the identical root cause (the
+    # OLD bottom-of-function fallback in `_propagates_taint` did not
+    # honour the opaque-extraction boundary, so it wrongly walked straight
+    # THROUGH `mar.group(2)` and found `mar` "tracked"). DEMONSTRATED
+    # dormant (0 hits each) once this round's fix landed -- removed per
+    # this module's own discipline, the same as that entry.
     ("_handle_setup_v2",
      "self._guarded_mutation([(kind, md.group(2))], lambda: "
      "mapper(deleter(md.group(2), actor_id)), actor_id, role, scope)",
@@ -3009,6 +3024,172 @@ _AUDIT_WAIVERS = {
         "a routing decision, the route was decided upstream by the "
         "literal `action` alternation this dict-`.get()` merely narrows "
         "an implementation for",
+    # -- #202 repair round 6, finding 1 -- newly reached now that
+    # `_mentions_tracked`/`_tracked_mentions` recognise `self.path` at any
+    # depth (not only when it is the bare operand) and the bottom-of-
+    # function fallback in `_propagates_taint` no longer blindly walks
+    # PAST the opaque-extraction boundary. `self.path` appears throughout
+    # `_dispatch_get`'s own GET query-string idiom -- `from urllib.parse
+    # import parse_qs, urlparse; qs = parse_qs(urlparse(self.path).query)`
+    # -- which this module had NEVER been able to see through before this
+    # round (`self.path` nested two calls deep was invisible to every
+    # existing check). Every entry in this block shares ONE shape: a GET
+    # query-string FILTER/IDENTITY parameter for a route the enclosing
+    # literal `path`/`sub` test has ALREADY fully decided -- the query
+    # string is never compared against by any dispatch test anywhere in
+    # this file (every test strips it first: `path = self.path.split("?",
+    # 1)[0]`), so a value read FROM it can change the response body or
+    # refuse the request (a resource-scoping/ownership check, same
+    # category as `scope_violation(...)`'s own waiver above) but never
+    # which route this is.
+    ("_dispatch_get", "parse_qs(urlparse(self.path).query)", "assign_rhs",
+     "path == '/api/setup/scheduling-policy'"):
+        "get_setup_scheduling_policy: the query-string parse itself. "
+        "`self.path` is examined here ONLY for its query component "
+        "(everything after '?', which dispatch never compares against); "
+        "the route was already selected by the literal `path` test",
+    ("_dispatch_get", "urlparse(self.path)", "attribute",
+     "path == '/api/setup/scheduling-policy'"):
+        "the same query-string parse, reached a second time as `urlparse`'s "
+        "own call node (its result's `.query` attribute is what the "
+        "immediately-preceding waiver's `parse_qs(...)` consumes) -- "
+        "identical reasoning",
+    ("_dispatch_get", "qs.get('scope_type')", "boolop",
+     "path == '/api/setup/scheduling-policy'"):
+        "one of three optional filter/scope query parameters "
+        "(scope_type/scope_id/season_id) for the already-decided "
+        "scheduling-policy read; see this block's own comment above",
+    ("_dispatch_get", "qs.get('scope_id')", "boolop",
+     "path == '/api/setup/scheduling-policy'"):
+        "same three-parameter group as `qs.get('scope_type')` immediately "
+        "above -- see that entry",
+    ("_dispatch_get", "qs.get('season_id')", "boolop",
+     "path == '/api/setup/scheduling-policy'"):
+        "same three-parameter group as `qs.get('scope_type')`, two entries "
+        "above -- see that entry",
+    ("_dispatch_get",
+     "api.get_scheduling_policy(scope_type=(qs.get('scope_type') or "
+     "[None])[0], scope_id=(qs.get('scope_id') or [None])[0], "
+     "season_id=(qs.get('season_id') or [None])[0])", "call_argument",
+     "path == '/api/setup/scheduling-policy'"):
+        "the service call itself, consuming all three already-waived "
+        "query parameters above -- not a routing decision, `path` alone "
+        "already selected this route",
+    ("_dispatch_get", "qs.get('team_id')", "boolop", "path == '/api/players'"):
+        "get_players: an optional team-scope filter for the already-"
+        "decided player-list read (#369) -- see this block's own comment "
+        "above",
+    ("_dispatch_get",
+     "api.list_players(team_id, include_email=True, user_id=user_id, "
+     "role=role, scope=scope)", "call_argument", "path == '/api/players'"):
+        "the service call consuming the already-waived `team_id` filter "
+        "immediately above -- not a routing decision",
+    ("_dispatch_get", "qs.get('recipient_ref')", "boolop",
+     "path == '/api/notifications/preferences'"):
+        "get_notifications_preferences: the recipient identity for a "
+        "channel-preferences read (#81) -- see this block's own comment "
+        "above",
+    ("_dispatch_get", "self._prefs_guard(recipient_ref)", "if_test",
+     "path == '/api/notifications/preferences'"):
+        "a per-request authorisation gate (operator -> any recipient; a "
+        "signed-in user -> only their own), the SAME 'blanket guard, not a "
+        "route selector' shape as `authorize(role, path)`/`_operator_only` "
+        "above -- refuses (403/401) or falls through to the SAME "
+        "already-decided read",
+    ("_dispatch_get", "api.get_notification_preferences(recipient_ref)",
+     "call_argument", "path == '/api/notifications/preferences'"):
+        "the service call consuming the already-waived `recipient_ref` -- "
+        "not a routing decision",
+    ("_dispatch_get", "qs.get('actor_type')", "boolop",
+     "path == '/api/calendar-feeds'"):
+        "get_calendar_feeds: one of two actor-identity query parameters "
+        "for a feed-token list read (#82) -- see this block's own comment "
+        "above",
+    ("_dispatch_get", "qs.get('actor_ref')", "boolop",
+     "path == '/api/calendar-feeds'"):
+        "the second of the two actor-identity parameters, alongside "
+        "`qs.get('actor_type')` immediately above -- same reasoning",
+    ("_dispatch_get", "self._feed_guard(actor_type, actor_ref)", "if_test",
+     "path == '/api/calendar-feeds'"):
+        "a per-request authorisation gate (operator -> any actor; a "
+        "signed-in user -> only their own), the SAME 'blanket guard, not a "
+        "route selector' shape as `self._prefs_guard(recipient_ref)` "
+        "above",
+    ("_dispatch_get", "api.list_calendar_feed_tokens(actor_type, actor_ref)",
+     "call_argument", "path == '/api/calendar-feeds'"):
+        "the service call consuming the two already-waived actor-identity "
+        "parameters above -- not a routing decision",
+    # This sub-group is reached inside `if m:` (a regex match on
+    # `/api/games/{id}(/{sub})?`), so its own enclosing if-text is the
+    # narrower `sub == '...'` literal test that already selected the leaf
+    # -- an own-team RESOURCE-SCOPING check (a coach/player may read only
+    # their own team's data; operators any team), the SAME category as
+    # `scope_violation(...)`'s own do_POST waiver above, not a route
+    # selector. `team_id` defaults to the caller's own team when the query
+    # string omits it, and is read from `self.path`'s query component the
+    # SAME way as every other entry in this block.
+    ("_dispatch_get",
+     "role in (Role.COACH, Role.PLAYER) and own_team and (team_id != "
+     "own_team)", "if_test", "sub == 'availability-summary'"):
+        "get_games_id_availability_summary (#89): own-team scoping for a "
+        "coach/player, operators exempt -- see this sub-group's own "
+        "comment above",
+    ("_dispatch_get", "api.get_availability_summary(gid, team_id)",
+     "call_argument", "sub == 'availability-summary'"):
+        "the service call consuming the already-waived `team_id` scope "
+        "check immediately above -- not a routing decision",
+    ("_dispatch_get",
+     "role == Role.COACH and own_team and (team_id != own_team)", "if_test",
+     "sub == 'substitute-candidates'"):
+        "get_games_id_substitute_candidates (#112): own-team scoping for a "
+        "coach, operators exempt -- see this sub-group's own comment "
+        "above (a `MANAGE_ROSTER` permission gate runs first, independent "
+        "of this scoping check)",
+    ("_dispatch_get", "api.get_substitute_candidates(gid, team_id)",
+     "call_argument", "sub == 'substitute-candidates'"):
+        "the service call consuming the already-waived `team_id` scope "
+        "check immediately above -- not a routing decision",
+    ("_dispatch_get",
+     "role == Role.COACH and own_team and (team_id != own_team)", "if_test",
+     "sub == 'substitute-addable'"):
+        "get_games_id_substitute_addable (#114): the same own-team scoping "
+        "as substitute-candidates immediately above, textually identical "
+        "but reached from a DIFFERENT `sub` branch -- the enclosing-if-"
+        "text fingerprint (`substitute-candidates` vs `substitute-"
+        "addable`) is what keeps the two from masquerading as one",
+    ("_dispatch_get", "api.get_addable_substitutes(gid, team_id)",
+     "call_argument", "sub == 'substitute-addable'"):
+        "the service call consuming the already-waived `team_id` scope "
+        "check immediately above -- not a routing decision",
+    # -- #202 repair round 6, finding 1's OTHER new shape: a bare Subscript
+    # (no Call anywhere around it) keyed on a tracked name, independently
+    # audited the same way an unlisted Call already is (see
+    # `_propagates_taint`'s own new `ast.Subscript` branch). Both entries
+    # below are the SAME already-reviewed `check_body(b, **_SCHEMA[combo])`
+    # bare statement (round 3, finding E's own waiver, above) -- that
+    # waiver covers the CALL as a whole; the Subscript nested inside its
+    # `**kwargs` unpack is now ALSO independently visited and needs its
+    # own entry, the same "each real one still needs its own reviewed
+    # waiver" discipline this dict uses throughout. NOT a routing
+    # decision: `combo` is already PROVEN a valid key of this exact
+    # SCHEMA dict by the enclosing `combo in _V{1,2}_REASSIGN_SCHEMA`
+    # test, which is what selected this route in the first place (#202
+    # repair root cause 1) -- re-indexing the SAME dict by the SAME combo
+    # to unpack its value as `check_body` validation kwargs does not pick
+    # a different one.
+    ("_handle_reassign", "_V1_REASSIGN_SCHEMA[combo]", "keyword",
+     "combo in _V1_REASSIGN_SCHEMA"):
+        "the `**_V1_REASSIGN_SCHEMA[combo]` unpack inside `check_body(b, "
+        "**_V1_REASSIGN_SCHEMA[combo])` (round 3, finding E's own waiver "
+        "above covers that call as a whole) -- see this sub-group's own "
+        "comment for why the nested Subscript is not a second routing "
+        "decision",
+    ("_handle_reassign_v2", "_V2_REASSIGN_SCHEMA[combo]", "keyword",
+     "combo in _V2_REASSIGN_SCHEMA"):
+        "the v2 sibling of `_handle_reassign`'s own identical-shape waiver "
+        "immediately above -- same reasoning, `check_body(b, "
+        "**_V2_REASSIGN_SCHEMA[combo])` is round 3, finding E's own "
+        "pre-existing waiver for the call as a whole",
 }
 
 
@@ -3146,6 +3327,30 @@ def _is_opaque_extraction(node) -> bool:
     return isinstance(node, ast.Attribute) and node.attr in _PATH_PROPERTIES
 
 
+def _is_self_path(node) -> bool:
+    """Is ``node`` exactly the ``self.path`` attribute access?
+
+    #202 repair round 6, finding 1: the ONE place this three-part shape
+    (``ast.Attribute`` named ``path``, off an ``ast.Name`` literally
+    ``self``) is matched -- :func:`_direct_operand_names`'s ``root_name``,
+    :func:`_mentions_tracked` and :func:`_tracked_mentions` all call this
+    rather than re-testing the same shape independently, which is exactly
+    what let it drift out of sync before this finding: ``root_name``
+    already recognised ``self.path`` when it is the WHOLE operand directly
+    (``if self.path == "/x":``), but neither mention helper recognised it
+    NESTED inside some other expression (``str(self.path)``,
+    ``f(self.path, other)``) -- both of them only ever matched a bare
+    ``ast.Name``, which ``self.path`` (an ``ast.Attribute``) never is,
+    however deep it sits. DEMONSTRATED: ``candidate =
+    str(self.path).split("?", 1)[0]`` then ``if candidate ==
+    "/api/hidden":`` answered live HTTP 200 while extraction stayed
+    silent -- ``str(...)`` is an unlisted call whose only tracked mention
+    was ``self.path``, invisible to ``_mentions_tracked`` before this fix.
+    """
+    return (isinstance(node, ast.Attribute) and node.attr == "path"
+            and isinstance(node.value, ast.Name) and node.value.id == "self")
+
+
 def _mentions_tracked(node, tracked: set) -> bool:
     """Does ``node`` reference a tracked name anywhere in its subtree,
     treating a nested :func:`_is_opaque_extraction` node as opaque?
@@ -3162,7 +3367,16 @@ def _mentions_tracked(node, tracked: set) -> bool:
     already covered by this module's dedicated machinery elsewhere (the
     walker's group-tracking for a capture, the completeness audit's own
     waivers for a Path property compared directly), not this coarse check.
+
+    #202 repair round 6, finding 1: checks :func:`_is_self_path` FIRST, so
+    ``self.path`` reads as tracked (whenever "path" itself is -- always
+    true for the completeness audit's own ``tracked``, which unconditionally
+    seeds "path" in) no matter how deeply it is nested, not only when it
+    happens to be the bare operand :func:`_direct_operand_names` already
+    special-cased.
     """
+    if _is_self_path(node):
+        return "path" in tracked
     if isinstance(node, ast.Name):
         return node.id in tracked
     if _is_opaque_extraction(node):
@@ -3186,7 +3400,14 @@ def _tracked_mentions(node, tracked: set) -> set:
     that) but WHICH name, so the caller's ``found`` set stays a set of
     real dispatch-subject names -- reuses :func:`_is_opaque_extraction`,
     the SAME boundary, rather than a second, independently-drifting rule.
+
+    #202 repair round 6, finding 1: also checks :func:`_is_self_path`
+    first, the SAME nested-``self.path`` recognition
+    :func:`_mentions_tracked` gained this round, for the SAME reason --
+    see that function's own docstring.
     """
+    if _is_self_path(node):
+        return {"path"} if "path" in tracked else set()
     if isinstance(node, ast.Name):
         return {node.id} if node.id in tracked else set()
     if _is_opaque_extraction(node):
@@ -3487,7 +3708,78 @@ def _propagates_taint(value, tracked: set, fn_name: str = "",
                     "it here (extend the whitelist, or model the shape "
                     "explicitly) -- do not let it be silently treated as "
                     "detached from the path.")
-            return False              # provably unrelated to any tracked name
+            # #202 repair round 6, finding 1: NOT ``return False`` any more.
+            # A Call found here that does not itself mention a tracked name
+            # is provably unrelated ON ITS OWN -- but ``value`` may be a
+            # LARGER expression with an entirely independent SIBLING that
+            # DOES (``candidate = path or fallback()``: ``fallback()``
+            # mentions nothing tracked, ``path`` sits right next to it).
+            # The bug this fixes was a SHORT-CIRCUIT, not a missing-shape
+            # gap: this loop walks EVERY node in ``value``'s subtree
+            # looking for a Call to classify, but the old ``return False``
+            # fired the INSTANT the FIRST such Call turned out unrelated,
+            # discarding whatever the REST of the walk might still find --
+            # "lets any unrelated nested Call clear taint for the whole
+            # expression", in the reviewer's own words. DEMONSTRATED:
+            # exactly the ``path or fallback()`` shape above answered live
+            # HTTP 200 while extraction stayed silent. Simply falling
+            # through here (nothing left to do for THIS node) lets the walk
+            # keep auditing every other node, and the bottom-of-function
+            # fallback below -- itself now compositional, see its own
+            # comment -- is what actually decides the boolean once the
+            # whole subtree has been audited, exactly the same way the
+            # Subscript case immediately below already has to (a bare
+            # Subscript never reaches this ``ast.Call`` branch at all).
+        if isinstance(node, ast.Subscript):
+            # #202 repair round 6, finding 1: a Subscript is audited the
+            # SAME way a Call is -- ``RESPONSES[path]``/``ERRORS[path]``
+            # are dict lookups KEYED on a tracked name, exactly as
+            # dispatch-relevant as ``TABLE.get(path)`` or a Subscript-
+            # callee (``TABLE[path]()``, already caught -- as a CALL -- by
+            # the branch above, and independently by ``root_name``'s own
+            # matching fix for the if-test side of this finding) -- but
+            # nothing here inspected a BARE Subscript with no Call
+            # anywhere around it at all. DEMONSTRATED, both live HTTP 200
+            # and silent ``extract_routes() == []``: ``return
+            # self._send_json(RESPONSES[path], 200)`` and ``raise
+            # ERRORS[path]``. The ``_TERMINAL_RESPONSE_SENDERS`` exemption
+            # above is correct on its own terms (WRITING the response is
+            # never itself a routing decision) and its own comment already
+            # claims "whatever is nested in its arguments is still
+            # reached... by this SAME walk" -- true for a nested CALL
+            # (independently visited and audited), never true for a bare
+            # Subscript before this branch existed. Only the SLICE (the
+            # KEY) is examined: a receiver being tracked (``combo[0]``) is
+            # a DIFFERENT, already-handled question -- see the bottom-of-
+            # function fallback, which still sees the whole Subscript.
+            mentioned = _tracked_mentions(node.slice, tracked)
+            if mentioned:
+                if captured and mentioned <= captured:
+                    # The SAME captured-only exemption a Call's arguments
+                    # get, several lines above (see this function's own
+                    # docstring on ``captured``): a lookup keyed on an
+                    # already-CAPTURED id (``CACHE[gid]``) is the subscript
+                    # form of the identical "produces a RESULT, not a
+                    # routing decision" shape ``api.get_x(gid)`` already
+                    # is -- never the primary ``path`` itself, and never a
+                    # ``combo``/``dest``/``parent``-style tuple, both
+                    # unconditionally excluded from ``captured`` upstream
+                    # (see ``_Ctx.captured``'s own docstring), so this
+                    # cannot be used to smuggle a real dispatch table past
+                    # review.
+                    continue
+                waiver_key = _waiver_key(fn_name, node, parents)
+                if waiver_key in _AUDIT_WAIVERS:
+                    if waiver_hits is not None:
+                        waiver_hits.setdefault(waiver_key, set()).add(id(node))
+                    continue
+                raise ExtractionError(
+                    f"line {node.lineno}: `{ast.unparse(node)}` indexes a "
+                    "container by a tracked dispatch name; route_extract "
+                    "cannot tell whether the looked-up value still decides "
+                    "the route. Classify it here (the same way an unlisted "
+                    "call is classified) -- do not let it be silently "
+                    "treated as detached from the path.")
     if isinstance(value, ast.Call) and _is_opaque_extraction(value):
         return False                  # an extraction/consumption, alone, is not the path
     if _is_path_derived(value):
@@ -3503,8 +3795,23 @@ def _propagates_taint(value, tracked: set, fn_name: str = "",
     if isinstance(value, ast.Attribute) and value.attr in _PATH_PROPERTIES:
         return _propagates_taint(value.value, tracked, fn_name, waiver_hits,
                                  parents, followed, captured)
-    return any(isinstance(x, ast.Name) and x.id in tracked
-               for x in ast.walk(value))
+    # #202 repair round 6, finding 1: ``_mentions_tracked`` -- which
+    # recognises ``self.path`` at any depth (see its own docstring) and
+    # stops at an opaque-extraction boundary -- not a blind ``ast.walk``
+    # Name-scan. The blind scan (`any(isinstance(x, ast.Name) and x.id in
+    # tracked for x in ast.walk(value))`) does not honour that boundary at
+    # all, so the MOMENT this fallback was reached for an expression
+    # merely CONTAINING an opaque extraction -- not equal to one, see the
+    # check immediately above -- it wrongly found the extraction's own
+    # RECEIVER "tracked" underneath it (round 5 finding 2b's own
+    # regression, documented at the ``_TERMINAL_RESPONSE_SENDERS``/
+    # ``captured`` exemptions above, was exactly this bug reached a
+    # different way: gate those exemptions too early and THIS SAME crude
+    # fallback is what they fall through to). ``_mentions_tracked`` is the
+    # SAME, already-correct boundary this function's own opaque/manipulates
+    # checks above rely on, reused here rather than a second, cruder rule
+    # for the cases that fall all the way through to it.
+    return _mentions_tracked(value, tracked)
 
 
 def _is_path_derived(node) -> bool:
@@ -3514,12 +3821,13 @@ def _is_path_derived(node) -> bool:
     all of it. Renaming the local was a DEMONSTRATED evasion: `p2 = self.path...`
     then `if p2 == "/api/evade-rename"` produced a live 200 while the gate
     stayed green, because the audit only ever tracked the literal name "path".
+
+    #202 repair round 6, finding 1: reuses :func:`_is_self_path`, the SAME
+    ``self.path`` shape-test :func:`_mentions_tracked`/:func:`_tracked_mentions`
+    and ``root_name`` (:func:`_direct_operand_names`) now also call, instead
+    of independently re-testing the same three-part shape a fourth time.
     """
-    for sub in ast.walk(node):
-        if isinstance(sub, ast.Attribute) and sub.attr == "path" \
-                and isinstance(sub.value, ast.Name) and sub.value.id == "self":
-            return True
-    return False
+    return any(_is_self_path(sub) for sub in ast.walk(node))
 
 
 def _direct_operand_names(test, tracked: frozenset = frozenset({"path"})) -> set:
@@ -3584,9 +3892,11 @@ def _direct_operand_names(test, tracked: frozenset = frozenset({"path"})) -> set
             # (which seeds "path" into ``tracked`` unconditionally, but never
             # "self"). DEMONSTRATED: this exact form produced a live route
             # neither classified nor raised before this check existed.
-            if isinstance(node, ast.Attribute) and node.attr == "path" \
-                    and isinstance(node.value, ast.Name) \
-                    and node.value.id == "self":
+            # #202 repair round 6, finding 1: reuses :func:`_is_self_path`,
+            # the SAME shape-test :func:`_mentions_tracked`/
+            # :func:`_tracked_mentions` now also call, rather than
+            # independently re-testing it a third time.
+            if _is_self_path(node):
                 return "path"
             # A WALRUS operand (#202 repair round 3, finding F):
             # ``(n := EXPR) == "foo"`` decides on ``n``'s newly bound value.
@@ -3607,7 +3917,30 @@ def _direct_operand_names(test, tracked: frozenset = frozenset({"path"})) -> set
                 return node.target.id
             if isinstance(node, ast.Name):
                 return node.id
-            if isinstance(node, (ast.Attribute, ast.Subscript)):
+            if isinstance(node, ast.Subscript):
+                # #202 repair round 6, finding 1: the SLICE (the KEY) is a
+                # routing-relevant operand in its own right whenever it
+                # mentions a tracked name -- ``FLAGS[path]`` used directly
+                # as (or boolop/not-ed into) the whole test decides on
+                # ``path`` exactly as plainly as ``FLAGS.get(path)`` would
+                # -- but the unwrap below (``node = node.value``, needed to
+                # resolve a RECEIVER chain like ``SOME_DICT[key].attr``
+                # toward its own root name) used to discard ``.slice``
+                # UNCONDITIONALLY. Round 5, finding 2a already special-
+                # cased this for a Subscript reached as a CALL's OWN
+                # callee (``PREDICATES[path]()``) with a one-off scan
+                # inside the ``ast.Call`` branch below; this generalises
+                # that fix to EVERY Subscript this loop ever unwraps
+                # through (this branch runs again for that SAME
+                # ``PREDICATES[path]`` node once ``node = node.func`` below
+                # loops back to the top, so the one-off scan there is now
+                # redundant and has been removed rather than left to drift
+                # out of sync with this more general rule). DEMONSTRATED:
+                # ``if FLAGS[path]: ...`` answered live HTTP 200 while
+                # extraction recorded zero routes and raised nothing.
+                found.update(_tracked_mentions(node.slice, tracked))
+                node = node.value
+            elif isinstance(node, ast.Attribute):
                 node = node.value
             elif isinstance(node, ast.Call):
                 # A Call's ARGUMENTS -- UNCONDITIONALLY (#202 repair round 4,
@@ -3636,32 +3969,15 @@ def _direct_operand_names(test, tracked: frozenset = frozenset({"path"})) -> set
                 # resolves to "path" exactly as before either way.
                 for arg in list(node.args) + [kw.value for kw in node.keywords]:
                     found.update(_tracked_mentions(arg, tracked))
-                # #202 repair round 5, finding 2a: a Subscript used AS THE
-                # CALLEE (``PREDICATES[path]()``, ``ROUTES[path]()``) is a
-                # DIFFERENT case from the plain ``ast.Subscript`` unwrapping
-                # two branches above (``node = node.value``, walking a
-                # receiver CHAIN like ``SOME_DICT[key].attr`` up toward its
-                # root name) -- that branch DISCARDS ``.slice`` on purpose,
-                # correct for a chain where the slice is not what decides
-                # anything, but WRONG here: which callable a Subscript-
-                # callee invokes depends on the WHOLE subscript expression,
-                # slice included, and ``node = node.func`` below would
-                # otherwise walk straight past it the very same way (this
-                # loop reaches ``PREDICATES`` as its eventual root name,
-                # never ``path`` sitting inside the ``[...]``).
-                # DEMONSTRATED: ``if PREDICATES[path](): ...`` answered live
-                # HTTP 200 for a hidden route while ``extract_routes``
-                # recorded zero routes and raised nothing -- ``path`` is
-                # not one of the Call's own ``.args`` here (the call takes
-                # none), so even THIS round's own args-scan just above
-                # never saw it. Scanned the SAME way call arguments are:
-                # this call is only ever reached from ``visit_operand`` as
-                # (or boolop/not-ed into) the whole tested condition or a
-                # comparison operand of it, so the callee's own subscript
-                # is still an operand position, never a case where scanning
-                # it would reach past what the test actually decides on.
-                if isinstance(node.func, ast.Subscript):
-                    found.update(_tracked_mentions(node.func, tracked))
+                # A Subscript used AS THE CALLEE (``PREDICATES[path]()``,
+                # ``ROUTES[path]()``, round 5 finding 2a's own repro) needs
+                # no special case here any more (#202 repair round 6,
+                # finding 1): ``node = node.func`` below sends this SAME
+                # Subscript node back through the TOP of this loop on the
+                # next iteration, where the general ``ast.Subscript``
+                # branch above now scans its ``.slice`` unconditionally --
+                # a one-off scan here would just re-derive the identical
+                # answer a second time.
                 node = node.func
             else:
                 # #202 repair round 5, finding 5: DEFAULT-DENY for every
