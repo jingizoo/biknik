@@ -1778,7 +1778,24 @@ class ContextReadCancelHandoffCases(ContextReadEpochBase):
         (the ``ConcurrencyConflictError`` handling ``ContextService.
         _snapshot`` already relies on for every other read-then-write) is
         what is actually being exercised here, on every backend, not merely
-        assumed to cover this one too."""
+        assumed to cover this one too.
+
+        The SIX SESSIONS are logged in SEQUENTIALLY, before any thread
+        starts, and only the SWITCH itself runs concurrently. Logging in
+        FROM WITHIN each thread (an earlier revision of this case did that)
+        makes what this case races an accidental second thing: six
+        simultaneous ``POST /api/auth/login`` calls for one username each
+        reserve an in-flight slot against ``LOGIN_THROTTLE``'s per-username
+        ceiling (``rate_limit.py``'s ``begin()`` — #267) before any of them
+        is known to succeed, and on a loaded runner (a real Postgres
+        round-trip per login, not the in-process Memory/SQLite path) that
+        window can widen enough for the reservations to overlap and trip a
+        429 that has nothing to do with this test's actual subject. Measured
+        directly: CI run 31810566262's PostgreSQL shard failed here on
+        exactly that 429, with the six switches never having raced at all.
+        Pre-authenticating removes the accidental race while keeping the
+        deliberate one — six DISTINCT sessions for the SAME account, exactly
+        as the docstring above states, still switching at once."""
         fx = self._program_with_two_seasons("ConcGen")
         username, user_id = self._operator("concgen")
         setup_client = self._login(username)
@@ -1788,10 +1805,13 @@ class ContextReadCancelHandoffCases(ContextReadEpochBase):
 
         rounds = 6
         errors = []
+        # Sequential on purpose (see docstring): each login's LOGIN_THROTTLE
+        # reservation is released before the next one begins, so this loop
+        # cannot itself race the throttle no matter how slow any one login is.
+        clients = [self._login(username) for _ in range(rounds)]
 
-        def switch_round(target):
+        def switch_round(client, target):
             try:
-                client = self._login(username)
                 status, raw, _ = self._req(
                     client, "POST", "/api/context",
                     {"program_id": fx["program_id"], "season_id": target})
@@ -1801,8 +1821,9 @@ class ContextReadCancelHandoffCases(ContextReadEpochBase):
                 errors.append((target, "exception", repr(exc)))
 
         threads = [
-            threading.Thread(target=switch_round,
-                             args=(fx["s2"] if i % 2 == 0 else fx["s1"],))
+            threading.Thread(
+                target=switch_round,
+                args=(clients[i], fx["s2"] if i % 2 == 0 else fx["s1"]))
             for i in range(rounds)]
         for t in threads:
             t.start()
