@@ -7,6 +7,7 @@ web framework) never see Python tracebacks across the boundary.
 """
 
 import copy
+import uuid
 from contextlib import contextmanager
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timedelta, timezone
@@ -14,9 +15,12 @@ from enum import Enum
 from typing import Callable, List, Optional
 
 from ..domain import (
+    ACCESS_ALLOWED,
+    ACCESS_DENIED,
     AvailabilityStatus,
     CalendarFeedToken,
     ContactDestination,
+    DataAccessLog,
     DeliveryStatus,
     Game,
     GameType,
@@ -35,6 +39,7 @@ from ..domain import (
     ResultStatus,
     RosterEntryStatus,
     SeasonStatus,
+    SensitiveFieldCategory,
     SlotType,
     SubstituteStatus,
     can,
@@ -50,6 +55,7 @@ from ..domain.errors import (
     ScheduleConflictError,
     ValidationError,
 )
+from ..services import visibility_policy
 from ..services import (
     ACTOR_TYPES,
     AccountService,
@@ -5047,6 +5053,110 @@ class ApiService:
                     "This official no longer exists.",
                     {"reason": "scope_subject_missing", "official_id": official_id})
 
+    # -- sensitive-read policy + audit (#124) -------------------------------
+    #
+    # The facade is where every read of a protected field category passes
+    # through the visibility policy (services/visibility_policy.py) and emits
+    # a durable DataAccessLog row — synchronously, inside the same store
+    # transaction as the read it records, matching the repo's "everything is
+    # auditable" and snapshot-consistency invariants. The one category with
+    # stored data behind it today is CONTACT_DESTINATION (#60's registry);
+    # birthdate/registration land with #273 and route through the same gate.
+    #
+    # Recorded as its own log — NEVER AuditLog/SetupAuditLog — and the row
+    # never carries the protected value (domain/privacy.py).
+
+    #: actor_role label recorded when a caller passed a role claim that parses
+    #: to no known Role: the policy fails closed on it, and the durable row
+    #: records the fact without copying arbitrary caller input into the log.
+    _PRIVACY_UNKNOWN_ROLE = "unknown"
+
+    @staticmethod
+    def _mint_request_id() -> str:
+        """Correlation id for one sensitive-read call, minted AT THE FACADE
+        BOUNDARY (#124): no request id exists anywhere in the web layer today,
+        so until the post-#159 server wiring passes one per HTTP request, each
+        facade read mints its own — every DataAccessLog row this call writes
+        shares it, and a caller-supplied id is honoured verbatim."""
+        return f"req_{uuid.uuid4().hex}"
+
+    @classmethod
+    def _privacy_principal(cls, actor_role):
+        """Resolve a facade ``actor_role`` argument to ``(role, label)``.
+
+        ``None`` is the TRANSITIONAL operator-boundary call shape: the live
+        ``/api/notifications/contacts`` routes enforce ``_operator_only``/
+        ``authorize()`` in ``web/server.py`` before calling the facade, but do
+        not yet propagate the acting account (that wiring lands after #159).
+        Until then the read is attributed to ``operator_boundary`` and allowed
+        only for :func:`visibility_policy.boundary_attested_categories`.
+
+        Anything else resolves to a real :class:`Role` (enum or its string
+        value) or — fail-closed — to ``(None, "unknown")``, which the policy
+        grants nothing.
+        """
+        if actor_role is None:
+            return None, visibility_policy.OPERATOR_BOUNDARY
+        if isinstance(actor_role, Role):
+            return actor_role, actor_role.value
+        try:
+            role = Role(actor_role)
+        except ValueError:
+            return None, cls._PRIVACY_UNKNOWN_ROLE
+        return role, role.value
+
+    @staticmethod
+    def _sensitive_read_allowed(actor_role, role, category) -> bool:
+        """One predicate for every sensitive-read gate in this facade, so the
+        transitional boundary rule cannot drift between surfaces: the legacy
+        no-actor shape (``actor_role is None``) is confined to the boundary-
+        attested categories; every explicit principal goes through the
+        policy's RAW check and fails closed."""
+        if actor_role is None:
+            return category in visibility_policy.boundary_attested_categories()
+        return visibility_policy.may_read_raw(role, category)
+
+    def _record_sensitive_read(self, category, subjects, purpose,
+                               actor_user_id, actor_role_label, outcome,
+                               request_id) -> None:
+        """Append one DataAccessLog row per subject. Callers hold the store
+        transaction that makes the rows atomic with the read/refusal they
+        record; this helper never opens its own."""
+        at = self.roster.clock()
+        for subject_type, subject_id in subjects:
+            self.store.add_data_access(DataAccessLog(
+                id=self.store.next_id("daccess"),
+                category=category,
+                subject_type=subject_type,
+                subject_id=subject_id,
+                purpose=purpose,
+                at=at,
+                actor_user_id=actor_user_id,
+                actor_role=actor_role_label,
+                outcome=outcome,
+                request_id=request_id))
+
+    def _refuse_sensitive_read(self, category, purpose, actor_user_id,
+                               actor_role_label, request_id):
+        """Record the refused attempt, then raise the refusal (#124: an
+        unauthorized read attempt produces an audit row AND a denial).
+
+        The denial row is committed in its OWN transaction BEFORE the raise:
+        raising inside that transaction would roll the row back, and a
+        refusal that leaves no trace is exactly what #124 forbids. One
+        collection-level ``("recipient", "*")`` subject — a refused caller
+        learned nothing, so no per-subject rows are enumerated (the
+        enumeration itself would be a disclosure vector).
+        """
+        with self.store.transaction():
+            self._record_sensitive_read(
+                category, [("recipient", "*")], purpose,
+                actor_user_id, actor_role_label, ACCESS_DENIED, request_id)
+        raise NotAuthorizedError(
+            "Your role can't read stored contact destinations.",
+            {"reason": "sensitive_read_denied", "category": category.value,
+             "request_id": request_id})
+
     # -- contact registry (#60) --------------------------------------------
     @staticmethod
     def _contact_row(c) -> dict:
@@ -5055,9 +5165,36 @@ class ApiService:
                 "label": c.label, "active": c.active}
 
     @catch
-    def list_contact_destinations(self) -> dict:
-        rows = [self._contact_row(c)
-                for c in self.store.all_contact_destinations()]
+    def list_contact_destinations(self, actor_role=None, actor_user_id=None,
+                                  request_id=None) -> dict:
+        """Every stored contact destination — a bulk read of protected values
+        (#124: CONTACT_DESTINATION), policy-gated and audited.
+
+        The parameters are appended, optional, and default to the transitional
+        operator-boundary shape (see ``_privacy_principal``), so the existing
+        ``server.py`` call site keeps its exact behavior while every read now
+        leaves durable DataAccessLog rows: one per disclosed recipient, or a
+        single ``("recipient", "*")`` row when the registry is empty — every
+        access attempt leaves a trace. Audit emission happens INSIDE the same
+        store transaction as the read, so the subjects recorded and the rows
+        returned come from one consistent snapshot.
+        """
+        request_id = request_id or self._mint_request_id()
+        role, label = self._privacy_principal(actor_role)
+        category = SensitiveFieldCategory.CONTACT_DESTINATION
+        if not self._sensitive_read_allowed(actor_role, role, category):
+            self._refuse_sensitive_read(
+                category, "list_contact_destinations",
+                actor_user_id, label, request_id)
+        with self.store.transaction():
+            rows = [self._contact_row(c)
+                    for c in self.store.all_contact_destinations()]
+            subjects = (sorted({("recipient", r["recipient_ref"])
+                                for r in rows})
+                        or [("recipient", "*")])
+            self._record_sensitive_read(
+                category, subjects, "list_contact_destinations",
+                actor_user_id, label, ACCESS_ALLOWED, request_id)
         rows.sort(key=lambda r: (r["recipient_ref"], r["channel"]))
         return {"contacts": rows}
 
@@ -5097,7 +5234,9 @@ class ApiService:
 
     @catch
     def set_contact_destination_active(self, contact_id: str, active: bool,
-                                       actor_id: Optional[str] = None) -> dict:
+                                       actor_id: Optional[str] = None,
+                                       actor_role=None,
+                                       request_id=None) -> dict:
         """Retire (or reactivate) a contact destination (#232 review 4).
 
         A durable, audited lifecycle toggle — never a delete. Retiring a row
@@ -5109,7 +5248,26 @@ class ApiService:
         is. Restricted to Player/Official-scoped rows, same as the delete
         lifecycle it serves — not a general contact-management surface for
         other recipient kinds (team, guardian, …).
+
+        The RESPONSE echoes the row including its STORED destination — a
+        value the caller did not submit — so this is also a sensitive read
+        (#124): gated by the same policy as ``list_contact_destinations``
+        (checked FIRST, before the row lookup, so an unauthorized caller
+        can't distinguish existing from missing ids) and recorded as a
+        DataAccessLog row inside the mutation's own transaction — a rolled
+        back toggle whose response never reached the caller leaves no
+        phantom read row. Its sibling ``set_contact_destination`` is
+        deliberately NOT gated here: its response contains only the
+        caller's own submitted values (the upsert overwrites before it
+        echoes), so no stored protected value is disclosed.
         """
+        request_id = request_id or self._mint_request_id()
+        role, label = self._privacy_principal(actor_role)
+        category = SensitiveFieldCategory.CONTACT_DESTINATION
+        if not self._sensitive_read_allowed(actor_role, role, category):
+            self._refuse_sensitive_read(
+                category, "set_contact_destination_active",
+                actor_id, label, request_id)
         c = next((row for row in self.store.all_contact_destinations()
                   if row.id == contact_id), None)
         if c is None:
@@ -5136,6 +5294,13 @@ class ApiService:
                 else "contact_destination_retired",
                 "contact_destination", contact_id, actor_id,
                 {"recipient_ref": c.recipient_ref, "channel": c.channel.value})
+            # Read-back disclosure of the stored destination (#124) — same
+            # transaction as the mutation, see the docstring.
+            self._record_sensitive_read(
+                SensitiveFieldCategory.CONTACT_DESTINATION,
+                [("recipient", c.recipient_ref)],
+                "set_contact_destination_active", actor_id, label,
+                ACCESS_ALLOWED, request_id)
         return self._contact_row(c)
 
     # -- notification preferences (#81) ------------------------------------
