@@ -11675,7 +11675,11 @@ class ApiService:
     @catch
     def delete_player(self, player_id: str,
                       actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.setup.delete_player(player_id, actor_id))
+        # #273 review round 2 finding 1: every Player-carrying payload routes
+        # through _player_dto, including a delete's echoed row — a bare
+        # _serialize here quietly carried the private birthdate/registration
+        # number back to whatever caller issued the delete.
+        return _player_dto(self.setup.delete_player(player_id, actor_id))
 
     # -- reassignment: move a record under a new parent (#166 PR D) --------
     @catch
@@ -11735,7 +11739,11 @@ class ApiService:
     @catch
     def assign_player_team(self, player_id: str, team_id: str,
                            actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.setup.assign_player_team(player_id, team_id, actor_id))
+        # #273 review round 2 finding 1: same _player_dto routing as every
+        # other Player-carrying payload — a move's echoed row must never
+        # carry the private birthdate/registration number either.
+        return _player_dto(self.setup.assign_player_team(
+            player_id, team_id, actor_id))
 
     @catch
     def assign_program_organization(self, program_id: str,
@@ -11924,9 +11932,9 @@ class ApiService:
     @catch
     def list_players(self, team_id: Optional[str] = None,
                      include_email: bool = False,
-                     include_identity: bool = False,
                      user_id=None, role=None,
-                     scope=None) -> List[dict]:
+                     scope=None, *,
+                     include_identity: bool = False) -> List[dict]:
         """#369 self-audit: when a real user context is supplied, the
         unfiltered list narrows to Teams in the caller's ACTIVE Program.
 
@@ -11939,6 +11947,17 @@ class ApiService:
         the same reasoning makes a cross-Program answer wrong. Called with no
         user context (the default), behavior is unchanged for existing
         internal callers.
+
+        ``include_identity`` (#273) is KEYWORD-ONLY, appended after every
+        pre-existing positional parameter (#273 review round 2 finding 1): an
+        earlier revision inserted it before ``user_id``, so an unchanged
+        legacy positional call like ``list_players("t1", False,
+        "legacy-user")`` silently reinterpreted its own third argument as
+        ``include_identity="legacy-user"`` — a truthy string that opted the
+        call into both private fields AND dropped ``user_id`` (defeating the
+        #369 Program-scoping gate below, since ``role`` then never arrives
+        either). Keyword-only closes both holes at once: no positional slot
+        can ever reach this parameter again.
         """
         players = (self.store.players_for_team(team_id) if team_id
                   else self.store.all_players())
