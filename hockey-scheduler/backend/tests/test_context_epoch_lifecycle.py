@@ -71,35 +71,10 @@ from hockey_scheduler.domain.enums import SeasonStatus
 from hockey_scheduler.services.context_epoch import context_epoch
 
 from test_context_read_cancel_handoff import (
-    _HEX32, _FakeRow, ContextReadEpochBase)
+    _HEX32, _FakeAxis, _FakeSeason, ContextReadEpochBase)
 from test_context_switch_server_exit import PATIENCE
 
 REOPEN_REASON = "Late roster corrections approved by the League."
-
-
-class _FakeSeason:
-    """A stand-in for one persisted Season, for the derivation cases: exactly
-    the fields ``_selected_season_lifecycle`` consults, nothing else."""
-
-    def __init__(self, status, archived_at=None):
-        self.status = status
-        self.archived_at = archived_at
-
-
-class _LifecycleFakeStore:
-    """The derivation cases' store: ``ActiveContext`` rows plus the Seasons
-    they select. ``get_season`` is the method the lifecycle material reads —
-    a store without it must fail loudly, which is its own case below."""
-
-    def __init__(self, rows=None, seasons=None):
-        self.rows = dict(rows or {})
-        self.seasons = dict(seasons or {})
-
-    def get_active_context(self, user_id):
-        return self.rows.get(user_id)
-
-    def get_season(self, season_id):
-        return self.seasons.get(season_id)
 
 
 # ==========================================================================
@@ -107,27 +82,33 @@ class _LifecycleFakeStore:
 # ==========================================================================
 class ContextEpochLifecycleDerivationTest(unittest.TestCase):
     """The properties the lifecycle material adds to the token. Store-free for
-    the same reason as the switch-dimension derivation class: these are claims
-    about a pure function, and all three backends must agree on it."""
+    the same reason as the switch-dimension derivation class
+    (``ContextEpochDerivationTest``): these are claims about a pure function
+    of ``(user_id, generation, program, season, league)``, and all three
+    backends must agree on it. ``season`` here is always the EFFECTIVE
+    resolved object (or ``None``) a caller already resolved — see that
+    class's docstring and ``services/context_epoch.py``'s module docstring
+    for why (#159 review finding 2)."""
 
-    ROW = _FakeRow("user_a", "program_1", "season_1", "league_1",
-                   datetime(2026, 8, 12, 9, 30, 15, 123456,
-                            tzinfo=timezone.utc))
+    USER_ID = "user_a"
+    GENERATION = 1
+    PROGRAM = _FakeAxis("program_1")
+    LEAGUE = _FakeAxis("league_1")
     ARCHIVED_AT = datetime(2026, 8, 13, 7, 0, 0, 1, tzinfo=timezone.utc)
 
     def _token(self, season):
-        seasons = {} if season is None else {"season_1": season}
-        return context_epoch(
-            _LifecycleFakeStore({"user_a": self.ROW}, seasons), "user_a")
+        return context_epoch(self.USER_ID, self.GENERATION, self.PROGRAM,
+                             season, self.LEAGUE)
 
     def test_archiving_the_selected_season_moves_the_token(self):
-        """THE HEADLINE. The ``ActiveContext`` row is identical on both sides
-        — only the Season's lifecycle moved. A row-only token is byte-identical
-        here, which is precisely the measured blindness this slice closes: the
-        archive was invisible, so the stale read was admitted."""
-        active = self._token(_FakeSeason(SeasonStatus.ACTIVE))
+        """THE HEADLINE. The user/generation/Program/League are identical on
+        both sides — only the Season's lifecycle moved. A token that ignored
+        the lifecycle would be byte-identical here, which is precisely the
+        measured blindness this slice closes: the archive was invisible, so
+        the stale read was admitted."""
+        active = self._token(_FakeSeason("season_1", SeasonStatus.ACTIVE))
         archived = self._token(
-            _FakeSeason(SeasonStatus.ARCHIVED, self.ARCHIVED_AT))
+            _FakeSeason("season_1", SeasonStatus.ARCHIVED, self.ARCHIVED_AT))
         self.assertRegex(active, _HEX32)
         self.assertNotEqual(
             active, archived,
@@ -140,12 +121,13 @@ class ContextEpochLifecycleDerivationTest(unittest.TestCase):
         a DELIBERATE restore: ``reopen_season`` clears ``archived_at``, so the
         two active states are byte-identical and a read rendered before the
         archive is readmitted — to the exact ceiling it was rendered under.
-        The tuple axis differs (``updated_at`` moves on every commit); the
-        lifecycle axis rounds a trip on purpose."""
-        active = self._token(_FakeSeason(SeasonStatus.ACTIVE))
+        The GENERATION axis differs (it moves on every context WRITE, and
+        archiving/reopening a Season is not one); the lifecycle axis rounds a
+        trip on purpose."""
+        active = self._token(_FakeSeason("season_1", SeasonStatus.ACTIVE))
         archived = self._token(
-            _FakeSeason(SeasonStatus.ARCHIVED, self.ARCHIVED_AT))
-        reopened = self._token(_FakeSeason(SeasonStatus.ACTIVE))
+            _FakeSeason("season_1", SeasonStatus.ARCHIVED, self.ARCHIVED_AT))
+        reopened = self._token(_FakeSeason("season_1", SeasonStatus.ACTIVE))
         self.assertNotEqual(archived, reopened,
                             "the reopen did not move the token")
         self.assertEqual(active, reopened,
@@ -160,50 +142,50 @@ class ContextEpochLifecycleDerivationTest(unittest.TestCase):
         field that moves without the refusal moving can only cause a DISCARD,
         never a serve, so erring wide fails in the safe direction."""
         first = self._token(
-            _FakeSeason(SeasonStatus.ARCHIVED, self.ARCHIVED_AT))
+            _FakeSeason("season_1", SeasonStatus.ARCHIVED, self.ARCHIVED_AT))
         second = self._token(_FakeSeason(
-            SeasonStatus.ARCHIVED,
+            "season_1", SeasonStatus.ARCHIVED,
             self.ARCHIVED_AT.replace(microsecond=2)))
         self.assertNotEqual(
             first, second,
             "two distinct archives hash identically, so a read rendered "
             "under the first archived state would be admitted in the second")
 
-    def test_no_season_and_vanished_season_are_distinct_well_defined_states(self):
-        """Program-only selection is a legitimate state; a selected Season id
-        that no longer resolves is a DELETED Season. Both have well-defined
-        tokens, and neither equals the other or any real lifecycle — a read
-        rendered under a since-deleted Season must not be admitted just
-        because the lookup came back empty."""
-        no_season_row = _FakeRow(self.ROW.id, self.ROW.program_id, None,
-                                 self.ROW.league_id, self.ROW.updated_at)
-        program_only = context_epoch(
-            _LifecycleFakeStore({"user_a": no_season_row}), "user_a")
-        vanished = self._token(None)          # selected id, no Season behind it
-        live = self._token(_FakeSeason(SeasonStatus.ACTIVE))
-        self.assertRegex(program_only, _HEX32)
-        self.assertRegex(vanished, _HEX32)
-        self.assertNotEqual(program_only, vanished)
-        self.assertNotEqual(vanished, live,
-                            "a deleted selected Season hashes like a live "
-                            "one, so the deletion is invisible to the epoch")
-        # Deterministic, both of them — a discard-and-retry must converge.
-        self.assertEqual(program_only, context_epoch(
-            _LifecycleFakeStore({"user_a": no_season_row}), "user_a"))
-        self.assertEqual(vanished, self._token(None))
+    def test_no_season_is_a_well_defined_state_distinct_from_any_real_one(self):
+        """Program-only selection is a legitimate, first-class effective
+        resolution. Its token is well-defined and stable, and distinct from
+        every real Season's — including one sharing the same fixture's other
+        axes. (A raw saved id that fails to resolve is no longer a state THIS
+        function can even be asked about: the caller already collapsed it to
+        ``None`` before calling here — see ``ContextService._resolve_locked``
+        — which is the fix for #159 review finding 2's exact gap: the epoch
+        used to be blind to an EFFECTIVE resolution changing underneath an
+        unchanged raw row.)"""
+        no_season = self._token(None)
+        live = self._token(_FakeSeason("season_1", SeasonStatus.ACTIVE))
+        self.assertRegex(no_season, _HEX32)
+        self.assertNotEqual(no_season, live,
+                            "a Program-only resolution hashes like a live "
+                            "Season, so Program-only is invisible to the "
+                            "epoch")
+        # Deterministic — a discard-and-retry must converge.
+        self.assertEqual(no_season, self._token(None))
 
-    def test_a_store_that_cannot_answer_get_season_fails_loudly(self):
-        """``store.get_season`` is called UNGUARDED on purpose: a
-        ``getattr(store, "get_season", None)`` fallback would let a store that
-        cannot answer produce a confident-looking token that is blind to the
-        exact transition this material exists to see. Silent blindness is the
-        one failure mode this file is about; it must be loud."""
-        class _Blind:
-            def get_active_context(self, user_id):
-                return ContextEpochLifecycleDerivationTest.ROW
+    def test_a_malformed_season_object_fails_loudly(self):
+        """``_season_lifecycle_fields`` reads ``season.status`` through
+        ``season_guard.season_is_read_only`` UNGUARDED. This module no longer
+        touches a store at all (#159 review finding 2 moved resolution to
+        ``ContextService``), so the analogous silent-blindness risk moved
+        from 'a store without get_season' to 'a season object missing the
+        field the decision needs' — a confident-looking token computed from a
+        malformed season would be blind to whatever transition the caller
+        failed to resolve correctly, and that must be loud, not silent."""
+        class _Malformed:
+            pass  # no .status at all
 
         with self.assertRaises(AttributeError):
-            context_epoch(_Blind(), "user_a")
+            context_epoch(self.USER_ID, self.GENERATION, self.PROGRAM,
+                         _Malformed(), self.LEAGUE)
 
 
 # ==========================================================================

@@ -180,6 +180,12 @@ class MigrationApplyTest(unittest.TestCase):
             # column that already exists and fails with "duplicate column name".
             cur.execute(
                 "ALTER TABLE user_active_context DROP COLUMN league_id")
+            # #159 review findings 2+5, migration 051: the persisted switch
+            # generation on the same row. Same reasoning as league_id above —
+            # drop it so adoption's re-run of 051's ALTER lands on a column
+            # that genuinely does not exist yet.
+            cur.execute(
+                "ALTER TABLE user_active_context DROP COLUMN generation")
             cur.execute("DELETE FROM schema_migrations")
             cur.execute("INSERT INTO schema_migrations(version, applied_at) "
                         "VALUES ('0001_initial', '2026-01-01')")
@@ -209,6 +215,10 @@ class MigrationApplyTest(unittest.TestCase):
             self.assertIn("operator_organization_id",
                           _table_columns(adopted, "programs"))
             self.assertIn("league_id", _table_columns(adopted, "venues"))
+            # #159 review findings 2+5, migration 051: the persisted switch
+            # generation re-added on the per-user context row.
+            self.assertIn("generation",
+                          _table_columns(adopted, "user_active_context"))
             # #174 PR E hierarchy external_ref columns re-landed on every table
             # (post-028 names: `programs` umbrella, `leagues` grouping).
             for tbl in ("organizations", "programs", "venues", "seasons",

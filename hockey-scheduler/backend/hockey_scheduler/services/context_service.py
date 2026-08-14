@@ -51,6 +51,7 @@ from ..domain import ActiveContext, SeasonStatus
 from ..domain.errors import (
     ConcurrencyConflictError, NotFoundError, ValidationError)
 from . import context_scope
+from .context_epoch import context_epoch as _epoch_hash
 from .league_scope import exact_league_season_or_conflict
 
 # The context authorization + selection runs under one SERIALIZABLE snapshot so a
@@ -123,6 +124,24 @@ class ContextService:
                     raise
         # Unreachable: the loop either returns or re-raises on the last attempt.
         raise AssertionError("snapshot retry loop exited without a result")
+
+    def _next_generation_locked(self, user_id):
+        """The generation to write on THIS commit (#159 review findings 2+5):
+        the currently persisted row's generation (0 if none has ever been
+        written) plus one. MUST be called immediately before the write, and
+        both MUST run inside the SAME ``_snapshot`` — the read-then-write is
+        made atomic by that transaction's isolation (a bounded retry on
+        conflict), exactly the pattern every other read-then-write in this
+        service already relies on, not by any locking done here.
+
+        A MONOTONIC counter rather than a timestamp on purpose: two commits
+        landing inside the same wall-clock tick would write the same
+        ``updated_at``, so a token derived from the tuple + timestamp could
+        reuse itself across an A -> B -> A round trip. This can't, because it
+        is READ before each write and always written one higher than what was
+        just read — never derived from a clock at all."""
+        current = self.store.get_active_context(user_id) if user_id else None
+        return (getattr(current, "generation", 0) or 0) + 1
 
     # -- resolution --------------------------------------------------------
     def resolve(self, user_id: Optional[str], role, scope) -> _Resolved:
@@ -478,6 +497,70 @@ class ContextService:
                     _detached(saved_league))
         return self._snapshot(work)
 
+    # -- epoch (#159 review findings 2+5) -----------------------------------
+    # Everything the context epoch (services/context_epoch.py) needs to hash:
+    # the EFFECTIVE resolved (program, season, league) `resolve_with_league`
+    # would render -- not the raw saved row, which can differ from it whenever
+    # the saved Program/Season is deleted/unauthorized and `_fallback` stands
+    # in, or whenever the fallback's OWN candidate set changes (a fallback
+    # Season getting archived moves who `_fallback` would pick even though
+    # nothing about THIS user's saved row changed) -- plus the persisted
+    # switch generation, which needs no row-lifecycle argument at all: it is
+    # what makes the epoch move on every switch regardless of what the clock
+    # or the resolution do.
+
+    def _epoch_material_locked(self, user_id, role, scope):
+        """``(generation, program, season, league)`` — MUST run inside the
+        caller's transaction; a caller that returns these across the lock
+        boundary detaches them first (see :meth:`resolve_epoch_state`).
+
+        Deliberately NOT built on top of :meth:`resolve_with_league`: that
+        method opens its OWN ``_snapshot``, and a caller that needs this
+        material read inside a WIDER transaction it already holds open — the
+        epoch comparison in front of a dependent scoped read,
+        :meth:`run_scoped_read`, #159 review finding 3 — needs the
+        un-snapshotted form so the whole thing stays ONE transaction rather
+        than two independent ones a lifecycle mutation could land between.
+        """
+        row = self.store.get_active_context(user_id) if user_id else None
+        generation = (getattr(row, "generation", 0) or 0) if row else 0
+        program, season = self._resolve_locked(user_id, role, scope)
+        league = self._resolve_league_locked(
+            user_id, role, scope, program, season)
+        return generation, program, season, league
+
+    def resolve_epoch_state(self, user_id, role, scope):
+        """``(generation, program, season, league)`` read under ONE snapshot
+        and DETACHED — the public, self-contained form of
+        :meth:`_epoch_material_locked` for a caller (``current_epoch`` below)
+        that only needs the epoch's material and is not also running a
+        dependent read under the same lock."""
+        def work():
+            generation, program, season, league = self._epoch_material_locked(
+                user_id, role, scope)
+            return (generation, _detached(program), _detached(season),
+                    _detached(league))
+        return self._snapshot(work)
+
+    def current_epoch(self, user_id, role, scope) -> str:
+        """The CURRENT context-epoch token for ``user_id`` (#159 review
+        finding 2), derived from the EFFECTIVE resolution rather than the raw
+        saved row. Used by the three places the client learns its context
+        (``GET /api/context``, ``GET /api/context/options``, and the ``POST
+        /api/context`` response, all in ``web/server.py``).
+
+        A falsy ``user_id`` is hashed with NO resolution attempted — there is
+        no role/scope-driven material to resolve for a caller with no
+        identity, and :func:`context_epoch.context_epoch` already has a
+        well-defined, stable answer for that case that cannot collide with a
+        real (if empty) resolution, because the id itself is part of the
+        material."""
+        if not user_id:
+            return _epoch_hash(None, 0, None, None, None)
+        generation, program, season, league = self.resolve_epoch_state(
+            user_id, role, scope)
+        return _epoch_hash(user_id, generation, program, season, league)
+
     # Every League-selection refusal uses this ONE message/reason, whatever the
     # underlying cause (#364 owner ruling): nonexistent, cross-Program,
     # unauthorized, deleted, archived-only, unbound, revoked, or ambiguous. The
@@ -660,7 +743,8 @@ class ContextService:
             # or wholly after it — never a half-applied or stale tuple.
             self.store.set_active_context(ActiveContext(
                 id=user_id, program_id=program_id, season_id=sid,
-                updated_at=self.clock(), league_id=league_id))
+                updated_at=self.clock(), league_id=league_id,
+                generation=self._next_generation_locked(user_id)))
             return (_detached(program), _detached(season), _detached(league))
 
         return self._snapshot(work)
@@ -714,7 +798,8 @@ class ContextService:
                                         {"reason": "season_not_accessible"})
             self.store.set_active_context(ActiveContext(
                 id=user_id, program_id=program_id, season_id=season_id,
-                updated_at=self.clock()))
+                updated_at=self.clock(),
+                generation=self._next_generation_locked(user_id)))
             return _detached(program), _detached(season)
 
         # Validation + write share ONE serializable snapshot (with bounded retry),

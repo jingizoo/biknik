@@ -2128,7 +2128,17 @@ class SqlStore:
         same statement, so the three axes can never be persisted half-updated:
         a caller that selects Program+Season without a League overwrites any
         previously-saved League with NULL rather than leaving a stale one bound
-        to a context it may not belong to."""
+        to a context it may not belong to.
+
+        ``generation`` (#159 review findings 2+5, migration 051) is written
+        verbatim from ``ctx`` — the CALLER (``ContextService``) computes
+        current+1 by reading the row inside the same serializable transaction
+        that wraps this write, so two concurrent writers correctly serialize
+        into two distinct successive values via that transaction's isolation
+        (a retry on conflict, same as every other read-then-write this
+        service does) rather than this method re-deriving it from whatever it
+        can see here, which would be a second, potentially-stale read of the
+        same fact."""
         with self.transaction():
             # #386 — take the SAME per-user mutex the authorizing readers
             # take, so a context switch and a write authorized against the
@@ -2144,14 +2154,17 @@ class SqlStore:
             self._lock_active_context_mutex(ctx.id)
             self._exec(
                 "INSERT INTO user_active_context "
-                "(id, program_id, season_id, updated_at, league_id) "
-                "VALUES (?, ?, ?, ?, ?) "
+                "(id, program_id, season_id, updated_at, league_id, "
+                "generation) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT (id) DO UPDATE SET "
                 "program_id = excluded.program_id, "
                 "season_id = excluded.season_id, "
                 "updated_at = excluded.updated_at, "
-                "league_id = excluded.league_id",
+                "league_id = excluded.league_id, "
+                "generation = excluded.generation",
                 (ctx.id, ctx.program_id, ctx.season_id,
                  ctx.updated_at.isoformat() if ctx.updated_at else None,
-                 getattr(ctx, "league_id", None)))
+                 getattr(ctx, "league_id", None),
+                 getattr(ctx, "generation", 0) or 0))
         return ctx

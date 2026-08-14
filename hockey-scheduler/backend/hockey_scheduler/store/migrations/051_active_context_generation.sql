@@ -1,0 +1,34 @@
+-- Persisted switch generation on the per-user active context (#159 review
+-- findings 2 + 5).
+--
+-- `updated_at` is NOT a reliable "moves on every switch" signal: two commits
+-- landing inside the same wall-clock tick (a coarse system clock, or two
+-- sequential writes that happen to resolve to the same microsecond under
+-- load) write the same timestamp, so A -> B -> A could reuse an epoch even
+-- though the operator switched twice -- the non-evictable-cancellation
+-- guarantee this column exists to protect. This is a MONOTONIC counter
+-- instead: `ContextService.set`/`set_with_league` read the current row's
+-- generation and write current+1 on EVERY commit, inside the same
+-- serializable transaction the write already opens, so two concurrent
+-- writers correctly serialize into two distinct successive values (a
+-- read-then-write pattern made atomic by that transaction's isolation, the
+-- same pattern the rest of this service already relies on -- see
+-- services/context_service.py) rather than by trusting the clock.
+--
+-- It also feeds the OTHER half of the same review round (finding 2): the
+-- context epoch is bound to the EFFECTIVE resolved Program/Season/League
+-- tuple, not the raw saved row, and that resolution alone is not enough to
+-- distinguish A -> B -> A when the effective tuple returns to where it
+-- started. This generation is hashed BESIDE the effective tuple so the two
+-- together give the epoch both properties at once -- see
+-- services/context_epoch.py.
+--
+-- Additive and portable (an INTEGER column with a constant default, no
+-- rebuild, no index): every pre-existing row backfills to 0, which is
+-- exactly the generation a saved selection that predates this migration
+-- should read as -- indistinguishable from "never explicitly written" until
+-- the next switch moves it to 1.
+--
+-- Forward-only. Rollback reality: reverting application code does not drop
+-- this column; dropping it is a separate manual database operation.
+ALTER TABLE user_active_context ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;

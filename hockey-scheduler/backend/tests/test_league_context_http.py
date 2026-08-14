@@ -89,7 +89,7 @@ REFUSED = (404, "not_found", "league_not_accessible")
 # more than it checked); a new field on ``ActiveContext`` fails here loudly
 # instead of quietly dropping out of the "unchanged" proof.
 ACTIVE_CONTEXT_FIELDS = {"id", "program_id", "season_id", "league_id",
-                         "updated_at"}
+                         "updated_at", "generation"}
 
 
 class CanonicalLeagueContextHttpContract:

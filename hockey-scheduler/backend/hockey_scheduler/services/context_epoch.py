@@ -52,41 +52,90 @@ anything this process controls, so no retention window can be proven long
 enough. **The only sound fix is to retain nothing.**
 
     NOTHING IS RETAINED HERE. There is no registry, no TTL, no cache, no
-    eviction and no configuration. The epoch is DERIVED, on demand, from the
-    row that ``ActiveContext`` already persists. An arrival delayed by an hour
-    is compared exactly as correctly as one delayed by a millisecond, because
-    the comparison reads the same persisted row either way. The rejected
-    failure mode is UNCONSTRUCTIBLE, not merely unlikely.
+    eviction and no configuration. The epoch is DERIVED, on demand, from
+    persisted state (see WHAT THE MATERIAL IS below). An arrival delayed by an
+    hour is compared exactly as correctly as one delayed by a millisecond,
+    because the comparison reads the same persisted state either way. The
+    rejected failure mode is UNCONSTRUCTIBLE, not merely unlikely.
 
-THE MECHANISM, in three sentences. The server derives an opaque token from the
-persisted ``ActiveContext`` row and hands it out wherever the client already
-learns its context (``GET /api/context``, ``GET /api/context/options``, and the
-``POST /api/context`` response). Each context-scoped GET echoes, in
-``X-Context-Epoch``, the token it was RENDERED UNDER. On arrival the server
-compares that echo with the token derived from the row as it stands NOW: equal
-means the selection has not moved and the request proceeds exactly as it does
-today, ceiling included; unequal means the tuple moved while the request was in
-transport, and it is answered ``204 No Content`` before the ceiling is ever
-evaluated.
+THE MECHANISM, in three sentences. The server derives an opaque token and hands
+it out wherever the client already learns its context (``GET /api/context``,
+``GET /api/context/options``, and the ``POST /api/context`` response). Each
+context-scoped GET echoes, in ``X-Context-Epoch``, the token it was RENDERED
+UNDER. On arrival the server compares that echo with the token derived from
+persisted state as it stands NOW: equal means the selection has not moved and
+the request proceeds exactly as it does today, ceiling included; unequal means
+the tuple moved while the request was in transport, and it is answered ``204 No
+Content`` before the ceiling is ever evaluated.
+
+WHAT THE MATERIAL IS, and why it is not the raw ``ActiveContext`` row (#159
+review finding 2). An earlier revision hashed the PERSISTED ROW directly —
+``store.get_active_context(user_id)``'s own fields. That is a change detector
+for the operator's SAVED selection, and it is the wrong question: the payload
+the client actually renders is the EFFECTIVE resolution
+(``ContextService.resolve_with_league``), which can differ from the saved row
+whenever the saved Program/Season is deleted or no longer authorized (a
+deterministic fallback stands in, and the row is deliberately NOT rewritten —
+see ``ContextService``'s own docstring) — and the gap is not academic:
+
+    Season S1 is persisted as the saved selection. S1 is deleted (or its
+      authorization is withdrawn) -> resolve() now falls back to S3, which the
+      client renders and whose epoch is issued
+    S3 is ARCHIVED -> resolve()'s fallback now picks S2 instead. The RAW ROW
+      never changed (it still names S1, which still fails to resolve either
+      way), so a token derived from the row alone is BYTE-IDENTICAL before and
+      after S3's archive
+    a scoped read rendered under the S3 epoch arrives, echoing a token that
+      still "matches" — the row never moved — and is judged against S2's
+      ceiling: a 404 for a Season the caller was never shown, instead of the
+      204 discard the moved EFFECTIVE selection earned it
+
+So the material is the EFFECTIVE ``(program, season, league)`` tuple
+``resolve_with_league`` would render for this exact ``(user_id, role, scope)``
+— see ``ContextService.resolve_epoch_state`` / ``_epoch_material_locked``,
+which read it under the same snapshot machinery every other resolution in that
+service uses — plus the persisted switch GENERATION (next paragraph) and the
+effective Season's lifecycle (see WHY THE SEASON'S LIFECYCLE below). This
+module itself stays store-free: it hashes objects it is HANDED, and resolving
+them is ``ContextService``'s job, not this one's — see WHAT THIS MODULE DOES
+NOT DO.
 
 FOUR PROPERTIES, each of which this module has to earn:
 
-  1. STABLE FOR A GIVEN PERSISTED ROW. The same row hashes to the same token
-     every time, in every process, across restarts — the material is the row,
-     and nothing else. Deliberately NOT a per-process counter or a random
-     nonce: either would make every restart invalidate every outstanding read,
-     and would make the token mean "which process answered" rather than "which
+  1. STABLE FOR A GIVEN INPUT. The same ``(user_id, generation, program,
+     season, league)`` hashes to the same token every time, in every process,
+     across restarts — the material is exactly those objects' ids/fields, and
+     nothing else. Deliberately NOT a per-process counter or a random nonce:
+     either would make every restart invalidate every outstanding read, and
+     would make the token mean "which process answered" rather than "which
      selection".
-  2. DIFFERENT AFTER ANY SWITCH, INCLUDING A SWITCH BACK TO THE SAME TUPLE.
-     ``ContextService.set_with_league`` writes ``updated_at=self.clock()`` on
-     every commit, so A -> B -> A moves the timestamp twice and therefore moves
-     the token twice, even though the tuple ends where it began. A token
-     derived from the tuple ALONE would have silently readmitted a read from
-     before the round trip.
-  3. OPAQUE AND NON-IDENTIFYING. The material is HASHED, never concatenated or
-     encoded, so no user id, Program id, Season id, League id or timestamp can
-     be read out of a token. See NON-DISCLOSURE below for the honest limit of
-     that claim.
+  2. DIFFERENT AFTER ANY SWITCH, INCLUDING A SWITCH BACK TO THE SAME TUPLE
+     (#159 review finding 5). ``ContextService.set``/``set_with_league`` read
+     the CURRENT persisted generation and write current+1 on EVERY commit —
+     inside the same serializable transaction as the write, so two concurrent
+     writers correctly serialize into two distinct successive values rather
+     than racing a lost update. A -> B -> A therefore moves the generation
+     TWICE and the token twice, even though the EFFECTIVE tuple ends where it
+     began.
+
+       NOT WALL-CLOCK ``updated_at``, which an earlier revision used instead
+       and which the review correctly rejected: two commits landing inside the
+       same tick (a coarse system clock, load, a virtualized host) can share a
+       timestamp, and A -> B -> A could then reuse an epoch — silently
+       readmitting a read from before the round trip, which is precisely the
+       non-evictable-cancellation guarantee this module exists to uphold. A
+       counter that is READ then WRITTEN ONE HIGHER, inside one transaction,
+       has no such window: it does not matter whether two writes share a
+       microsecond, only that each one reads what the other already committed
+       or loses a serialization conflict and retries.
+  3. OPAQUE, NON-IDENTIFYING, AND — new in this revision — UNFORGEABLE WITHOUT
+     A DEPLOYMENT SECRET (#159 review finding 4). The material is HASHED, never
+     concatenated or encoded, so no user id, Program id, Season id, League id
+     or generation can be READ OUT of a token; the digest is additionally
+     KEYED (see :func:`epoch_secret`), so it also cannot be RECOMPUTED —
+     confirming a guess, or enumerating a whole low-entropy candidate space —
+     by a party who does not hold that secret. See NON-DISCLOSURE below for
+     both halves of that claim, precisely.
   4. FAILS CLOSED. A token that is absent behaves exactly as today (no
      behaviour change for any client that does not send one); a token that is
      present but malformed, or present and simply wrong, DISCARDS. There is no
@@ -131,38 +180,47 @@ generation, AND cannot be correlated back to the account that produced it
 without the secret.
 
 WHERE IT IS COMPARED, and why that placement is load-bearing in both
-directions. ``Handler._read_under_context_gate`` compares AFTER the gate's
-shared hold is taken and BEFORE the service call:
-  * AFTER the hold, so a read that arrives mid-quiesce has already waited out
-    the switch that registered before it, and therefore reads the row as it
-    stands after that switch committed — never a half-applied one. Arrival
-    ordering for reads ALREADY inside the server is untouched: those hold the
-    gate, the switch waits for them, and their echo still matches.
+directions. ``ContextService.run_scoped_read`` derives the CURRENT epoch and
+compares it to the echo, and then — if and only if it matches or nothing was
+echoed — calls the dependent read, ALL INSIDE ONE SNAPSHOT (#159 review
+finding 3):
+  * ONE SNAPSHOT, so a lifecycle mutation (an archive, a reopen) or a
+    competing context switch cannot land BETWEEN the comparison and the
+    dependent read: either the snapshot observes the mutation (and the
+    freshly-derived current epoch already reflects it, so a stale echo
+    correctly mismatches) or it does not (and the dependent read is judged
+    against the exact state the comparison just matched) — never a hybrid
+    where the check passed against one state and the read observed another.
+    A post-service comparison is NOT equivalent: by the time it could run, the
+    dependent read may already have made an authorization or privacy decision
+    on stale data.
   * BEFORE the service call, so a discarded read never reaches
     ``api/service.py`` and the exact-Season ceiling is never evaluated for it.
     That is what lets the answer disclose nothing in EITHER direction — a
     discard looks identical whether the named Season is a sibling of the
     selection, is archived, or never existed.
-
-THE ONE HONEST DEGRADATION. Two switches that land inside the same clock tick
-would write the same ``updated_at`` and therefore the same token, and a read
-rendered under the first would not be discarded. ``datetime.now()`` resolves to
-a microsecond and two sequential HTTP commits cannot share one, but the failure
-is worth naming because of what it costs: such a read is judged by the ceiling,
-which is precisely the pre-#159 behaviour — a missed improvement, never a wrong
-answer, and never a disclosure. There is no interleaving in which a coarse
-clock causes data to be SERVED that would otherwise be refused.
+  * The snapshot is taken AFTER ``Handler._context_read_hold``'s shared gate
+    hold, so a read that arrives mid-quiesce has already waited out the switch
+    that registered before it, and therefore reads state as of after that
+    switch committed — never a half-applied one. Arrival ordering for reads
+    ALREADY inside the server is untouched: those hold the gate, the switch
+    waits for them, and their echo still matches.
 
 PER PROCESS? NO — and that is the difference from ``context_gate.py``. The gate
 is honestly per-process because it holds locks. This holds nothing: the epoch is
-a pure function of a row in the shared database, so a token issued by replica A
-compares correctly on replica B, and a restart mid-flight changes nothing. If
-this application is ever run multi-replica, this half needs no re-expression.
+a pure function of shared, persisted state (a database row, the objects it
+resolves to, and a deployment-wide configured secret), so a token issued by
+replica A compares correctly on replica B, and a restart mid-flight changes
+nothing. If this application is ever run multi-replica, this half needs no
+re-expression — PROVIDED the deployment secret (:func:`epoch_secret`) is
+configured identically on every replica; see that function's docstring for the
+rotation story, which is the one way this property can be temporarily broken
+on purpose.
 
-WHY THE SELECTED SEASON'S LIFECYCLE IS PART OF THE MATERIAL, and not only the
-``ActiveContext`` row. The token above answers "has the operator's SELECTION
-moved". That is not the whole question the scoped reads are judged by, and the
-gap was measured rather than reasoned about:
+WHY THE EFFECTIVE SEASON'S LIFECYCLE IS PART OF THE MATERIAL, and not only the
+resolved tuple's ids. The token above answers "has the operator's EFFECTIVE
+SELECTION moved". That is not the whole question the scoped reads are judged
+by, and the gap was measured rather than reasoned about:
 
     the Setup hierarchy answers, reporting `read_only: false` for the selected
       Season, and the client decides — correctly, on that snapshot — to fetch
@@ -171,13 +229,14 @@ gap was measured rather than reasoned about:
     the candidate GET arrives; `season_is_read_only` is now true and the
       unchanged exact-Season ceiling answers its deliberate generic 404
 
-    MEASURED: an archive writes ``Season.status``/``archived_at`` and touches
-    NO ``ActiveContext`` row, so a token derived from that row alone was
-    BYTE-IDENTICAL before and after the archive. The epoch could not see the
-    transition, so it could not discard the read, and the 404 survived the
-    mechanism built to remove it.
+    MEASURED: an archive writes ``Season.status``/``archived_at`` on the
+    Season row itself, and the SAME Season object is still the effective
+    selection either side of it (archived is honored as read-only history, not
+    swapped out) — so the ids alone are BYTE-IDENTICAL before and after the
+    archive. The epoch could not see the transition, so it could not discard
+    the read, and the 404 survived the mechanism built to remove it.
 
-So the material also carries the SELECTED Season's lifecycle, asked through
+So the material also carries the EFFECTIVE Season's lifecycle, asked through
 ``season_guard.season_is_read_only`` — the SAME predicate ``require_active_
 season`` refuses writes on, that ``get_venue_grant_candidates`` refuses this
 very read on, and that ``get_setup_hierarchy_v2`` publishes per Season as
@@ -207,8 +266,21 @@ is the safe direction.
     at both ends and a read rendered before the archive is ADMITTED after the
     reopen. That is the right answer, not a hole: it is admitted to the exact
     ceiling it was rendered under, which now answers exactly what the render
-    expected it to. The tuple axis differs because ``updated_at`` moves on
-    every commit — there the two ends only LOOK alike.
+    expected it to. The GENERATION axis differs because it moves on every
+    CONTEXT WRITE (a switch), and archiving/reopening a Season is not one —
+    there the two ends only look alike if you were also expecting a switch to
+    have happened, and none did.
+
+WHAT THIS MODULE DOES NOT DO, stated for the boundary rather than left
+implicit. It never opens a transaction, never reads ``os.environ`` for
+anything but the deployment secret, and never calls into ``ContextService`` or
+a store. RESOLVING the effective tuple under one consistent snapshot (findings
+2+3), and INCREMENTING the persisted generation on a write (finding 5), are
+``ContextService``'s job (``resolve_epoch_state`` / ``_epoch_material_locked``
+/ ``_next_generation_locked`` / ``run_scoped_read``) precisely so this module
+can stay a pure function of whatever it is handed — testable without a store,
+a transaction, or a thread, and incapable of quietly acquiring retention logic
+of its own (see ``test_nothing_is_retained_so_nothing_can_be_evicted``).
 """
 
 import hashlib
@@ -237,22 +309,27 @@ _EPOCH_RE = re.compile(r"^[0-9a-f]{32}$")
 
 # BLAKE2's personalization field, i.e. domain separation that is part of the
 # algorithm rather than of the message. A CONSTANT, never a per-process value:
-# property 1 above requires that the same row hash identically after a restart.
-# EXACTLY 8 BYTES because blake2s rejects anything longer, and the trailing "2"
-# is a format version — if the material below ever changes shape, bump it rather
-# than reusing this one, so old and new tokens cannot be confused for each other
-# during a rollout.
+# property 1 above requires that the same input hash identically after a
+# restart. EXACTLY 8 BYTES because blake2s rejects anything longer, and the
+# trailing digit is a format version — if the material below ever changes
+# shape, bump it rather than reusing this one, so old and new tokens cannot be
+# confused for each other during a rollout.
 #
-# BUMPED FROM "1" TO "2" when the selected Season's lifecycle joined the
-# material. That is the shape change the rule above is written for, and the
-# rollout it protects is real: a browser holding a "1" token would otherwise
-# have it compared against a "2" token derived from an unchanged row, and the
-# two must be UNEQUAL rather than coincidentally equal. Unequal is the safe
-# answer — those in-flight reads discard once and are re-issued under the new
-# token — whereas a reused personalization would make the old and new formats
-# collide only for rows whose Season happens to hash to the same suffix, i.e.
-# it would fail in a way nobody could predict.
-_PERSON = b"hsctxep2"
+# BUMPED TWICE. "1" -> "2" when the selected Season's lifecycle joined the
+# material. "2" -> "3" (#159 review findings 2+5) when the material itself
+# changed shape: the raw ``ActiveContext`` row's fields (id/program_id/
+# season_id/league_id/updated_at) were REPLACED by user_id + the EFFECTIVE
+# resolved tuple's ids + the persisted generation. A browser holding a "2"
+# token would otherwise be compared against a "3" token computed from
+# different material entirely; the two must be UNEQUAL rather than
+# coincidentally equal, which bumping guarantees. Unequal is the safe answer —
+# those in-flight reads discard once and are re-issued under the new token —
+# whereas a reused personalization risks a coincidental collision nobody could
+# predict. (Keying the digest with a deployment secret, the OTHER #159 review
+# change in this file, did NOT need a bump: it changes who can recompute a
+# token, not what the material is, and an old unkeyed token already fails to
+# match a new keyed one by construction — a discard, the same safe outcome.)
+_PERSON = b"hsctxep3"
 
 # -- the deployment secret (#159 review finding 4) --------------------------
 #
@@ -362,24 +439,20 @@ def _derived_key(secret: bytes) -> bytes:
 # costs nothing and keeps the material readable in a debugger.
 _SEP = "\x1f"
 _NONE = "\x00"
-# A row that does not exist at all (a user who has never made a selection) is
-# still an epoch, and a well-defined one: it is the state the first switch will
-# move AWAY from, so a read rendered before that first switch must be discarded
-# by it. Distinct from every real row because a real row always carries an id.
-_ABSENT_ROW = "\x00absent-row"
-# The two ways a row can select no LIVE Season, kept apart from each other and
-# from every real lifecycle. "Program-only" is a legitimate, common selection;
-# "the selected Season id no longer resolves" is a deleted Season, and a read
-# rendered under it must not be admitted just because the lookup came back
-# empty. Neither can be spelled by a real Season, whose fields never start with
-# a NUL.
+# The EFFECTIVE resolution selects no LIVE Season — either a deliberate
+# Program-only selection, or a fallback that found no authorized active
+# Season. Both collapse to the SAME well-defined sentinel here (#159 review
+# finding 2): unlike the pre-fix material, there is no separate "a selected id
+# exists but fails to resolve" state to distinguish, because `season` is
+# already the EFFECTIVE object (or None) `ContextService` resolved — a raw,
+# possibly-dangling saved id is never hashed directly. Cannot be spelled by a
+# real Season, whose fields never start with a NUL.
 _SEASON_NOT_SELECTED = "\x00no-season"
-_SEASON_UNRESOLVABLE = "\x00season-gone"
 
 
 def _field(value):
-    """One field of the hash material, normalized so the SAME persisted row
-    always produces the SAME string.
+    """One field of the hash material, normalized so the SAME input always
+    produces the SAME string.
 
     ``datetime`` is spelled out via ``isoformat()`` rather than left to
     ``str()``: ``SqlStore`` persists timestamps as ISO text and hydrates them
@@ -406,8 +479,8 @@ def _field(value):
     return str(value)
 
 
-def _selected_season_lifecycle(store, season_id):
-    """The SELECTED Season's lifecycle, as hash-material fields.
+def _season_lifecycle_fields(season):
+    """The EFFECTIVE Season's lifecycle, as hash-material fields.
 
     THE DECISION FIRST, and it is asked of ``season_guard.season_is_read_only``
     — the one predicate the write refusal, the candidate-read refusal and the
@@ -422,17 +495,13 @@ def _selected_season_lifecycle(store, season_id):
     that moves without the refusal moving can only cause a DISCARD, never a
     serve, so widening here fails in the safe direction.
 
-    ``store.get_season`` is called unguarded on purpose. Every store in this
-    repository implements it, and a ``getattr(store, "get_season", None)``
-    fallback would let a store that cannot answer produce a confident-looking
-    token that is blind to the exact transition this function exists to see —
-    the failure would be silent, which is the one thing it must not be.
+    ``season`` is the EFFECTIVE object already resolved by the caller (#159
+    review finding 2) — never a store lookup performed here. This module does
+    not touch a store at all; see the module docstring's WHAT THIS MODULE DOES
+    NOT DO.
     """
-    if not season_id:
-        return (_SEASON_NOT_SELECTED, _NONE, _NONE)
-    season = store.get_season(season_id)
     if season is None:
-        return (_SEASON_UNRESOLVABLE, _NONE, _NONE)
+        return (_SEASON_NOT_SELECTED, _NONE, _NONE)
     return (_field(season_is_read_only(season)),
             _field(getattr(season, "status", None)),
             _field(getattr(season, "archived_at", None)))
@@ -444,50 +513,46 @@ def _material(*fields) -> str:
     return _SEP.join(f"{len(f)}:{f}" for f in fields)
 
 
-def context_epoch(store, user_id) -> str:
-    """The epoch token for ``user_id``'s CURRENTLY PERSISTED context row.
+def context_epoch(user_id, generation, program, season, league) -> str:
+    """The epoch token for the EFFECTIVE resolved context (#159 review
+    findings 2+4+5): ``user_id``'s persisted switch ``generation`` plus the
+    EFFECTIVE ``(program, season, league)`` tuple
+    ``ContextService.resolve_with_league`` would render for this exact
+    ``(user_id, role, scope)`` — never the raw saved row, and never a store
+    lookup performed here (see the module docstring's WHAT THIS MODULE DOES
+    NOT DO). ``program``/``season``/``league`` may each be ``None``; only
+    their ``.id`` is hashed (plus, for ``season``, its lifecycle — see
+    :func:`_season_lifecycle_fields`).
 
-    Reads the row and hashes it. Holds nothing, caches nothing, and consults no
-    clock — call it a million times a second or once an hour and it answers from
-    the same place, which is the whole reason this replaced a retention-based
-    design.
+    A PURE FUNCTION of its five arguments, deliberately: resolving them under
+    one consistent snapshot is ``ContextService``'s job
+    (``resolve_epoch_state`` / ``_epoch_material_locked`` /
+    ``run_scoped_read``), and incrementing the generation on a write is
+    ``ContextService._next_generation_locked``'s. This function holds nothing,
+    caches nothing, and consults no clock — call it a million times a second
+    or once an hour and it answers the same way for the same input, which is
+    the whole reason the mechanism this replaces was retention-based and this
+    one is not.
 
-    ``store.get_active_context`` is the PERSISTED row, deliberately, not
-    ``ApiService.get_active_context``'s scope-filtered *resolution* of it. The
-    epoch is a change detector for the operator's saved selection; a resolution
-    can differ between two callers of the same row (role, scope, an archived
-    parent) and would make the token depend on who asked, which is exactly what
-    an epoch must not do.
+    A falsy ``user_id`` is a well-defined, stable state distinct from every
+    real user's — ``_field(None)`` differs from ``_field(<any real id>)`` — so
+    callers with no identity to resolve against (see ``ContextService.
+    current_epoch``) can pass ``(None, 0, None, None, None)`` without
+    colliding with a real, if empty, resolution.
 
-    ...AND THE SELECTED SEASON'S LIFECYCLE, because the row alone cannot see an
-    archive: archiving writes the SEASON, never the ``ActiveContext``, so a
-    token derived from the row was measured byte-identical either side of the
-    transition that flips the candidate read from 200 to its deliberate 404.
-    See the module docstring for the interleaving that made it visible.
+    KEYED with the deployment secret (:func:`epoch_secret`) so recomputing the
+    digest — including by enumerating a low-entropy candidate space, #159
+    review finding 4's exact attack — requires that secret and not merely the
+    material. See the module docstring's NON-DISCLOSURE section.
     """
-    row = store.get_active_context(user_id) if user_id else None
-    if row is None:
-        # No row means no selection, hence no selected Season to have a
-        # lifecycle. The Season fields are omitted rather than filled with
-        # sentinels: this branch's material is already distinct from every real
-        # row's (no real row hashes ``_ABSENT_ROW`` first), and adding three
-        # constant fields to it would say nothing.
-        material = _material(_ABSENT_ROW, _field(user_id))
-    else:
-        material = _material(
-            _field(getattr(row, "id", None)),
-            _field(getattr(row, "program_id", None)),
-            _field(getattr(row, "season_id", None)),
-            _field(getattr(row, "league_id", None)),
-            _field(getattr(row, "updated_at", None)),
-            *_selected_season_lifecycle(
-                store, getattr(row, "season_id", None)),
-        )
-    # KEYED (#159 review finding 4): the digest is now a MAC, not a plain
-    # hash, so recovering it — including by enumerating a small candidate
-    # space of ids, the finding's exact PoC — requires the deployment secret,
-    # not merely the material. See `epoch_secret` and the module docstring's
-    # NON-DISCLOSURE section.
+    material = _material(
+        _field(user_id),
+        _field(generation),
+        _field(getattr(program, "id", None)),
+        _field(getattr(season, "id", None)),
+        _field(getattr(league, "id", None)),
+        *_season_lifecycle_fields(season),
+    )
     return hashlib.blake2s(material.encode("utf-8"),
                            key=_derived_key(epoch_secret()),
                            digest_size=_DIGEST_BYTES,
@@ -512,8 +577,15 @@ EPOCH_MATCH = "match"
 EPOCH_MISMATCH = "mismatch"
 
 
-def epoch_verdict(store, user_id, echoed) -> str:
-    """Compare an echoed epoch against the current persisted one.
+def epoch_verdict(echoed, current) -> str:
+    """Compare an ECHOED epoch against the CURRENT one the caller has already
+    computed.
+
+    ``current`` is supplied rather than derived here (#159 review findings
+    2+3): deriving it now requires a role/scope-aware resolution read under
+    the SAME snapshot as any dependent read the caller is about to run, which
+    is ``ContextService.run_scoped_read`` / ``current_epoch``'s job, not a
+    concern this pure comparison needs to know about.
 
     ``EPOCH_ABSENT``   — nothing was echoed. The caller gets exactly the
                          behaviour it gets today; no client is required to
@@ -530,9 +602,9 @@ def epoch_verdict(store, user_id, echoed) -> str:
     ``EPOCH_MATCH``    — the selection is exactly the one this request was
                          rendered under. Proceed as today, ceiling included.
 
-    The shape check runs BEFORE the store read purely so a garbage header costs
-    no query; the verdict is identical either way, because a malformed value
-    could never equal a 32-hex digest.
+    The shape check runs BEFORE the equality comparison purely so a garbage
+    header costs nothing extra; the verdict is identical either way, because a
+    malformed value could never equal a 32-hex digest.
     """
     if echoed is None:
         return EPOCH_ABSENT
@@ -541,5 +613,4 @@ def epoch_verdict(store, user_id, echoed) -> str:
         return EPOCH_ABSENT
     if not is_epoch_token(echoed):
         return EPOCH_MISMATCH
-    return (EPOCH_MATCH if echoed == context_epoch(store, user_id)
-            else EPOCH_MISMATCH)
+    return EPOCH_MATCH if echoed == current else EPOCH_MISMATCH

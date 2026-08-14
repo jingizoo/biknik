@@ -40,8 +40,7 @@ from ..services import (
     push_transport_from_env,
 )
 from ..services.context_epoch import (
-    CONTEXT_EPOCH_HEADER, EPOCH_MISMATCH, context_epoch, epoch_secret,
-    epoch_verdict)
+    CONTEXT_EPOCH_HEADER, EPOCH_MISMATCH, epoch_secret, epoch_verdict)
 from ..services.context_gate import ContextSwitchGate
 from ..store import SqlStore, create_store
 from .auth import (
@@ -1498,21 +1497,23 @@ class Handler(BaseHTTPRequestHandler):
         with ticket.bind(user_id) as held:
             yield held
 
-    def _read_under_context_gate(self, user_id, produce):
+    def _read_under_context_gate(self, user_id, role, scope, produce):
         """Run a scoped read's service call under PHASE B of the gate, unless
-        the selection it was RENDERED UNDER is no longer the selection that is
-        persisted — in which case return ``DISCARDED_READ`` and never call the
-        service at all (#159 follow-up to #415).
+        the selection it was RENDERED UNDER is no longer the EFFECTIVE
+        selection — in which case return ``DISCARDED_READ`` and never call the
+        service at all (#159 follow-up to #415; role/scope-aware effective
+        resolution and the EPOCH_MISMATCH-guarded call added by #159 review
+        finding 2).
 
         THE TWO PLACEMENTS ARE THE WHOLE MECHANISM, and neither works without
         the other:
 
           * The comparison is made INSIDE the hold, i.e. AFTER ``bind`` has
             waited out every switch that registered before this request
-            arrived. So the row it reads is the row as of after that switch
-            committed — a read that arrives mid-quiesce cannot look early, see
-            the old epoch, match it, and then be judged by the ceiling against
-            the new tuple anyway.
+            arrived. So the CURRENT epoch it derives is derived as of after
+            that switch committed — a read that arrives mid-quiesce cannot
+            look early, see the old epoch, match it, and then be judged by the
+            ceiling against the new tuple anyway.
           * It is made BEFORE ``produce()``, so a discarded read never reaches
             ``api/service.py`` and the exact-Season ceiling is never evaluated
             for it. That is what lets the answer carry no data and disclose
@@ -1532,10 +1533,16 @@ class Handler(BaseHTTPRequestHandler):
 
         The hold is released before the caller writes its response, exactly as
         those branches did.
+
+        THE COMPARISON AND ``produce()`` ARE STILL TWO SEPARATE SNAPSHOTS
+        HERE — closing that window (a lifecycle mutation landing between them)
+        is #159 review finding 3's fix, ``ContextService.run_scoped_read``,
+        which replaces this two-step shape.
         """
         with self._context_read_hold(user_id):
-            verdict = epoch_verdict(STATE.api.store, user_id,
-                                    self.headers.get(CONTEXT_EPOCH_HEADER))
+            current = STATE.api.context.current_epoch(user_id, role, scope)
+            verdict = epoch_verdict(
+                self.headers.get(CONTEXT_EPOCH_HEADER), current)
             if verdict == EPOCH_MISMATCH:
                 return DISCARDED_READ
             return produce()
@@ -1650,13 +1657,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send_json({"error": {
                     "code": "unauthorized",
                     "message": "A signed-in account is required."}}, 401)
-            # `context_epoch` rides along (#159 follow-up): this is one of the
-            # three places the client LEARNS its context, and a scoped read can
+            # The context epoch rides along (#159 follow-up; effective-tuple
+            # resolution #159 review finding 2): this is one of the three
+            # places the client LEARNS its context, and a scoped read can
             # only echo the selection it was rendered under if the render knew
             # its name. Purely additive — a client that ignores it is unchanged.
             # Derived BEFORE the tuple is read, which is the fail-safe order —
             # see `_with_context_epoch`.
-            epoch = context_epoch(api.store, user_id)
+            epoch = api.context.current_epoch(user_id, role, scope)
             return self._send_api(self._with_context_epoch(
                 api.get_active_context(user_id, role, scope), epoch))
         if path == "/api/context/options":
@@ -1681,7 +1689,7 @@ class Handler(BaseHTTPRequestHandler):
             # instant, because it never sees them apart. Derived BEFORE the
             # options are read: see `_with_context_epoch` for why that order,
             # and not the other one, is the one that fails safe.
-            epoch = context_epoch(api.store, user_id)
+            epoch = api.context.current_epoch(user_id, role, scope)
             return self._send_api(self._with_context_epoch(
                 api.get_context_options(user_id, role, scope), epoch))
         if path == "/api/setup/hierarchy":
@@ -1779,7 +1787,7 @@ class Handler(BaseHTTPRequestHandler):
             # rendered under a selection the operator has since left, it is
             # DISCARDED in front of the ceiling rather than judged by it.
             payload = self._read_under_context_gate(
-                user_id,
+                user_id, role, scope,
                 lambda: api.get_venue_grant_candidates(
                     mvc.group(1), user_id, role, scope))
             if payload is DISCARDED_READ:
@@ -1893,7 +1901,7 @@ class Handler(BaseHTTPRequestHandler):
             # PHASE B of the context gate (#159) — same shape, same reason, and
             # the same untouched ceiling as the candidates route above.
             payload = self._read_under_context_gate(
-                user_id,
+                user_id, role, scope,
                 lambda: api.list_season_venue_access(
                     mv2va.group(1), user_id, role, scope))
             if payload is DISCARDED_READ:
@@ -2185,7 +2193,7 @@ class Handler(BaseHTTPRequestHandler):
             # carries the header and the branch is INERT until one does; wiring
             # it now is what stops the four routes drifting apart.
             payload = self._read_under_context_gate(
-                user_id,
+                user_id, role, scope,
                 lambda: api.get_standings(sd.group(1), user_id, role, scope))
             if payload is DISCARDED_READ:
                 return self._send_discarded_read()
@@ -2235,7 +2243,7 @@ class Handler(BaseHTTPRequestHandler):
             # instead of the contract's empty 204/no-service-call discard the
             # other four listed routes already give it.
             payload = self._read_under_context_gate(
-                user_id,
+                user_id, role, scope,
                 lambda: api.get_league_season_standings(
                     lss.group(1), lss.group(2), user_id, role, scope))
             if payload is DISCARDED_READ:
@@ -2325,7 +2333,7 @@ class Handler(BaseHTTPRequestHandler):
             # Same wiring, same inertness-until-enrolled note as
             # /api/standings/<division_id> above.
             payload = self._read_under_context_gate(
-                user_id,
+                user_id, role, scope,
                 lambda: api.get_schedule_scenario(
                     scenario_get.group(1), user_id, role, scope))
             if payload is DISCARDED_READ:
@@ -2931,16 +2939,18 @@ class Handler(BaseHTTPRequestHandler):
                     body.get("program_id"), body.get("season_id"),
                     body.get("league_id"))
                 # The NEW epoch, derived AFTER the commit and INSIDE the
-                # exclusive hold, so it is the epoch of the row THIS switch
-                # wrote. Outside the hold a second switch for the same user
-                # could commit first and this response would hand back an epoch
-                # for a selection its caller never asked for — the client would
-                # then echo it and have its reads ADMITTED against a tuple it is
-                # not rendering. This is the one call site that derives after
-                # rather than before; `_with_context_epoch` explains why the
-                # two orders are both correct in their own place.
+                # exclusive hold, so it reflects the row (and generation) THIS
+                # switch just wrote and the effective resolution built from it
+                # (#159 review finding 2). Outside the hold a second switch for
+                # the same user could commit first and this response would
+                # hand back an epoch for a selection its caller never asked
+                # for — the client would then echo it and have its reads
+                # ADMITTED against a tuple it is not rendering. This is the one
+                # call site that derives after rather than before;
+                # `_with_context_epoch` explains why the two orders are both
+                # correct in their own place.
                 payload = self._with_context_epoch(
-                    payload, context_epoch(api.store, user_id))
+                    payload, api.context.current_epoch(user_id, role, scope))
             return self._send_api(payload)
 
         # Authorize the acting role at the HTTP boundary (#24/#50). A session

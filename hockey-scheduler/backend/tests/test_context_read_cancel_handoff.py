@@ -98,7 +98,7 @@ from datetime import datetime, timezone
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
-from hockey_scheduler.domain import Role
+from hockey_scheduler.domain import Role, SeasonStatus
 from hockey_scheduler.domain.setup_models import ActiveContext
 from hockey_scheduler.services import context_epoch as _context_epoch_module
 from hockey_scheduler.services.context_epoch import (
@@ -156,39 +156,29 @@ def _env(**overrides):
                 os.environ[k] = v
 
 
-class _FakeRow:
-    """A stand-in for one persisted ``ActiveContext``, for the pure-function
-    cases. Used instead of a real store so those cases test the DERIVATION and
-    nothing else — no HTTP, no schema, no backend differences to explain away.
-    """
+class _FakeAxis:
+    """A stand-in for a resolved Program or League: just enough shape
+    (``.id``) for the pure-function cases to hash against. Used instead of a
+    real store/``ContextService`` so those cases test the DERIVATION itself —
+    no HTTP, no schema, no backend differences to explain away. Resolving the
+    EFFECTIVE tuple under one snapshot is ``ContextService``'s job (#159
+    review findings 2+3), exercised separately by the WIRING cases below."""
 
-    def __init__(self, id, program_id, season_id, league_id, updated_at):
+    def __init__(self, id):
         self.id = id
-        self.program_id = program_id
-        self.season_id = season_id
-        self.league_id = league_id
-        self.updated_at = updated_at
 
 
-class _FakeStore:
-    """Rows plus (optionally) the Seasons they select: the SELECTED Season's
-    lifecycle is part of the epoch material (see ``_selected_season_lifecycle``
-    in services/context_epoch.py), so the derivation reads ``get_season`` for
-    any row with a ``season_id``. The cases in THIS file leave ``seasons``
-    empty on purpose — a selected id with no Season behind it is the
-    well-defined ``season-gone`` state, constant across every case here, so
-    these cases keep measuring the ROW axis alone. The lifecycle axis has its
-    own file, ``tests/test_context_epoch_lifecycle.py``."""
+class _FakeSeason(_FakeAxis):
+    """A stand-in for a resolved Season: ``.id`` plus the two fields
+    ``_season_lifecycle_fields`` reads. ``status`` defaults to ACTIVE so a
+    case that only cares about identity does not have to spell out a
+    lifecycle; ``tests/test_context_epoch_lifecycle.py`` varies the lifecycle
+    instead of the id for its own cases."""
 
-    def __init__(self, rows=None, seasons=None):
-        self.rows = dict(rows or {})
-        self.seasons = dict(seasons or {})
-
-    def get_active_context(self, user_id):
-        return self.rows.get(user_id)
-
-    def get_season(self, season_id):
-        return self.seasons.get(season_id)
+    def __init__(self, id, status=SeasonStatus.ACTIVE, archived_at=None):
+        super().__init__(id)
+        self.status = status
+        self.archived_at = archived_at
 
 
 # ==========================================================================
@@ -197,67 +187,81 @@ class _FakeStore:
 class ContextEpochDerivationTest(unittest.TestCase):
     """The four properties the epoch has to have before any of the wiring
     below can mean anything. Store-independent on purpose: these are claims
-    about a pure function, and proving them through a server would prove them
-    only for whichever backend happened to run."""
+    about a pure function of ``(user_id, generation, program, season,
+    league)`` — resolving those five values under one consistent snapshot is
+    ``ContextService``'s job (#159 review findings 2+3), exercised by the
+    WIRING cases below; proving the DERIVATION through a server would prove
+    it only for whichever backend happened to run."""
 
-    ROW = _FakeRow("user_a", "program_1", "season_1", "league_1",
-                   datetime(2026, 8, 12, 9, 30, 15, 123456, tzinfo=timezone.utc))
+    USER_ID = "user_a"
+    GENERATION = 3
+    PROGRAM = _FakeAxis("program_1")
+    SEASON = _FakeSeason("season_1")
+    LEAGUE = _FakeAxis("league_1")
 
-    def test_the_same_persisted_row_always_produces_the_same_token(self):
-        """PROPERTY 1: stable for a given row, in this process and any other.
+    def test_the_same_material_always_produces_the_same_token(self):
+        """PROPERTY 1: stable for the same material, in this process and any
+        other.
 
         A per-process counter or a random nonce would satisfy every other case
         in this file and fail here — and in production would invalidate every
         outstanding read on every restart.
         """
-        store = _FakeStore({"user_a": self.ROW})
-        first = context_epoch(store, "user_a")
-        again = [context_epoch(store, "user_a") for _ in range(50)]
+        first = context_epoch(self.USER_ID, self.GENERATION, self.PROGRAM,
+                              self.SEASON, self.LEAGUE)
+        again = [context_epoch(self.USER_ID, self.GENERATION, self.PROGRAM,
+                               self.SEASON, self.LEAGUE) for _ in range(50)]
         self.assertTrue(all(t == first for t in again),
-                        f"the token moved without the row moving: {set(again)}")
-        # Recomputed from an EQUAL-BUT-DISTINCT row object: the material is the
-        # row's values, never its identity, so a fresh hydration from the
-        # database has to hash the same as the object that was written.
-        rehydrated = _FakeStore({"user_a": _FakeRow(
-            "user_a", "program_1", "season_1", "league_1",
-            datetime(2026, 8, 12, 9, 30, 15, 123456, tzinfo=timezone.utc))})
-        self.assertEqual(context_epoch(rehydrated, "user_a"), first,
-                         "an equal row hydrated fresh produced a different "
+                        f"the token moved without the material moving: "
+                        f"{set(again)}")
+        # Recomputed from EQUAL-BUT-DISTINCT objects: the material is their
+        # VALUES, never their identity, so a fresh resolution has to hash the
+        # same as the objects that were written.
+        rehydrated = context_epoch(
+            "user_a", 3, _FakeAxis("program_1"), _FakeSeason("season_1"),
+            _FakeAxis("league_1"))
+        self.assertEqual(rehydrated, first,
+                         "equal-but-distinct objects produced a different "
                          "token, so the token depends on object identity")
 
-    def test_a_switch_back_to_the_same_tuple_still_moves_the_token(self):
-        """PROPERTY 2, and the one a tuple-derived token would fail.
-
-        A -> B -> A leaves the operator on the tuple they started from. A token
-        derived from the tuple alone would be identical at both ends, and a read
-        rendered before the round trip would be silently READMITTED against a
-        selection that had moved twice underneath it.
-        """
-        base = self.ROW
-        later = _FakeRow(base.id, base.program_id, base.season_id,
-                         base.league_id,
-                         base.updated_at.replace(microsecond=123457))
+    def test_the_generation_moving_alone_moves_the_token(self):
+        """PROPERTY 2 (#159 review finding 5), and the one a tuple-derived
+        token would fail. A -> B -> A leaves the operator on the tuple they
+        started from; ``ContextService`` moves the persisted GENERATION on
+        every commit regardless — a read rendered before the round trip must
+        not be silently READMITTED against a selection that moved twice
+        underneath it, and this is what makes that true even when the tuple
+        and the clock cannot be trusted to."""
         self.assertNotEqual(
-            context_epoch(_FakeStore({"user_a": base}), "user_a"),
-            context_epoch(_FakeStore({"user_a": later}), "user_a"),
-            "the token did not move when only updated_at moved, so a switch "
-            "back to the same tuple would be invisible to it")
+            context_epoch(self.USER_ID, self.GENERATION, self.PROGRAM,
+                          self.SEASON, self.LEAGUE),
+            context_epoch(self.USER_ID, self.GENERATION + 1, self.PROGRAM,
+                          self.SEASON, self.LEAGUE),
+            "the token did not move when only the generation moved, so a "
+            "switch back to the same tuple would be invisible to it")
 
-    def test_every_axis_and_the_owner_are_part_of_the_material(self):
+    def test_every_axis_the_generation_and_the_owner_are_part_of_the_material(self):
         """Any one field changing must move the token. Otherwise some switch —
         Program-only, a League change, a different operator on identical data —
         would leave a stale read admissible."""
-        seen = {context_epoch(_FakeStore({"user_a": self.ROW}), "user_a")}
+        seen = {context_epoch(self.USER_ID, self.GENERATION, self.PROGRAM,
+                              self.SEASON, self.LEAGUE)}
         variants = {
-            "program": ("program_2", self.ROW.season_id, self.ROW.league_id),
-            "season": (self.ROW.program_id, "season_2", self.ROW.league_id),
-            "league": (self.ROW.program_id, self.ROW.season_id, "league_2"),
-            "season_cleared": (self.ROW.program_id, None, self.ROW.league_id),
-            "league_cleared": (self.ROW.program_id, self.ROW.season_id, None),
+            "generation": (self.GENERATION + 1, self.PROGRAM, self.SEASON,
+                          self.LEAGUE),
+            "program": (self.GENERATION, _FakeAxis("program_2"), self.SEASON,
+                       self.LEAGUE),
+            "season": (self.GENERATION, self.PROGRAM, _FakeSeason("season_2"),
+                      self.LEAGUE),
+            "league": (self.GENERATION, self.PROGRAM, self.SEASON,
+                      _FakeAxis("league_2")),
+            "season_cleared": (self.GENERATION, self.PROGRAM, None,
+                              self.LEAGUE),
+            "league_cleared": (self.GENERATION, self.PROGRAM, self.SEASON,
+                              None),
         }
-        for label, (p, s, lg) in variants.items():
-            row = _FakeRow(self.ROW.id, p, s, lg, self.ROW.updated_at)
-            token = context_epoch(_FakeStore({"user_a": row}), "user_a")
+        for label, (gen, p, s, lg) in variants.items():
+            token = context_epoch(self.USER_ID, gen, p, s, lg)
             self.assertNotIn(token, seen,
                              f"changing the {label} did not move the token")
             seen.add(token)
@@ -266,51 +270,56 @@ class ContextEpochDerivationTest(unittest.TestCase):
         # widen anything — but it would mean the token described a selection
         # rather than a selection HELD BY SOMEONE, which is not what the reads
         # are being judged against.
-        other = _FakeRow("user_b", self.ROW.program_id, self.ROW.season_id,
-                         self.ROW.league_id, self.ROW.updated_at)
-        self.assertNotIn(context_epoch(_FakeStore({"user_b": other}), "user_b"),
-                         seen, "two operators' identical selections collided")
+        other = context_epoch("user_b", self.GENERATION, self.PROGRAM,
+                              self.SEASON, self.LEAGUE)
+        self.assertNotIn(other, seen,
+                         "two operators' identical selections collided")
 
     def test_no_field_separator_confusion_can_forge_a_collision(self):
-        """The material is separated by a control character no id or ISO
-        timestamp can contain, so no two different rows can be rearranged into
-        the same string. A naive ``"|".join`` would let ("a", "b|c") and
-        ("a|b", "c") collide, and the collision would readmit a read across a
-        switch."""
-        left = _FakeRow("u", "a", "b\x1fc", None, self.ROW.updated_at)
-        right = _FakeRow("u", "a\x1fb", "c", None, self.ROW.updated_at)
-        self.assertNotEqual(context_epoch(_FakeStore({"u": left}), "u"),
-                            context_epoch(_FakeStore({"u": right}), "u"))
+        """The material is separated by a control character no id can
+        contain, so no two different inputs can be rearranged into the same
+        string. A naive ``"|".join`` would let ("a", "b|c") and ("a|b", "c")
+        collide, and the collision would readmit a read across a switch."""
+        left = context_epoch("u", 1, _FakeAxis("a"), _FakeSeason("b\x1fc"),
+                             None)
+        right = context_epoch("u", 1, _FakeAxis("a\x1fb"), _FakeSeason("c"),
+                              None)
+        self.assertNotEqual(left, right)
 
     def test_the_token_is_opaque_and_carries_no_identifier(self):
         """PROPERTY 3. Nothing is concatenated or encoded, so a holder of a
-        token cannot read a user, Program, Season, League or timestamp out of
-        it. (The honest limit — a party who ALREADY holds the whole row can
-        recompute and confirm it — is stated in the module docstring of
-        services/context_epoch.py; it discloses nothing that party did not
-        supply, and confirming it confers nothing.)"""
-        token = context_epoch(_FakeStore({"user_a": self.ROW}), "user_a")
+        token cannot read a user, Program, Season, League or generation out of
+        it. (The honest limit — a party who ALREADY holds the whole material
+        AND the deployment secret can recompute and confirm it — is stated in
+        the module docstring of services/context_epoch.py; it discloses
+        nothing that party did not supply, and confirming it confers nothing.
+        ``ContextEpochSecretTest`` covers the OTHER half: without the secret,
+        even the whole material is not enough — #159 review finding 4.)"""
+        token = context_epoch(self.USER_ID, self.GENERATION, self.PROGRAM,
+                              self.SEASON, self.LEAGUE)
         self.assertRegex(token, _HEX32)
-        for secret in ("user_a", "program_1", "season_1", "league_1",
-                       "2026", "123456"):
+        for secret in ("user_a", "program_1", "season_1", "league_1", "3"):
             self.assertNotIn(secret, token,
                              f"{secret!r} is readable out of the token")
 
-    def test_a_user_with_no_persisted_row_still_has_an_epoch(self):
-        """A brand-new operator has no ``ActiveContext`` row. That is still a
-        state a read can be rendered under, and the FIRST switch must move away
-        from it — otherwise the very first switch of a session is the one
-        interleaving the mechanism does not cover."""
-        empty = _FakeStore()
-        absent = context_epoch(empty, "user_a")
+    def test_a_user_with_no_resolution_still_has_an_epoch(self):
+        """A brand-new operator with no authorized Program resolves to
+        ``(program=None, season=None, league=None)`` at generation 0. That is
+        still a state a read can be rendered under, and the FIRST switch must
+        move away from it — otherwise the very first switch of a session is
+        the one interleaving the mechanism does not cover."""
+        absent = context_epoch("user_a", 0, None, None, None)
         self.assertRegex(absent, _HEX32)
-        self.assertEqual(absent, context_epoch(empty, "user_a"))
+        self.assertEqual(absent, context_epoch("user_a", 0, None, None, None))
         self.assertNotEqual(
-            absent, context_epoch(_FakeStore({"user_a": self.ROW}), "user_a"),
+            absent,
+            context_epoch("user_a", 1, self.PROGRAM, self.SEASON, self.LEAGUE),
             "making the first selection did not move the epoch away from the "
-            "no-row state")
-        # ...and it is still per-user, so one absent row is not every absent row.
-        self.assertNotEqual(absent, context_epoch(empty, "user_b"))
+            "no-resolution state")
+        # ...and it is still per-user, so one empty resolution is not every
+        # empty resolution.
+        self.assertNotEqual(absent,
+                            context_epoch("user_b", 0, None, None, None))
 
     def test_the_verdict_is_absent_match_or_mismatch_and_fails_closed(self):
         """PROPERTY 4. Absent is today's behaviour; anything present but not
@@ -318,17 +327,17 @@ class ContextEpochDerivationTest(unittest.TestCase):
         all. There is deliberately no fourth outcome: a 'malformed' branch that
         refused would give the header power over the response, which is the one
         thing it must never have."""
-        store = _FakeStore({"user_a": self.ROW})
-        current = context_epoch(store, "user_a")
-        self.assertEqual(epoch_verdict(store, "user_a", None), EPOCH_ABSENT)
-        self.assertEqual(epoch_verdict(store, "user_a", ""), EPOCH_ABSENT)
-        self.assertEqual(epoch_verdict(store, "user_a", "   "), EPOCH_ABSENT)
-        self.assertEqual(epoch_verdict(store, "user_a", current), EPOCH_MATCH)
-        self.assertEqual(epoch_verdict(store, "user_a", f"  {current}  "),
+        current = context_epoch(self.USER_ID, self.GENERATION, self.PROGRAM,
+                                self.SEASON, self.LEAGUE)
+        self.assertEqual(epoch_verdict(None, current), EPOCH_ABSENT)
+        self.assertEqual(epoch_verdict("", current), EPOCH_ABSENT)
+        self.assertEqual(epoch_verdict("   ", current), EPOCH_ABSENT)
+        self.assertEqual(epoch_verdict(current, current), EPOCH_MATCH)
+        self.assertEqual(epoch_verdict(f"  {current}  ", current),
                          EPOCH_MATCH)
         for junk in ("not-a-token", current.upper(), current[:-1], current + "0",
                      "g" * 32, "../../etc/passwd", "0", "\x00" * 32):
-            self.assertEqual(epoch_verdict(store, "user_a", junk),
+            self.assertEqual(epoch_verdict(junk, current),
                              EPOCH_MISMATCH, f"{junk!r} did not discard")
         self.assertFalse(is_epoch_token(None))
         self.assertFalse(is_epoch_token(current.upper()))
@@ -478,16 +487,18 @@ class ContextEpochSecretTest(unittest.TestCase):
         secrets over the SAME material produce different tokens), and PROPERTY
         1 survives keying (the same configured secret, called repeatedly,
         produces the same token)."""
-        store = _FakeStore({"user_a": ContextEpochDerivationTest.ROW})
+        material = ("user_a", 3, ContextEpochDerivationTest.PROGRAM,
+                    ContextEpochDerivationTest.SEASON,
+                    ContextEpochDerivationTest.LEAGUE)
         with _env(HS_CONTEXT_EPOCH_SECRET="a" * 32):
-            token_a1 = context_epoch(store, "user_a")
-            token_a2 = context_epoch(store, "user_a")
+            token_a1 = context_epoch(*material)
+            token_a2 = context_epoch(*material)
         with _env(HS_CONTEXT_EPOCH_SECRET="b" * 32):
-            token_b = context_epoch(store, "user_a")
+            token_b = context_epoch(*material)
         self.assertEqual(
             token_a1, token_a2,
             "the same configured secret produced two different tokens for "
-            "the identical row — keying broke property 1")
+            "the identical material — keying broke property 1")
         self.assertNotEqual(
             token_a1, token_b,
             "two different deployment secrets produced the SAME token for "
@@ -499,26 +510,25 @@ class ContextEpochSecretTest(unittest.TestCase):
         computed in a fresh ``python3`` process, given the identical
         configured secret and the identical material, must agree — the
         module docstring's 'PER PROCESS? NO' claim, now that the digest also
-        depends on a secret rather than only on the row."""
+        depends on a secret rather than only on the material."""
         secret = "cross-process-" + secrets.token_hex(16)
-        row = ContextEpochDerivationTest.ROW
         with _env(HS_CONTEXT_EPOCH_SECRET=secret):
-            here = context_epoch(_FakeStore({"user_a": row}), "user_a")
+            here = context_epoch(
+                "user_a", 3, ContextEpochDerivationTest.PROGRAM,
+                ContextEpochDerivationTest.SEASON,
+                ContextEpochDerivationTest.LEAGUE)
 
         script = (
-            "from datetime import datetime, timezone\n"
+            "from hockey_scheduler.domain import SeasonStatus\n"
             "from hockey_scheduler.services.context_epoch import context_epoch\n"
-            "class R:\n"
-            "    id = 'user_a'; program_id = 'program_1'; "
-            "season_id = 'season_1'; league_id = 'league_1'\n"
-            "    updated_at = datetime(2026, 8, 12, 9, 30, 15, 123456, "
-            "tzinfo=timezone.utc)\n"
-            "class S:\n"
-            "    def get_active_context(self, uid):\n"
-            "        return R() if uid == 'user_a' else None\n"
-            "    def get_season(self, sid):\n"
-            "        return None\n"
-            "print(context_epoch(S(), 'user_a'))\n")
+            "class A:\n"
+            "    def __init__(self, id):\n"
+            "        self.id = id\n"
+            "class S(A):\n"
+            "    status = SeasonStatus.ACTIVE\n"
+            "    archived_at = None\n"
+            "print(context_epoch('user_a', 3, A('program_1'), "
+            "S('season_1'), A('league_1')))\n")
         env = dict(os.environ)
         env["HS_CONTEXT_EPOCH_SECRET"] = secret
         result = subprocess.run([sys.executable, "-c", script],
@@ -529,9 +539,9 @@ class ContextEpochSecretTest(unittest.TestCase):
         self.assertRegex(there, _HEX32, result.stdout)
         self.assertEqual(
             here, there,
-            "the same configured secret and the same row hashed differently "
-            "in a fresh process — token issuance would not survive a "
-            "restart or agree across replicas")
+            "the same configured secret and the same material hashed "
+            "differently in a fresh process — token issuance would not "
+            "survive a restart or agree across replicas")
 
     def test_a_leaked_token_cannot_be_correlated_to_an_identity_without_the_secret(self):
         """THE FINDING 4 POC, reproduced and closed.
@@ -554,14 +564,17 @@ class ContextEpochSecretTest(unittest.TestCase):
         """
         real_secret = "prod-" + secrets.token_hex(32)
         target_user = "user_37"
-        empty = _FakeStore()          # no ActiveContext row for anyone
+        # generation=0, program=season=league=None is exactly the material a
+        # fresh account with no saved selection and no authorized Program
+        # hashes — the lowest-entropy state, and the reviewer's exact PoC.
         with _env(HS_CONTEXT_EPOCH_SECRET=real_secret, APP_MODE="production"):
-            leaked = context_epoch(empty, target_user)
+            leaked = context_epoch(target_user, 0, None, None, None)
         self.assertRegex(leaked, _HEX32)
 
         with _env(HS_CONTEXT_EPOCH_SECRET=real_secret, APP_MODE="production"):
-            found_with_secret = [n for n in range(1, 101)
-                                 if context_epoch(empty, f"user_{n}") == leaked]
+            found_with_secret = [
+                n for n in range(1, 101)
+                if context_epoch(f"user_{n}", 0, None, None, None) == leaked]
         self.assertEqual(
             found_with_secret, [37],
             "the brute force did not recover the token even WITH the "
@@ -571,7 +584,7 @@ class ContextEpochSecretTest(unittest.TestCase):
         with _env(HS_CONTEXT_EPOCH_SECRET=None, APP_MODE=None):
             found_without_secret = [
                 n for n in range(1, 101)
-                if context_epoch(empty, f"user_{n}") == leaked]
+                if context_epoch(f"user_{n}", 0, None, None, None) == leaked]
         self.assertEqual(
             found_without_secret, [],
             "the leaked token was recovered by a party WITHOUT the "
@@ -698,10 +711,16 @@ class ContextReadEpochBase(ContextGateFixtureBase):
         ]
 
     # -- helpers ------------------------------------------------------------
-    def _epoch(self, user_id):
-        """The epoch of the row as it stands NOW, derived the same way the
-        server derives it."""
-        return context_epoch(self.api.store, user_id)
+    def _epoch(self, user_id, role=Role.LEAGUE_ADMIN, scope=None):
+        """The CURRENT epoch for ``user_id`` as it stands NOW, derived the
+        same way the server derives it (``ApiService.context.current_epoch``,
+        #159 review finding 2's effective-tuple resolution). ``role``/
+        ``scope`` default to this file's standard operator shape — every
+        account ``_operator`` mints is a global ``Role.LEAGUE_ADMIN`` — so
+        every existing call site (``self._epoch(user_id)``) keeps working
+        unchanged; a case that builds a differently-scoped account passes its
+        own."""
+        return self.api.context.current_epoch(user_id, role, scope or {})
 
     def _epoch_from_api(self, client):
         """The epoch as the CLIENT learns it — off ``GET /api/context``.
@@ -725,6 +744,38 @@ class ContextReadEpochBase(ContextGateFixtureBase):
         return self._req(client, "GET",
                          f"/api/v2/setup/seasons/{season_id}/{kind}",
                          headers=headers)
+
+    def _selected_context(self, client):
+        """The signed-in client's effective context, off ``GET /api/context``
+        — including ``context_epoch``, so callers get the tuple and the epoch
+        it was rendered under from the SAME payload rather than pairing two
+        separate reads that could straddle a concurrent change."""
+        status, raw, body = self._req(client, "GET", "/api/context")
+        self.assertEqual(status, 200, raw)
+        return body
+
+    def _archive(self, client, season_id):
+        status, raw, _ = self._req(
+            client, "POST", f"/api/v2/setup/seasons/{season_id}/archive", {})
+        self.assertEqual(status, 200, raw)
+
+    def _empty_program_with_three_seasons(self, tag):
+        """A Program with THREE Seasons, none carrying a Division, Team, or
+        Venue grant — deletable and archivable with zero dependency block, so
+        the fixture's OWN plumbing can never be the explanation for a result
+        in the #159 review finding 2 case below."""
+        svc = self.api.setup
+        program = svc.create_program(f"{tag} Program")
+        s1 = svc.create_season(program.id, f"{tag} S1")
+        s2 = svc.create_season(program.id, f"{tag} S2")
+        s3 = svc.create_season(program.id, f"{tag} S3")
+        return {"tag": tag, "program_id": program.id,
+               "s1": s1.id, "s2": s2.id, "s3": s3.id}
+
+    def _delete_season(self, client, season_id):
+        status, raw, _ = self._req(
+            client, "POST", f"/api/setup/season/{season_id}/delete", {})
+        self.assertEqual(status, 200, raw)
 
     def _read_thread(self, client, season_id, kind, epoch, out):
         def run():
@@ -925,7 +976,7 @@ class ContextReadCancelHandoffCases(ContextReadEpochBase):
                 "something is retaining state, and the rejected design's "
                 "failure mode is reachable again")
             self.assertEqual(
-                epoch_verdict(self.api.store, user_id, echoed), EPOCH_MISMATCH,
+                epoch_verdict(echoed, self._epoch(user_id)), EPOCH_MISMATCH,
                 "the superseded read stopped being recognised as superseded")
 
             park.let_go()
@@ -1443,26 +1494,36 @@ class ContextReadCancelHandoffCases(ContextReadEpochBase):
 
     def test_the_epoch_survives_a_process_restart_of_the_derivation(self):
         """PROPERTY 1 through the real store, on every backend: the token is a
-        function of PERSISTED state, so re-importing the deriving module — the
-        closest a test gets to 'a different process reading the same row' —
-        produces the identical value. A per-process registry could not."""
+        function of PERSISTED state — the effective tuple ``ContextService``
+        resolves plus the persisted generation — so re-importing the deriving
+        module — the closest a test gets to 'a different process reading the
+        same material' — produces the identical value for the identical
+        material. A per-process registry could not."""
         fx = self._program_with_two_seasons("Restart")
         username, user_id = self._operator("restart")
         client = self._login(username)
         self._select(client, fx["program_id"], fx["s1"])
         before = self._epoch_from_api(client)
 
+        generation, program, season, league = (
+            self.api.context.resolve_epoch_state(
+                user_id, Role.LEAGUE_ADMIN, {}))
         module = importlib.import_module(
             "hockey_scheduler.services.context_epoch")
         reloaded = importlib.reload(module)
-        self.assertEqual(reloaded.context_epoch(self.api.store, user_id),
-                         before,
-                         "a fresh import of the deriving module produced a "
-                         "different token for the same persisted row")
-        # The row, read straight out of the store, is what it hashed.
+        self.assertEqual(
+            reloaded.context_epoch(user_id, generation, program, season,
+                                   league),
+            before,
+            "a fresh import of the deriving module produced a different "
+            "token for the identical material")
+        # The row, read straight out of the store, is what the generation
+        # came from; the resolution above is what the effective tuple did.
         row = self.api.store.get_active_context(user_id)
         self.assertIsInstance(row, ActiveContext)
         self.assertEqual(row.season_id, fx["s1"])
+        self.assertEqual(program.id, fx["program_id"])
+        self.assertEqual(season.id, fx["s1"])
 
     # ======================================================================
     # 8. THE KEYED MAC (#159 review finding 4), end to end over real HTTP
@@ -1522,6 +1583,243 @@ class ContextReadCancelHandoffCases(ContextReadEpochBase):
                 headers={CONTEXT_EPOCH_HEADER: fresh})
             self.assertEqual(status, 200, raw)
         self._assert_gate_is_clean("after the rotation discard")
+
+    # ======================================================================
+    # 9. THE EFFECTIVE TUPLE, NOT THE RAW ROW (#159 review finding 2)
+    # ======================================================================
+    def test_a_deleted_saved_row_then_an_archived_fallback_moves_the_epoch(self):
+        """FINDING 2'S EXACT POC, reproduced and closed.
+
+            Persisted S1 explicitly. Deleted S1 -> /api/context now resolves
+              the deterministic fallback (S2 or S3 — whichever `_fallback`
+              picks; this case observes it rather than predicting it).
+            Archived THAT fallback -> the fallback's OWN candidate set
+              shrank, so resolve() moves again, to the remaining Season.
+
+        Through both moves the RAW ActiveContext ROW never changes — it still
+        names the deleted S1, because #159/#409 explicitly PRESERVE an
+        invalid saved row rather than rewriting it, so a later restore of
+        authorization/existence resolves it again. Against a token bound to
+        that raw row alone, both EFFECTIVE moves are invisible: a read
+        rendered under the first fallback's epoch, echoed after ITS archive,
+        would still "match" and reach the ceiling naming an Season that is
+        now archived — a 404, not the 204 discard the effective move earned
+        it. Against the fix (the epoch bound to the EFFECTIVE tuple), each
+        move is visible and the stale read is discarded before the ceiling
+        runs; a token for the CURRENT effective resolution is still admitted
+        normally.
+
+        THE ARCHIVE ARRIVES ON A SEPARATE OPERATOR, deliberately: #409's
+        explicit-selection-only mutation gate judges a write against the
+        ACTOR's own SAVED context (never a fallback — ``ContextService.
+        resolve_saved_with_league``), so the PRIMARY operator's own raw row
+        (still naming the deleted S1) could not itself archive anything
+        without first explicitly re-selecting — which would rewrite the very
+        row this case is proving stays untouched. A second operator, tab, or
+        device is exactly the shape #159's own docstring already describes
+        for this interleaving, and the epoch is compared against the
+        PRIMARY operator's own persisted row and resolution — never the
+        archiver's — so which account performs the archive changes nothing
+        about what is being measured.
+        """
+        fx = self._empty_program_with_three_seasons("Delete2")
+        username, user_id = self._operator("delete2")
+        client = self._login(username)
+        archiver_name, _archiver_id = self._operator("delete2arch")
+        archiver = self._login(archiver_name)
+
+        self._select(client, fx["program_id"], fx["s1"])
+        ctx0 = self._selected_context(client)
+        self.assertEqual(ctx0["season_id"], fx["s1"])
+        epoch_s1 = ctx0["context_epoch"]
+        raw_before = self.api.store.get_active_context(user_id)
+        self.assertEqual(raw_before.season_id, fx["s1"])
+
+        # -- move 1: delete the saved Season -> resolve() falls back -------
+        self._delete_season(client, fx["s1"])
+        ctx1 = self._selected_context(client)
+        fallback_1 = ctx1["season_id"]
+        fallback_1_program = ctx1["program_id"]
+        self.assertIsNotNone(
+            fallback_1, "the fixture left no authorized active Season for "
+            "the fallback to land on, so this case measures nothing")
+        self.assertNotEqual(fallback_1, fx["s1"])
+        epoch_1 = ctx1["context_epoch"]
+        self.assertNotEqual(
+            epoch_1, epoch_s1,
+            "the epoch did not move when the EFFECTIVE resolution moved "
+            "from the deleted S1 to its fallback — finding 2's exact gap")
+        raw_1 = self.api.store.get_active_context(user_id)
+        self.assertEqual(
+            raw_1.season_id, fx["s1"],
+            "the saved row was REWRITTEN by a deleted-Season resolve — "
+            "#159/#409 require it be preserved, not corrected, so a later "
+            "restore of authorization/existence resolves it again")
+
+        # -- move 2: archive the fallback -> resolve() falls back again ----
+        # NOTE: the fallback need not belong to `fx["program_id"]` — a
+        # global LEAGUE_ADMIN's fallback search ranges over every Program
+        # this store has ever authorized it for (this class runs many cases
+        # against one shared store), and always lands on the lexically
+        # FIRST Program with an authorized active Season. The archiver
+        # selects whatever `ctx1` actually named, not this fixture's own
+        # Program id.
+        self._select(archiver, fallback_1_program, fallback_1)
+        self._archive(archiver, fallback_1)
+        ctx2 = self._selected_context(client)
+        fallback_2 = ctx2["season_id"]
+        self.assertIsNotNone(
+            fallback_2, "the fixture left no SECOND authorized active "
+            "Season, so this case measures nothing")
+        self.assertNotEqual(fallback_2, fallback_1)
+        epoch_2 = ctx2["context_epoch"]
+        self.assertNotEqual(
+            epoch_2, epoch_1,
+            "the epoch did not move when the fallback's OWN candidate set "
+            "changed and the effective resolution moved again — the second "
+            "half of finding 2's exact gap")
+        raw_2 = self.api.store.get_active_context(user_id)
+        self.assertEqual(
+            raw_2.season_id, fx["s1"],
+            "the saved row moved on an archive of an UNRELATED Season — it "
+            "must stay exactly what the operator themselves chose")
+
+        # -- the stale read: epoch_1 (the deleted-then-superseded fallback's
+        #    epoch), echoed now that the effective resolution has moved on.
+        service = self._watch_service("get_venue_grant_candidates")
+        status, raw, _ = self._req(
+            client, "GET",
+            f"/api/v2/setup/seasons/{fallback_1}/venue-candidates",
+            headers={CONTEXT_EPOCH_HEADER: epoch_1})
+        self.assertEqual(
+            status, 204,
+            f"a read rendered under the deleted-then-superseded fallback's "
+            f"epoch reached the ceiling ({status}) instead of being "
+            f"discarded — the epoch is still bound to the raw row rather "
+            f"than the effective resolution: {raw!r}")
+        self.assertEqual(raw, "", "a discard must carry no body")
+        self.assertEqual(
+            service, [],
+            "the stale read reached ApiService — the ceiling WAS "
+            "evaluated for it, so the discard did not short-circuit in "
+            "front of it")
+
+        # -- the fresh token: admitted normally, to the CURRENT ceiling ----
+        status, raw, body = self._req(
+            client, "GET",
+            f"/api/v2/setup/seasons/{fallback_2}/venue-candidates",
+            headers={CONTEXT_EPOCH_HEADER: epoch_2})
+        self.assertEqual(
+            status, 200,
+            f"a fresh token for the CURRENT effective resolution must be "
+            f"admitted: {raw}")
+        self.assertIn("candidates", body, raw)
+        self._assert_gate_is_clean("after the finding-2 PoC sweep")
+
+    # ======================================================================
+    # 10. THE PERSISTED GENERATION, NOT THE WALL CLOCK (#159 review
+    #     finding 5)
+    # ======================================================================
+    def test_two_writes_under_an_identical_frozen_clock_still_move_the_epoch(self):
+        """FINDING 5'S EXACT SCENARIO: ``updated_at`` is not a reliable
+        "moves on every switch" signal, because two commits CAN land inside
+        the same wall-clock tick — a coarse system clock, load, or (driven
+        here directly rather than waited for) a clock frozen for both
+        writes. The persisted GENERATION never consults a clock at all: it
+        is read then written one higher inside each write's own transaction,
+        so it moves on the second write regardless of what the clock says.
+        """
+        fx = self._program_with_two_seasons("FrozenClock")
+        username, user_id = self._operator("frozenclock")
+        client = self._login(username)
+
+        frozen = datetime(2027, 1, 1, tzinfo=timezone.utc)
+        original_clock = self.api.context.clock
+        self.api.context.clock = lambda: frozen
+        try:
+            self._select(client, fx["program_id"], fx["s1"])
+            row_1 = self.api.store.get_active_context(user_id)
+            epoch_1 = self._epoch(user_id)
+
+            self._select(client, fx["program_id"], fx["s2"])
+            row_2 = self.api.store.get_active_context(user_id)
+            epoch_2 = self._epoch(user_id)
+        finally:
+            self.api.context.clock = original_clock
+
+        self.assertEqual(
+            row_1.updated_at, row_2.updated_at,
+            "the fixture did not actually freeze the clock — this case "
+            "proves nothing without two IDENTICAL timestamps")
+        self.assertNotEqual(row_1.season_id, row_2.season_id,
+                            "the two writes selected the same tuple — this "
+                            "case needs a genuine switch")
+        self.assertEqual(
+            row_2.generation, row_1.generation + 1,
+            "the persisted generation did not move by exactly one on the "
+            "second write")
+        self.assertNotEqual(
+            epoch_1, epoch_2,
+            "two switches under an IDENTICAL frozen clock produced the "
+            "SAME epoch — updated_at alone cannot be trusted to move on "
+            "every switch, and the generation counter must be what "
+            "actually does")
+
+    def test_concurrent_a_to_b_to_a_never_loses_a_generation_step(self):
+        """FINDING 5'S CONCURRENCY HALF: A->B->A driven through REAL
+        concurrent requests (separate sessions for the same account,
+        switching at once) must not let the generation's read-then-write
+        step LOSE an update. A lost update would leave the counter short and
+        could let two of the writes collide on the SAME generation — the
+        A -> B -> A epoch reuse finding 5 exists to close, reached by a race
+        rather than by a coarse clock this time. Six alternating switches,
+        not two, so a single lucky ordering cannot hide an occasional loss —
+        run on Memory/SQLite/PostgreSQL, so the store's own retry-on-conflict
+        (the ``ConcurrencyConflictError`` handling ``ContextService.
+        _snapshot`` already relies on for every other read-then-write) is
+        what is actually being exercised here, on every backend, not merely
+        assumed to cover this one too."""
+        fx = self._program_with_two_seasons("ConcGen")
+        username, user_id = self._operator("concgen")
+        setup_client = self._login(username)
+        self._select(setup_client, fx["program_id"], fx["s1"])
+        start_generation = self.api.store.get_active_context(
+            user_id).generation
+
+        rounds = 6
+        errors = []
+
+        def switch_round(target):
+            try:
+                client = self._login(username)
+                status, raw, _ = self._req(
+                    client, "POST", "/api/context",
+                    {"program_id": fx["program_id"], "season_id": target})
+                if status != 200:
+                    errors.append((target, status, raw))
+            except Exception as exc:                    # pragma: no cover
+                errors.append((target, "exception", repr(exc)))
+
+        threads = [
+            threading.Thread(target=switch_round,
+                             args=(fx["s2"] if i % 2 == 0 else fx["s1"],))
+            for i in range(rounds)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(PATIENCE)
+        self.assertEqual(errors, [], f"a concurrent switch failed: {errors}")
+
+        final = self.api.store.get_active_context(user_id)
+        self.assertIn(final.season_id, (fx["s1"], fx["s2"]),
+                      "the final persisted tuple is neither requested "
+                      "Season — a concurrent write corrupted it")
+        self.assertEqual(
+            final.generation, start_generation + rounds,
+            f"the final generation ({final.generation}) is not exactly "
+            f"{rounds} past the pre-churn value ({start_generation}) — a "
+            f"concurrent write lost its increment, which can reuse an "
+            f"epoch across a switch exactly as finding 5 describes")
 
 
 class MemoryContextReadEpochTest(ContextReadCancelHandoffCases, unittest.TestCase):

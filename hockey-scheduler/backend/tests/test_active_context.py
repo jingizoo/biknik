@@ -45,6 +45,9 @@ from hockey_scheduler.web.server import STATE, Handler
 
 _VERSION = "044_active_context"
 _LEAGUE_VERSION = "049_active_context_league"   # #345 — ALTERs 044's table
+_GENERATION_VERSION = "051_active_context_generation"  # #159 review findings
+                                                        # 2+5 — ALTERs 044's
+                                                        # table too
 ADMIN = (Role.LEAGUE_ADMIN, {})       # (role, scope) for a global operator
 
 
@@ -1287,17 +1290,20 @@ class ActiveContextMigrationTest(unittest.TestCase):
     def _downgrade(self, store):
         """Simulate a genuinely pre-044 database.
 
-        Both versions that touch ``user_active_context`` are de-registered, not
-        just 044: migration 049 (#345) ALTERs the very table 044 creates, so
-        leaving 049 recorded while dropping 044 would simulate a state real
-        forward-only migration can never produce (the table recreated by 044
-        without 049's ``league_id`` column, yet 049 marked applied and therefore
-        skipped). Forward-only ordering — 044 then 049 — is what an adopted
-        database actually runs, and what this test must exercise."""
+        Every version that touches ``user_active_context`` is de-registered,
+        not just 044: migration 049 (#345) and migration 051 (#159 review
+        findings 2+5) both ALTER the very table 044 creates, so leaving either
+        recorded while dropping 044 would simulate a state real forward-only
+        migration can never produce (the table recreated by 044 without a
+        later ALTER's column, yet that version marked applied and therefore
+        skipped — exactly the "no column named generation" shape a real
+        adopted database, which always runs 044 then 049 then 051 in order,
+        can never reach). Forward-only ordering is what this test must
+        exercise."""
         with store.transaction():
             cur = store.conn.cursor()
             cur.execute("DROP TABLE IF EXISTS user_active_context")
-            for version in (_VERSION, _LEAGUE_VERSION):
+            for version in (_VERSION, _LEAGUE_VERSION, _GENERATION_VERSION):
                 cur.execute(store.dialect.sql(
                     "DELETE FROM schema_migrations WHERE version = ?"),
                     (version,))
