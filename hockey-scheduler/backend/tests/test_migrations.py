@@ -309,12 +309,26 @@ class MigrationApplyTest(unittest.TestCase):
 class MigrationSchemaParityTest(unittest.TestCase):
     """The hand-written migration SQL must match the SPECS the mapper uses."""
 
+    # Columns that may exist in the DATABASE while deliberately absent from
+    # the mapper's SPEC: fields deprecated OUT of the model/contract whose
+    # physical column is retained because migrations never drop or rewrite
+    # data (the migration policy note in sql_store.py). #273 removed
+    # ``guardian_person_id`` from Player — GuardianLink is the real guardian
+    # mechanism and no service ever read the field — and dropping the dead
+    # column is an explicit follow-up migration, at which point this entry
+    # simply becomes unnecessary (subtraction also passes once the column is
+    # gone). Anything NOT listed here still fails the drift gate.
+    _DEPRECATED_DB_ONLY_COLUMNS = {"players": {"guardian_person_id"}}
+
     def test_every_spec_table_matches_migrated_columns(self):
         store = SqlStore(":memory:")
         for spec in SPECS.values():
             with self.subTest(table=spec.table):
+                allowed_extra = self._DEPRECATED_DB_ONLY_COLUMNS.get(
+                    spec.table, set())
                 self.assertEqual(
-                    _table_columns(store, spec.table), set(spec.names),
+                    _table_columns(store, spec.table) - allowed_extra,
+                    set(spec.names),
                     f"{spec.table} columns drifted from the SPEC")
 
 

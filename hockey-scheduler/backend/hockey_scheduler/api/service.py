@@ -143,6 +143,33 @@ def _serialize(obj) -> dict:
     return _jsonify(obj)
 
 
+# The #273 PRIVATE athlete-identity fields. NEVER serialized by default —
+# every Player-carrying facade payload goes through _player_dto, so a bare
+# _serialize(Player) can't quietly leak them into a coach/public response.
+_PLAYER_PRIVATE_FIELDS = ("birthdate", "registration_number")
+
+
+def _player_dto(player, include_identity: bool = False) -> dict:
+    """Serialize a Player with the #273 private identity fields stripped.
+
+    The DEFAULT shape for every facade payload that carries a Player —
+    create/edit/deactivate responses and every list — so ordinary-Coach and
+    public consumers can never receive a birthdate or governing-body
+    registration number (#273 AC[2]; the bounded-#124 owner ruling: coaches
+    get eligibility summaries, never raw protected values). Operator
+    surfaces opt in per call via ``include_identity``, to be MANAGE_SETUP-
+    gated at the HTTP layer exactly like ``include_email`` (#268).
+    ``skill_rating`` stays in the default DTO deliberately: it is the
+    coach-facing 1-7 rating #287's substitute ranking consumes, not
+    identity data.
+    """
+    row = _serialize(player)
+    if not include_identity:
+        for field in _PLAYER_PRIVATE_FIELDS:
+            row.pop(field, None)
+    return row
+
+
 def _group(rows, attr):
     """Index dataclass rows by a foreign-key attribute → {key: [rows]}.
 
@@ -11864,23 +11891,41 @@ class ApiService:
         return out
 
     @catch
-    def create_player(self, team_id: str, name: str, position: str,
+    def create_player(self, team_id: str, name: Optional[str] = None,
+                      position: str = None,
                       jersey_number: Optional[int] = None,
                       email: Optional[str] = None,
                       shoots: Optional[str] = None,
                       is_active: bool = True,
-                      actor_id: Optional[str] = None) -> dict:
+                      actor_id: Optional[str] = None,
+                      first_name: Optional[str] = None,
+                      last_name: Optional[str] = None,
+                      preferred_name: Optional[str] = None,
+                      birthdate: Optional[str] = None,
+                      registration_number: Optional[str] = None,
+                      skill_rating: Optional[int] = None) -> dict:
         # Pass position through raw: the service's canonical _validate_position
         # parses/validates it with a field-level invalid_position error (#268
         # review), so create and edit share one validator and the same field.
-        return _serialize(self.setup.add_player(
+        # #273: either flattened `name` or structured first+last (one shared
+        # service contract); the response is the default Player DTO, which
+        # strips the private birthdate/registration_number like every other
+        # facade payload — the operator list re-reads them via its explicit
+        # opt-in.
+        return _player_dto(self.setup.add_player(
             team_id, name, position,
             jersey_number=jersey_number, email=email, shoots=shoots,
-            is_active=is_active, actor_id=actor_id))
+            is_active=is_active, actor_id=actor_id,
+            first_name=first_name, last_name=last_name,
+            preferred_name=preferred_name, birthdate=birthdate,
+            registration_number=registration_number,
+            skill_rating=skill_rating))
 
     @catch
     def list_players(self, team_id: Optional[str] = None,
-                     include_email: bool = False, user_id=None, role=None,
+                     include_email: bool = False,
+                     include_identity: bool = False,
+                     user_id=None, role=None,
                      scope=None) -> List[dict]:
         """#369 self-audit: when a real user context is supplied, the
         unfiltered list narrows to Teams in the caller's ACTIVE Program.
@@ -11923,22 +11968,23 @@ class ApiService:
                             if t.program_id == program.id
                             and (league is None or t.league_id == league.id)}
                 players = [p for p in players if p.team_id in in_scope]
-        rows = [_serialize(p) for p in players]
-        # The Player DTO deliberately carries no email (it reaches coach/roster
-        # views). Only the MANAGE_SETUP-gated operator list opts in, so the edit
-        # drawer (#268) can prefill the current address without ever exposing it
-        # on a coach/public payload.
-        #
-        # This IS a sensitive read of the SAME CONTACT_DESTINATION category
-        # the contacts registry gates (#426 review finding 2:
-        # "Player-email reads... also read or return stored destinations
-        # outside this gate") — policy-checked and audited using the SAME
-        # `role`/`user_id` this method already threads through for Program
-        # scoping. Masks rather than refuses on denial (the player LIST
-        # itself is not privacy-gated, only the email column is), so an
-        # unauthorized `include_email=True` caller still gets the roster,
-        # just with every email blanked — one durable denial row, not a
-        # broken listing.
+        # The default Player DTO carries no email and (#273) no birthdate or
+        # registration number — it reaches coach/roster views. Only the
+        # MANAGE_SETUP-gated operator list opts in (include_email for the
+        # #268 edit drawer; include_identity for the #273 identity fields),
+        # so private values never ride a coach/public payload.
+        rows = [_player_dto(p, include_identity=include_identity)
+                for p in players]
+        # The include_email opt-in below IS a sensitive read of the SAME
+        # CONTACT_DESTINATION category the contacts registry gates (#426
+        # review finding 2: "Player-email reads... also read or return
+        # stored destinations outside this gate") — policy-checked and
+        # audited using the SAME `role`/`user_id` this method already
+        # threads through for Program scoping. Masks rather than refuses on
+        # denial (the player LIST itself is not privacy-gated, only the
+        # email column is), so an unauthorized `include_email=True` caller
+        # still gets the roster, just with every email blanked — one
+        # durable denial row, not a broken listing.
         if include_email:
             request_id = self._safe_request_id(None)
             email_role, email_label = self._privacy_principal(role)
@@ -11976,9 +12022,11 @@ class ApiService:
         """
         kwargs = {key: fields[key]
                   for key in ("name", "position", "jersey_number", "shoots",
-                              "email")
+                              "email", "first_name", "last_name",
+                              "preferred_name", "birthdate",
+                              "registration_number", "skill_rating")
                   if key in fields}
-        return _serialize(self.setup.update_player(
+        return _player_dto(self.setup.update_player(
             player_id, actor_id=actor_id, **kwargs))
 
     @catch
@@ -11986,8 +12034,67 @@ class ApiService:
                           actor_id: Optional[str] = None,
                           reason: Optional[str] = None) -> dict:
         """Deactivate/reactivate a Player without deleting history (#270)."""
-        return _serialize(self.setup.set_player_active(
+        return _player_dto(self.setup.set_player_active(
             player_id, active, actor_id=actor_id, reason=reason))
+
+    # -- athlete identity + age eligibility (#273) -----------------------
+
+    @catch
+    def set_age_eligibility_rule(self, league_season_id: str,
+                                 cutoff_month=None, cutoff_day=None,
+                                 tiers=None, enforcement=None,
+                                 actor_id: Optional[str] = None) -> dict:
+        """Append the next VERSION of a LeagueSeason's cutoff/age-tier rule.
+
+        Warn-first (#273): ``enforcement`` defaults to ``"warn"``; nothing in
+        this slice hard-blocks on it. Rule rows are immutable history — the
+        response carries the version so eligibility answers stay
+        reproducible.
+        """
+        return _serialize(self.setup.set_age_eligibility_rule(
+            league_season_id, cutoff_month, cutoff_day, tiers,
+            enforcement=enforcement, actor_id=actor_id))
+
+    @catch
+    def list_age_eligibility_rules(self,
+                                   league_season_id: str) -> List[dict]:
+        """Every rule version for one LeagueSeason, ascending (audit/history
+        view; rules contain no athlete data)."""
+        return [_serialize(rule) for rule in
+                self.store.age_eligibility_rules_for_league_season(
+                    league_season_id)]
+
+    @catch
+    def evaluate_player_eligibility(self, player_id: str, division_id: str,
+                                    include_details: bool = False) -> dict:
+        """Is this athlete age-eligible for this Division? (#273 AC[1])
+
+        The DEFAULT response is the Coach-safe eligibility SUMMARY the
+        bounded-#124 owner ruling requires — status / reason / tier /
+        rule version / enforcement — never the birthdate (which no mode of
+        this method returns). ``include_details`` adds the derived
+        ``age_at_cutoff`` + ``cutoff_date`` for operator surfaces, to be
+        MANAGE_SETUP-gated at the HTTP layer like ``include_email``.
+        """
+        result = self.setup.evaluate_player_age_eligibility(
+            player_id, division_id)
+        if not include_details:
+            for key in ("age_at_cutoff", "cutoff_date"):
+                result.pop(key, None)
+        return result
+
+    @catch
+    def player_duplicate_report(self,
+                                team_id: Optional[str] = None) -> dict:
+        """Duplicate-candidate warnings (#273 AC[4]) — operator tooling.
+
+        Read-only; never merges and never matches by name alone. Carries
+        registration-number values (they are what an operator de-duplicates
+        by), so its future HTTP route is MANAGE_SETUP-gated like the
+        include_email/include_identity opt-ins; it is never part of a
+        coach/public payload.
+        """
+        return {"warnings": self.setup.player_duplicate_report(team_id)}
 
     @catch
     def create_game(self, season_id: str, division_id: str, home_team_id: str,
@@ -12046,7 +12153,10 @@ class ApiService:
             if not isinstance(text, str):
                 raise ValidationError(f"{name}_csv must be a CSV text string.")
             sheets[name] = parse_csv_text(text)
-        return validate_import(sheets, store=self.store)
+        # today (#273): from the setup service's injected clock, so the
+        # dry-run's future-birthdate answer matches the commit's exactly.
+        return validate_import(sheets, store=self.store,
+                               today=self.setup.clock().date())
 
     # ====================================================================
     # Pilot onboarding import — teams + players commit (#93)

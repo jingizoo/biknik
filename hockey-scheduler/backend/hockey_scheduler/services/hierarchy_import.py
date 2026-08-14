@@ -30,6 +30,16 @@ from ..domain.jersey import (
     MIN_JERSEY_NUMBER,
     parse_jersey_cell,
 )
+from ..domain.identity import (
+    MAX_SKILL_RATING,
+    MIN_SKILL_RATING,
+    normalize_birthdate,
+    normalize_preferred_name,
+    normalize_registration_number,
+    normalize_skill_rating,
+    normalized_name_key,
+)
+from ..domain.shooting import normalize_shoots
 # The season-boundary parser + timezone resolver are shared with the interactive
 # create_season path (#272) so manual setup and this import normalize dates
 # identically. setup_service does not import this module, so there is no cycle.
@@ -95,10 +105,16 @@ HIERARCHY_TEMPLATES = {
     ),
     # Player (#260): stable player_code -> Team. email is optional; when
     # supplied it may create/update the same player:<id> ContactDestination
-    # manual creation already produces.
+    # manual creation already produces. #273 adds the optional identity
+    # columns: preferred_name, shoots (L/R), birthdate (YYYY-MM-DD, private),
+    # registration_number (governing-body id, private), skill_rating (1-7).
+    # A blank/absent optional cell means "leave as-is", never a clear.
     "players_csv": (
-        "player_code,team_code,first_name,last_name,jersey_number,position,email\n"
-        "P001,LIONS,Jane,Smith,7,forward,jane@example.com\n"
+        "player_code,team_code,first_name,last_name,jersey_number,position,"
+        "email,preferred_name,shoots,birthdate,registration_number,"
+        "skill_rating\n"
+        "P001,LIONS,Jane,Smith,7,forward,jane@example.com,JJ,L,2015-03-02,"
+        "HC-12345,4\n"
     ),
     # Season registrations (#180, #260): one row per team's participation in
     # a season. league_code is REQUIRED (issue #260 review decision 2) — an
@@ -477,7 +493,132 @@ def _check_player_jersey_conflicts(report, player_rows, store, existing_teams,
                 "jersey_number")
 
 
-def validate_hierarchy_import(sheets: Dict[str, List[dict]], store) -> dict:
+def _identity_pair_proven_different(a_birth, a_reg, b_birth, b_reg) -> bool:
+    """Two same-name records are DISAMBIGUATED only when both carry a
+    birthdate or registration number that proves them different people
+    (#273). Absent data can never disambiguate."""
+    return ((a_birth is not None and b_birth is not None and a_birth != b_birth)
+            or (a_reg is not None and b_reg is not None and a_reg != b_reg))
+
+
+def _check_player_duplicates(report, player_rows, store, existing_teams):
+    """#273 AC[4]: report ambiguous/duplicate athlete identities BEFORE any
+    write — reads only, never a merge, never a name-alone match.
+
+    * ``duplicate_registration_number`` (ERROR): one governing-body id on two
+      rows aimed at ONE team, or colliding with a DIFFERENT existing player
+      on that same persisted team — the commit hard-refuses these, so the
+      preview must too.
+    * ``shared_registration_number`` (WARNING): the same id across different
+      teams — legitimate under the legacy permanent Player→Team model (one
+      human, two teams), but worth an operator's look.
+    * ``duplicate_player_name`` (WARNING): exact same-name rows aimed at one
+      team (or matching an existing player on that team, other than the row's
+      own ``player_code`` self-update) where the pair lacks disambiguating
+      birthdate/registration data. A warning only — never blocks the import.
+
+    Sheet-vs-store comparisons use the CURRENT store rows not updated by this
+    same sheet; a row's own persisted player (same player_code) is its
+    self-update, never its duplicate.
+    """
+    rows = []
+    for index, row in enumerate(player_rows, start=1):
+        team_code = _optional(row.get("team_code"))
+        first = _optional(row.get("first_name")) or ""
+        last = _optional(row.get("last_name")) or ""
+        name_key = normalized_name_key(f"{first} {last}")
+        registration, _reason = normalize_registration_number(
+            _optional(row.get("registration_number")))
+        birthdate, _reason = normalize_birthdate(
+            _optional(row.get("birthdate")))
+        code = _optional(row.get("player_code"))
+        rows.append((index, team_code, code, name_key, birthdate,
+                     registration))
+
+    upload_codes = {code for _i, _t, code, _k, _b, _r in rows if code}
+    existing_by_team = {}
+    for player in store.all_players():
+        if player.external_ref and player.external_ref in upload_codes:
+            continue  # updated by this sheet; compared as its post-commit row
+        existing_by_team.setdefault(player.team_id, []).append(player)
+
+    def _persisted_team_id(team_code):
+        team = existing_teams.get(team_code) if team_code else None
+        return team.id if team is not None else None
+
+    # -- registration numbers ------------------------------------------------
+    by_registration = {}
+    for entry in rows:
+        if entry[5] is not None:
+            by_registration.setdefault(entry[5], []).append(entry)
+    for registration, group in sorted(by_registration.items()):
+        team_codes = {entry[1] for entry in group if entry[1]}
+        if len(group) >= 2 and len(team_codes) <= 1:
+            for index, team_code, _c, _k, _b, _r in group:
+                report.error(
+                    "players", index, "duplicate_registration_number",
+                    f"registration_number {registration} appears on "
+                    f"multiple rows for team {team_code}.",
+                    "registration_number")
+        elif len(group) >= 2:
+            for index, _t, _c, _k, _b, _r in group:
+                report.warning(
+                    "players", index, "shared_registration_number",
+                    f"registration_number {registration} appears on rows "
+                    f"for several teams — one athlete duplicated across "
+                    f"teams, or a data error.", "registration_number")
+    for index, team_code, code, _key, _birth, registration in rows:
+        if registration is None:
+            continue
+        team_id = _persisted_team_id(team_code)
+        for player in (existing_by_team.get(team_id, []) if team_id else []):
+            if player.registration_number == registration:
+                report.error(
+                    "players", index, "duplicate_registration_number",
+                    f"registration_number {registration} already belongs to "
+                    f"existing player {player.id} on team {team_code}.",
+                    "registration_number")
+
+    # -- same-name-on-one-team warnings -------------------------------------
+    by_team_name = {}
+    for entry in rows:
+        if entry[1] and entry[3]:
+            by_team_name.setdefault((entry[1], entry[3]), []).append(entry)
+    for (team_code, _key), group in sorted(by_team_name.items()):
+        if len(group) < 2:
+            continue
+        proven = all(
+            _identity_pair_proven_different(a[4], a[5], b[4], b[5])
+            for i, a in enumerate(group) for b in group[i + 1:])
+        if not proven:
+            other_rows = ", ".join(str(entry[0]) for entry in group)
+            for index, _t, _c, _k, _b, _r in group:
+                report.warning(
+                    "players", index, "duplicate_player_name",
+                    f"Rows {other_rows} share one name on team {team_code} "
+                    f"without birthdate/registration data proving them "
+                    f"different people. They will import as separate "
+                    f"players — never merged by name.", "last_name")
+    for index, team_code, code, name_key, birthdate, registration in rows:
+        if name_key is None:
+            continue
+        team_id = _persisted_team_id(team_code)
+        for player in (existing_by_team.get(team_id, []) if team_id else []):
+            if normalized_name_key(player.name) != name_key:
+                continue
+            if not _identity_pair_proven_different(
+                    birthdate, registration,
+                    player.birthdate, player.registration_number):
+                report.warning(
+                    "players", index, "duplicate_player_name",
+                    f"Row matches existing player {player.id}'s exact name "
+                    f"on team {team_code} without disambiguating data; it "
+                    f"will import as a SEPARATE player — records are never "
+                    f"merged by name.", "last_name")
+
+
+def validate_hierarchy_import(sheets: Dict[str, List[dict]], store,
+                              today=None) -> dict:
     """Validate every hierarchy reference before any write.
 
     References may resolve from another sheet in this upload or from a unique,
@@ -485,6 +626,13 @@ def validate_hierarchy_import(sheets: Dict[str, List[dict]], store) -> dict:
     SeasonVenueAccess, an existing composite key). The function only reads
     the store. Returns every row's errors in one pass — it never stops at
     the first failure (#260 review).
+
+    ``today`` (#273): an optional :class:`datetime.date` the caller's clock
+    supplies (the commit path passes its service clock's date) so a FUTURE
+    birthdate is reported here, before any write. This function itself never
+    reads a clock; with ``today`` omitted, birthdate cells are still
+    format/calendar-checked and the future rule is enforced at commit by the
+    service validator.
     """
     rows = {name: list((sheets or {}).get(name) or [])
             for name in HIERARCHY_SHEET_NAMES}
@@ -680,9 +828,49 @@ def validate_hierarchy_import(sheets: Dict[str, List[dict]], store) -> dict:
             if at <= 0 or "." not in email[at + 1:]:
                 report.error("players", index, "invalid_email",
                             f"Invalid email {email!r}.", "email")
+        # -- optional identity cells (#273): the same pure-domain contracts
+        # the commit path enforces, so a clean preview cannot fail commit on
+        # these fields.
+        preferred = _optional(row.get("preferred_name"))
+        if preferred is not None:
+            _c, reason = normalize_preferred_name(preferred)
+            if reason is not None:
+                report.error("players", index, "invalid_preferred_name",
+                             f"Invalid preferred_name {preferred!r} "
+                             f"({reason}).", "preferred_name")
+        shoots = _optional(row.get("shoots"))
+        if shoots is not None:
+            _c, reason = normalize_shoots(shoots)
+            if reason is not None:
+                report.error("players", index, "invalid_shoots",
+                             f"Invalid shoots {shoots!r} (use L or R).",
+                             "shoots")
+        birthdate = _optional(row.get("birthdate"))
+        if birthdate is not None:
+            _c, reason = normalize_birthdate(birthdate, today=today)
+            if reason is not None:
+                report.error("players", index, "invalid_birthdate",
+                             f"Invalid birthdate {birthdate!r} ({reason}).",
+                             "birthdate")
+        registration = _optional(row.get("registration_number"))
+        if registration is not None:
+            _c, reason = normalize_registration_number(registration)
+            if reason is not None:
+                report.error("players", index, "invalid_registration_number",
+                             f"Invalid registration_number {registration!r} "
+                             f"({reason}).", "registration_number")
+        skill = _optional(row.get("skill_rating"))
+        if skill is not None:
+            _c, reason = normalize_skill_rating(skill)
+            if reason is not None:
+                report.error("players", index, "invalid_skill_rating",
+                             f"Invalid skill_rating {skill!r} (must be "
+                             f"{MIN_SKILL_RATING}-{MAX_SKILL_RATING}).",
+                             "skill_rating")
 
     _check_player_jersey_conflicts(
         report, rows["players"], store, existing_teams, upload_team_codes)
+    _check_player_duplicates(report, rows["players"], store, existing_teams)
 
     # -- permanent teams + registrations + season venue access --------------
     # Codes may resolve from this upload or from existing external_refs.
@@ -1225,7 +1413,8 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
         counts = _new_counts()
         try:
             with store.transaction():
-                result = validate_hierarchy_import(sheets, store)
+                result = validate_hierarchy_import(
+                    sheets, store, today=setup.clock().date())
                 if not result["ok"]:
                     return {
                         "committed": False,
@@ -1502,19 +1691,30 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
                     code = _clean(row.get("player_code"))
                     team = teams[_clean(row.get("team_code"))]
                     jersey = _optional(row.get("jersey_number"))
-                    name = (f"{_clean(row.get('first_name'))} "
-                            f"{_clean(row.get('last_name'))}").strip()
                     existing_player = players.get(code)
                     extra = {}
                     if existing_player is not None:
                         extra["staged_original_jersey"] = released.get(
                             existing_player.id, existing_player.jersey_number)
+                    # #273: the sheet's structured names are passed through
+                    # (the display name is derived by the shared contract,
+                    # no longer flattened here), plus the optional identity
+                    # cells — a blank/absent cell stays None = "leave as-is".
                     obj, created, changed = setup.upsert_imported_player(
-                        code, name, team.id,
+                        code, None, team.id,
                         Position(_clean(row.get("position")).lower()),
                         int(jersey) if jersey else None, _optional(row.get("email")),
                         existing=existing_player, actor_id=actor_id,
-                        import_batch_id=batch_id, **extra)
+                        import_batch_id=batch_id,
+                        first_name=_clean(row.get("first_name")),
+                        last_name=_clean(row.get("last_name")),
+                        preferred_name=_optional(row.get("preferred_name")),
+                        birthdate=_optional(row.get("birthdate")),
+                        registration_number=_optional(
+                            row.get("registration_number")),
+                        shoots=_optional(row.get("shoots")),
+                        skill_rating=_optional(row.get("skill_rating")),
+                        **extra)
                     players[code] = obj
                     _tally("players", created, changed)
 

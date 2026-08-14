@@ -14,7 +14,9 @@ mapping and commit remain #93's job.
 CSV column shapes (header row + data rows; no template/UI in this slice):
     teams.csv:      team_code, team_name, club_name, division_name
     players.csv:    player_code, first_name, last_name, team_code,
-                     jersey_number, position, email
+                     jersey_number, position, email,
+                     preferred_name, shoots, birthdate,
+                     registration_number, skill_rating   (#273, all optional)
     officials.csv:  official_code, name, email, home_club_name
     rinks.csv:      venue_name, rink_code, rink_name, address
     ice_slots.csv:  rink_code, start_time, end_time, slot_type
@@ -37,6 +39,16 @@ from ..domain import (
     intervals_overlap,
     parse_jersey_cell,
 )
+from ..domain.identity import (
+    MAX_SKILL_RATING,
+    MIN_SKILL_RATING,
+    normalize_birthdate,
+    normalize_preferred_name,
+    normalize_registration_number,
+    normalize_skill_rating,
+    normalized_name_key,
+)
+from ..domain.shooting import normalize_shoots
 from .ice_availability import curfew_instant, parse_hhmm
 
 IMPORT_SHEET_NAMES = ("teams", "players", "officials", "rinks", "ice_slots")
@@ -232,6 +244,157 @@ def _check_players(report: _Report, rows: List[dict], team_codes: set,
                 f"Duplicate jersey_number {key[1]} on team {team_code}; "
                 f"conflicting upload row(s): {upload_rows}{holder_text}.",
                 field="jersey_number")
+
+
+def _check_player_identity(report: _Report, rows: List[dict],
+                           store=None, today=None) -> None:
+    """#273 identity-cell checks + duplicate-candidate detection, all reads.
+
+    Field checks reuse the pure-domain contracts the commit path enforces
+    (``preferred_name`` / ``shoots`` / ``birthdate`` / ``registration_number``
+    / ``skill_rating`` — every one optional; blank = leave-as-is), so a row
+    that previews clean cannot fail commit on these cells. ``today`` is the
+    caller's clock date (the commit passes it) for the future-birthdate rule;
+    this function never reads a clock itself.
+
+    Duplicates (AC[4] — reported BEFORE any write; never merged, never
+    matched by name alone):
+
+    * one registration number on two rows for ONE team, or colliding with a
+      different existing player on that team → ERROR (commit refuses it);
+    * one registration number across teams in the sheet → WARNING;
+    * exact same-name rows on one team — or matching an existing same-team
+      player other than the row's own ``player_code`` self-update — lacking
+      birthdate/registration data that proves them different people →
+      WARNING (they import as separate players).
+    """
+    def _proven_different(a_birth, a_reg, b_birth, b_reg):
+        return ((a_birth is not None and b_birth is not None
+                 and a_birth != b_birth)
+                or (a_reg is not None and b_reg is not None
+                    and a_reg != b_reg))
+
+    checks = (
+        ("preferred_name", normalize_preferred_name,
+         "must be a short name"),
+        ("shoots", normalize_shoots, "use L or R"),
+        ("registration_number", normalize_registration_number,
+         "must be a short identifier without whitespace"),
+        ("skill_rating", normalize_skill_rating,
+         f"must be {MIN_SKILL_RATING}-{MAX_SKILL_RATING}"),
+    )
+    parsed = []
+    for i, row in enumerate(rows, start=1):
+        for field, normalizer, hint in checks:
+            value = row.get(field)
+            if _blank(value):
+                continue
+            _canonical, reason = normalizer(_clean(value))
+            if reason is not None:
+                report.error(
+                    "players", i,
+                    f"Invalid {field} {_clean(value)!r} ({hint}).",
+                    field=field)
+        birthdate_cell = row.get("birthdate")
+        birthdate = None
+        if not _blank(birthdate_cell):
+            birthdate, reason = normalize_birthdate(
+                _clean(birthdate_cell), today=today)
+            if reason is not None:
+                report.error(
+                    "players", i,
+                    f"Invalid birthdate {_clean(birthdate_cell)!r} "
+                    f"({reason}).", field="birthdate")
+        registration, _r = normalize_registration_number(
+            None if _blank(row.get("registration_number"))
+            else _clean(row.get("registration_number")))
+        first = "" if _blank(row.get("first_name")) else _clean(row.get("first_name"))
+        last = "" if _blank(row.get("last_name")) else _clean(row.get("last_name"))
+        name_key = normalized_name_key(f"{first} {last}")
+        team_code = (None if _blank(row.get("team_code"))
+                     else _clean(row.get("team_code")))
+        code = (None if _blank(row.get("player_code"))
+                else _clean(row.get("player_code")))
+        parsed.append((i, team_code, code, name_key, birthdate, registration))
+
+    upload_codes = {c for _i, _t, c, _k, _b, _r in parsed if c}
+    existing_teams = {}
+    existing_by_team = {}
+    if store is not None:
+        existing_teams = {t.external_ref: t for t in store.all_teams()
+                          if t.external_ref}
+        for player in store.all_players():
+            if player.external_ref and player.external_ref in upload_codes:
+                continue  # this sheet updates it; not a duplicate of itself
+            existing_by_team.setdefault(player.team_id, []).append(player)
+
+    by_registration = {}
+    for entry in parsed:
+        if entry[5] is not None:
+            by_registration.setdefault(entry[5], []).append(entry)
+    for registration, group in sorted(by_registration.items()):
+        team_codes = {entry[1] for entry in group if entry[1]}
+        if len(group) >= 2 and len(team_codes) <= 1:
+            for i, team_code, _c, _k, _b, _r in group:
+                report.error(
+                    "players", i,
+                    f"registration_number {registration} appears on multiple "
+                    f"rows for team {team_code}.",
+                    field="registration_number")
+        elif len(group) >= 2:
+            for i, _t, _c, _k, _b, _r in group:
+                report.warning(
+                    "players", i,
+                    f"registration_number {registration} appears on rows for "
+                    f"several teams — one athlete duplicated across teams, "
+                    f"or a data error.")
+    for i, team_code, code, _key, _birth, registration in parsed:
+        if registration is None or team_code is None:
+            continue
+        team = existing_teams.get(team_code)
+        for player in (existing_by_team.get(team.id, []) if team else []):
+            if player.registration_number == registration:
+                report.error(
+                    "players", i,
+                    f"registration_number {registration} already belongs to "
+                    f"existing player {player.id} on team {team_code}.",
+                    field="registration_number")
+
+    by_team_name = {}
+    for entry in parsed:
+        if entry[1] and entry[3]:
+            by_team_name.setdefault((entry[1], entry[3]), []).append(entry)
+    for (team_code, _key), group in sorted(by_team_name.items()):
+        if len(group) < 2:
+            continue
+        proven = all(
+            _proven_different(a[4], a[5], b[4], b[5])
+            for idx, a in enumerate(group) for b in group[idx + 1:])
+        if not proven:
+            row_list = ", ".join(str(entry[0]) for entry in group)
+            for i, _t, _c, _k, _b, _r in group:
+                report.warning(
+                    "players", i,
+                    f"Rows {row_list} share one name on team {team_code} "
+                    f"without birthdate/registration data proving them "
+                    f"different people. They will import as separate "
+                    f"players — never merged by name.")
+    for i, team_code, code, name_key, birthdate, registration in parsed:
+        if name_key is None or team_code is None:
+            continue
+        team = existing_teams.get(team_code)
+        for player in (existing_by_team.get(team.id, []) if team else []):
+            if normalized_name_key(player.name) != name_key:
+                continue
+            if not _proven_different(birthdate, registration,
+                                     player.birthdate,
+                                     player.registration_number):
+                report.warning(
+                    "players", i,
+                    f"Row matches existing player {player.id}'s exact name "
+                    f"on team {team_code} without disambiguating data; it "
+                    f"will import as a SEPARATE player — records are never "
+                    f"merged by name.")
 
 
 def _check_ice_slots(report: _Report, rows: List[dict], rink_codes: set) -> None:
@@ -596,13 +759,20 @@ def _check_overlaps(report: _Report, parsed_slots) -> None:
                     f"Slot overlaps another slot on the same rink (row {row_b}).")
 
 
-def validate_import(sheets: Dict[str, List[dict]], store=None) -> dict:
+def validate_import(sheets: Dict[str, List[dict]], store=None,
+                    today=None) -> dict:
     """Validate spreadsheet-shaped import rows without writing to the store.
 
     ``sheets`` maps sheet name -> list of row dicts; any of
     :data:`IMPORT_SHEET_NAMES` may be absent, treated as an empty sheet.
     Returns a report dict: ``{"ok", "summary", "errors", "warnings"}``.
     ``ok`` is true iff ``errors`` is empty — warnings never block it.
+
+    ``today`` (#273): optional :class:`datetime.date` from the CALLER's clock
+    (the commit paths pass theirs) so a future birthdate is reported here,
+    before any write; this function never reads a clock itself. Omitted,
+    birthdate cells are still format/calendar-checked and the future rule is
+    enforced at commit.
     """
     rows = {name: list(sheets.get(name) or []) for name in IMPORT_SHEET_NAMES}
     report = _Report()
@@ -616,6 +786,7 @@ def validate_import(sheets: Dict[str, List[dict]], store=None) -> dict:
 
     _check_players(report, rows["players"],
                    _codes(rows["teams"], "team_code"), store=store)
+    _check_player_identity(report, rows["players"], store=store, today=today)
     parsed_slots, slot_types = _check_ice_slots(
         report, rows["ice_slots"], _codes(rows["rinks"], "rink_code"))
     _check_overlaps(report, parsed_slots)
