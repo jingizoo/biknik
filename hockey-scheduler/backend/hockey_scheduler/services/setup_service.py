@@ -974,6 +974,12 @@ class SetupService:
         # non-race path).
         rules = self.store.age_eligibility_rules_for_league_season(
             league_season_id)
+        # #205 review round 1 finding 2 — a membership's league_season_id is
+        # a REQUIRED (non-nullable) foreign key onto this exact row, the same
+        # shape team registrations/games above already block on regardless of
+        # status; ANY membership (even released/transferred history) blocks.
+        memberships = [m for m in self.store.all_season_roster_memberships()
+                      if m.league_season_id == league_season_id]
         self._block_if_dependents(
             "league_season", league_season_id, "season binding", [
                 self._dep_group("division", divisions, lambda d: d.name),
@@ -983,7 +989,9 @@ class SetupService:
                 self._dep_group("schedule scenario", scenarios,
                                 lambda s: s.name),
                 self._dep_group("age eligibility rule", rules,
-                                lambda r: f"v{r.version}")])
+                                lambda r: f"v{r.version}"),
+                self._dep_group("roster membership", memberships,
+                                self._membership_label)])
         self.store.delete_league_season(league_season_id)
         self._audit("league_season_deleted", "league_season", league_season_id,
                     actor_id, {"league_id": ls.league_id,
@@ -2050,6 +2058,16 @@ class SetupService:
                 if self._season_of_league_season(reg.league_season_id)})
         to_move = []          # (reg, season_id) pairs eligible to move
         blocked = []          # {registration_id, season_id, affected_game_ids}
+        # #205 review round 1 finding 2 — {registration_id, season_id,
+        # affected_membership_ids}: a LIVE membership still names the OLD
+        # (LeagueSeason, Team) pair this transfer is about to move the
+        # registration OFF of. Moving/superseding underneath it would leave
+        # the membership's league_season_id naming a League the Team no
+        # longer plays in (Team<->LeagueSeason disagreement) — exactly the
+        # stranding the review demonstrated. Terminal rows are closed
+        # history and never block, mirroring the games check (cancelled
+        # games don't block either).
+        blocked_memberships = []
         for reg in fresh_candidates:
             season_id = self._season_of_league_season(reg.league_season_id)
             season = locked_seasons.get(season_id) if season_id else None
@@ -2067,14 +2085,29 @@ class SetupService:
                 blocked.append({"registration_id": reg.id,
                                 "season_id": season_id,
                                 "affected_game_ids": stranded})
-            else:
-                to_move.append((reg, season_id))
+                continue
+            live_memberships = self._open_memberships_for_league_season_team(
+                reg.league_season_id, team_id)
+            if live_memberships:
+                blocked_memberships.append({
+                    "registration_id": reg.id, "season_id": season_id,
+                    "affected_membership_ids":
+                        [m.id for m in live_memberships]})
+                continue
+            to_move.append((reg, season_id))
         if blocked:
             raise ValidationError(
                 "Cannot transfer this team while it has active registrations "
                 "with scheduled games; resolve those games first.",
                 {"reason": "team_transfer_strands_games", "team_id": team_id,
                  "blocked": blocked})
+        if blocked_memberships:
+            raise ValidationError(
+                "Cannot transfer this team while it has live roster "
+                "memberships on its current League; release/transfer them "
+                "first.",
+                {"reason": "team_transfer_strands_memberships",
+                 "team_id": team_id, "blocked": blocked_memberships})
 
         # #331 review round 18: resolve each candidate's target LeagueSeason
         # and check for a row ALREADY sitting there before any write --
@@ -2193,6 +2226,23 @@ class SetupService:
                 "games; resolve those games first.",
                 {"reason": "team_has_scheduled_games",
                  "affected_game_ids": stranded, "count": len(stranded)})
+        # #205 review round 1 finding 2 — a LIVE (non-terminal) membership on
+        # this exact (LeagueSeason, Team) says a player currently participates
+        # here; unregistering would strand it against a Team the operator just
+        # said is no longer participating (create_season_roster_membership
+        # itself refuses a NEW membership once the registration is inactive —
+        # this closes the same gap for an EXISTING one). Terminal (released/
+        # transferred) rows are closed history and never block, mirroring
+        # cancelled games above.
+        live_memberships = self._open_memberships_for_league_season_team(
+            reg.league_season_id, reg.team_id)
+        if live_memberships:
+            raise ValidationError(
+                "Cannot remove this team from the season while it has live "
+                "roster memberships; release/transfer them first.",
+                {"reason": "team_has_live_memberships",
+                 "affected_membership_ids": [m.id for m in live_memberships],
+                 "count": len(live_memberships)})
         reg.active = False
         self.store.save_season_team_registration(reg)
         self._audit("season_team_unregistered", "season_team_registration",
@@ -2272,9 +2322,20 @@ class SetupService:
         games = [g for g in self.store.all_games()
                 if g.season_id == season_id
                 and reg.team_id in (g.home_team_id, g.away_team_id)]
+        # #205 review round 1 finding 2 — a membership names this exact
+        # (LeagueSeason, Team) pair by REQUIRED (non-nullable) foreign key,
+        # so a permanent delete here is exactly the "required FK" shape
+        # games/regs already block on above: ANY membership blocks,
+        # regardless of status (even released/transferred history still
+        # names this row), mirroring delete_team/delete_league/delete_season
+        # blocking on ANY registration regardless of active status.
+        memberships = self.store.memberships_for_league_season_team(
+            reg.league_season_id, reg.team_id)
         self._block_if_dependents(
             "season_team_registration", registration_id, "registration", [
-                self._dep_group("game", games, self._matchup)])
+                self._dep_group("game", games, self._matchup),
+                self._dep_group("roster membership", memberships,
+                                self._membership_label)])
         detail = {"season_id": season_id, "team_id": reg.team_id,
                   "league_id": league_id, "division_id": reg.division_id,
                   "reason": "explicit_inactive_cleanup"}
@@ -2493,6 +2554,74 @@ class SetupService:
                 + ", ".join(s.value for s in MembershipStatus) + ".",
                 {"reason": "invalid_membership_status", "field": "status"})
 
+    def _open_memberships_for_league_season_team(
+            self, league_season_id: str, team_id: str
+            ) -> list:
+        """Every LIVE (non-terminal) membership at this exact (LeagueSeason,
+        Team) pair (#205 review round 1 finding 2) — the set a parent
+        mutation that stops this Team's participation there (unregister,
+        League transfer) must not silently strand. Terminal (released/
+        transferred) rows are closed history and are never returned."""
+        return [m for m in self.store.memberships_for_league_season_team(
+                    league_season_id, team_id)
+                if not m.status.is_terminal]
+
+    def _assert_membership_spine_valid(
+            self, membership: SeasonRosterMembership) -> None:
+        """Reactivation must recheck the SAME spine ``create_season_roster_
+        membership`` required at birth (#205 review round 1 finding 2):
+        Player, Team and LeagueSeason still exist, the Team still belongs to
+        the LeagueSeason's League, and the Team still holds an ACTIVE
+        registration there.
+
+        Without this, a membership PARKED (inactive/injured) before its
+        Team's registration was unregistered, or before the Team was
+        transferred to a different League, could be waved back to
+        ``active``/``applicant``/``affiliate`` even though the spine that
+        justified it no longer holds — reactivating a stint the parent side
+        has already ended. finding 2's OTHER fixes (unregister/transfer now
+        block while a LIVE membership exists) prevent this for anything
+        mutated going forward; this is the matching read-time guard for
+        rows that predate those fixes, or whose parent state changed by any
+        other route this store allows (e.g. a restored backup)."""
+        team = self.store.get_team(membership.team_id)
+        if team is None:
+            raise ValidationError(
+                "This membership's Team no longer exists.",
+                {"reason": "membership_team_missing",
+                 "membership_id": membership.id,
+                 "team_id": membership.team_id})
+        ls = self.store.get_league_season(membership.league_season_id)
+        if ls is None:
+            raise ValidationError(
+                "This membership's League season no longer exists.",
+                {"reason": "membership_league_season_missing",
+                 "membership_id": membership.id,
+                 "league_season_id": membership.league_season_id})
+        if team.league_id and ls.league_id != team.league_id:
+            raise ValidationError(
+                "This membership's Team has since moved to a different "
+                "League; it can no longer be reactivated as-is.",
+                {"reason": "membership_league_mismatch",
+                 "membership_id": membership.id, "team_id": team.id,
+                 "team_league_id": team.league_id,
+                 "league_season_league_id": ls.league_id})
+        registration = self.store.registration_for_team_in_league_season(
+            membership.league_season_id, membership.team_id)
+        if registration is None or not registration.active:
+            raise ValidationError(
+                "This membership's Team is no longer actively registered "
+                "in this season; it can no longer be reactivated as-is.",
+                {"reason": "team_not_registered",
+                 "membership_id": membership.id, "team_id": team.id,
+                 "league_season_id": membership.league_season_id})
+        if self.store.get_player(membership.player_id) is None:
+            raise ValidationError(
+                "This membership's Player no longer exists.",
+                {"reason": "membership_player_missing",
+                 "membership_id": membership.id,
+                 "player_id": membership.player_id})
+
     def _assert_membership_jersey_available(
             self, league_season_id: str, team_id: str, jersey_number,
             *, exclude_membership_id: Optional[str] = None) -> None:
@@ -2701,6 +2830,11 @@ class SetupService:
                 {"reason": "membership_status_unchanged",
                  "status": status.value})
         if status is MembershipStatus.ACTIVE:
+            # #205 review round 1 finding 2 — the spine check runs BEFORE
+            # the uniqueness re-checks: a reactivation onto a spine that no
+            # longer holds is invalid regardless of whether another active
+            # membership or jersey happens to conflict.
+            self._assert_membership_spine_valid(membership)
             self._assert_no_active_membership_conflict(
                 membership.player_id, membership.season_id,
                 exclude_membership_id=membership.id)
@@ -10574,6 +10708,15 @@ class SetupService:
         team = self.store.get_team(team_id) if team_id else None
         return team.name if team else (team_id or "—")
 
+    def _membership_label(self, m) -> str:
+        """Display label for a SeasonRosterMembership dependency-block row
+        (#205 review round 1 finding 2): the player's name plus its current
+        status, so a blocked parent mutation names WHO is stranding it, not
+        just an opaque membership id."""
+        player = self.store.get_player(m.player_id) if m.player_id else None
+        name = player.name if player else (m.player_id or "—")
+        return f"{name} ({m.status.value})"
+
     def _season_name(self, season_id) -> str:
         season = self.store.get_season(season_id) if season_id else None
         return season.name if season else (season_id or "—")
@@ -10650,6 +10793,11 @@ class SetupService:
         # explicit dependents (there is no FK to catch this at the DB layer).
         teams = [t for t in self.store.all_teams()
                  if t.league_id == league_id]
+        # #205 review round 1 finding 2 — same "required FK" shape as
+        # registrations/games above: ANY membership on any of this League's
+        # LeagueSeasons blocks, regardless of status.
+        memberships = [m for m in self.store.all_season_roster_memberships()
+                      if m.league_season_id in ls_ids]
         # #159 — a LeagueSeason binding is itself a dependent, NOT something this
         # delete may silently cascade away: the destructive-delete contract is
         # dependency-gated, itemized blockers with no implicit cascades. An
@@ -10665,7 +10813,9 @@ class SetupService:
                             lambda s: s.name),
             self._dep_group("team", teams, lambda t: t.name),
             self._dep_group("season binding", ls_rows,
-                            lambda ls: self._season_name(ls.season_id))])
+                            lambda ls: self._season_name(ls.season_id)),
+            self._dep_group("roster membership", memberships,
+                            self._membership_label)])
         self.store.delete_league(league_id)
         self._audit("level_deleted", "level", league_id, actor_id,
                     {"name": league.name, "program_id": league.program_id})
@@ -10752,6 +10902,11 @@ class SetupService:
         # Season. See _copy_forward_result_from_ledger_row.
         copy_forward_commits = (
             self.store.season_copy_forward_commits_for_season(season_id))
+        # #205 review round 1 finding 2 — same "required FK" shape as the
+        # registrations/games above: ANY membership in this Season blocks,
+        # regardless of status (``season_id`` is denormalized but NOT NULL
+        # on every membership row).
+        memberships = self.store.memberships_for_season(season_id)
         self._block_if_dependents("season", season_id, "season", [
             self._dep_group("level", levels, lambda lv: lv.name,
                             display="league"),
@@ -10765,7 +10920,9 @@ class SetupService:
                             lambda a: self._venue_name(a.venue_id)),
             self._dep_group("copy_forward_commit", copy_forward_commits,
                             lambda c: c.copy_forward_fingerprint,
-                            display="copy-forward commit")])
+                            display="copy-forward commit"),
+            self._dep_group("roster membership", memberships,
+                            self._membership_label)])
         self._cascade_scheduling_policy(
             PolicyScopeType.SEASON, season_id, actor_id)
         self.store.delete_season(season_id)
@@ -10887,6 +11044,13 @@ class SetupService:
                  if p.recipient_ref == team_id]
         devices = [d for d in self.store.all_device_tokens()
                    if d.recipient_ref == team_id]
+        # #205 review round 1 finding 2 — a membership's team_id is a
+        # REQUIRED (non-nullable) foreign key onto this exact Team, the same
+        # shape season registrations/games above already block on regardless
+        # of status; ANY membership (even released/transferred history)
+        # blocks.
+        memberships = [m for m in self.store.all_season_roster_memberships()
+                      if m.team_id == team_id]
         self._block_if_dependents("team", team_id, "team", [
             self._dep_group("season registration", regs,
                             lambda r: self._season_name(  # #283: via LeagueSeason
@@ -10910,7 +11074,9 @@ class SetupService:
             self._dep_group("notification preference", prefs,
                             lambda p: p.channel.value),
             self._dep_group("device token", devices,
-                            lambda d: d.label or d.provider)])
+                            lambda d: d.label or d.provider),
+            self._dep_group("roster membership", memberships,
+                            self._membership_label)])
         self.store.delete_team(team_id)
         self._audit("team_deleted", "team", team_id, actor_id,
                     {"name": team.name, "league_id": team.program_id})
@@ -11021,6 +11187,15 @@ class SetupService:
                  if p.active and p.recipient_ref == ref]
         devices = [d for d in self.store.all_device_tokens()
                    if d.active and d.recipient_ref == ref]
+        # #205 review round 1 finding 2 — a membership's player_id is a
+        # REQUIRED (non-nullable) foreign key onto this exact Player; before
+        # this check, Memory left a dangling player_id on any surviving
+        # membership and SQLite/PostgreSQL surfaced only the DB's generic,
+        # untranslated foreign-key-violation error. ANY membership (even
+        # released/transferred history) blocks now, mirroring the roster
+        # entry/availability/substitute checks above, which also block on
+        # historical rows, not just live ones.
+        memberships = self.store.memberships_for_player(player_id)
         self._block_if_dependents("player", player_id, "player", [
             self._dep_group("roster entry", rosters, self._matchup_for_game_ref),
             self._dep_group("availability response", availability,
@@ -11045,7 +11220,9 @@ class SetupService:
             self._dep_group("notification preference", prefs,
                             lambda p: p.channel.value),
             self._dep_group("device token", devices,
-                            lambda d: d.label or d.provider)])
+                            lambda d: d.label or d.provider),
+            self._dep_group("roster membership", memberships,
+                            self._membership_label)])
         self.store.delete_player(player_id)
         self._audit("player_deleted", "player", player_id, actor_id,
                     {"name": player.name, "team_id": player.team_id})
