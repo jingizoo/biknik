@@ -75,6 +75,12 @@ def _downgrade_051(store):
             "WHERE is_active = 1 AND jersey_number IS NOT NULL")
         cur.execute("PRAGMA foreign_keys = ON")
     cur.execute("DROP INDEX IF EXISTS ix_players_registration_number")
+    # #273 review round 2 finding 2: the partial unique (team_id,
+    # registration_number) index added alongside the plain one above —
+    # drop it too so this pre-051 simulation is a complete reversal on
+    # BOTH backends, regardless of whether a Postgres column drop already
+    # cascaded to it.
+    cur.execute("DROP INDEX IF EXISTS ux_players_team_registration_number")
     cur.execute("DROP TABLE IF EXISTS age_eligibility_rules")
     cur.execute(store.dialect.sql(
         "DELETE FROM schema_migrations WHERE version = ?"), (_MIGRATION,))

@@ -923,10 +923,12 @@ class SetupService:
         it removes a single ``LeagueSeason`` binding so an operator can, in turn,
         delete a permanent League (which blocks on its bindings — deletions are
         dependency-gated with no silent cascades). It is itself dependency-gated:
-        a binding that still owns Divisions, registrations, or Games is refused
-        (resolve those first), and it fails closed with ``season_archived`` on an
-        archived Season so read-only history is never rewritten. All checks run
-        before the single delete, so a refused unbind changes nothing."""
+        a binding that still owns Divisions, registrations, Games, schedule
+        scenarios, or age-eligibility rule history (#273 review round 2 finding 3)
+        is refused (resolve those first), and it fails closed with
+        ``season_archived`` on an archived Season so read-only history is never
+        rewritten. All checks run before the single delete, so a refused unbind
+        changes nothing."""
         ls = self.store.get_league_season(league_season_id)
         if ls is None:
             raise NotFoundError(
@@ -955,6 +957,20 @@ class SetupService:
                  if g.league_season_id == league_season_id]
         scenarios = [s for s in self.store.all_schedule_scenarios()
                      if s.league_season_id == league_season_id]
+        # #273 review round 2 finding 3: age-eligibility rule history is now
+        # an itemized dependent too. Previously this delete overlooked rule
+        # rows entirely, so removing a LeagueSeason left its
+        # age_eligibility_rules orphaned — pointing at a binding that no
+        # longer existed, with no operator-facing signal that history would
+        # be stranded. Also the SAME invariant migration 051's new FK on
+        # age_eligibility_rules.league_season_id now enforces at the
+        # database level (a DB-level backstop against a create-rule-vs-
+        # delete-binding race this service-level gate alone cannot close —
+        # this itemized check is still what gives an operator a friendly,
+        # actionable refusal instead of a raw constraint error on the
+        # non-race path).
+        rules = self.store.age_eligibility_rules_for_league_season(
+            league_season_id)
         self._block_if_dependents(
             "league_season", league_season_id, "season binding", [
                 self._dep_group("division", divisions, lambda d: d.name),
@@ -962,7 +978,9 @@ class SetupService:
                                 lambda r: self._team_name(r.team_id)),
                 self._dep_group("game", games, self._matchup),
                 self._dep_group("schedule scenario", scenarios,
-                                lambda s: s.name)])
+                                lambda s: s.name),
+                self._dep_group("age eligibility rule", rules,
+                                lambda r: f"v{r.version}")])
         self.store.delete_league_season(league_season_id)
         self._audit("league_season_deleted", "league_season", league_season_id,
                     actor_id, {"league_id": ls.league_id,
@@ -7548,12 +7566,47 @@ class SetupService:
         ``enforcement`` mode are canonicalized by the pure domain module
         before any write. Audited without PII: the detail carries scope,
         version, cutoff, tier codes, and mode.
+
+        #273 review round 2 finding 3: the OWNING Season is locked (row-locked
+        via ``_require_active_season``, mirroring ``create_league_season`` /
+        ``delete_league_season``'s identical Season-first lock order) BEFORE
+        any further work, and the LeagueSeason binding is RE-READ under that
+        lock. A prior revision read the LeagueSeason with a plain unlocked
+        get, never called ``_require_active_season`` at all, and computed
+        ``max(version) + 1`` with no lock held — so a rule could be appended
+        to an ARCHIVED Season's history (frozen history silently mutated),
+        and two concurrent callers appending a rule for the SAME
+        league_season_id could both read the same ``existing`` list and both
+        compute the same next version (the unique ``(league_season_id,
+        version)`` index would then reject the loser outright, rather than
+        the two committing consecutive versions the way two concurrent
+        ``create_league_season``/``archive_season`` callers already do
+        elsewhere in this file). Locking the Season row first closes both
+        holes at once: it fails closed on an archived Season exactly like
+        every other Season-owned write, AND it serializes every writer
+        appending a rule for a LeagueSeason under that same Season — a second
+        writer blocks on the row lock until the first commits, then re-reads
+        ``existing`` (below) and sees the just-committed row, so both writers
+        succeed with genuinely consecutive versions instead of racing for the
+        same one. The RE-READ of the LeagueSeason itself (like
+        ``delete_league_season``'s own re-fetch) catches a concurrent
+        ``delete_league_season`` of this SAME binding, which takes the
+        identical Season-row lock first: the loser of that race fails closed
+        with ``not_found`` and zero mutation rather than resurrecting a
+        rule against a binding that no longer exists.
         """
         if not league_season_id:
             raise ValidationError(
                 "league_season_id is required.",
                 {"reason": "field_required", "field": "league_season_id"})
-        if self.store.get_league_season(league_season_id) is None:
+        ls = self.store.get_league_season(league_season_id)
+        if ls is None:
+            raise NotFoundError(
+                f"LeagueSeason {league_season_id} not found.")
+        if ls.season_id:
+            self._require_active_season(ls.season_id)  # #159 read-only guard
+        ls = self.store.get_league_season(league_season_id)
+        if ls is None:
             raise NotFoundError(
                 f"LeagueSeason {league_season_id} not found.")
         canonical_cutoff, reason = normalize_cutoff(cutoff_month, cutoff_day)
@@ -7576,6 +7629,10 @@ class SetupService:
             raise ValidationError(
                 "enforcement must be 'warn' or 'block'.",
                 {"reason": "invalid_enforcement", "field": "enforcement"})
+        # Still holding the Season row lock acquired above: a second
+        # concurrent writer blocks on that SAME lock until this transaction
+        # commits or rolls back, so the version it computes here can never
+        # race another writer's — see the docstring.
         existing = self.store.age_eligibility_rules_for_league_season(
             league_season_id)
         version = existing[-1].version + 1 if existing else 1
