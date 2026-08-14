@@ -173,19 +173,24 @@ def _import_rejected(res):
     pure pre-commit validator (``validate_import``/``validate_hierarchy_
     import``) FIRST; if IT catches the problem, the commit returns the
     clean ``{"committed": False, "errors": [...]}`` report without ever
-    reaching a write. That pre-check's OWN duplicate-registration logic
-    does not (yet -- a separate, narrower gap than this finding's write-
-    time fix, and out of THIS finding's scope; see the module docstring)
-    know to check a BLANK cell's EFFECTIVE retained value on a Team move,
-    so it can wave a blank-cell move through clean. When it does, this
-    finding's write-time fix (inside the row loop itself) is what actually
-    catches it -- and since that raise is not one of the validator's
-    collected "errors", it is not caught locally and surfaces as the
-    facade's normal exception envelope, ``{"error": {...}}``, instead.
-    Either way NOTHING is written (the whole transaction rolls back), so a
-    caller after this finding's fix must accept both shapes and, more
-    importantly, verify the REAL invariant directly (zero mutation) rather
-    than assume one specific response shape."""
+    reaching a write. At the time this finding (round 2) landed, that
+    pre-check's OWN duplicate-registration logic did not yet know to check
+    a BLANK cell's EFFECTIVE retained value on a Team move, so it could wave
+    a blank-cell move through clean; this write-time fix (inside the row
+    loop itself) was what actually caught it, surfacing as the facade's
+    normal exception envelope, ``{"error": {...}}``, instead of the clean
+    validator report.
+
+    #273 review round 3 finding 1 closed that preview-side gap: the SAME
+    blank-cell-Team-move scenario now ALSO previews ``ok: False`` before any
+    write is attempted (see test_import_effective_registration_state.py),
+    so every scenario in THIS module's ``ImportBypassTest`` below in fact
+    now reaches the clean ``{"committed": False, "errors": [...]}`` shape
+    too, not the exception envelope. This helper is kept accepting EITHER
+    shape anyway — it is still correct, it costs nothing, and a caller
+    verifying the REAL invariant should check zero mutation directly rather
+    than assume one specific response shape survives every future change.
+    """
     return bool(res.get("error")) or res.get("committed") is False
 
 
@@ -273,20 +278,20 @@ class ImportBypassTest(unittest.TestCase):
                     store.close()
 
     def test_legacy_import_dry_run_never_writes(self):
-        """The dry-run previewer never writes, REGARDLESS of what it
-        reports: its own registration-duplicate check does not (yet) know
-        about a blank cell's effective retained value on a Team move (see
-        ``_import_rejected``'s docstring) and can report this exact payload
-        clean -- but a preview is a preview. It must still write nothing,
-        and the commit two tests above proves the SAME payload is in fact
-        correctly refused when it actually tries to write."""
+        """The dry-run previewer never writes -- and (#273 review round 3
+        finding 1 closed the preview-side gap this test used to route
+        around; see ``_import_rejected``'s docstring) now ALSO correctly
+        reports this exact blank-cell Team move as unsafe, matching the
+        commit two tests above, which proves the SAME payload is in fact
+        refused when it actually tries to write."""
         for label, store in _backends():
             with self.subTest(backend=label):
                 api, season_id, teams_csv, mover_team_id = self._legacy_seed(store)
                 before = len(store.all_players())
-                api.get_import_dry_run(
+                preview = api.get_import_dry_run(
                     {"teams_csv": teams_csv,
                      "players_csv": self._legacy_move_row("")})
+                self.assertFalse(preview["ok"], (label, preview))
                 self.assertEqual(len(store.all_players()), before, label)
                 if isinstance(store, SqlStore):
                     store.close()
@@ -360,14 +365,17 @@ class ImportBypassTest(unittest.TestCase):
                     store.close()
 
     def test_hierarchy_import_dry_run_never_writes(self):
-        """See ``LegacyImportSwapTest``'s sibling test docstring: the
-        previewer never writes regardless of its verdict."""
+        """See ``test_legacy_import_dry_run_never_writes``'s sibling test
+        docstring just above: the previewer never writes, and now (#273
+        review round 3 finding 1) also correctly reports this blank-cell
+        Team move as unsafe."""
         for label, store in _backends():
             with self.subTest(backend=label):
                 api, sheets, _mover_team_id = self._hierarchy_seed(store)
                 before = len(store.all_players())
                 moved = self._hierarchy_move_row(sheets, "")
-                api.get_hierarchy_import_dry_run(moved)
+                preview = api.get_hierarchy_import_dry_run(moved)
+                self.assertFalse(preview["ok"], (label, preview))
                 self.assertEqual(len(store.all_players()), before, label)
                 if isinstance(store, SqlStore):
                     store.close()

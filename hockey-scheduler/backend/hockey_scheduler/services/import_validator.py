@@ -47,6 +47,7 @@ from ..domain.identity import (
     normalize_registration_number,
     normalize_skill_rating,
     normalized_name_key,
+    plan_effective_registration_state,
 )
 from ..domain.shooting import normalize_shoots
 from .ice_availability import curfew_instant, parse_hhmm
@@ -260,9 +261,17 @@ def _check_player_identity(report: _Report, rows: List[dict],
     Duplicates (AC[4] — reported BEFORE any write; never merged, never
     matched by name alone):
 
-    * one registration number on two rows for ONE team, or colliding with a
-      different existing player on that team → ERROR (commit refuses it);
-    * one registration number across teams in the sheet → WARNING;
+    * one EFFECTIVE registration number (the row's own supplied cell, or —
+      blank is a RETAIN, never a clear — the value the matching existing
+      player already carries) on two entities aimed at ONE destination team
+      → ERROR (commit refuses it); computed by the same post-import
+      effective-state plan the commit path stages against
+      (``domain.identity.plan_effective_registration_state`` +
+      ``SetupService.release_batch_player_registrations``, #273 review
+      round 3 finding 1), so a same-team swap or longer cycle previews
+      clean and a blank-cell Team move onto an already-occupied number does
+      not;
+    * one SUPPLIED registration number across teams in the sheet → WARNING;
     * exact same-name rows on one team — or matching an existing same-team
       player other than the row's own ``player_code`` self-update — lacking
       birthdate/registration data that proves them different people →
@@ -320,45 +329,93 @@ def _check_player_identity(report: _Report, rows: List[dict],
     upload_codes = {c for _i, _t, c, _k, _b, _r in parsed if c}
     existing_teams = {}
     existing_by_team = {}
+    existing_players_by_code = {}
     if store is not None:
         existing_teams = {t.external_ref: t for t in store.all_teams()
                           if t.external_ref}
         for player in store.all_players():
+            if player.external_ref:
+                existing_players_by_code[player.external_ref] = player
             if player.external_ref and player.external_ref in upload_codes:
                 continue  # this sheet updates it; not a duplicate of itself
             existing_by_team.setdefault(player.team_id, []).append(player)
 
+    # Cross-team WARNING only ("shared_registration_number" in spirit — this
+    # module has no separate machine code, only the message text): based on
+    # the row's own SUPPLIED cell, never a retained value — an operator only
+    # sees this diagnostic for a number THIS upload actually typed somewhere.
     by_registration = {}
     for entry in parsed:
         if entry[5] is not None:
             by_registration.setdefault(entry[5], []).append(entry)
     for registration, group in sorted(by_registration.items()):
         team_codes = {entry[1] for entry in group if entry[1]}
-        if len(group) >= 2 and len(team_codes) <= 1:
-            for i, team_code, _c, _k, _b, _r in group:
-                report.error(
-                    "players", i,
-                    f"registration_number {registration} appears on multiple "
-                    f"rows for team {team_code}.",
-                    field="registration_number")
-        elif len(group) >= 2:
+        if len(group) >= 2 and len(team_codes) > 1:
             for i, _t, _c, _k, _b, _r in group:
                 report.warning(
                     "players", i,
                     f"registration_number {registration} appears on rows for "
                     f"several teams — one athlete duplicated across teams, "
                     f"or a data error.")
+
+    # #273 review round 3 finding 1: the SAME-team ERROR must use the
+    # EFFECTIVE post-import registration_number — the row's own supplied
+    # cell, or (a blank cell is a RETAIN, never a clear, exactly like every
+    # other optional identity cell) the value the matching existing player
+    # already carries — and compare it against every OTHER entity that will
+    # hold a number on the SAME destination team once the whole batch has
+    # landed: an untouched existing player already there, or another upload
+    # row. A per-row "does this row's own cell collide with something"
+    # check missed a blank-cell Team move onto an already-occupied number
+    # (the row's own cell is None, so it was skipped outright); a per-row
+    # "do two rows share one SUPPLIED literal" check flagged a valid
+    # same-team swap (each row's own cell differs from what it collides
+    # with mid-scan, even though the FINAL state has no collision at all).
+    # ``plan_effective_registration_state`` answers the FINAL-state question
+    # once, shared with both import paths; the commit side stages a
+    # matching release pass (``release_batch_player_registrations``) so a
+    # batch this function accepts can always actually be applied.
+    row_slot = {}
+    conflict_entries = []
     for i, team_code, code, _key, _birth, registration in parsed:
-        if registration is None or team_code is None:
+        existing_player = (existing_players_by_code.get(code)
+                            if code else None)
+        effective = (registration if registration is not None
+                    else (existing_player.registration_number
+                          if existing_player is not None else None))
+        if team_code is None:
+            row_slot[i] = None
             continue
         team = existing_teams.get(team_code)
-        for player in (existing_by_team.get(team.id, []) if team else []):
-            if player.registration_number == registration:
-                report.error(
-                    "players", i,
-                    f"registration_number {registration} already belongs to "
-                    f"existing player {player.id} on team {team_code}.",
-                    field="registration_number")
+        team_key = team.id if team is not None else ("upload", team_code)
+        row_slot[i] = (team_key, effective)
+        conflict_entries.append((("row", i), team_key, effective))
+    for team_id, players in existing_by_team.items():
+        for player in players:
+            conflict_entries.append(
+                (("existing", player.id), team_id,
+                 player.registration_number))
+
+    conflicts = plan_effective_registration_state(conflict_entries)
+    for i, team_code, _code, _key, _birth, _registration in parsed:
+        slot = row_slot.get(i)
+        if slot is None or slot not in conflicts:
+            continue
+        registration = slot[1]
+        existing_ids = sorted(
+            entity[1] for entity in conflicts[slot] if entity[0] == "existing")
+        if existing_ids:
+            report.error(
+                "players", i,
+                f"registration_number {registration} already belongs to "
+                f"existing player {existing_ids[0]} on team {team_code}.",
+                field="registration_number")
+        else:
+            report.error(
+                "players", i,
+                f"registration_number {registration} appears on multiple "
+                f"rows for team {team_code}.",
+                field="registration_number")
 
     by_team_name = {}
     for entry in parsed:

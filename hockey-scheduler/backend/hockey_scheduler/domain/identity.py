@@ -152,6 +152,66 @@ def normalize_registration_number(value) -> Tuple[Optional[str], Optional[str]]:
     return trimmed, None
 
 
+def plan_effective_registration_state(entries) -> dict:
+    """The ONE post-import effective-state uniqueness plan for
+    ``registration_number``, shared by both import previews and both import
+    commits (#273 review round 3 finding 1).
+
+    A naive per-row check ("does THIS row's own supplied cell collide with
+    something?") misses two real shapes of the same invariant:
+
+    * a blank cell is a RETAIN, not an absence — the row's post-import
+      EFFECTIVE value is the sheet's own cell when it supplies one, else
+      whatever the matching existing player already has. A Team move with a
+      blank cell carries that retained value onto the new team, and it can
+      collide there even though the row's own upload cell is empty.
+    * two (or more) rows that each supply a DIFFERENT number than they
+      started with — a same-team swap or a longer cycle — never collide in
+      the FINAL state even though a naive "does any two rows share one
+      literal cell value" scan sees nothing wrong either, but a naive
+      "does this row's target collide with what someone ELSE holds RIGHT
+      NOW" scan (checked one row at a time, mid-batch) falsely flags it.
+
+    This function only answers the FIRST question — what does the final
+    state actually look like, and does anything collide — leaving row
+    order, staging, and any "who holds what right now" mid-batch bookkeeping
+    to the caller (see ``SetupService.release_batch_player_registrations``
+    for the commit-side swap/cycle-safe staging this plan makes safe to
+    apply sequentially).
+
+    ``entries`` is an iterable of ``(entity, team_key, registration_number)``
+    triples, one per entity that will hold (or keep holding) a registration
+    number once this whole batch has landed: an upload row (its own supplied
+    cell, or — when blank — the value the player it updates already has), or
+    an EXISTING player this batch does not touch at all (its own unchanged
+    value). ``entity`` is any hashable identifying WHO this entry is about
+    (never inspected by this function — pure passthrough, so a caller can
+    hand back exactly what it needs to translate a conflict into its own
+    error shape). ``team_key`` identifies the destination team — a real
+    persisted id, or any other hashable a caller uses consistently for a
+    team this same batch is about to create (never confused with a
+    different team as long as one call uses one key per real team).
+
+    Entries with ``registration_number is None`` or ``team_key is None``
+    never conflict with anything (an absent value or an unresolvable team
+    is reported elsewhere, not here) and are dropped.
+
+    Returns ``{(team_key, registration_number): [entity, ...]}`` restricted
+    to slots with 2+ DISTINCT entities — the TRUE final-state duplicates. A
+    valid swap or cycle among upload rows produces one entity per slot after
+    the move and is correctly ABSENT from the result; a genuine collision
+    (two entities that both end up wanting the same number on the same team)
+    is the only thing that appears.
+    """
+    groups: dict = {}
+    for entity, team_key, registration_number in entries:
+        if registration_number is None or team_key is None:
+            continue
+        groups.setdefault((team_key, registration_number), []).append(entity)
+    return {slot: entities for slot, entities in groups.items()
+            if len(entities) >= 2}
+
+
 def normalize_skill_rating(value) -> Tuple[Optional[int], Optional[str]]:
     """Canonicalize an optional 1-7 skill rating (#287 owner ruling → #273).
 

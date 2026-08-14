@@ -38,6 +38,7 @@ from ..domain.identity import (
     normalize_registration_number,
     normalize_skill_rating,
     normalized_name_key,
+    plan_effective_registration_state,
 )
 from ..domain.shooting import normalize_shoots
 # The season-boundary parser + timezone resolver are shared with the interactive
@@ -505,13 +506,19 @@ def _check_player_duplicates(report, player_rows, store, existing_teams):
     """#273 AC[4]: report ambiguous/duplicate athlete identities BEFORE any
     write — reads only, never a merge, never a name-alone match.
 
-    * ``duplicate_registration_number`` (ERROR): one governing-body id on two
-      rows aimed at ONE team, or colliding with a DIFFERENT existing player
-      on that same persisted team — the commit hard-refuses these, so the
-      preview must too.
-    * ``shared_registration_number`` (WARNING): the same id across different
-      teams — legitimate under the legacy permanent Player→Team model (one
-      human, two teams), but worth an operator's look.
+    * ``duplicate_registration_number`` (ERROR): one EFFECTIVE governing-body
+      id (the row's own supplied cell, or — blank is a RETAIN, never a
+      clear — the value the matching existing player already carries) on
+      two entities aimed at the SAME destination team — the commit
+      hard-refuses these, so the preview must too. Computed by the same
+      post-import effective-state plan the commit path stages against
+      (``domain.identity.plan_effective_registration_state`` +
+      ``SetupService.release_batch_player_registrations``, #273 review
+      round 3 finding 1): a same-team swap or longer cycle previews clean,
+      and a blank-cell Team move onto an already-occupied number does not.
+    * ``shared_registration_number`` (WARNING): the same SUPPLIED id across
+      different teams — legitimate under the legacy permanent Player→Team
+      model (one human, two teams), but worth an operator's look.
     * ``duplicate_player_name`` (WARNING): exact same-name rows aimed at one
       team (or matching an existing player on that team, other than the row's
       own ``player_code`` self-update) where the pair lacks disambiguating
@@ -537,7 +544,10 @@ def _check_player_duplicates(report, player_rows, store, existing_teams):
 
     upload_codes = {code for _i, _t, code, _k, _b, _r in rows if code}
     existing_by_team = {}
+    existing_players_by_code = {}
     for player in store.all_players():
+        if player.external_ref:
+            existing_players_by_code[player.external_ref] = player
         if player.external_ref and player.external_ref in upload_codes:
             continue  # updated by this sheet; compared as its post-commit row
         existing_by_team.setdefault(player.team_id, []).append(player)
@@ -546,38 +556,72 @@ def _check_player_duplicates(report, player_rows, store, existing_teams):
         team = existing_teams.get(team_code) if team_code else None
         return team.id if team is not None else None
 
-    # -- registration numbers ------------------------------------------------
+    # -- registration numbers, cross-team WARNING only -----------------------
+    # Based on the row's own SUPPLIED cell, never a retained value — an
+    # operator only sees this diagnostic for a number THIS upload actually
+    # typed somewhere.
     by_registration = {}
     for entry in rows:
         if entry[5] is not None:
             by_registration.setdefault(entry[5], []).append(entry)
     for registration, group in sorted(by_registration.items()):
         team_codes = {entry[1] for entry in group if entry[1]}
-        if len(group) >= 2 and len(team_codes) <= 1:
-            for index, team_code, _c, _k, _b, _r in group:
-                report.error(
-                    "players", index, "duplicate_registration_number",
-                    f"registration_number {registration} appears on "
-                    f"multiple rows for team {team_code}.",
-                    "registration_number")
-        elif len(group) >= 2:
+        if len(group) >= 2 and len(team_codes) > 1:
             for index, _t, _c, _k, _b, _r in group:
                 report.warning(
                     "players", index, "shared_registration_number",
                     f"registration_number {registration} appears on rows "
                     f"for several teams — one athlete duplicated across "
                     f"teams, or a data error.", "registration_number")
+
+    # -- registration numbers, SAME-team ERROR, effective post-import state --
+    # #273 review round 3 finding 1: see the docstring above and
+    # ``domain.identity.plan_effective_registration_state`` for why this must
+    # be the row's EFFECTIVE value (never just its own literal cell) compared
+    # against every OTHER entity landing on the SAME destination team, not a
+    # per-row "does my own cell collide with something right now" scan.
+    row_slot = {}
+    conflict_entries = []
     for index, team_code, code, _key, _birth, registration in rows:
-        if registration is None:
-            continue
+        existing_player = (existing_players_by_code.get(code)
+                            if code else None)
+        effective = (registration if registration is not None
+                    else (existing_player.registration_number
+                          if existing_player is not None else None))
         team_id = _persisted_team_id(team_code)
-        for player in (existing_by_team.get(team_id, []) if team_id else []):
-            if player.registration_number == registration:
-                report.error(
-                    "players", index, "duplicate_registration_number",
-                    f"registration_number {registration} already belongs to "
-                    f"existing player {player.id} on team {team_code}.",
-                    "registration_number")
+        if team_id is None and team_code is not None:
+            team_key = ("upload", team_code)
+        else:
+            team_key = team_id
+        row_slot[index] = None if team_key is None else (team_key, effective)
+        if team_key is not None:
+            conflict_entries.append((("row", index), team_key, effective))
+    for team_id, players in existing_by_team.items():
+        for player in players:
+            conflict_entries.append(
+                (("existing", player.id), team_id,
+                 player.registration_number))
+
+    conflicts = plan_effective_registration_state(conflict_entries)
+    for index, team_code, _code, _key, _birth, _registration in rows:
+        slot = row_slot.get(index)
+        if slot is None or slot not in conflicts:
+            continue
+        registration = slot[1]
+        existing_ids = sorted(
+            entity[1] for entity in conflicts[slot] if entity[0] == "existing")
+        if existing_ids:
+            report.error(
+                "players", index, "duplicate_registration_number",
+                f"registration_number {registration} already belongs to "
+                f"existing player {existing_ids[0]} on team {team_code}.",
+                "registration_number")
+        else:
+            report.error(
+                "players", index, "duplicate_registration_number",
+                f"registration_number {registration} appears on "
+                f"multiple rows for team {team_code}.",
+                "registration_number")
 
     # -- same-name-on-one-team warnings -------------------------------------
     by_team_name = {}
@@ -1687,6 +1731,30 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
                      int(_optional(row.get("jersey_number")))
                      if _optional(row.get("jersey_number")) else None)
                     for row in rows["players"])
+
+                # Swap-safe apply, registration_number (#273 review round 3
+                # finding 1, mirrors the jersey release just above): release
+                # every existing player's registration_number whose final
+                # (team, registration) differs from its current one, BEFORE
+                # any per-row assignment, so a valid same-team (or cross-team)
+                # swap or longer cycle commits without a transient uniqueness
+                # failure. A blank registration_number cell RETAINS the
+                # player's current value (never a clear), so the "final"
+                # value computed here falls back to it, exactly like the
+                # per-row upsert below will.
+                def _final_registration(row):
+                    existing_for_row = players.get(
+                        _clean(row.get("player_code")))
+                    supplied = _optional(row.get("registration_number"))
+                    return (supplied if supplied is not None
+                            else (existing_for_row.registration_number
+                                  if existing_for_row is not None else None))
+                released_registrations = setup.release_batch_player_registrations(
+                    (players.get(_clean(row.get("player_code"))),
+                     teams[_clean(row.get("team_code"))].id,
+                     _final_registration(row))
+                    for row in rows["players"])
+
                 for row in rows["players"]:
                     code = _clean(row.get("player_code"))
                     team = teams[_clean(row.get("team_code"))]
@@ -1696,6 +1764,10 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
                     if existing_player is not None:
                         extra["staged_original_jersey"] = released.get(
                             existing_player.id, existing_player.jersey_number)
+                        extra["staged_original_registration"] = (
+                            released_registrations.get(
+                                existing_player.id,
+                                existing_player.registration_number))
                     # #273: the sheet's structured names are passed through
                     # (the display name is derived by the shared contract,
                     # no longer flattened here), plus the optional identity

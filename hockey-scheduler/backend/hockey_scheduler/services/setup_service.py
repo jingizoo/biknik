@@ -6713,6 +6713,7 @@ class SetupService:
                                actor_id: Optional[str] = None,
                                import_batch_id: Optional[str] = None,
                                staged_original_jersey=_UNSET,
+                               staged_original_registration=_UNSET,
                                first_name: Optional[str] = None,
                                last_name: Optional[str] = None,
                                preferred_name: Optional[str] = None,
@@ -6736,7 +6737,14 @@ class SetupService:
         update, unset on create" — an import never clears identity data. A
         same-team duplicate registration number is refused before any write;
         a same-name-on-one-Team create appends the ``player_duplicate_warning``
-        audit (warn only, never a block or merge).
+        audit (warn only, never a block or merge). ``staged_original_
+        registration`` (#273 review round 3 finding 1) is the pre-staging
+        registration_number a caller's own
+        :meth:`release_batch_player_registrations` pre-pass already reported
+        for this player, if it released one — see that method and
+        ``staged_original_jersey`` immediately below for why a caller running
+        that pre-pass must pass its result back here rather than let this
+        method read ``existing.registration_number`` directly.
         """
         self._validate_jersey_number(jersey_number)
         # Validate/canonicalize the email BEFORE any player write (#268 review):
@@ -6814,11 +6822,26 @@ class SetupService:
         # existing row's own retained value -- exactly like the unconditional
         # jersey check just above. ``exclude_player_id`` keeps a same-team
         # no-op (or a same-team re-import) from colliding with itself.
+        #
+        # #273 review round 3 finding 1: the RETAINED fallback must be the
+        # TRUE pre-staging value, not ``existing.registration_number`` read
+        # directly -- when the caller ran a swap/cycle-safe
+        # ``release_batch_player_registrations`` pre-pass (mirroring #292's
+        # jersey release) before calling this method, ``existing`` may
+        # already carry the transient released NULL, which would make a
+        # blank-cell row that is actually retaining a real number look like
+        # it holds nothing at all and skip this check entirely.
+        # ``staged_original_registration`` is that pre-pass's own reported
+        # original, exactly like ``staged_original_jersey`` above.
+        original_registration = (
+            staged_original_registration
+            if staged_original_registration is not _UNSET
+            else (existing.registration_number if existing is not None
+                 else None))
         new_registration = identity_values.get("registration_number")
         effective_registration = (
             new_registration if new_registration is not None
-            else (existing.registration_number if existing is not None
-                 else None))
+            else original_registration)
         if effective_registration is not None:
             self._assert_registration_number_available(
                 team_id, effective_registration,
@@ -6850,6 +6873,18 @@ class SetupService:
             # blank/keep-current cell must land the original, not the NULL.
             if staged_original_jersey is not _UNSET:
                 obj.jersey_number = staged_original_jersey
+            # Same restore-before-diff for registration_number (#273 review
+            # round 3 finding 1). Unlike jersey_number, this field is placed
+            # into ``values`` ONLY when the sheet supplies a new one (the
+            # same "absent key = leave as-is" contract every other optional
+            # identity cell in ``identity_values`` follows) -- so the restore
+            # alone is enough here: a blank cell's ``values`` carries no
+            # "registration_number" key at all, ``_apply_changes`` never
+            # touches the just-restored original, and no false "changed"
+            # report follows; an explicitly re-supplied value is still in
+            # ``values`` and still overwrites + reports exactly as before.
+            if staged_original_registration is not _UNSET:
+                obj.registration_number = staged_original_registration
             changed = self._apply_changes(obj, values)
             if changed:
                 self.store.save_player(obj)
@@ -7066,6 +7101,61 @@ class SetupService:
                 continue  # staying put → keep it so real collisions still catch
             released[existing.id] = existing.jersey_number
             existing.jersey_number = None
+            self.store.save_player(existing)
+        return released
+
+    def release_batch_player_registrations(self, assignments) -> dict:
+        """Stage a batch import's registration_number moves so a valid
+        same-team swap or longer cycle can commit (#273 review round 3
+        finding 1) — the SAME mechanism as :meth:`release_batch_player_jerseys`
+        (#292) above, applied to ``registration_number`` instead of
+        ``jersey_number``, with the one difference the invariant itself
+        already draws: a registration number is reserved by an INACTIVE
+        player too (migration 051, ``_assert_registration_number_available``),
+        so this release is NOT conditioned on ``is_active`` the way the
+        jersey release is.
+
+        A sequential per-row apply cannot commit an otherwise-valid same-team
+        registration swap (A ``REG-A``→``REG-B``, B ``REG-B``→``REG-A``) or a
+        longer cycle: the first write collides with the number a later row in
+        the SAME batch still holds. Run FIRST, inside the batch's single
+        transaction: for every EXISTING player (active or inactive) whose
+        final ``(team, registration_number)`` differs from its current one,
+        release the number it holds now (set ``registration_number = NULL`` —
+        always unconstrained; migration 051's partial unique index excludes
+        NULL), so the subsequent per-row assignment lands the validated final
+        state with no transient uniqueness failure. Only
+        ``registration_number`` is touched — the id, the team, the jersey,
+        and every other field are preserved — and no audit is written here:
+        the per-row upsert emits the real ``player_created`` /
+        ``player_updated`` entry with the final value. A genuine final-state
+        collision is still caught by the per-row
+        ``_assert_registration_number_available`` (and the DB index), so the
+        whole batch rolls back with zero writes — the SAME final-state
+        question :func:`hockey_scheduler.domain.identity.
+        plan_effective_registration_state` already answered for the preview
+        that gated this commit.
+
+        ``assignments`` is an iterable of ``(existing_player, final_team_id,
+        final_registration_number)``; new players (``existing_player is
+        None``), numberless players, and players staying in the same slot are
+        skipped. Returns ``{player_id: pre-release registration_number}`` for
+        exactly the players it released, so the apply step can restore each
+        real original — a blank/keep-current cell must land the ORIGINAL
+        value, not the transient NULL, and the single final audit must
+        describe the operator's real before→after, not the staging.
+        """
+        released = {}
+        for existing, final_team_id, final_registration in assignments:
+            if existing is None:
+                continue
+            if existing.registration_number is None:
+                continue  # holds no number → nothing to release
+            if (existing.team_id, existing.registration_number) == (
+                    final_team_id, final_registration):
+                continue  # staying put → keep it so real collisions still catch
+            released[existing.id] = existing.registration_number
+            existing.registration_number = None
             self.store.save_player(existing)
         return released
 
@@ -8751,6 +8841,26 @@ class SetupService:
                     released = self.release_batch_player_jerseys(
                         _final_slot(row) for row in player_rows)
 
+                    # Swap-safe apply, registration_number (#273 review round
+                    # 3 finding 1, mirrors the jersey release just above):
+                    # release every existing player's registration_number
+                    # whose final (team, registration) differs from its
+                    # current one BEFORE any per-row write, so a valid
+                    # same-team (or cross-team) swap or longer cycle commits
+                    # without a transient uniqueness failure. A blank
+                    # registration_number cell RETAINS the current value
+                    # (final == current → not released).
+                    def _final_registration(row):
+                        existing = by_code.get(_clean(row.get("player_code")))
+                        team_id = team_code_to_id.get(_clean(row.get("team_code")))
+                        raw = row.get("registration_number")
+                        registration = (_clean(raw) if not _blank(raw)
+                                        else (existing.registration_number
+                                              if existing else None))
+                        return existing, team_id, registration
+                    released_registrations = self.release_batch_player_registrations(
+                        _final_registration(row) for row in player_rows)
+
                     for row in player_rows:
                         player_code = _clean(row.get("player_code"))
                         # #273: the sheet's structured names are PERSISTED now
@@ -8866,15 +8976,36 @@ class SetupService:
                             # jersey check above; exclude_player_id keeps
                             # a same-team re-import from colliding with
                             # itself.
+                            #
+                            # #273 review round 3 finding 1: the RETAINED
+                            # fallback must be the TRUE pre-staging value —
+                            # resolved from ``released_registrations``
+                            # (captured before the swap-safe release above),
+                            # never ``player.registration_number`` read
+                            # directly, which may already hold the transient
+                            # released NULL — exactly the same original vs.
+                            # transient distinction ``original_jersey`` draws
+                            # for jersey_number just above. The final value is
+                            # then assigned UNCONDITIONALLY (mirroring
+                            # ``player.jersey_number = target_jersey`` above),
+                            # not only ``if registration_cell is not None``:
+                            # a blank cell's effective value already equals
+                            # the just-restored original when nothing else in
+                            # this batch moved it, and equals the row's own
+                            # supplied value when it did — either way this is
+                            # always the row's true final state, so it is
+                            # always safe (and, once release is in play,
+                            # required) to land it.
+                            original_registration = released_registrations.get(
+                                player.id, player.registration_number)
                             effective_registration = (
                                 registration_cell if registration_cell is not None
-                                else player.registration_number)
+                                else original_registration)
                             if effective_registration is not None:
                                 self._assert_registration_number_available(
                                     team_id, effective_registration,
                                     exclude_player_id=player.id)
-                            if registration_cell is not None:
-                                player.registration_number = registration_cell
+                            player.registration_number = effective_registration
                             if skill_cell is not None:
                                 player.skill_rating = skill_cell
                             self.store.save_player(player)

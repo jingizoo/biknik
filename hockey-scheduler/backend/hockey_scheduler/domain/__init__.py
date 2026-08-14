@@ -131,6 +131,7 @@ from .identity import (
     normalize_registration_number,
     normalize_skill_rating,
     normalized_name_key,
+    plan_effective_registration_state,
 )
 from .eligibility import (
     ENFORCEMENT_MODES,
@@ -268,6 +269,7 @@ __all__ = [
     "normalize_registration_number",
     "normalize_skill_rating",
     "normalized_name_key",
+    "plan_effective_registration_state",
     # age eligibility (#273)
     "ENFORCEMENT_MODES",
     "age_on",
