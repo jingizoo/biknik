@@ -245,6 +245,69 @@ for the standing tripwire):
   not something that closes this gap by construction in
   :mod:`route_extract` itself.
 
+#202 repair round 12, finding 1 (documented here deliberately, NOT fixed
+this round -- see ``tests/test_route_extract.py``'s
+``MatchCaptureShadowLimitationGuardTests`` for the standing tripwire):
+
+* Round 11's own finding A bounded itself explicitly to "is ``STATE``
+  shadowed here", not to chasing ``STATE``'s own module-level definition
+  further -- but even within that narrower, already-accepted scope, the
+  fix is not complete: :func:`_name_rebinding_sites` (see its own
+  docstring and body, just below) enumerates the SPELLINGS Python's
+  grammar uses for a binding -- an ``ast.Name`` in Store/Del context, an
+  ``ast.arg``, an ``ExceptHandler.name``, a ``global``/``nonlocal``
+  declaration, an ``import ... as`` alias -- but Python's structural
+  pattern matching (``match``/``case``) adds binding forms this list does
+  not enumerate: a bare capture pattern (``case STATE:``, parsed as an
+  ``ast.MatchAs`` with ``pattern=None`` and ``name="STATE"``) and a
+  mapping-rest capture (``case {**STATE}:``, an ``ast.MatchMapping`` with
+  ``rest="STATE"``) each bind their own name for the REST of the
+  enclosing function exactly as a plain ``name = ...`` assignment would
+  (a ``match`` statement introduces no new scope of its own), yet neither
+  ``ast.MatchAs`` nor ``ast.MatchMapping`` appears among the node types
+  :func:`_name_rebinding_sites` walks for (route_extract.py:4019-4034).
+  CONFIRMED directly, not asserted from memory: for a synthetic function
+  body containing ``api = STATE.api`` followed by ``match x: case
+  STATE: pass``, ``_name_rebinding_sites("STATE", fn)`` returns ``[]``
+  (an empty list) -- so :func:`_trusted_source_free_roots`'s zero-hits
+  check (route_extract.py:4158-4160) never observes the shadow at all,
+  and ``_has_dominating_trusted_binding("api", fn, parents)`` still
+  answers ``True`` for the shadowed function. This is the exact same
+  class of escape round 11's own finding A closed for a parameter-default
+  or a preceding local reassignment of ``STATE`` (documented above),
+  reopening through a THIRD, distinct binding spelling neither round 10
+  nor round 11 enumerated -- not a new category of gap, but the SAME
+  "spelling/binding-form enumeration is not exhaustive" regress this
+  module's own docstring already predicts below ("a twelfth round should
+  be expected to find a twelfth thing").
+* NOT exploitable against the real ``server.py`` today: independently
+  RE-confirmed fresh for this round (not copied forward from any prior
+  verify track's own claim) by parsing the real file and walking its
+  FULL parsed AST for any ``ast.Match`` node -- zero, anywhere in the
+  file, a strictly BROADER check than "only inside ``class Handler``" or
+  "only inside the two entry points" since a module with no ``match``
+  statement anywhere has none reachable from anywhere either.
+  ``MatchCaptureShadowLimitationGuardTests`` asserts this directly
+  against the real file and fails LOUDLY the moment a ``match`` statement
+  is introduced anywhere in ``server.py``, rather than staying silent
+  while the gap this section describes quietly goes live. This is
+  architectural and latent, not a live hole today.
+* What would close it, and why it is NOT implemented now: teach
+  :func:`_name_rebinding_sites` two more node shapes to watch for --
+  an ``ast.MatchAs`` node whose ``.name`` is not ``None``, and an
+  ``ast.MatchMapping`` node whose ``.rest`` is not ``None`` -- the SAME
+  reason that function already special-cases ``ast.arg``/
+  ``ExceptHandler``/``Global``/``Nonlocal``/``Import`` individually
+  rather than relying on ``ast.Name`` Store/Del context alone: each is a
+  binding Python's grammar does not spell as an ``ast.Name`` at all. This
+  is a bounded, mechanical extension of an EXISTING function's EXISTING
+  enumeration strategy, not a new architectural question -- but,
+  mirroring finding H's and finding B's own treatment above, it is
+  deliberately NOT implemented this round: ``server.py`` has no ``match``
+  statement anywhere for it to matter against today, and the standing
+  tripwire above is what would force the extension to be made the day it
+  first does, rather than this gap quietly going live unnoticed.
+
 On the soundness of this gate, honestly stated
 ------------------------------------------------
 This module has been adversarially reviewed across ELEVEN rounds: the
