@@ -11540,12 +11540,15 @@ class ApiService:
             self, membership_id: str, status: str,
             reason: Optional[str] = None,
             actor_id: Optional[str] = None) -> dict:
-        # #205 review round 1 finding 5: a terminal target (released/
-        # transferred) is refused here without a non-blank actor_id AND
-        # reason — the narrowed Slice A floor, not the authorized transfer/
-        # release/deadline-policy/override workflow #212 places in a later
-        # #205 slice. See SetupService.set_season_roster_membership_status's
-        # docstring.
+        # #205 review round 2 (owner product ruling, overriding round 1
+        # finding 5's shipped "actor_id + reason" floor): a terminal target
+        # (released/transferred) is UNCONDITIONALLY refused here — a
+        # NotAuthorizedError @catch turns into {"error": {"code":
+        # "forbidden", ...}} below, never satisfiable by any actor_id or
+        # reason value. The authorized transfer/release/deadline-policy/
+        # override workflow #212 places in a later #205 slice is what will
+        # eventually replace this refusal. See SetupService.
+        # set_season_roster_membership_status's docstring.
         return _serialize(self.setup.set_season_roster_membership_status(
             membership_id, status, reason=reason, actor_id=actor_id))
 

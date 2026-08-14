@@ -85,6 +85,7 @@ from ..domain.errors import (
     HasDependenciesError,
     IntegrityConflictError,
     InvalidTransitionError,
+    NotAuthorizedError,
     NotEligibleError,
     NotFoundError,
     ScheduleConflictError,
@@ -2812,19 +2813,27 @@ class SetupService:
         silently absorbed, so the event history never lies about a change
         that didn't happen.
 
-        Entering a TERMINAL status requires a non-blank ``actor_id`` AND
-        ``reason`` (#205 review round 1 finding 5) — a floor, not the full
-        authorized transfer/release/deadline-policy/override workflow #212
-        places in a LATER #205 slice. This PR is scoped to "schema and
-        migration" (#212's Slice A), so it deliberately does not build
-        principal-authorization, deadline enforcement, or an override
-        workflow here — it narrows the already-shipped facade surface back
-        to that boundary by refusing the one thing an entirely unauthored,
-        unreasoned terminal transition would otherwise let slip through
-        silently. ``released``/``transferred`` remain valid ENUM values (the
-        schema stays capable of representing them, including for a future
-        backfill/migration path) — only setting one through this facade
-        method without an actor and a reason is refused."""
+        Entering a TERMINAL status is UNCONDITIONALLY REFUSED — a hard
+        ``NotAuthorizedError``, never reachable by any caller, actor_id or
+        reason string (#205 review round 2, owner product ruling overriding
+        round 1 finding 5's shipped "actor_id + reason" floor). That floor
+        was reachable by any caller supplying an arbitrary non-blank string
+        for each — an unvalidated string is not authorization, so it never
+        actually stopped anyone from releasing or transferring a
+        membership; it only stopped the SILENT/anonymous/unreasoned case.
+        This PR (#212 Slice A) is scoped to schema/migration/compatibility
+        proof only. The authorized transfer/release workflow — session-
+        resolved principals, scope checks, a deadline/override policy,
+        Game-state safeguards, atomic audit, tri-store/HTTP coverage — ships
+        in a LATER #205 slice with its own review; until then, NOTHING on
+        this surface may reach a terminal status. ``released``/
+        ``transferred`` remain valid ENUM values (the schema and event model
+        stay fully capable of representing them, including for a future
+        backfill/migration path) — only SETTING one through this method is
+        refused, unconditionally. A membership already born released/
+        transferred (e.g. planted directly at the store layer, never through
+        this method) is still immutable history exactly as before — that
+        rule, above, is untouched."""
         membership = self.store.get_season_roster_membership_for_update(
             membership_id)
         if membership is None:
@@ -2857,24 +2866,35 @@ class SetupService:
                 membership.jersey_number,
                 exclude_membership_id=membership.id)
         elif status.is_terminal:
-            # #205 review round 1 finding 5 — narrowed floor: an
-            # unauthenticated or unreasoned terminal transition is refused
-            # with zero mutation/event/audit, checked BEFORE any write.
-            if not actor_id or not isinstance(actor_id, str) or not actor_id.strip():
-                raise ValidationError(
-                    "A terminal transition (released/transferred) requires "
-                    "an authenticated actor.",
-                    {"reason": "terminal_transition_requires_actor",
-                     "membership_id": membership.id, "status": status.value})
-            if not reason or not isinstance(reason, str) or not reason.strip():
-                raise ValidationError(
-                    "A terminal transition (released/transferred) requires "
-                    "a reason.",
-                    {"reason": "terminal_transition_requires_reason",
-                     "membership_id": membership.id, "status": status.value})
+            # #205 review round 2 — owner product ruling, overriding round
+            # 1 finding 5's "actor_id + reason" floor: that floor was a
+            # VALIDATED INPUT check, not authorization — any caller could
+            # satisfy it by supplying an arbitrary non-blank string for
+            # each, so it never actually stopped an unauthorized release or
+            # transfer, only a silent/anonymous/unreasoned one. This slice
+            # (#212 Slice A) is scoped to schema/migration/compatibility
+            # proof only; the authorized workflow (session-resolved
+            # principals, scope checks, deadline/override policy, Game-
+            # state safeguards, atomic audit, tri-store/HTTP coverage)
+            # ships in a LATER #205 slice. Until then this refuses
+            # UNCONDITIONALLY — checked before any write/event/audit, and
+            # never satisfiable by any actor_id or reason value, unlike the
+            # floor it replaces.
+            raise NotAuthorizedError(
+                "Releasing or transferring a membership is not available "
+                "through this method yet; the authorized transition "
+                "workflow ships in a later slice.",
+                {"reason": "terminal_transition_not_authorized",
+                 "membership_id": membership.id, "status": status.value})
         previous = membership.status
         membership.status = status
         if status.is_terminal:
+            # Currently unreachable through THIS method — the unconditional
+            # refusal above always raises first for any terminal ``status``
+            # — deliberately left in place rather than deleted: the later
+            # #205 slice that ships the authorized transition workflow
+            # replaces that refusal with real authorization checks and
+            # reuses this exact stamping, rather than having to re-add it.
             membership.effective_to = self.clock()
         self.store.save_season_roster_membership(membership)
         self._membership_event(

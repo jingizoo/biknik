@@ -46,7 +46,7 @@ import unittest
 from datetime import datetime, timezone
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
-from helpers import fresh_sql_store
+from helpers import end_membership_directly, fresh_sql_store
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.domain import (
@@ -245,10 +245,34 @@ class MembershipLifecycleTest(unittest.TestCase):
                     m["id"], "active", actor_id=ADMIN)
                 self.assertEqual(noop["error"]["details"]["reason"],
                                  "membership_status_unchanged", label)
-                rel = api.set_season_roster_membership_status(
+                # #205 review round 2 (owner ruling, overriding round 1
+                # finding 5's actor_id+reason floor): reaching "released"
+                # through this method is now refused UNCONDITIONALLY, zero
+                # write — proven here on the live, non-terminal membership
+                # this subTest already has, before falling back to a direct
+                # store write for the "already terminal, immutable" half of
+                # this test below (which is a DIFFERENT rule, untouched).
+                before_events = len(api.list_season_roster_membership_events(
+                    m["id"])["events"])
+                before_audit = len(api.store.all_setup_audit())
+                refused = api.set_season_roster_membership_status(
                     m["id"], "released", reason="cut", actor_id=ADMIN)
-                self.assertEqual(rel["status"], "released", label)
-                self.assertIsNotNone(rel["effective_to"], label)
+                self.assertEqual(refused["error"]["code"], "forbidden",
+                                 (label, refused))
+                self.assertEqual(
+                    refused["error"]["details"]["reason"],
+                    "terminal_transition_not_authorized", (label, refused))
+                self.assertEqual(
+                    len(api.list_season_roster_membership_events(
+                        m["id"])["events"]),
+                    before_events, label)
+                self.assertEqual(len(api.store.all_setup_audit()),
+                                 before_audit, label)
+                self.assertIs(
+                    api.store.get_season_roster_membership(m["id"]).status,
+                    MembershipStatus.ACTIVE, label)
+                rel = end_membership_directly(api.store, m["id"], "released")
+                self.assertIs(rel.status, MembershipStatus.RELEASED, label)
                 frozen = api.set_season_roster_membership_status(
                     m["id"], "active", actor_id=ADMIN)
                 self.assertEqual(frozen["error"]["details"]["reason"],
@@ -315,8 +339,12 @@ class MembershipLifecycleTest(unittest.TestCase):
                 self.assertEqual(
                     conflict["error"]["details"]["reason"],
                     "duplicate_membership_jersey_number", label)
-                api.set_season_roster_membership_status(
-                    m1["id"], "released", reason="cut", actor_id=ADMIN)
+                # Direct store write, not the now-unconditionally-refused
+                # set_season_roster_membership_status (#205 review round 2
+                # owner ruling) — this test's subject is that RELEASING
+                # frees the jersey number, not the transition method's own
+                # (now removed) authorization.
+                end_membership_directly(api.store, m1["id"], "released")
                 freed = api.create_season_roster_membership(
                     p2["id"], ls_id, team["id"], jersey_number=9,
                     actor_id=ADMIN)
@@ -425,16 +453,26 @@ class MembershipLifecycleTest(unittest.TestCase):
                                  "membership_filter_required", label)
 
 
-class MembershipTerminalTransitionFloorTest(unittest.TestCase):
-    """#205 review round 1 finding 5 — the PR narrows back to Slice A scope:
-    the schema stays capable of representing released/transferred (the enum
-    values are untouched), but the facade/service floor now REFUSES to set
-    either without a non-blank actor_id AND reason, with zero mutation.
+class MembershipTerminalTransitionRefusedTest(unittest.TestCase):
+    """#205 review round 2 — OWNER PRODUCT RULING, overriding round 1
+    finding 5's shipped "actor_id + reason" floor
+    (formerly MembershipTerminalTransitionFloorTest, REWORKED, not merely
+    renamed: every test below now proves the OPPOSITE of what this class
+    used to prove — that an actor_id+reason combination that satisfied the
+    old floor now ALSO gets refused).
 
-    This is deliberately a FLOOR, not the authorized transfer/release/
-    deadline-policy/override workflow #212 places in a later #205 slice —
-    see create_season_roster_membership's and set_season_roster_membership_
-    status's docstrings and the PR body for the explicit scope statement."""
+    The floor was a validated-INPUT check, not authorization: any caller
+    could satisfy it by supplying an arbitrary non-blank string for each,
+    so it never actually stopped an unauthorized release/transfer — only a
+    silent/anonymous/unreasoned one. ``set_season_roster_membership_status``
+    now UNCONDITIONALLY refuses every terminal transition (released AND
+    transferred) — no actor_id/reason combination, including ones that used
+    to succeed under the old floor, reaches a write. The schema and event
+    model stay fully capable of representing released/transferred (the enum
+    values are untouched, and a direct store write still reaches them, see
+    the last test below) — only SETTING one through this method is refused.
+    See set_season_roster_membership_status's and its facade pass-through's
+    docstrings, and the PR body, for the explicit ruling."""
 
     def _stores(self):
         yield "memory", InMemoryStore()
@@ -456,59 +494,76 @@ class MembershipTerminalTransitionFloorTest(unittest.TestCase):
                  if a.entity_id == membership_id]
         return row.status, len(events), len(audits)
 
-    def test_no_actor_refuses_terminal_transition_zero_write(self):
+    def test_released_refused_unconditionally_zero_write(self):
         for label, api, m in self._each():
             with self.subTest(backend=label):
                 before = self._snapshot(api, m["id"])
-                for kwargs in ({"reason": "cut"},                # no actor
-                              {"reason": "cut", "actor_id": ""},  # blank
-                              {"reason": "cut", "actor_id": "   "}):
+                for kwargs in (
+                        {},                                    # neither
+                        {"actor_id": ADMIN},                    # actor only
+                        {"reason": "cut"},                      # reason only
+                        {"actor_id": "", "reason": ""},         # blank
+                        {"actor_id": "   ", "reason": "   "},   # whitespace
+                        # The EXACT combination round 1's floor accepted —
+                        # the whole point of the owner ruling is that this
+                        # no longer succeeds either.
+                        {"actor_id": ADMIN, "reason": "cut"}):
                     res = api.set_season_roster_membership_status(
                         m["id"], "released", **kwargs)
+                    self.assertEqual(res["error"]["code"], "forbidden",
+                                     (label, kwargs, res))
                     self.assertEqual(
                         res["error"]["details"]["reason"],
-                        "terminal_transition_requires_actor",
+                        "terminal_transition_not_authorized",
                         (label, kwargs, res))
                     self.assertEqual(self._snapshot(api, m["id"]), before,
                                      (label, kwargs))
 
-    def test_no_reason_refuses_terminal_transition_zero_write(self):
+    def test_transferred_refused_unconditionally_zero_write(self):
         for label, api, m in self._each():
             with self.subTest(backend=label):
                 before = self._snapshot(api, m["id"])
-                for kwargs in ({"actor_id": ADMIN},                # no reason
-                              {"actor_id": ADMIN, "reason": ""},    # blank
-                              {"actor_id": ADMIN, "reason": "   "}):
-                    res = api.set_season_roster_membership_status(
-                        m["id"], "released", **kwargs)
-                    self.assertEqual(
-                        res["error"]["details"]["reason"],
-                        "terminal_transition_requires_reason",
-                        (label, kwargs, res))
-                    self.assertEqual(self._snapshot(api, m["id"]), before,
-                                     (label, kwargs))
+                res = api.set_season_roster_membership_status(
+                    m["id"], "transferred", reason="moved club",
+                    actor_id=ADMIN)
+                self.assertEqual(res["error"]["code"], "forbidden",
+                                 (label, res))
+                self.assertEqual(
+                    res["error"]["details"]["reason"],
+                    "terminal_transition_not_authorized", (label, res))
+                self.assertEqual(self._snapshot(api, m["id"]), before, label)
 
-    def test_non_terminal_transition_needs_neither(self):
-        # The floor is scoped to TERMINAL targets only — parking a
-        # membership (a fully reversible, non-terminal transition) is
-        # unaffected, matching the review's own "at minimum" floor framing.
+    def test_non_terminal_transition_unaffected(self):
+        # The refusal is scoped to TERMINAL targets only — parking a
+        # membership (a fully reversible, non-terminal transition) still
+        # needs neither an actor nor a reason, exactly as before the ruling.
         for label, api, m in self._each():
             with self.subTest(backend=label):
                 res = api.set_season_roster_membership_status(
                     m["id"], "inactive")
                 self.assertNotIn("error", res, (label, res))
 
-    def test_authorized_terminal_transition_succeeds(self):
+    def test_schema_still_represents_terminal_status_via_direct_write(self):
+        # The enum/schema and event model stay fully capable of
+        # representing released/transferred (#212's later slice ships the
+        # authorized path that reaches them through the service); only
+        # THIS method's surface is closed. A membership terminated directly
+        # at the store layer (the owner ruling's prescribed rework for
+        # tests that need a terminal PRECONDITION — see
+        # end_membership_directly, used throughout this module) is still
+        # immutable afterward, the SAME pre-existing rule
+        # test_status_lifecycle_terminal_immutability_and_new_stint proves
+        # above, unaffected by this ruling.
         for label, api, m in self._each():
             with self.subTest(backend=label):
-                res = api.set_season_roster_membership_status(
-                    m["id"], "released", reason="cut", actor_id=ADMIN)
-                self.assertNotIn("error", res, (label, res))
-                self.assertEqual(res["status"], "released", label)
-                events = api.list_season_roster_membership_events(
-                    m["id"])["events"]
-                self.assertEqual(events[-1]["reason"], "cut", label)
-                self.assertEqual(events[-1]["actor_id"], ADMIN, label)
+                released = end_membership_directly(
+                    api.store, m["id"], "released")
+                self.assertIs(released.status, MembershipStatus.RELEASED,
+                              label)
+                frozen = api.set_season_roster_membership_status(
+                    m["id"], "active", actor_id=ADMIN)
+                self.assertEqual(frozen["error"]["details"]["reason"],
+                                 "membership_terminal", label)
 
 
 class MembershipPersistenceTest(unittest.TestCase):
@@ -1558,24 +1613,46 @@ class MembershipPostgresLifecycleTest(unittest.TestCase):
         upd = api.update_season_roster_membership(
             m["id"], jersey_number=12, reason="switch", actor_id=ADMIN)
         self.assertEqual(upd["jersey_number"], 12)
-        rel = api.set_season_roster_membership_status(
+        # #205 review round 2 (owner ruling, overriding round 1 finding 5's
+        # actor_id+reason floor): set_season_roster_membership_status now
+        # refuses EVERY terminal transition unconditionally — proven here
+        # on real PostgreSQL too, zero write, before the terminal state
+        # this test still needs (to exercise "already terminal, immutable"
+        # below) is constructed directly at the store layer instead, per
+        # the owner ruling's explicit guidance for existing Slice-A
+        # coverage that needs a terminal PRECONDITION.
+        before_events = len(
+            api.list_season_roster_membership_events(m["id"])["events"])
+        before_audit = len(api.store.all_setup_audit())
+        refused = api.set_season_roster_membership_status(
             m["id"], "released", reason="cut", actor_id=ADMIN)
-        self.assertEqual(rel["status"], "released")
-        self.assertIsNotNone(rel["effective_to"])
+        self.assertEqual(refused["error"]["code"], "forbidden")
+        self.assertEqual(refused["error"]["details"]["reason"],
+                         "terminal_transition_not_authorized")
+        self.assertEqual(
+            len(api.list_season_roster_membership_events(m["id"])["events"]),
+            before_events)
+        self.assertEqual(len(api.store.all_setup_audit()), before_audit)
+        rel = end_membership_directly(api.store, m["id"], "released")
+        self.assertIs(rel.status, MembershipStatus.RELEASED)
         frozen = api.set_season_roster_membership_status(
             m["id"], "active", actor_id=ADMIN)
         self.assertEqual(frozen["error"]["details"]["reason"],
                          "membership_terminal")
+        # 2 events, not 3: "created" + "attributes_changed" (the update
+        # above). The direct-store release above appends no event (it
+        # bypasses the service, so there is no "status_changed" — see
+        # end_membership_directly's docstring), unlike a real transition.
         events = api.list_season_roster_membership_events(m["id"])["events"]
         self.assertEqual([e["action"] for e in events],
-                         ["created", "attributes_changed", "status_changed"])
+                         ["created", "attributes_changed"])
         # Durable across a second connection to the same database.
         second = SqlStore(os.environ["TEST_DATABASE_URL"])
         try:
             row = second.get_season_roster_membership(m["id"])
             self.assertIs(row.status, MembershipStatus.RELEASED)
             self.assertEqual(row.jersey_number, 12)
-            self.assertEqual(len(second.events_for_membership(m["id"])), 3)
+            self.assertEqual(len(second.events_for_membership(m["id"])), 2)
         finally:
             second.close()
 

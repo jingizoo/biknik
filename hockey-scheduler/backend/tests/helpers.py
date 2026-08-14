@@ -153,6 +153,32 @@ def fresh_sql_store(url):
     return store
 
 
+def end_membership_directly(store, membership_id, status="released"):
+    """Move a SeasonRosterMembership straight to a TERMINAL status via the
+    STORE layer, bypassing ``SetupService.set_season_roster_membership_
+    status`` entirely.
+
+    #205 review round 2 (owner product ruling, overriding round 1 finding
+    5's shipped "actor_id + reason" floor): that service method now hard-
+    refuses EVERY terminal transition (released/transferred), for any
+    actor_id/reason, unconditionally — no caller can reach one through it
+    any more. Several existing Slice-A tests need an ALREADY-terminal
+    membership only as a PRECONDITION for something ELSE they exercise
+    (e.g. "a terminal membership does not block unregister/transfer",
+    unlike a live one; "release frees a jersey number") — not to test the
+    transition method's own authorization, which is exactly what the owner
+    ruling says must be reconstructed this way rather than weakened back
+    open. A membership moved this way carries no ``status_changed`` event
+    and no audit row (a direct write, not a service call) — callers whose
+    assertions count events/audits need to account for that.
+    """
+    from hockey_scheduler.domain import MembershipStatus
+    m = store.get_season_roster_membership(membership_id)
+    m.status = MembershipStatus(status)
+    store.save_season_roster_membership(m)
+    return m
+
+
 def cookie_from_set_cookie(set_cookie_header, name):
     """Extract a single cookie's ``name=value`` from a Set-Cookie header.
 

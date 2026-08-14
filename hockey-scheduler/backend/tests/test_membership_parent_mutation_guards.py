@@ -37,6 +37,7 @@ import threading
 import unittest
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
+from helpers import end_membership_directly as _end_membership_directly
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.domain import MembershipStatus, Position, SeasonRosterMembership
@@ -82,6 +83,20 @@ def _make_membership(api, fx, status="applicant"):
         jersey_number=None, actor_id=ADMIN)
 
 
+# _end_membership_directly (imported above as helpers.end_membership_directly)
+# — #205 review round 2 (owner product ruling): set_season_roster_membership_
+# status now hard-refuses EVERY terminal transition, unconditionally — no
+# caller, actor_id or reason can reach one through it any more. Several tests
+# in this module need an ALREADY-terminal membership only as a PRECONDITION
+# for something ELSE they exercise (a terminal membership does not block
+# unregister/transfer, unlike a live one) — not to test the transition
+# method's own authorization, which is exactly what the owner ruling says
+# must be reconstructed this way rather than weakened back open. Mirrors this
+# file's own pre-existing convention for reaching an out-of-band state
+# (ReactivationSpineTest's direct api.store.delete_team/save_team calls,
+# below).
+
+
 class UnregisterStrandingTest(unittest.TestCase):
     """``unregister_team_from_season`` must refuse while a LIVE membership
     still names this exact (LeagueSeason, Team) — zero write, zero audit."""
@@ -111,9 +126,12 @@ class UnregisterStrandingTest(unittest.TestCase):
                     # Zero audit: no new setup_audit_logs row.
                     self.assertEqual(len(api.store.all_setup_audit()),
                                      before_audit, (label, status))
-                    # Clean up for the next status in this loop.
-                    api.set_season_roster_membership_status(
-                        m["id"], "released", reason="test", actor_id=ADMIN)
+                    # Clean up for the next status in this loop. Direct
+                    # store write (#205 review round 2 owner ruling):
+                    # set_season_roster_membership_status now hard-refuses
+                    # every terminal transition, and this is a precondition
+                    # for the next loop iteration, not the thing under test.
+                    _end_membership_directly(api.store, m["id"], "released")
 
     def test_terminal_membership_does_not_block_unregister(self):
         for label, store in _each_store():
@@ -121,8 +139,12 @@ class UnregisterStrandingTest(unittest.TestCase):
                 api = ApiService(store)
                 fx = _fixture(api)
                 m = _make_membership(api, fx, "applicant")
-                api.set_season_roster_membership_status(
-                    m["id"], "released", reason="test", actor_id=ADMIN)
+                # Direct store write, not the now-unconditionally-refused
+                # set_season_roster_membership_status (#205 review round 2
+                # owner ruling) — this test's subject is unregister's
+                # behavior against an ALREADY-terminal membership, not the
+                # transition method's own (now removed) authorization.
+                _end_membership_directly(api.store, m["id"], "released")
                 res = api.unregister_team_from_season(
                     fx["reg"]["id"], actor_id=ADMIN)
                 self.assertNotIn("error", res, (label, res))
@@ -149,9 +171,16 @@ class RegistrationDeleteStrandingTest(unittest.TestCase):
                 fx = _fixture(api)
                 m = _make_membership(api, fx, "applicant")
                 self.assertNotIn("error", m, (label, m))
-                released = api.set_season_roster_membership_status(
-                    m["id"], "released", reason="test", actor_id=ADMIN)
-                self.assertNotIn("error", released, (label, released))
+                # Direct store write, not the now-unconditionally-refused
+                # set_season_roster_membership_status (#205 review round 2
+                # owner ruling) — this test's subject is the PERMANENT
+                # delete's "any status, even terminal history" FK block,
+                # not the transition method's own (now removed)
+                # authorization.
+                released = _end_membership_directly(
+                    api.store, m["id"], "released")
+                self.assertIs(released.status, MembershipStatus.RELEASED,
+                              (label, released))
                 unreg = api.unregister_team_from_season(
                     fx["reg"]["id"], actor_id=ADMIN)
                 self.assertNotIn("error", unreg, (label, unreg))
@@ -309,8 +338,12 @@ class TransferStrandingTest(unittest.TestCase):
                 api = ApiService(store)
                 fx = _fixture(api)
                 m = _make_membership(api, fx, "applicant")
-                api.set_season_roster_membership_status(
-                    m["id"], "released", reason="test", actor_id=ADMIN)
+                # Direct store write, not the now-unconditionally-refused
+                # set_season_roster_membership_status (#205 review round 2
+                # owner ruling) — this test's subject is transfer's
+                # behavior against an ALREADY-terminal membership, not the
+                # transition method's own (now removed) authorization.
+                _end_membership_directly(api.store, m["id"], "released")
                 res = api.transfer_team_to_league(
                     fx["team"]["id"], fx["other_league_id"], actor_id=ADMIN)
                 self.assertNotIn("error", res, (label, res))
