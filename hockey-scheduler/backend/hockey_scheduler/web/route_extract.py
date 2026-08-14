@@ -1912,6 +1912,43 @@ class _DispatchWalker:
         while changed:
             changed = False
             for node in ast.walk(fn):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) \
+                        and node is not fn:
+                    # #202 repair round 6, finding 2: a LOCALLY-DEFINED
+                    # closure -- nested directly inside the audited
+                    # function, reading an outer name through Python's own
+                    # closure mechanism rather than receiving it as a
+                    # syntactic argument -- is invisible to every call-
+                    # auditing mechanism in this module: _mentions_tracked
+                    # only ever looks at a Call's OWN visible receiver and
+                    # arguments, and a call to a closure that reads a
+                    # tracked FREE VARIABLE mentions nothing tracked in its
+                    # own syntax at all, regardless of how many arguments
+                    # it takes. DEMONSTRATED: ``def compute(): return
+                    # path`` then ``candidate = compute()`` answered live
+                    # HTTP 200 while extraction stayed silent --
+                    # ``compute()``'s call site has no argument for any
+                    # existing check to examine.
+                    # Treated as an IMPLICIT binding, the closure's own
+                    # NAME "bound from" its whole body: if the closure
+                    # mentions ANYTHING tracked anywhere in it
+                    # (``_mentions_tracked`` -- the SAME opaque-extraction-
+                    # aware check every other consumer in this module
+                    # uses, so a closure that only touches a captured/
+                    # opaque value stays clean, same as everywhere else),
+                    # its name joins ``tracked`` through this SAME fixed-
+                    # point loop -- so a LATER call to it, however it is
+                    # spelled or how many arguments it takes, is audited
+                    # exactly like any other tracked reference, with zero
+                    # new call-shape logic needed. Re-checked every pass
+                    # (not just once) the same way every other binding
+                    # here is, so a closure that itself calls ANOTHER
+                    # closure only provably tracked on a later pass still
+                    # converges correctly.
+                    if node.name not in tracked and _mentions_tracked(node, tracked):
+                        tracked.add(node.name)
+                        changed = True
+                    continue
                 # #202 repair round 4, finding 2: every binding form this
                 # module tracks -- ``ast.Assign``/``ast.AnnAssign``, (round
                 # 3 finding F) ``ast.NamedExpr``, and (this round)
@@ -2196,6 +2233,34 @@ class _DispatchWalker:
                 _propagates_taint(node.exc, tracked, fn.name,
                                   self.waiver_hits, parents, self._followed,
                                   captured_names)
+            if isinstance(node, (ast.With, ast.AsyncWith)):
+                # #202 repair round 6, finding 2: a ``with`` statement's
+                # CONTEXT EXPRESSION (``with CONTEXTS[path]:``) is a
+                # CONTROL-TRANSFER-relevant expression this module never
+                # inspected at all -- not the fixed-point loop (which only
+                # ever looks at a ``with ... as name:`` item's context
+                # expression to decide whether ITS OWN bound NAME should
+                # join ``tracked``, per :func:`_binding_value_and_targets`,
+                # and does nothing at all for a bare ``with EXPR:`` with no
+                # ``as`` clause -- exactly this shape), nor the bare-Expr/
+                # Return/Raise scans above (none of which visit
+                # ``With.items``). A context manager's own ``__enter__``/
+                # ``__exit__`` can have side effects, and ``__exit__``
+                # returning true SUPPRESSES an exception raised in the
+                # block -- both observably change what response the
+                # request gets, driven entirely by WHICH context manager
+                # ``CONTEXTS[path]`` resolves to. DEMONSTRATED: ``with
+                # CONTEXTS[path]: return self._send(1)`` answered live
+                # HTTP 200 while extraction stayed silent. Reuses the SAME
+                # _propagates_taint check every other statement position
+                # in this module already runs, purely for its raise-if-
+                # unlisted-and-tracked side effect -- every item, not only
+                # the first, and regardless of whether the item binds a
+                # name at all.
+                for item in node.items:
+                    _propagates_taint(item.context_expr, tracked, fn.name,
+                                      self.waiver_hits, parents,
+                                      self._followed, captured_names)
             if isinstance(node, ast.ExceptHandler) and node.name is not None:
                 # #202 repair round 5, finding 6c -- the HARD part, stated
                 # honestly rather than left silently unaddressed (matching
@@ -2235,7 +2300,35 @@ class _DispatchWalker:
                 # `candidate` carries the raised path as its exception
                 # payload, invisible to every check in this module until
                 # now.
-                if self._function_has_tracked_raise(fn, tracked):
+                #
+                # #202 repair round 6, finding 2: finding 6c's own check
+                # above only ever looks for an EXPLICIT ``ast.Raise`` node
+                # -- an IMPLICIT exception (a Subscript/operation that
+                # fails naturally: ``{}[path]``'s own ``KeyError``,
+                # ``int(path)``'s own ``ValueError``, ...) can carry
+                # tracked data into THIS SAME handler's payload exactly
+                # the way an explicit ``raise`` already does, but was
+                # invisible to a check that only pattern-matches
+                # ``ast.Raise``. :meth:`_try_body_has_tracked_operation`
+                # closes this SCOPED to the handler's OWN enclosing
+                # ``ast.Try`` body specifically (not function-wide, the
+                # way the explicit-raise check above deliberately is) --
+                # not a further approximation, but an ACCURATE reflection
+                # of Python's own exception semantics: a handler can only
+                # ever catch what its OWN try body raises, implicitly or
+                # explicitly. DEMONSTRATED: ``try: {}[path] \n except
+                # KeyError as e: candidate = str(e.args[0]) \n if
+                # candidate == "/api/hidden": ...`` answered live HTTP
+                # while extraction stayed silent -- even once the bare
+                # ``{}[path]`` access is independently caught by this
+                # round's own Subscript audit (see _propagates_taint), a
+                # REVIEWED, WAIVED tracked operation in the SAME try body
+                # (this module's own established escape hatch for a
+                # legitimately-safe call/subscript) would otherwise still
+                # leave this handler completely unexamined.
+                if self._function_has_tracked_raise(fn, tracked) \
+                        or self._try_body_has_tracked_operation(
+                            node, tracked, parents):
                     key = _waiver_key(fn.name, node, parents)
                     if key in _AUDIT_WAIVERS:
                         self._record_waiver_hit(key, node)
@@ -2244,13 +2337,14 @@ class _DispatchWalker:
                         f"{fn.name}:{node.lineno} `except ... as "
                         f"{node.name}:` binds a name that MAY carry "
                         "exception-payload taint -- this function "
-                        "contains a raise whose argument mentions a "
+                        "contains a raise (explicit, or an operation that "
+                        "may raise implicitly) whose argument mentions a "
                         "tracked dispatch name, and route_extract cannot "
                         "prove this handler does not receive it (a "
-                        "conservative, function-wide over-approximation: "
-                        "see _audit_function's own finding-6c comment). "
-                        "Rewrite to avoid depending on the exception "
-                        "payload, or classify here.")
+                        "conservative, function-wide-or-try-body-scoped "
+                        "over-approximation: see _audit_function's own "
+                        "finding-6c comment). Rewrite to avoid depending "
+                        "on the exception payload, or classify here.")
 
     def _function_has_tracked_raise(self, fn: ast.FunctionDef,
                                     tracked: set) -> bool:
@@ -2270,6 +2364,45 @@ class _DispatchWalker:
                     and _mentions_tracked(node.exc, tracked):
                 return True
         return False
+
+    @staticmethod
+    def _try_body_has_tracked_operation(handler: ast.ExceptHandler,
+                                        tracked: set,
+                                        parents: dict) -> bool:
+        """Does the ``ast.Try`` block ``handler`` belongs to contain, in
+        its OWN try body specifically, an expression that mentions a
+        tracked name? (#202 repair round 6, finding 2.)
+
+        :meth:`_function_has_tracked_raise` (round 5, finding 6c) only
+        ever looks for an EXPLICIT ``ast.Raise`` node, function-wide. An
+        IMPLICIT exception -- a Subscript/operation that fails naturally
+        (``{}[path]``'s own ``KeyError``, ...) rather than an explicit
+        ``raise`` -- was invisible to it no matter how directly it carried
+        tracked data into THIS SAME handler's payload. This check is
+        scoped to the handler's OWN enclosing try body, narrower than
+        finding 6c's function-wide reach -- not a further approximation,
+        but an ACCURATE reflection of Python's own exception semantics: a
+        handler can only ever catch what its OWN try body raises, so
+        looking function-wide here would over-flag every named handler in
+        a function that merely happens to ALSO have an unrelated tracked
+        expression somewhere else in it, in a way finding 6c's own
+        already-accepted function-wide over-approximation for EXPLICIT
+        raises does not (an explicit ``raise`` can be re-raised or
+        propagate through nested try/except in ways this module has no
+        control-flow model for, which is exactly finding 6c's own
+        documented reason for going function-wide there; an implicit
+        failure has no such ambiguity -- it can only ever be caught by a
+        handler of the SAME try statement it occurs in).
+
+        Uses the SAME ``_mentions_tracked`` boundary every other check in
+        this module does, walking each top-level statement of the try
+        body (not the try statement's OWN handlers/orelse/finalbody,
+        which are not what this try body's OWN exceptions come from).
+        """
+        parent = parents.get(id(handler))
+        if not isinstance(parent, ast.Try):
+            return False
+        return any(_mentions_tracked(stmt, tracked) for stmt in parent.body)
 
     def _audit_dispatch_helper_calls(self, fn: ast.FunctionDef) -> None:
         """Raise if ``fn`` calls an uncatalogued ``_handle_*``/``_dispatch_*``
@@ -3190,6 +3323,37 @@ _AUDIT_WAIVERS = {
         "immediately above -- same reasoning, `check_body(b, "
         "**_V2_REASSIGN_SCHEMA[combo])` is round 3, finding E's own "
         "pre-existing waiver for the call as a whole",
+    # -- #202 repair round 6, finding 2 -- newly reached now that a
+    # `with`/an implicit-exception-into-handler data flow is audited at
+    # all (this dict's own two entries below are the SECOND of those, the
+    # try-body-scoped except-handler check; finding 2's other three gaps
+    # -- closures, `with` context expressions, and the captured-exemption
+    # narrowing for dispatch selection -- need no waiver against the real
+    # server.py: it has no local closure that reads a tracked free
+    # variable, no `with` statement at all, and no captured id used to
+    # select-then-immediately-invoke a callable). Both entries below are
+    # the SAME shape: `except BodyError as exc: return self._send_json(
+    # exc.payload, exc.status)`, whose own enclosing try body is
+    # `check_body(b, **_V{1,2}_REASSIGN_SCHEMA[combo])` (round 3, finding
+    # E's own pre-existing waiver, several entries above, covers that
+    # call). NOT a routing decision: `check_body` raises `BodyError` on a
+    # malformed REQUEST BODY for the ALREADY-DECIDED `combo`, and this
+    # handler's only action is to translate that into the response --
+    # `exc.payload`/`exc.status` are returned directly, never inspected or
+    # compared to select a different template -- the SAME "produces the
+    # final answer for an already-decided route" shape as every other
+    # `check_body`-adjacent waiver in this dict.
+    ("_handle_reassign",
+     "except BodyError as exc:\n    return self._send_json(exc.payload, "
+     "exc.status)", "try", "combo in _V1_REASSIGN_SCHEMA"):
+        "the exception handler for `check_body`'s own BodyError, "
+        "translating a malformed-body failure straight into the "
+        "response -- see this sub-group's own comment above",
+    ("_handle_reassign_v2",
+     "except BodyError as exc:\n    return self._send_json(exc.payload, "
+     "exc.status)", "try", "combo in _V2_REASSIGN_SCHEMA"):
+        "the v2 sibling of `_handle_reassign`'s own identical-shape "
+        "waiver immediately above -- same reasoning",
 }
 
 
@@ -3293,6 +3457,47 @@ _PATH_CONSUMING_METHODS = ("read_bytes", "read_text", "open")
 #: mention when it is nested inside some OTHER unlisted call's arguments
 #: (e.g. a routing comparison hidden inside a genexpr) -- only an
 #: EXTRACTION/CONSUMPTION's receiver must not leak outward like that.
+def _is_callee(node: ast.AST, parents: Optional[dict]) -> bool:
+    """Is ``node`` itself the CALLEE of its immediate parent -- i.e. is it
+    about to be INVOKED, not merely read as data?
+
+    #202 repair round 6, finding 2: the ``captured`` exemption (see
+    :func:`_propagates_taint`'s own docstring) is deliberately narrow --
+    "a NON-``self.`` call whose only tracked mentions are already-captured
+    names" -- but that test alone cannot tell apart ``api.get_x(gid)`` (a
+    captured id handed to a FIXED, KNOWN service function as inert DATA --
+    exactly the shape the exemption exists for) from ``handlers.get(action,
+    default)()`` (a captured id used to SELECT WHICH CALLABLE RUNS, then
+    immediately invoke it -- the SAME dispatch-table shape
+    ``PREDICATES[path]()``/``ROUTES[path]()`` already require full
+    scrutiny for, round 5 finding 2a and this round's own Subscript audit,
+    just with the tracked key replaced by a captured group). DEMONSTRATED:
+    a regex-captured ``action`` selecting ``handlers.get(action,
+    default_handler)(self)`` extracted as a single ``/api/{}`` wildcard
+    while the live handler answered 200 for one concrete value and 404 for
+    another -- the captured exemption accepted it because its ONLY
+    tracked mention (``action``) was captured, never asking whether the
+    call's own RESULT was about to be called.
+
+    Used to gate the ``captured`` exemption OFF for exactly this shape:
+    a Call or Subscript that is itself ``parent.func`` for an ENCLOSING
+    ``ast.Call`` -- i.e. about to be invoked -- never qualifies, no matter
+    how narrowly its own tracked mentions are captured-only. A captured id
+    used as a plain ARGUMENT or receiver elsewhere (``deleter(md.group(2),
+    actor_id)``, ``mapper(deleter(...))`` -- real server.py shapes, see
+    ``_AUDIT_WAIVERS``) is UNAFFECTED: neither is ever ``parent.func`` for
+    anything (each is bound to a plain local NAME first via a separate
+    assignment, and a bare ``ast.Name`` callee is never independently
+    examined by the Call/Subscript-shaped checks this gates at all), so
+    this only narrows the exemption for the shape it was never meant to
+    cover in the first place.
+    """
+    if parents is None:
+        return False
+    parent = parents.get(id(node))
+    return isinstance(parent, ast.Call) and parent.func is node
+
+
 def _is_self_call(node: ast.Call) -> bool:
     """Is ``node``'s callee rooted at ``self`` -- ``self.method(...)``,
     ``self.attr.method(...)``, or any deeper ``self.a.b.c(...)`` chain?
@@ -3676,11 +3881,19 @@ def _propagates_taint(value, tracked: set, fn_name: str = "",
                     # separately, by this SAME walk.
                     continue
                 if (captured and not is_self_call
+                        and not _is_callee(node, parents)
                         and _tracked_mentions(node, tracked) <= captured):
                     # See this function's own docstring: a NON-self call
                     # whose only tracked mentions are already-captured
                     # names is the bound-first counterpart of
                     # ``_is_known_capture_extraction``'s inline exemption.
+                    # #202 repair round 6, finding 2: ALSO never when this
+                    # call is itself about to be INVOKED as an enclosing
+                    # call's own callee (see ``_is_callee``'s own
+                    # docstring) -- selecting WHICH callable runs is a
+                    # dispatch decision even when the selector is a
+                    # captured id, not the inert-data case this exemption
+                    # exists for.
                     continue
                 waiver_key = _waiver_key(fn_name, node, parents)
                 if waiver_key in _AUDIT_WAIVERS:
@@ -3754,7 +3967,8 @@ def _propagates_taint(value, tracked: set, fn_name: str = "",
             # function fallback, which still sees the whole Subscript.
             mentioned = _tracked_mentions(node.slice, tracked)
             if mentioned:
-                if captured and mentioned <= captured:
+                if captured and mentioned <= captured \
+                        and not _is_callee(node, parents):
                     # The SAME captured-only exemption a Call's arguments
                     # get, several lines above (see this function's own
                     # docstring on ``captured``): a lookup keyed on an
@@ -3766,7 +3980,13 @@ def _propagates_taint(value, tracked: set, fn_name: str = "",
                     # unconditionally excluded from ``captured`` upstream
                     # (see ``_Ctx.captured``'s own docstring), so this
                     # cannot be used to smuggle a real dispatch table past
-                    # review.
+                    # review. #202 repair round 6, finding 2: ALSO never
+                    # when this Subscript is itself about to be INVOKED as
+                    # an enclosing call's own callee (``HANDLERS[action]
+                    # ()``, see ``_is_callee``'s own docstring) -- the
+                    # Subscript-callee analogue of the SAME dispatch-
+                    # selection concern the Call-branch's own exemption,
+                    # above, is narrowed for.
                     continue
                 waiver_key = _waiver_key(fn_name, node, parents)
                 if waiver_key in _AUDIT_WAIVERS:

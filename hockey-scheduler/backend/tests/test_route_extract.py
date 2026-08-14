@@ -18,6 +18,7 @@ Three properties, each with a falsifying case:
 
 import ast
 import json
+import re
 import textwrap
 import threading
 import unittest
@@ -1121,7 +1122,7 @@ class WaiverFingerprintTests(unittest.TestCase):
             route_extract_module._AUDIT_WAIVERS.update(saved)))
 
     def test_every_real_waiver_is_hit_exactly_once(self):
-        """The real server.py, unmodified: each of the 71 declared waivers
+        """The real server.py, unmodified: each of the 73 declared waivers
         (18 from rounds 2-3 -- 2 pre-existing + 2 pre-existing ternaries + 6
         round-2 finding A additions + 8 round-3 finding E additions -- plus
         11 round-4 finding 1 additions, once a Call reached DIRECTLY as the
@@ -1149,7 +1150,13 @@ class WaiverFingerprintTests(unittest.TestCase):
         two `_handle_setup_v2` `call(...)` entries -- that turned out to
         have been needed only because the OLD blind-scan fallback wrongly
         read straight through an opaque capture, not because the
-        expressions they covered were ever genuinely tracked) is consulted
+        expressions they covered were ever genuinely tracked -- plus 2
+        round-6 finding 2 additions, once an except handler whose own
+        enclosing try body contains a tracked operation is audited the
+        same way finding 6c's function-wide raise check already was: the
+        two `_handle_reassign`/`_handle_reassign_v2` `except BodyError as
+        exc:` handlers for `check_body`'s own already-reviewed
+        `_V{1,2}_REASSIGN_SCHEMA[combo]`-keyed validation) is consulted
         for precisely the one line it names -- proves the instrumentation
         is wired all the way through _propagates_taint AND the ast.If/
         ast.IfExp/ast.While/ast.match_case scan, not just one of them.
@@ -1159,7 +1166,7 @@ class WaiverFingerprintTests(unittest.TestCase):
         dedicated proof for what the extra two parts catch that this
         exact-one-hit check alone would not."""
         walker = extract_walker()
-        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 71)
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 73)
         for key in route_extract_module._AUDIT_WAIVERS:
             with self.subTest(waiver=key):
                 self.assertEqual(len(walker.waiver_hits.get(key, ())), 1)
@@ -2359,14 +2366,18 @@ class UnmodelledBindingFormTests(unittest.TestCase):
         """A ``with EXPR:`` with no ``as`` clause binds no target -- there is
         nothing for taint to reach, so this must NOT raise merely because
         the with-item exists; the INNER, ordinary ``path`` test is still
-        correctly recognised as a route. (The context expression's own call
-        touching ``path`` with no binding at all is a documented, narrower,
-        out-of-scope shape -- see _binding_value_and_targets' docstring --
-        not a finding-2 regression.)"""
+        correctly recognised as a route. Isolated from the context
+        expression's OWN taint (a SEPARATE concern -- #202 repair round 6,
+        finding 2 audits that directly now, see
+        ``ExecutionControlAndDataFlowTests.
+        test_with_context_expression_touching_path_raises`` below, closing
+        what THIS test's own docstring used to document as an
+        intentionally out-of-scope shape for round 4's finding 2) via a
+        context expression that mentions nothing tracked at all."""
         found = {(r.method, r.template) for r in extract_routes(_module('''
             def do_GET(self):
                 path = self.path.split("?", 1)[0]
-                with nullcontext(path):
+                with nullcontext():
                     if path == "/api/normal-with-noas":
                         return self._send(1)
         '''))}
@@ -2647,7 +2658,7 @@ class WaiverTaintPropagationTests(unittest.TestCase):
         walker = extract_walker()
         self.assertEqual(len(walker.routes), 239)
         self.assertEqual(walker.unreachable, [])
-        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 71)
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 73)
 
 
 # --------------------------------------------------------------------------- #
@@ -2865,7 +2876,7 @@ class SubscriptCalleeAndReturnDispatchTests(unittest.TestCase):
         walker = extract_walker()
         self.assertEqual(len(walker.routes), 239)
         self.assertEqual(walker.unreachable, [])
-        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 71)
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 73)
 
 
 # --------------------------------------------------------------------------- #
@@ -3021,7 +3032,7 @@ class DefaultDenyExpressionOperandTests(unittest.TestCase):
         walker = extract_walker()
         self.assertEqual(len(walker.routes), 239)
         self.assertEqual(walker.unreachable, [])
-        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 71)
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 73)
 
 
 # --------------------------------------------------------------------------- #
@@ -3263,7 +3274,7 @@ class ExceptionDrivenRoutingTests(unittest.TestCase):
         walker = extract_walker()
         self.assertEqual(len(walker.routes), 239)
         self.assertEqual(walker.unreachable, [])
-        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 71)
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 73)
 
 
 # --------------------------------------------------------------------------- #
@@ -3563,13 +3574,582 @@ class CompositionalTaintTests(unittest.TestCase):
         self.path fix newly reaches throughout `_dispatch_get`, and the
         two `SCHEMA[combo]` keyword-unpack Subscripts this finding's own
         new Subscript audit newly reaches -- must still extract cleanly:
-        239 routes, 71 waivers (23 new minus 3 proven dormant -- see
-        WaiverFingerprintTests' own pinned count and docstring for the
-        exact accounting)."""
+        239 routes, 71 waivers as of THIS finding's own landing (23 new
+        minus 3 proven dormant -- see WaiverFingerprintTests' own pinned
+        count for the CURRENT total, which round 6 finding 2 grows
+        further)."""
         walker = extract_walker()
         self.assertEqual(len(walker.routes), 239)
         self.assertEqual(walker.unreachable, [])
-        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 71)
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 73)
+
+
+# --------------------------------------------------------------------------- #
+# #202 repair round 6, finding 2 (external review, 03:59:55): the audited     #
+# execution-control inventory remains fail-open. Five reviewer-supplied       #
+# same-source repros (four live-HTTP-before/static-silent-after, one a        #
+# static-wildcard/live-behaviour-split), each independently demonstrated      #
+# below before being shown closed:                                            #
+#                                                                              #
+#   * a LOCAL closure reading a tracked name as a free variable rather than   #
+#     a syntactic argument -- invisible to every call-auditing mechanism,     #
+#     which only ever looks at a call's own visible receiver/arguments;       #
+#   * a ``with EXPR:`` (no ``as``) context expression -- never inspected by   #
+#     anything, the binding model only ever looked at a WITH-item's context   #
+#     expression to decide whether ITS OWN bound name should join tracked;    #
+#   * a ``for``/``async for`` iterable keyed on a tracked name -- ALREADY     #
+#     closed as a side effect of round 6 finding 1's own Subscript audit      #
+#     (the fixed-point loop already runs every iterable through               #
+#     ``_propagates_taint`` to decide the loop TARGET's own trackedness, so   #
+#     the new Subscript branch reaches it for free) -- verified, not just     #
+#     assumed, below;                                                         #
+#   * an IMPLICIT exception (a Subscript/operation that fails naturally,      #
+#     never an explicit ``raise``) inspected through its own handler's        #
+#     payload -- round 5 finding 6c's coarse over-approximation only ever     #
+#     looks for an explicit ``ast.Raise`` node, function-wide;                #
+#   * the round 5 finding 2b ``captured`` exemption applied to a captured id  #
+#     used to SELECT a callable that is then immediately invoked             #
+#     (``handlers.get(action, default)()``) -- the exemption's own "only a   #
+#     captured id" test cannot tell dispatch SELECTION apart from inert      #
+#     DATA handed to a fixed, known service.                                  #
+#                                                                              #
+# Closed via: a closure's own name treated as an IMPLICIT binding (joins     #
+# ``tracked`` when its body mentions anything tracked, through the SAME      #
+# fixed-point loop); a ``with``/``async with`` context-expression scan       #
+# (reusing ``_propagates_taint`` exactly as the Return/Raise/bare-Expr       #
+# scans already do); a new, narrowly-SCOPED (the handler's own enclosing     #
+# try body, not function-wide) implicit-exception check alongside finding    #
+# 6c's own explicit one; and a new ``_is_callee`` guard narrowing the        #
+# ``captured`` exemption so it can never fire for a Call/Subscript that is   #
+# itself about to be invoked. Two real new sites in server.py needed their   #
+# own reviewed waiver (see WaiverFingerprintTests' own pinned count).        #
+# --------------------------------------------------------------------------- #
+class ExecutionControlAndDataFlowTests(unittest.TestCase):
+    # -- pre-fix escapes, reproduced via git stash (not re-run here: git
+    # stash cannot be invoked from inside a test process) -- the transcript
+    # below is what running each of the five fixtures below produced against
+    # the code as it stood immediately before this finding's fix (head
+    # 15ff6b1618a47135fab5e867bab3e89eaaf25034, round 5's own final head, via
+    # an isolated copy of route_extract.py at that exact commit -- round 6
+    # finding 1's OWN fix landed first, on top of the same base, as an
+    # independent commit; the four repros below were separately re-verified
+    # against that finding-1-fixed head too, to isolate exactly what finding
+    # 2 itself closes), captured verbatim:
+    #
+    #   repro1-closure-captures-path:            NO RAISE both heads. live: 200
+    #   repro2-with-contexts-subscript:           NO RAISE both heads. live: 200
+    #   repro3-for-routes-subscript:               NO RAISE pre-fix-1; RAISES
+    #                                               once finding 1 lands (see
+    #                                               its own Subscript audit)
+    #   repro4-implicit-exception-handler-inspect: NO RAISE both heads. live: 200
+    #   repro5-captured-dispatch-selection:  wildcard both heads. live: 200/404
+    #
+    # each now raises (or, for repro3, already raised via finding 1) against
+    # the FIXED code, asserted below, which a test process can still verify
+    # for itself on every run.
+
+    def _raises(self, body, *substrings):
+        with self.assertRaises(ExtractionError) as caught:
+            extract_routes(_module(body))
+        msg = str(caught.exception)
+        for s in substrings:
+            self.assertIn(s, msg)
+
+    # -- closures ----------------------------------------------------------
+
+    def test_closure_reading_path_as_a_free_variable_raises(self):
+        """The reviewer's own first repro: a LOCAL closure whose body reads
+        ``path`` through Python's own closure mechanism (a free variable,
+        never a syntactic argument), called with `compute()` -- a call
+        site that mentions NOTHING tracked in its own visible syntax, so
+        no existing call-auditing check ever looked twice at it."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path
+                def compute():
+                    return path
+                candidate = compute()
+                if candidate == "/api/hidden":
+                    return self._send(1)
+                return self._send_json({"error": "not_found"}, 404)
+        ''', "unlisted call", "compute()")
+
+    def test_closure_escape_answers_over_real_http(self):
+        status, text = _real_http_probe('''
+            def do_GET(self):
+                path = self.path
+                def compute():
+                    return path
+                candidate = compute()
+                if candidate == "/api/hidden":
+                    return self._send(1)
+                return self._send_json({"error": "not_found"}, 404)
+        ''', "GET", "/api/hidden")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"n": 1})
+
+    def test_a_closure_touching_nothing_tracked_is_unaffected(self):
+        """A control: a closure that reads no tracked name at all -- only
+        a constant -- must not raise merely for existing, and its call
+        site must not be treated as tracked either."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                def compute():
+                    return "fixed-value"
+                candidate = compute()
+                if candidate == "whatever":
+                    return self._send(1)
+                if path == "/api/real":
+                    return self._send(2)
+        '''))}
+        self.assertEqual(found, {("GET", "/api/real")})
+
+    def test_a_closure_touching_only_a_captured_id_still_raises_deliberately(self):
+        """A DELIBERATE choice, stated plainly: a closure whose only
+        tracked mention is an already-CAPTURED name (``gid``, not the
+        primary ``path``) still needs review, unlike an INLINE capture
+        used the SAME way (``f"item {gid}"`` written directly, with no
+        closure, is already exempt via ``_TERMINAL_RESPONSE_SENDERS``
+        here). The closure fix intentionally does not extend the
+        ``captured``-only exemption through a closure call -- the call
+        site's own tracked mention is the CLOSURE'S NAME, never ``gid``
+        itself, and ``ctx.captured`` is deliberately never grown by this
+        fix (see its own comment) -- so this fails CLOSED rather than
+        silently assuming every closure that merely touches captured data
+        is safe. Reviewable via the SAME waiver escape hatch as
+        everything else, demonstrated below."""
+        src = _module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                m = re.match(r"^/api/items/([^/]+)$", path)
+                if m:
+                    gid = m.group(1)
+                    def describe():
+                        return f"item {gid}"
+                    return self._send_json({"label": describe()}, 200)
+        ''')
+        with self.assertRaises(ExtractionError):
+            extract_routes(src)
+        self._with_waivers({
+            ("do_GET", "describe()", "dict_value", "m"):
+                "test-only: describe() only formats an already-captured "
+                "id into a label string, never used for routing",
+        })
+        found = {(r.method, r.template) for r in extract_routes(src)}
+        self.assertEqual(found, {("GET", "/api/items/{}")})
+
+    # -- with context expressions -------------------------------------------
+
+    def test_with_context_expression_touching_path_raises(self):
+        """The reviewer's own second repro: ``with CONTEXTS[path]:`` --
+        the context expression of a bare ``with`` (no ``as`` clause) was
+        never inspected by anything: the binding model only ever looks at
+        a with-item's context expression to decide whether ITS OWN bound
+        name should join ``tracked``, which does not apply here at all."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path
+                with CONTEXTS[path]:
+                    return self._send(1)
+        ''', "indexes a container", "CONTEXTS[path]")
+
+    def test_with_context_expression_escape_answers_over_real_http(self):
+        status, text = _real_http_probe_with_globals('''
+            def do_GET(self):
+                path = self.path
+                with CONTEXTS[path]:
+                    return self._send(1)
+        ''', {"CONTEXTS": {"/api/hidden": __import__("contextlib").nullcontext()}},
+                                                     "GET", "/api/hidden")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"n": 1})
+
+    def test_with_no_as_context_expression_touching_only_captured_data_is_unaffected(self):
+        """A control mirroring the ``captured``-only exemption for the
+        WITH-context-expression position: a context manager selected by
+        an already-captured id must stay clean."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                m = re.match(r"^/api/items/([^/]+)$", path)
+                if m:
+                    gid = m.group(1)
+                    with LOCKS[gid]:
+                        return self._send(1)
+        '''))}
+        self.assertEqual(found, {("GET", "/api/items/{}")})
+
+    def test_async_with_context_expression_touching_path_raises(self):
+        """``async with`` gets the SAME audit as ``with`` (see the
+        ``isinstance(node, (ast.With, ast.AsyncWith))`` branch in
+        ``_audit_function`` -- one check, both node types) -- exercised
+        via a nested ``async def`` (the only syntactically valid place one
+        can appear at all: ``do_GET`` itself must stay a plain,
+        synchronous ``BaseHTTPRequestHandler`` method, per ENTRY_POINTS'
+        own model, so this is necessarily static-only -- there is no
+        meaningful way to drive an ``async with`` over a synchronous real
+        HTTP probe here). In THIS particular arrangement the closure fix
+        (this same finding's own OTHER new mechanism, several tests above)
+        actually catches it FIRST -- ``helper``'s body mentions `path`
+        (through the async-with's own context expression, however it is
+        nested), so ``helper`` itself joins ``tracked`` during the SAME
+        fixed-point pass, before the dedicated with/async-with scan even
+        runs -- which is a fine outcome (the escape closes either way) but
+        means the message below names ``helper()``, not ``CONTEXTS
+        [path]`` directly; the with-audit's OWN message is independently
+        proven, in isolation from any closure, by the plain (synchronous)
+        ``test_with_context_expression_touching_path_raises`` above."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path
+                async def helper():
+                    async with CONTEXTS[path]:
+                        return True
+                if helper():
+                    return self._send(1)
+        ''', "unrecognised shape", "helper()")
+
+    # -- for/async for iterables (verifying finding 1's own coverage) ------
+
+    def test_for_loop_over_a_tracked_subscript_raises(self):
+        """The reviewer's own third repro: ``for _ in ROUTES[path]: return
+        ...`` -- CLOSED as a side effect of round 6 finding 1's own
+        Subscript audit (the fixed-point loop already runs a For's own
+        ``.iter`` through ``_propagates_taint`` to decide whether the loop
+        TARGET should join ``tracked``, so the new Subscript branch
+        reaches ``ROUTES[path]`` for free) -- verified here directly
+        rather than merely assumed, since finding 2's own required
+        correction names ``For``/``AsyncFor`` iterables explicitly."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path
+                for _ in ROUTES[path]:
+                    return self._send(1)
+                return self._send_json({"error": "not_found"}, 404)
+        ''', "indexes a container", "ROUTES[path]")
+
+    def test_for_loop_escape_answers_over_real_http(self):
+        status, text = _real_http_probe_with_globals('''
+            def do_GET(self):
+                path = self.path
+                for _ in ROUTES[path]:
+                    return self._send(1)
+                return self._send_json({"error": "not_found"}, 404)
+        ''', {"ROUTES": {"/api/hidden": [1]}}, "GET", "/api/hidden")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"n": 1})
+
+    def test_for_loop_tuple_target_over_a_tracked_subscript_raises(self):
+        """The tuple-target variant of the same shape (``for a, b in
+        ROUTES[path]:``) -- the reviewer's own required "tuple ...
+        variants where applicable"."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path
+                for a, b in ROUTES[path]:
+                    return self._send(1)
+                return self._send_json({"error": "not_found"}, 404)
+        ''', "indexes a container", "ROUTES[path]")
+
+    def test_async_for_over_a_tracked_subscript_raises(self):
+        """``async for`` gets the SAME coverage as ``for`` (both are
+        already routed through the SAME ``_binding_value_and_targets``
+        extraction, per ``BINDING_NODE_TYPES``) -- exercised via a nested
+        ``async def``, static-only, for the same reason
+        ``test_async_with_context_expression_touching_path_raises``
+        above is."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path
+                async def helper():
+                    async for _ in ROUTES[path]:
+                        return True
+                    return False
+                if helper():
+                    return self._send(1)
+        ''', "indexes a container", "ROUTES[path]")
+
+    def test_a_for_loop_over_something_unrelated_is_unaffected(self):
+        """A control: a for-loop iterable that mentions nothing tracked
+        must not raise, and its target must not become tracked either."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                for item in FIXED_LIST:
+                    if item == "whatever":
+                        return self._send(1)
+                if path == "/api/real":
+                    return self._send(2)
+        '''))}
+        self.assertEqual(found, {("GET", "/api/real")})
+
+    # -- implicit exceptions inspected through a handler's own payload -----
+
+    def test_implicit_exception_inspected_via_handler_value_raises(self):
+        """The reviewer's own fourth repro: ``{}[path]`` raises `KeyError`
+        IMPLICITLY (no explicit ``raise`` anywhere), and the handler
+        inspects the caught exception's own payload
+        (``e.args[0]``) to make the actual routing decision. The bare
+        ``{}[path]`` access is independently caught by finding 1's own
+        Subscript audit (see the message asserted below) -- the DEEPER,
+        finding-2-specific claim (a WAIVED implicit-exception-producing
+        expression still leaves its handler examined) is proven in
+        isolation by
+        ``test_implicit_exception_behind_a_waived_call_still_flags_its_handler``
+        below, which cannot be masked by finding 1's own Subscript catch."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path
+                try:
+                    {}[path]
+                except KeyError as e:
+                    candidate = str(e.args[0])
+                    if candidate == "/api/hidden":
+                        return self._send(1)
+                return self._send_json({"error": "not_found"}, 404)
+        ''', "indexes a container", "{}[path]")
+
+    def test_implicit_exception_escape_answers_over_real_http(self):
+        status, text = _real_http_probe('''
+            def do_GET(self):
+                path = self.path
+                try:
+                    {}[path]
+                except KeyError as e:
+                    candidate = str(e.args[0])
+                    if candidate == "/api/hidden":
+                        return self._send(1)
+                return self._send_json({"error": "not_found"}, 404)
+        ''', "GET", "/api/hidden")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"n": 1})
+
+    def test_implicit_exception_behind_a_waived_call_still_flags_its_handler(self):
+        """Isolates finding 2's own new mechanism
+        (:meth:`_DispatchWalker._try_body_has_tracked_operation`) from
+        finding 1's Subscript audit: the try body's own tracked operation
+        here is a CALL that is explicitly WAIVED (a stand-in for a real,
+        reviewed call that may raise internally on bad input) -- so
+        finding 1's machinery raises nothing for it, and finding 6c's own
+        EXPLICIT-raise check (round 5) also sees nothing (there is no
+        ``ast.Raise`` anywhere in this function). Without this finding's
+        own try-body-scoped check, `except LookupError as e: candidate =
+        str(e)` would go completely unexamined."""
+        src = _module('''
+            def do_GET(self):
+                path = self.path
+                try:
+                    api.some_reviewed_lookup(path)
+                except LookupError as e:
+                    candidate = str(e)
+                    if candidate == "/api/hidden":
+                        return self._send(1)
+                return self._send_json({"error": "not_found"}, 404)
+        ''')
+        self._with_waivers({
+            ("do_GET", "api.some_reviewed_lookup(path)", "bare_stmt", ""):
+                "test-only: a reviewed, waived call that may raise "
+                "internally, isolating finding 2's try-body-scoped "
+                "implicit-exception check from finding 1's own Subscript "
+                "audit",
+        })
+        with self.assertRaises(ExtractionError) as caught:
+            extract_routes(src)
+        self.assertIn("except ... as", str(caught.exception))
+
+    def _with_waivers(self, waivers: dict):
+        """As ``WaiverFingerprintTests._with_waivers``: temporarily ADDS
+        `waivers` on top of the real ``_AUDIT_WAIVERS`` (not a full
+        replacement -- this class's other tests still need the real
+        server.py's own waivers to stay absent so THEIR fixtures raise
+        correctly), restored even if the test body raises."""
+        saved = dict(route_extract_module._AUDIT_WAIVERS)
+        route_extract_module._AUDIT_WAIVERS.update(waivers)
+        self.addCleanup(lambda: (
+            route_extract_module._AUDIT_WAIVERS.clear(),
+            route_extract_module._AUDIT_WAIVERS.update(saved)))
+
+    def test_an_except_handler_whose_try_body_touches_nothing_tracked_is_unaffected(self):
+        """A control: a named except handler in a function that has NO
+        explicit tracked raise AND whose own enclosing try body mentions
+        nothing tracked must not be flagged."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if path == "/api/real":
+                    try:
+                        unrelated_call()
+                    except LookupError as e:
+                        return self._send_status(500)
+                    return self._send(1)
+                return self._send(2)
+        '''))}
+        self.assertEqual(found, {("GET", "/api/real")})
+
+    def test_a_named_handler_in_an_unrelated_sibling_try_is_unaffected(self):
+        """A control: this check is scoped to the handler's OWN enclosing
+        try body, not function-wide -- a named handler on a DIFFERENT,
+        unrelated try statement in the SAME function must stay clean even
+        though the function has SOME OTHER try body that touches `path`
+        (a reviewed, WAIVED call here -- isolating the scoping question
+        from whether that OTHER try body's own tracked call needed a
+        waiver in the first place, already covered by
+        ``test_implicit_exception_behind_a_waived_call_still_flags_its_handler``
+        above)."""
+        src = _module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                try:
+                    logger.info(path)
+                except LookupError:
+                    pass
+                if path == "/api/real":
+                    try:
+                        unrelated_call()
+                    except LookupError as e:
+                        return self._send_status(500)
+                    return self._send(1)
+                return self._send(2)
+        ''')
+        self._with_waivers({
+            ("do_GET", "logger.info(path)", "bare_stmt", ""):
+                "test-only: an unrelated, reviewed logging call in a "
+                "SIBLING try body, isolating the try-body-scoping "
+                "question this test is actually about",
+        })
+        found = {(r.method, r.template) for r in extract_routes(src)}
+        self.assertEqual(found, {("GET", "/api/real")})
+
+    # -- captured-exemption narrowing for dispatch selection ---------------
+
+    def test_captured_id_selecting_a_directly_invoked_callable_raises(self):
+        """The reviewer's own fifth repro: a regex-captured ``action``
+        selects ``handlers.get(action, default_handler)()`` -- the
+        ``captured`` exemption (round 5, finding 2b) accepted this
+        because its ONLY tracked mention (``action``) is captured, never
+        asking whether the call's own RESULT is about to be invoked."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return handlers.get(action, default_handler)(self)
+        ''', "unlisted call", "handlers.get(action, default_handler)")
+
+    def test_captured_dispatch_selection_escape_answers_over_real_http(self):
+        status, text = _real_http_probe_with_globals('''
+            def do_GET(self):
+                path = self.path
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return handlers.get(action, default_handler)(self)
+        ''', {"re": re, "handlers": {"hidden": lambda h: h._send(1)},
+              "default_handler": lambda h: h._send_json(
+                  {"error": "not_found"}, 404)},
+                                                     "GET", "/api/hidden")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"n": 1})
+        status2, text2 = _real_http_probe_with_globals('''
+            def do_GET(self):
+                path = self.path
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return handlers.get(action, default_handler)(self)
+        ''', {"re": re, "handlers": {"hidden": lambda h: h._send(1)},
+              "default_handler": lambda h: h._send_json(
+                  {"error": "not_found"}, 404)},
+                                                     "GET", "/api/other")
+        self.assertEqual(status2, 404)
+        self.assertEqual(json.loads(text2), {"error": "not_found"})
+
+    def test_captured_id_selecting_a_subscript_callee_also_raises(self):
+        """The Subscript-callee sibling of the same shape --
+        ``HANDLERS[action]()`` -- narrowed via the identical
+        ``_is_callee`` guard on finding 1's own Subscript-branch
+        exemption, not only the Call-branch one."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return HANDLERS[action]()
+        ''', "indexes a container", "HANDLERS[action]")
+
+    def test_captured_id_as_a_plain_call_argument_is_still_unaffected(self):
+        """A control proving the narrowing is precise: a captured id
+        handed to a FIXED, KNOWN service as a plain ARGUMENT (never a
+        callee) stays exempt, exactly as round 5 finding 2b established
+        -- the real server.py shape (`deleter`/`mapper`/`fn`/`coach`,
+        bound from a table lookup FIRST via a separate assignment, then
+        invoked through a bare Name that is never itself a Call/Subscript
+        node needing this exemption at all) is the SAME thing, verified
+        at scale by this class's own real-server test below."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                m = re.match(r"^/api/items/([^/]+)$", path)
+                if m:
+                    gid = m.group(1)
+                    return self._send_api(api.get_item(gid))
+        '''))}
+        self.assertEqual(found, {("GET", "/api/items/{}")})
+
+    def test_captured_id_bound_first_then_invoked_via_a_bare_name_still_needs_its_own_review(self):
+        """Precisely characterises the EXACT real server.py idiom
+        (`deleter`/`mapper`/`fn`/`coach`, each already carrying its own
+        round-5 finding 2b waiver): a captured id selects a CALLABLE via a
+        table lookup bound to a local FIRST (`fn = HANDLERS.get(action,
+        default_handler)`) -- THIS assignment's own call is
+        `_is_callee`-exempt (its parent is the Assign, not an enclosing
+        Call, so the narrowing this finding adds does not touch it at
+        all) -- but the round-5 "waiver/exemption silences the call, not
+        the RESULT" rule still makes `fn` itself join `tracked`, so the
+        LATER `fn(self)` -- a bare Name callee, never a Call/Subscript
+        node `_is_callee` would even be consulted for -- still needs its
+        OWN review, UNCHANGED by this finding either way: exactly the
+        pre-existing behaviour the real server.py's own four waived call
+        sites already rely on, not a new requirement finding 2 adds."""
+        src = _module('''
+            def do_GET(self):
+                path = self.path
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    fn = HANDLERS.get(action, default_handler)
+                    return fn(self)
+        ''')
+        with self.assertRaises(ExtractionError) as caught:
+            extract_routes(src)
+        self.assertIn("fn(self)", str(caught.exception))
+        self._with_waivers({
+            ("do_GET", "fn(self)", "return_value", "m"):
+                "test-only: fn is HANDLERS.get(action, default_handler), "
+                "the SAME table-lookup-bound-first shape as the real "
+                "server.py's own deleter/mapper/fn/coach",
+        })
+        found = {(r.method, r.template) for r in extract_routes(src)}
+        self.assertEqual(found, {("GET", "/api/{}")})
+
+    def test_the_real_server_extracts_with_no_new_raises(self):
+        """The real server.py has no local closure that reads a tracked
+        free variable, no ``with``/``async with`` statement at all, and
+        no captured id used to select-then-immediately-invoke a callable
+        -- the ONLY real new sites this finding reaches are the two
+        `_handle_reassign`/`_handle_reassign_v2` `except BodyError as
+        exc:` handlers (their own enclosing try body's `check_body(b,
+        **_V{1,2}_REASSIGN_SCHEMA[combo])` is a tracked operation, round 3
+        finding E's own pre-existing waiver) -- must still extract
+        cleanly: 239 routes, 73 waivers (see WaiverFingerprintTests' own
+        pinned count and docstring for the exact accounting)."""
+        walker = extract_walker()
+        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(walker.unreachable, [])
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 73)
 
 
 if __name__ == "__main__":  # pragma: no cover
