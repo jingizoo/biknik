@@ -66,6 +66,7 @@ from hockey_scheduler.store.integrity_checks import (
     find_active_players_with_missing_team,
     find_active_players_with_program_mismatch,
     find_active_players_with_team_league_mismatch,
+    find_active_players_with_team_program_mismatch,
     find_teams_with_duplicate_active_season_registrations,
 )
 from hockey_scheduler.store.sql_store import migrate
@@ -755,16 +756,22 @@ class MembershipBackfillTest(unittest.TestCase):
 
 class MembershipBackfillSpineTest(unittest.TestCase):
     """Migration 052's preflight validates the FULL registration ->
-    LeagueSeason -> Season/League spine, and Team<->LeagueSeason League (and
-    Program) coherence, before any DDL (#205 review round 1 finding 3).
+    LeagueSeason -> Season/League spine, Team<->LeagueSeason League
+    coherence, League<->Season Program coherence (#205 review round 1
+    finding 3), AND the Team's OWN Program against its League's (#205
+    review round 2 finding 1 — a gap round 1's checks left open: a Team's
+    ``program_id`` is a separate column from its ``league_id``, so even a
+    Team whose League/LeagueSeason/Season chain is perfectly coherent can
+    still disagree with that chain on Program), before any DDL.
 
-    None of these four corruption shapes touch a column any FK constraint
+    None of these five corruption shapes touch a column any FK constraint
     actually covers (``season_team_registrations.league_season_id``,
-    ``league_seasons.season_id``/``league_id`` and ``teams.league_id`` were
-    all added by plain ``ALTER TABLE ... ADD COLUMN`` — no
-    ``FOREIGN KEY``), so no FK-disable dance is needed to plant them; that
-    is exactly WHY they can reach an ordinary UPDATE undetected in the first
-    place, and exactly why this preflight exists.
+    ``league_seasons.season_id``/``league_id``, ``teams.league_id`` and
+    ``teams.program_id`` were all added by plain
+    ``ALTER TABLE ... ADD COLUMN`` — no ``FOREIGN KEY``), so no FK-disable
+    dance is needed to plant them; that is exactly WHY they can reach an
+    ordinary UPDATE undetected in the first place, and exactly why this
+    preflight exists.
     """
 
     def _cleanup(self, store):
@@ -948,6 +955,65 @@ class MembershipBackfillSpineTest(unittest.TestCase):
                     "UPDATE leagues SET program_id = ? WHERE id = (SELECT "
                     "league_id FROM league_seasons WHERE id = ?)"),
                     (original_program_id, ids["ls"]))
+                if store.backend == "sqlite":
+                    store.conn.commit()
+                migrate(store.conn, store.dialect)
+                rows = store.all_season_roster_memberships()
+                self.assertEqual(
+                    [(m.player_id, m.league_season_id) for m in rows],
+                    [(ids["active"], ids["ls"])], label)
+            finally:
+                self._cleanup(store)
+
+    def test_team_program_mismatch_aborts_and_repairs(self):
+        # A fresh external review's exact scenario (#205 review round 2
+        # finding 1): change a candidate Team's OWN program_id to another
+        # existing Program while its League, LeagueSeason and Season stay
+        # otherwise valid and mutually coherent — team.league_id still
+        # matches ls.league_id (find_active_players_with_team_league_mismatch
+        # stays clean) and league.program_id still matches season.program_id
+        # (find_active_players_with_program_mismatch stays clean too), so
+        # only a check that reads teams.program_id directly can catch it.
+        for label, url in _sql_backends():
+            store = _fresh(url)
+            try:
+                api = ApiService(store)
+                ids = _seed_legacy(api)
+                other_program = api.create_program("Other Program",
+                                                    actor_id=ADMIN)
+                original_team_program_id = api.store.get_team(
+                    ids["team"]).program_id
+                cur = store.conn.cursor()
+                cur.execute(store.dialect.sql(
+                    "UPDATE teams SET program_id = ? WHERE id = ?"),
+                    (other_program["id"], ids["team"]))
+                if store.backend == "sqlite":
+                    store.conn.commit()
+                _downgrade_052(store)
+
+                # Both ROUND 1 spine checks stay clean — this is a NEW gap,
+                # not a duplicate of either.
+                self.assertEqual(
+                    find_active_players_with_team_league_mismatch(
+                        store.conn), [], label)
+                self.assertEqual(
+                    find_active_players_with_program_mismatch(store.conn),
+                    [], label)
+                found = find_active_players_with_team_program_mismatch(
+                    store.conn)
+                self.assertEqual(len(found), 1, (label, found))
+                self.assertEqual(found[0][0], ids["active"], (label, found))
+                self.assertEqual(found[0][1], ids["team"], (label, found))
+                self.assertEqual(found[0][2], other_program["id"],
+                                 (label, found))
+                with self.assertRaises(MigrationDataError, msg=label) as ctx:
+                    migrate(store.conn, store.dialect)
+                self.assertIn(ids["active"], str(ctx.exception), label)
+                self._assert_clean_rollback(store, label)
+                # Repair: restore the Team's original Program.
+                cur.execute(store.dialect.sql(
+                    "UPDATE teams SET program_id = ? WHERE id = ?"),
+                    (original_team_program_id, ids["team"]))
                 if store.backend == "sqlite":
                     store.conn.commit()
                 migrate(store.conn, store.dialect)

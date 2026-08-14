@@ -1684,6 +1684,54 @@ def find_active_players_with_program_mismatch(conn):
                  for row in cur.fetchall())
 
 
+def find_active_players_with_team_program_mismatch(conn):
+    """Active players (real backfill candidates) whose Team's OWN
+    ``program_id`` disagrees with the registration's League (#205 review
+    round 2 finding 1 — a fresh external review of this exact migration,
+    found AFTER ``find_active_players_with_team_league_mismatch`` and
+    ``find_active_players_with_program_mismatch`` above already shipped).
+
+    Those two existing checks validate ``team.league_id == ls.league_id``
+    and ``league.program_id == season.program_id`` — together they make the
+    League/LeagueSeason/Season leg of the spine coherent, but NEITHER one
+    ever reads ``teams.program_id`` at all. A Team carries its OWN
+    ``program_id`` (``domain/models.py``'s ``Team.program_id`` — a SEPARATE
+    column from ``league_id``, kept consistent with the League's Program by
+    the SERVICE layer per that field's own docstring: ``the invariant
+    league.program_id == team.program_id ... is enforced in the service
+    layer``), so a direct write that changes a Team's ``program_id`` alone
+    — leaving its ``league_id``, and that League's own League/LeagueSeason/
+    Season chain, otherwise perfectly coherent — passes BOTH existing
+    checks cleanly and still backfills: the review demonstrated exactly
+    this on SQLite (preflight clean, migration 052 backfilled anyway) and
+    it reproduces identically on PostgreSQL (see
+    ``MembershipBackfillSpineTest.test_team_program_mismatch_aborts_and_
+    repairs``). The resulting row would claim a Team's participation under
+    a Program the Team itself disagrees with, encoding a scope boundary
+    that cannot actually exist — exactly the kind of impossible state
+    ``find_active_players_with_program_mismatch`` already treats as
+    migration-blocking for the League/Season leg, now closed for the
+    Team/League leg too, with the SAME defense-in-depth posture (a direct
+    write bypassing service validation, not a normal service-level
+    mutation, which the service layer already forbids)."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT p.id AS player_id, t.id AS team_id, "
+        "t.program_id AS team_program_id, lg.id AS league_id, "
+        "lg.program_id AS league_program_id "
+        "FROM players p "
+        "JOIN teams t ON t.id = p.team_id "
+        "JOIN season_team_registrations r ON r.team_id = t.id AND r.active = 1 "
+        "JOIN league_seasons ls ON ls.id = r.league_season_id "
+        "JOIN seasons s ON s.id = ls.season_id AND s.status = 'active' "
+        "JOIN leagues lg ON lg.id = ls.league_id "
+        "WHERE p.is_active = 1 AND t.program_id IS NOT NULL "
+        "AND t.program_id != lg.program_id")
+    return sorted((row["player_id"], row["team_id"], row["team_program_id"],
+                  row["league_id"], row["league_program_id"])
+                 for row in cur.fetchall())
+
+
 def assert_season_roster_membership_backfill_ready(conn):
     """Abort migration 052 (#205 Slice A) unless the membership backfill is
     fully deterministic for every row it would derive.
@@ -1701,7 +1749,16 @@ def assert_season_roster_membership_backfill_ready(conn):
     Program matches the Season's) — every check below closes one of those
     gaps, each independently proven able to slip past the ORIGINAL checks
     and reach ``INSERT`` (see test_season_roster_membership.py's
-    ``MembershipBackfillSpineTest``)."""
+    ``MembershipBackfillSpineTest``).
+
+    #205 review round 2 finding 1 — round 1's coherence checks validated
+    League<->LeagueSeason and League<->Season, but never the Team's OWN
+    ``program_id`` against either: a Team whose ``program_id`` disagrees
+    with its League's (while ``league_id`` itself, and the whole League/
+    LeagueSeason/Season chain, stay perfectly coherent) passed every check
+    above cleanly and still backfilled on both SQLite and PostgreSQL —
+    ``find_active_players_with_team_program_mismatch`` closes that gap the
+    same way its Round 1 siblings closed theirs."""
     dangling = find_active_players_with_missing_team(conn)
     dup_regs = find_teams_with_duplicate_active_season_registrations(conn)
     dup_jerseys = find_backfill_candidate_jersey_duplicates(conn)
@@ -1709,8 +1766,10 @@ def assert_season_roster_membership_backfill_ready(conn):
     dangling_ls_parents = find_active_players_with_dangling_league_season_parents(conn)
     team_league_mismatch = find_active_players_with_team_league_mismatch(conn)
     program_mismatch = find_active_players_with_program_mismatch(conn)
+    team_program_mismatch = find_active_players_with_team_program_mismatch(conn)
     if not any((dangling, dup_regs, dup_jerseys, dangling_reg_target,
-               dangling_ls_parents, team_league_mismatch, program_mismatch)):
+               dangling_ls_parents, team_league_mismatch, program_mismatch,
+               team_program_mismatch)):
         return
 
     problems = []
@@ -1779,6 +1838,17 @@ def assert_season_roster_membership_backfill_ready(conn):
             f"{len(program_mismatch)} active player(s) resolve to a "
             f"LeagueSeason whose League and Season belong to different "
             f"Programs: {shown}{more}")
+    if team_program_mismatch:
+        shown = ", ".join(
+            f"player {p} (team={t!r}/program {tp!r} vs "
+            f"league={lg!r}/program {lgp!r})"
+            for p, t, tp, lg, lgp in team_program_mismatch[:20])
+        more = ("" if len(team_program_mismatch) <= 20
+                else f" (+{len(team_program_mismatch) - 20} more)")
+        problems.append(
+            f"{len(team_program_mismatch)} active player(s) would backfill a "
+            f"membership whose Team's own Program disagrees with its "
+            f"League's: {shown}{more}")
     raise MigrationDataError(
         "Cannot backfill Season roster memberships (#205 Slice A): "
         + "; ".join(problems)
