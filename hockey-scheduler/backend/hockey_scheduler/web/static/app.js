@@ -596,6 +596,51 @@ const contextScopedReadAborts = [];   // {method, url, generation, dispatched,
 // is RENDERING, at the instant it decided what to render.
 let contextEpoch = null;
 
+// THE OTHER HALF OF THE DISCARD CONTRACT: "the client re-reads and moves on."
+// A 204 discard is the server saying "the selection or its Season's lifecycle
+// moved after you rendered". For an IN-APP switch the app has already moved
+// on — sendContextSwitch() adopts the fresh tuple+epoch from the POST echo and
+// re-renders — so a discarded read from the superseded pass needs nothing.
+// But the epoch also moves on changes THIS PAGE never performed: a switch or
+// an archive/reopen in a second tab, another operator archiving the selected
+// Season, or any raw API use (the venue-access-cleanup journey archives via
+// the API precisely because the shipped UI has no archive control). After one
+// of those, this page's reads discard while the app still believes its pass is
+// current — and without this function they would discard FOREVER, rendering
+// empty lists where history belongs (CI shard 2 caught exactly that: the
+// just-archived Season's allowed-venues history rendered "0 venues").
+//
+// So: when a CURRENT-generation read is discarded, re-read the options — which
+// adopts the fresh tuple and epoch TOGETHER, the only sanctioned adoption
+// point — and re-render under them. Generation-stale discards are excluded on
+// purpose: their successor pass is already running with a fresh pair, and
+// resyncing for them would fetch options once per abandoned read.
+//
+// TERMINATION, not a loop: after the adoption the page echoes the CURRENT
+// epoch, so its reads are admitted and no further discard fires. Another
+// discard can only be caused by another real change, each of which converges
+// the same way. The in-flight guard collapses a burst of discards from one
+// render pass (every Season's reads of one surface) into ONE options fetch.
+let contextEpochResyncInFlight = false;
+function requestContextEpochResync() {
+  if (contextEpochResyncInFlight) return;
+  contextEpochResyncInFlight = true;
+  (async () => {
+    try {
+      await loadContextOptions();
+      renderContextSwitcher();
+      // The same invalidation an in-app switch performs once its canonical
+      // new selection is known: supersede the pass whose reads were
+      // discarded (it may still be mid-flight, writing empties) and rebind
+      // revision-stamped consumers to the selection as it actually is.
+      contextRevision += 1;
+      render();
+    } finally {
+      contextEpochResyncInFlight = false;
+    }
+  })();
+}
+
 function contextScopedReadSignal() {
   if (!contextScopedReadController) {
     contextScopedReadController = new AbortController();
@@ -698,7 +743,17 @@ async function getJSONContextScoped(p, renderedEpoch) {
     // keeps `result === CONTEXT_READ_ABORTED` a legitimate test and puts the
     // read in the abort ledger the journeys reconcile, rather than leaving a
     // discard looking like data.
-    if (response.status === 204) return abortedResult(true, true);
+    if (response.status === 204) {
+      // A discard of a read the app still considers CURRENT means the change
+      // that moved the epoch happened outside this page (second tab, another
+      // operator, an API archive/reopen) — re-read the options and re-render,
+      // or these reads would discard forever. A generation-stale discard is
+      // the in-app case: its successor pass already carries the fresh pair.
+      if (generation === contextScopedReadGeneration) {
+        requestContextEpochResync();
+      }
+      return abortedResult(true, true);
+    }
     // Drains the body -- see SETTLEMENT MEANS THE BODY IS DRAINED above.
     const body = await readApiResponse(response);
     // Delivered in full, but the tuple moved while it was arriving. The body

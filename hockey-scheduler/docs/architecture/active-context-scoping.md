@@ -1436,6 +1436,24 @@ compares it, **after** the gate's shared hold and **before** the service call:
 204 rather than a 4xx because this is not a refusal: the operator superseded the
 request themselves, and it must not surface as a page error.
 
+**What the client does with a discard — the other half of the contract.** For
+an in-app switch, nothing: `sendContextSwitch` already adopted the fresh
+tuple+epoch pair from the POST echo and re-rendered, so a discarded read from
+the superseded pass is simply recorded in the abort ledger
+(`{dispatched: true, discarded: true}`). But the epoch also moves on changes
+the page never performed — a switch or archive/reopen in a second tab, another
+operator archiving the selected Season, raw API use — after which the page's
+reads would discard **forever** while it still believed its render current
+(CI caught exactly that: a just-archived Season's allowed-venues history
+rendering "0 venues"). So a 204 on a **current-generation** read triggers
+`requestContextEpochResync()`: one `/api/context/options` re-read — the
+sanctioned adoption point, so the tuple and epoch arrive together — then a
+re-render under the fresh pair. Generation-stale discards are excluded (their
+successor pass is already fresh), a single in-flight guard collapses one
+pass's burst of discards into one fetch, and the loop terminates by
+construction: once the fresh epoch is echoed, reads are admitted, and only a
+further real change can discard again.
+
 #### Why an epoch and not a cancellation ledger
 
 The first attempt gave each read a client-minted id, had the switch's POST
