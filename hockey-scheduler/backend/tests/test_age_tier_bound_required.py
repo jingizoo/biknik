@@ -41,9 +41,7 @@ from datetime import timezone
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import (
-    Division, League, LeagueSeason, Position, Program, Season, Team,
-    normalize_age_tiers)
+from hockey_scheduler.domain import Division, Position, Team, normalize_age_tiers
 from hockey_scheduler.domain.errors import ValidationError
 from hockey_scheduler.store import InMemoryStore, SqlStore
 
