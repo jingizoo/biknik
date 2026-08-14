@@ -61,7 +61,11 @@ from hockey_scheduler.store import InMemoryStore, SqlStore
 from hockey_scheduler.store.integrity_checks import (
     MigrationDataError,
     assert_season_roster_membership_backfill_ready,
+    find_active_players_with_dangling_league_season_parents,
+    find_active_players_with_dangling_registration_target,
     find_active_players_with_missing_team,
+    find_active_players_with_program_mismatch,
+    find_active_players_with_team_league_mismatch,
     find_teams_with_duplicate_active_season_registrations,
 )
 from hockey_scheduler.store.sql_store import migrate
@@ -658,6 +662,212 @@ class MembershipBackfillTest(unittest.TestCase):
                 self.assertEqual(
                     [(m.player_id, m.league_season_id) for m in rows
                      if m.team_id == ids["team"]],
+                    [(ids["active"], ids["ls"])], label)
+            finally:
+                self._cleanup(store)
+
+
+class MembershipBackfillSpineTest(unittest.TestCase):
+    """Migration 052's preflight validates the FULL registration ->
+    LeagueSeason -> Season/League spine, and Team<->LeagueSeason League (and
+    Program) coherence, before any DDL (#205 review round 1 finding 3).
+
+    None of these four corruption shapes touch a column any FK constraint
+    actually covers (``season_team_registrations.league_season_id``,
+    ``league_seasons.season_id``/``league_id`` and ``teams.league_id`` were
+    all added by plain ``ALTER TABLE ... ADD COLUMN`` — no
+    ``FOREIGN KEY``), so no FK-disable dance is needed to plant them; that
+    is exactly WHY they can reach an ordinary UPDATE undetected in the first
+    place, and exactly why this preflight exists.
+    """
+
+    def _cleanup(self, store):
+        if store.backend != "sqlite":
+            store.reset_schema()
+        store.close()
+
+    def _assert_clean_rollback(self, store, label):
+        cur = store.conn.cursor()
+        cur.execute(store.dialect.sql(
+            "SELECT COUNT(*) AS n FROM schema_migrations WHERE version = ?"),
+            (_VERSION,))
+        self.assertEqual(cur.fetchone()["n"], 0, label)
+        if store.backend == "sqlite":
+            cur.execute(
+                "SELECT COUNT(*) AS n FROM sqlite_master WHERE "
+                "type='table' AND name='season_roster_memberships'")
+        else:
+            cur.execute(
+                "SELECT COUNT(*) AS n FROM information_schema.tables "
+                "WHERE table_name='season_roster_memberships'")
+        self.assertEqual(cur.fetchone()["n"], 0, label)
+
+    def test_dangling_registration_target_aborts_and_repairs(self):
+        for label, url in _sql_backends():
+            store = _fresh(url)
+            try:
+                api = ApiService(store)
+                ids = _seed_legacy(api)
+                reg = api.store.registration_for_team_in_league_season(
+                    ids["ls"], ids["team"])
+                cur = store.conn.cursor()
+                cur.execute(store.dialect.sql(
+                    "UPDATE season_team_registrations "
+                    "SET league_season_id = ? WHERE id = ?"),
+                    ("ghost_ls", reg.id))
+                if store.backend == "sqlite":
+                    store.conn.commit()
+                _downgrade_052(store)
+
+                self.assertEqual(
+                    find_active_players_with_dangling_registration_target(
+                        store.conn),
+                    [(ids["active"], reg.id, "ghost_ls")], label)
+                with self.assertRaises(MigrationDataError, msg=label) as ctx:
+                    migrate(store.conn, store.dialect)
+                self.assertIn(ids["active"], str(ctx.exception), label)
+                self._assert_clean_rollback(store, label)
+                # Repair: point the registration back; the re-run applies
+                # cleanly and derives the exact same membership as before.
+                cur.execute(store.dialect.sql(
+                    "UPDATE season_team_registrations "
+                    "SET league_season_id = ? WHERE id = ?"),
+                    (ids["ls"], reg.id))
+                if store.backend == "sqlite":
+                    store.conn.commit()
+                migrate(store.conn, store.dialect)
+                rows = store.all_season_roster_memberships()
+                self.assertEqual(
+                    [(m.player_id, m.league_season_id) for m in rows],
+                    [(ids["active"], ids["ls"])], label)
+            finally:
+                self._cleanup(store)
+
+    def test_dangling_league_season_parent_aborts_and_repairs(self):
+        for label, url in _sql_backends():
+            store = _fresh(url)
+            try:
+                api = ApiService(store)
+                ids = _seed_legacy(api)
+                original_league_id = api.store.get_league_season(
+                    ids["ls"]).league_id
+                cur = store.conn.cursor()
+                cur.execute(store.dialect.sql(
+                    "UPDATE league_seasons SET league_id = ? WHERE id = ?"),
+                    ("ghost_league", ids["ls"]))
+                if store.backend == "sqlite":
+                    store.conn.commit()
+                _downgrade_052(store)
+
+                found = find_active_players_with_dangling_league_season_parents(
+                    store.conn)
+                self.assertEqual(len(found), 1, (label, found))
+                self.assertEqual(found[0][0], ids["active"], (label, found))
+                self.assertEqual(found[0][3], "ghost_league", (label, found))
+                with self.assertRaises(MigrationDataError, msg=label) as ctx:
+                    migrate(store.conn, store.dialect)
+                self.assertIn(ids["active"], str(ctx.exception), label)
+                self._assert_clean_rollback(store, label)
+                # Repair: restore the LeagueSeason's original League.
+                cur.execute(store.dialect.sql(
+                    "UPDATE league_seasons SET league_id = ? WHERE id = ?"),
+                    (original_league_id, ids["ls"]))
+                if store.backend == "sqlite":
+                    store.conn.commit()
+                migrate(store.conn, store.dialect)
+                rows = store.all_season_roster_memberships()
+                self.assertEqual(
+                    [(m.player_id, m.league_season_id) for m in rows],
+                    [(ids["active"], ids["ls"])], label)
+            finally:
+                self._cleanup(store)
+
+    def test_team_league_mismatch_aborts_and_repairs(self):
+        # Mirrors the review's exact scenario: a registration corrupted to
+        # point at ANOTHER League's LeagueSeason in the SAME active Season.
+        for label, url in _sql_backends():
+            store = _fresh(url)
+            try:
+                api = ApiService(store)
+                ids = _seed_legacy(api)
+                league_b = api.create_league(ids["season"], "Bronze",
+                                             actor_id=ADMIN)
+                ls_b = api.store.league_season_for(league_b["id"],
+                                                    ids["season"])
+                reg = api.store.registration_for_team_in_league_season(
+                    ids["ls"], ids["team"])
+                cur = store.conn.cursor()
+                cur.execute(store.dialect.sql(
+                    "UPDATE season_team_registrations "
+                    "SET league_season_id = ? WHERE id = ?"),
+                    (ls_b.id, reg.id))
+                if store.backend == "sqlite":
+                    store.conn.commit()
+                _downgrade_052(store)
+
+                found = find_active_players_with_team_league_mismatch(
+                    store.conn)
+                self.assertEqual(len(found), 1, (label, found))
+                self.assertEqual(found[0][0], ids["active"], (label, found))
+                self.assertEqual(found[0][3], ls_b.id, (label, found))
+                with self.assertRaises(MigrationDataError, msg=label) as ctx:
+                    migrate(store.conn, store.dialect)
+                self.assertIn(ids["active"], str(ctx.exception), label)
+                self._assert_clean_rollback(store, label)
+                # Repair: point the registration back at the Team's OWN League.
+                cur.execute(store.dialect.sql(
+                    "UPDATE season_team_registrations "
+                    "SET league_season_id = ? WHERE id = ?"),
+                    (ids["ls"], reg.id))
+                if store.backend == "sqlite":
+                    store.conn.commit()
+                migrate(store.conn, store.dialect)
+                rows = store.all_season_roster_memberships()
+                self.assertEqual(
+                    [(m.player_id, m.league_season_id) for m in rows],
+                    [(ids["active"], ids["ls"])], label)
+            finally:
+                self._cleanup(store)
+
+    def test_program_mismatch_aborts_and_repairs(self):
+        for label, url in _sql_backends():
+            store = _fresh(url)
+            try:
+                api = ApiService(store)
+                ids = _seed_legacy(api)
+                other_program = api.create_program("Other Program",
+                                                    actor_id=ADMIN)
+                cur = store.conn.cursor()
+                cur.execute(store.dialect.sql(
+                    "UPDATE leagues SET program_id = ? WHERE id = (SELECT "
+                    "league_id FROM league_seasons WHERE id = ?)"),
+                    (other_program["id"], ids["ls"]))
+                if store.backend == "sqlite":
+                    store.conn.commit()
+                _downgrade_052(store)
+
+                found = find_active_players_with_program_mismatch(store.conn)
+                self.assertEqual(len(found), 1, (label, found))
+                self.assertEqual(found[0][0], ids["active"], (label, found))
+                self.assertEqual(found[0][3], other_program["id"],
+                                 (label, found))
+                with self.assertRaises(MigrationDataError, msg=label) as ctx:
+                    migrate(store.conn, store.dialect)
+                self.assertIn(ids["active"], str(ctx.exception), label)
+                self._assert_clean_rollback(store, label)
+                # Repair: restore the League's original Program.
+                original_program_id = api.store.get_season(
+                    ids["season"]).program_id
+                cur.execute(store.dialect.sql(
+                    "UPDATE leagues SET program_id = ? WHERE id = (SELECT "
+                    "league_id FROM league_seasons WHERE id = ?)"),
+                    (original_program_id, ids["ls"]))
+                if store.backend == "sqlite":
+                    store.conn.commit()
+                migrate(store.conn, store.dialect)
+                rows = store.all_season_roster_memberships()
+                self.assertEqual(
+                    [(m.player_id, m.league_season_id) for m in rows],
                     [(ids["active"], ids["ls"])], label)
             finally:
                 self._cleanup(store)

@@ -1577,6 +1577,113 @@ def find_backfill_candidate_jersey_duplicates(conn):
                   for row in cur.fetchall())
 
 
+def find_active_players_with_dangling_registration_target(conn):
+    """Active players whose Team's active registration points at a
+    ``league_season_id`` that does not exist (#205 review round 1 finding
+    3).
+
+    Migration 052's backfill INSERT reaches this row only through an INNER
+    JOIN onto ``league_seasons`` — a dangling target does not error, it is
+    SILENTLY DROPPED, so the backfill would complete with FEWER memberships
+    than the permanent model actually grants that player today (a silent
+    eligibility loss, not a loud failure). Reported here so it aborts the
+    upgrade instead."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT p.id AS player_id, r.id AS registration_id, "
+        "r.league_season_id AS league_season_id "
+        "FROM players p "
+        "JOIN teams t ON t.id = p.team_id "
+        "JOIN season_team_registrations r ON r.team_id = t.id AND r.active = 1 "
+        "LEFT JOIN league_seasons ls ON ls.id = r.league_season_id "
+        "WHERE p.is_active = 1 AND ls.id IS NULL")
+    return sorted((row["player_id"], row["registration_id"],
+                  row["league_season_id"]) for row in cur.fetchall())
+
+
+def find_active_players_with_dangling_league_season_parents(conn):
+    """Active players whose registration's LeagueSeason exists, but ITS
+    ``season_id`` or ``league_id`` does not resolve (#205 review round 1
+    finding 3) — the SAME silent-exclusion risk as
+    :func:`find_active_players_with_dangling_registration_target`, one join
+    further out, and equally unreported by the migration's INNER JOIN
+    chain."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT p.id AS player_id, r.league_season_id AS league_season_id, "
+        "ls.season_id AS season_id, ls.league_id AS league_id "
+        "FROM players p "
+        "JOIN teams t ON t.id = p.team_id "
+        "JOIN season_team_registrations r ON r.team_id = t.id AND r.active = 1 "
+        "JOIN league_seasons ls ON ls.id = r.league_season_id "
+        "LEFT JOIN seasons s ON s.id = ls.season_id "
+        "LEFT JOIN leagues lg ON lg.id = ls.league_id "
+        "WHERE p.is_active = 1 AND (s.id IS NULL OR lg.id IS NULL)")
+    return sorted((row["player_id"], row["league_season_id"],
+                  row["season_id"], row["league_id"])
+                 for row in cur.fetchall())
+
+
+def find_active_players_with_team_league_mismatch(conn):
+    """Active players (real backfill candidates: registration/LeagueSeason
+    resolve, Season resolves and is active) whose Team's OWN permanent
+    League disagrees with the registration's LeagueSeason League (#205
+    review round 1 finding 3).
+
+    The live SERVICE path enforces this identical rule 7 analog on every
+    ``create_season_roster_membership`` call (``team.league_id != ls.
+    league_id``); migration 052's backfill trusts ``league_season_id``
+    blindly instead. A registration corrupted to point at ANOTHER League's
+    LeagueSeason in the same active Season currently passes every existing
+    preflight check and silently backfills a membership whose Team and
+    LeagueSeason disagree."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT p.id AS player_id, t.id AS team_id, "
+        "t.league_id AS team_league_id, ls.id AS league_season_id, "
+        "ls.league_id AS ls_league_id "
+        "FROM players p "
+        "JOIN teams t ON t.id = p.team_id "
+        "JOIN season_team_registrations r ON r.team_id = t.id AND r.active = 1 "
+        "JOIN league_seasons ls ON ls.id = r.league_season_id "
+        "JOIN seasons s ON s.id = ls.season_id AND s.status = 'active' "
+        "WHERE p.is_active = 1 AND t.league_id IS NOT NULL "
+        "AND t.league_id != ls.league_id")
+    return sorted((row["player_id"], row["team_id"], row["team_league_id"],
+                  row["league_season_id"], row["ls_league_id"])
+                 for row in cur.fetchall())
+
+
+def find_active_players_with_program_mismatch(conn):
+    """Active players (real backfill candidates) whose registration's
+    LeagueSeason binds a League and a Season from DIFFERENT Programs (#205
+    review round 1 finding 3).
+
+    ``league.program_id == season.program_id`` is an invariant the SERVICE
+    layer enforces when a ``LeagueSeason`` is first bound
+    (``_link_league_season``); this is the migration-time backstop for data
+    that reached this state some other way (a restored backup, a direct
+    write) — the exact defense-in-depth posture ``find_teams_with_
+    duplicate_active_season_registrations`` already takes for a DIFFERENT
+    invariant this same backfill depends on."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT p.id AS player_id, ls.id AS league_season_id, "
+        "lg.id AS league_id, lg.program_id AS league_program_id, "
+        "s.id AS season_id, s.program_id AS season_program_id "
+        "FROM players p "
+        "JOIN teams t ON t.id = p.team_id "
+        "JOIN season_team_registrations r ON r.team_id = t.id AND r.active = 1 "
+        "JOIN league_seasons ls ON ls.id = r.league_season_id "
+        "JOIN seasons s ON s.id = ls.season_id AND s.status = 'active' "
+        "JOIN leagues lg ON lg.id = ls.league_id "
+        "WHERE p.is_active = 1 AND lg.program_id != s.program_id")
+    return sorted((row["player_id"], row["league_season_id"],
+                  row["league_id"], row["league_program_id"],
+                  row["season_id"], row["season_program_id"])
+                 for row in cur.fetchall())
+
+
 def assert_season_roster_membership_backfill_ready(conn):
     """Abort migration 052 (#205 Slice A) unless the membership backfill is
     fully deterministic for every row it would derive.
@@ -1584,11 +1691,26 @@ def assert_season_roster_membership_backfill_ready(conn):
     Read-only: raises :class:`MigrationDataError` with bounded row-level
     diagnostics and leaves all data unchanged, so re-running the upgrade after
     the operator resolves each named row applies cleanly (same idempotent
-    re-run contract as migrations 029/035)."""
+    re-run contract as migrations 029/035).
+
+    #205 review round 1 finding 3 — the original checks covered ``players.
+    team_id`` dangling, same-Season registration duplicates, and jersey
+    duplicates, but never validated that the registration's OWN spine
+    (LeagueSeason -> Season/League) resolves, nor that the resolved spine is
+    COHERENT (Team's League matches the LeagueSeason's League; the League's
+    Program matches the Season's) — every check below closes one of those
+    gaps, each independently proven able to slip past the ORIGINAL checks
+    and reach ``INSERT`` (see test_season_roster_membership.py's
+    ``MembershipBackfillSpineTest``)."""
     dangling = find_active_players_with_missing_team(conn)
     dup_regs = find_teams_with_duplicate_active_season_registrations(conn)
     dup_jerseys = find_backfill_candidate_jersey_duplicates(conn)
-    if not dangling and not dup_regs and not dup_jerseys:
+    dangling_reg_target = find_active_players_with_dangling_registration_target(conn)
+    dangling_ls_parents = find_active_players_with_dangling_league_season_parents(conn)
+    team_league_mismatch = find_active_players_with_team_league_mismatch(conn)
+    program_mismatch = find_active_players_with_program_mismatch(conn)
+    if not any((dangling, dup_regs, dup_jerseys, dangling_reg_target,
+               dangling_ls_parents, team_league_mismatch, program_mismatch)):
         return
 
     problems = []
@@ -1615,6 +1737,48 @@ def assert_season_roster_membership_backfill_ready(conn):
         problems.append(
             f"{len(dup_jerseys)} active (team, jersey) pair(s) among backfill "
             f"candidates are duplicated: {shown}{more}")
+    if dangling_reg_target:
+        shown = ", ".join(
+            f"player {p} (registration={r!r} -> league_season={ls!r})"
+            for p, r, ls in dangling_reg_target[:20])
+        more = ("" if len(dangling_reg_target) <= 20
+                else f" (+{len(dangling_reg_target) - 20} more)")
+        problems.append(
+            f"{len(dangling_reg_target)} active player(s) have a Team "
+            f"registration pointing at a LeagueSeason that does not exist: "
+            f"{shown}{more}")
+    if dangling_ls_parents:
+        shown = ", ".join(
+            f"player {p} (league_season={ls!r}, season={s!r}, league={lg!r})"
+            for p, ls, s, lg in dangling_ls_parents[:20])
+        more = ("" if len(dangling_ls_parents) <= 20
+                else f" (+{len(dangling_ls_parents) - 20} more)")
+        problems.append(
+            f"{len(dangling_ls_parents)} active player(s) resolve to a "
+            f"LeagueSeason whose Season or League does not exist: "
+            f"{shown}{more}")
+    if team_league_mismatch:
+        shown = ", ".join(
+            f"player {p} (team={t!r} league={tl!r} vs "
+            f"league_season={ls!r} league={lsl!r})"
+            for p, t, tl, ls, lsl in team_league_mismatch[:20])
+        more = ("" if len(team_league_mismatch) <= 20
+                else f" (+{len(team_league_mismatch) - 20} more)")
+        problems.append(
+            f"{len(team_league_mismatch)} active player(s) would backfill a "
+            f"membership whose Team and LeagueSeason disagree on League: "
+            f"{shown}{more}")
+    if program_mismatch:
+        shown = ", ".join(
+            f"player {p} (league_season={ls!r}: league {lg!r}/program "
+            f"{lgp!r} vs season {s!r}/program {sp!r})"
+            for p, ls, lg, lgp, s, sp in program_mismatch[:20])
+        more = ("" if len(program_mismatch) <= 20
+                else f" (+{len(program_mismatch) - 20} more)")
+        problems.append(
+            f"{len(program_mismatch)} active player(s) resolve to a "
+            f"LeagueSeason whose League and Season belong to different "
+            f"Programs: {shown}{more}")
     raise MigrationDataError(
         "Cannot backfill Season roster memberships (#205 Slice A): "
         + "; ".join(problems)
