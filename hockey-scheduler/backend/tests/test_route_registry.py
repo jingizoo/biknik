@@ -119,25 +119,38 @@ class RegistryInternalConsistencyTests(unittest.TestCase):
             with self.subTest(spec=spec.name):
                 self.assertRegex(sample_path(spec.template), spec.pattern)
 
-    # #202 classification is landing in independent, reviewed batches (each
-    # batch's own ``note`` on its entries carries the file:line citation), so
-    # this can no longer pin the WHOLE registry empty the way it once did — by
-    # this batch's own turn other batches (e.g. the games/notifications/
-    # standings leaves) already carry values too. What stays checkable
-    # without knowing every other batch in advance:
+    # #202 repair round 6, finding 4: classification is NOT batch-by-batch
+    # any more, and has not been since round 4, finding 4 landed (this
+    # comment block, and the test below, used to describe the EARLIER,
+    # mid-migration state -- "landing in independent, reviewed batches",
+    # "cannot pin the whole registry" -- which stopped being true two
+    # rounds ago and was left stale here, exactly the kind of drift this
+    # finding exists to catch). The CURRENT, actual state: every one of
+    # the 238 REACHABLE specs (239 total minus the one deliberately-
+    # excluded ``get_empty_path``, see below) carries a real auth/
+    # scope_axis classification, gated per-route against an independently
+    # re-derived expected value by ``_EXPECTED_CLASSIFICATION``'s own
+    # comprehensive check further down this file (THE CLASSIFICATION
+    # GATE, below) -- THAT gate is what actually proves each value is
+    # CORRECT, not merely present. What THIS test still separately checks
+    # -- structural invariants the comprehensive gate does not restate,
+    # plus a handful of specific pins kept as a direct, cheap regression
+    # anchor rather than because they are otherwise unverified:
     #   * a spec never carries HALF a classification (auth filled, scope_axis
     #     still UNCLASSIFIED, or vice versa) — that is exactly the
     #     "half-populated policy field reads as authority" failure mode the
-    #     original guard existed to catch, and it is still checkable per-spec;
+    #     original guard existed to catch;
     #   * every filled value is one of the axis's own declared classes, not a
     #     typo or an invented one;
-    #   * THIS batch's own leaves (static files + the /calendar/*.ics leaf)
-    #     carry exactly what their notes claim: auth="none", scope_axis="none";
+    #   * a handful of always-public static/calendar leaves carry exactly
+    #     auth="none", scope_axis="none";
     #   * ``get_empty_path`` — the impossible fallback (unreachable over HTTP,
     #     see its note) — is deliberately EXCLUDED and stays UNCLASSIFIED.
-    # Nothing yet READS any of these fields (enforcement is the separate,
-    # later #202 PR the classification PR's body describes).
-    _THIS_BATCH_NONE_NONE = frozenset({
+    # Both fields are CLASSIFIED and CI-GATED for every reachable spec, but
+    # NOT YET runtime-enforced -- nothing in server.py reads either field
+    # while dispatching a request (wiring real enforcement is later #202
+    # work, not this repair round's).
+    _KNOWN_NONE_NONE_LEAVES = frozenset({
         "get_index", "get_mobile_shell", "get_mobile_shell_slash",
         "get_setup_shell", "get_setup_shell_slash", "get_static_tail",
         "get_calendar_division_id_ics", "get_calendar_official_id_ics",
@@ -148,12 +161,13 @@ class RegistryInternalConsistencyTests(unittest.TestCase):
         UNCLASSIFIED,
     })
 
-    def test_classification_slots_are_still_empty(self):
-        """``auth``/``scope_axis`` are declared slots, filled in batches.
-
-        See the block comment above for what this can and cannot pin now that
-        classification lands batch-by-batch rather than all at once.
-        """
+    def test_no_spec_is_half_classified_or_reverted(self):
+        """Structural invariants over EVERY spec's ``auth``/``scope_axis``
+        pairing, plus a handful of specific pins -- see the block comment
+        above for the full accounting of what is (and, since round 4
+        finding 4, is no longer) checkable here versus by
+        ``_EXPECTED_CLASSIFICATION``'s own comprehensive gate further down
+        this file."""
         half_filled = [(s.name, s.auth, s.scope_axis) for s in REGISTRY
                         if (s.auth != UNCLASSIFIED)
                         != (s.scope_axis != UNCLASSIFIED)]
@@ -165,7 +179,7 @@ class RegistryInternalConsistencyTests(unittest.TestCase):
         self.assertEqual(bad_axis, [])
 
         by_name = {s.name: (s.auth, s.scope_axis) for s in REGISTRY}
-        for name in self._THIS_BATCH_NONE_NONE:
+        for name in self._KNOWN_NONE_NONE_LEAVES:
             with self.subTest(name=name):
                 self.assertEqual(by_name[name], ("none", "none"))
 
@@ -196,8 +210,10 @@ class RegistryInternalConsistencyTests(unittest.TestCase):
 # Everything above this line checks that the registry covers the LIVE         #
 # DISPATCH (admission). Nothing above it checks that a filled-in auth/        #
 # scope_axis value is actually CORRECT, or even that it is a value this       #
-# module recognises at all -- test_classification_slots_are_still_empty       #
-# (above) only pins TEN specific entries by name and checks that a spec       #
+# module recognises at all -- test_no_spec_is_half_classified_or_reverted     #
+# (above -- named test_classification_slots_are_still_empty before round 6    #
+# finding 4's own rename, once classification stopped landing batch-by-batch) #
+# only pins TEN specific entries by name and checks that a spec               #
 # never carries HALF a classification; every other one of the 238 reachable   #
 # specs, and any auth STRING WHATSOEVER (a typo, 'unclassified', a value      #
 # from a different axis entirely), passed silently. Reviewer-demonstrated:    #

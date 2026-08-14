@@ -96,7 +96,19 @@ gate's cross-check reports where the two disagree.
 """
 from dataclasses import dataclass
 
-#: Value of a classification slot no one has filled in yet. Read by nothing.
+#: #202 repair round 6, finding 4: NOT "a slot no one has filled in yet" --
+#: every reachable spec IS classified (see the module docstring's own
+#: accounting, above). This is the value reserved for the one spec that
+#: is deliberately, permanently EXCLUDED from classification --
+#: ``get_empty_path``, an impossible fallback shape unreachable over HTTP
+#: (see its own note in REGISTRY) -- and it is not "read by nothing"
+#: either: ``tests/test_route_registry.py``'s own CI gate
+#: (``_VALID_AUTH_VALUES``/``_EXPECTED_CLASSIFICATION``,
+#: ``RegistryInternalConsistencyTests.
+#: test_no_spec_is_half_classified_or_reverted``) reads and enforces it
+#: directly. What remains true is narrower: nothing in server.py reads
+#: this value AT RUNTIME while dispatching a request -- see the module
+#: docstring's own note on that.
 UNCLASSIFIED = "unclassified"
 
 
@@ -153,7 +165,7 @@ REGISTRY = (
                     "shape, not a reachable leaf to classify (see "
                     "test_route_registry.py's own pin on this entry, "
                     "RegistryInternalConsistencyTests."
-                    "test_classification_slots_are_still_empty).")),
+                    "test_no_spec_is_half_classified_or_reverted).")),
     RouteSpec("GET", r"^/$", "/", "get_index", "_serve_static", kind="static",
               auth="none", scope_axis="none",
               note=("#202: _serve_static (server.py:1273-1309) -- no "
