@@ -1,4 +1,6 @@
 import json
+import os
+import tempfile
 import threading
 import unittest
 import urllib.error
@@ -7,6 +9,7 @@ from http.server import ThreadingHTTPServer
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
+from hockey_scheduler.domain import Role
 from hockey_scheduler.web.server import STATE, Handler
 
 
@@ -410,6 +413,239 @@ class OptionalSessionRouteTests(unittest.TestCase):
         status, body = self._get_h("/api/me/player-home", cookie=cookie)
         self.assertEqual(status, 200)
         self.assertEqual(body["player_id"], self.player_id)
+
+
+# --------------------------------------------------------------------------- #
+# #202 repair round 5, finding 3 (external review, 19:36): the optional-      #
+# session HTTP matrix above proved OptionalSessionRouteTests' own claim only  #
+# under demo mode's default (in-memory) store -- STATE.reset() with no        #
+# arguments and no APP_MODE override. Session resolution (SESSIONS.resolve)   #
+# and the account/official/player reads these three routes make are all      #
+# STORE-BACKED, and APP_MODE=production takes a materially different code    #
+# path through STATE.reset() itself (server.py's own comment: "NEVER reset    #
+# the schema or seed demo data" -- no seeded personas, no X-Demo-Role         #
+# fallback) -- neither was exercised. This section re-runs the IDENTICAL      #
+# 3-cookie-state (no cookie / invalid cookie / valid cookie) x 3-route        #
+# (/api/auth/me, /api/me/assignments, /api/me/player-home) matrix under       #
+# APP_MODE=production, against each of Memory/SQLite/PostgreSQL, confirming   #
+# the SAME anonymous-200/401/real-data contract OptionalSessionRouteTests     #
+# already proved for demo mode holds across the two axes that module left    #
+# untouched. Pure test-coverage expansion -- no route_extract.py/            #
+# route_registry.py change implied by this finding.                          #
+#                                                                              #
+# Store selection follows this repo's own established tri-store pattern      #
+# (see test_context_league_http.py's LeagueContextHttpContract /             #
+# Memory-/Sqlite-/PostgresLeagueContextHttpTest): a shared CONTRACT mixin     #
+# (never itself a TestCase) with an abstract ``database_url()``, and one      #
+# thin concrete subclass per backend. APP_MODE=production is layered on TOP  #
+# of that same contract, isolated and restored the same careful way          #
+# ``DATABASE_URL`` already is there.                                         #
+# --------------------------------------------------------------------------- #
+class OptionalSessionProductionMatrixContract:
+    """Shared body; each subclass supplies the store the server runs on.
+    Never itself a TestCase (mirrors LeagueContextHttpContract exactly, for
+    the same reason: instantiating the mixin alone would run with no
+    ``database_url()``)."""
+
+    def database_url(self):
+        raise NotImplementedError
+
+    # -- harness -------------------------------------------------------
+    @classmethod
+    def setUpClass(cls):
+        cls._prev_app_mode = os.environ.get("APP_MODE")
+        cls._prev_db = os.environ.get("DATABASE_URL")
+        cls._tmp_path = None
+        # Set BEFORE reset() so production's own branch in STATE.reset()
+        # runs (server.py: "Production (#71): NEVER reset the schema or
+        # seed demo data") rather than the demo seed path -- the whole
+        # point of this class is exercising THAT branch, not demo's.
+        os.environ["APP_MODE"] = "production"
+        url = cls.database_url(cls)
+        if url:
+            os.environ["DATABASE_URL"] = url
+        else:
+            os.environ.pop("DATABASE_URL", None)
+        STATE.reset()
+        cls.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        cls.port = cls.httpd.server_address[1]
+        cls.thread = threading.Thread(target=cls.httpd.serve_forever,
+                                      daemon=True)
+        cls.thread.start()
+        api = STATE.api
+        # Production seeds NOTHING (no demo personas, no X-Demo-Role
+        # fallback) -- every account and the official/player it binds to
+        # must be built from scratch here, unlike OptionalSessionRoute
+        # Tests' own setUpClass which can lean on the demo seed's
+        # home_team_id. Passwords are 10+ chars (the account service's own
+        # policy minimum) rather than OptionalSessionRouteTests' demo-only
+        # "pw", which that policy would reject outside the demo seed path.
+        api.accounts.create_account(
+            "finding3_admin", "finding3-admin-pw", Role.LEAGUE_ADMIN,
+            actor_id="test_seed")
+        official = api.create_official("Finding3 Official")
+        cls.official_id = official["id"]
+        api.create_user_account(
+            "finding3_official", "finding3-official-pw", "official",
+            scope={"official_id": cls.official_id})
+        # A Player needs a real Team, which (unlike Official) needs a real
+        # permanent League -- the minimal Program -> Season -> League ->
+        # Team -> Player chain, built the same way test_context_league_
+        # http.py's own _program_season_league fixture does.
+        program_id = api.create_program("Finding3 Program", "US", "UTC")["id"]
+        season_id = api.create_season(program_id, "Finding3 Season")["id"]
+        league_id = api.create_league(season_id, "Finding3 League")["id"]
+        team = api.create_team(name="Finding3 Team", league_id=league_id)
+        player = api.create_player(team["id"], "Finding3 Player", "forward")
+        cls.player_id = player["id"]
+        api.create_user_account(
+            "finding3_player", "finding3-player-pw", "player",
+            scope={"player_id": cls.player_id})
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.thread.join(timeout=5)
+        cls.httpd.server_close()
+        # Undo every process-global effect, in reverse order -- APP_MODE
+        # and DATABASE_URL are process-global env vars and STATE is a
+        # module-level singleton, all shared with every OTHER test module
+        # in this run (mirrors LeagueContextHttpContract's own
+        # _restore_environment, adapted to setUpClass/tearDownClass since
+        # this matrix rebuilds the store once per CLASS, not once per
+        # test method).
+        if cls._prev_app_mode is None:
+            os.environ.pop("APP_MODE", None)
+        else:
+            os.environ["APP_MODE"] = cls._prev_app_mode
+        if cls._prev_db is None:
+            os.environ.pop("DATABASE_URL", None)
+        else:
+            os.environ["DATABASE_URL"] = cls._prev_db
+        try:
+            STATE.reset()
+        except Exception:
+            pass
+        if cls._tmp_path:
+            try:
+                os.remove(cls._tmp_path)
+            except OSError:
+                pass
+
+    def _get_h(self, path, cookie=None):
+        url = f"http://127.0.0.1:{self.port}{path}"
+        req = urllib.request.Request(url, method="GET")
+        if cookie is not None:
+            req.add_header("Cookie", cookie)
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read() or b"{}")
+
+    def _login(self, username, password):
+        url = f"http://127.0.0.1:{self.port}/api/auth/login"
+        data = json.dumps({"username": username, "password": password}).encode()
+        req = urllib.request.Request(
+            url, data=data, method="POST",
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req) as r:
+            return r.headers.get("Set-Cookie", "").split(";", 1)[0]
+
+    # -- /api/auth/me ----------------------------------------------------
+    def test_auth_me_no_cookie_is_anonymous_200(self):
+        status, body = self._get_h("/api/auth/me")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"user": None})
+
+    def test_auth_me_invalid_cookie_is_401(self):
+        status, body = self._get_h("/api/auth/me", cookie="hs_sid=bogus-session")
+        self.assertEqual(status, 401)
+        self.assertEqual(body["error"]["code"], "unauthorized")
+
+    def test_auth_me_valid_cookie_returns_the_real_user(self):
+        cookie = self._login("finding3_admin", "finding3-admin-pw")
+        status, body = self._get_h("/api/auth/me", cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertIsNotNone(body["user"])
+        self.assertEqual(body["user"]["username"], "finding3_admin")
+
+    # -- /api/me/assignments ----------------------------------------------
+    def test_me_assignments_no_cookie_is_anonymous_200(self):
+        status, body = self._get_h("/api/me/assignments")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"official_id": None, "assignments": []})
+
+    def test_me_assignments_invalid_cookie_is_401(self):
+        status, body = self._get_h("/api/me/assignments",
+                                   cookie="hs_sid=bogus-session")
+        self.assertEqual(status, 401)
+        self.assertEqual(body["error"]["code"], "unauthorized")
+
+    def test_me_assignments_valid_bound_cookie_returns_the_real_inbox(self):
+        cookie = self._login("finding3_official", "finding3-official-pw")
+        status, body = self._get_h("/api/me/assignments", cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["official_id"], self.official_id)
+        self.assertIn("assignments", body)
+
+    def test_me_assignments_valid_unbound_cookie_is_the_same_empty_shape(self):
+        """A valid session with NO official binding (the League Admin) gets
+        the SAME empty shape as no cookie at all -- see
+        OptionalSessionRouteTests' own identically-named test for why this
+        distinction (rather than merely "some 200") is what is being
+        proven."""
+        cookie = self._login("finding3_admin", "finding3-admin-pw")
+        status, body = self._get_h("/api/me/assignments", cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"official_id": None, "assignments": []})
+
+    # -- /api/me/player-home -----------------------------------------------
+    def test_me_player_home_no_cookie_is_anonymous_200(self):
+        status, body = self._get_h("/api/me/player-home")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {
+            "player_id": None, "next_game": None, "today_count": 0,
+            "substitute_offers": [], "substitute_opportunities": [],
+            "unread_notifications": 0})
+
+    def test_me_player_home_invalid_cookie_is_401(self):
+        status, body = self._get_h("/api/me/player-home",
+                                   cookie="hs_sid=bogus-session")
+        self.assertEqual(status, 401)
+        self.assertEqual(body["error"]["code"], "unauthorized")
+
+    def test_me_player_home_valid_bound_cookie_returns_the_real_home(self):
+        cookie = self._login("finding3_player", "finding3-player-pw")
+        status, body = self._get_h("/api/me/player-home", cookie=cookie)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["player_id"], self.player_id)
+
+
+class MemoryOptionalSessionProductionTest(OptionalSessionProductionMatrixContract,
+                                          unittest.TestCase):
+    def database_url(self):
+        return None                     # in-memory store, production mode
+
+
+class SqliteOptionalSessionProductionTest(OptionalSessionProductionMatrixContract,
+                                          unittest.TestCase):
+    def database_url(self):
+        # A real file, not ":memory:" -- the server is threaded, and a
+        # file-backed database is what an operator actually runs
+        # production against (mirrors SqliteLeagueContextHttpTest).
+        fd, path = tempfile.mkstemp(suffix=".sqlite")
+        os.close(fd)
+        self._tmp_path = path
+        return path
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL not configured (TEST_DATABASE_URL)")
+class PostgresOptionalSessionProductionTest(OptionalSessionProductionMatrixContract,
+                                            unittest.TestCase):
+    def database_url(self):
+        return os.environ["TEST_DATABASE_URL"]
 
 
 if __name__ == "__main__":
