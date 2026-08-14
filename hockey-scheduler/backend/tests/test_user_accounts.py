@@ -8,6 +8,7 @@ from http.cookiejar import CookieJar
 from http.server import ThreadingHTTPServer
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
+from helpers import clear_membership_rows_directly
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.domain import Role, Team
@@ -408,6 +409,11 @@ class AccountCreationHttpTest(unittest.TestCase):
         home_team = srv.STATE.ids["home_team_id"]
         player = srv.STATE.api.create_player(
             home_team, "HTTP Ghost Player", "forward")
+        # Plumbing: the #205 cutover's dual-write auto-opened a stint, and
+        # the landed #205 rule blocks delete_player while ANY membership
+        # row exists — this test's subject is the account-scope rejection
+        # for an already-deleted player, so clear the rows out-of-band.
+        clear_membership_rows_directly(srv.STATE.api.store, player["id"])
         srv.STATE.api.delete_player(player["id"])
         accounts_before = len(srv.STATE.api.store.all_user_accounts())
         audits_before = len(srv.STATE.api.store.all_setup_audit())

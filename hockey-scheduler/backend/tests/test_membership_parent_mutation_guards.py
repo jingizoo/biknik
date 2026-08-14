@@ -50,6 +50,26 @@ ADMIN = "setup_admin"
 _LIVE_STATUSES = ("applicant", "active", "affiliate", "inactive", "injured")
 
 
+def _store_player(api, team_id, name, jersey=None):
+    """A Player row with NO seasonal stint yet, written at the store.
+
+    The facade's ``create_player`` now also opens the permanent-model-parity
+    ACTIVE membership (the #205 substitute cutover's dual-write) — which
+    would make every hand-crafted ``create_season_roster_membership`` in
+    this module collide with an already-open stint. These guard tests
+    exercise the membership surface itself FROM the no-stint state, a state
+    production still reaches through the store-level bulk import paths (and
+    any pre-059 row); the dual-write has its own coverage in
+    test_substitute_membership_cutover.py. Every assertion in this module
+    is unchanged — same adaptation test_season_roster_membership.py makes."""
+    from hockey_scheduler.domain import Player
+    player = Player(id=api.store.next_id("player"), team_id=team_id,
+                    name=name, position=Position.FORWARD,
+                    jersey_number=jersey)
+    api.store.add_player(player)
+    return {"id": player.id, "name": name, "team_id": team_id}
+
+
 def _fixture(api):
     """Program -> Season -> Division -> Club -> registered Team (+ a second
     League/Team for transfer targets), plus one Player. Returns a dict of
@@ -63,8 +83,7 @@ def _fixture(api):
                                        actor_id=ADMIN)
     ls_id = api.store.get_season_team_registration(reg["id"]).league_season_id
     league_id = api.store.get_league_season(ls_id).league_id
-    player = api.create_player(team["id"], "Skater", "forward",
-                               jersey_number=9, actor_id=ADMIN)
+    player = _store_player(api, team["id"], "Skater", jersey=9)
     other_league = api.create_league(season["id"], "Bronze", actor_id=ADMIN)
     return {"program": program, "season": season, "division": division,
            "club": club, "team": team, "reg": reg, "ls_id": ls_id,
@@ -782,9 +801,8 @@ class ParkedRevivalSpineTest(unittest.TestCase):
                                 m["id"], "inactive", actor_id=ADMIN))
                         # Another player takes jersey 7 ACTIVE on the same
                         # (LeagueSeason, Team).
-                        other = api.create_player(
-                            fx["team"]["id"], "Rival", "forward",
-                            jersey_number=7, actor_id=ADMIN)
+                        other = _store_player(api, fx["team"]["id"],
+                                              "Rival", jersey=7)
                         rival = api.create_season_roster_membership(
                             other["id"], fx["ls_id"], fx["team"]["id"],
                             status="active", jersey_number=7, actor_id=ADMIN)

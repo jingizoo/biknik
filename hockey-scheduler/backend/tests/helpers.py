@@ -180,6 +180,65 @@ def end_membership_directly(store, membership_id, status="released"):
     return m
 
 
+def end_parity_stints_directly(store, player_id, status="transferred"):
+    """Move every LIVE membership of ``player_id`` to a TERMINAL status via
+    the STORE layer (see ``end_membership_directly`` above for why the
+    service surface cannot do this yet).
+
+    #205 substitute cutover plumbing: the parity dual-write auto-opens an
+    ACTIVE stint for every facade-created active player on an actively
+    registered team, and the landed stranding guards then rightly block
+    ``unregister_team_from_season`` / ``transfer_team_to_league`` while
+    that stint is live. Tests whose SUBJECT is one of those other mutations
+    end the auto-opened stints this way first — the operator action the
+    production refusal message itself demands ("release/transfer them
+    first"), reconstructed out-of-band because the governed workflow ships
+    in a later #205 slice."""
+    from hockey_scheduler.domain import MembershipStatus
+    ended = []
+    for m in store.memberships_for_player(player_id):
+        if m.status not in (MembershipStatus.RELEASED,
+                            MembershipStatus.TRANSFERRED):
+            ended.append(end_membership_directly(store, m.id, status))
+    return ended
+
+
+def clear_membership_rows_directly(store, player_id):
+    """Physically remove ``player_id``'s SeasonRosterMembership rows AND
+    their events at the STORE layer — NOT a lifecycle transition.
+
+    #205 substitute cutover plumbing for HARD-DELETE probes only: the
+    landed #205 service rule blocks ``delete_player`` while ANY membership
+    row (even terminal) exists, and the store-level FK enforces the same
+    (that posture is pinned by test_membership_parent_mutation_guards and
+    must stay). A handful of pre-cutover tests hard-delete a player purely
+    as PLUMBING for something else they exercise (context fail-closed on a
+    deleted subject, account-scope rejection for a deleted player, the
+    route-authorization positive delete case) — post-cutover their
+    facade-created players carry an auto-opened stint, so the precondition
+    "a player with no membership rows" is reconstructed here out-of-band,
+    exactly like the direct writes above. Never use this to bypass the
+    delete guards in a test ABOUT deletion behavior."""
+    memberships = list(store.memberships_for_player(player_id))
+    ids = {m.id for m in memberships}
+    from hockey_scheduler.store import InMemoryStore
+    if isinstance(store, InMemoryStore):
+        store.season_roster_membership_events = {
+            eid: e for eid, e in store.season_roster_membership_events.items()
+            if e.membership_id not in ids}
+        for mid in ids:
+            store.season_roster_memberships.pop(mid, None)
+    else:
+        with store.transaction():
+            store._exec(
+                "DELETE FROM season_roster_membership_events WHERE"
+                " membership_id IN (SELECT id FROM season_roster_memberships"
+                " WHERE player_id = ?)", (player_id,))
+            store._exec("DELETE FROM season_roster_memberships"
+                        " WHERE player_id = ?", (player_id,))
+    return memberships
+
+
 def race_with_forced_order(url, gate_method, first, second, timeout=5):
     """Run ``first(store)`` and ``second(store)`` concurrently, each on its
     OWN new real-PostgreSQL ``SqlStore(url)`` connection/thread, but force

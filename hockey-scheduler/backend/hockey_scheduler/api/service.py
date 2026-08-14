@@ -6307,13 +6307,20 @@ class ApiService:
     def _opportunity_base_dict(self, g, player) -> dict:
         """The fields a substitute opportunity carries in both the Home list
         (#107) and the detail view (#110) — kept in one place so the two
-        surfaces can't drift on the shared shape."""
-        team = self.store.get_team(player.team_id) if player.team_id else None
-        opp_id = self._opponent_team_id(g, player.team_id)
+        surfaces can't drift on the shared shape.
+
+        The surfaced team is the side the player RESOLVES to for THIS game
+        (#205 cutover — membership for a LeagueSeason-bound game, permanent
+        pointer for an unbound one); the pointer is only the label fallback
+        for the never-eligible edge (callers list eligible games, so it is
+        ordinarily unreachable)."""
+        team_id = self.roster.team_for_game(g, player) or player.team_id
+        team = self.store.get_team(team_id) if team_id else None
+        opp_id = self._opponent_team_id(g, team_id)
         opp_team = self.store.get_team(opp_id) if opp_id else None
         return {
             "game_id": g.id,
-            "team_name": team.name if team else player.team_id,
+            "team_name": team.name if team else team_id,
             "opponent_name": opp_team.name if opp_team else None,
             "start_time": g.start_time.isoformat() if g.start_time else None,
             "venue_name": self._venue_name_for_game(g),
@@ -6448,12 +6455,16 @@ class ApiService:
         if player is None:
             raise NotFoundError("Player not found.")
         game = self.store.get_game(game_id)
-        # Only a player on one of the participating teams may view the
-        # opportunity — don't confirm another team's game to a non-participant.
-        if game is None or player.team_id not in (
-                game.home_team_id, game.away_team_id):
+        # Only a player who RESOLVES to one of the participating teams may
+        # view the opportunity — don't confirm another team's game to a
+        # non-participant. Resolution is membership-based for a
+        # LeagueSeason-bound game and permanent-pointer for an unbound one
+        # (#205 cutover, RosterService.team_for_game).
+        team_id = (self.roster.team_for_game(game, player)
+                   if game is not None else None)
+        if game is None or team_id is None:
             raise NotFoundError("Opportunity not found.")
-        rstatus = self.roster.compute_roster_status(game_id, player.team_id)
+        rstatus = self.roster.compute_roster_status(game_id, team_id)
         enrollment = self.store.substitute_for_player(game_id, player_id)
         status = enrollment.status if enrollment else None
         can_accept = can_withdraw = can_accept_offer = can_decline_offer = False

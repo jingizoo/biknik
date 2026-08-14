@@ -44,6 +44,7 @@ from http.cookiejar import CookieJar
 from http.server import ThreadingHTTPServer
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
+from helpers import end_parity_stints_directly
 
 import hockey_scheduler.web.server as srv
 from hockey_scheduler.domain import GameType, OfficialRole, Role
@@ -321,6 +322,13 @@ class LeagueContextHttpContract:
         proving nothing about the League axis. Historical Games are deliberately
         NOT rewritten, which is exactly why the Official's frozen derivation and
         the live Team-derived one diverge here."""
+        # The #205 cutover's dual-write auto-opened live stints for the
+        # Team's players, and the landed stranding guard rightly refuses a
+        # League transfer while they are live ("release/transfer them
+        # first") — perform that operator action out-of-band (the governed
+        # workflow is a later #205 slice) before the real transfer.
+        for p in self.store.players_for_team(team_id):
+            end_parity_stints_directly(self.store, p.id)
         self.api.setup.transfer_team_to_league(
             team_id, new_league_id, actor_id="test_seed")
 
