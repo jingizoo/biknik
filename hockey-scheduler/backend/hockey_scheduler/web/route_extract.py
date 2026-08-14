@@ -3546,8 +3546,9 @@ _PATH_CONSUMING_METHODS = ("read_bytes", "read_text", "open")
 #: (e.g. a routing comparison hidden inside a genexpr) -- only an
 #: EXTRACTION/CONSUMPTION's receiver must not leak outward like that.
 def _is_callee(node: ast.AST, parents: Optional[dict]) -> bool:
-    """Is ``node`` itself the CALLEE of its immediate parent -- i.e. is it
-    about to be INVOKED, not merely read as data?
+    """Is ``node`` -- however much transparent composition sits between it
+    and its eventual use -- about to be INVOKED somewhere in its enclosing
+    statement, rather than merely read as data?
 
     #202 repair round 6, finding 2: the ``captured`` exemption (see
     :func:`_propagates_taint`'s own docstring) is deliberately narrow --
@@ -3565,58 +3566,92 @@ def _is_callee(node: ast.AST, parents: Optional[dict]) -> bool:
     while the live handler answered 200 for one concrete value and 404 for
     another -- the captured exemption accepted it because its ONLY
     tracked mention (``action``) was captured, never asking whether the
-    call's own RESULT was about to be called.
-
-    Used to gate the ``captured`` exemption OFF for exactly this shape:
-    a Call or Subscript that is itself ``parent.func`` for an ENCLOSING
-    ``ast.Call`` -- i.e. about to be invoked -- never qualifies, no matter
-    how narrowly its own tracked mentions are captured-only. A captured id
-    used as a plain ARGUMENT or receiver elsewhere (``deleter(md.group(2),
+    call's own RESULT was about to be called. Introduced this function to
+    gate the ``captured`` exemption OFF for exactly this shape: a Call or
+    Subscript about to be invoked never qualifies, no matter how narrowly
+    its own tracked mentions are captured-only. A captured id used as a
+    plain ARGUMENT or receiver elsewhere (``deleter(md.group(2),
     actor_id)``, ``mapper(deleter(...))`` -- real server.py shapes, see
-    ``_AUDIT_WAIVERS``) is UNAFFECTED: neither is ever ``parent.func`` for
-    anything (each is bound to a plain local NAME first via a separate
-    assignment, and a bare ``ast.Name`` callee is never independently
-    examined by the Call/Subscript-shaped checks this gates at all), so
-    this only narrows the exemption for the shape it was never meant to
-    cover in the first place.
+    ``_AUDIT_WAIVERS``) is UNAFFECTED by any round of this function's own
+    history, including this one: neither is ever part of what invokes it
+    (each is bound to a plain local NAME first via a separate assignment,
+    and a bare ``ast.Name`` callee is never independently examined by the
+    Call/Subscript-shaped checks this gates at all).
 
-    #202 repair round 7, finding 1: walks UP through every ``ast.Attribute``/
-    ``ast.Subscript`` layer where the node reached SO FAR is the RECEIVER
-    (``.value``) of that layer -- not only ``node``'s own IMMEDIATE parent
-    -- before asking "is this the callee of an enclosing Call". The
-    original, single-hop version missed a call reached through a RECEIVER
-    CHAIN: ``handlers.get(action, default_handler).serve(self)`` -- the
-    dispatch-selecting ``handlers.get(action, default_handler)`` Call's own
-    immediate parent is the ``.serve`` ``ast.Attribute``, never a Call
-    directly, so the one-hop test answered False for it even though
-    ``.serve(self)`` invokes exactly what that Call returns. DEMONSTRATED:
-    a regex-captured ``action`` selecting a handler this exact way
-    extracted as a single ``/api/{}`` wildcard while a real live handler
-    answered 200 for one concrete value and 404 for another -- the
-    ``captured`` exemption above accepted it because THIS check, looking
-    only one hop up, never saw the enclosing ``.serve(self)`` invocation at
-    all. Climbing through Attribute/Subscript layers (never through a
-    Call -- a call's RESULT being later used as someone else's receiver is
-    a completely different, already-handled question, not another hop to
-    climb) mirrors the SAME receiver-chain unwrapping ``_is_self_call`` and
-    ``_direct_operand_names``'s own ``root_name`` already do, just walking
-    the opposite direction (up from a node toward its eventual callee,
-    rather than down from a callee toward its root).
+    #202 repair round 7, finding 1: the original version only checked
+    ``node``'s own IMMEDIATE parent, so a call reached through a RECEIVER
+    CHAIN -- ``handlers.get(action, default_handler).serve(self)``, whose
+    dispatch-selecting Call's immediate parent is the ``.serve``
+    ``ast.Attribute``, never a Call directly -- answered False even though
+    ``.serve(self)`` invokes exactly what that Call returns. Widened to
+    walk UP through every ``ast.Attribute``/``ast.Subscript`` layer where
+    the node reached so far is that layer's own RECEIVER (``.value``)
+    before asking "is this a Call's callee". DEMONSTRATED the same way:
+    ``/api/{}`` wildcard, 200/404 live divergence.
+
+    #202 repair round 8, finding 1 (external review): round 7's climb
+    still only continues past TWO curated shapes -- Attribute and
+    Subscript, one hop at a time -- so it stops, returning False, the
+    INSTANT ``node``'s own immediate parent is anything else, before ever
+    asking what sits above THAT. A ``Tuple``, a ``List`` or an ``IfExp``
+    holding ``node`` is none of those two shapes. DEMONSTRATED, the
+    reviewer's own repro, verbatim: a regex-captured ``action`` selecting
+    ``(handlers.get(action, default_handler),)[0].serve(self)`` -- a
+    ONE-ELEMENT TUPLE immediately indexed by a literal ``0`` -- extracted
+    as a single ``/api/{}`` wildcard while a real live handler answered
+    200 for one concrete value and 404 for another; the SAME true of the
+    identical shape spelled as a ``List``
+    (``[handlers.get(...)][0].serve(self)``) or as a conditional
+    expression (``(handlers.get(...) if flag else default_handler)
+    (self)``) wrapping the captured-derived call before its receiver
+    chain or invocation. This exact category has now recurred three times
+    (round 5 finding 5's own default-deny expression-operand gap, round 6
+    finding 2's original narrowing, round 7 finding 1's receiver-chain
+    climb) across three different specific wrapper shapes each time --
+    enumerating one more transparent-wrapper shape as it is separately
+    discovered is not converging, so this round REPLACES the curated
+    upward climb entirely rather than extending its shape list a fourth
+    time.
+
+    The replacement needs no notion of "transparent wrapper" at all:
+    climb ``parents`` from ``node`` up to the nearest enclosing
+    ``ast.stmt`` (the smallest scope always cheaply available without
+    re-deriving it from the expression's own shape -- climbing any
+    FURTHER, e.g. to the whole enclosing function, would answer identically
+    since an AST node object is never shared or interned, so ``node`` can
+    structurally occur at only the one position it actually sits at,
+    however large a scope containing that position is searched), then,
+    for EVERY ``ast.Call`` anywhere in that statement, ask whether
+    ``node`` is present ANYWHERE inside that call's own ``.func``
+    subtree -- an ordinary, unrestricted ``ast.walk``, which recurses
+    through a Tuple, a List, an IfExp, a BoolOp, or any node shape
+    Python's grammar has or will ever add, none of which this function
+    needs to name to recognise. ``node`` can only be found there if it
+    really is, structurally, part of what that Call is about to invoke;
+    a plain ARGUMENT position (``deleter(md.group(2), actor_id)``,
+    ``mapper(deleter(...))``) is never inside any Call's own ``.func``
+    subtree, so both real server.py shapes the ``captured`` exemption
+    exists for stay exempt exactly as every prior round left them. This
+    is deliberately the MORE conservative of the two fixes the review
+    offered over a fourth curated shape: it now also refuses a captured
+    value found in a callee/receiver position through composition no
+    round of this function ever enumerated by name, which is the point.
     """
     if parents is None:
         return False
-    current = node
-    while True:
-        parent = parents.get(id(current))
+    statement = node
+    while not isinstance(statement, ast.stmt):
+        parent = parents.get(id(statement))
         if parent is None:
-            return False
-        if isinstance(parent, ast.Call) and parent.func is current:
-            return True
-        if (isinstance(parent, (ast.Attribute, ast.Subscript))
-                and parent.value is current):
-            current = parent
+            break
+        statement = parent
+    for candidate in ast.walk(statement):
+        if not isinstance(candidate, ast.Call):
             continue
-        return False
+        for sub in ast.walk(candidate.func):
+            if sub is node:
+                return True
+    return False
 
 
 def _is_self_call(node: ast.Call) -> bool:

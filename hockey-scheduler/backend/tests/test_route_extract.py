@@ -4598,5 +4598,503 @@ class LoopIterableAndReceiverChainDispatchTests(unittest.TestCase):
         self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 75)
 
 
+# --------------------------------------------------------------------------- #
+# #202 repair round 8, finding 1 (external review): round 7's ``_is_callee``   #
+# climb recognised exactly TWO transparent wrapper shapes -- ``ast.Attribute``  #
+# and ``ast.Subscript`` -- so it stopped, returning False, the INSTANT a       #
+# captured-derived Call/Subscript's own immediate parent was anything else.    #
+# A ``Tuple``, a ``List`` or an ``IfExp`` holding the node is none of those     #
+# two shapes. The reviewer's own repro, verbatim: a regex-captured ``action``  #
+# selecting ``(handlers.get(action, default_handler),)[0].serve(self)`` -- a   #
+# one-element TUPLE immediately indexed by a literal ``0`` -- extracted as a   #
+# single ``/api/{}`` wildcard while live HTTP answered 200/404. The SAME true  #
+# spelled as a ``List`` or wrapped in an ``ast.IfExp`` ternary. This exact     #
+# category recurred THREE times (round 5 finding 5, round 6 finding 2, round   #
+# 7 finding 1) across three different specific wrapper shapes each time, so    #
+# THIS round replaces the curated upward climb entirely -- a generic          #
+# DOWNWARD scan of the whole enclosing statement (does ``node`` occur          #
+# anywhere inside any ``ast.Call``'s own ``.func`` subtree, an ordinary        #
+# unrestricted ``ast.walk``) rather than a fourth curated parent-shape hop --  #
+# per the review's own stated preference over enumerating another shape.       #
+# See ``_is_callee``'s own docstring (route_extract.py) for the full account.  #
+#                                                                              #
+# Reproduced via git stash (git stash cannot run from inside a test process;   #
+# ``git stash push -- backend/hockey_scheduler/web/route_extract.py`` then     #
+# ``git stash pop``, isolating JUST the production fix from this file's own    #
+# new tests) against the code as it stood immediately before this finding's    #
+# fix, ``python3 -m unittest test_route_extract.                              #
+# TransparentCompositionCalleeTests -v``, captured verbatim:                   #
+#                                                                              #
+#   FAIL: test_tuple_indexed_selector_raises   (AssertionError: ExtractionError#
+#     not raised) -- the reviewer's own repro verbatim; live probe on the      #
+#     SAME source (run separately, not gated on the static side) still shows   #
+#     200 for /api/hidden, 404 for /api/other                                 #
+#   FAIL: test_list_indexed_selector_raises    (AssertionError: ExtractionError#
+#     not raised)                                                             #
+#   FAIL: test_ifexp_wrapped_selector_raises   (AssertionError: ExtractionError#
+#     not raised)                                                             #
+#   Ran 17 tests in 3.175s -- FAILED (failures=3)                             #
+#                                                                              #
+# exactly the THREE new raise-tests failed -- a genuine "ExtractionError not   #
+# raised" AssertionError each, not a vacuous pass. Every OTHER test in this    #
+# class passed AGAINST THE PRE-FIX CODE TOO, which is the expected, CORRECT    #
+# outcome for each, not a gap in this proof: the three                        #
+# ``test_existing_*_form_still_raises`` regression tests assert round 6/7's    #
+# OWN shapes, already fixed in THIS branch before this finding existed, so     #
+# they pass whether or not round 8's own fix is present -- they exist to      #
+# prove round 8 does not REGRESS round 6/7, a question the pre-fix run cannot  #
+# even pose; the live-HTTP and negative-control tests pass unconditionally by  #
+# design (the live tests assert nothing about ``extract_routes`` at all, and   #
+# the negative controls must pass either way, proving THEMSELVES only); the    #
+# two MUTATION tests construct their OWN self-contained mutated function       #
+# in-process rather than exercising whatever ``route_extract_module.          #
+# _is_callee`` currently is, so they are insensitive to the stash either way   #
+# by construction (see their own docstrings). All 17 pass against the FIXED    #
+# code, asserted below on every run -- ``git stash pop`` restored the fix      #
+# immediately after capturing the transcript above; it is not left stashed.    #
+#                                                                              #
+# The two MUTATION tests are a SECOND, finer-grained, ALWAYS-RUN              #
+# falsifiability proof of the SAME kind, closing the one gap the stash-based   #
+# proof above cannot reach on its own (it only ever exercises the ONE         #
+# specific pre-fix/post-fix pair this branch's git history actually has, not   #
+# a partially-applied fix): each disables exactly one of the new algorithm's   #
+# two structural rules (in-process, via a temporary monkeypatch of            #
+# ``route_extract_module._is_callee``, restored by ``addCleanup`` even if the  #
+# test itself fails) and asserts that EVERY raise-case it exercises -- not     #
+# just this round's own new ones -- stops raising under that ONE mutation,    #
+# proving each rule is independently NECESSARY, not merely jointly            #
+# sufficient, without depending on git stash (which cannot run inside this     #
+# process) to re-demonstrate it on demand.                                    #
+# --------------------------------------------------------------------------- #
+class TransparentCompositionCalleeTests(unittest.TestCase):
+    def _raises(self, body, *substrings):
+        with self.assertRaises(ExtractionError) as caught:
+            extract_routes(_module(body))
+        msg = str(caught.exception)
+        for s in substrings:
+            self.assertIn(s, msg)
+
+    # -- rule: a captured dispatch selector wrapped in a Tuple/List/IfExp  --
+    # -- before its receiver chain or invocation must not escape ------------
+
+    def test_tuple_indexed_selector_raises(self):
+        """The reviewer's own repro, verbatim: a regex-captured ``action``
+        selects ``(handlers.get(action, default_handler),)[0].serve(self)``
+        -- a one-element TUPLE immediately indexed by a literal ``0``,
+        between the dispatch-selecting Call and the ``.serve`` receiver
+        chain round 7 already climbs through. Round 7's climb stops the
+        instant it reaches ``node``'s own immediate parent (the Tuple),
+        which is neither an ``ast.Attribute`` nor an ``ast.Subscript``, so
+        it never even reaches the Subscript (``[0]``) or Attribute
+        (``.serve``) layers sitting ABOVE the tuple."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return (handlers.get(action, default_handler),)[0].serve(self)
+        ''', "unlisted call", "handlers.get(action, default_handler)")
+
+    def test_tuple_indexed_selector_escape_answers_over_real_http(self):
+        """The SAME source text as the static test above, driven over a
+        real socket -- 200 for the hidden action, 404 for every other one,
+        via the tuple-index-then-receiver-chain shape the old
+        ``_is_callee`` could not see through."""
+        body = '''
+            def do_GET(self):
+                path = self.path
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return (handlers.get(action, default_handler),)[0].serve(self)
+        '''
+        extra_globals = {
+            "re": re,
+            "handlers": {"hidden": _ServeHandler(lambda h: h._send(1))},
+            "default_handler": _ServeHandler(
+                lambda h: h._send_json({"error": "not_found"}, 404)),
+        }
+        status, text = _real_http_probe_with_globals(
+            body, extra_globals, "GET", "/api/hidden")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"n": 1})
+        status2, text2 = _real_http_probe_with_globals(
+            body, extra_globals, "GET", "/api/other")
+        self.assertEqual(status2, 404)
+        self.assertEqual(json.loads(text2), {"error": "not_found"})
+
+    def test_list_indexed_selector_raises(self):
+        """The List sibling of the reviewer's own Tuple repro --
+        ``[handlers.get(action, default_handler)][0].serve(self)`` -- the
+        review's own words, "List ... wrapper[s] fail the same way"."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return [handlers.get(action, default_handler)][0].serve(self)
+        ''', "unlisted call", "handlers.get(action, default_handler)")
+
+    def test_list_indexed_selector_escape_answers_over_real_http(self):
+        """As ``test_tuple_indexed_selector_escape_answers_over_real_http``
+        above, for the List-index variant."""
+        body = '''
+            def do_GET(self):
+                path = self.path
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return [handlers.get(action, default_handler)][0].serve(self)
+        '''
+        extra_globals = {
+            "re": re,
+            "handlers": {"hidden": _ServeHandler(lambda h: h._send(1))},
+            "default_handler": _ServeHandler(
+                lambda h: h._send_json({"error": "not_found"}, 404)),
+        }
+        status, text = _real_http_probe_with_globals(
+            body, extra_globals, "GET", "/api/hidden")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"n": 1})
+        status2, text2 = _real_http_probe_with_globals(
+            body, extra_globals, "GET", "/api/other")
+        self.assertEqual(status2, 404)
+        self.assertEqual(json.loads(text2), {"error": "not_found"})
+
+    def test_ifexp_wrapped_selector_raises(self):
+        """The conditional-expression (``ast.IfExp``) sibling of the same
+        shape -- ``(handlers.get(action, default_handler) if
+        unrelated_flag else default_handler)(self)``. ``unrelated_flag`` is
+        deliberately NOT derived from ``path``/``action`` at all, so the
+        ONLY escape this fixture can be exercising is the IfExp
+        composition sitting between the captured-derived Call and its
+        direct invocation -- not the already-independently-covered "an if
+        test touches a tracked name" rule (``_direct_operand_names``),
+        which a tracked IfExp ``.test`` would trip through a completely
+        different mechanism."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return (handlers.get(action, default_handler) if unrelated_flag else default_handler)(self)
+        ''', "unlisted call", "handlers.get(action, default_handler)")
+
+    def test_ifexp_wrapped_selector_escape_answers_over_real_http(self):
+        """As the Tuple/List live tests above, for the IfExp variant --
+        ``unrelated_flag`` is a plain global, True for every request, so
+        both live probes below exercise the SAME branch of the ternary and
+        the divergence is entirely ``handlers``' own captured lookup, not
+        which side of ``if unrelated_flag else`` ran."""
+        body = '''
+            def do_GET(self):
+                path = self.path
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return (handlers.get(action, default_handler) if unrelated_flag else default_handler)(self)
+        '''
+        extra_globals = {
+            "re": re, "unrelated_flag": True,
+            "handlers": {"hidden": lambda h: h._send(1)},
+            "default_handler": lambda h: h._send_json(
+                {"error": "not_found"}, 404),
+        }
+        status, text = _real_http_probe_with_globals(
+            body, extra_globals, "GET", "/api/hidden")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"n": 1})
+        status2, text2 = _real_http_probe_with_globals(
+            body, extra_globals, "GET", "/api/other")
+        self.assertEqual(status2, 404)
+        self.assertEqual(json.loads(text2), {"error": "not_found"})
+
+    # -- regression: the round 6/round 7 shapes this round must not break --
+    # -- (self-contained per this round's own section, not merely relying  --
+    # -- on ExecutionControlAndDataFlowTests/                              --
+    # -- LoopIterableAndReceiverChainDispatchTests staying unchanged) ------
+
+    def test_existing_direct_call_form_still_raises(self):
+        """Round 6 finding 2's own repro must still raise under the new,
+        generic scan -- a direct call needs no composition at all:
+        ``candidate.func is node`` on the very first (and only) candidate
+        Call is already true."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return handlers.get(action, default_handler)(self)
+        ''', "unlisted call", "handlers.get(action, default_handler)")
+
+    def test_existing_attribute_receiver_chain_form_still_raises(self):
+        """Round 7 finding 1's own repro must still raise: an Attribute
+        hop alone (no Tuple/List/IfExp at all) is still recognised by the
+        new scan -- ``ast.walk(candidate.func)`` descends into an
+        Attribute's own ``.value`` exactly as readily as into anything
+        else, so this shape needs no special case any more than the new
+        ones do."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return handlers.get(action, default_handler).serve(self)
+        ''', "unlisted call", "handlers.get(action, default_handler)")
+
+    def test_existing_subscript_receiver_chain_form_still_raises(self):
+        """Round 7 finding 1's own Subscript-hop repro must still raise,
+        for the same reason as the Attribute one above."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return REGISTRY.get(action, DEFAULT)[0](self)
+        ''', "unlisted call", "REGISTRY.get(action, DEFAULT)")
+
+    # -- negative controls: a captured id used purely as inert DATA, never --
+    # -- a callee, must stay exempt -- including when it is ALSO wrapped   --
+    # -- in the exact tuple/list/ifexp shapes this round newly recognises, --
+    # -- proving the fix is precise (position-sensitive), not a blanket    --
+    # -- "captured value touched by any transparent wrapper now raises" ----
+
+    def test_captured_id_as_a_plain_argument_is_still_unaffected(self):
+        """Round 5 finding 2b's own control, unchanged: a captured id
+        handed to a FIXED, KNOWN service as a plain ARGUMENT (never a
+        callee) stays exempt."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                m = re.match(r"^/api/items/([^/]+)$", path)
+                if m:
+                    gid = m.group(1)
+                    return self._send_api(api.get_item(gid))
+        '''))}
+        self.assertEqual(found, {("GET", "/api/items/{}")})
+
+    def test_captured_id_tuple_indexed_as_a_plain_argument_is_unaffected(self):
+        """The tuple-index SHAPE this round newly recognises, but used as
+        a plain ARGUMENT rather than a callee/receiver: ``api.get_item(
+        (gid, "meta")[0])`` extracts ``gid`` through the identical
+        tuple-index composition the vulnerable repro used, but the result
+        is handed to a fixed service as DATA, never invoked -- proving the
+        new scan is sensitive to POSITION (does this land in some Call's
+        ``.func``), not merely to "was a tuple involved somewhere"."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                m = re.match(r"^/api/items/([^/]+)$", path)
+                if m:
+                    gid = m.group(1)
+                    return self._send_api(api.get_item((gid, "meta")[0]))
+        '''))}
+        self.assertEqual(found, {("GET", "/api/items/{}")})
+
+    def test_captured_id_list_indexed_as_a_plain_argument_is_unaffected(self):
+        """As the tuple-index control above, for a List."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                m = re.match(r"^/api/items/([^/]+)$", path)
+                if m:
+                    gid = m.group(1)
+                    return self._send_api(api.get_item([gid, "meta"][0]))
+        '''))}
+        self.assertEqual(found, {("GET", "/api/items/{}")})
+
+    def test_captured_id_in_ifexp_as_a_plain_argument_is_unaffected(self):
+        """As the tuple/list controls above, for an IfExp whose BOTH
+        branches are the same captured id -- still never a callee, so
+        still exempt regardless of which branch a real call would take."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                m = re.match(r"^/api/items/([^/]+)$", path)
+                if m:
+                    gid = m.group(1)
+                    return self._send_api(api.get_item(gid if unrelated_flag else gid))
+        '''))}
+        self.assertEqual(found, {("GET", "/api/items/{}")})
+
+    def test_a_fixed_service_receiver_chain_not_derived_from_path_is_unaffected(self):
+        """Round 7's own control, unchanged: a chain selected by a FIXED,
+        untracked key stays exempt exactly as an ordinary reviewed service
+        call already is."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if path == "/api/real":
+                    return SERVICES.get("fixed_action", default_handler).serve(self)
+                return self._send(2)
+        '''))}
+        self.assertEqual(found, {("GET", "/api/real")})
+
+    # -- load-bearing mutations: each of the two structural rules inside   --
+    # -- the new ``_is_callee`` is independently necessary ------------------
+
+    def _patch_is_callee(self, mutated):
+        """Temporarily replace ``route_extract_module._is_callee`` --
+        ``_propagates_taint`` calls it by bare module-global name, resolved
+        at CALL time against the module's own namespace, so patching the
+        module attribute here changes what an ALREADY-DEFINED
+        ``_propagates_taint`` invokes on its very next call, no reimport or
+        reload needed. Restored by ``addCleanup`` even if the test body
+        itself raises or fails an assertion."""
+        original = route_extract_module._is_callee
+        route_extract_module._is_callee = mutated
+        self.addCleanup(setattr, route_extract_module, "_is_callee", original)
+
+    def test_disabling_recursive_descent_breaks_every_composed_or_chained_case(self):
+        """MUTATION of rule 2 (descend into ``candidate.func`` with an
+        unrestricted ``ast.walk``): replaced with a SHALLOW check
+        (``candidate.func is node`` -- direct identity only, no descent).
+        The bare direct-call shape (``handlers.get(...)(self)``, where
+        ``candidate.func`` literally IS ``node``) still raises under this
+        mutation -- proving the mutation is a genuine WEAKENING, not a
+        no-op -- but EVERY receiver-chain or composed shape (Attribute,
+        Subscript, Tuple, List, IfExp alike) stops raising, because none
+        of their outer Call's ``.func`` is ``node`` ITSELF, only something
+        ``node`` sits inside. This is what makes rule 2 load-bearing for
+        round 7's OWN shapes, not only this round's new ones."""
+        def shallow_identity_only(node, parents):
+            if parents is None:
+                return False
+            statement = node
+            while not isinstance(statement, ast.stmt):
+                parent = parents.get(id(statement))
+                if parent is None:
+                    break
+                statement = parent
+            for candidate in ast.walk(statement):
+                if isinstance(candidate, ast.Call) and candidate.func is node:
+                    return True
+            return False
+
+        self._patch_is_callee(shallow_identity_only)
+
+        # Direct call: unaffected by this mutation (candidate.func IS node).
+        self._raises('''
+            def do_GET(self):
+                path = self.path
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return handlers.get(action, default_handler)(self)
+        ''', "unlisted call")
+
+        # Every chained/composed shape now WRONGLY stays exempt.
+        for body in (
+            '''
+            def do_GET(self):
+                path = self.path
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return handlers.get(action, default_handler).serve(self)
+            ''',
+            '''
+            def do_GET(self):
+                path = self.path
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return (handlers.get(action, default_handler),)[0].serve(self)
+            ''',
+            '''
+            def do_GET(self):
+                path = self.path
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return [handlers.get(action, default_handler)][0].serve(self)
+            ''',
+            '''
+            def do_GET(self):
+                path = self.path
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return (handlers.get(action, default_handler) if unrelated_flag else default_handler)(self)
+            ''',
+        ):
+            found = {(r.method, r.template) for r in extract_routes(_module(body))}
+            self.assertEqual(found, {("GET", "/api/{}")},
+                             "mutation expected to WRONGLY exempt this shape")
+
+    def test_disabling_the_climb_breaks_even_the_bare_direct_call_case(self):
+        """MUTATION of rule 1 (climb ``parents`` up from ``node`` to the
+        nearest enclosing ``ast.stmt`` before scanning): replaced with NO
+        climb at all -- the scan starts AT ``node`` itself. Since an
+        enclosing Call is, by definition, an ANCESTOR of ``node``, never a
+        DESCENDANT, scanning only ``node``'s own subtree can never find
+        one -- ``_is_callee`` degenerates to unconditionally returning
+        False, so even the bare direct-call shape (needing no composition
+        or chain at all) now WRONGLY stays exempt. This is what makes rule
+        1 load-bearing on its own, independent of rule 2: rule 2's
+        unrestricted descent is worthless if the scan never starts from a
+        node large enough to contain the invoking Call in the first
+        place."""
+        def no_climb(node, parents):
+            if parents is None:
+                return False
+            statement = node                      # <-- the disabled rule
+            for candidate in ast.walk(statement):
+                if not isinstance(candidate, ast.Call):
+                    continue
+                for sub in ast.walk(candidate.func):
+                    if sub is node:
+                        return True
+            return False
+
+        self._patch_is_callee(no_climb)
+
+        for body in (
+            '''
+            def do_GET(self):
+                path = self.path
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return handlers.get(action, default_handler)(self)
+            ''',
+            '''
+            def do_GET(self):
+                path = self.path
+                m = re.match(r"^/api/([^/]+)$", path)
+                if m:
+                    action = m.group(1)
+                    return (handlers.get(action, default_handler),)[0].serve(self)
+            ''',
+        ):
+            found = {(r.method, r.template) for r in extract_routes(_module(body))}
+            self.assertEqual(found, {("GET", "/api/{}")},
+                             "mutation expected to WRONGLY exempt this shape")
+
+    def test_the_real_server_extracts_with_no_new_raises(self):
+        """The real server.py's own captured-only exemption sites (75, by
+        ``WaiverFingerprintTests``' pinned count) are each independently
+        confirmed, by direct instrumentation during this round's own
+        development (not re-asserted here as a runtime count -- there is
+        no production hook to count internal calls without changing
+        production code for a test), to never place the captured value in
+        a callee/receiver position -- ``_is_callee`` now returns False for
+        every one of them under the generic scan exactly as it did under
+        round 7's curated climb, so the broadened check finds no NEW
+        waiver-worthy site in the real file. Must still extract cleanly:
+        239 routes, 75 waivers (see WaiverFingerprintTests' own pinned
+        count and docstring for the exact accounting)."""
+        walker = extract_walker()
+        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(walker.unreachable, [])
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 75)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
