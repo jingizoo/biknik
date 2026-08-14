@@ -3478,6 +3478,40 @@ def _direct_operand_names(test, tracked: frozenset = frozenset({"path"})) -> set
                     found.update(_tracked_mentions(node.func, tracked))
                 node = node.func
             else:
+                # #202 repair round 5, finding 5: DEFAULT-DENY for every
+                # remaining expression shape, the SAME "fail closed on an
+                # unlisted call" pattern round 2 finding A already applies
+                # in `_propagates_taint` (see that function's own
+                # docstring), extended here to the general operand-
+                # resolution walk. Every branch above this one is an
+                # explicit, REVIEWED pass-through -- self.path, a walrus
+                # target, a bare Name, an Attribute/Subscript RECEIVER
+                # chain, a Call's callee/arguments -- each recognised
+                # because it is either the tracked name itself or a chain
+                # that plainly still carries it. Anything else -- a BinOp
+                # (string concatenation: `path + ""`), a JoinedStr
+                # (an f-string: `f"{path}"`), an IfExp reached as an
+                # OPERAND rather than the whole test (`(path if True else
+                # "")`), or any future node type this module has not been
+                # taught -- used to fall through here silently, returning
+                # None with NO further inspection. DEMONSTRATED (the
+                # reviewer's own three same-source forms): each of
+                # `if path + "" == "/api/hidden":`, `if f"{path}" ==
+                # "/api/hidden":`, and `if (path if True else "") ==
+                # "/api/hidden":` answered live HTTP 200 while extraction
+                # stayed silent -- the comparison operand was reached
+                # here, resolved to nothing, and the tracked name inside
+                # it was simply never looked at. Reuses `_tracked_mentions`
+                # (the SAME name-collecting function, SAME opaque-
+                # extraction boundary, the Call-argument branch above
+                # already relies on) rather than a new, parallel rule --
+                # so a genuinely detached value (a captured group nested
+                # inside an otherwise-unrecognised wrapper) still does not
+                # trip this, exactly as it would not for a Call argument.
+                # This only ADDS to `found`; an unrecognised node that
+                # truly mentions nothing tracked is silently, correctly
+                # ignored, same as before.
+                found.update(_tracked_mentions(node, tracked))
                 return None
 
     def visit_operand(node):

@@ -2854,5 +2854,161 @@ class SubscriptCalleeAndReturnDispatchTests(unittest.TestCase):
         self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 51)
 
 
+# --------------------------------------------------------------------------- #
+# #202 repair round 5, finding 5 (external review, 19:48): ordinary           #
+# expression wrappers still hide tracked path decisions. ``_direct_operand_   #
+# names``'s ``root_name`` recognises a small, explicit list of pass-through   #
+# shapes (self.path, a walrus target, a bare Name, an Attribute/Subscript     #
+# RECEIVER chain, a Call's callee/arguments) and silently returns ``None``    #
+# -- no inspection at all -- for anything else. The reviewer's own three      #
+# same-source forms (a string concatenation, an f-string, and a ternary       #
+# reached as a comparison OPERAND rather than the whole test) each answered   #
+# live HTTP 200 while extraction stayed silent: the gate is permissive for    #
+# ANY wrapper shape it has not been explicitly taught, not just these three.  #
+# --------------------------------------------------------------------------- #
+class DefaultDenyExpressionOperandTests(unittest.TestCase):
+    # -- pre-fix escapes, reproduced via git stash (not re-run here: git
+    # stash cannot be invoked from inside a test process) -- the transcript
+    # below is what running each of the three fixtures below produced
+    # against the code as it stood immediately before this finding's fix
+    # (round 5, finding 2's own commit), captured verbatim:
+    #
+    #   binop concatenation:  NO RAISE. routes = []
+    #   f-string:             NO RAISE. routes = []
+    #   ternary as operand:   NO RAISE. routes = []
+    #
+    # each now raises against the FIXED code, asserted below, which a test
+    # process can still verify for itself on every run. The control fixture
+    # (an opaque captured group nested inside an f-string operand) was
+    # UNAFFECTED before this fix and remains unaffected after it -- verified
+    # directly in test_an_opaque_capture_nested_in_an_unrecognised_wrapper_
+    # still_does_not_raise, not merely asserted in this comment.
+
+    def _raises(self, body, *substrings):
+        with self.assertRaises(ExtractionError) as caught:
+            extract_routes(_module(body))
+        msg = str(caught.exception)
+        for s in substrings:
+            self.assertIn(s, msg)
+
+    def test_string_concatenation_operand_raises(self):
+        """The reviewer's own first reproduction: ``path + ""`` is an
+        ``ast.BinOp``, a node type ``root_name`` never recognised at all --
+        not judged safe, simply never looked at."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if path + "" == "/api/hidden":
+                    return self._send(1)
+        ''', "unrecognised shape", "path")
+
+    def test_fstring_operand_raises(self):
+        """The reviewer's own second reproduction: ``f"{path}"`` is an
+        ``ast.JoinedStr``, likewise never recognised."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if f"{path}" == "/api/hidden":
+                    return self._send(1)
+        ''', "unrecognised shape", "path")
+
+    def test_ternary_as_comparison_operand_raises(self):
+        """The reviewer's own third reproduction: a ternary reached as a
+        COMPARISON OPERAND (``(path if True else "") == "..."``), distinct
+        from the ALREADY-modelled case of a ternary forming the WHOLE
+        test (that shape has its own, older, dedicated check and its own
+        message -- 'route_extract does not model ternaries' -- this is a
+        ternary buried one level deeper, inside another expression)."""
+        self._raises('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if (path if True else "") == "/api/hidden":
+                    return self._send(1)
+        ''', "unrecognised shape", "path")
+
+    def test_string_concatenation_escape_answers_over_real_http(self):
+        status, text = _real_http_probe('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if path + "" == "/api/hidden":
+                    return self._send(1)
+                return self._send_json({"error": "not_found"}, 404)
+        ''', "GET", "/api/hidden")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"n": 1})
+
+    def test_fstring_escape_answers_over_real_http(self):
+        status, text = _real_http_probe('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if f"{path}" == "/api/hidden":
+                    return self._send(1)
+                return self._send_json({"error": "not_found"}, 404)
+        ''', "GET", "/api/hidden")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"n": 1})
+
+    def test_ternary_as_operand_escape_answers_over_real_http(self):
+        status, text = _real_http_probe('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                if (path if True else "") == "/api/hidden":
+                    return self._send(1)
+                return self._send_json({"error": "not_found"}, 404)
+        ''', "GET", "/api/hidden")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(text), {"n": 1})
+
+    def test_an_opaque_capture_nested_in_an_unrecognised_wrapper_still_does_not_raise(self):
+        """The design principle this finding does NOT touch: a captured
+        group remains genuinely detached even when nested inside one of
+        the PREVIOUSLY-silent wrapper shapes this finding now inspects --
+        ``_tracked_mentions`` (the SAME name-collecting function, SAME
+        opaque-extraction boundary the Call-argument scan already relies
+        on) is reused here rather than a new, parallel rule, so
+        ``f"prefix-{oav.group(1)}"`` used as a comparison operand still
+        does not surface ``oav``."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                oav = re.match(r"^/officials/([^/]+)/availability$", path)
+                if oav:
+                    if f"prefix-{oav.group(1)}" == self._some_const():
+                        return self._send_status(403)
+                    return self._send(1)
+
+            def _some_const(self):
+                return "x"
+        '''))}
+        self.assertEqual(found, {("GET", "/officials/{}/availability")})
+
+    def test_an_unrelated_binop_not_touching_path_is_still_unaffected(self):
+        """A control: string concatenation of two names NEITHER of which
+        is tracked must not raise -- the default-deny only fires once
+        ``_tracked_mentions`` actually finds something, exactly as the
+        Call-argument scan's own existing behaviour already works."""
+        found = {(r.method, r.template) for r in extract_routes(_module('''
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                prefix = "x"
+                suffix = "y"
+                if prefix + suffix == "xy":
+                    return self._send(1)
+                if path == "/api/real":
+                    return self._send(2)
+        '''))}
+        self.assertEqual(found, {("GET", "/api/real")})
+
+    def test_the_real_server_extracts_with_no_new_raises(self):
+        """The real server.py contains no BinOp/JoinedStr/IfExp-as-operand
+        wrapper around any tracked name -- must still extract cleanly with
+        no new waivers needed: 239 routes, the SAME 51 waivers as finding
+        2 left it (see WaiverFingerprintTests' own pinned count)."""
+        walker = extract_walker()
+        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(walker.unreachable, [])
+        self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 51)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
