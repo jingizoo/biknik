@@ -655,6 +655,63 @@ def is_context_scoped_read(path: str) -> bool:
 # the honest per-process scope limit.
 CONTEXT_GATE = ContextSwitchGate()
 
+# A SECOND, INDEPENDENT instance of the SAME primitive, ordering scoped reads
+# against Season LIFECYCLE mutations (archive/reopen) instead of context
+# switches (#159 review finding 3 — the check->service TOCTOU).
+#
+# THE DEFECT. A scoped read's epoch check and its dependent service call
+# (`ApiService.get_venue_grant_candidates` etc.) are two SEPARATE reads of
+# persisted state. Between them, `archive_season`/`reopen_season` can commit:
+# the check observed the pre-archive epoch and matched, the service call then
+# observes the POST-archive Season and answers whatever the ceiling says for
+# an archived selection — a data/authorization decision made against a
+# DIFFERENT state than the one the epoch match just certified. Measured
+# directly: park `get_venue_grant_candidates` immediately after a matching
+# epoch is admitted, archive the selected Season from a second request, then
+# release the read — it returned 404 for the now-missing active Season
+# instead of the contract's 204/no-service-call discard, because nothing
+# stopped the archive from landing in that exact window.
+#
+# WHY A GATE, NOT A SHARED DATABASE TRANSACTION. The first cut of this fix
+# wrapped the epoch check and `produce()` in one `ContextService._snapshot`
+# so both observed one consistent commit. That is correct in isolation but
+# wrong in practice: it holds the STORE's own process-wide lock
+# (`SqlStore`/`InMemoryStore` `self._lock`, held for the WHOLE transaction —
+# see `SqlStore.transaction`'s docstring) across whatever the dependent
+# service call does, which is unbounded from this gate's point of view. That
+# deadlocked `test_context_switch_server_exit.py`'s existing harness, which
+# parks a read INSIDE a wrapped `ApiService` method (i.e. inside that
+# transaction) while the MAIN TEST THREAD reads the store directly — a
+# different thread blocking on the same lock the parked thread holds, with
+# no path to the release that would free it. It is also a live production
+# concern independent of any test: a slow dependent read would hold the
+# store's ONE lock for its full duration, stalling every OTHER request that
+# touches the store at all — not merely the one racing a lifecycle mutation.
+# A GATE avoids both: it holds nothing but its own lightweight condition
+# variable (see `services/context_gate.py`), so a held reader never blocks
+# unrelated store access, and ordering — not shared-transaction visibility —
+# is what prevents the interleaving from existing at all.
+#
+# WHY A SEPARATE INSTANCE, KEYED GLOBALLY RATHER THAN PER-USER LIKE
+# `CONTEXT_GATE`. A context switch is inherently per-user: only the switching
+# user's OWN scoped reads can be affected, so keying by user_id is what keeps
+# `CONTEXT_GATE` from coupling unrelated operators. A Season's lifecycle is
+# SHARED state — archiving it can affect every user who currently has that
+# Season effectively selected, not only the archiving operator — so keying
+# this gate by the archiver's own id would not order it against ANOTHER
+# user's in-flight scoped read at all. `_LIFECYCLE_GATE_KEY` is therefore one
+# constant every participant uses, making this gate's shared/exclusive split
+# GLOBAL rather than per-identity: every enrolled scoped read (shared) is
+# ordered against every archive/reopen (exclusive), full stop.
+#
+# LOCK ORDER: level 0, the SAME level as `CONTEXT_GATE` and for the identical
+# reason — see `services/context_gate.py`'s LOCK ORDER note. A scoped read
+# takes both gates before touching the store for this request; archive/reopen
+# take this gate alone, before their own `store.transaction()`. Neither gate
+# is ever acquired while a store lock is held.
+LIFECYCLE_GATE = ContextSwitchGate()
+_LIFECYCLE_GATE_KEY = "season-lifecycle"
+
 # THE OTHER HALF OF THE SAME PROBLEM (#159 follow-up to #415). The gate orders a
 # read that is ALREADY INSIDE the server against a switch. It cannot help a read
 # the client DISPATCHED before the switch but that reaches `do_GET` AFTER it:
@@ -1497,29 +1554,63 @@ class Handler(BaseHTTPRequestHandler):
         with ticket.bind(user_id) as held:
             yield held
 
+    @contextmanager
+    def _lifecycle_read_hold(self):
+        """Hold ``LIFECYCLE_GATE`` SHARED across a scoped read's epoch check
+        AND its dependent service call (#159 review finding 3), ordering it
+        against ``archive_season``/``reopen_season`` — see that gate's own
+        module-level comment for the full defect/fix argument.
+
+        UNLIKE ``_context_read_hold``, no early (PHASE A) arrival is needed.
+        The window this has to protect starts exactly where it is entered
+        (``_read_under_context_gate``, right before the epoch is derived):
+        before that point no epoch decision has been made yet for THIS
+        gate to protect, so an archive/reopen landing any earlier is simply
+        part of the state the not-yet-started check will correctly observe.
+        ``LIFECYCLE_GATE``'s key is a single constant (not a per-request
+        identity to resolve), so there is no "arrived but not yet
+        identified" window analogous to the one ``_context_read_ticket``
+        exists for.
+
+        Released before the caller writes its response, exactly as
+        ``_context_read_hold`` is.
+        """
+        ticket = LIFECYCLE_GATE.arrive()
+        with ticket.bind(_LIFECYCLE_GATE_KEY):
+            yield
+
     def _read_under_context_gate(self, user_id, role, scope, produce):
         """Run a scoped read's service call under PHASE B of the gate, unless
         the selection it was RENDERED UNDER is no longer the EFFECTIVE
         selection — in which case return ``DISCARDED_READ`` and never call the
         service at all (#159 follow-up to #415; role/scope-aware effective
-        resolution and the EPOCH_MISMATCH-guarded call added by #159 review
-        finding 2).
+        resolution added by #159 review finding 2).
 
-        THE TWO PLACEMENTS ARE THE WHOLE MECHANISM, and neither works without
-        the other:
+        THE PLACEMENTS ARE THE WHOLE MECHANISM, and none works without the
+        others:
 
-          * The comparison is made INSIDE the hold, i.e. AFTER ``bind`` has
-            waited out every switch that registered before this request
-            arrived. So the CURRENT epoch it derives is derived as of after
-            that switch committed — a read that arrives mid-quiesce cannot
-            look early, see the old epoch, match it, and then be judged by the
-            ceiling against the new tuple anyway.
-          * It is made BEFORE ``produce()``, so a discarded read never reaches
-            ``api/service.py`` and the exact-Season ceiling is never evaluated
-            for it. That is what lets the answer carry no data and disclose
-            nothing about the named Season in EITHER direction: a discard looks
-            the same whether the Season is a sibling of the selection, is
-            archived, or was never real.
+          * The comparison is made INSIDE ``_context_read_hold``, i.e. AFTER
+            ``bind`` has waited out every SWITCH that registered before this
+            request arrived. So the CURRENT epoch it derives is derived as of
+            after that switch committed — a read that arrives mid-quiesce
+            cannot look early, see the old epoch, match it, and then be
+            judged by the ceiling against the new tuple anyway.
+          * The comparison AND ``produce()`` both run INSIDE
+            ``_lifecycle_read_hold`` too (#159 review finding 3), so an
+            archive/reopen cannot commit BETWEEN "the epoch matched" and "the
+            service ran": ``LIFECYCLE_GATE`` orders this read's entire
+            protected window against every such mutation, so the two can
+            never straddle one — either the mutation is ordered wholly before
+            this read (and the epoch check itself already reflects it, so a
+            stale echo correctly mismatches) or wholly after it (and
+            ``produce()`` runs against exactly the state the epoch was just
+            proven current against). See ``LIFECYCLE_GATE``'s own comment for
+            why this is a GATE rather than a shared database transaction.
+          * The whole thing is BEFORE any data-bearing response is possible,
+            so a discarded read never reaches the exact-Season ceiling and the
+            answer discloses nothing about the named Season in EITHER
+            direction: a discard looks the same whether the Season is a
+            sibling of the selection, is archived, or was never real.
 
         A read the gate ordered AHEAD of the switch is untouched: it holds the
         gate, the switch waits for it, the row does not move underneath it, and
@@ -1529,17 +1620,14 @@ class Handler(BaseHTTPRequestHandler):
 
         A caller that echoes NOTHING gets exactly today's behaviour — the
         verdict is ``EPOCH_ABSENT`` and this reduces to the plain
-        ``_context_read_hold`` the four branches took before.
+        ``_context_read_hold`` the four branches took before (now also
+        ordered against lifecycle mutations, which changes no OBSERVABLE
+        behaviour for an absent header — there is still no epoch to compare).
 
-        The hold is released before the caller writes its response, exactly as
-        those branches did.
-
-        THE COMPARISON AND ``produce()`` ARE STILL TWO SEPARATE SNAPSHOTS
-        HERE — closing that window (a lifecycle mutation landing between them)
-        is #159 review finding 3's fix, ``ContextService.run_scoped_read``,
-        which replaces this two-step shape.
+        The holds are released before the caller writes its response, exactly
+        as ``_context_read_hold`` alone was before.
         """
-        with self._context_read_hold(user_id):
+        with self._context_read_hold(user_id), self._lifecycle_read_hold():
             current = STATE.api.context.current_epoch(user_id, role, scope)
             verdict = epoch_verdict(
                 self.headers.get(CONTEXT_EPOCH_HEADER), current)
@@ -4748,11 +4836,19 @@ class Handler(BaseHTTPRequestHandler):
             # blocker in a different costume.
             call = (api.archive_season if mar.group(2) == "archive"
                     else api.reopen_season)
-            return self._guarded_mutation(
-                [("season", mar.group(1))],
-                lambda: call(mar.group(1), reason=b.get("reason"),
-                             actor_id=actor_id),
-                actor_id, role, scope)
+            # EXCLUSIVE on LIFECYCLE_GATE (#159 review finding 3): orders this
+            # commit against every scoped read currently between its epoch
+            # check and its dependent service call — see that gate's own
+            # module-level comment. Wraps the whole guarded mutation (not
+            # narrowed to `call()` alone) so the authorization/lock/audit
+            # sequence `_guarded_mutation` runs is what the gate is held
+            # across, matching the CONTEXT_GATE writer side's own scope.
+            with LIFECYCLE_GATE.exclusive(_LIFECYCLE_GATE_KEY):
+                return self._guarded_mutation(
+                    [("season", mar.group(1))],
+                    lambda: call(mar.group(1), reason=b.get("reason"),
+                                 actor_id=actor_id),
+                    actor_id, role, scope)
         # Delete: /api/v2/setup/<entity>/<id>/delete — canonical names
         # (program-delete = umbrella, league-delete = the grouping League).
         md = re.match(

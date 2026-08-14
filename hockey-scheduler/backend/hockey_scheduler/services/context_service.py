@@ -561,6 +561,29 @@ class ContextService:
             user_id, role, scope)
         return _epoch_hash(user_id, generation, program, season, league)
 
+    # NOTE on #159 review finding 3 (the check->service TOCTOU): an earlier
+    # revision of this fix added a `run_scoped_read` here that wrapped the
+    # epoch comparison AND the dependent service call in one `_snapshot` —
+    # correct in isolation, but it holds the store's own lock
+    # (`SqlStore`/`InMemoryStore` `self._lock`, ACQUIRED FOR THE WHOLE
+    # TRANSACTION) across whatever `produce()` does, which is unbounded from
+    # this method's point of view. That deadlocked the EXISTING
+    # `test_context_switch_server_exit.py` harness, which parks a read
+    # INSIDE a wrapped ApiService method (i.e. inside that transaction) and
+    # then has the MAIN TEST THREAD read the store directly via `SqlStore.
+    # _get`'s OWN `with self._lock:` — a different thread blocking on a lock
+    # the parked thread holds while waiting on the harness to un-park it,
+    # which the blocked main thread can now never reach. It is also a live
+    # concern outside tests: a slow or blocked dependent read would hold the
+    # store's ONE process-wide lock for its full duration, stalling every
+    # OTHER request that touches the store at all, not only the one racing
+    # a lifecycle mutation. The fix that landed instead orders scoped reads
+    # against archive/reopen with a GATE (the same proven shape
+    # `web/server.py`'s `CONTEXT_GATE` already uses for the switch
+    # dimension) rather than a shared database transaction — see
+    # `web/server.py`'s `LIFECYCLE_GATE` and `Handler._read_under_context_
+    # gate`. This method stays store-transaction-free on purpose.
+
     # Every League-selection refusal uses this ONE message/reason, whatever the
     # underlying cause (#364 owner ruling): nonexistent, cross-Program,
     # unauthorized, deleted, archived-only, unbound, revoked, or ambiguous. The

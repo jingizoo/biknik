@@ -106,7 +106,7 @@ from hockey_scheduler.services.context_epoch import (
     context_epoch, epoch_secret, epoch_verdict, is_epoch_token)
 
 from test_context_switch_server_exit import (
-    PATIENCE, ContextGateFixtureBase, _Park, _wait)
+    COMMIT_WINDOW, PATIENCE, ContextGateFixtureBase, _Park, _wait)
 
 # The "arbitrarily large" delay between dispatch and arrival, in seconds. Small
 # by default only so the suite stays fast: the assertions this case makes do not
@@ -1820,6 +1820,250 @@ class ContextReadCancelHandoffCases(ContextReadEpochBase):
             f"{rounds} past the pre-churn value ({start_generation}) — a "
             f"concurrent write lost its increment, which can reuse an "
             f"epoch across a switch exactly as finding 5 describes")
+
+    # ======================================================================
+    # 11. THE CHECK->SERVICE TOCTOU (#159 review finding 3)
+    # ======================================================================
+    def test_an_archive_dispatched_while_a_read_is_parked_mid_service_waits_for_it(self):
+        """FINDING 3'S EXACT POC, reproduced and closed: park the read
+        INSIDE its own service call (the review's own methodology) — i.e.
+        strictly AFTER ``_read_under_context_gate``'s epoch check has
+        already matched and BEFORE the ceiling evaluates anything — then
+        archive the selected Season from a SECOND request while the read is
+        held there. Exercised over EVERY route in
+        ``CONTEXT_SCOPED_READ_ROUTES`` (a table, not a hand-picked one, for
+        the same reason ``test_every_registered_scoped_read_route_discards_
+        on_a_stale_epoch`` is).
+
+        BEFORE THE FIX: nothing ordered the archive against a read already
+        past its epoch check, so it committed immediately — the parked read
+        then resumed against a Season archived out from under an epoch match
+        it had already been granted, and the ceiling answered 404 (or the
+        generic empty-standings shape) for a request the discard mechanism
+        should have caught. That is precisely what the review measured.
+
+        AFTER THE FIX: the read's SHARED hold on ``LIFECYCLE_GATE``
+        registers when it enters ``_read_under_context_gate`` — before its
+        epoch check, so certainly before it can be parked inside the
+        service call that follows a MATCHING one. The archive's EXCLUSIVE
+        hold therefore waits behind it. This is measured directly, not
+        inferred from the eventual answer: while the read remains parked,
+        the Season's live status is polled and asserted still ACTIVE — the
+        archive has not committed. Only once the park is released does the
+        read complete (entirely against pre-archive state, so it is
+        answered exactly as the pre-archive baseline was) and THEN does the
+        archive's own request return.
+        """
+        probe = self._program_with_two_seasons("ToctouLabels")
+        labels = [c["label"] for c in self._all_scoped_route_cases(probe)]
+        for i, label in enumerate(labels):
+            with self.subTest(route=label):
+                fx = self._program_with_two_seasons(f"Toctou{i}")
+                case = next(c for c in self._all_scoped_route_cases(fx)
+                           if c["label"] == label)
+                username, user_id = self._operator(f"toctou{i}")
+                client = self._login(username)
+                self._select(client, fx["program_id"], fx["s1"])
+                epoch = self._epoch_from_api(client)
+                baseline, base_raw, _ = self._req(
+                    client, "GET", case["path"],
+                    headers={CONTEXT_EPOCH_HEADER: epoch})
+                self.assertNotEqual(
+                    baseline, 204, f"{label}: the fixture route itself "
+                    f"discards with no race involved at all: {base_raw}")
+
+                out = {}
+
+                def do_read():
+                    out["result"] = self._req(
+                        client, "GET", case["path"],
+                        headers={CONTEXT_EPOCH_HEADER: epoch})
+
+                with self._read_parked_in(case["service"], case["watch"]) as (
+                        park, _exited):
+                    rt = threading.Thread(target=do_read, daemon=True)
+                    rt.start()
+                    self.assertTrue(
+                        park.arrived.wait(PATIENCE),
+                        f"{label}: the read never reached its service call")
+
+                    archive_out = {}
+
+                    def do_archive():
+                        archive_out["result"] = self._req(
+                            client, "POST",
+                            f"/api/v2/setup/seasons/{fx['s1']}/archive", {})
+
+                    at = threading.Thread(target=do_archive, daemon=True)
+                    at.start()
+
+                    # THE MEASUREMENT: while the read remains parked between
+                    # its epoch match and its service call, the archive must
+                    # NOT have committed — it is BLOCKED behind the read's
+                    # LIFECYCLE_GATE hold, not racing ahead of it.
+                    time.sleep(COMMIT_WINDOW)
+                    mid_season = self.api.store.get_season(fx["s1"])
+                    self.assertEqual(
+                        mid_season.status, SeasonStatus.ACTIVE,
+                        f"{label}: the archive committed WHILE the read was "
+                        f"still parked between its epoch match and its "
+                        f"service call — LIFECYCLE_GATE did not order it, "
+                        f"and finding 3's TOCTOU is still open")
+
+                    park.let_go()
+                    rt.join(PATIENCE)
+                    at.join(PATIENCE)
+
+                self.assertIn("result", out,
+                             f"{label}: the parked read never returned")
+                status, raw, _ = out["result"]
+                self.assertEqual(
+                    status, baseline,
+                    f"{label}: a read parked ENTIRELY pre-archive must be "
+                    f"answered exactly as the pre-archive baseline was: "
+                    f"{raw!r}")
+
+                self.assertIn("result", archive_out,
+                             f"{label}: the archive request never returned "
+                             f"— it may still be blocked")
+                arc_status, arc_raw, _ = archive_out["result"]
+                self.assertEqual(
+                    arc_status, 200,
+                    f"{label}: the archive, unblocked after the read "
+                    f"finished, must still succeed: {arc_raw}")
+                final_season = self.api.store.get_season(fx["s1"])
+                self.assertEqual(
+                    final_season.status, SeasonStatus.ARCHIVED,
+                    f"{label}: the archive never actually took effect once "
+                    f"unblocked")
+                self._assert_gate_is_clean(
+                    f"after the {label} check->service TOCTOU sweep")
+
+    @contextmanager
+    def _lifecycle_exclusive_parked(self):
+        """Park INSIDE ``LIFECYCLE_GATE.exclusive``'s body — i.e. AFTER the
+        wait for prior participants has already been satisfied and the
+        EXCLUSIVE hold is genuinely GRANTED, but BEFORE the caller's own
+        code (the archive/reopen route, which opens the real store
+        transaction) runs.
+
+        Deliberately NOT a park inside ``archive_season`` itself
+        (``_read_parked_in`` would reach it too, since its first positional
+        argument is a Season id like every other wrapped method here): that
+        method runs INSIDE the guarded mutation's own store transaction, so
+        parking there holds the STORE's lock (``SqlStore``/``InMemoryStore``
+        ``self._lock``) for the pause — which starves an unrelated read's
+        own session/role resolution before it can even reach
+        ``_read_under_context_gate`` to register with ``LIFECYCLE_GATE`` at
+        all, on the SQL-backed stores. That is the identical shape of
+        problem the module comment on ``LIFECYCLE_GATE`` documents this
+        finding's fix AVOIDING; a test seam must not reintroduce it.
+        Parking here instead holds only the gate's own lightweight condition
+        variable — never the store — so an unrelated read can complete its
+        own store access freely and reach the point where it genuinely
+        contends on ``LIFECYCLE_GATE``, which is the fact this case needs to
+        observe.
+        """
+        gate = self.srv.LIFECYCLE_GATE
+        original = gate.exclusive
+        park = _Park()
+
+        @contextmanager
+        def wrapped(key):
+            with original(key) as ticket:
+                park.hold()
+                yield ticket
+
+        gate.exclusive = wrapped
+        try:
+            yield park
+        finally:
+            gate.exclusive = original
+            park.let_go()
+
+    def test_an_archive_parked_mid_commit_makes_a_later_read_see_only_its_result(self):
+        """THE OTHER COMMIT ORDER (#159 review finding 3's "both commit
+        orders" requirement): the archive's EXCLUSIVE hold on
+        ``LIFECYCLE_GATE`` registers BEFORE a read that is dispatched while
+        the archive is still in flight. The read's SHARED hold must wait
+        behind it, so the read's OWN EPOCH CHECK — not merely its service
+        call — is what observes the post-archive state: the read is
+        echoing the PRE-archive epoch it was rendered under, and by the
+        time its (delayed) check runs that epoch has moved, so the correct
+        answer is the SAME 204 discard any other stale echo produces —
+        never a 200 admitted into a ceiling that has moved out from under
+        it, and never a straddled mix of pre/post state.
+
+        Driven on ``venue-candidates``, the review's own route; every route
+        already shares the one ordering primitive under test
+        (``LIFECYCLE_GATE``), so this is not a per-route property the way
+        the epoch MATERIAL itself is — that half is covered by
+        ``test_an_archive_dispatched_while_a_read_is_parked_mid_service_
+        waits_for_it`` across every registered route.
+        """
+        fx = self._program_with_two_seasons("ToctouOtherOrder")
+        username, user_id = self._operator("toctouorder")
+        client = self._login(username)
+        self._select(client, fx["program_id"], fx["s1"])
+        epoch = self._epoch_from_api(client)
+
+        archive_out = {}
+
+        def do_archive():
+            archive_out["result"] = self._req(
+                client, "POST",
+                f"/api/v2/setup/seasons/{fx['s1']}/archive", {})
+
+        read_out = {}
+        with self._lifecycle_exclusive_parked() as park:
+            at = threading.Thread(target=do_archive, daemon=True)
+            at.start()
+            self.assertTrue(park.arrived.wait(PATIENCE),
+                            "the archive's exclusive hold was never granted")
+
+            service = self._watch_service("get_venue_grant_candidates")
+
+            def do_read():
+                read_out["result"] = self._scoped_read(
+                    client, fx["s1"], "venue-candidates", epoch)
+
+            rt = threading.Thread(target=do_read, daemon=True)
+            rt.start()
+            # The read's SHARED hold must be seen to be WAITING (never
+            # admitted) while the archiver's EXCLUSIVE hold — registered
+            # first — is still held. Measured via the gate's own stats
+            # rather than inferred from timing.
+            self.assertTrue(
+                _wait(lambda:
+                     self.srv.LIFECYCLE_GATE.stats()["waiting_readers"] >= 1,
+                     PATIENCE),
+                "the read never showed up as waiting behind the parked "
+                "archive's exclusive hold")
+            self.assertNotIn("result", read_out,
+                            "the read was admitted WHILE the archive still "
+                            "held the exclusive lock — the two orders "
+                            "interleaved")
+
+            park.let_go()
+            at.join(PATIENCE)
+            rt.join(PATIENCE)
+
+        self.assertIn("result", archive_out, "the archive never returned")
+        self.assertEqual(archive_out["result"][0], 200, archive_out["result"][1])
+        self.assertIn("result", read_out, "the read never returned")
+        status, raw, _ = read_out["result"]
+        self.assertEqual(
+            status, 204,
+            f"a read whose SHARED hold waited behind the archiver's "
+            f"EXCLUSIVE one must have its (now-delayed) epoch check observe "
+            f"the moved epoch and discard — never be admitted to a ceiling "
+            f"straddling two states: {raw!r}")
+        self.assertEqual(raw, "", "a discard must carry no body")
+        self.assertEqual(
+            service, [],
+            "the discarded read reached ApiService — the ceiling WAS "
+            "evaluated for it")
+        self._assert_gate_is_clean("after the archive-parked-first sweep")
 
 
 class MemoryContextReadEpochTest(ContextReadCancelHandoffCases, unittest.TestCase):
