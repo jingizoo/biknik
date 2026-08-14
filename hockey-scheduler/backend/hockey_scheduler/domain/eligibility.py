@@ -69,8 +69,20 @@ def normalize_age_tiers(tiers) -> Tuple[Optional[List[dict]], Optional[str]]:
 
     Codes are trimmed + upper-cased and must be unique, non-blank, and at most
     :data:`MAX_TIER_CODE_LENGTH` chars. ``max_age`` is an int in
-    [:data:`MIN_TIER_AGE`, :data:`MAX_TIER_AGE`] or None (open tier). Order is
-    preserved — it is the operator's display order, not a semantic ranking.
+    [:data:`MIN_TIER_AGE`, :data:`MAX_TIER_AGE`] or an EXPLICIT ``None`` (an
+    intentional open tier — Senior, no upper bound). Order is preserved — it
+    is the operator's display order, not a semantic ranking.
+
+    #273 review round 3 finding 2: the ``max_age`` KEY must be present on
+    every tier. ``{"code": "U10"}`` (the key entirely omitted) is
+    ``tier_max_age_missing``, a DIFFERENT, harder error than
+    ``{"code": "U10", "max_age": None}`` (the key present, explicitly null) —
+    the latter is accepted exactly as before and is the only way to declare
+    an open tier. Missing data must never silently weaken an age policy: a
+    caller who reads ``tier.get("max_age")`` cannot tell "the operator typed
+    null on purpose" apart from "the max_age column/key was never supplied
+    at all" — those two inputs must not collapse into the same accepted
+    open-tier outcome, since an omitted bound was never operator intent.
     """
     if not isinstance(tiers, (list, tuple)) or not tiers:
         return None, "tiers_empty"
@@ -91,7 +103,9 @@ def normalize_age_tiers(tiers) -> Tuple[Optional[List[dict]], Optional[str]]:
         if code in seen:
             return None, "tier_code_duplicate"
         seen.add(code)
-        max_age = tier.get("max_age")
+        if "max_age" not in tier:
+            return None, "tier_max_age_missing"
+        max_age = tier["max_age"]
         if max_age is not None:
             if isinstance(max_age, bool) or not isinstance(max_age, int):
                 return None, "tier_max_age_invalid"
