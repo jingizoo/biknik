@@ -42,9 +42,12 @@ from ..domain import (
     RescheduleStatus,
     Organization,
     PolicyScopeType,
+    MembershipStatus,
     Rink,
     SchedulingPolicy,
     Season,
+    SeasonRosterMembership,
+    SeasonRosterMembershipEvent,
     SeasonStatus,
     SeasonTeamRegistration,
     SeasonVenueAccess,
@@ -2384,6 +2387,321 @@ class SetupService:
                     access_id, actor_id, detail)
         return {"id": access_id, **detail,
                 "season_name": season.name, "venue_name": venue.name}
+
+    # -- season roster memberships (#205 Slice A) ---------------------------
+    #
+    # An athlete's participation stint for one Team in one Season, on the
+    # permanent Team + LeagueSeason spine. This slice ships the bounded
+    # lifecycle only — create, status change, season-scoped attribute edit —
+    # each appending a SeasonRosterMembershipEvent (the per-membership
+    # immutable history) plus the global SetupAuditLog entry. The
+    # transfer/release/deadline-policy workflows and the consumer cutover
+    # (roster/substitute eligibility resolving through memberships) are
+    # follow-up #205 slices and deliberately absent here.
+
+    def _membership_event(self, membership_id: str, action: str,
+                          actor_id: Optional[str], reason: Optional[str],
+                          detail: Optional[dict] = None
+                          ) -> SeasonRosterMembershipEvent:
+        """Append one immutable history event for a membership. Called by
+        every membership mutation in this service — never skipped, so the
+        per-membership history and the audit trail can only move together."""
+        return self.store.add_season_roster_membership_event(
+            SeasonRosterMembershipEvent(
+                id=self.store.next_id("srme"),
+                membership_id=membership_id,
+                action=action,
+                at=self.clock(),
+                actor_id=actor_id,
+                reason=reason,
+                detail=detail or {},
+            ))
+
+    def _validate_membership_status(self, status) -> MembershipStatus:
+        """Type-safe status gate: a real MembershipStatus or its exact string
+        value; anything else is a field-level validation error, never a
+        TypeError/500."""
+        if isinstance(status, MembershipStatus):
+            return status
+        try:
+            return MembershipStatus(status)
+        except (ValueError, TypeError):
+            raise ValidationError(
+                "status must be one of "
+                + ", ".join(s.value for s in MembershipStatus) + ".",
+                {"reason": "invalid_membership_status", "field": "status"})
+
+    def _assert_membership_jersey_available(
+            self, league_season_id: str, team_id: str, jersey_number,
+            *, exclude_membership_id: Optional[str] = None) -> None:
+        """Reject a jersey held by another ACTIVE membership of the same
+        (LeagueSeason, Team) — #269's integrity at its season-Team scope.
+
+        Mirrors :meth:`_assert_jersey_available` exactly: only an active
+        membership reserves a number, only concrete numbers are constrained,
+        and the raise is the SAME stable ``IntegrityConflictError`` migration
+        052's ``ux_srm_active_team_jersey`` partial unique index produces on
+        a lost cross-process race. Callers run this BEFORE mutating."""
+        if jersey_number is None:
+            return
+        for other in self.store.memberships_for_league_season_team(
+                league_season_id, team_id):
+            if (other.status is MembershipStatus.ACTIVE
+                    and other.jersey_number == jersey_number
+                    and other.id != exclude_membership_id):
+                raise IntegrityConflictError(
+                    f"Jersey number {jersey_number} is already worn by an "
+                    f"active membership on this team this season.",
+                    {"reason": "duplicate_membership_jersey_number",
+                     "league_season_id": league_season_id,
+                     "team_id": team_id, "jersey_number": jersey_number,
+                     "conflicting_membership_id": other.id})
+
+    def _assert_no_active_membership_conflict(
+            self, player_id: str, season_id: str,
+            *, exclude_membership_id: Optional[str] = None) -> None:
+        """One AUTHORITATIVE active membership per (player, Season) — the
+        epic's core uniqueness rule. Affiliate/call-up rows are outside it by
+        status. The database index (052) decides cross-process races; this
+        pre-check turns the ordinary case into a named, actionable error."""
+        conflicts = [m.id for m in
+                     self.store.active_memberships_for_player_in_season(
+                         player_id, season_id)
+                     if m.id != exclude_membership_id]
+        if conflicts:
+            raise ValidationError(
+                "Player already has an active membership this season; "
+                "release/transfer it (or use affiliate status) first.",
+                {"reason": "membership_active_conflict",
+                 "player_id": player_id, "season_id": season_id,
+                 "affected_membership_ids": conflicts})
+
+    @_transactional
+    def create_season_roster_membership(
+            self, player_id: str, league_season_id: str, team_id: str,
+            status=MembershipStatus.ACTIVE, position=None,
+            jersey_number=_UNSET, shoots=_UNSET,
+            reason: Optional[str] = None,
+            actor_id: Optional[str] = None) -> SeasonRosterMembership:
+        """Open a membership stint for a player on a Team's LeagueSeason
+        (#205 Slice A).
+
+        Spine rules, mirroring register_team_for_season: the Team is
+        row-locked FIRST (canonical Team → League → Season lock order, so a
+        concurrent League transfer can't strand the membership on a foreign
+        LeagueSeason), the Team must belong to the LeagueSeason's League
+        (rule 7 analog), hold an ACTIVE SeasonTeamRegistration there, and the
+        Season must not be archived. The player is NOT required to have
+        ``player.team_id == team_id`` — that permanent coupling is exactly
+        what memberships replace; legacy consumers keep reading the untouched
+        Player fields until the cutover slice.
+
+        ``position``/``jersey_number``/``shoots`` default to the player's
+        current permanent values (the same copy the 052 backfill performs);
+        pass explicit values — including ``None`` for jersey/shoots — to
+        override. A terminal status can't be born (``released``/
+        ``transferred`` rows exist only as ended stints), and an ``active``
+        create enforces the one-active-per-(player, Season) rule.
+        """
+        for field_name, value in (("player_id", player_id),
+                                  ("league_season_id", league_season_id),
+                                  ("team_id", team_id)):
+            if not value or not isinstance(value, str):
+                raise ValidationError(
+                    f"{field_name} is required.",
+                    {"reason": "field_required", "field": field_name})
+        team = self.store.get_team_for_update(team_id)
+        if team is None:
+            raise NotFoundError(f"Team {team_id} not found.")
+        ls = self.store.get_league_season(league_season_id)
+        if ls is None:
+            raise NotFoundError(f"League season {league_season_id} not found.")
+        season = self._require_active_season(ls.season_id)  # #159 guard
+        player = self.store.get_player(player_id)
+        if player is None:
+            raise NotFoundError(f"Player {player_id} not found.")
+        if team.league_id and ls.league_id != team.league_id:
+            raise ValidationError(
+                "A membership must sit on the Team's own League's season.",
+                {"reason": "membership_league_mismatch", "team_id": team_id,
+                 "team_league_id": team.league_id,
+                 "league_season_league_id": ls.league_id})
+        registration = self.store.registration_for_team_in_league_season(
+            league_season_id, team_id)
+        if registration is None or not registration.active:
+            raise ValidationError(
+                "Team is not actively registered in this season.",
+                {"reason": "team_not_registered", "team_id": team_id,
+                 "league_season_id": league_season_id})
+        status = self._validate_membership_status(status)
+        if status.is_terminal:
+            raise ValidationError(
+                "A membership cannot be created in a terminal status.",
+                {"reason": "membership_status_terminal_create",
+                 "status": status.value})
+        canonical_position = self._validate_position(
+            position if position is not None else player.position)
+        jersey = (player.jersey_number if jersey_number is _UNSET
+                  else jersey_number)
+        self._validate_jersey_number(jersey)
+        canonical_shoots = self._validate_shoots(
+            player.shoots if shoots is _UNSET else shoots)
+        # Uniqueness pre-checks (the 052 partial unique indexes decide any
+        # cross-process race the same way, via IntegrityConflictError).
+        open_rows = self.store.open_memberships_for_player_in_league_season(
+            player_id, league_season_id)
+        if open_rows:
+            raise ValidationError(
+                "Player already has an open membership on this league "
+                "season; update or end it instead of creating another.",
+                {"reason": "membership_open_conflict",
+                 "affected_membership_ids": [m.id for m in open_rows]})
+        if status is MembershipStatus.ACTIVE:
+            self._assert_no_active_membership_conflict(player_id, season.id)
+            self._assert_membership_jersey_available(
+                league_season_id, team_id, jersey)
+        membership = SeasonRosterMembership(
+            id=self.store.next_id("srm"),
+            player_id=player_id,
+            league_season_id=league_season_id,
+            season_id=season.id,
+            team_id=team_id,
+            status=status,
+            position=canonical_position,
+            jersey_number=jersey,
+            shoots=canonical_shoots,
+            effective_from=self.clock(),
+            effective_to=None,
+        )
+        self.store.add_season_roster_membership(membership)
+        self._membership_event(
+            membership.id, "created", actor_id, reason,
+            {"player_id": player_id, "league_season_id": league_season_id,
+             "season_id": season.id, "team_id": team_id,
+             "status": status.value, "position": canonical_position.value,
+             "jersey_number": jersey, "shoots": canonical_shoots})
+        self._audit("season_roster_membership_created",
+                    "season_roster_membership", membership.id, actor_id,
+                    {"player_id": player_id, "team_id": team_id,
+                     "league_season_id": league_season_id,
+                     "season_id": season.id, "status": status.value})
+        return membership
+
+    @_transactional
+    def set_season_roster_membership_status(
+            self, membership_id: str, status,
+            reason: Optional[str] = None,
+            actor_id: Optional[str] = None) -> SeasonRosterMembership:
+        """Move a membership stint through its lifecycle (#205 Slice A).
+
+        A terminal row (released/transferred) is immutable history: it can
+        never transition again — the future #205 correction workflow, with
+        privileged authorization + reason + audit, is the only thing that
+        will ever revisit one, and a NEW stint is a new row. Entering
+        ``active`` re-asserts both uniqueness rules (authoritative-per-
+        (player, Season) and the season-Team jersey). Entering a terminal
+        status stamps ``effective_to``. A no-op transition is rejected, not
+        silently absorbed, so the event history never lies about a change
+        that didn't happen."""
+        membership = self.store.get_season_roster_membership_for_update(
+            membership_id)
+        if membership is None:
+            raise NotFoundError(f"Membership {membership_id} not found.")
+        self._require_active_season(membership.season_id)  # #159 guard
+        status = self._validate_membership_status(status)
+        if membership.status.is_terminal:
+            raise ValidationError(
+                "This membership has ended; its row is immutable history. "
+                "Create a new membership for a new stint.",
+                {"reason": "membership_terminal",
+                 "membership_id": membership.id,
+                 "status": membership.status.value})
+        if status is membership.status:
+            raise ValidationError(
+                f"Membership is already {status.value}.",
+                {"reason": "membership_status_unchanged",
+                 "status": status.value})
+        if status is MembershipStatus.ACTIVE:
+            self._assert_no_active_membership_conflict(
+                membership.player_id, membership.season_id,
+                exclude_membership_id=membership.id)
+            self._assert_membership_jersey_available(
+                membership.league_season_id, membership.team_id,
+                membership.jersey_number,
+                exclude_membership_id=membership.id)
+        previous = membership.status
+        membership.status = status
+        if status.is_terminal:
+            membership.effective_to = self.clock()
+        self.store.save_season_roster_membership(membership)
+        self._membership_event(
+            membership.id, "status_changed", actor_id, reason,
+            {"from": previous.value, "to": status.value})
+        self._audit("season_roster_membership_status_changed",
+                    "season_roster_membership", membership.id, actor_id,
+                    {"from": previous.value, "to": status.value})
+        return membership
+
+    @_transactional
+    def update_season_roster_membership(
+            self, membership_id: str, *, position=_UNSET,
+            jersey_number=_UNSET, shoots=_UNSET,
+            reason: Optional[str] = None,
+            actor_id: Optional[str] = None) -> SeasonRosterMembership:
+        """Correct a membership's SEASON-SCOPED attributes in place (#205
+        Slice A) — id, spine, status and history unchanged.
+
+        Partial and audited exactly like ``update_player``: a field left
+        ``_UNSET`` is untouched; explicit ``None`` clears a nullable one
+        (jersey/shoots; position is always concrete). Values reuse the shared
+        validation (jersey range, membership-scoped active uniqueness,
+        position/shoots gates). A genuine no-op writes nothing and appends
+        no event, so the history never lies. Terminal rows are immutable."""
+        membership = self.store.get_season_roster_membership_for_update(
+            membership_id)
+        if membership is None:
+            raise NotFoundError(f"Membership {membership_id} not found.")
+        self._require_active_season(membership.season_id)  # #159 guard
+        if membership.status.is_terminal:
+            raise ValidationError(
+                "This membership has ended; its row is immutable history.",
+                {"reason": "membership_terminal",
+                 "membership_id": membership.id,
+                 "status": membership.status.value})
+        changed = {}
+        if position is not _UNSET:
+            new_position = self._validate_position(position)
+            if new_position is not membership.position:
+                changed["position"] = {
+                    "from": membership.position.value
+                    if membership.position else None,
+                    "to": new_position.value}
+                membership.position = new_position
+        if jersey_number is not _UNSET:
+            self._validate_jersey_number(jersey_number)
+            if jersey_number != membership.jersey_number:
+                if membership.status is MembershipStatus.ACTIVE:
+                    self._assert_membership_jersey_available(
+                        membership.league_season_id, membership.team_id,
+                        jersey_number, exclude_membership_id=membership.id)
+                changed["jersey_number"] = {
+                    "from": membership.jersey_number, "to": jersey_number}
+                membership.jersey_number = jersey_number
+        if shoots is not _UNSET:
+            new_shoots = self._validate_shoots(shoots)
+            if new_shoots != membership.shoots:
+                changed["shoots"] = {
+                    "from": membership.shoots, "to": new_shoots}
+                membership.shoots = new_shoots
+        if not changed:
+            return membership
+        self.store.save_season_roster_membership(membership)
+        self._membership_event(
+            membership.id, "attributes_changed", actor_id, reason, changed)
+        self._audit("season_roster_membership_updated",
+                    "season_roster_membership", membership.id, actor_id,
+                    {"changed_fields": sorted(changed)})
+        return membership
 
     @_transactional
     def roll_forward_registrations(self, from_season_id: str, to_season_id: str,
