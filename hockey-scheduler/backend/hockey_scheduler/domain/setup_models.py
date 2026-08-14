@@ -13,6 +13,7 @@ from .enums import (
     DeliveryStatus,
     IceSlotStatus,
     IceSlotType,
+    MembershipStatus,
     NotificationAudience,
     NotificationChannel,
     NotificationKind,
@@ -20,6 +21,7 @@ from .enums import (
     OfficialAvailabilityStatus,
     OfficialRole,
     PolicyScopeType,
+    Position,
     RescheduleStatus,
     ResultStatus,
     SeasonStatus,
@@ -298,6 +300,77 @@ class SeasonVenueAccess:
     season_id: str
     venue_id: str
     active: bool = True
+
+
+@dataclass
+class SeasonRosterMembership:
+    """One athlete's participation stint for one Team in one Season (#205
+    Slice A).
+
+    Hangs off the permanent Team + LeagueSeason spine: ``league_season_id``
+    names the Team's own League's participation in the Season (never a
+    re-created League), and ``team_id`` must be a Team of that League with an
+    active :class:`SeasonTeamRegistration` there — both enforced in the
+    service layer, mirroring registration rule 7. ``season_id`` is carried
+    denormalized (service-enforced equal to the LeagueSeason's ``season_id``)
+    so the ONE database-expressible uniqueness rule — at most one
+    ``active`` membership per (player, Season), migration 052's partial
+    unique index — needs no join. ``affiliate`` rows are the governed call-up
+    exception and sit outside that rule.
+
+    ``player_id`` keys the membership to the existing Player identity: #205's
+    durable-athlete substrate arrives with #273, which preserves Player ids,
+    so this column is the forward-compatible identity key today and the
+    compatibility map's join column for backfilled rows (``srm_legacy_*``
+    ids, migration 052).
+
+    ``position`` / ``jersey_number`` / ``shoots`` are SEASON-SCOPED (#269
+    becomes (LeagueSeason, Team)-scoped for memberships): they describe this
+    stint, not the permanent Player row, which keeps its own fields until the
+    consumer cutover retires them. ``effective_from``/``effective_to`` bound
+    the stint; a backfilled row has ``effective_from`` NULL — first-class
+    "predates membership tracking", never a fabricated date. A row whose
+    status ``is_terminal`` (released/transferred) is immutable history; a
+    later stint for the same player is a NEW row, so rows accumulate as the
+    transfer/release history the epic requires. Fine-grained changes append
+    :class:`SeasonRosterMembershipEvent` rows via the service layer.
+    """
+    id: str
+    player_id: str
+    league_season_id: str
+    season_id: str
+    team_id: str
+    status: MembershipStatus = MembershipStatus.ACTIVE
+    position: Optional[Position] = None
+    jersey_number: Optional[int] = None
+    shoots: Optional[str] = None
+    effective_from: Optional[datetime] = None
+    effective_to: Optional[datetime] = None
+
+
+@dataclass
+class SeasonRosterMembershipEvent:
+    """Append-only history entry for one :class:`SeasonRosterMembership`
+    (#205 Slice A) — the immutable record of Team/jersey/position/status
+    changes the epic requires, kept per-membership (queryable by workflow
+    slices) alongside the global ``SetupAuditLog`` trail.
+
+    Append-only BY CONSTRUCTION: no store exposes an update or delete for
+    these rows, and the service layer writes one on every membership
+    mutation it performs. ``detail`` carries the machine-readable
+    field-by-field before/after values; ``reason`` is the operator-supplied
+    justification (required by the future transfer/release workflows, opt-in
+    here). Backfilled memberships (migration 052) start with an EMPTY
+    history rather than a fabricated "created" event, because the migration
+    has no honest timestamp or actor for one.
+    """
+    id: str
+    membership_id: str
+    action: str
+    at: datetime
+    actor_id: Optional[str] = None
+    reason: Optional[str] = None
+    detail: dict = field(default_factory=dict)
 
 
 @dataclass
