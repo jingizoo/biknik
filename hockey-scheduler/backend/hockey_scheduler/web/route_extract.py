@@ -2734,24 +2734,46 @@ _AUDIT_WAIVERS = {
         "own guardian-link waivers, above `deleter`/`mapper`) -- NOT a "
         "routing decision, the route was already decided by `md`'s own "
         "entity alternation",
-    # REMOVED (#202 repair round 5, finding 2b): this dict used to carry
-    # its own waiver here for ("_handle_setup", "_to_v1.get(kind, lambda
-    # r: r)", "assign_rhs", "md") -- selecting the v1 wire-shape RESPONSE
-    # mapper for the delete route's already-decided entity `kind` (#202
-    # repair round 2, finding A's own original reasoning: every kind in
-    # `md`'s pattern already yields the SAME `/api/setup/<entity>/{}/
-    # delete` leaf, so this only reshapes the response body). Finding 2b's
-    # new `captured` exemption in `_propagates_taint` (see that function's
-    # own docstring) now handles this shape GENERALLY: `_to_v1.get(...)`
-    # is a NON-`self.` call whose only tracked mention (`kind`) is an
-    # already-captured id, so it is exempt the same way `_is_known_
-    # capture_extraction`'s inline form always was, without needing its
-    # own per-call-site waiver. DEMONSTRATED dormant (0 hits,
-    # WaiverFingerprintTests' own real-server exact-one-hit check) once
-    # this finding's fix landed -- removed per this module's own
-    # discipline ("a dormant waiver matches nothing and must be removed:
-    # proof nothing depends on it") rather than left as a stale entry a
-    # future reader would have no way to tell apart from a live one.
+    # RESTORED (#202 repair round 9, finding 1 -- external review): removed
+    # at round 5 finding 2b (see the git history for that round's own
+    # "REMOVED" comment, superseded by this one) once the general
+    # `captured` exemption in `_propagates_taint` started covering this
+    # shape without a per-call-site waiver -- round 9 narrows that general
+    # exemption to a small, explicit allowlist of call TARGETS
+    # (`_captured_arg_safe_callee`: currently just the `api` facade) that
+    # does not include `_to_v1` (a LOCAL dict of v1 response-shape mappers,
+    # built two lines above this call, not the API facade), so this call
+    # site needs its own reviewed waiver again, live once more (see
+    # WaiverFingerprintTests' own pinned count).
+    ("_handle_setup", "_to_v1.get(kind, lambda r: r)", "assign_rhs", "md"):
+        "#202 repair round 2, finding A's own original reasoning, restored "
+        "round 9: selects the v1 wire-shape RESPONSE mapper for the "
+        "delete route's already-decided entity `kind` -- every kind in "
+        "`md`'s pattern already yields the SAME `/api/setup/<entity>/{}/"
+        "delete` leaf, so this only reshapes the response body, it does "
+        "not choose a route. `_to_v1` is a plain module-shape dict built "
+        "from `_v1.*_to_v1` mapper functions two lines above this call, "
+        "never invoked with anything other than the already-serialized "
+        "deleted record (see the `mapper(deleter(...))` waiver just below "
+        "`_handle_reassign_v2`'s own entries) -- not a hidden dispatcher.",
+    # NEW (#202 repair round 9, finding 1 -- external review): round 9's
+    # `_captured_arg_safe_callee` allowlist covers only a call/subscript
+    # rooted at `api` (or a dict literal of such) -- `kind.capitalize()`
+    # is neither: the captured value `kind` is the call's own RECEIVER,
+    # not an argument selecting some OTHER callable, so no dispatch table
+    # is involved at all, but it also does not fit the allowlist shape,
+    # so it needs its own explicit waiver rather than silently widening
+    # that allowlist for a single-site pattern.
+    ("_handle_setup", "kind.capitalize()", "formattedvalue", "mmv"):
+        "reshapes the captured v2-moved entity name for a 409 error "
+        "MESSAGE string only (`f\"{kind.capitalize()} delete has moved "
+        "to v2....\"`)  -- a builtin `str.capitalize()` call ON the "
+        "captured value itself (never an argument choosing which OTHER "
+        "callable runs), the same narrow 'produces a derived scalar, not "
+        "a routing decision' shape `_PATH_METHODS`/`_PATH_PROPERTIES` "
+        "already carve out for `path` -- the route here was already "
+        "fully decided by `mmv`'s own `(player|official)` alternation two "
+        "lines above.",
     ("do_POST", "required_permission(path)", "assign_rhs",
      "not authorize(role, path)"):
         "#202 repair round 2 finding A -- builds the human-readable "
@@ -3636,6 +3658,29 @@ def _is_callee(node: ast.AST, parents: Optional[dict]) -> bool:
     offered over a fourth curated shape: it now also refuses a captured
     value found in a callee/receiver position through composition no
     round of this function ever enumerated by name, which is the point.
+
+    #202 repair round 9 (external review): this function alone cannot
+    carry the whole "is a captured selector about to be invoked" question
+    any further -- see :func:`_captured_arg_safe_callee`'s own docstring
+    for why. The reviewer's own round-9 repro --
+    ``invoke(handlers.get(action, default_handler), self)`` with
+    ``invoke = lambda fn, h: fn.serve(h)`` -- hands the dispatch-selecting
+    call to ``invoke`` as a plain ARGUMENT; it never sits inside ANY
+    call's own ``.func`` subtree in this statement (``invoke`` itself is
+    invoked BY ITS CALLER, elsewhere, not by anything visible here), so
+    this function correctly -- and, after this round, PERMANENTLY --
+    answers False for it, exactly as it always correctly has for the
+    genuinely inert ``api.get_item(gid)``. That is not a bug in this
+    function: a purely SYNTACTIC, single-statement climb structurally
+    cannot see what an arbitrary function does with an argument inside
+    its own body, a different function entirely -- no further shape this
+    function could be taught to recognise closes that gap, only running
+    the callee's body would. The round-9 fix is therefore a SEPARATE,
+    additional gate in :func:`_propagates_taint` (`_captured_arg_safe_
+    callee`), not a further widening of this function's own climb; this
+    function's contract stays exactly "is this node about to be invoked,
+    syntactically, in this statement" -- unchanged, neither more nor less
+    conservative.
     """
     if parents is None:
         return False
@@ -3651,6 +3696,124 @@ def _is_callee(node: ast.AST, parents: Optional[dict]) -> bool:
         for sub in ast.walk(candidate.func):
             if sub is node:
                 return True
+    return False
+
+
+#: #202 repair round 9 (external review): the ONLY call targets the
+#: ``captured``-only exemption in :func:`_propagates_taint` may ever treat
+#: a captured value handed to as inert DATA, now that "any non-``self.``
+#: call" is no longer good enough (see :func:`_captured_arg_safe_callee`'s
+#: own docstring for why). Deliberately ONE entry: ``api``, the module-
+#: level API FACADE this codebase's own layering (CLAUDE.md) guarantees
+#: performs no HTTP routing -- the SAME guarantee this module's docstrings
+#: have invoked since round 5 finding 2b introduced the ``captured``
+#: exemption in the first place. Confirmed (by the SAME instrumentation
+#: methodology round 8's own docstring used -- a temporary counter at each
+#: exemption site, run against the real file, removed before commit) to
+#: cover 37 of the real server.py's 39 captured-only call/subscript sites;
+#: the remaining two (a local dict of response-shape mappers, and a
+#: builtin string method called ON the captured value itself, both in
+#: ``_handle_setup``) do NOT fit this shape and are reviewed individually
+#: as their own ``_AUDIT_WAIVERS`` entries instead -- see those entries'
+#: own comments, just below ``_handle_setup``'s existing waivers.
+#: Extending this set is a REVIEW, exactly the weight of adding an
+#: ``_AUDIT_WAIVERS`` entry: do not add a second name merely to make some
+#: future call site pass without individually confirming it is a genuine
+#: service boundary that never invokes, stores, or forwards whatever it is
+#: handed -- that confirmation is the entire point of keeping this set
+#: small and explicit rather than defaulting to "anything not self.".
+_CAPTURED_ARG_SAFE_CALLEE_ROOTS = frozenset({"api"})
+
+
+def _captured_arg_safe_callee(node) -> bool:
+    """Does ``node`` -- a Call's own ``.func``, or the container a
+    Subscript/``.get()`` indexes -- resolve to a call target the
+    ``captured``-only exemption (see :func:`_propagates_taint`'s own
+    docstring) may trust with a captured value as plain data, rather than
+    an unmodelled receiver that might invoke, store, or forward it?
+
+    #202 repair round 9 (external review) -- the THIRD recurrence of "the
+    captured-value exemption is broader than it should be" (round 6:
+    direct-compare shapes; round 8: transparent tuple/list/IfExp
+    composition; this round: higher-order ARGUMENT transfer). Every prior
+    round narrowed the exemption by teaching :func:`_is_callee` one more
+    shape a captured selector's own call could sit inside on its way to
+    being invoked -- all of them SYNTACTIC, single-statement, "where does
+    this node sit relative to a Call it's inside" questions. The
+    reviewer's own round-9 repro defeats that whole strategy at once,
+    demonstrated over real HTTP (200 for one concrete value, 404 for
+    another) while extraction stayed silent:
+
+        return invoke(handlers.get(action, default_handler), self)
+
+    with ``invoke = lambda fn, h: fn.serve(h)`` (the reviewer's own
+    independent reproduction used ``operator.call(handlers.get(action,
+    default_handler).serve, self)`` instead -- the SAME shape, a stdlib
+    higher-order callable rather than a hand-written one). ``handlers.get(
+    action, default_handler)`` sits in ``invoke``'s ARGUMENT list -- never
+    inside ANY call's own ``.func`` subtree in this statement -- so
+    :func:`_is_callee` correctly, and PERMANENTLY, answers False for it,
+    the same as it does for the genuinely inert ``api.get_item(gid)``.
+    :func:`_is_callee` cannot tell these two apart because the difference
+    between them is not syntactic (where the captured value sits in THIS
+    expression) but SEMANTIC (what the receiving function DOES with it),
+    and ``invoke``'s own body -- the only place that answer lives -- is a
+    different function entirely, possibly not even defined in this file.
+    Chasing one more transfer shape (a keyword argument, ``operator.
+    call``, a callback stashed via ``setattr`` or a container and invoked
+    later) would only rename the same unbounded problem: ANY unmodelled
+    callee could invoke, store, or forward whatever it is handed, and
+    this module cannot run the callee's own body to find out -- exactly
+    the review's own diagnosis: "shape-by-shape closure is not
+    converging".
+
+    So this function does not add another shape. It inverts the DEFAULT
+    instead: rather than trusting any non-``self.`` call unless proven
+    otherwise (the OLD rule this round removes), a captured value handed
+    to a call is inert ONLY when the call target is on the small,
+    explicit, reviewed allowlist above
+    (``_CAPTURED_ARG_SAFE_CALLEE_ROOTS``) -- currently just the API
+    facade, ``api``. ``invoke``, ``operator.call``, ``setattr``, and
+    ``list.append`` are all, correctly, NOT on it, so a captured selector
+    handed to any of them now falls through to the SAME unlisted-call
+    raise (or a dedicated, individually reviewed ``_AUDIT_WAIVERS``
+    entry) any other unmodelled call already gets -- see
+    ``CapturedArgumentCalleeAllowlistTests`` (test_route_extract.py) for
+    all five named repros (invoke positional, invoke keyword, operator.
+    call, a callback stashed via ``setattr``, one stashed via
+    ``list.append``), each proven BOTH as a live-HTTP 200/404 divergence
+    (the underlying shape really is exploitable Python, independent of
+    this module) and as a static ``ExtractionError`` raise against the
+    fixed code.
+
+    Resolves a plain ``ast.Attribute`` chain to its ROOT name the same
+    way :func:`_is_self_call` resolves a ``self.`` chain (any depth --
+    ``api.x``, ``self.api.x`` would resolve to ``self`` first and never
+    reach this function at all, since the caller only ever invokes this
+    for a call :func:`_is_self_call` has already ruled out). A plain
+    ``ast.Dict`` LITERAL gets its own rule: ``{...}[kind]`` or ``{...}.
+    get(kind, default)`` can only ever select one of the VALUES written
+    right there in the source -- the real ``_handle_setup``/
+    ``_handle_setup_v2`` delete-dispatch tables and ``do_POST``'s
+    substitute-action table are exactly this shape, each a dict literal
+    of ``api.X`` references -- so a dict literal is safe iff EVERY one of
+    its values independently is, checked recursively (a dict of dicts is
+    not a real server.py shape today, but costs nothing extra to handle
+    correctly rather than assume away). Anything else -- a bare ``Name``
+    like ``handlers``/``invoke``/``operator`` (an opaque external
+    variable or function this module cannot see the contents or body of),
+    a further Call or Subscript, ... -- is NOT safe: there is no way to
+    confirm what it resolves to, or does with what it is handed, without
+    running the program.
+    """
+    if isinstance(node, ast.Attribute):
+        root = node
+        while isinstance(root, (ast.Attribute, ast.Subscript)):
+            root = root.value
+        return (isinstance(root, ast.Name)
+                and root.id in _CAPTURED_ARG_SAFE_CALLEE_ROOTS)
+    if isinstance(node, ast.Dict):
+        return all(_captured_arg_safe_callee(v) for v in node.values)
     return False
 
 
@@ -3990,6 +4153,38 @@ def _propagates_taint(value, tracked: set, fn_name: str = "",
     completeness scan) uses ``_tracked_mentions``, a separate function this
     change does not touch, so ``if self._is_hidden(gid):`` still raises
     exactly as finding 1 (round 4) already made it.
+
+    #202 repair round 9 (external review): "a NON-``self.`` call" is no
+    longer sufficient on its own -- narrowed further to "a NON-``self.``
+    call whose own callee ALSO resolves to the small, explicit, reviewed
+    allowlist :func:`_captured_arg_safe_callee` checks" (both the Call
+    branch below and the parallel Subscript branch). Round 6's own
+    narrowing (``_is_callee``: never when the call is itself about to be
+    invoked) answers a SYNTACTIC question -- where does the captured value
+    sit in THIS statement -- that a captured selector handed to an
+    arbitrary function AS AN ARGUMENT, and invoked from INSIDE that
+    function's own body, simply does not trip: ``invoke(handlers.get(
+    action, default_handler), self)`` (the reviewer's own repro,
+    ``invoke = lambda fn, h: fn.serve(h)``) never places the selector in
+    any call's own ``.func`` subtree, so ``_is_callee`` correctly answers
+    False, and -- before this round -- nothing else asked whether
+    ``invoke`` itself was a call this module has any basis to trust.
+    DEMONSTRATED live (200/404 divergence, extraction silent) for that
+    repro, its keyword-argument form, the reviewer's own
+    ``operator.call(...)`` variant, and two independently invented
+    transfer shapes -- a callback stashed via ``setattr`` and one via
+    ``list.append`` -- each invoked in a later statement. Fixing this by
+    teaching :func:`_is_callee` about ``invoke`` specifically would only
+    be a fourth curated shape in a series that has not converged (round
+    6, round 7, round 8 each closed exactly what they targeted and each
+    time review found a materially different composition); INSTEAD of
+    that, or of attempting general data-flow analysis to trace what an
+    arbitrary function does with its own arguments, this round flips the
+    default: a captured value handed to a call is inert ONLY when the
+    call target is on the allowlist, not whenever it merely fails to be
+    ``self.`` -- see :func:`_captured_arg_safe_callee`'s own docstring for
+    the full reasoning and :class:`CapturedArgumentCalleeAllowlistTests`
+    (test_route_extract.py) for the regression coverage.
     """
     for node in ast.walk(value):
         if isinstance(node, ast.Call):
@@ -4038,7 +4233,8 @@ def _propagates_taint(value, tracked: set, fn_name: str = "",
                     continue
                 if (captured and not is_self_call
                         and not _is_callee(node, parents)
-                        and _tracked_mentions(node, tracked) <= captured):
+                        and _tracked_mentions(node, tracked) <= captured
+                        and _captured_arg_safe_callee(func)):
                     # See this function's own docstring: a NON-self call
                     # whose only tracked mentions are already-captured
                     # names is the bound-first counterpart of
@@ -4050,6 +4246,19 @@ def _propagates_taint(value, tracked: set, fn_name: str = "",
                     # dispatch decision even when the selector is a
                     # captured id, not the inert-data case this exemption
                     # exists for.
+                    # #202 repair round 9, finding 1 (external review):
+                    # ALSO never when this call's own callee (``func``) is
+                    # not on the small, explicit, reviewed allowlist (see
+                    # ``_captured_arg_safe_callee``'s own docstring) --
+                    # "not a captured/receiver position" (round 6) is
+                    # necessary but no longer sufficient, because a
+                    # captured selector handed to an ARBITRARY unmodelled
+                    # function as a plain argument can be invoked from
+                    # INSIDE that function's own body, never appearing in
+                    # any call's own ``.func`` subtree in THIS statement
+                    # at all (``invoke(handlers.get(action,
+                    # default_handler), self)``, DEMONSTRATED live 200/404
+                    # while every prior round's checks stayed silent).
                     continue
                 waiver_key = _waiver_key(fn_name, node, parents)
                 if waiver_key in _AUDIT_WAIVERS:
@@ -4124,7 +4333,8 @@ def _propagates_taint(value, tracked: set, fn_name: str = "",
             mentioned = _tracked_mentions(node.slice, tracked)
             if mentioned:
                 if captured and mentioned <= captured \
-                        and not _is_callee(node, parents):
+                        and not _is_callee(node, parents) \
+                        and _captured_arg_safe_callee(node.value):
                     # The SAME captured-only exemption a Call's arguments
                     # get, several lines above (see this function's own
                     # docstring on ``captured``): a lookup keyed on an
@@ -4142,7 +4352,18 @@ def _propagates_taint(value, tracked: set, fn_name: str = "",
                     # ()``, see ``_is_callee``'s own docstring) -- the
                     # Subscript-callee analogue of the SAME dispatch-
                     # selection concern the Call-branch's own exemption,
-                    # above, is narrowed for.
+                    # above, is narrowed for. #202 repair round 9, finding
+                    # 1 (external review): ALSO never when the CONTAINER
+                    # (``node.value``) is not on the same small, explicit,
+                    # reviewed allowlist the Call-branch now requires (see
+                    # ``_captured_arg_safe_callee``'s own docstring) -- an
+                    # opaque external dict (``HANDLERS[action]`` used as a
+                    # plain argument, never itself a callee) is no more
+                    # provably inert than an opaque external function is;
+                    # only a dict LITERAL of already-safe values (the real
+                    # ``_handle_setup``/``_handle_setup_v2``/``do_POST``
+                    # delete- and action-dispatch tables, each spelled
+                    # inline right here) is.
                     continue
                 waiver_key = _waiver_key(fn_name, node, parents)
                 if waiver_key in _AUDIT_WAIVERS:
