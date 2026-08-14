@@ -162,7 +162,7 @@ def evaluate_age_eligibility(*, birthdate, tier_declared,
         {"status": "eligible" | "ineligible" | "indeterminate",
          "reason": None | "no_birthdate" | "no_season_start" | "no_tier_declared"
                   | "unknown_tier" | "invalid_birthdate" | "invalid_cutoff"
-                  | "over_age",
+                  | "not_born_at_cutoff" | "over_age",
          "tier_code": str | None,  "max_age": int | None,
          "age_at_cutoff": int | None,  "cutoff_date": "YYYY-MM-DD" | None}
 
@@ -190,18 +190,42 @@ def evaluate_age_eligibility(*, birthdate, tier_declared,
         return result
     result["cutoff_date"] = cutoff.isoformat()
 
+    # #273 review round 2 finding 4: a birthdate strictly AFTER the cutoff
+    # means the athlete is not yet born as of that date. This is checked
+    # BEFORE the open-tier shortcut below (an open tier used to report
+    # "eligible" without ever looking at birthdate at all — even earlier
+    # than the bounded-tier bug) and independent of ``tier["max_age"]``, so
+    # both bounded and open tiers are covered by one check. Previously a
+    # bounded tier fell through to ``age_on()``, which naively subtracts
+    # calendar years with no floor — cutoff 2010-12-31 / birthdate
+    # 2015-01-01 produced ``age_at_cutoff=-5`` and, since -5 is less than
+    # any positive ``max_age``, ``status="eligible"``. A birthdate must
+    # never produce a negative displayed age or a positive eligibility
+    # answer for a cutoff date before the athlete existed; this is a
+    # distinct, stable outcome, not folded into ``over_age`` (a birth-order
+    # data/config problem reads very differently from an athlete who is
+    # simply too old for the tier). ``age_at_cutoff`` stays None here
+    # (never negative) — there is no meaningful age to report yet.
+    canonical_birthdate = None
+    if birthdate is not None:
+        canonical_birthdate, reason = normalize_birthdate(birthdate)
+        if reason is not None or canonical_birthdate is None:
+            result["reason"] = "invalid_birthdate"
+            return result
+        if date.fromisoformat(canonical_birthdate) > cutoff:
+            result["status"] = "ineligible"
+            result["reason"] = "not_born_at_cutoff"
+            return result
+
     if tier["max_age"] is None:
-        # Open tier: eligible whatever the age — even with no birthdate on
-        # file, since no age bound exists to check against.
+        # Open tier: eligible whatever the age (birth-before-cutoff already
+        # confirmed above when a birthdate was supplied) — even with no
+        # birthdate on file, since no age bound exists to check against.
         result["status"] = "eligible"
         return result
 
-    if birthdate is None:
+    if canonical_birthdate is None:
         result["reason"] = "no_birthdate"
-        return result
-    canonical_birthdate, reason = normalize_birthdate(birthdate)
-    if reason is not None or canonical_birthdate is None:
-        result["reason"] = "invalid_birthdate"
         return result
 
     age = age_on(date.fromisoformat(canonical_birthdate), cutoff)

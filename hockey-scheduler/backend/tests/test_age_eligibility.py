@@ -248,5 +248,158 @@ class EligibilityRuleServiceTest(unittest.TestCase):
             self.assertEqual(missing["error"]["code"], "not_found", label)
 
 
+# =========================================================================== #
+# #273 review round 2 finding 4: a birthdate AFTER the cutoff must never      #
+# report eligible or a negative displayed age.                                #
+# =========================================================================== #
+class NotBornAtCutoffTest(unittest.TestCase):
+    """cutoff 2010-12-31, birthdate 2015-01-01 (the reviewer's own example)
+    used to return ``status="eligible"`` with ``age_at_cutoff=-5`` on a
+    BOUNDED tier -- ``age_on()`` naively subtracts calendar years with no
+    floor. An OPEN tier short-circuited even earlier: it reported eligible
+    without ever looking at birthdate at all. Both are now a stable,
+    distinct, non-eligible outcome (``not_born_at_cutoff``), and
+    ``age_at_cutoff`` is never negative -- it stays ``None`` (there is no
+    meaningful age yet), same as every other indeterminate/ineligible
+    outcome that has nothing to report."""
+
+    def _run(self, **overrides):
+        kwargs = dict(birthdate="2017-01-15", tier_declared="U10",
+                      cutoff_month=12, cutoff_day=31,
+                      season_start=datetime(2026, 9, 1, tzinfo=UTC),
+                      tiers=TIERS)
+        kwargs.update(overrides)
+        return evaluate_age_eligibility(**kwargs)
+
+    def test_reviewers_own_example_bounded_tier(self):
+        result = self._run(birthdate="2015-01-01", cutoff_month=12,
+                           cutoff_day=31,
+                           season_start=datetime(2010, 6, 1, tzinfo=UTC))
+        self.assertEqual(result["status"], "ineligible")
+        self.assertEqual(result["reason"], "not_born_at_cutoff")
+        self.assertIsNone(result["age_at_cutoff"])  # never negative
+        self.assertEqual(result["cutoff_date"], "2010-12-31")
+
+    def test_open_tier_no_longer_short_circuits_before_birth(self):
+        # SENIOR is max_age=None (open). Before the fix this returned
+        # "eligible" immediately, never even looking at birthdate.
+        result = self._run(birthdate="2015-01-01", tier_declared="senior",
+                           cutoff_month=12, cutoff_day=31,
+                           season_start=datetime(2010, 6, 1, tzinfo=UTC))
+        self.assertEqual(result["status"], "ineligible")
+        self.assertEqual(result["reason"], "not_born_at_cutoff")
+        self.assertIsNone(result["age_at_cutoff"])
+        self.assertIsNone(result["max_age"])  # still names the open tier
+
+    def test_open_tier_with_no_birthdate_is_still_eligible(self):
+        """Positive control: the fix does not regress the legacy-athlete
+        case an open tier is FOR -- no birthdate on file at all."""
+        result = self._run(birthdate=None, tier_declared="senior")
+        self.assertEqual(result["status"], "eligible")
+
+    def test_birth_exactly_on_cutoff_is_normal_not_special_cased(self):
+        # Born the SAME day as the cutoff: age 0 at cutoff, ordinarily
+        # eligible for any bounded tier -- must NOT be treated as
+        # not-yet-born (the boundary is strictly AFTER, never on).
+        result = self._run(birthdate="2026-12-31", cutoff_month=12,
+                           cutoff_day=31,
+                           season_start=datetime(2026, 9, 1, tzinfo=UTC))
+        self.assertEqual(result["status"], "eligible")
+        self.assertEqual(result["age_at_cutoff"], 0)
+        self.assertIsNone(result["reason"])
+
+    def test_birth_the_day_after_cutoff_is_not_born_at_cutoff(self):
+        result = self._run(birthdate="2027-01-01", cutoff_month=12,
+                           cutoff_day=31,
+                           season_start=datetime(2026, 9, 1, tzinfo=UTC))
+        self.assertEqual(result["status"], "ineligible")
+        self.assertEqual(result["reason"], "not_born_at_cutoff")
+        self.assertIsNone(result["age_at_cutoff"])
+
+    def test_bounded_tier_born_well_before_cutoff_is_unaffected(self):
+        """Positive control: the ordinary case must not regress."""
+        result = self._run(birthdate="2017-01-15", cutoff_month=12,
+                           cutoff_day=31,
+                           season_start=datetime(2026, 9, 1, tzinfo=UTC))
+        self.assertEqual(result["status"], "eligible")
+        self.assertEqual(result["age_at_cutoff"], 9)
+        self.assertIsNone(result["reason"])
+
+    def test_historical_season_the_cutoff_year_is_still_the_seasons_own(self):
+        # A Season from the PAST: the cutoff is anchored to ITS start year
+        # (2010), not today's. A birthdate after THAT historical cutoff is
+        # still not_born_at_cutoff -- the bug is about ordering birthdate
+        # against cutoff, not about "the cutoff being in the future".
+        result = self._run(birthdate="2011-06-01", cutoff_month=12,
+                           cutoff_day=31,
+                           season_start=datetime(2010, 9, 1, tzinfo=UTC))
+        self.assertEqual(result["status"], "ineligible")
+        self.assertEqual(result["reason"], "not_born_at_cutoff")
+        self.assertEqual(result["cutoff_date"], "2010-12-31")
+        # And a birthdate before that SAME historical cutoff is normal.
+        normal = self._run(birthdate="2009-06-01", cutoff_month=12,
+                           cutoff_day=31,
+                           season_start=datetime(2010, 9, 1, tzinfo=UTC))
+        self.assertEqual(normal["status"], "eligible")
+        self.assertEqual(normal["age_at_cutoff"], 1)
+
+
+class NotBornAtCutoffFacadeTest(unittest.TestCase):
+    """The facade summary/detail shapes on Memory/SQLite/[PostgreSQL]: a
+    not-yet-born athlete is reported through the SAME two shapes as every
+    other eligibility answer, and ``age_at_cutoff``/``cutoff_date`` stay
+    out of the Coach-facing summary exactly as they do for every other
+    outcome (#124 boundary) -- this finding does not carve out a special
+    exception."""
+
+    def _each(self):
+        # A HISTORICAL Season (starts 2015, cutoff -> 2015-12-31): a
+        # perfectly ordinary, valid (non-future, relative to today)
+        # birthdate can still land AFTER a season this old ran -- the
+        # real-world shape of this bug, not a birthdate literally in the
+        # future (which add_player's OWN, separate in_future guard already
+        # refuses at write time, before any eligibility evaluation).
+        for label, store in _service_backends():
+            with self.subTest(backend=label):
+                store.add_program(Program(id="pr", name="P"))
+                store.add_season(Season(
+                    id="se", program_id="pr", name="2015",
+                    start_date=datetime(2015, 9, 1, tzinfo=UTC)))
+                store.add_league(League(id="lg", program_id="pr", name="L"))
+                store.add_league_season(LeagueSeason(
+                    id="ls", league_id="lg", season_id="se"))
+                store.add_division(Division(
+                    id="d", league_season_id="ls", name="D1",
+                    age_group="U10"))
+                store.add_team(Team(id="t1", name="T1"))
+                api = ApiService(store)
+                try:
+                    yield label, store, api, api.setup
+                finally:
+                    if isinstance(store, SqlStore):
+                        store.close()
+
+    def test_not_yet_born_athlete_via_facade_summary_and_detail(self):
+        for label, store, api, setup in self._each():
+            setup.set_age_eligibility_rule("ls", 12, 31, TIERS)
+            # Cutoff is 2015-12-31 (the 2015 Season's own start year); this
+            # athlete's real, valid birthdate is after it.
+            player = setup.add_player(
+                "t1", None, Position.FORWARD, first_name="Not",
+                last_name="YetBorn", birthdate="2020-03-01")
+            detail = api.evaluate_player_eligibility(
+                player.id, "d", include_details=True)
+            self.assertEqual(detail["status"], "ineligible", label)
+            self.assertEqual(detail["reason"], "not_born_at_cutoff", label)
+            self.assertIsNone(detail["age_at_cutoff"], label)
+            self.assertNotIn("birthdate", detail, label)
+            summary = api.evaluate_player_eligibility(player.id, "d")
+            self.assertEqual(summary["status"], "ineligible", label)
+            self.assertEqual(summary["reason"], "not_born_at_cutoff", label)
+            self.assertNotIn("age_at_cutoff", summary, label)
+            self.assertNotIn("cutoff_date", summary, label)
+            self.assertNotIn("birthdate", summary, label)
+
+
 if __name__ == "__main__":
     unittest.main()
