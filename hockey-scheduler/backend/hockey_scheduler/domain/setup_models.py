@@ -232,6 +232,34 @@ class SeasonCopyForwardCommit:
 
 
 @dataclass
+class AgeEligibilityRule:
+    """A VERSIONED age-tier/cutoff rule for one :class:`LeagueSeason` (#273).
+
+    The structured replacement for the free-text ``Division.age_group``
+    convention: a cutoff (month/day in the Season's start year) plus tier
+    definitions (``[{"code": "U10", "max_age": 10}, ...]``; ``max_age`` None =
+    open tier). Rows are immutable — updating the rule appends the next
+    ``version`` for the same ``league_season_id`` — so an eligibility answer
+    can always name (and reproduce under) the exact rule version it used,
+    matching the owner's versioned-policy ruling on epic #205.
+
+    ``enforcement`` is the #273 warn-first switch: ``"warn"`` (default;
+    eligibility is surfaced, nothing is blocked) or ``"block"`` (consumers may
+    hard-refuse). No consumer hard-blocks in this slice; the mode is stored
+    and reported so the later wiring is a policy flip, not a schema change.
+    """
+    id: str
+    league_season_id: str
+    version: int
+    cutoff_month: int
+    cutoff_day: int
+    tiers: list = field(default_factory=list)
+    enforcement: str = "warn"
+    created_at: Optional[datetime] = None
+    actor_id: Optional[str] = None
+
+
+@dataclass
 class TeamLeagueMigrationDecision:
     """An operator-supplied permanent-League assignment for a Team whose
     historical registrations span more than one League (#283 migration 035).

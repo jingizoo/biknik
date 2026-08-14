@@ -68,6 +68,7 @@ from .models import (
 )
 from .setup_models import (
     ActiveContext,
+    AgeEligibilityRule,
     CalendarFeedToken,
     Club,
     ContactDestination,
@@ -117,6 +118,28 @@ from .privacy import (
     DataAccessLog,
     SensitiveFieldCategory,
     VALID_OUTCOMES,
+)
+from .identity import (
+    MAX_NAME_PART_LENGTH,
+    MAX_REGISTRATION_NUMBER_LENGTH,
+    MAX_SKILL_RATING,
+    MIN_SKILL_RATING,
+    derive_display_name,
+    normalize_birthdate,
+    normalize_name_part,
+    normalize_preferred_name,
+    normalize_registration_number,
+    normalize_skill_rating,
+    normalized_name_key,
+)
+from .eligibility import (
+    ENFORCEMENT_MODES,
+    age_on,
+    evaluate_age_eligibility,
+    match_tier,
+    normalize_age_tiers,
+    normalize_cutoff,
+    normalize_enforcement,
 )
 from .time_utils import intervals_overlap
 
@@ -178,6 +201,7 @@ __all__ = [
     "Team",
     # setup models
     "ActiveContext",
+    "AgeEligibilityRule",
     "Club",
     "Division",
     "GuardianLink",
@@ -232,4 +256,24 @@ __all__ = [
     "MAX_JERSEY_NUMBER",
     "jersey_number_error",
     "parse_jersey_cell",
+    # athlete identity (#273)
+    "MAX_NAME_PART_LENGTH",
+    "MAX_REGISTRATION_NUMBER_LENGTH",
+    "MIN_SKILL_RATING",
+    "MAX_SKILL_RATING",
+    "derive_display_name",
+    "normalize_birthdate",
+    "normalize_name_part",
+    "normalize_preferred_name",
+    "normalize_registration_number",
+    "normalize_skill_rating",
+    "normalized_name_key",
+    # age eligibility (#273)
+    "ENFORCEMENT_MODES",
+    "age_on",
+    "evaluate_age_eligibility",
+    "match_tier",
+    "normalize_age_tiers",
+    "normalize_cutoff",
+    "normalize_enforcement",
 ]

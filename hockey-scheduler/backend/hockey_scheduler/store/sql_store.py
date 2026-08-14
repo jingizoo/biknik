@@ -31,6 +31,7 @@ from ..domain import (
     SchedulingPolicy,
     PolicyScopeType,
     ActiveContext,
+    AgeEligibilityRule,
     GameResult,
     League,
     LeagueSeason,
@@ -149,7 +150,10 @@ def _jsonc():
 
 
 def _jsonl():
-    """Like ``_jsonc`` but list-biased: an EMPTY list is a legitimate value
+    """JSON-encoded LIST column (e.g. SeasonCopyForwardCommit registrations,
+    AgeEligibilityRule.tiers).
+
+    Like ``_jsonc`` but list-biased: an EMPTY list is a legitimate value
     (a copy-forward commit that created zero registrations), so this must
     round-trip ``[]`` as ``[]`` rather than folding it into ``{}`` the way
     ``_jsonc``'s dict-biased ``v or {}`` would."""
@@ -201,6 +205,11 @@ SPECS = {
     League: Spec(League, "leagues"),
     LeagueSeason: Spec(LeagueSeason, "league_seasons"),
     Division: Spec(Division, "divisions"),
+    # Child of league_seasons (#273); before its parent for the factory-reset
+    # child-first deletion order, like the other LeagueSeason children here.
+    AgeEligibilityRule: Spec(
+        AgeEligibilityRule, "age_eligibility_rules",
+        {"tiers": _jsonl(), "created_at": _dt()}),
     SeasonTeamRegistration: Spec(
         SeasonTeamRegistration, "season_team_registrations", {"active": _bool()}),
     SeasonCopyForwardCommit: Spec(
@@ -1990,6 +1999,14 @@ class SqlStore:
         self._delete(SchedulingPolicy, policy_id)
     def all_scheduling_policies(self):
         return self._query(SchedulingPolicy, order="id")
+
+    # -- versioned age eligibility rules (#273) --------------------------
+    def add_age_eligibility_rule(self, rule): return self._insert(rule)
+    def get_age_eligibility_rule(self, rule_id):
+        return self._get(AgeEligibilityRule, rule_id)
+    def age_eligibility_rules_for_league_season(self, league_season_id):
+        return self._query(AgeEligibilityRule, "league_season_id = ?",
+                           (league_season_id,), order="version")
 
     # -- immutable schedule scenarios (#378) -----------------------------
     def add_schedule_scenario(self, scenario): return self._insert(scenario)

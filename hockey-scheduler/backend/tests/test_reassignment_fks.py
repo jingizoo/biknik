@@ -140,6 +140,17 @@ def _downgrade_040(store):
                         "ON teams (program_id)")
             cur.execute("CREATE INDEX IF NOT EXISTS ix_teams_league "
                         "ON teams (league_id)")
+            # The rebuild above recreates `players` at its pre-051 shape (the
+            # hardcoded pre-#273 column list), so 051's identity columns are
+            # physically gone while still recorded in the ledger. Un-record
+            # 051 too: the re-migrate then replays 040 AND 051 in order,
+            # exactly like a genuine pre-040 database upgrading through both.
+            # SQLite-branch only — the Postgres branch drops just the named
+            # constraints and keeps every column, so re-running 051's plain
+            # ADD COLUMN there would fail on the existing columns.
+            cur.execute(store.dialect.sql(
+                "DELETE FROM schema_migrations WHERE version = ?"),
+                ("051_athlete_identity",))
         cur.execute(store.dialect.sql(
             "DELETE FROM schema_migrations WHERE version = ?"), (_VERSION,))
 

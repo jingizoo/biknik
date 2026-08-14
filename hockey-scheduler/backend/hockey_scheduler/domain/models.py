@@ -54,16 +54,43 @@ class Team:
 class Player:
     id: str
     team_id: str
+    # Flattened DISPLAY name — kept for every legacy consumer. When the
+    # structured names below are set it is always derived ("<first> <last>",
+    # see domain.identity.derive_display_name), never free-typed (#273).
     name: str
     position: Position
     shoots: Optional[str] = None
     jersey_number: Optional[int] = None
     is_active: bool = True
-    guardian_person_id: Optional[str] = None
     # Idempotency key for the CSV import (#93): the ``player_code`` a repeat
     # upload is matched against. None for players created outside the import
     # flow.
     external_ref: Optional[str] = None
+    # -- durable athlete identity (#273) --------------------------------
+    # Structured names. Nullable: legacy players keep only the flattened
+    # ``name`` until an edit/import supplies real parts — migration 051 never
+    # guesses a first/last split from the display name.
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    preferred_name: Optional[str] = None
+    # PRIVATE birthdate, canonical "YYYY-MM-DD" (a calendar date, no
+    # timezone). Stripped from every default facade payload — operators opt
+    # in explicitly; ordinary Coach/public payloads never carry it (#273/#124
+    # boundary).
+    birthdate: Optional[str] = None
+    # Stable governing-body registration number (private, same handling as
+    # birthdate). The duplicate detector keys on it; it is never a merge key.
+    registration_number: Optional[str] = None
+    # Coach's 1-7 skill assessment (owner ruling on #287 assigns the field to
+    # #273). None = unrated, a fully supported state substitute ranking must
+    # degrade on, never exclude.
+    skill_rating: Optional[int] = None
+    # NOTE (#273): ``guardian_person_id`` is REMOVED from the model/contract.
+    # It was serialized but never read or written by any service; the real,
+    # verified guardian relationship is ``GuardianLink`` (#26/#35). The DB
+    # column is left in place untouched (dropping it is a follow-up
+    # migration), so existing rows and the 040 SQLite table rebuild are
+    # unaffected.
 
     @property
     def slot_type(self) -> SlotType:

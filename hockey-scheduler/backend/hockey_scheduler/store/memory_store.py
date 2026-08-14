@@ -13,6 +13,7 @@ from typing import Dict, List, Optional
 
 from ..domain import (
     ActiveContext,
+    AgeEligibilityRule,
     AuditLog,
     CalendarFeedToken,
     Club,
@@ -96,6 +97,7 @@ class InMemoryStore:
         self.ice_slots: Dict[str, IceSlot] = {}
         self.scheduling_policies: Dict[str, SchedulingPolicy] = {}
         self.schedule_scenarios: Dict[str, ScheduleScenario] = {}
+        self.age_eligibility_rules: Dict[str, AgeEligibilityRule] = {}
         self.officials: Dict[str, Official] = {}
         self.official_assignments: Dict[str, OfficialAssignment] = {}
         self.game_results: Dict[str, GameResult] = {}
@@ -946,6 +948,29 @@ class InMemoryStore:
 
     def all_scheduling_policies(self) -> List[SchedulingPolicy]:
         return list(self.scheduling_policies.values())
+
+    # -- versioned age eligibility rules (#273) --------------------------
+    def add_age_eligibility_rule(
+            self, rule: AgeEligibilityRule) -> AgeEligibilityRule:
+        """Store an immutable rule version. Deep-copied on the way in AND on
+        every read (like schedule scenarios): rule rows are append-only
+        history, so no caller may mutate a stored version in place."""
+        stored = copy.deepcopy(rule)
+        self.age_eligibility_rules[stored.id] = stored
+        return copy.deepcopy(stored)
+
+    def get_age_eligibility_rule(
+            self, rule_id: str) -> Optional[AgeEligibilityRule]:
+        rule = self.age_eligibility_rules.get(rule_id)
+        return copy.deepcopy(rule) if rule is not None else None
+
+    def age_eligibility_rules_for_league_season(
+            self, league_season_id: str) -> List[AgeEligibilityRule]:
+        """Every version for one LeagueSeason, ascending by version."""
+        rules = [r for r in self.age_eligibility_rules.values()
+                 if r.league_season_id == league_season_id]
+        rules.sort(key=lambda r: r.version)
+        return [copy.deepcopy(r) for r in rules]
 
     # -- immutable schedule scenarios (#378) -----------------------------
     def add_schedule_scenario(self, scenario: ScheduleScenario) -> ScheduleScenario:
