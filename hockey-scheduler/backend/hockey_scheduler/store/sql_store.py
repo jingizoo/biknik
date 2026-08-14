@@ -1806,7 +1806,22 @@ class SqlStore:
     def delete_ice_slot(self, slot_id):
         self._delete_parent(IceSlot, "ice_slot", slot_id)
     def delete_official(self, official_id): self._delete(Official, official_id)
-    def delete_player(self, player_id): self._delete(Player, player_id)
+    def delete_player(self, player_id):
+        # A HARD player delete (#232 mistaken-creation removal) takes the
+        # player's seasonal stint rows with it, child-first — migration
+        # 052's FK physically requires it now that create_player opens the
+        # parity stint (#205 cutover), and history fabricated for a
+        # mistaken identity should not outlive it. This is the same
+        # whole-subject exception clear_all_data already makes to the
+        # membership-events append-only rule; it is NOT a per-event delete
+        # API, which still does not exist.
+        self._exec(
+            "DELETE FROM season_roster_membership_events WHERE membership_id"
+            " IN (SELECT id FROM season_roster_memberships"
+            " WHERE player_id = ?)", (player_id,))
+        self._exec("DELETE FROM season_roster_memberships"
+                   " WHERE player_id = ?", (player_id,))
+        self._delete(Player, player_id)
 
     # -- officials (#30) ---------------------------------------------------
     def add_official(self, official): return self._insert(official)

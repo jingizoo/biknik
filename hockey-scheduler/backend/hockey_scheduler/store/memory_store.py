@@ -1383,6 +1383,17 @@ class InMemoryStore:
         self.officials.pop(official_id, None)
 
     def delete_player(self, player_id: str) -> None:
+        # Same whole-subject cascade as SqlStore.delete_player: a hard
+        # player delete removes the player's stints and their events —
+        # the clear_all_data-class exception to append-only, not a
+        # per-event delete API.
+        membership_ids = {m.id for m in self.season_roster_memberships.values()
+                          if m.player_id == player_id}
+        self.season_roster_membership_events = {
+            eid: e for eid, e in self.season_roster_membership_events.items()
+            if e.membership_id not in membership_ids}
+        for mid in membership_ids:
+            self.season_roster_memberships.pop(mid, None)
         self.players.pop(player_id, None)
 
     def all_setup_audit(self) -> List[SetupAuditLog]:

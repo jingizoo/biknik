@@ -85,9 +85,25 @@ def _fixture(api, program="Over 55", season="Fall 2026"):
 
 def _player(api, team_id, name="Skater", position="forward", jersey=9,
             shoots="L", is_active=True):
-    return api.create_player(team_id, name, position, jersey_number=jersey,
-                             shoots=shoots, is_active=is_active,
-                             actor_id=ADMIN)
+    """A Player row with NO seasonal stint yet.
+
+    Written at the store because the facade's ``create_player`` now also
+    opens the permanent-model-parity ACTIVE membership (the #205 substitute
+    cutover's dual-write) — which would make every hand-crafted
+    ``create_season_roster_membership`` below collide with an already-open
+    stint. These tests exercise the membership service surface itself
+    FROM the no-stint state, a state production still reaches through the
+    store-level bulk import paths (and any pre-052 row); the dual-write has
+    its own coverage in test_substitute_membership_cutover.py. Every
+    assertion in this file is unchanged.
+    """
+    from hockey_scheduler.domain import Player
+    player = Player(id=api.store.next_id("player"), team_id=team_id,
+                    name=name, position=Position(position),
+                    jersey_number=jersey, shoots=shoots,
+                    is_active=is_active)
+    api.store.add_player(player)
+    return {"id": player.id, "name": name, "team_id": team_id}
 
 
 def _archive(store, season_id):

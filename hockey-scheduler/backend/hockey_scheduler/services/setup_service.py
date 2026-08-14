@@ -1465,6 +1465,7 @@ class SetupService:
                         existing.id, actor_id,
                         {"season_id": season_id, "team_id": team_id,
                          "division_id": existing.division_id, "reactivated": True})
+            self._mirror_memberships_for_registration(existing, actor_id)
             return existing
         reg = SeasonTeamRegistration(
             id=self.store.next_id("streg"), league_season_id=ls.id,
@@ -1474,7 +1475,98 @@ class SetupService:
                     reg.id, actor_id,
                     {"season_id": season_id, "team_id": team_id,
                      "division_id": reg.division_id})
+        self._mirror_memberships_for_registration(reg, actor_id)
         return reg
+
+    # -- permanent-model parity dual-write (#205 substitute cutover) -------
+    #
+    # Substitute eligibility now RESOLVES through SeasonRosterMembership for
+    # every LeagueSeason-bound game, and migration 052 backfilled the stints
+    # the permanent model implied for rows that existed at migration time:
+    # active player x actively-registered team x non-archived Season. These
+    # two hooks are that same rule applied at CREATE time, on the two
+    # service edges that produce a new (player, registered-team, Season)
+    # participation — a player added to a Team (add_player) and a Team
+    # (re)registered into a Season (register_team_for_season). Without
+    # them, every player or registration created after 052 would be
+    # silently ineligible to substitute in bound games until an operator
+    # hand-opened a stint.
+    #
+    # Precedence rule of the transition: the SEASONAL record wins wherever
+    # it has explicitly said something. A player who already holds an open
+    # membership on this LeagueSeason, or an authoritative ACTIVE
+    # membership anywhere else in the Season (a recorded transfer), is left
+    # exactly as recorded — the permanent pointer no longer overrides it.
+    # Deliberately NOT mirrored, and why:
+    #   * imports (store-level bulk player writes) — the "imports over to
+    #     seasonal membership" cutover is its own Release-2 slice;
+    #   * assign_player_team — a mid-season permanent-pointer move must NOT
+    #     silently re-scope seasonal eligibility; that is precisely the
+    #     governed transfer workflow of a later #205 slice;
+    #   * set_player_active reactivation of a pre-052-inactive player —
+    #     052 deliberately minted no stint for parked players, and
+    #     reactivating one is an operator decision whose stint should be
+    #     opened explicitly.
+
+    def _open_parity_membership(self, player, league_season_id: str,
+                                team_id: str, actor_id) -> None:
+        """Open the ACTIVE stint the permanent model implies for one
+        (active player, actively-registered team, LeagueSeason) edge,
+        unless the seasonal record already says otherwise. Reuses
+        create_season_roster_membership wholesale (transaction() is
+        reentrant, #215) so spine checks, uniqueness, the per-membership
+        event and the audit entry are the real ones — an auto-opened stint
+        carries the same rigor and history as an operator-created one. A
+        genuine conflict it does not pre-clear (e.g. a seasonal jersey
+        clash) propagates and rolls back the caller's whole write: fail
+        closed, never a player row the seasonal model rejects."""
+        if self.store.open_memberships_for_player_in_league_season(
+                player.id, league_season_id):
+            return  # this stint already exists (any non-terminal status)
+        ls = self.store.get_league_season(league_season_id)
+        if ls is not None and self.store.active_memberships_for_player_in_season(
+                player.id, ls.season_id):
+            return  # recorded transfer elsewhere in this Season wins
+        self.create_season_roster_membership(
+            player.id, league_season_id, team_id,
+            reason="auto-opened for permanent-model parity (#205 cutover)",
+            actor_id=actor_id)
+
+    def _mirror_memberships_for_registration(self, reg, actor_id) -> None:
+        """Registration edge of the parity dual-write: the Team's ACTIVE
+        players each get their stint for the newly (re)activated
+        registration's Season — the create-time image of 052's
+        player x registration x Season join. Skips nothing silently except
+        what the seasonal record already governs (see above)."""
+        ls = self.store.get_league_season(reg.league_season_id)
+        season = (self.store.get_season(ls.season_id)
+                  if ls is not None else None)
+        if season is None or season.status is not SeasonStatus.ACTIVE:
+            return
+        for player in sorted(self.store.players_for_team(reg.team_id),
+                             key=lambda p: p.id):
+            if player.is_active:
+                self._open_parity_membership(
+                    player, reg.league_season_id, reg.team_id, actor_id)
+
+    def _mirror_memberships_for_new_player(self, player, actor_id) -> None:
+        """Player edge of the parity dual-write: an ACTIVE player added to
+        a Team opens their stint in each non-archived Season the Team is
+        actively registered in. A player created inactive opens nothing —
+        a parked player holds no current participation (052's own
+        deliberate exclusion)."""
+        if not player.is_active:
+            return
+        for reg in self.store.all_season_team_registrations():
+            if not reg.active or reg.team_id != player.team_id:
+                continue
+            ls = self.store.get_league_season(reg.league_season_id)
+            season = (self.store.get_season(ls.season_id)
+                      if ls is not None else None)
+            if season is None or season.status is not SeasonStatus.ACTIVE:
+                continue
+            self._open_parity_membership(
+                player, reg.league_season_id, reg.team_id, actor_id)
 
     def _candidate_registration_league_id(self, team, division_id,
                                           league_id) -> Optional[str]:
@@ -6251,6 +6343,9 @@ class SetupService:
         if canonical_email is not None:
             # Nonblank only: create/reactivate via the shared set/retire path.
             self._set_email_contact(f"player:{player.id}", canonical_email)
+        # #205 cutover parity dual-write — see
+        # _mirror_memberships_for_new_player above register_team_for_season.
+        self._mirror_memberships_for_new_player(player, actor_id)
         return player
 
     @staticmethod

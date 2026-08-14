@@ -22,6 +22,7 @@ from ..domain import (
     GameAvailability,
     GameRosterEntry,
     GameStatus,
+    MembershipStatus,
     NotificationEvent,
     Player,
     RosterEntryStatus,
@@ -422,9 +423,12 @@ class RosterService:
         self._guard_mutable(game)
         player = self._require_player(player_id)
 
-        if player.team_id not in (game.home_team_id, game.away_team_id):
+        # #205 cutover: membership-resolved for a LeagueSeason-bound game,
+        # permanent-pointer for an unbound one — see team_for_game.
+        if self.team_for_game(game, player) is None:
             raise NotEligibleError(
-                f"{player.name} is not eligible (cross-team borrowing is off)."
+                f"{player.name} is not eligible (no membership with a team "
+                f"in this game; cross-team borrowing is off)."
             )
         if not player.is_active:
             raise NotEligibleError(f"{player.name} is not an active player.")
@@ -506,13 +510,14 @@ class RosterService:
     ) -> SubstituteEnrollment:
         game = self._require_game(game_id)
         self._guard_mutable(game)
-        self._require_active_player(player_id)   # fail closed on deactivation
+        player = self._require_active_player(player_id)   # fail closed on deactivation
         sub = self.store.substitute_for_player(game_id, player_id)
         if sub is None or sub.status != SubstituteStatus.ENROLLED:
             raise InvalidTransitionError(
                 "Only an enrolled substitute can be offered a slot."
             )
-        self._require_open_slot(game_id, sub.slot_type, self._player_team(sub.player_id))
+        self._require_open_slot(game_id, sub.slot_type,
+                                self._require_team_for_game(game, player))
         sub.status = SubstituteStatus.OFFERED
         sub.offered_at = self.clock()
         sub.offer_expires_at = offer_expires_at
@@ -584,8 +589,13 @@ class RosterService:
     ) -> GameRosterEntry:
         # Runs inside accept_substitute's transaction (the game/sub were fetched
         # and validated within that same unit, so no interleaving is possible).
-        # First-accepted-wins: the slot must still be open.
-        self._require_open_slot(game.id, sub.slot_type, self._player_team(sub.player_id))
+        # First-accepted-wins: the slot must still be open. The side the offer
+        # counts against is the game-resolved team (#205 cutover) — and
+        # resolution failing here (membership ended since the offer) fails
+        # closed, same posture as the #270 deactivation gate.
+        team_id = self._require_team_for_game(
+            game, self.store.get_player(player_id))
+        self._require_open_slot(game.id, sub.slot_type, team_id)
         game_id = game.id
         sub.status = SubstituteStatus.ACCEPTED
         sub.accepted_at = self.clock()
@@ -610,7 +620,7 @@ class RosterService:
             NotificationKind.SUBSTITUTE_ACCEPTED, NotificationAudience.COACH,
             "Substitute accepted",
             "A substitute accepted the open slot and joined the roster.",
-            audience_ref=self._player_team(player_id), game_id=game_id)
+            audience_ref=team_id, game_id=game_id)
         return entry
 
     @_transactional
@@ -633,12 +643,17 @@ class RosterService:
         )
         # Notify the team's coach so they can advance to the next candidate
         # (#112) — the pre-#112 decline path emitted no notification at all.
+        # Tolerant resolution (never a raise): declining stays possible even
+        # for a player whose membership has since ended, so the audience may
+        # honestly be nobody rather than a permanent-pointer guess.
         _push_notification(
             self.store, self.clock,
             NotificationKind.SUBSTITUTE_DECLINED, NotificationAudience.COACH,
             "Substitute declined",
             "A substitute declined the offer — you can offer the next candidate.",
-            audience_ref=self._player_team(player_id), game_id=game_id)
+            audience_ref=self.team_for_game(
+                game, self.store.get_player(player_id)),
+            game_id=game_id)
         return sub
 
     @_transactional
@@ -648,7 +663,7 @@ class RosterService:
         """Coach override: offer + accept in one step (audited)."""
         game = self._require_game(game_id)
         self._guard_mutable(game)
-        self._require_active_player(player_id)   # fail closed on deactivation
+        player = self._require_active_player(player_id)   # fail closed on deactivation
         sub = self.store.substitute_for_player(game_id, player_id)
         if sub is None or sub.status not in (
             SubstituteStatus.ENROLLED,
@@ -657,7 +672,8 @@ class RosterService:
             raise NotEnrolledError(
                 "Player must be an enrolled/offered substitute to be added."
             )
-        self._require_open_slot(game_id, sub.slot_type, self._player_team(sub.player_id))
+        self._require_open_slot(game_id, sub.slot_type,
+                                self._require_team_for_game(game, player))
         sub.status = SubstituteStatus.ACCEPTED
         sub.accepted_at = self.clock()
         self.store.save_substitute(sub)
@@ -720,9 +736,100 @@ class RosterService:
                 f"The {slot_type.value} slot is already filled."
             )
 
-    def _player_team(self, player_id: str) -> Optional[str]:
-        p = self.store.get_player(player_id)
-        return p.team_id if p else None
+    # ====================================================================
+    # game-scoped team resolution (#205 substitute eligibility cutover)
+    # ====================================================================
+    # An ACTIVE membership is the authoritative stint; AFFILIATE is the
+    # governed call-up exception the #205 model defines (secondary
+    # participation with exactly that Team). applicant/inactive/injured hold
+    # no current participation, and terminal rows are immutable history —
+    # none of them grants eligibility.
+    _ELIGIBLE_MEMBERSHIP_STATUSES = (MembershipStatus.ACTIVE,
+                                     MembershipStatus.AFFILIATE)
+
+    def _game_season_id(self, game) -> Optional[str]:
+        """Season a LeagueSeason-bound game belongs to, or ``None`` — either
+        because the game carries no ``league_season_id`` at all (exhibitions
+        by design, plus unbound legacy rows) or because the pointer dangles.
+        Callers distinguish those two via ``game.league_season_id``."""
+        if not game.league_season_id:
+            return None
+        ls = self.store.get_league_season(game.league_season_id)
+        return ls.season_id if ls is not None else None
+
+    def team_for_game(self, game, player) -> Optional[str]:
+        """Which of ``game``'s two teams ``player`` belongs to, or ``None``.
+
+        THE eligibility resolution of the #205 substitute cutover, shared by
+        every substitute surface (enroll gate, block-reason, outreach queue,
+        addable pool, offer/accept slot accounting, view scoping). For a
+        game bound to a LeagueSeason it resolves
+        ``game.league_season_id -> Season -> SeasonRosterMembership``: the
+        player's eligible memberships in that Season are matched against the
+        game's two teams — ACTIVE outranking AFFILIATE, home side before
+        away for determinism in the pathological both-sides case. A player
+        whose only eligible memberships name OTHER teams resolves ``None``:
+        cross-boundary substitution stays CLOSED (fail-closed, the same
+        posture the permanent gate had; #287 open question 4 — who may
+        substitute across League/Division boundaries — is an unruled owner
+        question this cutover does not answer).
+
+        For a game with NO LeagueSeason binding there is no Season to
+        resolve memberships against, so the permanent ``player.team_id``
+        pointer remains the only source — exhibitions and unbound legacy
+        games keep pre-#205 behavior exactly. A bound game whose
+        LeagueSeason row is missing resolves NOBODY (fail closed), never
+        silently reverting to permanent ownership.
+        """
+        if player is None:
+            return None
+        sides = tuple(t for t in (game.home_team_id, game.away_team_id) if t)
+        if not game.league_season_id:
+            return player.team_id if player.team_id in sides else None
+        season_id = self._game_season_id(game)
+        if season_id is None:
+            return None
+        matched = {}
+        for m in self.store.memberships_for_player(player.id):
+            if (m.season_id == season_id and m.team_id in sides
+                    and m.status in self._ELIGIBLE_MEMBERSHIP_STATUSES):
+                matched.setdefault(m.status, set()).add(m.team_id)
+        for status in self._ELIGIBLE_MEMBERSHIP_STATUSES:
+            teams = matched.get(status, ())
+            for side in sides:
+                if side in teams:
+                    return side
+        return None
+
+    def _require_team_for_game(self, game, player) -> str:
+        """``team_for_game`` or a NotEligibleError — the raising form the
+        state-machine transitions use so a player whose membership ended
+        after enrollment fails CLOSED at the next transition (mirrors the
+        #270 deactivation gate)."""
+        team_id = self.team_for_game(game, player)
+        if team_id is None:
+            name = player.name if player is not None else "Player"
+            raise NotEligibleError(
+                f"{name} is not eligible for this game (no membership with "
+                f"a team in it; cross-team borrowing is off).")
+        return team_id
+
+    def _players_for_game_team(self, game, team_id) -> List[Player]:
+        """The candidate pool "players of ``team_id`` for ``game``" (#205
+        cutover): for a LeagueSeason-bound game, every player holding an
+        eligible membership with that team in the game's Season; for an
+        unbound game, the permanent roster. Ordering is the caller's job."""
+        if not game.league_season_id:
+            return self.store.players_for_team(team_id)
+        season_id = self._game_season_id(game)
+        if season_id is None:
+            return []
+        player_ids = {
+            m.player_id for m in self.store.memberships_for_season(season_id)
+            if (m.team_id == team_id
+                and m.status in self._ELIGIBLE_MEMBERSHIP_STATUSES)}
+        players = (self.store.get_player(pid) for pid in sorted(player_ids))
+        return [p for p in players if p is not None]
 
     # ====================================================================
     # coach controls
@@ -777,13 +884,21 @@ class RosterService:
         raise ValidationError("No previous roster to copy for this team.")
 
     @staticmethod
+    def _is_visible_game(g) -> bool:
+        """Published, non-draft, non-cancelled, scheduled game — the
+        player-visible half of :meth:`_is_visible_team_game`, split out so
+        the membership-resolved offer scan (#205 cutover) can pair it with
+        :meth:`team_for_game` instead of the permanent-pointer team test."""
+        return (not g.cancelled and g.published and not g.is_draft
+                and g.start_time is not None)
+
+    @staticmethod
     def _is_visible_team_game(g, team_id) -> bool:
         """Published, non-draft, non-cancelled game involving ``team_id`` —
         the shared "counts for the Player Home Page" predicate (#107), so
         next-game, today-count, and substitute-opportunity scans can never
         drift apart on what a player-visible game is."""
-        return (not g.cancelled and g.published and not g.is_draft
-                and g.start_time is not None
+        return (RosterService._is_visible_game(g)
                 and team_id in (g.home_team_id, g.away_team_id))
 
     def find_next_game_for_player(self, player_id: str) -> Optional[Game]:
@@ -836,7 +951,10 @@ class RosterService:
         game = self.store.get_game(game_id)
         if game is None:
             return "Game not found."
-        if player.team_id not in (game.home_team_id, game.away_team_id):
+        # #205 cutover: membership-resolved for a LeagueSeason-bound game,
+        # permanent-pointer for an unbound one — see team_for_game.
+        team_id = self.team_for_game(game, player)
+        if team_id is None:
             return "You are not on a team in this game."
         if game.cancelled:
             return "This game has been cancelled."
@@ -852,7 +970,7 @@ class RosterService:
             return "You are already on the roster for this game."
         needed = player.position.slot_type
         if rstatus is None:
-            rstatus = self.compute_roster_status(game_id, player.team_id)
+            rstatus = self.compute_roster_status(game_id, team_id)
         open_slots = (rstatus.open_goalie_slots if needed == SlotType.GOALIE
                       else rstatus.open_skater_slots)
         if open_slots <= 0:
@@ -860,13 +978,15 @@ class RosterService:
         return None
 
     def list_substitute_opportunities(self, player_id: str) -> List[Game]:
-        """Games where this player's own team has an open slot matching
-        their position and the player isn't already selected/enrolled — the
-        Player Home Page's substitute-opportunities section (#107).
+        """Games where a team this player belongs to has an open slot
+        matching their position and the player isn't already
+        selected/enrolled — the Player Home Page's substitute-opportunities
+        section (#107).
 
-        Cross-team borrowing is off (the same constraint enroll_substitute
-        enforces at line 363), so this only ever surfaces the player's own
-        team's games. A pure read helper — must NOT be @_transactional.
+        "Belongs to" is the #205 membership resolution (via
+        substitute_block_reason -> team_for_game): cross-boundary borrowing
+        stays off, so this only ever surfaces games of teams the player
+        resolves to. A pure read helper — must NOT be @_transactional.
         """
         player = self.store.get_player(player_id)
         if player is None or not player.is_active:
@@ -915,7 +1035,12 @@ class RosterService:
         now = self.clock()
         offers = []
         for g in self.store.all_games():
-            if not self._is_visible_team_game(g, player.team_id) or g.start_time < now:
+            # #205 cutover: an offer surfaces when the player RESOLVES to a
+            # team in the game (membership for LeagueSeason-bound games,
+            # permanent pointer for unbound ones) — otherwise an offered
+            # membership-only substitute could never see their own offer.
+            if (not self._is_visible_game(g) or g.start_time < now
+                    or self.team_for_game(g, player) is None):
                 continue
             sub = self.store.substitute_for_player(g.id, player_id)
             if sub is not None and sub.status == SubstituteStatus.OFFERED:
@@ -951,8 +1076,11 @@ class RosterService:
         for sub in self.store.substitutes_for_game(game_id):
             player = self.store.get_player(sub.player_id)
             # A deactivated player's enrollment stays as history but drops out
-            # of the live outreach queue (#270 review) — never offer-able.
-            if player is None or player.team_id != team_id or not player.is_active:
+            # of the live outreach queue (#270 review) — never offer-able. The
+            # same live-fail-closed rule applies to the #205 resolution: a
+            # membership ended after enrollment drops the row from the queue.
+            if (player is None or not player.is_active
+                    or self.team_for_game(game, player) != team_id):
                 continue
             can_offer = (sub.status == SubstituteStatus.ENROLLED
                          and not game.locked and not game.cancelled
@@ -973,9 +1101,12 @@ class RosterService:
 
     def list_addable_players(self, game_id: str, team_id: Optional[str] = None,
                              rstatus=None) -> List[dict]:
-        """Active same-team players a coach could add as a substitute
-        candidate right now (#114) — substitute_block_reason (the SAME gate
-        the player-side opportunity list uses) returns None for them, and
+        """Active players of this game-team a coach could add as a
+        substitute candidate right now (#114) — the pool is
+        membership-resolved for a LeagueSeason-bound game and the permanent
+        roster for an unbound one (#205 cutover, _players_for_game_team),
+        then substitute_block_reason (the SAME gate the player-side
+        opportunity list uses) returns None for them, and
         they aren't already an enrolled/offered substitute (that pair of
         states already show up in the outreach queue with an Offer action;
         re-adding them here would just hit enroll_substitute's own duplicate
@@ -989,7 +1120,7 @@ class RosterService:
             if s.status in (SubstituteStatus.ENROLLED, SubstituteStatus.OFFERED)
         }
         rows = []
-        for player in self.store.players_for_team(team_id):
+        for player in self._players_for_game_team(game, team_id):
             if not player.is_active or player.id in already_sub:
                 continue
             if self.substitute_block_reason(
