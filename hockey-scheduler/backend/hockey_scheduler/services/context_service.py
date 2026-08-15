@@ -28,8 +28,21 @@ orders entirely before this request (it sees the old scope) or entirely after it
 (it sees the new scope) — the result can never be a hybrid of the two (e.g. an
 old Program set with a now-empty Season set). Memory/SQLite get the same guarantee
 for free: each store's per-INSTANCE transaction lock (not a process-wide one)
-fully serializes every transaction taken through that store, and on SQLite the
-``BEGIN IMMEDIATE`` of #392 extends it to any other connection on the file.
+fully serializes every transaction taken through that store, and on SQLite a
+WRITE-capable snapshot's ``BEGIN IMMEDIATE`` (#392) additionally extends it to
+any other connection on the file. A genuinely READ-only snapshot (``resolve``,
+``options`` and every League-aware read below; ``_snapshot``'s own
+``read_only=True``, round-N+2, PR #423) opens with ``BEGIN DEFERRED`` instead —
+a SHARED, not RESERVED, file lock — which is strictly weaker at the SQLite
+engine level but delivers the identical isolation for the read's own duration
+(SQLite cannot let ANY writer reach EXCLUSIVE, the lock a write actually needs,
+while this SHARED lock is held — see ``SqlStore.transaction``'s own docstring
+for the full argument); the only thing it gives up is refusing to also block a
+concurrent connection that merely holds RESERVED (write INTENT, not yet a
+write), which is precisely what a scoped read's own dedicated connection
+(``_read_under_context_gate_sqlite``'s ``fresh_store``, round-N+1 finding 1)
+holds for the duration of its ``produce()`` call — the regression this
+distinction fixes.
 
 **League is the optional third axis (#345).** It is added ADDITIVELY: ``resolve``,
 ``options`` and ``set`` keep their exact pre-#345 signatures and tuple shapes, and
@@ -62,11 +75,14 @@ from .league_scope import exact_league_season_or_conflict
 # attempt re-reads a fresh consistent snapshot. Memory/SQLite serialize via each
 # store's own per-INSTANCE transaction lock (a ``threading.RLock``, not — as this
 # said before — a process-wide one), so no SERIALIZATION conflict arises there.
-# On SQLite the retry is not dead code, though: since #392 ``transaction()``
-# opens with ``BEGIN IMMEDIATE``, so a second connection to the same file can
-# make BEGIN itself fail ``lock_not_available`` after the busy handler gives up,
-# and that lands here as the same ConcurrencyConflictError. This loop already
-# handles it.
+# On SQLite the retry is not dead code, though: a WRITE-capable snapshot's
+# ``BEGIN IMMEDIATE`` (#392) can make BEGIN itself fail ``lock_not_available``
+# once another connection's already-held RESERVED outlasts the busy handler,
+# and a READ-only snapshot's ``BEGIN DEFERRED`` (round-N+2, ``_snapshot``'s
+# ``read_only=True``, PR #423) can — far more rarely, since SHARED conflicts
+# with much less — hit the identical failure if its first read races another
+# connection's held EXCLUSIVE past the same busy handler. Either shape lands
+# here as the same ConcurrencyConflictError. This loop already handles both.
 _SNAPSHOT_ISOLATION = "SERIALIZABLE"
 _MAX_SNAPSHOT_RETRIES = 10
 
@@ -108,17 +124,41 @@ class ContextService:
         self.store = store
         self.clock = clock
 
-    def _snapshot(self, work):
+    def _snapshot(self, work, read_only=False):
         """Run ``work()`` inside ONE serializable transaction, so the whole
         authorization computation + selection (and, for ``set``, the write) reads
         a single consistent snapshot — the result always corresponds wholly to
         the pre- OR post-revocation scope, never a hybrid. Retry a bounded number
         of times on a serialization conflict (each retry re-reads a fresh
         snapshot); a domain error (e.g. a non-oracle not-found) is not a conflict,
-        so it propagates immediately and unchanged."""
+        so it propagates immediately and unchanged.
+
+        ``read_only`` (round-N+2 regression fix, PR #423) is THIS CALL's own
+        promise that ``work()`` performs no write — forwarded verbatim to
+        ``store.transaction(read_only=...)``, never inferred here. Every
+        caller below states it explicitly: the several entry points with no
+        row-lock concept at all (``resolve``, ``options``,
+        ``options_with_league``, ``options_with_saved``,
+        ``resolve_epoch_state``) always pass ``True``; ``resolve_with_league``
+        and ``resolve_saved_with_league`` pass ``not lock`` — even their
+        ``lock=True`` form takes no store WRITE, only a locked READ
+        (``get_active_context_for_update``), but on SQLite that locked read's
+        whole point is to make a concurrent writer wait for it (#386), which
+        needs the SAME write-strength file lock a real write does; passing
+        ``read_only=True`` there would silently defeat that guarantee instead
+        of raising, which is exactly why it is spelled ``not lock`` rather
+        than assumed. ``_set_locked``/``_set_with_league_locked`` never pass
+        it (default ``False``): both genuinely write inside ``work()``, so
+        they always need the SAME write-strength transaction this method
+        opened before ``read_only`` existed.
+
+        See ``SqlStore.transaction``'s own docstring for the mechanism this
+        buys (a SHARED, not RESERVED, SQLite file lock) and why it does not
+        weaken the snapshot's isolation guarantee above."""
         for attempt in range(_MAX_SNAPSHOT_RETRIES):
             try:
-                with self.store.transaction(isolation=_SNAPSHOT_ISOLATION):
+                with self.store.transaction(
+                        isolation=_SNAPSHOT_ISOLATION, read_only=read_only):
                     return work()
             except ConcurrencyConflictError:
                 if attempt == _MAX_SNAPSHOT_RETRIES - 1:
@@ -166,7 +206,9 @@ class ContextService:
         def work():
             program, season = self._resolve_locked(user_id, role, scope)
             return _detached(program), _detached(season)
-        return self._snapshot(work)
+        # read_only=True (round-N+2): no lock concept at this entry point at
+        # all, and work() above performs no write.
+        return self._snapshot(work, read_only=True)
 
     def _resolve_locked(self, user_id, role, scope) -> _Resolved:
         """The validated ``(program, season)`` live rows — MUST run inside the
@@ -240,7 +282,9 @@ class ContextService:
                                  [_detached(s) for s in seasons]))
             sel_program, sel_season = self._resolve_locked(user_id, role, scope)
             return programs, _detached(sel_program), _detached(sel_season)
-        return self._snapshot(work)
+        # read_only=True (round-N+2): no lock concept at this entry point at
+        # all, and work() above performs no write.
+        return self._snapshot(work, read_only=True)
 
     # -- League axis (#345) ------------------------------------------------
     # Additive throughout: `resolve`/`options`/`set` above keep their exact
@@ -319,7 +363,12 @@ class ContextService:
             league = self._resolve_league_locked(
                 user_id, role, scope, program, season)
             return _detached(program), _detached(season), _detached(league)
-        return self._snapshot(work)
+        # read_only=not lock (round-N+2): work() itself never writes, but
+        # lock=True's whole point is a locked READ strong enough to make a
+        # concurrent writer wait for it (#386 — see this method's own
+        # docstring above) — read_only=True there would silently defeat that,
+        # so this stays tied to `lock`, never assumed True.
+        return self._snapshot(work, read_only=not lock)
 
     def resolve_saved_with_league(self, user_id: Optional[str], role, scope,
                                   lock=False):
@@ -369,7 +418,12 @@ class ContextService:
                 user_id, role, scope, lock=lock)
             return (_detached(saved), _detached(program), _detached(season),
                     _detached(league))
-        return self._snapshot(work)
+        # read_only=not lock (round-N+2): same reasoning as
+        # resolve_with_league's own call site — lock=True's row lock (#386)
+        # needs write-strength on SQLite even though work() itself never
+        # writes; lock=False (the #409 preflight's own call, the exact path
+        # this round's regression traced to) genuinely does not.
+        return self._snapshot(work, read_only=not lock)
 
     def _saved_locked(self, user_id, role, scope, lock=False):
         """The persisted row and the axes it still validly names, as LIVE rows —
@@ -422,8 +476,11 @@ class ContextService:
         time, where it can report a precise reason, not silently by omission
         here.
         """
+        # read_only=True (round-N+2): no lock concept at this entry point at
+        # all, and _options_locked performs no write.
         return self._snapshot(
-            lambda: self._options_locked(user_id, role, scope))
+            lambda: self._options_locked(user_id, role, scope),
+            read_only=True)
 
     def _options_locked(self, user_id, role, scope):
         """The switcher's enumeration + RESOLVED selection, already detached —
@@ -496,7 +553,9 @@ class ContextService:
             return (programs, sel_program, sel_season, sel_league,
                     _detached(saved_program), _detached(saved_season),
                     _detached(saved_league))
-        return self._snapshot(work)
+        # read_only=True (round-N+2): no lock concept at this entry point at
+        # all, and work() above performs no write.
+        return self._snapshot(work, read_only=True)
 
     # -- epoch (#159 review findings 2+5) -----------------------------------
     # Everything the context epoch (services/context_epoch.py) needs to hash:
@@ -541,7 +600,9 @@ class ContextService:
                 user_id, role, scope)
             return (generation, _detached(program), _detached(season),
                     _detached(league))
-        return self._snapshot(work)
+        # read_only=True (round-N+2): no lock concept at this entry point at
+        # all, and _epoch_material_locked performs no write.
+        return self._snapshot(work, read_only=True)
 
     def current_epoch(self, user_id, role, scope) -> str:
         """The CURRENT context-epoch token for ``user_id`` (#159 review
@@ -879,6 +940,11 @@ class ContextService:
             return (_detached(program), _detached(season), _detached(league),
                     epoch)
 
+        # read_only defaults to False here (round-N+2): work() genuinely
+        # writes (set_active_context above), so this stays at the ORIGINAL
+        # write-strength transaction every caller of this method already
+        # depended on — unlike every read-only entry point above, this one
+        # must never pass read_only=True.
         return self._snapshot(work)
 
     # -- mutation ----------------------------------------------------------
@@ -975,4 +1041,6 @@ class ContextService:
         # Validation + write share ONE serializable snapshot (with bounded retry),
         # so a concurrent revocation is either seen here (rejected non-oracle) or
         # ordered entirely after this call — never a half-applied hybrid.
+        # read_only defaults to False (round-N+2): work() genuinely writes
+        # (set_active_context above).
         return self._snapshot(work)
