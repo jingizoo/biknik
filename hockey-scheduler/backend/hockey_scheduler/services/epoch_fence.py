@@ -26,13 +26,50 @@ mechanism itself (that lives on the store, per backend — see
 ``context_service.py``, ``account_service.py``, ``setup_service.py`` and
 ``guardian_service.py`` names a key the exact same way, with one source of
 truth for the string format.
+
+KNOWN, ACCEPTED CONSEQUENCE -- discovered during implementation, not merely
+theorized, so recorded here where the next reader of the global key will find
+it: because ``EPOCH_FENCE_GLOBAL_KEY`` is EXCLUSIVE-locked by all FOURTEEN
+"global" writers (season/program/league/league_season lifecycle+delete,
+venue-access revoke/delete, Team transfer, Official assign/unassign,
+Player/Guardian reassignment) for their WHOLE transaction, any two of those
+fourteen now serialize against EACH OTHER, not merely against a concurrent
+scoped READ (the fence's actual purpose -- see the module docstring above).
+Before this widening, the ONLY thing sharing this global key
+(``_LIFECYCLE_GATE_KEY``/``LIFECYCLE_GATE``) was Season archive/reopen, a
+rare, admin-driven, effectively single-flight operation, so writer-vs-writer
+contention on it was never practically observable. Two `unassign_official`
+calls for two COMPLETELY UNRELATED games now briefly serialize where they
+never did before -- confirmed directly (not merely reasoned about) via
+``tests/test_write_race_hardening.py``'s
+``test_unassign_vs_unassign_single_effect``, a pre-existing, PR-#423-adjacent
+test whose original assertions pinned the OLD, purely-row-lock-mediated
+resolution; PR #423 updates that test's specific pinned outcome (which side
+wins, what error the loser sees) while preserving, and re-verifying just as
+strictly, the safety property it exists to prove (exactly one effect, no
+corruption, a well-typed retryable error for the loser, not a hang or a wrong
+answer) -- see that test's own updated docstring for the full account. This
+is judged an acceptable, DELIBERATE consequence of the owner's own explicit
+choice to fold all fourteen into one global key (design §4.1/§4.2, §11.4's
+open question read in the direction of "one mechanism, coarse membership"),
+not a defect being silently absorbed -- flagged here, and in the PR's own
+reporting, exactly so a future reader does not mistake newly-discovered
+writer-vs-writer contention for an oversight. Ordinary (non-test-paused)
+production contention on this key is expected to be on the order of the
+transaction time of ONE of these fourteen writers (milliseconds), not the
+fence's full timeout bound -- this test's use of an artificial pause is what
+turns a normally-brief overlap into the full bounded wait, exactly the way
+this codebase's other ``_pause_race``-style tests already turn other brief
+races into deterministic, observable ones.
 """
 
-# Reuses today's ``_LIFECYCLE_GATE_KEY`` string (``web/server.py``) for
-# continuity: it already means "the one shared, global epoch-affecting
-# concern" in this codebase, and every caller migrating off the old gate's
-# constant onto this one keeps the identical wire/log value.
-EPOCH_FENCE_GLOBAL_KEY = "lifecycle"
+# Reuses today's ``_LIFECYCLE_GATE_KEY`` string (``web/server.py:601``,
+# ``"season-lifecycle"``) verbatim, for continuity: it already means "the one
+# shared, global epoch-affecting concern" in this codebase, and every caller
+# migrating off the old gate's constant onto this one keeps the identical
+# wire/log value. tests/test_epoch_fence.py asserts this against
+# ``web/server.py``'s own constant directly, so the two cannot silently drift.
+EPOCH_FENCE_GLOBAL_KEY = "season-lifecycle"
 
 
 def user_fence_key(user_id) -> str:

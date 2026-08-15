@@ -1987,7 +1987,7 @@ class SqlStore:
     # Duplicated, not imported -- see _epoch_fence_timeout_seconds' comment on
     # why store/ never imports from services/. tests/test_epoch_fence.py
     # asserts the two literals stay equal.
-    _EPOCH_FENCE_GLOBAL_KEY = "lifecycle"
+    _EPOCH_FENCE_GLOBAL_KEY = "season-lifecycle"
 
     def _epoch_fence_lock_target(self, key: str):
         """``(namespace, fixed_objid)`` for ``key`` -- ``fixed_objid`` is the
