@@ -186,6 +186,12 @@ class MigrationApplyTest(unittest.TestCase):
             # that genuinely does not exist yet.
             cur.execute(
                 "ALTER TABLE user_active_context DROP COLUMN generation")
+            # #423 round-N review finding 1, migration 052: the epoch fence's
+            # persisted version-counter table is a brand-new CREATE TABLE, the
+            # same shape as schedule_scenarios (050) above — drop it so
+            # adoption's re-run of 052 lands on a table that genuinely does
+            # not exist yet, rather than "table already exists".
+            cur.execute("DROP TABLE IF EXISTS epoch_fence_version")
             cur.execute("DELETE FROM schema_migrations")
             cur.execute("INSERT INTO schema_migrations(version, applied_at) "
                         "VALUES ('0001_initial', '2026-01-01')")
@@ -241,6 +247,17 @@ class MigrationApplyTest(unittest.TestCase):
                 "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
             self.assertIn("league_seasons", adopted_tables)
             self.assertIn("schedule_scenarios", adopted_tables)
+            # #423 round-N review finding 1, migration 052: the epoch fence's
+            # version-counter table re-created on adoption. No rows are
+            # pre-seeded (each fence key gets a row on its first bump — see
+            # the migration's own docstring), so an unbumped key correctly
+            # reads back 0 on a freshly-adopted database.
+            self.assertIn("epoch_fence_version", adopted_tables)
+            self.assertEqual(
+                adopted.current_epoch_fence_version("some-key-nobody-bumped"),
+                0,
+                "an unbumped key on a freshly-adopted database must read 0, "
+                "not raise or read something stale")
             self.assertIn("league_season_id", _table_columns(adopted, "divisions"))
             self.assertIn("program_id", _table_columns(adopted, "leagues"))
             self.assertIn("league_id", _table_columns(adopted, "teams"))

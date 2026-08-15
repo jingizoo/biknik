@@ -148,17 +148,40 @@ class _FalsifiabilityRaceMixin:
 
         def reader_body():
             def do_check_and_read():
+                # Round-N review finding 1: the version-counter check every
+                # backend gets, sampled BEFORE the epoch derivation exactly
+                # as `web/server.py`'s `_read_under_context_gate` samples it
+                # — bracketing the epoch check AND the simulated `produce()`
+                # below with NO LOCK held across either, unlike the SHARED
+                # holds this method also (optionally) takes. Keyed on
+                # EPOCH_FENCE_GLOBAL_KEY, the exact key `mutator_body` below
+                # bumps (a Season archive is a global-keyed writer).
+                version_before = (
+                    reader_store.current_epoch_fence_version(
+                        EPOCH_FENCE_GLOBAL_KEY)
+                    if use_fence else None)
                 current = ApiService(reader_store).context.current_epoch(
                     "u1", *ADMIN)
                 outcome["matched"] = (current == client_epoch)
                 checked.set()
                 proceed.wait(_WAIT)
-                if outcome["matched"]:
-                    outcome["produce_ran"] = True
-                    outcome["produce_saw_status"] = (
-                        reader_store.get_season(sid).status)
-                else:
+                if not outcome["matched"]:
                     outcome["produce_ran"] = False
+                    outcome["served"] = False
+                    return
+                outcome["produce_ran"] = True
+                outcome["produce_saw_status"] = (
+                    reader_store.get_season(sid).status)
+                if use_fence:
+                    version_after = reader_store.current_epoch_fence_version(
+                        EPOCH_FENCE_GLOBAL_KEY)
+                    outcome["served"] = (version_after == version_before)
+                else:
+                    # The pre-#423 baseline: no counter, no SHARED hold,
+                    # nothing — this arm's whole point is to reproduce what
+                    # a genuinely independent second process saw with ZERO
+                    # protection, so it must not incidentally gain any.
+                    outcome["served"] = True
 
             if not use_fence:
                 do_check_and_read()
@@ -174,6 +197,9 @@ class _FalsifiabilityRaceMixin:
             try:
                 with m.transaction(isolation="SERIALIZABLE"):
                     if use_fence:
+                        # Bumps the persisted version counter (round-N finding
+                        # 1) as well as taking the advisory lock — see
+                        # epoch_fence_acquire_exclusive's own docstring.
                         m.epoch_fence_acquire_exclusive(EPOCH_FENCE_GLOBAL_KEY)
                     season = m.get_season_for_update(sid)
                     season.status = SeasonStatus.ARCHIVED
@@ -317,6 +343,7 @@ class _FalsifiabilityRaceMixin:
         out = self._race(use_fence=True, writer_first=True)
         self.assertFalse(out["matched"], out)
         self.assertFalse(out["produce_ran"], out)
+        self.assertFalse(out["served"], out)
 
     def test_reader_first_unfenced_is_a_lucky_accident_not_a_guarantee(self):
         """Unfenced, reader-first: nothing blocks the writer, so it commits
@@ -342,6 +369,10 @@ class _FalsifiabilityRaceMixin:
         self.assertTrue(out["matched"], out)
         self.assertTrue(out["produce_ran"], out)
         self.assertEqual(out["produce_saw_status"], SeasonStatus.ACTIVE, out)
+        # The writer never got to commit until the reader's hold released, so
+        # the version counter never moved during the reader's window either —
+        # both mechanisms agree the response is safe to serve.
+        self.assertTrue(out["served"], out)
 
 
 @unittest.skipUnless(_pg_url(), "PostgreSQL required (set TEST_DATABASE_URL)")
@@ -362,19 +393,34 @@ class EpochFenceCrossProcessFalsifiabilitySqliteTest(
     codebase already relies on for ``BEGIN IMMEDIATE``'s cross-connection
     guarantee.
 
-    OVERRIDES the mixin's two "fenced" tests deliberately: file-backed
-    SQLite's ``epoch_fence_acquire_exclusive``/``_shared`` are a documented
-    NO-OP (see those methods' own docstrings) — a real dedicated-connection
-    implementation was built, measured to deadlock/livelock against a real
-    ``ThreadingHTTPServer`` (a genuine AB-BA cycle between SQLite's single
-    file-lock axis and ``self._lock``, absent on PostgreSQL where advisory
-    locks are a separate axis), and reverted for safety. The two inherited
-    "unfenced" tests below still run unmodified and still demonstrate the
-    torn read; on SQLite, that demonstration is not a "before the fix"
-    snapshot, it is the STANDING state for a hypothetical second SQLite
-    process this round — stated here explicitly per this design's own
-    convention of writing down a scope reduction rather than silently
-    dropping coverage."""
+    OVERRIDES the mixin's two "fenced" tests, still — but as of round-N
+    review finding 1, to prove the defect is CLOSED, not that it remains.
+    File-backed SQLite's ``epoch_fence_acquire_exclusive``/``_shared``
+    ADVISORY-LOCK halves are STILL a documented NO-OP (see those methods' own
+    docstrings) — a real dedicated-connection implementation was built,
+    measured to deadlock/livelock against a real ``ThreadingHTTPServer`` (a
+    genuine AB-BA cycle between SQLite's single file-lock axis and
+    ``self._lock``, absent on PostgreSQL where advisory locks are a separate
+    axis), and reverted for safety. ``FENCE_IS_REAL`` therefore stays
+    ``False`` — the LOCK still cannot genuinely block a contending party on
+    this backend, so ``_race`` still has to impose its own explicit
+    interleaving via the shared ``threading.Event`` signals rather than
+    asserting a real bounded-block.
+
+    What changed is the VERSION-COUNTER half (round-N finding 1's actual
+    fix), which is NOT a lock and runs on every backend unconditionally (see
+    ``SqlStore.epoch_fence_acquire_exclusive``/``current_epoch_fence_version``).
+    ``produce()`` still physically runs here — nothing blocks it, exactly as
+    before — but the version it reads AFTER running no longer agrees with the
+    one it read before, because the mutator's commit bumped the persisted
+    counter in between. The response is therefore DISCARDED (``served`` is
+    ``False``) rather than handed the torn read it computed — the same 204
+    outcome a genuine block would have produced by a different, lock-free
+    route. The two inherited "unfenced" tests below (``use_fence=False``,
+    exercising NEITHER the lock nor the counter) still run unmodified and
+    still demonstrate the pre-#423 baseline defect, which is the point of
+    keeping them: the version counter is what changed, not the meaning of
+    "no protection at all"."""
 
     FENCE_IS_REAL = False
 
@@ -392,21 +438,189 @@ class EpochFenceCrossProcessFalsifiabilitySqliteTest(
             pass
 
     def test_writer_first_fenced_discards_before_reaching_the_read(self):
-        """Overridden: SQLite's fence is a no-op, so "fenced" and
-        "unfenced" are the SAME code path here — this asserts that
-        documented fact directly rather than inheriting an assertion that
-        assumes protection SQLite does not provide this round."""
+        """Overridden (round-N finding 1): SQLite's ADVISORY LOCK is still a
+        no-op, so the epoch check still matches E0 and ``produce()`` still
+        physically runs and still observes the torn ARCHIVED status — none
+        of that changed. What is NEW is that the mutator's commit (which now
+        also bumps the persisted version counter — the SAME transaction,
+        atomically) lands strictly between the reader's before/after samples
+        BY CONSTRUCTION (this is the writer-first interleaving, explicitly
+        ordered by the harness since nothing here genuinely blocks), so the
+        version check catches it and the read is DISCARDED rather than
+        served — closing exactly the gap the previous revision of this test
+        only documented."""
         out = self._race(use_fence=True, writer_first=True)
         self.assertTrue(out["matched"], out)
         self.assertTrue(out["produce_ran"], out)
         self.assertEqual(out["produce_saw_status"], SeasonStatus.ARCHIVED, out)
+        self.assertFalse(
+            out["served"],
+            f"the version-counter check must discard a response produce() "
+            f"computed under a torn read, even though nothing on SQLite "
+            f"genuinely blocked produce() from running: {out}")
 
     def test_reader_first_fenced_stays_consistent(self):
-        """Overridden for the same reason as the sibling override above."""
+        """Overridden (round-N finding 1) for the same reason as the sibling
+        override above: reader-first still lets the mutator commit (and bump
+        the version counter) WHILE the reader is parked mid-``produce()``,
+        because nothing on SQLite genuinely blocks it. The version check
+        still catches the disagreement on release and still discards —
+        "reader first" and "writer first" converge to the SAME safe outcome
+        here, which is expected: without a real lock there is no ordering
+        for the two arrival orders to differ BY."""
         out = self._race(use_fence=True, writer_first=False)
         self.assertTrue(out["matched"], out)
         self.assertTrue(out["produce_ran"], out)
         self.assertEqual(out["produce_saw_status"], SeasonStatus.ARCHIVED, out)
+        self.assertFalse(
+            out["served"],
+            f"the version-counter check must discard a response produce() "
+            f"computed under a torn read, even though nothing on SQLite "
+            f"genuinely blocked produce() from running: {out}")
+
+
+# =========================================================================
+# Round-N review finding 1's SECOND named repro: Memory, SAME PROCESS,
+# SELECTED-SEASON DELETE. Unlike the PG/SQLite mixin above (a cross-PROCESS
+# race that needs independent connections), InMemoryStore cannot participate
+# in independent workers at all -- two separate instances share zero state
+# -- so there is no cross-process race to reproduce there. What the review
+# named instead is narrower and real: the kept CONTEXT_GATE/LIFECYCLE_GATE
+# in-process gates order a scoped read against SPECIFIC writers (a context
+# switch, an archive/reopen) but never against the OTHER newly-fenced
+# writers -- delete_season among them -- because nothing ever wrapped THOSE
+# calls in CONTEXT_GATE/LIFECYCLE_GATE in the first place (#423's fence is
+# the first mechanism that touches them at all). So a scoped read racing a
+# concurrent delete of the operator's OWN selected Season, on ONE shared
+# InMemoryStore, is exactly the "same-process delete repro" the review says
+# "remains constructible" pre-fix.
+# =========================================================================
+
+class EpochFenceMemorySameProcessTornReadTest(unittest.TestCase):
+    """Two threads, ONE shared ``InMemoryStore``/``ApiService`` -- the only
+    concurrency shape Memory can ever have. ``use_version_check`` toggles
+    ONLY whether this test's own reader samples/compares the counter, mirroring
+    exactly how the PG/SQLite mixin's ``use_fence`` toggles whether ITS reader
+    takes the shared holds: ``False`` reproduces the pre-round-N baseline
+    (nothing orders the read against this writer at all -- CONTEXT_GATE/
+    LIFECYCLE_GATE never wrapped delete_season, and the fence's advisory-lock
+    half is a documented no-op on Memory regardless), ``True`` exercises the
+    version-counter half, which is NOT optional in production -- every call to
+    ``_read_under_context_gate`` performs it unconditionally; the toggle exists
+    only so this ONE test file can demonstrate both the defect and its closure
+    side by side, the same falsifiability shape §10.6 already established for
+    the cross-process case."""
+
+    def setUp(self):
+        self.store = InMemoryStore()
+        self.api = ApiService(self.store)
+
+    def _race(self, use_version_check):
+        pid, sid = _program_season(self.api, "MemP", "MemS")
+        self.api.set_active_context("u1", *ADMIN, pid, sid)
+        client_epoch = self.api.context.current_epoch("u1", *ADMIN)
+        # `setup_guarded_mutation`'s `("season", sid, "scope")` target check
+        # (`setup_target_accessible`) requires the ACTING user's OWN active
+        # context to already name this Program/Season -- a separate axis
+        # from "u1"'s selection above, and easy to miss: without it the
+        # delete is silently refused (`payload["error"]["code"] ==
+        # "active_context_required"`, `refused` stays None) and the Season
+        # is never actually removed, which would make this test check
+        # nothing. "admin" is a different account than "u1" on purpose (two
+        # operators, not one wearing two hats), so it needs its own selection.
+        self.api.set_active_context("admin", *ADMIN, pid, sid)
+
+        outcome = {}
+        checked = threading.Event()
+        proceed = threading.Event()
+        deleter_done = threading.Event()
+
+        def reader_body():
+            # Keyed on EPOCH_FENCE_GLOBAL_KEY, the exact key
+            # `setup_guarded_mutation`'s "season"/"scope" target bumps for
+            # delete_season (design §3 row 6).
+            version_before = (
+                self.store.current_epoch_fence_version(EPOCH_FENCE_GLOBAL_KEY)
+                if use_version_check else None)
+            current = self.api.context.current_epoch("u1", *ADMIN)
+            outcome["matched"] = (current == client_epoch)
+            checked.set()
+            proceed.wait(_WAIT)
+            if not outcome["matched"]:
+                outcome["produce_ran"] = False
+                outcome["served"] = False
+                return
+            outcome["produce_ran"] = True
+            # Stands in for `produce()` -- the dependent service read a real
+            # scoped-read route makes, e.g. resolving the named Season. A
+            # deleted Season reads back None on every backend.
+            outcome["produce_saw_season"] = self.store.get_season(sid)
+            if use_version_check:
+                version_after = self.store.current_epoch_fence_version(
+                    EPOCH_FENCE_GLOBAL_KEY)
+                outcome["served"] = (version_after == version_before)
+            else:
+                outcome["served"] = True
+
+        def deleter_body():
+            # THE GUARDED PATH, not a bare `self.api.setup.delete_season(...)`
+            # call -- `epoch_fence_acquire_exclusive` (and therefore the
+            # version bump) is taken by `setup_guarded_mutation`'s own
+            # wrapper, not by `SetupService.delete_season` itself (see
+            # `services/epoch_fence.py`'s own module docstring: "web/server.py's
+            # HTTP dispatch is the ONLY caller of the guarded path in
+            # production" — this is that path, exactly as
+            # `EpochFenceWriterOrderingTest.test_row6_season_delete` drives
+            # it). Calling the bare method would silently test nothing.
+            payload, refused = self.api.setup_guarded_mutation(
+                [("season", sid, "scope")],
+                lambda: self.api.setup.delete_season(sid, actor_id="admin"),
+                "admin", *ADMIN)
+            self.assertIsNone(refused, (payload, refused))
+            deleter_done.set()
+
+        t_reader = threading.Thread(target=reader_body)
+        t_reader.start()
+        self.assertTrue(checked.wait(_WAIT),
+                        "reader never reached its epoch check")
+        # No lock anywhere in this path (Memory's fence is a documented
+        # no-op) -- imposing the interleaving explicitly, same as the
+        # PG/SQLite mixin's own "elif writer_first" branch does when nothing
+        # genuinely blocks either side.
+        deleter_body()
+        self.assertTrue(deleter_done.wait(_WAIT), "delete never completed")
+        proceed.set()
+        t_reader.join(_WAIT)
+        return outcome
+
+    def test_baseline_unversioned_reproduces_the_selected_season_delete_repro(self):
+        """Pre-round-N baseline: the epoch check matches E0 (the delete
+        doesn't touch the Season's lifecycle material the SAME way an
+        archive does -- it removes the row entirely, and the check already
+        ran before the delete lands here by construction), the simulated
+        read runs, and it observes the Season GONE -- exactly the same-
+        process delete repro the review named as remaining constructible."""
+        out = self._race(use_version_check=False)
+        self.assertTrue(out["matched"], out)
+        self.assertTrue(out["produce_ran"], out)
+        self.assertIsNone(out["produce_saw_season"], out)
+        self.assertTrue(out["served"], out)  # the defect: served anyway
+
+    def test_version_checked_discards_the_selected_season_delete_repro(self):
+        """Round-N finding 1's fix: `delete_season` (design §3 row 6) calls
+        `epoch_fence_acquire_exclusive`, which now bumps the SAME persisted
+        counter on EVERY backend including Memory. The reader's before/after
+        samples disagree, so the response is discarded rather than served
+        -- closing the repro without any lock ever crossing the simulated
+        read."""
+        out = self._race(use_version_check=True)
+        self.assertTrue(out["matched"], out)
+        self.assertTrue(out["produce_ran"], out)
+        self.assertIsNone(out["produce_saw_season"], out)
+        self.assertFalse(
+            out["served"],
+            f"a selected-Season delete landed inside the read's window and "
+            f"must be caught by the version check: {out}")
 
 
 # =========================================================================
