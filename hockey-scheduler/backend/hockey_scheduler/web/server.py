@@ -55,6 +55,7 @@ from .authz import authorize, required_permission
 from ..api import v1_setup_adapter as _v1
 from ..api import v2_setup_projection as _v2p
 from .rate_limit import LoginThrottle, RateLimiter
+from .route_registry import REGISTRY
 from .scope import can_read_private_game_data, own_team_id, scope_violation
 from .validation import BodyError, check_body, parse_json_object
 
@@ -211,170 +212,56 @@ _REASSIGN_PARENTS = {
 }
 
 
-# Method-405 routing table (#271). Two ordered lists of compiled path patterns
-# transcribed from the ``do_GET``/``do_POST`` dispatch below (an explicitly
-# scoped near-term list, a bounded child of #202). ``_method_fallback`` uses
-# them to answer an unsupported method with a JSON 405 + a correct ``Allow``
-# header instead of the stdlib's HTML 501. Every method/path claimed here is
-# verified against the real dispatch (see tests/test_write_schemas.py). The
-# game POST pattern enumerates only the ACTUAL write actions, so a read-only
-# subpath (``.../board``) is NOT claimed as POST.
-_GET_ROUTES = [re.compile(p) for p in (
-    r"^/api/demo/overview$",
-    r"^/api/setup/hierarchy$",
-    r"^/api/import/hierarchy-codes$",
-    r"^/api/setup/leagues/[^/]+/teams$",
-    r"^/api/setup/seasons/[^/]+/team-registrations$",
-    r"^/api/onboarding/status$",
-    r"^/api/v2/setup/overview$",
-    r"^/api/v2/setup/seasons/[^/]+/venue-candidates$",  # #369 grant candidates
-    r"^/api/v2/setup/hierarchy$",
-    r"^/api/v2/setup/progress$",
-    r"^/api/v2/setup/programs/[^/]+/teams$",
-    r"^/api/v2/setup/seasons/[^/]+/team-registrations$",
-    r"^/api/v2/setup/seasons/[^/]+/venue-access$",
-    r"^/api/setup/scheduling-policy$",
-    r"^/api/v2/onboarding/status$",
-    r"^/api/bootstrap/status$",
-    r"^/api/status$",
-    r"^/api/health$",
-    r"^/api/readiness$",
-    r"^/api/auth/roles$",
-    r"^/api/auth/accounts$",
-    r"^/api/accounts$",
-    r"^/api/accounts/[^/]+/sessions$",
-    r"^/api/guardians/links$",
-    r"^/api/officials$",
-    r"^/api/players$",
-    r"^/api/reschedule/pending$",
-    r"^/api/officials/[^/]+/availability$",
-    r"^/api/notifications$",
-    r"^/api/notifications/deliveries$",
-    r"^/api/notifications/contacts$",
-    r"^/api/notifications/preferences$",
-    r"^/api/calendar-feeds$",
-    r"^/api/notifications/device-tokens$",
-    r"^/api/me/assignments$",
-    r"^/api/me/player-home$",
-    r"^/api/me/substitute-opportunities/[^/]+$",
-    r"^/api/me/guardian/home$",
-    r"^/api/me/guardian/[^/]+/substitute-opportunities/[^/]+$",
-    r"^/api/standings/[^/]+$",
-    r"^/api/standings/league-season/[^/]+/[^/]+$",
-    r"^/api/public/schedule$",
-    r"^/api/public/standings/[^/]+$",
-    r"^/api/public/standings/league-season/[^/]+/[^/]+$",
-    r"^/api/public/games/[^/]+$",
-    r"^/api/scheduler/drafts$",
-    r"^/api/scheduler/scenarios$",
-    r"^/api/scheduler/scenarios/[^/]+$",
-    r"^/api/auth/me$",
-    r"^/api/context$",
-    r"^/api/context/options$",
-    r"^/api/games/[^/]+(?:/(?:board|lineups|roster-status|roster|substitutes"
-    r"|substitute-candidates|substitute-addable|reschedule|officials"
-    r"|availability-summary))?$",
-)]
-_POST_ROUTES = [re.compile(p) for p in (
-    r"^/api/bootstrap/claim$",
-    r"^/api/auth/login$",
-    r"^/api/auth/logout$",
-    r"^/api/public/calendar-feeds$",
-    r"^/api/notifications/preferences$",
-    r"^/api/officials/[^/]+/availability$",
-    r"^/api/officials/availability/[^/]+/delete$",
-    r"^/api/games/[^/]+/reschedule/[^/]+/respond$",
-    r"^/api/calendar-feeds$",
-    r"^/api/calendar-feeds/[^/]+/revoke$",
-    r"^/api/me/substitute-opportunities/[^/]+/"
-    r"(?:enroll|withdraw|accept-offer|decline-offer)$",
-    r"^/api/me/guardian/[^/]+/games/[^/]+/availability$",
-    r"^/api/me/guardian/[^/]+/substitute-opportunities/[^/]+/"
-    r"(?:accept-offer|decline-offer)$",
-    r"^/api/reset$",
-    r"^/api/demo/(?:reset|load|clear)$",
-    r"^/api/admin/factory-reset/(?:preview|execute)$",
-    r"^/api/demo/add-ice-slot$",
-    r"^/api/context$",
-    # v1 setup writes (#271): EXACT routes transcribed from _handle_setup /
-    # _handle_reassign — a broad `.+` over-claims POST on nonexistent paths
-    # whose real POST is a 404, so the fallback would wrongly answer 405.
-    r"^/api/setup/(?:league|season|level|division|club|team|organization"
-    r"|venue|rink|ice-slot|game|official|player)$",  # entity creates
-    r"^/api/setup/(?:organization|league|season|level|division|club|team"
-    r"|venue|rink|ice-slot|game|player|official)/[^/]+/delete$",  # deletes
-    r"^/api/setup/league/[^/]+/assign-organization$",
-    r"^/api/setup/venue/[^/]+/assign-organization$",
-    r"^/api/setup/rink/[^/]+/assign-venue$",
-    r"^/api/setup/division/[^/]+/assign-level$",
-    r"^/api/setup/team/[^/]+/assign-club$",
-    r"^/api/setup/player/[^/]+/assign-team$",
-    r"^/api/setup/seasons/[^/]+/team-registrations$",
-    r"^/api/setup/seasons/[^/]+/roll-forward$",
-    r"^/api/setup/season-team-registration/[^/]+/assign-division$",
-    r"^/api/setup/season-team-registration/[^/]+/remove$",
-    # v2 setup writes (#271): EXACT routes from _handle_setup_v2 /
-    # _handle_reassign_v2 (the v2 entity/target sets differ from v1).
-    r"^/api/v2/setup/(?:program|season|league|division|club|team|organization"
-    r"|venue|rink|ice-slot|game|official|player)$",  # entity creates
-    r"^/api/v2/setup/(?:organization|program|season|league|league-season"
-    r"|division|club|team|venue|rink|ice-slot|game|official|player)"
-    r"/[^/]+/delete$",  # deletes
-    r"^/api/v2/setup/program/[^/]+/assign-organization$",
-    r"^/api/v2/setup/division/[^/]+/assign-league$",
-    r"^/api/v2/setup/team/[^/]+/assign-club$",
-    r"^/api/v2/setup/team/[^/]+/assign-league$",
-    r"^/api/v2/setup/player/[^/]+/assign-team$",
-    r"^/api/v2/setup/player/[^/]+/update$",
-    r"^/api/v2/setup/player/[^/]+/active$",
-    r"^/api/v2/setup/rink/[^/]+/assign-venue$",
-    r"^/api/v2/setup/venue/[^/]+/assign-organization$",
-    r"^/api/v2/setup/seasons/[^/]+/team-registrations$",
-    r"^/api/v2/setup/seasons/[^/]+/venue-access$",
-    r"^/api/v2/setup/seasons/[^/]+/roll-forward$",
-    r"^/api/v2/setup/seasons/[^/]+/archive$",
-    r"^/api/v2/setup/seasons/[^/]+/reopen$",
-    r"^/api/v2/setup/season-team-registration/[^/]+/assign-league$",
-    r"^/api/v2/setup/season-team-registration/[^/]+/assign-division$",
-    r"^/api/v2/setup/season-team-registration/[^/]+/remove$",
-    r"^/api/v2/setup/season-team-registration/[^/]+/delete$",
-    r"^/api/v2/setup/season-venue-access/[^/]+/remove$",
-    r"^/api/v2/setup/season-venue-access/[^/]+/delete$",
-    r"^/api/import/dry-run$",
-    r"^/api/import/commit/(?:teams-players|officials-availability"
-    r"|rinks-ice-slots)$",
-    r"^/api/scheduler/draft$",
-    r"^/api/scheduler/scenarios$",
-    r"^/api/scheduler/scenarios/[^/]+/commit$",
-    r"^/api/scheduler/commit$",
-    r"^/api/scheduler/drafts/(?:publish|discard)$",
-    r"^/api/setup/ice-availability/(?:preview|commit)$",
-    r"^/api/setup/scheduling-policy$",
-    r"^/api/notifications/deliveries/process$",
-    r"^/api/notifications/deliveries/[^/]+/(?:retry|ignore)$",
-    r"^/api/notifications/contacts$",
-    r"^/api/notifications/contacts/[^/]+/active$",
-    r"^/api/notifications/device-tokens$",
-    r"^/api/notifications/device-tokens/[^/]+/active$",
-    r"^/api/notifications/preferences/[^/]+/active$",
-    r"^/api/accounts$",
-    r"^/api/accounts/[^/]+/active$",
-    r"^/api/accounts/[^/]+/scope$",
-    r"^/api/accounts/[^/]+/sessions/[^/]+/revoke$",
-    r"^/api/guardians/links$",
-    r"^/api/guardians/links/[^/]+/verify$",
-    r"^/api/notifications/read-all$",
-    r"^/api/notifications/[^/]+/read$",
-    r"^/api/officials/assignments/[^/]+/(?:accept|decline|unassign)$",
-    # Game write actions only (NOT the read-only subpaths above): a POST to a
-    # read subpath like ``.../board`` is a 404, never a real route.
-    r"^/api/games/[^/]+/(?:availability|availability/remind|build-roster"
-    r"|roster/select|roster/remove|roster/copy-previous|officials/assign"
-    r"|result|result/approve|publish|move|reschedule/request"
-    r"|reschedule/[^/]+/decide|substitutes/enroll|substitutes/withdraw"
-    r"|substitutes/add-candidate|substitutes/[^/]+/(?:offer|accept|decline"
-    r"|add-to-roster)|roster/lock|roster/unlock|cancel)$",
-)]
+# Method-405 routing table (#202 repair, wiring step; #271 origin). Two lists
+# of compiled path patterns, now DERIVED from route_registry.py rather than
+# hand-transcribed -- there is no longer a second, hand-maintained table that
+# can drift from the dispatch it claims to describe (the failure the #202
+# post-merge review found: 12 routes silently misrepresented as one wildcard
+# in the registry, with nothing checking it against this table or vice
+# versa). ``_method_fallback`` uses these to answer an unsupported method
+# with a JSON 405 + a correct ``Allow`` header instead of the stdlib's HTML
+# 501.
+#
+# The filter reproduces this table's PRE-EXISTING, narrower-than-the-full-
+# registry scope EXACTLY (proven byte-for-byte via HTTP diffing -- see
+# tests/test_route_registry.py and the #202 wiring step's own proof run, not
+# just reasoned about) rather than silently widening it now that a fuller
+# inventory exists:
+#
+#   kind == "route"   excludes kind="static" (the /setup, /mobile, / shells
+#                     and the unconditional static-file tail -- serving a
+#                     static asset was never this table's job; OPTIONS/PUT on
+#                     a static path answers 404 today, not 405+Allow, and
+#                     must keep doing so) and kind="fallthrough" (the
+#                     ``/api/{*0}`` do-nothing tail -- a 404 fallthrough is
+#                     not a route with a policy, #202 repair finding 6) and
+#                     kind="family" (a branch broader than the real routes
+#                     under it -- ``/api/games/{}/{*}`` matches ANY
+#                     sub-action, including nonexistent ones; admitting it
+#                     would over-claim paths this table never admitted
+#                     before. Its concrete siblings -- ``.../result``,
+#                     ``.../publish``, etc -- are each their own
+#                     kind="route" spec and ARE admitted individually, the
+#                     same "ACTUAL write actions only" scope the old
+#                     hand-written game POST pattern documented).
+#   "/api/" prefix    excludes the four ``/calendar/<kind>/<id>.ics`` feeds
+#                     and ``/favicon.ico`` -- live GET routes, but never
+#                     claimed by this table before either. That gap is REAL
+#                     and pre-existing (OPTIONS/PUT on a feed URL 404s
+#                     instead of 405+Allow today) -- left exactly as it is;
+#                     closing it is enforcement, a separate, later step, not
+#                     this wiring change.
+#
+# tests/test_route_registry.py pins this scope from both directions: every
+# admitted pattern still has a matching RouteSpec, and the specific set this
+# table omits (the static shells/tail, the calendar feeds, favicon, the games
+# family) is exactly this set and no more, no less.
+_GET_ROUTES = [re.compile(spec.pattern) for spec in REGISTRY
+              if spec.method == "GET" and spec.kind == "route"
+              and spec.pattern.startswith(r"^/api/")]
+_POST_ROUTES = [re.compile(spec.pattern) for spec in REGISTRY
+               if spec.method == "POST" and spec.kind == "route"
+               and spec.pattern.startswith(r"^/api/")]
 
 
 def _json_default(obj):
