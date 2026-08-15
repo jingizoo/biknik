@@ -191,6 +191,70 @@ class LeagueContextHttpContract:
             with self.store.transaction():
                 self.store.delete_league_season(ls.id)
 
+    def _mutate_after_context_resolved(self, mutate):
+        """Land ``mutate`` right after ``context.current_epoch`` returns —
+        the GET handler's OWN first context-service call, its transaction
+        already fully closed (round-N+2, PR #423).
+
+        The two GET-boundary tests below used to share
+        ``_mutate_after_league_check`` with the POST-boundary tests above,
+        injecting mid-``work()`` by wrapping ``context_scope.
+        authorized_league_ids``. That is still correct for a POST, whose
+        OWN enclosing snapshot is write-capable (``read_only=False``) — the
+        injected write simply joins it, exactly as before this round. It
+        stopped being correct for a GET once a GET's own snapshot became
+        genuinely ``read_only=True`` (``SqlStore.transaction``'s SHARED, not
+        RESERVED, file lock — see that method's own docstring): nesting an
+        ACTUAL WRITE into it is now refused (``SqlStore.transaction``'s own
+        nested-join check) rather than silently reopening the
+        SHARED->RESERVED promotion bug #392 already fixed once — and routing
+        the injected write through a genuinely SEPARATE connection instead
+        does not work either, and is not merely slower: that connection's
+        write cannot complete until the read's SHARED lock releases, but the
+        read cannot release it until the (synchronous, same-thread)
+        injection call returns — a circular wait bounded only by
+        ``HS_CONTEXT_GATE_TIMEOUT``. Measured directly (not estimated) on an
+        earlier revision of this fix that tried exactly that: both tests
+        went from milliseconds to ~11s each, one busy-wait-and-fail per run.
+        That is not a real product deadlock (`_snapshot`'s bounded retry and
+        the busy handler's own bound both still apply, so it does
+        eventually resolve), but it is definitely not what a "land it
+        deterministically" injection point is supposed to do, and it is the
+        same SHAPE of problem this whole round exists to remove,
+        self-inflicted by reusing a same-transaction-shaped injection
+        technique for a transaction that is now genuinely read-only.
+
+        Landing here instead needs no special connection at all: by the
+        time ``current_epoch()`` returns, ``self.store``'s outermost
+        transaction has already committed, so ``mutate``'s own
+        ``self.store.transaction()`` call (inside ``_unbind`` / the
+        caller's own closure) is a fresh, ordinary, OUTERMOST write, exactly
+        as it always was — no promotion bug, no circular wait, no special
+        casing. The window this lands in — between ``current_epoch()``'s
+        snapshot closing and ``get_active_context()``'s separate snapshot
+        opening, both called in that order by the real ``GET /api/context``
+        handler (``web/server.py``) — is a REAL one: `self._lock` is only
+        held DURING each individual `transaction()` call, never across the
+        gap between two independent ones, so a genuinely concurrent writer
+        could interleave exactly here in production. This is the SAME
+        technique ``test_active_context.py``'s ``_mutate_after`` already
+        uses for byte-identical purpose (see that helper's own docstring),
+        and it was not broken by this round — proof that landing a
+        mutation AFTER a snapshot's own transaction closes, rather than
+        nested inside it, remains sound for a read_only=True caller."""
+        original = self.api.context.current_epoch
+        fired = {"done": False}
+
+        def wrapper(*a, **k):
+            r = original(*a, **k)      # GET's own snapshot; its transaction closed
+            fired["done"] = True
+            mutate()                   # concurrent-style commit lands NOW
+            return r
+
+        self.api.context.current_epoch = wrapper
+        self.addCleanup(setattr, self.api.context, "current_epoch", original)
+        return fired
+
     def is_postgres(self):
         """True only where a SECOND, independent connection can commit while a
         first one is paused mid-transaction. Memory/SQLite serialize every
@@ -943,15 +1007,23 @@ class LeagueContextHttpContract:
         self.assertIsNone(rendered["league_id"], rendered)
 
     def test_get_is_snapshot_consistent_at_its_league_boundary(self):
-        """The READ path gets the same treatment: a mutation landing inside the
-        resolve window must still yield a consistent payload, and must never
-        rewrite the saved preference."""
+        """The READ path gets the same treatment: a mutation landing right
+        after this GET's own context resolution must still leave a
+        consistent payload, and must never rewrite the saved preference.
+
+        Injected via ``_mutate_after_context_resolved`` (round-N+2, PR
+        #423), not the mid-``work()`` ``_mutate_after_league_check`` the
+        POST-boundary tests above use — a GET's own snapshot is now
+        genuinely ``read_only=True``, and nesting a write into it is no
+        longer sound; see that helper's own docstring for why, and for why
+        this is still a real race window, not a weaker stand-in for one."""
         admin = self._login("admin")
         pid, sid, lid = self._program_season_league()
         self._req("POST", "/api/context",
                   {"program_id": pid, "season_id": sid, "league_id": lid},
                   opener=admin)
-        fired = self._mutate_after_league_check(lambda: self._unbind(lid, sid))
+        fired = self._mutate_after_context_resolved(
+            lambda: self._unbind(lid, sid))
 
         status, resp = self._req("GET", "/api/context", opener=admin)
         self.assertTrue(fired["done"], "barrier never engaged — vacuous race")
@@ -962,7 +1034,11 @@ class LeagueContextHttpContract:
 
     def test_revocation_at_the_get_league_boundary(self):
         """The 4th boundary leg: revocation against a READ. Completes
-        {unbind, revocation} x {GET, POST} at the validate->render seam."""
+        {unbind, revocation} x {GET, POST} at the validate->render seam.
+
+        Injected via ``_mutate_after_context_resolved`` (round-N+2, PR
+        #423) — same reasoning as
+        ``test_get_is_snapshot_consistent_at_its_league_boundary`` above."""
         fx = self._transfer_scenario()
         official = self._account("off_getrace", Role.OFFICIAL,
                                  {"official_id": fx["oid"]})
@@ -978,7 +1054,7 @@ class LeagueContextHttpContract:
                 for a in assignments:
                     self.store.remove_official_assignment(a.id)
 
-        fired = self._mutate_after_league_check(revoke)
+        fired = self._mutate_after_context_resolved(revoke)
         status, resp = self._req("GET", "/api/context", opener=official)
 
         self.assertTrue(fired["done"], "barrier never engaged — vacuous race")
