@@ -52,6 +52,7 @@ from ..domain.errors import (
     ConcurrencyConflictError, NotFoundError, ValidationError)
 from . import context_scope
 from .context_epoch import context_epoch as _epoch_hash
+from .epoch_fence import user_fence_key
 from .league_scope import exact_league_season_or_conflict
 
 # The context authorization + selection runs under one SERIALIZABLE snapshot so a
@@ -690,7 +691,70 @@ class ContextService:
         This never CREATES a binding: an unbound pair is refused, and binding a
         League to a Season stays the authorized, audited job of
         ``setup_service.create_league_season``.
+
+        UNCHANGED three-tuple contract (PR #423): every existing caller —
+        production and the ~60 call sites across
+        ``tests/test_league_context_canonical.py``,
+        ``tests/test_active_context_league.py`` and
+        ``tests/test_league_context_races.py`` — unpacks exactly
+        ``(program, season, league)``. See :meth:`set_with_league_and_epoch`
+        for the epoch-returning variant the facade uses; this method is now a
+        thin wrapper over the same underlying work so the two can never drift
+        apart, and drops the fourth element rather than changing this
+        widely-depended-on shape.
         """
+        program, season, league, _epoch = self._set_with_league_locked(
+            user_id, role, scope, program_id, season_id, league_id)
+        return program, season, league
+
+    def set_with_league_and_epoch(self, user_id: Optional[str], role, scope,
+                                  program_id, season_id, league_id=None):
+        """Same as :meth:`set_with_league`, but ALSO returns the epoch
+        derived from the SAME snapshot as the write (PR #423 design §8.1) —
+        ``(program, season, league, epoch)``.
+
+        NOT currently called by the facade's ``set_active_context``
+        (honest correction: an earlier revision of this docstring claimed
+        it was — it is not; ``api/service.py``'s ``set_active_context``
+        still calls plain :meth:`set_with_league` and the HTTP handler
+        still derives the response epoch via a SEPARATE, later
+        ``current_epoch()`` call, exactly as before this PR). That second,
+        separate read is still fully covered IN-PROCESS by the kept
+        ``CONTEXT_GATE.exclusive(user_id)`` wrap at the HTTP call site
+        (unchanged — see ``web/server.py``'s own comment there for why it
+        was kept rather than deleted: the owner's explicit instruction to
+        preserve Phase-A and everything that depends on it, which a second
+        writer-side caller of ``CONTEXT_GATE.exclusive`` is not, but whose
+        removal here would leave nothing left to consult the arrival
+        tickets Phase-A registers), so the race this method exists to
+        close is closed for two switches racing WITHIN one process. It is
+        NOT closed for two switches for the same user racing ACROSS two
+        independent processes — ``CONTEXT_GATE`` cannot coordinate across
+        processes at all, and the cross-process fence this PR adds is only
+        held for the WRITE itself (via :meth:`_set_with_league_locked`'s
+        own ``epoch_fence_acquire_exclusive`` call, taken either way,
+        whether reached from here or from :meth:`set_with_league`), not
+        across the HTTP handler's second, separate read. This is a
+        narrow, stated residual gap (a same-user double-switch race
+        across replicas), not the primary cross-process reader/writer
+        ordering this redesign targets — see the PR's own reporting for
+        the full account. This method exists, tested and correct, for a
+        future caller that wants the fold (a new HTTP call site, or a
+        ``set_active_context`` return-shape change) without re-deriving
+        this logic; wiring it in was judged higher-risk than its benefit
+        justified this round (``set_active_context`` has ~200 existing
+        callers expecting its current dict-only return shape)."""
+        return self._set_with_league_locked(
+            user_id, role, scope, program_id, season_id, league_id)
+
+    def _set_with_league_locked(self, user_id: Optional[str], role, scope,
+                                program_id, season_id, league_id=None):
+        """Shared implementation for :meth:`set_with_league` /
+        :meth:`set_with_league_and_epoch` — always returns the full
+        ``(program, season, league, epoch)`` four-tuple; the two public
+        methods differ only in whether they drop the epoch, so the
+        validation/write/epoch-derivation logic exists in exactly one
+        place."""
         if not user_id:
             raise ValidationError(
                 "A signed-in user is required to set a working context.")
@@ -699,6 +763,15 @@ class ContextService:
                                   {"reason": "field_required"})
 
         def work():
+            # PR #423: the epoch fence's EXCLUSIVE hold, FIRST — before any
+            # read or lock below, matching the design's general "truly first"
+            # placement (§4.2/§4.4/§8.1). Per-user key: this writer already
+            # holds the affected account's own id, so it is row 1 of the
+            # design's per-user class, ordered against a scoped read's shared
+            # hold on the SAME key (``web/server.py``'s
+            # ``_read_under_context_gate``). Auto-released at this
+            # ``_snapshot``'s commit/rollback.
+            self.store.epoch_fence_acquire_exclusive(user_fence_key(user_id))
             # `sid` is a LOCAL working copy of the requested season_id, never a
             # rebinding of the enclosing parameter. Two reasons, both real:
             # assigning the closure variable would make Python treat it as local
@@ -764,11 +837,24 @@ class ContextService:
             # so a concurrent unbind / archive / revocation / competing context
             # write either orders wholly before this (and is seen, and refuses)
             # or wholly after it — never a half-applied or stale tuple.
+            generation = self._next_generation_locked(user_id)
             self.store.set_active_context(ActiveContext(
                 id=user_id, program_id=program_id, season_id=sid,
                 updated_at=self.clock(), league_id=league_id,
-                generation=self._next_generation_locked(user_id)))
-            return (_detached(program), _detached(season), _detached(league))
+                generation=generation))
+            # PR #423 (design §8.1): the RESPONSE epoch, computed HERE, in the
+            # SAME snapshot as the write — not a second, separate
+            # `current_epoch()` call after commit. `server.py`'s own comment
+            # at the call site explains why a second call was needed before
+            # this fold existed: a second concurrent switch for the same user
+            # could otherwise land between the write and that second read and
+            # hand back an epoch for a selection this caller never asked for.
+            # Folding it into one snapshot makes "same transaction as the
+            # write" literally true for the epoch this response carries,
+            # rather than approximately true via the caller's own gate.
+            epoch = _epoch_hash(user_id, generation, program, season, league)
+            return (_detached(program), _detached(season), _detached(league),
+                    epoch)
 
         return self._snapshot(work)
 
@@ -794,7 +880,35 @@ class ContextService:
         None). Carrying one over would leave a League bound to a Program/Season
         it may not belong to — the one state the League axis must never reach.
         Callers that want to preserve or set a League use
-        :meth:`set_with_league`."""
+        :meth:`set_with_league`.
+
+        UNCHANGED two-tuple contract (PR #423): every existing caller (all in
+        ``tests/`` — the facade's ``set_active_context`` always routes
+        through :meth:`set_with_league`, even for a two-axis body, per
+        ``api/service.py``'s own docstring) unpacks exactly
+        ``(program, season)``. See :meth:`set_and_epoch` for the
+        epoch-returning variant."""
+        program, season, _epoch = self._set_locked(
+            user_id, role, scope, program_id, season_id)
+        return program, season
+
+    def set_and_epoch(self, user_id: Optional[str], role, scope,
+                      program_id, season_id):
+        """Same as :meth:`set`, but ALSO returns the epoch derived from the
+        SAME snapshot as the write (PR #423 design §8.1) —
+        ``(program, season, epoch)``. Not currently called in production —
+        the facade's ``set_active_context`` always routes through plain
+        :meth:`set_with_league` (see that method's own corrected docstring:
+        its epoch-returning twin, :meth:`set_with_league_and_epoch`, is ALSO
+        not wired to the facade this round). Added for symmetry and so a
+        future two-axis-only HTTP path gets the same same-snapshot epoch
+        guarantee without re-deriving this logic."""
+        return self._set_locked(user_id, role, scope, program_id, season_id)
+
+    def _set_locked(self, user_id: Optional[str], role, scope,
+                    program_id, season_id):
+        """Shared implementation for :meth:`set` / :meth:`set_and_epoch` —
+        always returns ``(program, season, epoch)``."""
         if not user_id:
             raise ValidationError(
                 "A signed-in user is required to set a working context.")
@@ -803,6 +917,9 @@ class ContextService:
                                   {"reason": "field_required"})
 
         def work():
+            # PR #423: same placement/reasoning as set_with_league's own
+            # fence acquisition above — truly first, per-user key.
+            self.store.epoch_fence_acquire_exclusive(user_fence_key(user_id))
             programs = context_scope.authorized_program_ids(
                 self.store, role, scope, user_id)
             program = (self.store.get_program(program_id)
@@ -819,11 +936,18 @@ class ContextService:
                 if season_id not in seasons or season is None:
                     raise NotFoundError("Season not found or not accessible.",
                                         {"reason": "season_not_accessible"})
+            generation = self._next_generation_locked(user_id)
             self.store.set_active_context(ActiveContext(
                 id=user_id, program_id=program_id, season_id=season_id,
                 updated_at=self.clock(),
-                generation=self._next_generation_locked(user_id)))
-            return _detached(program), _detached(season)
+                generation=generation))
+            # PR #423 (design §8.1): the two-axis form has no League, so the
+            # epoch hash's league argument is simply None -- context_epoch
+            # already treats a None league as "no League selected"
+            # (context_epoch.py), the same value resolve()/set() without a
+            # League always produced.
+            epoch = _epoch_hash(user_id, generation, program, season, None)
+            return _detached(program), _detached(season), epoch
 
         # Validation + write share ONE serializable snapshot (with bounded retry),
         # so a concurrent revocation is either seen here (rejected non-oracle) or

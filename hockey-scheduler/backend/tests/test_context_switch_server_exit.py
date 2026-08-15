@@ -374,6 +374,24 @@ class ContextGateFixtureBase:
     def _gate(self):
         return self.srv.CONTEXT_GATE
 
+    def _set_epoch_fence_timeout_env(self, value: str):
+        """PR #423: set HS_CONTEXT_GATE_TIMEOUT for the duration of one test,
+        restoring the prior value (or absence) on cleanup -- the env-var
+        half of "the same knob" a `gate.wait_timeout = X` override needs
+        alongside it now that the store-layer epoch fence ALSO reads this
+        var and has no gate object a test could mutate an attribute on
+        directly."""
+        original = os.environ.get("HS_CONTEXT_GATE_TIMEOUT")
+
+        def restore():
+            if original is None:
+                os.environ.pop("HS_CONTEXT_GATE_TIMEOUT", None)
+            else:
+                os.environ["HS_CONTEXT_GATE_TIMEOUT"] = original
+
+        os.environ["HS_CONTEXT_GATE_TIMEOUT"] = value
+        self.addCleanup(restore)
+
     def _assert_gate_is_clean(self, why):
         """No hold, no waiter, no arrival ticket left registered. Polled
         briefly because a request's ``finally`` runs a hair after its response
@@ -1211,11 +1229,24 @@ class ContextSwitchServerExitBase(ContextGateFixtureBase):
         the assertions run. Both wait directions are then driven into the bound
         and observed to hit it:
 
-          * A SWITCH waiting on that read completes anyway, in roughly
-            ``wait_timeout``, and ``stats()["timeouts"]`` goes up — a wedged
-            read cannot lock an operator out of switching context.
+          * A SWITCH waiting on that read is answered in BOUNDED time, in
+            roughly ``wait_timeout`` (now compounded once through the new
+            store-layer fence's OWN bound too — see the env-var note below),
+            and ``stats()["timeouts"]`` goes up — a wedged read cannot lock
+            an operator out FOREVER. PR #423 (design §4.5, deliberate):
+            the answer is now a retryable 409, not a silent 200 — the new
+            fence's writer side fails CLOSED on timeout rather than open,
+            specifically so a writer can never silently readmit the exact
+            TOCTOU the fence exists to close. Bounded-and-actionable, not
+            indefinite, is the property this test actually proves; the
+            OLD gate's silent-success wire shape was never the safety
+            property itself.
           * A LATER scoped read waiting on a switch that never finishes is
-            bounded the same way, and answers rather than hanging.
+            bounded the same way, and answers rather than hanging — this
+            direction is UNCHANGED, because the park in direction 2 sits
+            before the new fence is ever acquired (see that block's own
+            comment), so only the old, unchanged reader-fails-open path is
+            exercised there.
 
         The gate is left empty once the parked participants finally exit, so
         hitting the bound is a HANDLED outcome and not a corrupted one.
@@ -1224,6 +1255,14 @@ class ContextSwitchServerExitBase(ContextGateFixtureBase):
         original_timeout = gate.wait_timeout
         gate.wait_timeout = 0.4
         self.addCleanup(setattr, gate, "wait_timeout", original_timeout)
+        # PR #423: the store-layer epoch fence reads HS_CONTEXT_GATE_TIMEOUT
+        # directly (it has no gate OBJECT to mutate an attribute on) and is
+        # ALSO held by the same parked read this test never releases, so it
+        # must be given the SAME bound as `gate.wait_timeout` above or this
+        # test's own PATIENCE budget is exceeded by a mechanism the test
+        # predates -- see services/epoch_fence.py / SqlStore.epoch_fence_
+        # acquire_shared's own docstring for why this is "the same knob."
+        self._set_epoch_fence_timeout_env("0.4")
 
         fx = self._program_with_two_seasons("Bound")
         username, user_id = self._operator("bound")
@@ -1254,7 +1293,39 @@ class ContextSwitchServerExitBase(ContextGateFixtureBase):
             self.assertFalse(st.is_alive(),
                              "the switch never completed — a wedged read "
                              "blocked it INDEFINITELY")
-            self.assertEqual(switch["result"][0], 200, switch["result"][1])
+            # PR #423 (design §4.5, deliberate and documented): the OLD gate
+            # alone fails OPEN on both sides, so a switch racing a wedged
+            # read used to succeed silently once its bound passed. The new
+            # store-layer fence is asymmetric ON PURPOSE — reader fails
+            # open, WRITER fails CLOSED (raises, retryable) — because a
+            # writer failing open would silently readmit the exact TOCTOU
+            # the fence exists to close, for every concurrent reader, which
+            # the design's own §4.5 judges a worse trade than a bounded,
+            # actionable 409 for the rare pathological case this test
+            # forces. The switch is NOT locked out INDEFINITELY (this
+            # assertion, above, still holds: it completes, bounded, and
+            # this is the numeric bound checked below) — it is told,
+            # correctly, that the read it raced is still live and to retry.
+            #
+            # ONLY on the backend where the fence is REAL (PostgreSQL):
+            # Memory's epoch_fence_acquire_exclusive is an unconditional
+            # no-op (self._lock already covers the whole transaction body —
+            # see that method's own docstring) and file-backed SQLite's is
+            # ALSO a no-op (the deadlock hazard documented on
+            # epoch_fence_acquire_shared), so on those two backends this
+            # exact race is governed ENTIRELY by the OLD, unchanged gate,
+            # which still fails open on both sides — no behavior change,
+            # still 200, exactly as before this PR.
+            is_postgres = bool(self.STORE_URL) and self.STORE_URL.startswith(
+                ("postgres://", "postgresql://"))
+            if is_postgres:
+                self.assertEqual(switch["result"][0], 409, switch["result"][1])
+                self.assertEqual(
+                    switch["result"][2].get("error", {}).get("details", {})
+                        .get("retryable"),
+                    True, switch["result"][1])
+            else:
+                self.assertEqual(switch["result"][0], 200, switch["result"][1])
             self.assertGreaterEqual(
                 elapsed, gate.wait_timeout * 0.5,
                 "the switch did not actually wait — the bound was not the "
@@ -1397,6 +1468,9 @@ class ContextSwitchServerExitBase(ContextGateFixtureBase):
         original_timeout = gate.wait_timeout
         gate.wait_timeout = 4.0
         self.addCleanup(setattr, gate, "wait_timeout", original_timeout)
+        # PR #423: see the identical note in
+        # test_a_waiter_cannot_block_forever_on_a_read_that_never_returns.
+        self._set_epoch_fence_timeout_env("4.0")
 
         fx = self._program_with_two_seasons("Cross")
         alice_name, alice_id = self._operator("cross_alice")
