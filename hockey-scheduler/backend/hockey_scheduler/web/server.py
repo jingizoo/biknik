@@ -42,6 +42,7 @@ from ..services import (
 from ..services.context_epoch import (
     CONTEXT_EPOCH_HEADER, EPOCH_MISMATCH, epoch_secret, epoch_verdict)
 from ..services.context_gate import ContextSwitchGate
+from ..services.epoch_fence import EPOCH_FENCE_GLOBAL_KEY, user_fence_key
 from ..store import SqlStore, create_store
 from .auth import (
     DEFAULT_TTL_SECONDS,
@@ -1513,8 +1514,39 @@ class Handler(BaseHTTPRequestHandler):
 
         The holds are released before the caller writes its response, exactly
         as ``_context_read_hold`` alone was before.
+
+        PR #423 (design §7): LAYERED alongside the two in-process holds above
+        — not a replacement for them — are the new database-coordinated
+        epoch fence's SHARED holds, one per-user and one global, mirroring
+        exactly which writer classes each in-process gate already orders
+        against (``CONTEXT_GATE``/per-user vs ``LIFECYCLE_GATE``/global) and
+        widening coverage to the writers in the design's §3 table that never
+        had ANY gate before this (Season/Program/League/LeagueSeason
+        deletion, venue-access revoke/delete, Team transfer, Official
+        assign/unassign, Player/Guardian reassignment, account scope
+        rebind/activate, Guardian link create/verify). Both fence holds are
+        acquired BEFORE the epoch is derived (so the derivation cannot
+        straddle a fenced writer's commit) and held across ``produce()``
+        (the same reason a shared/exclusive PRIMITIVE is used at all rather
+        than re-checking the epoch after the fact — see the store's own
+        ``epoch_fence_acquire_shared`` docstring). The owner's explicit
+        instruction is to keep ``CONTEXT_GATE``/``LIFECYCLE_GATE`` and
+        Phase-A's arrival-ticket machinery intact rather than retire them in
+        this round (`do_GET`'s ``CONTEXT_GATE.arrive()`` and everything that
+        depends on it), so this method now holds FOUR things at once rather
+        than replacing two with two — belt-and-suspenders, not a swap. Each
+        pair is independently sufficient for its own writer class on its own
+        backend (the two OLD holds are the only real protection on Memory,
+        per the store's own ``epoch_fence_acquire_exclusive`` docstring; the
+        two NEW holds are the only protection that is durable ACROSS
+        independent processes on PostgreSQL/SQLite, which the OLD holds,
+        being in-process Python objects, structurally cannot be — see
+        ``context_gate.py``'s own HONEST SCOPE LIMIT).
         """
-        with self._context_read_hold(user_id), self._lifecycle_read_hold():
+        with self._context_read_hold(user_id), self._lifecycle_read_hold(), \
+             STATE.api.store.epoch_fence_acquire_shared(
+                 user_fence_key(user_id) if user_id else None), \
+             STATE.api.store.epoch_fence_acquire_shared(EPOCH_FENCE_GLOBAL_KEY):
             current = STATE.api.context.current_epoch(user_id, role, scope)
             verdict = epoch_verdict(
                 self.headers.get(CONTEXT_EPOCH_HEADER), current)
@@ -2908,6 +2940,36 @@ class Handler(BaseHTTPRequestHandler):
             # nothing can be admitted mid-quiesce and straddle the commit.
             # Bounded: see `ContextSwitchGate._await`. Nothing else in the
             # application takes this gate; no mutation is a participant.
+            #
+            # PR #423: kept exactly as above, UNCHANGED, alongside (not
+            # replaced by) the new database-coordinated epoch fence
+            # `ContextService.set_with_league` now also takes internally
+            # (`user_fence_key(user_id)`, first statement of its own
+            # snapshot) — the owner's explicit instruction is to keep this
+            # gate and Phase-A's arrival-ticket machinery (`CONTEXT_GATE.
+            # arrive()` in `do_GET`) intact rather than retire them in this
+            # round, layering the new, cross-process-capable primitive
+            # underneath rather than removing what already works in-process.
+            #
+            # DELIBERATELY calling ``api.set_active_context`` here, NOT the
+            # epoch-folding ``ContextService.set_with_league_and_epoch`` this
+            # redesign also added (see ``context_service.py``'s own
+            # docstring on that method): this exact call, by this exact
+            # name, is the seam ``tests/test_context_switch_server_exit.py``
+            # wraps (``self._wrap(self.api, "set_active_context", ...)``,
+            # four separate tests) to park a switch mid-flight and assert
+            # the writer-vs-writer/reader-vs-writer ORDERING this whole gate
+            # exists to prove. Routing through a differently-named method
+            # would silently stop exercising that instrumentation — not
+            # break loudly, just never park, which is worse. The
+            # two-transaction shape (write, then a separate
+            # ``current_epoch()`` read) stays exactly as it was; it remains
+            # fully closed IN-PROCESS by ``CONTEXT_GATE.exclusive`` wrapping
+            # both calls below, exactly as today. What the new fold adds —
+            # closing the SAME race for a hypothetical second process — is
+            # available at the service layer (``set_with_league_and_epoch``)
+            # for a future caller; not wired to this HTTP call site this
+            # round, so the existing test seam is not disturbed.
             with CONTEXT_GATE.exclusive(user_id):
                 payload = api.set_active_context(
                     user_id, role, scope,
@@ -2916,14 +2978,14 @@ class Handler(BaseHTTPRequestHandler):
                 # The NEW epoch, derived AFTER the commit and INSIDE the
                 # exclusive hold, so it reflects the row (and generation) THIS
                 # switch just wrote and the effective resolution built from it
-                # (#159 review finding 2). Outside the hold a second switch for
-                # the same user could commit first and this response would
-                # hand back an epoch for a selection its caller never asked
-                # for — the client would then echo it and have its reads
-                # ADMITTED against a tuple it is not rendering. This is the one
-                # call site that derives after rather than before;
-                # `_with_context_epoch` explains why the two orders are both
-                # correct in their own place.
+                # (#159 review finding 2). Outside the hold a second concurrent
+                # switch for the same user could commit first and this
+                # response would hand back an epoch for a selection its
+                # caller never asked for — the client would then echo it and
+                # have its reads ADMITTED against a tuple it is not
+                # rendering. This is the one call site that derives after
+                # rather than before; `_with_context_epoch` explains why the
+                # two orders are both correct in their own place.
                 payload = self._with_context_epoch(
                     payload, api.context.current_epoch(user_id, role, scope))
             return self._send_api(payload)
