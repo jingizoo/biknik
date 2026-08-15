@@ -1422,7 +1422,7 @@ this read was rendered under* — travels **on the read itself**.
 
 | what | where | carries |
 | --- | --- | --- |
-| `context_epoch` | `GET /api/context`, `GET /api/context/options`, the `POST /api/context` response | the opaque epoch of the caller's currently persisted `ActiveContext` row **and the selected Season's persisted lifecycle** (below) |
+| `context_epoch` | `GET /api/context`, `GET /api/context/options`, the `POST /api/context` response | the opaque epoch of the caller's EFFECTIVE resolved `(program, season, league)` tuple, the persisted per-user switch generation, **and the selected Season's persisted lifecycle** (below) — never the raw saved row (§ below) |
 | `X-Context-Epoch` | every context-scoped GET the client enrols | the epoch that read was **rendered under** |
 
 `services/context_epoch.py` derives the token; `Handler._read_under_context_gate`
@@ -1481,11 +1481,35 @@ its input is persisted state rather than process memory.
 
 #### What the token is, and what it is not
 
-* **Stable** for a given row — the same row hashes identically in any process,
+The material is NOT the raw `ActiveContext` row. An early revision hashed the
+row's own fields (`program_id`/`season_id`/`league_id`/`updated_at`) directly,
+and a #159 review (findings 2+5) rejected that shape on two independent
+grounds, both fixed in the current design (`services/context_epoch.py`):
+
+* **The row is the wrong question.** What a client actually renders is the
+  EFFECTIVE resolution (`ContextService.resolve_with_league`), which can
+  differ from the saved row whenever the saved Program/Season is deleted or no
+  longer authorized and a deterministic fallback stands in — so the material
+  is the EFFECTIVE `(program, season, league)` tuple, never the raw saved ids.
+* **`updated_at` is not a reliable "moved" signal.** Two commits landing
+  inside the same wall-clock tick (a coarse system clock, load, a virtualized
+  host) can share a timestamp, which would let an A → B → A round trip reuse
+  an epoch — silently readmitting a read from before the round trip, exactly
+  the non-evictable-cancellation guarantee this mechanism exists to uphold.
+  The material instead carries the persisted per-user switch **generation**: a
+  MONOTONIC counter `ContextService.set`/`set_with_league` read and write
+  current+1 on every commit, inside the same transaction as the write. A → B →
+  A therefore moves the generation twice, and the epoch twice, even though the
+  effective tuple ends where it began — with no wall-clock dependency at all.
+
+With that corrected, what the token is:
+
+* **Stable** for a given input — the same `(user_id, generation, program,
+  season, league)` hashes identically in any process and across restarts,
   which a per-process counter or nonce could not do.
-* **Moves on every switch, including a switch back to the same tuple**, because
-  `set_with_league` rewrites `updated_at` on every commit. A tuple-derived token
-  would have silently readmitted a read from before an A → B → A round trip.
+* **Moves on every switch, including a switch back to the same tuple**,
+  because the generation above does — see that bullet for why this no longer
+  depends on the clock at all.
 * **Moves on the selected Season's lifecycle** — archive and reopen each move
   it, though the row is untouched, because the material also carries
   `season_guard.season_is_read_only` for the selected Season plus its raw
@@ -1493,29 +1517,42 @@ its input is persisted state rather than process memory.
   distinct tokens; a full archive → reopen round trip **restores** the token,
   deliberately — `archived_at` returns to `None`, so a read rendered before the
   archive is readmitted to the exact ceiling it was rendered under.
-* **Opaque**: BLAKE2s over the length-prefixed row, so no user, Program, Season,
-  League or timestamp can be read out of it. Honest limit — it is a keyless
-  digest, so a party who already holds the whole row can recompute and confirm
-  it; that party supplied everything the token could disclose, and confirming it
-  buys nothing (below).
+* **Opaque AND unforgeable without a deployment secret** (#159 review finding
+  4): BLAKE2s over the length-prefixed material, so no user id, Program,
+  Season, League id or generation can be READ OUT of a token — and, unlike an
+  earlier keyless revision, the digest is additionally KEYED with a
+  deployment-wide secret (`context_epoch.epoch_secret`), so it also cannot be
+  RECOMPUTED by a party who does not hold that secret. A keyless digest let a
+  low-entropy id space (a small sequential `user_id` range) be dictionary-
+  hashed to correlate a leaked token back to an account with no authority
+  needed at all; keying closes exactly that attack. See
+  `services/context_epoch.py`'s own NON-DISCLOSURE section for the precise
+  claim.
 * **Confers no authority.** A comparison can only ever *discard*. Echo a stale
   token and you throw away your own read; echo the current token on a genuinely
   stale question and you get today's 404, unchanged; echo garbage and you throw
   away your own read; echo another operator's token and you throw away your own
   read. It cannot widen scope, cannot identify, and cannot serve a byte the
   ceiling would have refused.
-* **One honest degradation:** two switches inside a single clock tick would
-  share an `updated_at` and therefore a token, and a read rendered under the
-  first would not be discarded. It would then be judged by the ceiling — the
-  pre-#159 behaviour: a missed improvement, never a wrong answer.
 
 **The ceiling is untouched, again.** `api/service.py` is not in this change at
 all; the epoch is attached to the three context payloads and compared in
 `web/server.py`. The sibling-Season and nonexistent-Season refusals stay
 byte-identical to each other and to `main`.
 
-**Not a per-process limit, unlike the gate.** The epoch holds no locks and no
-memory, so a token issued by one replica compares correctly on another.
+**Not a per-process limit, IN THIS NARROW SENSE, unlike the gate.** The epoch
+TOKEN ITSELF holds no locks and no memory — it is a pure function of shared,
+persisted state and a deployment-wide secret — so a token issued by one
+replica compares correctly on another. That is a narrower claim than "the
+whole mechanism is cross-process for free," and PR #423 is the record of the
+gap between them: the in-process gates (`ContextSwitchGate`/`CONTEXT_GATE`/
+`LIFECYCLE_GATE`, § below) that decide WHEN it is safe to compare the token
+against a dependent read honestly are per-process, and #423 added a
+database-coordinated fence (real advisory locks plus a persisted version
+counter, `services/epoch_fence.py`) specifically to extend that ordering
+across replicas on PostgreSQL, with a narrower, documented same-process-only
+fallback on SQLite/Memory. See `web/server.py`'s `Handler._read_under_context_
+gate` for where the two layers meet.
 
 #### The SECOND source of the same 404 — the Season lifecycle — and why it is in the material
 

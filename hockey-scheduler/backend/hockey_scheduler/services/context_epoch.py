@@ -180,42 +180,70 @@ generation, AND cannot be correlated back to the account that produced it
 without the secret.
 
 WHERE IT IS COMPARED, and why that placement is load-bearing in both
-directions. ``ContextService.run_scoped_read`` derives the CURRENT epoch and
+directions. There is no ``ContextService.run_scoped_read`` — that name
+describes a revision that was BUILT AND REJECTED (see ``ContextService``'s own
+NOTE on #159 review finding 3, ``services/context_service.py``): wrapping the
+comparison and the dependent read in one ``store.transaction()`` holds the
+store's process-wide lock across whatever ``produce()`` does, which measurably
+DEADLOCKED a real test harness and would, in production, stall every other
+request touching the store for the duration of one slow dependent read. The
+comparison instead happens in ``web/server.py``'s
+``Handler._read_under_context_gate``, which derives the CURRENT epoch and
 compares it to the echo, and then — if and only if it matches or nothing was
-echoed — calls the dependent read, ALL INSIDE ONE SNAPSHOT (#159 review
-finding 3):
-  * ONE SNAPSHOT, so a lifecycle mutation (an archive, a reopen) or a
-    competing context switch cannot land BETWEEN the comparison and the
-    dependent read: either the snapshot observes the mutation (and the
+echoed — calls the dependent read, ordered by GATES rather than a shared
+database transaction:
+  * ``Handler._context_read_hold`` (per-user) and ``_lifecycle_read_hold``
+    (global) — the SAME in-process ``ContextSwitchGate`` shape #415/#159 built
+    — are held across both the comparison and the dependent read, so a
+    lifecycle mutation or a competing context switch that takes either gate
+    cannot land BETWEEN them: either it is ordered wholly before (and the
     freshly-derived current epoch already reflects it, so a stale echo
-    correctly mismatches) or it does not (and the dependent read is judged
-    against the exact state the comparison just matched) — never a hybrid
-    where the check passed against one state and the read observed another.
-    A post-service comparison is NOT equivalent: by the time it could run, the
+    correctly mismatches) or wholly after (and the dependent read is judged
+    against the exact state the comparison just matched) — never a hybrid. A
+    post-service comparison is NOT equivalent: by the time it could run, the
     dependent read may already have made an authorization or privacy decision
     on stale data.
-  * BEFORE the service call, so a discarded read never reaches
+  * PR #423 LAYERS a database-coordinated fence alongside those two gates —
+    ``STATE.api.store.epoch_fence_acquire_shared`` for the SAME per-user and
+    global keys, real advisory-lock holds on PostgreSQL (the only backend an
+    independent second process can exist on), documented no-ops on
+    SQLite/Memory — widening the writers ordered against to the full set in
+    ``services/epoch_fence.py``'s own table, and extending the guarantee
+    ACROSS replicas rather than only within one process. A shared hold that
+    could not be confirmed (a bounded PostgreSQL wait that timed out) is
+    treated exactly like a mismatch — see that method's own docstring for the
+    round-N review finding 2 fix.
+  * A ROUND-N review finding 1 addition closes what the gates and the
+    PostgreSQL-only advisory lock structurally cannot: a persisted version
+    counter, keyed the SAME way, is sampled before the comparison and again
+    after the dependent read returns, with NO LOCK held across that call at
+    all (the AB-BA deadlock a real SQLite lock was measured to produce is
+    exactly what this avoids). Every writer bumps it as part of its own
+    transaction; if the two samples disagree, some writer's whole transaction
+    landed inside the window regardless of backend, and the (already-computed)
+    result is discarded rather than served.
+  * BEFORE the service call in every case, so a discarded read never reaches
     ``api/service.py`` and the exact-Season ceiling is never evaluated for it.
     That is what lets the answer disclose nothing in EITHER direction — a
     discard looks identical whether the named Season is a sibling of the
     selection, is archived, or never existed.
-  * The snapshot is taken AFTER ``Handler._context_read_hold``'s shared gate
-    hold, so a read that arrives mid-quiesce has already waited out the switch
-    that registered before it, and therefore reads state as of after that
-    switch committed — never a half-applied one. Arrival ordering for reads
-    ALREADY inside the server is untouched: those hold the gate, the switch
-    waits for them, and their echo still matches.
 
-PER PROCESS? NO — and that is the difference from ``context_gate.py``. The gate
-is honestly per-process because it holds locks. This holds nothing: the epoch is
-a pure function of shared, persisted state (a database row, the objects it
-resolves to, and a deployment-wide configured secret), so a token issued by
-replica A compares correctly on replica B, and a restart mid-flight changes
-nothing. If this application is ever run multi-replica, this half needs no
-re-expression — PROVIDED the deployment secret (:func:`epoch_secret`) is
-configured identically on every replica; see that function's docstring for the
-rotation story, which is the one way this property can be temporarily broken
-on purpose.
+THIS MODULE'S OWN TOKEN IS NOT PER-PROCESS, which is not quite the same claim
+as "the mechanism that compares it is not per-process" — the gates above
+honestly ARE per-process (they hold Python locks; see ``context_gate.py``'s
+own HONEST SCOPE LIMIT), and that is exactly why PR #423 added the database
+fence rather than declaring the gates sufficient. What THIS module's
+``context_epoch()`` guarantees is narrower and unconditional: it is a pure
+function of shared, persisted state (a database row, the objects it resolves
+to, and a deployment-wide configured secret) with no in-memory component of
+its own, so a token issued by replica A compares correctly on replica B and a
+restart mid-flight changes nothing — PROVIDED the deployment secret
+(:func:`epoch_secret`) is configured identically on every replica; see that
+function's docstring for the rotation story, which is the one way this
+property can be temporarily broken on purpose. Whether a STALE token gets
+CAUGHT before a torn read is served is the comparison mechanism's job,
+described above and in ``services/epoch_fence.py``/``web/server.py``, not
+this module's.
 
 WHY THE EFFECTIVE SEASON'S LIFECYCLE IS PART OF THE MATERIAL, and not only the
 resolved tuple's ids. The token above answers "has the operator's EFFECTIVE
@@ -277,10 +305,16 @@ anything but the deployment secret, and never calls into ``ContextService`` or
 a store. RESOLVING the effective tuple under one consistent snapshot (findings
 2+3), and INCREMENTING the persisted generation on a write (finding 5), are
 ``ContextService``'s job (``resolve_epoch_state`` / ``_epoch_material_locked``
-/ ``_next_generation_locked`` / ``run_scoped_read``) precisely so this module
+/ ``_next_generation_locked`` / ``current_epoch``) precisely so this module
 can stay a pure function of whatever it is handed — testable without a store,
 a transaction, or a thread, and incapable of quietly acquiring retention logic
 of its own (see ``test_nothing_is_retained_so_nothing_can_be_evicted``).
+Ordering the comparison against a dependent read — deciding WHEN it is safe to
+call ``current_epoch`` and act on the answer — is ``web/server.py``'s
+``Handler._read_under_context_gate``'s job, not this module's or
+``ContextService``'s; see that method's own docstring (and the module
+docstring's WHERE IT IS COMPARED section above) for the gates and the
+database-coordinated fence that do it.
 """
 
 import hashlib
@@ -526,8 +560,8 @@ def context_epoch(user_id, generation, program, season, league) -> str:
 
     A PURE FUNCTION of its five arguments, deliberately: resolving them under
     one consistent snapshot is ``ContextService``'s job
-    (``resolve_epoch_state`` / ``_epoch_material_locked`` /
-    ``run_scoped_read``), and incrementing the generation on a write is
+    (``resolve_epoch_state`` / ``_epoch_material_locked`` / ``current_epoch``),
+    and incrementing the generation on a write is
     ``ContextService._next_generation_locked``'s. This function holds nothing,
     caches nothing, and consults no clock — call it a million times a second
     or once an hour and it answers the same way for the same input, which is
@@ -582,10 +616,12 @@ def epoch_verdict(echoed, current) -> str:
     computed.
 
     ``current`` is supplied rather than derived here (#159 review findings
-    2+3): deriving it now requires a role/scope-aware resolution read under
-    the SAME snapshot as any dependent read the caller is about to run, which
-    is ``ContextService.run_scoped_read`` / ``current_epoch``'s job, not a
-    concern this pure comparison needs to know about.
+    2+3): deriving it requires a role/scope-aware resolution
+    (``ContextService.current_epoch``), and ORDERING that derivation against
+    a dependent read the caller is about to run is
+    ``web/server.py``'s ``Handler._read_under_context_gate``'s job — see the
+    module docstring's WHERE IT IS COMPARED section — not a concern this pure
+    comparison needs to know about.
 
     ``EPOCH_ABSENT``   — nothing was echoed. The caller gets exactly the
                          behaviour it gets today; no client is required to
