@@ -76,6 +76,7 @@ from ..services import (
 # #411: the import-context gate must normalize a lookup key EXACTLY as the
 # commit that writes it does, or the gate is bypassable by whitespace (and
 # "NA" would stop meaning "no Club"). Imported verbatim rather than re-spelled.
+from ..services.epoch_fence import EPOCH_FENCE_GLOBAL_KEY, user_fence_key
 from ..services.setup_service import (
     _blank as _import_blank,
     _clean as _import_clean,
@@ -443,6 +444,30 @@ class ApiService:
         "ice_slot": "get_ice_slot_for_update",
         "organization": "get_organization_for_update",
     }
+
+    # PR #423 (design §8.3): the (already hyphen-folded, see
+    # setup_guarded_mutation) kinds whose guarded mutation is epoch-material
+    # — Season/Program/League/LeagueSeason lifecycle or deletion, and the
+    # season_venue_access BRIDGE kind (its Season parent's access grants are
+    # what `context_epoch`'s effective-Season resolution can depend on).
+    # `division` is DELIBERATELY excluded — it is not part of
+    # `context_epoch`'s hashed material and no epoch input traces through it
+    # (see the design's own note at §8.3).
+    #
+    # ALSO, incidentally but by design, covers row 12 (design §8.4,
+    # `transfer_team_to_league`'s `("team","league")` v2 reassignment):
+    # `_V2_REASSIGN_DEST` always adds the DESTINATION League as a second
+    # guarded target for that combo (`web/server.py`'s
+    # `_V2_REASSIGN_DEST[("team","league")] = ("league", "league_id")`, and
+    # a `league_id` is body-required for that exact combo), so `"league"`
+    # being in this set already fences that writer too — no separate
+    # `"team"` entry needed (which would over-broadly fence every OTHER
+    # guarded Team mutation, most of which do not touch `league_id` and are
+    # not epoch-material). Confirmed by `tests/test_epoch_fence.py`'s
+    # ``test_row12_team_league_transfer``, which asserts on this exact path.
+    _EPOCH_FENCE_KINDS = frozenset({
+        "season", "program", "league", "league_season", "season_venue_access",
+    })
 
     # (action, entity_type) pairs a "this user created this record" audit row
     # can legitimately carry, per canonical kind. NOT simply
@@ -1992,6 +2017,24 @@ class ApiService:
     def _guarded_attempt(self, checks, mutation, user_id, role, scope):
         """One all-or-nothing attempt. See ``setup_guarded_mutation``."""
         with self.store.transaction(isolation="SERIALIZABLE"):
+            # PR #423 (design §8.3): the epoch fence's GLOBAL exclusive hold,
+            # gated on whether ANY named target is epoch-material
+            # (`_EPOCH_FENCE_KINDS`) — before #409's own context-error check
+            # immediately below, matching "truly first" (§4.2/§4.4). This ONE
+            # insertion covers Season archive/reopen (ADDITIONALLY to, not
+            # replacing, the existing `LIFECYCLE_GATE.exclusive` wrap at the
+            # `web/server.py` dispatch site — kept intentionally, alongside
+            # this new primitive rather than removed, matching the same
+            # "layer the new fence underneath what already works, in this
+            # round" decision `_read_under_context_gate` documents for
+            # Phase-A) AND closes the confirmed writer-coverage gap for
+            # Season/Program/League/LeagueSeason DELETE and
+            # season-venue-access revoke/delete, none of which had any gate
+            # before this (design §1.3/§3) and which have NO in-process gate
+            # to be additional to.
+            if any(kind in self._EPOCH_FENCE_KINDS
+                  for _index, kind, _record_id, _rule in checks):
+                self.store.epoch_fence_acquire_exclusive(EPOCH_FENCE_GLOBAL_KEY)
             # #409, and FIRST — before any target row is even looked up, so a
             # caller who has chosen nothing learns nothing about which records
             # exist, and before any setup row is LOCKED, so ActiveContext keeps
