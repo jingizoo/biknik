@@ -1533,26 +1533,122 @@ class Handler(BaseHTTPRequestHandler):
         instruction is to keep ``CONTEXT_GATE``/``LIFECYCLE_GATE`` and
         Phase-A's arrival-ticket machinery intact rather than retire them in
         this round (`do_GET`'s ``CONTEXT_GATE.arrive()`` and everything that
-        depends on it), so this method now holds FOUR things at once rather
+        depends on it), so this method now holds SIX things at once rather
         than replacing two with two — belt-and-suspenders, not a swap. Each
-        pair is independently sufficient for its own writer class on its own
-        backend (the two OLD holds are the only real protection on Memory,
-        per the store's own ``epoch_fence_acquire_exclusive`` docstring; the
-        two NEW holds are the only protection that is durable ACROSS
-        independent processes on PostgreSQL/SQLite, which the OLD holds,
-        being in-process Python objects, structurally cannot be — see
-        ``context_gate.py``'s own HONEST SCOPE LIMIT).
+        layer is independently sufficient for its own writer class on its own
+        backend (the two OLD holds are the only real protection on Memory
+        against the writers they already covered pre-#423; the two NEW SHARED
+        holds are the only protection that is durable ACROSS independent
+        PostgreSQL processes, which the OLD holds, being in-process Python
+        objects, structurally cannot be — see ``context_gate.py``'s own
+        HONEST SCOPE LIMIT; the version-counter check below is what actually
+        closes Memory and SQLite, on which the two NEW holds are themselves
+        documented no-ops).
+
+        ROUND-N REVIEW FINDING 2 — the two SHARED holds' return values are
+        no longer discarded. Each ``epoch_fence_acquire_shared`` yields
+        ``True`` only when it genuinely acquired (or the call is a documented
+        no-op that never contends — Memory/SQLite); it yields ``False`` when
+        it FAILED OPEN after PostgreSQL's bounded ``lock_timeout`` expired
+        against a held EXCLUSIVE holder (SQLSTATE 55P03 — see
+        ``_epoch_fence_shared_postgres``). Proceeding past a ``False`` used to
+        mean deriving the epoch and calling ``produce()`` completely
+        unprotected: if the exclusive writer that outlasted the timeout then
+        committed between those two calls, the exact torn read this whole
+        mechanism exists to prevent would be served instead of discarded.
+        FAILING TO ACQUIRE IS NOW TREATED EXACTLY LIKE AN EPOCH MISMATCH —
+        the empty 204, ``produce()`` never called — which changes nothing
+        about the FENCE's own fail-open-toward-not-blocking-writers property
+        (a stuck reader still can never lock out a writer; see
+        ``epoch_fence_acquire_shared``'s own docstring, unchanged): it only
+        changes what THIS READER does when IT could not get the fence, from
+        "serve unprotected" to "safely discard".
+
+        ROUND-N REVIEW FINDING 1 — the two SHARED holds (real on PostgreSQL,
+        documented no-ops on Memory/SQLite) are no longer the ONLY mechanism
+        ordering a scoped read against a fenced writer. ``*_version_before``/
+        ``*_version_after`` bracket the epoch derivation AND ``produce()``
+        with the persisted, EVERY-BACKEND version counters every one of the
+        17 fenced writers bumps as part of its own transaction (``SqlStore``/
+        ``InMemoryStore`` ``epoch_fence_acquire_exclusive`` — see either's
+        docstring). NO LOCK is held across ``produce()`` for this check —
+        unlike the SHARED holds above, it cannot deadlock the way a real
+        dedicated-connection SQLite lock was measured to (AB-BA against
+        ``self._lock``, see ``epoch_fence_acquire_shared``'s own docstring) —
+        so it is what actually closes the SQLite/Memory torn-read window the
+        SHARED holds structurally cannot: if either pair of samples
+        disagrees, SOME fenced writer's whole transaction landed inside this
+        read's window, and the (already-computed) result is discarded rather
+        than served — the same 204/no-data answer an epoch mismatch
+        produces, not a partial one.
+
+        KEYED THE SAME WAY THE SHARED HOLDS ARE — one counter for THIS
+        user's own key, one for the global key — not one shared counter
+        across every writer for every user. A single shared counter shipped
+        first and was reverted: it made an UNRELATED user's own writer
+        (their own context switch, nothing to do with THIS read) discard
+        this read too, breaking the cross-user independence
+        ``ContextSwitchGate``/``CONTEXT_GATE`` exist to bound (measured
+        directly against ``test_context_switch_server_exit.py``'s own
+        cross-user cases, which regressed from 200 to 204 the moment a
+        single global counter shipped). See migration 052's own docstring
+        for the fuller account.
+
+        SAMPLED *AFTER* THE TWO IN-PROCESS HOLDS SETTLE, NOT BEFORE THEM —
+        placement matters here too, and getting it wrong reproduced the
+        SAME class of false discard the paragraph above describes, from a
+        different angle: a read legitimately WAITING on ``_context_read_
+        hold`` for a writer that registered ahead of it (the #415/#159 gate's
+        own, correct, intended job — e.g. this user's own switch, already
+        committing when this read arrived) is not a torn read; it is
+        exactly the re-ordering that gate exists to produce, and the read
+        is SUPPOSED to observe the writer's fresh commit once the wait
+        ends. Sampling ``*_version_before`` ahead of that wait would count
+        the wait's own writer as evidence of tearing and wrongly discard a
+        read the gate had already correctly re-ordered — measured directly
+        against ``test_one_operators_switch_is_not_stalled_by_anothers_
+        scoped_read``, whose own Bob-behind-his-own-switch case went from
+        200 to 204 the moment the sample was taken too early. Sampling once
+        the holds — and therefore any wait they were going to do — have
+        already settled means the baseline reflects state as of "now
+        genuinely free to proceed", so only a writer that commits DURING
+        the still-open window (epoch derivation through ``produce()``
+        returning) can move it.
         """
+        user_key = user_fence_key(user_id) if user_id else None
         with self._context_read_hold(user_id), self._lifecycle_read_hold(), \
              STATE.api.store.epoch_fence_acquire_shared(
-                 user_fence_key(user_id) if user_id else None), \
-             STATE.api.store.epoch_fence_acquire_shared(EPOCH_FENCE_GLOBAL_KEY):
+                 user_key) as user_fence_held, \
+             STATE.api.store.epoch_fence_acquire_shared(
+                 EPOCH_FENCE_GLOBAL_KEY) as global_fence_held:
+            if user_fence_held is False or global_fence_held is False:
+                # Finding 2: could not confirm no exclusive writer is held —
+                # fail CLOSED (discard), never serve unprotected.
+                return DISCARDED_READ
+            user_version_before = (
+                STATE.api.store.current_epoch_fence_version(user_key)
+                if user_key else None)
+            global_version_before = (
+                STATE.api.store.current_epoch_fence_version(
+                    EPOCH_FENCE_GLOBAL_KEY))
             current = STATE.api.context.current_epoch(user_id, role, scope)
             verdict = epoch_verdict(
                 self.headers.get(CONTEXT_EPOCH_HEADER), current)
             if verdict == EPOCH_MISMATCH:
                 return DISCARDED_READ
-            return produce()
+            result = produce()
+            # Finding 1: no lock held across the call above — just two plain
+            # reads of the persisted counters bracketing it, one per key.
+            user_version_after = (
+                STATE.api.store.current_epoch_fence_version(user_key)
+                if user_key else None)
+            global_version_after = (
+                STATE.api.store.current_epoch_fence_version(
+                    EPOCH_FENCE_GLOBAL_KEY))
+            if (user_version_after != user_version_before
+                    or global_version_after != global_version_before):
+                return DISCARDED_READ
+            return result
 
     def _send_discarded_read(self) -> None:
         """The answer to a scoped read whose selection moved while it was in

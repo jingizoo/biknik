@@ -917,6 +917,12 @@ class SqlStore:
                 cur.execute(f"DROP TABLE IF EXISTS levels{cascade}")
                 cur.execute(f"DROP TABLE IF EXISTS counters{cascade}")
                 cur.execute(f"DROP TABLE IF EXISTS schema_migrations{cascade}")
+                # Round-N review finding 1: outside SPECS (an administrative
+                # counter, not a domain model — see migration 052), so it
+                # needs the SAME explicit drop `levels`/`counters` get above,
+                # or a re-migrate after `schema_migrations` is gone would try
+                # to CREATE TABLE a table that never went away and fail.
+                cur.execute(f"DROP TABLE IF EXISTS epoch_fence_version{cascade}")
             finally:
                 # defer_foreign_keys resets itself at COMMIT; only the standalone
                 # foreign_keys toggle needs restoring here.
@@ -2006,7 +2012,9 @@ class SqlStore:
         return self._EPOCH_FENCE_USER_NAMESPACE, None
 
     def epoch_fence_acquire_exclusive(self, key: str) -> None:
-        """Take the EXCLUSIVE side of the epoch fence for ``key`` (PR #423).
+        """Take the EXCLUSIVE side of the epoch fence for ``key`` (PR #423),
+        AND bump the persisted version counter every backend's readers can
+        optimistically validate against (round-N review finding 1).
 
         MUST be called as a statement inside an already-open
         ``self.transaction()`` -- ideally the FIRST statement, per the
@@ -2017,7 +2025,40 @@ class SqlStore:
         holder exists for ``key``; auto-released at this transaction's
         commit/rollback -- no separate release call, so nothing can leak it.
 
-        SQLite: a no-op. This transaction's own outermost ``BEGIN IMMEDIATE``
+        THE VERSION BUMP (round-N review finding 1) runs on EVERY backend,
+        unconditionally -- see ``current_epoch_fence_version``'s own
+        docstring for the read side and migration 052 for why this is keyed
+        PER FENCE KEY (mirroring the advisory lock's own per-user/global
+        split) rather than one shared counter. It is a portable UPSERT on
+        ``self.conn``, i.e. a statement inside the SAME transaction as
+        everything else this writer does, so it commits or rolls back
+        atomically WITH the writer's own row mutation -- a reader can never
+        observe the bump without the mutation, or the mutation without the
+        bump. This is what closes the SQLite/Memory torn-read window
+        WITHOUT holding any lock across a reader's ``produce()`` call (the
+        AB-BA deadlock class the SQLite no-op below exists to avoid): the
+        reader instead samples this counter, FOR THE SAME KEY, before and
+        after, with no lock held in between at all, and discards if it
+        moved -- see ``web/server.py``'s ``_read_under_context_gate``.
+
+        ON POSTGRESQL, ``SET LOCAL lock_timeout`` now runs BEFORE the UPSERT,
+        not only before the advisory-lock SELECT that used to be the first
+        thing bounded. The UPSERT is a REAL ROW WRITE, unlike the advisory
+        lock, so two concurrent exclusive acquisitions for the SAME key
+        contend on that row's lock too -- putting the bound only around the
+        advisory lock left THAT contention UNBOUNDED, so a racer could block
+        past the fence's own configured timeout on the row lock alone, and
+        by the time it unblocked (the holder having since committed) sail
+        through the now-uncontended advisory lock and reach real business
+        logic instead of failing closed on schedule. Measured directly, not
+        merely reasoned about: ``tests/test_write_race_hardening.py``'s
+        ``test_unassign_vs_unassign_single_effect`` pins the loser's error as
+        a ``ConcurrencyConflictError`` from the BOUNDED wait, and regressed to
+        a plain ``NotFoundError`` from real business logic when the bound
+        was ordered after the UPSERT instead of before it.
+
+        SQLite: the ADVISORY-LOCK half below is a no-op (unchanged from
+        before this round). This transaction's own outermost ``BEGIN IMMEDIATE``
         (see ``transaction()`` above) already took the database file's write
         lock as the FIRST statement of the whole unit, before any read this
         method's caller could have made -- there is nothing further to
@@ -2060,12 +2101,42 @@ class SqlStore:
         (``setup_guarded_mutation`` / ``ContextService._snapshot``) already
         catches. Nothing new to catch here.
         """
+        # PostgreSQL: bound EVERYTHING this method can block on with the SAME
+        # operator-configurable timeout, set FIRST — before the version-bump
+        # UPSERT below, not only before the advisory-lock SELECT. The UPSERT
+        # is a REAL ROW WRITE (unlike the advisory lock, which touches no
+        # table), so two concurrent exclusive acquisitions for the SAME key
+        # now ALSO contend on that row's lock; setting the bound here first
+        # means that contention fails closed on the SAME configured timeout
+        # rather than blocking UNBOUNDED (the ordering that shipped first,
+        # and that measurably broke this writer-side bound — a genuinely
+        # blocking row-lock wait ahead of the bounded advisory lock let a
+        # racer sail through with the advisory lock trivially free by the
+        # time it got there, reaching real business logic instead of timing
+        # out; see ``tests/test_write_race_hardening.py``'s
+        # ``test_unassign_vs_unassign_single_effect`` for the exact
+        # regression this ordering fixes). ``LOCAL``: see the pre-existing
+        # advisory-lock comment (now below) for why — auto-resets at this
+        # transaction's end so it can never leak onto a later, unrelated one
+        # sharing ``self.conn``.
+        if self.backend == "postgres":
+            bound_ms = max(1, int(_epoch_fence_timeout_seconds() * 1000))
+            self._exec(f"SET LOCAL lock_timeout = '{bound_ms}ms'")
+        # Round-N review finding 1: unconditional, every backend. Portable
+        # UPSERT (the same idiom next_id()'s own counters table uses): a
+        # key's first bump inserts the row at version 1, every later bump
+        # for the SAME key increments the existing one. On PostgreSQL this
+        # is now bounded by the ``lock_timeout`` set immediately above; on
+        # SQLite the whole transaction is already serialized by ``BEGIN
+        # IMMEDIATE``/``self._lock`` before this statement can even run, so
+        # there is nothing further for it to block on there.
+        self._exec(
+            "INSERT INTO epoch_fence_version(fence_key, version) "
+            "VALUES (?, 1) ON CONFLICT(fence_key) DO UPDATE "
+            "SET version = epoch_fence_version.version + 1", (key,))
         if self.backend != "postgres":
             return
         namespace, fixed_objid = self._epoch_fence_lock_target(key)
-        bound_ms = max(1, int(_epoch_fence_timeout_seconds() * 1000))
-        # LOCAL: see the docstring above for why.
-        self._exec(f"SET LOCAL lock_timeout = '{bound_ms}ms'")
         if fixed_objid is not None:
             self._exec("SELECT pg_advisory_xact_lock(?, ?)",
                        (namespace, fixed_objid))
@@ -2211,6 +2282,64 @@ class SqlStore:
                 except Exception:                                # noqa: BLE001
                     pass    # never let a release failure mask the caller's own
             conn.close()
+
+    def current_epoch_fence_version(self, key: str) -> int:
+        """The CURRENT value of the persisted epoch-fence version counter FOR
+        ``key`` (round-N review finding 1) — the optimistic-validation read
+        side, for a caller (``web/server.py``'s ``_read_under_context_gate``)
+        that samples this once before deriving its epoch and once more after
+        its dependent ``produce()`` call returns, discarding if the two
+        disagree.
+
+        KEYED THE SAME WAY THE ADVISORY LOCK IS (``user:<id>`` /
+        ``EPOCH_FENCE_GLOBAL_KEY``) — see migration 052's own docstring for
+        why a single shared counter was tried and reverted: it made an
+        UNRELATED user's own writer (their own context switch, say) discard
+        every OTHER user's concurrently in-flight scoped read, which breaks
+        the cross-user independence ``ContextSwitchGate`` exists to bound. A
+        reader therefore samples exactly the two keys it also takes the
+        SHARED advisory-lock side for (its own user key, plus the one global
+        key) — see the two call sites in ``_read_under_context_gate``.
+
+        A key nobody has ever bumped has NO ROW — this reads that as ``0``,
+        the same value a freshly-migrated, explicitly-zeroed row would give,
+        so there is no "does the row exist yet" branch for a caller to get
+        wrong; see migration 052's own comment on why no rows are pre-seeded.
+
+        A PLAIN, LOCK-FREE READ, deliberately. ``self.conn`` is opened
+        ``autocommit=True`` on PostgreSQL and with ``isolation_level = None``
+        on SQLite (``store/db.py``), so a bare ``SELECT`` run outside any
+        ``self.transaction()`` — exactly how every call site here calls this
+        — is its own implicit transaction and always observes the LATEST
+        value any other connection has committed, precisely like
+        ``next_id()``'s own counter table. No dedicated second connection,
+        no advisory lock, nothing that could deadlock against a concurrent
+        ``produce()`` needing ``self._lock`` — the whole point of this
+        mechanism (see ``epoch_fence_acquire_exclusive``'s docstring) is that
+        NEITHER side of the check ever holds a lock across the caller's own
+        unbounded work.
+
+        Only ``self._lock`` is taken, and only for the instant of the read
+        itself — the same grain as ``_get``/``next_id`` — so two concurrent
+        callers on this ONE store instance (the shared web-server case) never
+        tear each other's read, and neither can be blocked for longer than a
+        single SELECT.
+
+        MUST NOT be called with THIS store's own ``transaction()`` already
+        open if the caller needs the truly-latest cross-connection value: an
+        open SERIALIZABLE/REPEATABLE READ transaction on PostgreSQL would
+        then read that transaction's own frozen snapshot rather than the live
+        row. ``_read_under_context_gate`` never holds one open across this
+        call, by construction — it calls this before ``current_epoch()``
+        opens (and closes) its own snapshot, and again after ``produce()``
+        returns, never from inside either.
+        """
+        with self._lock:
+            cur = self._exec(
+                "SELECT version FROM epoch_fence_version WHERE fence_key = ?",
+                (key,))
+            row = cur.fetchone()
+        return row["version"] if row else 0
 
     def _lock_active_context_mutex(self, user_id):
         """Take the per-user ActiveContext MUTEX for this transaction (#386).
