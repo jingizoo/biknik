@@ -582,6 +582,13 @@ class SqlStore:
         # guaranteed and refused when it would need more. None outside a
         # transaction, and outside one it is meaningless.
         self._txn_isolation = None
+        # Whether the OPEN outermost transaction promised read_only=True
+        # (round-N+2 regression fix, PR #423) — mirrors ``_txn_isolation``'s
+        # own admit/refuse shape: a nested join asking for write capability
+        # is refused when the open transaction is read-only, and admitted
+        # otherwise. None outside a transaction, and outside one it is
+        # meaningless (same convention as ``_txn_isolation``).
+        self._txn_read_only = None
         # Re-resolver for the no-row-lock parent-delete FK race (#201 Slice 3),
         # set by the service via set_dependent_conflict_resolver. Invoked by the
         # OUTERMOST transaction() only after rollback, so the itemised
@@ -606,7 +613,7 @@ class SqlStore:
         self._dependent_conflict_resolver = resolver
 
     @contextmanager
-    def transaction(self, isolation=None):
+    def transaction(self, isolation=None, read_only=False):
         """Atomic multi-write block: commit on success, roll back on error.
 
         Reentrant (#215): only the outermost ``transaction()`` opens and
@@ -625,10 +632,62 @@ class SqlStore:
         one SERIALIZABLE transaction around an authorization computation that
         itself asks for SERIALIZABLE (the context selector) and REPEATABLE READ
         (the target chain walk), and both are already guaranteed by the outer
-        one. On SQLite it is a no-op: ``self._lock`` serializes every
-        transaction taken through THIS store, and the ``BEGIN IMMEDIATE``
-        below serializes this connection against any other one on the same
-        file — together that is already strictly stronger than SERIALIZABLE.
+        one. On SQLite ``isolation`` is itself a no-op (kept only so a caller
+        can state its intent and so the nested-join rank check above still
+        applies): ``self._lock`` serializes every transaction taken through
+        THIS store, and — for a WRITE-capable transaction — SQLite's own
+        ``BEGIN IMMEDIATE`` serializes this connection against any other one on
+        the same file; together that is already strictly stronger than
+        SERIALIZABLE. See ``read_only`` for the READ-only case, which is
+        strictly weaker at the SQLite engine level (a SHARED file lock, not
+        RESERVED) but — see below — no weaker in the isolation it actually
+        delivers to the caller.
+
+        ``read_only`` (round-N+2 regression fix, PR #423) is this caller's OWN
+        promise that ``work()`` will perform no write of any kind — never
+        inferred, always stated explicitly by the caller, because getting it
+        wrong has two very different failure modes depending on direction (see
+        the SQLite branch below for the one that is silent-until-a-write and
+        therefore the one to fear). It is the mechanism-level fix for a real,
+        measured regression: ``ContextService._snapshot`` used to open EVERY
+        one of its transactions — including its several genuinely read-only
+        entry points (``resolve``, ``options``, and the #409 preflight's
+        ``resolve_saved_with_league(lock=False)``) — at full write strength
+        (``isolation=SERIALIZABLE`` on a store whose SQLite branch, below,
+        unconditionally ran ``BEGIN IMMEDIATE`` regardless of what ``isolation``
+        even was). ``BEGIN IMMEDIATE`` takes SQLite's file-level RESERVED
+        lock, which a #409 preflight — itself just an ordinary, unrelated
+        request's FIRST cheap check, taken with no other lock held — has no
+        reason to need, and which directly CONTENDS with
+        ``_read_under_context_gate_sqlite``'s ``fresh_store`` (a completely
+        different request's scoped read, round-N+1 finding 1) holding that
+        exact same file's RESERVED lock for the deliberately-unbounded
+        duration of whatever ``produce()`` does. Measured directly (not
+        estimated): with a scoped read parked mid-``produce()``, an unrelated
+        archive/reopen request's #409 preflight — merely constructing the 409
+        refusal, reading no target row — took 10.7-10.8s to even ATTEMPT its
+        target lookup, the FULL ``HS_CONTEXT_GATE_TIMEOUT`` busy-wait, and
+        because that whole wait runs with THIS store's ``self._lock`` held
+        (below), every other concurrent use of this SAME store instance —
+        including totally unrelated reads — stalled for the identical
+        10.7-10.8s window. On a loaded CI runner that is enough of the test's
+        20s HTTP client timeout to tip over into an outright failure.
+
+        ``read_only=True`` does not weaken isolation for the caller: SQLite
+        guarantees no dirty reads and no torn view regardless of which lock
+        strength a transaction holds, because acquiring even the WEAKER
+        SHARED lock (what a read-only transaction takes here) already blocks
+        every other connection from reaching EXCLUSIVE — the lock a writer
+        MUST hold to actually mutate a page of the file — for as long as this
+        transaction keeps its SHARED lock, i.e. for its entire duration. A
+        concurrent writer can still acquire RESERVED (signal intent) and even
+        queue behind this read at PENDING, but it cannot complete its commit
+        until every SHARED holder, this one included, releases. So a
+        read-only transaction's view is exactly as consistent for its own
+        duration as a write-capable one's — SHARED is simply COMPATIBLE with
+        another connection's already-held RESERVED (only PENDING/EXCLUSIVE
+        conflict with SHARED), which is the one and only reason it does not
+        contend with ``fresh_store`` the way ``BEGIN IMMEDIATE`` did.
         """
         if isolation is not None and isolation not in _ISOLATION_LEVELS:
             raise ValueError(f"unsupported isolation level: {isolation!r}")
@@ -641,6 +700,12 @@ class SqlStore:
                         "transaction; a nested join cannot raise the isolation "
                         f"of the open one ({self._txn_isolation!r} < "
                         f"{isolation!r})")
+                if not read_only and self._txn_read_only:
+                    raise RuntimeError(
+                        "transaction(read_only=False) cannot join an "
+                        "already-open read_only=True transaction; a nested "
+                        "caller that needs to write must not be nested inside "
+                        "one that promised it would not")
                 self._txn_depth += 1
                 try:
                     yield
@@ -664,6 +729,7 @@ class SqlStore:
             self._reconnect_if_lost()
             self._txn_depth = 1
             self._txn_isolation = isolation
+            self._txn_read_only = read_only
             try:
                 try:
                     if self.dialect.paramstyle == "pyformat":  # psycopg manages it
@@ -765,11 +831,48 @@ class SqlStore:
                             # which re-reads its own env var on every
                             # construction and additionally lets a caller
                             # mutate `wait_timeout` directly at runtime.
+                            #
+                            # round-N+2 (regression fix): `read_only=True`
+                            # takes `BEGIN DEFERRED` here instead — a SHARED
+                            # lock, not RESERVED — and is the ONE exception to
+                            # "always IMMEDIATE" above. It does not reopen the
+                            # promotion bug that paragraph describes, because
+                            # that bug is specifically a PROMOTION failure
+                            # (SHARED -> RESERVED mid-transaction, at a
+                            # caller's first write) and a `read_only=True`
+                            # caller is a caller that has PROMISED `work()`
+                            # performs no write at all — there is no promotion
+                            # to fail, ever, by construction. What it buys:
+                            # this transaction's SHARED lock is compatible
+                            # with another connection's already-held RESERVED
+                            # (only PENDING/EXCLUSIVE conflict with SHARED),
+                            # so a genuinely read-only transaction — e.g. the
+                            # #409 preflight's `ContextService._snapshot`
+                            # calls, see `read_only`'s own docstring above —
+                            # no longer contends with
+                            # `_read_under_context_gate_sqlite`'s `fresh_store`
+                            # holding RESERVED for the duration of a scoped
+                            # read's `produce()` call, which is what the
+                            # regression this fixes actually measured: an
+                            # unrelated read-only transaction busy-waiting the
+                            # full `HS_CONTEXT_GATE_TIMEOUT` for a RESERVED
+                            # lock it never needed, with `self._lock` held for
+                            # that whole wait — the reentrant lock is held
+                            # across this ENTIRE `BEGIN`/`yield`/`commit`
+                            # sequence (see the field's own comment at
+                            # `self._lock`'s assignment in `__init__`), not
+                            # merely across the `BEGIN` statement, so the
+                            # busy-wait this branch used to do unconditionally
+                            # was never a purely-SQLite-engine-level delay: it
+                            # froze this Python store instance for every OTHER
+                            # caller too, for as long as it lasted.
                             busy_ms = max(
                                 1, int(_epoch_fence_timeout_seconds() * 1000))
                             self.conn.execute(
                                 f"PRAGMA busy_timeout = {busy_ms}")
-                            self.conn.execute("BEGIN IMMEDIATE")
+                            self.conn.execute(
+                                "BEGIN DEFERRED" if read_only
+                                else "BEGIN IMMEDIATE")
                             yield
                             self.conn.commit()
                         except Exception:
@@ -810,6 +913,7 @@ class SqlStore:
             finally:
                 self._txn_depth = 0
                 self._txn_isolation = None
+                self._txn_read_only = None
 
     def _enrich_jersey_conflict(self, exc) -> None:
         """Add the conflicting player to a rolled-back jersey conflict (#292).

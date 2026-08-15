@@ -225,7 +225,7 @@ class InMemoryStore:
                 value.clear()
 
     @contextmanager
-    def transaction(self, isolation=None):
+    def transaction(self, isolation=None, read_only=False):
         """Atomic, reentrant unit of work — the shared store transaction contract.
 
         ``isolation`` (e.g. ``"SERIALIZABLE"``) is accepted for parity with
@@ -233,6 +233,21 @@ class InMemoryStore:
         lock already fully serializes every transaction, so all reads inside one
         transaction observe a single consistent snapshot with no concurrent
         interleaving — the strongest isolation, for free.
+
+        ``read_only`` (round-N+2 regression fix, PR #423) is likewise accepted
+        for parity with :class:`SqlStore` and is likewise a **no-op** here: the
+        re-entrant lock this method takes below (``self._lock``, a single
+        per-instance ``threading.RLock`` — see its many "transaction() holds
+        self._lock for its whole body" call-site comments throughout this
+        file) is already the ONLY thing serializing access to this store, at
+        full strength, regardless of whether the caller intends to write —
+        there is no second, weaker lock tier for a promise of read-only-ness
+        to relax. The SQLite store's own ``read_only`` fixes a real contention
+        bug specific to ITS two-tier SHARED/RESERVED FILE locking, which this
+        store has no analogue of at all (there is no second connection, and no
+        file); so nothing here needed to change — the parameter exists purely
+        so a caller (e.g. ``ContextService._snapshot``) can pass the identical
+        keyword to whichever backend it happens to be holding.
 
         Contract (identical observable behavior in every store implementation):
 
