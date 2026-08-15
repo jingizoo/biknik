@@ -1650,6 +1650,21 @@ class ApiService:
         # store's own per-instance transaction lock already serializes the
         # block.
         #
+        # read_only=True (round-N+2, PR #423): this whole block — rules 3
+        # through 6 — never writes (verified directly: every store call
+        # beneath it is a `get_*`/`all_*` read; see `SqlStore.transaction`'s
+        # own docstring for the general mechanism and
+        # `ContextService._snapshot`'s for the sibling regression this same
+        # round-N+2 fixed at the OTHER #409 preflight). This is not merely a
+        # correctness nicety here, it is A SECOND INSTANCE OF THAT SAME
+        # REGRESSION, on this exact request path: `_guarded_mutation`
+        # (`web/server.py`) reaches `_reject_target_outside_scope` ->
+        # `setup_target_allowed` -> here, UNGATED, immediately after its own
+        # `_refuse_unchosen_context` check — so fixing only the #409
+        # preflight and leaving this one at its old default (write-strength
+        # `BEGIN IMMEDIATE`) would have left the exact same class of stall
+        # reachable one call later on the identical archive/reopen request.
+        #
         # Requesting isolation is legal on the outermost transaction, and also
         # on a join whose open transaction ALREADY guarantees at least this much
         # (#369) — which is how `setup_guarded_mutation` runs this predicate,
@@ -1659,33 +1674,55 @@ class ApiService:
         # own bounded retry owns any conflict.
         #
         # WHY THERE IS STILL NO RETRY LOOP HERE, stated precisely, because the
-        # reason this comment used to give is no longer true. It said READ-ONLY
-        # at REPEATABLE READ cannot raise a serialization conflict. That remains
-        # true of SERIALIZATION conflicts, but it was never the whole set: since
-        # #392 the SQLite branch opens with `BEGIN IMMEDIATE`, so this block can
-        # now raise `ConcurrencyConflictError` from LOCK ACQUISITION — a
-        # `database is locked` at BEGIN, classified `lock_not_available` — and
-        # read-only says nothing about that. Unlike `ContextService._snapshot`
-        # this call site has no bounded retry, so the claim needed re-deciding
-        # rather than re-wording.
+        # reason this comment used to give is no longer true, TWICE over —
+        # once when #392 shipped, and again when round-N+1 shipped. It said
+        # READ-ONLY at REPEATABLE READ cannot raise a serialization conflict.
+        # That remains true of SERIALIZATION conflicts, but it was never the
+        # whole set: since #392 the SQLite branch opened with `BEGIN
+        # IMMEDIATE` regardless of intent, so this block could raise
+        # `ConcurrencyConflictError` from LOCK ACQUISITION — a `database is
+        # locked` at BEGIN, classified `lock_not_available` — and read-only
+        # said nothing about that. Unlike `ContextService._snapshot` this call
+        # site has no bounded retry, so the claim needed re-deciding rather
+        # than re-wording, and it was re-decided BELOW under a claim ("no
+        # in-process second connection exists in production") that round-N+1
+        # then made false without this comment being revisited: file-backed
+        # SQLite scoped reads (`_read_under_context_gate_sqlite`'s
+        # `fresh_store`, `web/server.py`) are now EXACTLY that second
+        # in-process connection to the LIVE file, opened on every ordinary
+        # scoped-read request, not merely in a test or a backup drill. This
+        # comment's own reachability argument was therefore already wrong by
+        # the time this predicate was next read closely enough to matter, and
+        # the fix that closed it (`read_only=True` above, round-N+2) is a
+        # response to that false claim having gone uncorrected, not merely a
+        # style pass.
         #
-        # The decision is still no retry, for reasons about reachability and
-        # about what a retry would mean:
+        # The decision is still no retry, but the reachability argument that
+        # justifies it now rests on `read_only=True`, not on "no second
+        # connection exists":
         #
-        # * Contending needs a SECOND connection to the same file. A serving
-        #   process has exactly ONE store (`create_store()` at web/server.py and
-        #   bootstrap.py), and `SqlStore._lock` — reentrant, per instance —
-        #   already serializes every transaction taken through it, so no two
-        #   in-process transactions can be at BEGIN at once. The one production
-        #   path that opens a second SQLite connection (`backup_sqlite`) opens
-        #   it on the DESTINATION file, never the live one.
-        # * Where a second connection does exist — the `*_lock_sqlite_file`
-        #   tests, or an operator pointing the backup drill at a live database —
-        #   BEGIN blocks in the busy handler for the full 5s `busy_timeout`
-        #   first. Anything that surfaces here has therefore ALREADY waited five
-        #   seconds. That is not a transient blip a tight retry would paper
-        #   over; it is a writer that is genuinely wedged, and the retryable
-        #   409 is the honest answer for the caller to act on.
+        # * `read_only=True` takes SQLite's SHARED lock (`BEGIN DEFERRED`),
+        #   not RESERVED (`BEGIN IMMEDIATE`) — and SHARED is COMPATIBLE with
+        #   another connection's already-held RESERVED (only PENDING/
+        #   EXCLUSIVE conflict with SHARED; see `SqlStore.transaction`'s own
+        #   docstring for the full argument). `fresh_store` only ever holds
+        #   RESERVED — it is itself a read, never an actual write — so this
+        #   block no longer contends with it AT ALL, regardless of how long a
+        #   scoped read's `produce()` takes. That closes the reachable-in-
+        #   production case entirely, not merely documents it.
+        # * What is left is a genuinely ACTIVE writer — one that has reached
+        #   PENDING/EXCLUSIVE to actually flush its commit, a window normally
+        #   far under a millisecond, not the open-ended duration of an
+        #   unrelated read. Where that does contend — the `*_lock_sqlite_file`
+        #   tests deliberately construct it, or a pathologically wedged real
+        #   writer could — BEGIN blocks in the busy handler for the full
+        #   `HS_CONTEXT_GATE_TIMEOUT` first. Anything that surfaces here has
+        #   therefore ALREADY waited that long. That is not a transient blip a
+        #   tight retry would paper over; it is a writer that is genuinely
+        #   wedged, and the retryable 409 is the honest answer for the caller
+        #   to act on — the ORIGINAL reasoning this comment gave, restored to
+        #   being actually true now that the false "no second connection"
+        #   premise it depended on is not what makes it true anymore.
         # * A retry here would also be dead weight on PostgreSQL, where the
         #   original read-only argument still holds in full.
         #
@@ -1693,7 +1730,8 @@ class ApiService:
         # for the instant it read, and by the time a caller acts on the answer
         # the chain may have moved. Only `setup_guarded_mutation`, which holds
         # the row locks and the transaction across the mutation, is.
-        with self.store.transaction(isolation="REPEATABLE READ"):
+        with self.store.transaction(
+                isolation="REPEATABLE READ", read_only=True):
             # -- rule 3: existence (indistinguishable from inaccessible) ---
             record = self._setup_target_record(normalized, record_id)
             if record is None:

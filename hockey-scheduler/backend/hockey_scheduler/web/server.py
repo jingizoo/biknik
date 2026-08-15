@@ -1826,7 +1826,14 @@ class Handler(BaseHTTPRequestHandler):
             # ``RuntimeError`` on every single scoped read. Asking for it here
             # is free on SQLite: this branch's own docstring already explains
             # why `BEGIN IMMEDIATE` + `self._lock` is unconditionally at least
-            # as strong.
+            # as strong. This call deliberately leaves `read_only` at its
+            # default `False` for the SAME reason: `current_epoch()`'s own
+            # nested `_snapshot` call now asks for `read_only=True`
+            # (round-N+2), but a nested join only ever ADMITS or JOINS the
+            # already-open transaction's strength (never downgrades it) — see
+            # `SqlStore.transaction`'s nested-join check — so that inner
+            # `read_only=True` is satisfied by, and changes nothing about,
+            # this outer write-strength (`BEGIN IMMEDIATE`) transaction.
             try:
                 with fresh_store.transaction(isolation="SERIALIZABLE"):
                     fresh_api = ApiService(fresh_store)
