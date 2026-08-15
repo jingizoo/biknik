@@ -16,18 +16,49 @@ WHAT THIS FILE PROVES, mapped to the design's own §10:
   `use_fence=True` (the new store-level primitive). The `False` variant is
   asserted to reproduce the torn read; the `True` variant is asserted not
   to. Both live in one file so the proof and the fix are reviewed together.
-  SQLite's OWN falsifiability class (`...SqliteTest`) asserts BOTH arms
-  show the SAME torn-read outcome -- a deliberate, stated scope reduction,
-  not an oversight: a real dedicated-connection attempt for SQLite was
-  built, measured to deadlock/livelock (a genuine AB-BA cycle between
-  SQLite's single file-lock axis and `self._lock`, distinct from
-  PostgreSQL's separate advisory-lock axis), and reverted to a documented
-  no-op -- see `SqlStore.epoch_fence_acquire_exclusive`/`_shared`'s own
-  docstrings for the full account. File-backed SQLite's cross-process gap
-  therefore remains OPEN this round; same-process SQLite stays fully
-  covered by the kept, unchanged `ContextSwitchGate` holds (proven by
-  `test_context_switch_server_exit.py`'s `SqliteContextSwitchServerExitTest`
-  passing in full).
+  SQLite's OWN falsifiability class (`...SqliteTest`) exercises a NARROWER
+  claim than the Postgres one -- correction: an earlier revision of this
+  bullet described a state its own per-test docstrings
+  (`test_writer_first_fenced_discards_before_reaching_the_read`/
+  `test_reader_first_fenced_stays_consistent`) had already outgrown by
+  round-N. It does NOT assert both arms show the SAME torn-read outcome:
+  `use_fence=False` still reproduces the pre-#423 baseline (served);
+  `use_fence=True` now DISCARDS on both arrival orders (round-N finding 1's
+  persisted version counter, which -- unlike the advisory-lock half -- is
+  NOT a no-op on any backend), so the two arms diverge exactly the way the
+  Postgres class's do. What IS still a documented no-op on this backend,
+  unchanged: the ADVISORY-LOCK half, `SqlStore.epoch_fence_acquire_
+  exclusive`/`_shared`'s own lock-shaped primitive -- a real
+  dedicated-connection attempt was built, measured to deadlock/livelock (a
+  genuine AB-BA cycle between SQLite's single file-lock axis and
+  `self._lock`, distinct from PostgreSQL's separate advisory-lock axis), and
+  reverted; see those methods' own docstrings for the full account. This
+  class therefore proves the version counter alone is enough to discard a
+  torn read at the STORE level, on both arrival orders, with the
+  lock-shaped half still contributing nothing.
+
+  round-N+1 built a SEPARATE, additional mechanism this class does not
+  exercise at all: `web/server.py`'s `_read_under_context_gate_sqlite` runs
+  a scoped read's epoch-check-through-`produce()` window against a FRESH,
+  independent `SqlStore`, using `transaction()`'s existing `BEGIN IMMEDIATE`
+  as a genuine, engine-level, OS-file-granular lock -- proven at the HTTP
+  layer, SAME-PROCESS, by `test_epoch_fence_http.py`'s
+  `SqliteEpochFenceZeroCallHttpTest` (a real spy showing ZERO scoped-read
+  service calls under a torn window, not merely a discarded response).
+  Stated honestly rather than assumed: because SQLite's own lock is an
+  OS/file-level primitive rather than an in-process Python object, the
+  reasoning for why it should also hold across genuinely separate processes
+  is sound (see that method's own docstring), but -- unlike PostgreSQL,
+  which `tests/test_epoch_fence_cross_replica.py` now proves with two real
+  HTTP server PROCESSES -- no test in this file or elsewhere races
+  file-backed SQLite across two genuinely independent OS processes to
+  DEMONSTRATE that claim empirically. File-backed SQLite's cross-process
+  guarantee therefore rests on the engine-level argument, not (yet) an
+  empirical two-process proof; same-process SQLite (today's only deployed
+  topology) stays fully covered both by the kept, unchanged
+  `ContextSwitchGate` holds (proven by `test_context_switch_server_exit.py`'s
+  `SqliteContextSwitchServerExitTest` passing in full) and by the new
+  independent-store file-lock mechanism above.
 * §10.1 independent instances: every concurrency test here uses two (or
   three) separately-constructed `SqlStore(url)` objects against the SAME
   live database, sharing no Python state -- the exact pattern

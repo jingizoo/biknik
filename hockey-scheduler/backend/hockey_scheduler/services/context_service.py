@@ -713,37 +713,60 @@ class ContextService:
         derived from the SAME snapshot as the write (PR #423 design §8.1) —
         ``(program, season, league, epoch)``.
 
-        NOT currently called by the facade's ``set_active_context``
-        (honest correction: an earlier revision of this docstring claimed
-        it was — it is not; ``api/service.py``'s ``set_active_context``
-        still calls plain :meth:`set_with_league` and the HTTP handler
-        still derives the response epoch via a SEPARATE, later
-        ``current_epoch()`` call, exactly as before this PR). That second,
-        separate read is still fully covered IN-PROCESS by the kept
-        ``CONTEXT_GATE.exclusive(user_id)`` wrap at the HTTP call site
-        (unchanged — see ``web/server.py``'s own comment there for why it
-        was kept rather than deleted: the owner's explicit instruction to
-        preserve Phase-A and everything that depends on it, which a second
-        writer-side caller of ``CONTEXT_GATE.exclusive`` is not, but whose
-        removal here would leave nothing left to consult the arrival
-        tickets Phase-A registers), so the race this method exists to
-        close is closed for two switches racing WITHIN one process. It is
-        NOT closed for two switches for the same user racing ACROSS two
-        independent processes — ``CONTEXT_GATE`` cannot coordinate across
-        processes at all, and the cross-process fence this PR adds is only
-        held for the WRITE itself (via :meth:`_set_with_league_locked`'s
-        own ``epoch_fence_acquire_exclusive`` call, taken either way,
-        whether reached from here or from :meth:`set_with_league`), not
-        across the HTTP handler's second, separate read. This is a
-        narrow, stated residual gap (a same-user double-switch race
-        across replicas), not the primary cross-process reader/writer
-        ordering this redesign targets — see the PR's own reporting for
-        the full account. This method exists, tested and correct, for a
-        future caller that wants the fold (a new HTTP call site, or a
-        ``set_active_context`` return-shape change) without re-deriving
-        this logic; wiring it in was judged higher-risk than its benefit
-        justified this round (``set_active_context`` has ~200 existing
-        callers expecting its current dict-only return shape)."""
+        CALLED BY THE FACADE, UNCONDITIONALLY (correction: an earlier
+        revision of this docstring claimed the opposite — that claim went
+        stale the moment round-N review finding 3 landed, and sat
+        uncorrected through a full review round; it is fixed here).
+        ``api/service.py``'s ``set_active_context`` calls this method —
+        never plain :meth:`set_with_league` — on every invocation. Its own
+        ``include_epoch`` keyword controls only whether the epoch is kept
+        in *that method's* return value (dropped for the ~200 legacy
+        callers expecting a bare dict) or paired with the payload (the ONE
+        production caller, ``web/server.py``'s ``POST /api/context``
+        handler); the underlying call, and the single-snapshot epoch
+        derivation it buys, always happens.
+
+        THE RACE THIS CLOSES. Before finding 3, the HTTP handler called
+        :meth:`set_with_league` (the write, one transaction) and THEN a
+        SEPARATE ``current_epoch()`` call (a second, independent
+        transaction) to build the response epoch. Between those two
+        transactions, another replica could commit a second switch for the
+        SAME user, and the response would then describe THAT replica's
+        selection rather than the one this request's own write just made.
+        Folding the write and the epoch derivation into ONE ``_snapshot``
+        (what :meth:`_set_with_league_locked` does) makes "the epoch
+        matches the row this response carries" true by construction.
+
+        WHY THIS CLOSES THE CROSS-PROCESS CASE TOO, not merely the
+        in-process one ``CONTEXT_GATE.exclusive(user_id)`` (still held,
+        unchanged, at the HTTP call site) already covered on its own.
+        :meth:`_set_with_league_locked`'s ``work()`` acquires
+        ``epoch_fence_acquire_exclusive(user_fence_key(user_id))`` — a REAL
+        PostgreSQL advisory lock — FIRST, before any row is read, and holds
+        it for the WHOLE transaction: the epoch is derived at the END of
+        that SAME ``work()``, still inside the same held lock, released
+        only at commit. A second replica's own call to this method for the
+        SAME user therefore cannot even START its write until this one's
+        lock releases: the two calls fully serialize, one committing
+        (write and epoch together, atomically) before the other's
+        ``epoch_fence_acquire_exclusive`` is even granted. There is no
+        window for a second replica's write to land between THIS call's
+        write and an epoch read, because there is no separate read left to
+        land inside — the gap the earlier (now-corrected) revision of this
+        docstring described as a "narrow, stated residual gap" is closed,
+        not merely narrowed. See ``tests/test_epoch_fence_cross_replica.py``
+        for the real two-process, real-authenticated-HTTP proof of exactly
+        this claim (round-N+1 finding 3): two independent server
+        processes, a deterministic A->B->A (and B->A->B, and a genuinely
+        concurrent) ordering, every response's epoch independently
+        recomputed from a fresh read of the persisted row.
+
+        Kept as a SEPARATE method from :meth:`set_with_league`, rather than
+        changing that method's own return shape, so the widely-depended-on
+        two/three-tuple contract ~60 existing test call sites unpack stays
+        untouched — the two public methods differ only in whether the
+        epoch is dropped, sharing one validation/write/epoch-derivation
+        implementation in :meth:`_set_with_league_locked`."""
         return self._set_with_league_locked(
             user_id, role, scope, program_id, season_id, league_id)
 

@@ -1535,8 +1535,26 @@ With that corrected, what the token is:
   read. It cannot widen scope, cannot identify, and cannot serve a byte the
   ceiling would have refused.
 
-**The ceiling is untouched, again.** `api/service.py` is not in this change at
-all; the epoch is attached to the three context payloads and compared in
+**The ceiling itself is untouched — `api/service.py` is not, and that
+distinction matters.** An earlier revision of this section claimed
+`api/service.py` was not in this change at all; that stopped being true the
+moment round-N review finding 3 landed, and round-N+1 widened it further.
+`ApiService.set_active_context` now calls `ContextService.
+set_with_league_and_epoch` unconditionally, folding the response epoch's
+derivation into the SAME snapshot as the write (finding 3), and round-N+1's
+Memory/SQLite rework additionally wraps `_guarded_attempt` — every kind in
+`_EPOCH_FENCE_KINDS` — and six individual facade methods
+(`rebind_user_account_scope`, `set_user_account_active`, `assign_official`/
+`unassign_official`, `create_guardian_link`/`verify_guardian_link`) in
+`CONTEXT_GATE`/`LIFECYCLE_GATE` holds (`services/context_gate.py`), so that
+same-process writers get a genuine pre-produce() ordering guarantee on
+backends where the database fence is a documented no-op. What has NOT
+changed, through any of that: the AUTHORIZATION DECISION itself. No target-
+authorization rule, no scope check, no refusal condition anywhere in
+`api/service.py` was added, removed, or reordered by any of this — every
+new line either derives or attaches an epoch, or decides WHEN a dependent
+read/write may proceed, never WHAT it is allowed to see or do. The epoch is
+attached to the three context payloads and independently compared in
 `web/server.py`. The sibling-Season and nonexistent-Season refusals stay
 byte-identical to each other and to `main`.
 
