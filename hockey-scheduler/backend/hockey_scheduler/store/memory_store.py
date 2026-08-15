@@ -1119,6 +1119,69 @@ class InMemoryStore:
         """
         yield
 
+    # -- epoch fence (PR #423 redesign) -------------------------------------
+    def epoch_fence_acquire_exclusive(self, key: str) -> None:
+        """A documented no-op, matching ``SqlStore``'s spelling, and for the
+        analogous reason: ``self._lock`` (this store's process-wide,
+        per-INSTANCE RLock) already wraps the WHOLE ``transaction()`` body
+        this method is always called from inside, on the only Python object
+        that could ever be racing (``InMemoryStore`` cannot participate in
+        independent workers at all -- two separate instances share zero
+        state, so "independent Memory workers coordinating" is not a
+        deployment shape this store needs to defend against; see the design's
+        §5). That serialization already gives every OTHER
+        ``transaction()``-wrapped writer full mutual exclusion against this
+        one.
+
+        This is a TRUE no-op, not merely a cheap one: a genuinely BLOCKING
+        acquire here — waiting on any lock/condition while ``self._lock`` is
+        already held by this same call frame (it always is; this method's
+        contract requires it be called from inside an open ``transaction()``)
+        — can deadlock against a scoped read whose shared hold spans a
+        ``produce()`` call that itself needs ``self._lock``: this thread
+        holds ``self._lock`` and blocks waiting for the read to release; the
+        read, mid-``produce()``, blocks waiting for ``self._lock``. Proven
+        directly (a real ``ContextSwitchGate``-backed attempt at this method
+        reproduces the deadlock on demand) before settling on the no-op,
+        exactly mirroring the AB-BA hazard ``context_gate.py:107-115``'s LOCK
+        ORDER note already documents for the in-process gate.
+
+        CONSEQUENCE, STATED EXPLICITLY rather than left implicit: on Memory,
+        the writers newly listed by this redesign that had NO gate coverage
+        before it (account scope rebind/activate, Season/Program/League/
+        LeagueSeason delete, venue-access revoke/delete, Team transfer,
+        Official assign/unassign, Player/Guardian reassignment) do not gain a
+        new BLOCKING ordering guarantee from THIS store-layer primitive on
+        Memory specifically — they keep exactly the protection they had
+        before this change (full per-transaction serialization via
+        ``self._lock``, plus the epoch's own re-resolution-from-live-state
+        correctness, #3 of the design). The writers ALREADY gated today
+        (context switch, Season archive/reopen) are UNCHANGED and fully
+        protected: this redesign deliberately keeps ``CONTEXT_GATE`` /
+        ``LIFECYCLE_GATE`` and their existing wraps in ``web/server.py``
+        exactly as they are (see that module for why, and the owner's
+        explicit instruction to keep Phase-A intact), layering this new,
+        cross-process-capable primitive alongside them rather than replacing
+        them. On PostgreSQL and SQLite — the two backends an independent
+        second worker can actually exist on — every one of the newly listed
+        writers DOES gain the real, cross-process, blocking guarantee; this
+        gap is Memory-only, matching the demo/dev/test role that backend
+        already plays (``create_store()``: Memory is the no-``DATABASE_URL``
+        default, never the configured production target).
+        """
+        return
+
+    @contextmanager
+    def epoch_fence_acquire_shared(self, key: str):
+        """A documented no-op, for the same reason as the exclusive side
+        above: since nothing on Memory ever holds this primitive's exclusive
+        side (it is a no-op too), there is never a genuine holder for this
+        method to defer to — a real gate object here would be exercised but
+        never actually contended, which is observationally identical to not
+        having one. Yields ``True`` (not ``False``/fail-open) since this call
+        never times out — it never even tries to wait."""
+        yield True
+
     def get_active_context(self, user_id: str) -> Optional[ActiveContext]:
         return self.user_active_context.get(user_id)
 

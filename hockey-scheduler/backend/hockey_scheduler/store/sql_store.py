@@ -528,6 +528,29 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# The epoch fence's bounded wait (PR #423 redesign) reuses the SAME
+# operator-configurable timeout ContextSwitchGate already exposes
+# (services/context_gate.py's HS_CONTEXT_GATE_TIMEOUT / DEFAULT_WAIT_TIMEOUT
+# = 10.0), rather than adding a second knob -- see the design's §4.5. The
+# name/default are duplicated here, not imported: store/ imports nothing from
+# services/ anywhere in this codebase (services/ imports FROM store/, never
+# the reverse), and this is a five-line env lookup, not a shared mechanism.
+# tests/test_epoch_fence.py asserts these two literals stay identical.
+_EPOCH_FENCE_TIMEOUT_ENV = "HS_CONTEXT_GATE_TIMEOUT"
+_EPOCH_FENCE_DEFAULT_TIMEOUT = 10.0
+
+
+def _epoch_fence_timeout_seconds() -> float:
+    raw = os.environ.get(_EPOCH_FENCE_TIMEOUT_ENV)
+    if not raw:
+        return _EPOCH_FENCE_DEFAULT_TIMEOUT
+    try:
+        value = float(raw)
+    except ValueError:
+        return _EPOCH_FENCE_DEFAULT_TIMEOUT
+    return value if value > 0 else _EPOCH_FENCE_DEFAULT_TIMEOUT
+
+
 class SqlStore:
     def __init__(self, url: str = ":memory:"):
         self.conn, self.dialect, resolved_path = connect(url)
@@ -1948,6 +1971,246 @@ class SqlStore:
     # arbitrary but STABLE namespace, so these advisory locks can never
     # collide with another feature's.
     _ACTIVE_CONTEXT_LOCK_NAMESPACE = 0x4143      # "AC"
+
+    # The epoch fence's advisory-lock namespaces (PR #423 redesign). A NEW,
+    # DEDICATED pair -- deliberately NOT reusing _ACTIVE_CONTEXT_LOCK_NAMESPACE.
+    # The #386 mutex above and this fence protect different concerns (the
+    # ActiveContext row's first-insert race, vs. reader/writer epoch-visibility
+    # ordering) that happen to often be keyed by the same user_id; sharing a
+    # namespace would over-serialize the two for no correctness benefit and
+    # would make pg_locks contention undiagnosable (two different concerns
+    # showing up as one key).
+    _EPOCH_FENCE_USER_NAMESPACE = 0x4645         # "FE" -- per-user fence keys
+    _EPOCH_FENCE_GLOBAL_NAMESPACE = 0x4C43       # "LC" -- the one global key
+    _EPOCH_FENCE_GLOBAL_OBJID = 0                # the only objid used there
+    # Byte-identical to services.epoch_fence.EPOCH_FENCE_GLOBAL_KEY.
+    # Duplicated, not imported -- see _epoch_fence_timeout_seconds' comment on
+    # why store/ never imports from services/. tests/test_epoch_fence.py
+    # asserts the two literals stay equal.
+    _EPOCH_FENCE_GLOBAL_KEY = "lifecycle"
+
+    def _epoch_fence_lock_target(self, key: str):
+        """``(namespace, fixed_objid)`` for ``key`` -- ``fixed_objid`` is the
+        pinned ``_EPOCH_FENCE_GLOBAL_OBJID`` for the one global key (no hash
+        needed: it is the ONLY objid ever used in that namespace, so there is
+        zero collision risk for the single key that guards every
+        Season/Program/League/LeagueSeason writer), or ``None`` for every
+        other (per-user) key, telling the caller to hash ``key`` itself via
+        ``hashtext()`` -- the SAME mechanism ``_lock_active_context_mutex``
+        above already uses. ``hashtext`` collisions there are possible and
+        harmless (see that method's own docstring): correctness never depends
+        on the key being unique, only on it being the SAME for one user.
+        """
+        if key == self._EPOCH_FENCE_GLOBAL_KEY:
+            return self._EPOCH_FENCE_GLOBAL_NAMESPACE, self._EPOCH_FENCE_GLOBAL_OBJID
+        return self._EPOCH_FENCE_USER_NAMESPACE, None
+
+    def epoch_fence_acquire_exclusive(self, key: str) -> None:
+        """Take the EXCLUSIVE side of the epoch fence for ``key`` (PR #423).
+
+        MUST be called as a statement inside an already-open
+        ``self.transaction()`` -- ideally the FIRST statement, per the
+        per-writer transaction-boundary guidance in the design (§8). Blocks
+        (bounded by the same operator-configurable timeout
+        ``ContextSwitchGate`` already uses,
+        ``_epoch_fence_timeout_seconds()`` above) until no shared OR exclusive
+        holder exists for ``key``; auto-released at this transaction's
+        commit/rollback -- no separate release call, so nothing can leak it.
+
+        SQLite: a no-op. This transaction's own outermost ``BEGIN IMMEDIATE``
+        (see ``transaction()`` above) already took the database file's write
+        lock as the FIRST statement of the whole unit, before any read this
+        method's caller could have made -- there is nothing further to
+        acquire, and that write lock's own busy_timeout +
+        ``lock_not_available`` -> ``ConcurrencyConflictError`` translation
+        already gives exactly the bounded-wait-then-retryable-conflict
+        behavior this method would otherwise have to build from scratch.
+        This is not merely a convenient simplification: a real, DEDICATED
+        second connection was tried first and measured to DEADLOCK-class-
+        livelock against ``epoch_fence_acquire_shared``'s own reader side --
+        SQLite's exclusive-at-commit wait and a dedicated reader connection's
+        SHARED hold are the SAME lock axis (the file's own state machine),
+        unlike PostgreSQL's advisory locks, which are a separate axis from
+        row/self._lock entirely. A reader holding that dedicated connection's
+        SHARED lock while ALSO needing ``self._lock`` for its own subsequent
+        store calls, racing a writer holding ``self._lock`` (inside
+        ``transaction()``) while blocked in ``self.conn.commit()`` waiting
+        for that SAME SHARED lock to release, is a genuine cross-primitive
+        AB-BA cycle -- measured directly as a 50+ second stall via a real
+        ``ThreadingHTTPServer`` test before being reverted in favor of this
+        no-op. See ``epoch_fence_acquire_shared``'s own docstring for the
+        full account and the resulting, deliberate scope reduction for
+        file-backed SQLite.
+
+        PostgreSQL: ``SET LOCAL lock_timeout`` (auto-reset at this
+        transaction's end, so it can never leak onto a LATER, unrelated
+        transaction sharing ``self.conn``) bounds a genuinely BLOCKING
+        ``pg_advisory_xact_lock`` -- no manual poll loop is written here.
+        PostgreSQL's own lock manager already implements "bounded blocking
+        wait, timeout raises" for a blocking advisory-lock acquisition
+        exactly as it does for a row lock (verified directly against a real
+        server before this was wired in: a contended
+        ``pg_advisory_xact_lock`` under ``lock_timeout`` raises within the
+        bound, carrying sqlstate 55P03). On timeout the raised error
+        propagates out of this method, through the caller's open
+        ``transaction()``, whose EXISTING exception boundary
+        (``translate_db_exception``) already classifies 55P03 as
+        ``lock_not_available`` and raises ``ConcurrencyConflictError`` --
+        exactly what the caller's existing bounded retry loop
+        (``setup_guarded_mutation`` / ``ContextService._snapshot``) already
+        catches. Nothing new to catch here.
+        """
+        if self.backend != "postgres":
+            return
+        namespace, fixed_objid = self._epoch_fence_lock_target(key)
+        bound_ms = max(1, int(_epoch_fence_timeout_seconds() * 1000))
+        # LOCAL: see the docstring above for why.
+        self._exec(f"SET LOCAL lock_timeout = '{bound_ms}ms'")
+        if fixed_objid is not None:
+            self._exec("SELECT pg_advisory_xact_lock(?, ?)",
+                       (namespace, fixed_objid))
+        else:
+            self._exec("SELECT pg_advisory_xact_lock(?, hashtext(?))",
+                       (namespace, key))
+
+    @contextmanager
+    def epoch_fence_acquire_shared(self, key: str):
+        """Take the SHARED side of the epoch fence for ``key`` (PR #423).
+
+        MUST be called OUTSIDE any ``self.transaction()``. Returns a context
+        manager; blocks (bounded, see above) until no EXCLUSIVE holder exists
+        for ``key`` -- any number of concurrent shared holders may coexist.
+        Released explicitly on context-manager exit, independent of any
+        ``self.transaction()`` lifetime -- may span several, or none, which is
+        the whole point: it is what lets a scoped read's epoch comparison AND
+        its dependent service call be ordered as one unit against a writer's
+        commit, without holding ``self._lock``/a single wide transaction
+        across an unbounded dependent call (see ``server.py``'s
+        ``_read_under_context_gate`` and the design's §4.3-4.4 for why).
+
+        Acquired on a connection SEPARATE from ``self.conn`` -- opened fresh
+        for this call and closed when the hold releases. This is what makes
+        it safe ON POSTGRES: a slow ``produce()`` call held on its own
+        connection never touches ``self._lock``, so it can never stall
+        unrelated same-process store traffic (the exact concern
+        ``context_service.py``'s and ``server.py``'s own comments name for
+        why an earlier revision of this fix, a shared ``store.transaction()``,
+        was rejected), and a reader can never deadlock against a writer
+        waiting to get into ``self._lock`` -- a Postgres advisory lock is a
+        SEPARATE axis from ``self._lock``/row locks entirely, so the writer's
+        wait for it never depends on ``self._lock`` being released at all.
+
+        THIS DOES NOT HOLD ON SQLITE, and SQLite therefore does NOT use a
+        dedicated connection here -- see ``epoch_fence_acquire_exclusive``'s
+        own docstring for the concrete deadlock hazard measured directly (not
+        merely reasoned about) before this was scoped down: SQLite has only
+        ONE lock axis (the file's own SHARED/RESERVED/PENDING/EXCLUSIVE state
+        machine), and ``self.conn``'s commit -- which needs EXCLUSIVE --
+        already runs INSIDE ``self._lock``. A dedicated reader connection
+        holding SHARED on that SAME axis, while ALSO needing ``self._lock``
+        for its own subsequent store calls (``current_epoch()``/``produce()``
+        both do), is a genuine AB-BA cycle between the file lock and
+        ``self._lock`` -- not merely a theoretical one: measured directly as
+        a 50+ second stall (bounded, not infinite, because SQLite's own
+        busy_timeout eventually lets the writer's transaction fail and
+        release ``self._lock`` -- but only after ``_snapshot``/
+        ``setup_guarded_mutation``'s full retry budget, and CPython's RLock
+        gives no fairness guarantee against the SAME thread re-entering on
+        each retry, so this is a real livelock hazard, not just a slow path).
+
+        On timeout, PROCEEDS ANYWAY -- fails OPEN, exactly matching
+        ``ContextSwitchGate``'s existing, deliberate choice
+        (``context_gate.py:117-123``): a scoped read that can't get a fence
+        hold must not be able to lock an operator out of a context switch or
+        a Season lifecycle change. Yields ``True`` if the hold was genuinely
+        acquired, ``False`` if it failed open -- tests use this to assert the
+        happy path actually exercised the lock rather than silently timing
+        out every time.
+
+        A falsy ``key`` acquires nothing (mirrors ``_context_read_hold``'s
+        existing falsy-``user_id`` short-circuit, ``context_gate.py:249-252``).
+
+        ``self.is_memory_backed`` (SQLite ``:memory:``/empty path) would ALSO
+        be a no-op for its OWN, separate reason even if file-backed SQLite
+        used a real dedicated connection: ``sqlite3``'s ``:memory:``
+        databases are PER-CONNECTION-PRIVATE (confirmed directly: a fresh
+        ``connect(":memory:")`` opens a blank, unmigrated database, not a
+        second handle onto ``self.conn``'s data), so "a dedicated connection
+        to the SAME store" is not merely unnecessary there, it is INCOHERENT:
+        there is no second connection that could see what the first one
+        holds. ``self._lock`` already fully serializes every
+        ``transaction()`` this ONE store instance ever runs (the same
+        reasoning ``is_memory_backed`` already exists for elsewhere in this
+        class), which is the strongest guarantee available and exactly
+        ``InMemoryStore.epoch_fence_acquire_shared``'s own justification.
+        """
+        if not key:
+            yield None
+            return
+        if self.backend != "postgres":
+            # SQLite (both :memory: and file-backed) -- a documented no-op;
+            # see the deadlock-hazard paragraph above for file-backed, and
+            # the PER-CONNECTION-PRIVATE paragraph for :memory:. On
+            # file-backed SQLite this is a real, stated scope reduction from
+            # the design's original ask: same-PROCESS ordering stays fully
+            # covered by the kept ContextSwitchGate holds (unchanged,
+            # web/server.py), but a genuinely independent SECOND PROCESS
+            # sharing the same SQLite file is not ordered against by this
+            # primitive this round. PostgreSQL -- the actual deployment
+            # target -- gets the real, tested, cross-process mechanism below.
+            yield True
+            return
+        with self._epoch_fence_shared_postgres(key) as held:
+            yield held
+
+    @contextmanager
+    def _epoch_fence_shared_postgres(self, key: str):
+        namespace, fixed_objid = self._epoch_fence_lock_target(key)
+        bound_ms = max(1, int(_epoch_fence_timeout_seconds() * 1000))
+        conn, _dialect, _path = connect(self._url)
+        acquired = False
+        try:
+            # set_config, not `SET lock_timeout = %s` -- PostgreSQL does not
+            # accept a bind parameter as a SET value (a literal or `$n` isn't
+            # valid there); set_config is the parametrized equivalent.
+            # `is_local=false`: this connection is single-purpose and
+            # short-lived (opened fresh for this call, closed on release), so
+            # a session-wide setting on it is equivalent to a transaction-local
+            # one and needs no enclosing transaction to apply.
+            conn.execute("SELECT set_config('lock_timeout', %s, false)",
+                        (f"{bound_ms}ms",))
+            if fixed_objid is not None:
+                conn.execute("SELECT pg_advisory_lock_shared(%s, %s)",
+                            (namespace, fixed_objid))
+            else:
+                conn.execute("SELECT pg_advisory_lock_shared(%s, hashtext(%s))",
+                            (namespace, key))
+            acquired = True
+            yield True
+        except Exception as exc:                                # noqa: BLE001
+            # Duck-typed, exactly like db_errors.py's own classification --
+            # psycopg need not be importable here. Only the TIMEOUT case
+            # (55P03, "lock_not_available") fails open; anything else
+            # propagates unchanged so an unrecognized failure surfaces as a
+            # real error rather than being silently swallowed.
+            if getattr(exc, "sqlstate", None) != "55P03":
+                conn.close()
+                raise
+            yield False
+        finally:
+            if acquired:
+                try:
+                    if fixed_objid is not None:
+                        conn.execute(
+                            "SELECT pg_advisory_unlock_shared(%s, %s)",
+                            (namespace, fixed_objid))
+                    else:
+                        conn.execute(
+                            "SELECT pg_advisory_unlock_shared(%s, hashtext(%s))",
+                            (namespace, key))
+                except Exception:                                # noqa: BLE001
+                    pass    # never let a release failure mask the caller's own
+            conn.close()
 
     def _lock_active_context_mutex(self, user_id):
         """Take the per-user ActiveContext MUTEX for this transaction (#386).
