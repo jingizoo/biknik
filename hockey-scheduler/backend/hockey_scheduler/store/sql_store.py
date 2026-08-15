@@ -733,6 +733,42 @@ class SqlStore:
                             # genuinely contended writer now blocks in the busy
                             # handler at BEGIN — where SQLite *does* honour the
                             # timeout — instead of failing on contact.
+                            #
+                            # round-N+1 (finding 1 SQLite rework): the busy
+                            # handler's OWN bound is set HERE, immediately
+                            # before every single outermost BEGIN — not once
+                            # at connection-open — and re-READS
+                            # `HS_CONTEXT_GATE_TIMEOUT` FRESH each time,
+                            # matching the SAME "the SAME configured knob
+                            # every layer of this mechanism uses" contract
+                            # Postgres's `SET LOCAL lock_timeout` (in
+                            # `epoch_fence_acquire_exclusive`) already keeps.
+                            # `PRAGMA busy_timeout` is a CONNECTION-level
+                            # setting with no `SET LOCAL`-style auto-reset, so
+                            # setting it ONCE at `__init__` was tried first and
+                            # measured to be WRONG: a test (or an operator)
+                            # that changes the env var AFTER a long-lived
+                            # store's connection already exists (exactly
+                            # `test_a_waiter_cannot_block_forever_on_a_read_
+                            # that_never_returns`'s own shape — the store is
+                            # built once in `setUpClass`, the env var is
+                            # lowered to 0.4s inside the test method) would
+                            # silently keep the OLD value forever, compounding
+                            # through this method's own bounded retry loop
+                            # (`_GUARDED_MUTATION_RETRIES`/
+                            # `_MAX_SNAPSHOT_RETRIES`, 10 attempts) into a
+                            # multi-minute stall the test's own PATIENCE
+                            # budget could not absorb. Re-setting it here,
+                            # every time, is cheap (a local, in-memory
+                            # connection setting — no I/O) and makes this
+                            # store behave exactly like `ContextSwitchGate`,
+                            # which re-reads its own env var on every
+                            # construction and additionally lets a caller
+                            # mutate `wait_timeout` directly at runtime.
+                            busy_ms = max(
+                                1, int(_epoch_fence_timeout_seconds() * 1000))
+                            self.conn.execute(
+                                f"PRAGMA busy_timeout = {busy_ms}")
                             self.conn.execute("BEGIN IMMEDIATE")
                             yield
                             self.conn.commit()

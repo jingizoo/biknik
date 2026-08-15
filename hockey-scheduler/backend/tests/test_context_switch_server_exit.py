@@ -210,11 +210,63 @@ class ContextGateFixtureBase:
     def _wrap(self, obj, name, wrapper_factory):
         """Shadow a BOUND method on the LIVE instance with a wrapper built from
         the original. Instance attributes win over class attributes, so no
-        production module is patched and the undo is a plain ``delattr``."""
+        production module is patched and the undo is a plain ``delattr``.
+
+        round-N+1: ALSO shadows the underlying CLASS's method, for a call
+        made through a DIFFERENT instance of the SAME class — specifically
+        ``web/server.py``'s ``_read_under_context_gate_sqlite``, which runs a
+        scoped read's service call against its OWN, fully independent
+        ``ApiService`` (bound to a fresh, independent ``SqlStore``, never
+        ``STATE.api``) for FILE-BACKED SQLite. Before this, every SQLite case
+        in this file (and in ``test_context_read_cancel_handoff.py``/
+        ``test_context_epoch_lifecycle.py``, which reuse this exact method)
+        parked or spied on ``self.api.<method>`` and then waited forever: the
+        call it needed to see was happening on a DIFFERENT, freshly-
+        constructed instance the instance-level shadow above cannot reach.
+
+        THIS IS PURELY ADDITIVE for every EXISTING caller. Python resolves an
+        INSTANCE attribute before a CLASS one, so the instance-level shadow
+        above is still what actually runs for every call through ``obj``
+        itself — the class-level dispatch below is only ever reached for a
+        call through some OTHER instance of ``type(obj)``.
+
+        ONE SET OF CLOSURE STATE backs BOTH paths, not two independent ones:
+        every wrapper factory in this codebase's test suite (a spy's
+        accumulating ``calls`` list, a park's ``_Park``/``exited`` dict) is
+        already written to hold its OWN mutable state OUTSIDE
+        ``wrapper_factory``'s own body — ``wrapper_factory`` itself only ever
+        closes over ``original`` — so calling it a SECOND time below (once
+        per newly-seen instance, with THAT instance's own true original bound
+        method) still reads and writes the exact same outer `calls`/`park`/
+        `exited`, never a disconnected copy. A spy therefore sees every call
+        regardless of which instance received it, and a park catches
+        whichever instance's call happens to arrive.
+        """
         original = getattr(obj, name)
         setattr(obj, name, wrapper_factory(original))
-        self._restores.append(lambda: (delattr(obj, name)
-                                       if name in vars(obj) else None))
+        cls = type(obj)
+        class_original = getattr(cls, name)
+
+        def class_dispatch(instance, *a, **kw):
+            if instance is obj:
+                # Unreachable in practice — attribute lookup never falls
+                # through to the class for `obj` once the instance shadow
+                # above exists — kept so this stays CORRECT even if that
+                # invariant is ever violated, rather than silently calling
+                # `original` twice for the one call the instance shadow
+                # already serves.
+                return getattr(obj, name)(*a, **kw)
+            bound = class_original.__get__(instance, cls)
+            return wrapper_factory(bound)(*a, **kw)
+
+        setattr(cls, name, class_dispatch)
+
+        def undo():
+            if name in vars(obj):
+                delattr(obj, name)
+            setattr(cls, name, class_original)
+
+        self._restores.append(undo)
         return original
 
     # -- HTTP ---------------------------------------------------------------
@@ -1307,18 +1359,33 @@ class ContextSwitchServerExitBase(ContextGateFixtureBase):
             # this is the numeric bound checked below) — it is told,
             # correctly, that the read it raced is still live and to retry.
             #
-            # ONLY on the backend where the fence is REAL (PostgreSQL):
-            # Memory's epoch_fence_acquire_exclusive is an unconditional
-            # no-op (self._lock already covers the whole transaction body —
-            # see that method's own docstring) and file-backed SQLite's is
-            # ALSO a no-op (the deadlock hazard documented on
-            # epoch_fence_acquire_shared), so on those two backends this
-            # exact race is governed ENTIRELY by the OLD, unchanged gate,
-            # which still fails open on both sides — no behavior change,
-            # still 200, exactly as before this PR.
-            is_postgres = bool(self.STORE_URL) and self.STORE_URL.startswith(
-                ("postgres://", "postgresql://"))
-            if is_postgres:
+            # round-N+1 CORRECTION: this used to read "ONLY on the backend
+            # where the fence is REAL (PostgreSQL)" and expect 200 (silent,
+            # unordered success) on BOTH Memory and file-backed SQLite,
+            # because BOTH of `epoch_fence_acquire_exclusive`/`_shared` were
+            # genuine no-ops there before this round. That premise no longer
+            # holds for file-backed SQLite specifically:
+            # `_read_under_context_gate_sqlite` now runs a scoped read's
+            # epoch-check-through-produce() window against its OWN,
+            # independent `SqlStore` connection, holding a REAL SQLite file
+            # lock (`BEGIN IMMEDIATE`) for the read's whole parked duration —
+            # so a WRITER's connection (`STATE.api.store`, a SEPARATE
+            # connection to the SAME file) now genuinely CONTENDS with it,
+            # exactly as it always has against PostgreSQL's real advisory
+            # lock. The store-layer retry loop
+            # (`ContextService._snapshot`'s `_MAX_SNAPSHOT_RETRIES`)
+            # exhausts against that real, busy-timeout-bounded contention
+            # and surfaces the SAME translated, retryable
+            # `ConcurrencyConflictError` Postgres's timeout already does —
+            # measured directly: this case now returns 409 on file-backed
+            # SQLite too, not 200. Memory is UNCHANGED (still 200): it has no
+            # database-level lock at all to contend on, and row 1 (context
+            # switch) was ALREADY wired into `CONTEXT_GATE` before this
+            # round, so nothing about ITS behavior for this exact race
+            # differs — the OLD, unchanged, fails-open-on-both-sides gate
+            # still governs it alone.
+            is_durable_store = bool(self.STORE_URL)
+            if is_durable_store:
                 self.assertEqual(switch["result"][0], 409, switch["result"][1])
                 self.assertEqual(
                     switch["result"][2].get("error", {}).get("details", {})
@@ -1570,7 +1637,35 @@ class ContextSwitchServerExitBase(ContextGateFixtureBase):
         still ordered behind his own read; and afterwards each operator's reads
         agree with their OWN tuple and only their own. Two distinct persisted
         contexts, one process, one gate.
+
+        round-N+1 CORRECTION, file-backed SQLite only: this file's own gates
+        (``CONTEXT_GATE``/``LIFECYCLE_GATE``) are keyed per-user, so Alice's
+        exclusive hold never waits on Bob's ticket THERE — that half of the
+        claim is unchanged, on every backend. But for FILE-BACKED SQLite
+        specifically, Bob's held read ALSO now holds a REAL SQLite file lock
+        for its whole parked duration (``_read_under_context_gate_sqlite``'s
+        own independent connection — see that method's own docstring), and
+        SQLite's native locking is FILE-granular: it has no primitive
+        analogous to the gate's or PostgreSQL's advisory locks' per-user
+        keying, so it cannot distinguish "Alice's write" from "Bob's read"
+        the way either of those can. An unrelated operator's write CAN
+        therefore now be briefly delayed — and, if the contention outlasts
+        the guarded write's own bounded retry budget, cleanly REFUSED with a
+        retryable 409 rather than silently starved — by another operator's
+        held scoped read, on this ONE backend. This is a new, DOCUMENTED
+        (not silently absorbed) consequence of using the file's own native
+        lock as the durable, engine-level primitive finding 1 asked for, not
+        a defect in this test's original claim, which still holds exactly as
+        written for Memory and PostgreSQL — both have real per-key
+        coordination and never pay this cost.
         """
+        # Bounds a genuinely contended SQLite file lock to a small multiple
+        # of 1s rather than the 10s default, so this test's own artificial
+        # park cannot inflate ANY guarded write's bounded retry budget into
+        # a multi-minute wait — see `SqlStore.transaction`'s SQLite branch
+        # for why this must be set (or changed) before the write it governs
+        # opens its transaction, not merely before the test starts.
+        self._set_epoch_fence_timeout_env("1")
         fx = self._program_with_two_seasons("Pair")
         alice_name, alice_id = self._operator("pair_alice")
         bob_name, bob_id = self._operator("pair_bob")
@@ -1579,6 +1674,9 @@ class ContextSwitchServerExitBase(ContextGateFixtureBase):
         bob_switcher = self._login(bob_name)
         self._select(alice, fx["program_id"], fx["s1"])
         self._select(bob_reader, fx["program_id"], fx["s1"])
+
+        is_sqlite_file = bool(self.STORE_URL) and not self.STORE_URL.startswith(
+            ("postgres://", "postgresql://"))
 
         with self._read_parked_in("get_venue_grant_candidates", fx["s1"]) as (
                 park, _exited):
@@ -1592,15 +1690,29 @@ class ContextSwitchServerExitBase(ContextGateFixtureBase):
             self.assertTrue(park.arrived.wait(PATIENCE),
                             "Bob's read never reached the server")
 
-            # ALICE switches while Bob's read is held. Her switch is not Bob's
-            # read's business: it must commit, and promptly.
+            # ALICE switches while Bob's read is held. Always on a thread —
+            # not inline — because on the SQLite-file branch below she may
+            # genuinely have to wait for Bob's read to release before her
+            # own guarded write's retry budget lets her proceed, and this
+            # test must not deadlock itself waiting for her synchronously
+            # while ALSO being the thing that eventually releases Bob.
             started = time.monotonic()
-            self._select(alice, fx["program_id"], fx["s3"])
-            alice_elapsed = time.monotonic() - started
-            self.assertLess(
-                alice_elapsed, self._gate().wait_timeout / 2,
-                f"Alice's switch waited {alice_elapsed:.2f}s behind ANOTHER "
-                f"operator's held scoped read")
+            alice_switch = {}
+            ast = self._switch_thread(alice, fx["program_id"], fx["s3"],
+                                      alice_switch)
+            if not is_sqlite_file:
+                # Memory/PostgreSQL: her switch is not Bob's read's business
+                # AT ALL (no file lock, no shared advisory-lock key) — it
+                # must commit, and promptly.
+                ast.join(self._gate().wait_timeout / 2)
+                alice_elapsed = time.monotonic() - started
+                self.assertFalse(
+                    ast.is_alive(),
+                    f"Alice's switch waited more than "
+                    f"{self._gate().wait_timeout / 2:.2f}s behind ANOTHER "
+                    f"operator's held scoped read")
+                self.assertEqual(alice_switch["result"][0], 200,
+                                 alice_switch["result"][1])
 
             # BOB's switch, by contrast, IS his read's business.
             bob_switch = {}
@@ -1611,18 +1723,41 @@ class ContextSwitchServerExitBase(ContextGateFixtureBase):
                 self._persisted(bob_id), (fx["program_id"], fx["s1"]),
                 "Bob's switch committed while Bob's read was inside the "
                 "server")
-            self.assertEqual(
-                self._persisted(alice_id), (fx["program_id"], fx["s3"]),
-                "Alice's committed tuple did not survive Bob's quiesce")
+            if not is_sqlite_file:
+                self.assertEqual(
+                    self._persisted(alice_id), (fx["program_id"], fx["s3"]),
+                    "Alice's committed tuple did not survive Bob's quiesce")
             park.let_go()
             rt.join(PATIENCE)
             bst.join(PATIENCE)
+            if is_sqlite_file:
+                # Released now, not before: Alice's retries could only ever
+                # succeed once Bob's read (and its file lock) is gone.
+                ast.join(PATIENCE)
+                self.assertFalse(
+                    ast.is_alive(),
+                    "Alice's switch never completed even once Bob's read "
+                    "released — the contended file lock left it wedged, "
+                    "not merely delayed")
+                self.assertIn(
+                    alice_switch["result"][0], (200, 409),
+                    f"Alice's switch against a contended SQLite file lock "
+                    f"must resolve cleanly, one way or the other: "
+                    f"{alice_switch['result'][1]}")
 
         self.assertEqual(bob_read["result"][0], 200, bob_read["result"][1])
         self.assertEqual(bob_switch["result"][0], 200, bob_switch["result"][1])
-        self.assertEqual(self._persisted(alice_id), (fx["program_id"], fx["s3"]))
+        if alice_switch["result"][0] == 200:
+            self.assertEqual(self._persisted(alice_id),
+                             (fx["program_id"], fx["s3"]))
+            self._assert_reads_agree_with(alice, fx, fx["s3"])
+        else:
+            # Only reachable on the SQLite-file branch (Memory/PostgreSQL
+            # already asserted 200 above): a cleanly-refused write must
+            # leave Alice's PRE-race tuple untouched, never half-applied.
+            self.assertEqual(self._persisted(alice_id),
+                             (fx["program_id"], fx["s1"]))
         self.assertEqual(self._persisted(bob_id), (fx["program_id"], fx["s2"]))
-        self._assert_reads_agree_with(alice, fx, fx["s3"])
         self._assert_reads_agree_with(bob_reader, fx, fx["s2"])
         self._assert_gate_is_clean("after two operators interleaved")
 
