@@ -727,8 +727,20 @@ class ContextSnapshotConsistencyTest(unittest.TestCase):
                     pid, sid = _program_season(api, "P1", "S1")
                     if kind == "reopen":
                         _archive(store, sid)
+                    # round-N review finding 3: the facade's
+                    # ``set_active_context`` now routes through
+                    # ``ContextService.set_with_league_and_epoch`` (the
+                    # same-snapshot tuple+epoch fold), not plain
+                    # ``set_with_league`` — wrapping the OLD name here would
+                    # silently go vacuous exactly the way this helper's own
+                    # docstring warns about (and #360 hit for real): the
+                    # facade would stop calling it, the mutation would never
+                    # land, and every assertion below would keep passing
+                    # while checking nothing. Both methods share the SAME
+                    # "validated snapshot; its transaction closed" timing —
+                    # this is a like-for-like retarget, not a weaker check.
                     fired = self._mutate_after(
-                        api, "set_with_league",
+                        api, "set_with_league_and_epoch",
                         _mutation(store, pid, sid, kind))
                     c = api.set_active_context("u", *ADMIN, pid, sid)
                     _assert_context_consistent(self, c, (kind, label))
@@ -980,8 +992,16 @@ class ContextSnapshotConsistencyPgTest(unittest.TestCase):
         # never fire, and this barrier would hang rather than fail loudly about
         # the real cause. Pausing here still means exactly what it always did:
         # after the service has validated and DETACHED its objects (its
-        # transaction closed), before the facade renders them.
-        method = "resolve_with_league" if verb == "GET" else "set_with_league"
+        # transaction closed), before the facade renders them. Round-N review
+        # finding 3: the POST side now goes through `set_with_league_and_epoch`
+        # (the same-snapshot tuple+epoch fold `ApiService.set_active_context`
+        # calls internally) rather than plain `set_with_league` — patching the
+        # old name here would silently stop firing (the exact vacuous-test
+        # failure mode `_mutate_after`'s own docstring, elsewhere in this
+        # file, warns about) and this barrier would hang instead of ever
+        # reaching `paused.wait(15)`.
+        method = ("resolve_with_league" if verb == "GET"
+                 else "set_with_league_and_epoch")
         orig = getattr(api.context, method)
 
         def paused_boundary(*a, **k):

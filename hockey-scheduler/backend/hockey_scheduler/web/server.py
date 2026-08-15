@@ -3047,43 +3047,39 @@ class Handler(BaseHTTPRequestHandler):
             # round, layering the new, cross-process-capable primitive
             # underneath rather than removing what already works in-process.
             #
-            # DELIBERATELY calling ``api.set_active_context`` here, NOT the
-            # epoch-folding ``ContextService.set_with_league_and_epoch`` this
-            # redesign also added (see ``context_service.py``'s own
-            # docstring on that method): this exact call, by this exact
-            # name, is the seam ``tests/test_context_switch_server_exit.py``
+            # STILL calling ``api.set_active_context`` here, by this exact
+            # name — the seam ``tests/test_context_switch_server_exit.py``
             # wraps (``self._wrap(self.api, "set_active_context", ...)``,
             # four separate tests) to park a switch mid-flight and assert
             # the writer-vs-writer/reader-vs-writer ORDERING this whole gate
-            # exists to prove. Routing through a differently-named method
-            # would silently stop exercising that instrumentation — not
-            # break loudly, just never park, which is worse. The
-            # two-transaction shape (write, then a separate
-            # ``current_epoch()`` read) stays exactly as it was; it remains
-            # fully closed IN-PROCESS by ``CONTEXT_GATE.exclusive`` wrapping
-            # both calls below, exactly as today. What the new fold adds —
-            # closing the SAME race for a hypothetical second process — is
-            # available at the service layer (``set_with_league_and_epoch``)
-            # for a future caller; not wired to this HTTP call site this
-            # round, so the existing test seam is not disturbed.
+            # exists to prove — but round-N review finding 3 fixed WHAT this
+            # call does: ``include_epoch=True`` folds the write AND the
+            # response epoch into the SAME serializable snapshot
+            # (``ContextService.set_with_league_and_epoch``, via
+            # ``ApiService.set_active_context``'s own widened signature —
+            # see that method's docstring), replacing the two-transaction
+            # shape (write, then a SEPARATE ``current_epoch()`` read) an
+            # earlier revision of this comment defended as "fully closed
+            # in-process by CONTEXT_GATE.exclusive" — true for two switches
+            # racing WITHIN one process, but not for two independent
+            # replicas: replica B could commit a second switch for this same
+            # user between replica A's write and A's separate epoch read,
+            # and A would hand its caller an epoch for B's selection. Nesting
+            # the fold INSIDE the unchanged ``CONTEXT_GATE.exclusive`` wrap
+            # is composition, not a replacement — Phase-A's arrival tickets
+            # keep the exact same consumer they always had, and the ONE call
+            # below is still the ONE code path both concerns share, so the
+            # existing test seam parks the real write exactly as before.
             with CONTEXT_GATE.exclusive(user_id):
-                payload = api.set_active_context(
+                payload, epoch = api.set_active_context(
                     user_id, role, scope,
                     body.get("program_id"), body.get("season_id"),
-                    body.get("league_id"))
-                # The NEW epoch, derived AFTER the commit and INSIDE the
-                # exclusive hold, so it reflects the row (and generation) THIS
-                # switch just wrote and the effective resolution built from it
-                # (#159 review finding 2). Outside the hold a second concurrent
-                # switch for the same user could commit first and this
-                # response would hand back an epoch for a selection its
-                # caller never asked for — the client would then echo it and
-                # have its reads ADMITTED against a tuple it is not
-                # rendering. This is the one call site that derives after
-                # rather than before; `_with_context_epoch` explains why the
-                # two orders are both correct in their own place.
-                payload = self._with_context_epoch(
-                    payload, api.context.current_epoch(user_id, role, scope))
+                    body.get("league_id"), include_epoch=True)
+                # `epoch` is None on a refused write (`payload` is then the
+                # error dict) — `_with_context_epoch` already no-ops on any
+                # payload carrying an "error" key, so passing None through
+                # is inert rather than needing its own branch here.
+                payload = self._with_context_epoch(payload, epoch)
             return self._send_api(payload)
 
         # Authorize the acting role at the HTTP boundary (#24/#50). A session

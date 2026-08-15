@@ -285,9 +285,9 @@ class ApiService:
             user_id, role, scope)
         return self._context_view(program, season, league)
 
-    @catch
     def set_active_context(self, user_id, role, scope,
-                           program_id, season_id, league_id=None) -> dict:
+                           program_id, season_id, league_id=None,
+                           include_epoch=False):
         """Record a Program/Season(/League) selection.
 
         ``league_id`` is appended LAST and defaults to None (#345) so the
@@ -297,10 +297,74 @@ class ApiService:
         two-axis ``ContextService.set`` produced (``league_id`` NULL), so the
         legacy behavior — including CLEARING a previously-saved League rather
         than carrying it onto a Program/Season it was not chosen for — is
-        preserved exactly."""
-        program, season, league = self.context.set_with_league(
-            user_id, role, scope, program_id, season_id, league_id)
-        return self._context_view(program, season, league)
+        preserved exactly.
+
+        ``include_epoch=True`` (round-N review finding 3, KEYWORD-ONLY in
+        practice — every existing caller passes at most five positionals)
+        returns ``(payload, epoch)`` instead of the plain dict: the response
+        epoch derived from the SAME serializable snapshot as the write
+        (``ContextService.set_with_league_and_epoch``, PR #423 design §8.1 —
+        wired to the facade for the first time this round). Defaulted
+        ``False`` so the ~200 other callers across this codebase's test
+        suite keep this method's exact dict-only return shape untouched.
+        Used ONLY by ``web/server.py``'s ``POST /api/context`` handler.
+
+        THE RACE ``include_epoch=True`` CLOSES. That handler used to call
+        this method (one transaction, the write) and THEN a SEPARATE
+        ``ContextService.current_epoch()`` call (a second, independent
+        transaction) to build the response epoch — both inside the same
+        in-process ``CONTEXT_GATE.exclusive(user_id)`` hold, which fully
+        closes the race for two switches racing WITHIN one process, but NOT
+        across two independent replicas: replica B could commit a second
+        switch for the SAME user between replica A's write and A's separate
+        epoch read, and A would then hand its caller an epoch describing B's
+        selection rather than the tuple A's own response just rendered.
+        Folding the write and the epoch derivation into ONE ``_snapshot``
+        (what ``set_with_league_and_epoch`` already does, and already has
+        its own dedicated test coverage for) makes "the epoch matches the
+        row this response carries" true by construction rather than by the
+        in-process gate's cooperation. ``web/server.py``'s
+        ``_with_context_epoch`` is still where the epoch is ATTACHED to the
+        response dict (transport metadata, kept out of this domain-facing
+        module) — this method only hands the two values back paired.
+
+        SAME NAME, ON PURPOSE — this is a widened SIGNATURE, not a new
+        method. ``tests/test_context_switch_server_exit.py`` wraps this
+        exact bound method, by this exact name (``self._wrap(self.api,
+        "set_active_context", ...)``, four separate tests), to park a switch
+        mid-flight and assert the writer-vs-writer/reader-vs-writer ORDERING
+        the whole gate exists to prove; every one of those wrap factories
+        forwards ``*args, **kwargs`` generically, so calling this method with
+        ``include_epoch=True`` still runs through the SAME wrapped call site
+        the tests park. Adding a second, differently-named method for the
+        HTTP handler to call instead would have silently stopped exercising
+        that instrumentation for the real production path — not break
+        loudly, just never park, which is worse; a defaulted keyword
+        argument on the one name already being called is what keeps the
+        write itself as the ONE code path both concerns share.
+
+        NOT wrapped in the module-level ``@catch`` decorator (removed from
+        this method this round): ``catch``'s wrapper returns a BARE ``dict``
+        on a caught ``DomainError`` (``exc.to_dict()``), which the
+        ``include_epoch=True`` two-value return shape cannot absorb — a
+        caller unpacking ``payload, epoch = ...`` would crash trying to
+        unpack a one-key error dict. This method instead catches
+        ``DomainError`` itself, inline, and shapes it via ``exc.to_dict()``
+        — BYTE-IDENTICAL to what ``@catch`` produced — returning it ALONE
+        when ``include_epoch`` is False (preserving the exact historical
+        return type for every other caller) or paired with ``epoch=None``
+        when True. Any non-``DomainError`` exception propagates uncaught,
+        exactly matching ``@catch``'s own behavior for everything it does
+        not recognize."""
+        try:
+            program, season, league, epoch = (
+                self.context.set_with_league_and_epoch(
+                    user_id, role, scope, program_id, season_id, league_id))
+        except DomainError as exc:
+            error = exc.to_dict()
+            return (error, None) if include_epoch else error
+        payload = self._context_view(program, season, league)
+        return (payload, epoch) if include_epoch else payload
 
     def _season_option(self, season) -> dict:
         """A Season as the switcher needs it: id + name + lifecycle, with the
