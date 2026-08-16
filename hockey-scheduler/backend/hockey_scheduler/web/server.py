@@ -551,6 +551,13 @@ def is_context_scoped_read(path: str) -> bool:
 # (the resolve_role() 401 and the authorize() 403), never by
 # _operator_only's GET-side gate, which already has its own
 # per-call-site audit_category parameter.
+#
+# The device-token active-toggle entry (#426 round-3 review finding 1)
+# joins the contacts-active-toggle entry above it for the SAME reason: its
+# response echoes a stored raw value (the token) an unauthorized caller
+# never submitted, so a transport-level refusal is exactly as much a
+# sensitive-read denial as the facade's own — reusing the ONE
+# CONTACT_DESTINATION-category gate, not a second one.
 _SENSITIVE_POST_AUDIT_ROUTES = (
     (re.compile(r"^/api/notifications/contacts/[^/]+/active$"),
      SensitiveFieldCategory.CONTACT_DESTINATION, "set_contact_destination_active"),
@@ -558,6 +565,8 @@ _SENSITIVE_POST_AUDIT_ROUTES = (
      SensitiveFieldCategory.CONTACT_DESTINATION, "retry_notification_delivery"),
     (re.compile(r"^/api/notifications/deliveries/[^/]+/ignore$"),
      SensitiveFieldCategory.CONTACT_DESTINATION, "ignore_notification_delivery"),
+    (re.compile(r"^/api/notifications/device-tokens/[^/]+/active$"),
+     SensitiveFieldCategory.CONTACT_DESTINATION, "set_device_token_active"),
 )
 
 
@@ -2555,10 +2564,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(
                 api.list_calendar_feed_tokens(actor_type, actor_ref))
         if path == "/api/notifications/device-tokens":
-            # Device token registry listing for operators (#65); same guard.
-            if self._operator_only("/api/notifications/device-tokens"):
+            # Device token registry listing for operators (#65) — a
+            # sensitive read (#124/#426 round-3 review finding 1: a raw
+            # device token is the same class of protected value a raw
+            # contact destination is). Same shape as the contacts route
+            # above: _operator_only durably audits its OWN refusal, an
+            # ALLOWED caller falls through to _sensitive_get, which passes
+            # the real role/user_id/request_id into the facade's OWN
+            # policy+audit gate.
+            if self._operator_only(
+                    "/api/notifications/device-tokens",
+                    audit_category=SensitiveFieldCategory.CONTACT_DESTINATION):
                 return
-            return self._send_api(api.list_device_tokens())
+            return self._sensitive_get(api.list_device_tokens)
         if path == "/api/me/assignments":
             # The signed-in official's own inbox (#55). Identity comes from the
             # session cookie, with the same rules as /api/auth/me: no cookie →
@@ -4033,8 +4051,14 @@ class Handler(BaseHTTPRequestHandler):
                 body.get("token"), body.get("label")))
         dt = re.match(r"^/api/notifications/device-tokens/([^/]+)/active$", path)
         if dt:
+            # The response echoes the stored raw token — a sensitive read
+            # (#124/#426 round-3 review finding 1) — so this route
+            # propagates the ONE role/user_id this route's generic
+            # authorize() gate (above) already resolved, the SAME
+            # convention the contacts-active-toggle route above uses.
             return self._send_api(api.set_device_token_active(
-                dt.group(1), bool(body.get("active"))))
+                dt.group(1), bool(body.get("active")), actor_id=user_id,
+                actor_role=role, request_id=api._mint_request_id()))
 
         # Retire/reactivate a notification preference (#232 review 4) — the
         # audited, non-destructive counterpart to the contact-destination

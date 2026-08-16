@@ -5891,6 +5891,27 @@ class ApiService:
                          self.roster.clock(), calendar_name=name)
 
     # -- device token registry (#65) ---------------------------------------
+    #
+    # A raw device token is, for audit purposes, the SAME kind of protected
+    # value a ContactDestination's raw destination is — #426 round-3 review
+    # finding 1: "DeviceToken is architecturally the same class of problem
+    # ContactDestination already solved ... reuse that exact same
+    # boundary/mechanism ... rather than building a second parallel one".
+    # ``list_device_tokens``/``set_device_token_active`` below therefore
+    # route through the IDENTICAL policy+audit gate ``list_contact_
+    # destinations``/``set_contact_destination_active`` use — same
+    # ``SensitiveFieldCategory.CONTACT_DESTINATION`` category (not a new
+    # one), same ``_privacy_principal``/``_sensitive_read_allowed``/
+    # ``_refuse_sensitive_read``/``_record_sensitive_read`` calls, same
+    # sanitizers — just a different stored row shape underneath.
+    #
+    # ``register_device_token`` is deliberately NOT gated, for the SAME
+    # reason ``set_contact_destination`` (its ContactDestination sibling)
+    # is not: on both the create AND the reactivate-existing path, its
+    # response only ever echoes the ``token`` value the CALLER just
+    # submitted in this SAME call — never a stored value the caller didn't
+    # already have — so it discloses nothing new and is not a sensitive
+    # read.
     @staticmethod
     def _device_token_row(t) -> dict:
         return {"id": t.id, "recipient_ref": t.recipient_ref,
@@ -5898,9 +5919,30 @@ class ApiService:
                 "label": t.label, "active": t.active}
 
     @catch
-    def list_device_tokens(self) -> dict:
-        rows = [self._device_token_row(t)
-                for t in self.store.all_device_tokens()]
+    def list_device_tokens(self, actor_role=None, actor_user_id=None,
+                           request_id=None) -> dict:
+        """Every stored device token — a bulk read of protected values
+        (#124/#426 round-3 review finding 1: CONTACT_DESTINATION, the same
+        category a raw stored ContactDestination read uses), policy-gated
+        and audited exactly like ``list_contact_destinations`` (see that
+        method's own docstring for the full contract this mirrors).
+        """
+        request_id = self._safe_request_id(request_id)
+        role, label = self._privacy_principal(actor_role)
+        category = SensitiveFieldCategory.CONTACT_DESTINATION
+        if not self._sensitive_read_allowed(role, category):
+            self._refuse_sensitive_read(
+                category, "list_device_tokens", actor_user_id, label,
+                request_id)
+        with self.store.transaction():
+            rows = [self._device_token_row(t)
+                    for t in self.store.all_device_tokens()]
+            subjects = (sorted({("recipient", r["recipient_ref"])
+                                for r in rows})
+                       or [("recipient", "*")])
+            self._record_sensitive_read(
+                category, subjects, "list_device_tokens",
+                actor_user_id, label, ACCESS_ALLOWED, request_id)
         rows.sort(key=lambda r: (r["recipient_ref"], not r["active"], r["id"]))
         return {"device_tokens": rows}
 
@@ -5936,14 +5978,43 @@ class ApiService:
         return self._device_token_row(t)
 
     @catch
-    def set_device_token_active(self, token_id: str, active: bool) -> dict:
-        t = self.store.get_device_token(token_id)
-        if t is None:
-            raise NotFoundError("Device token not found.")
-        if active:
-            self._reject_dangling_recipient(t.recipient_ref)
-        t.active = bool(active)
-        self.store.save_device_token(t)
+    def set_device_token_active(self, token_id: str, active: bool,
+                                actor_id: Optional[str] = None,
+                                actor_role=None, request_id=None) -> dict:
+        """Retire (or reactivate) a device token.
+
+        The RESPONSE echoes the row including its STORED raw token — a
+        value the caller did not submit — so this is also a sensitive read
+        (#124/#426 round-3 review finding 1), gated by the SAME policy as
+        ``list_device_tokens``/``set_contact_destination_active`` (checked
+        FIRST, before the row lookup, so an unauthorized caller can't
+        distinguish existing from missing ids) and recorded as a
+        DataAccessLog row inside the mutation's own transaction — a
+        rolled-back toggle whose response never reached the caller leaves
+        no phantom read row. Mirrors ``set_contact_destination_active``'s
+        exact shape; see that method's own docstring.
+        """
+        request_id = self._safe_request_id(request_id)
+        role, label = self._privacy_principal(actor_role)
+        category = SensitiveFieldCategory.CONTACT_DESTINATION
+        if not self._sensitive_read_allowed(role, category):
+            self._refuse_sensitive_read(
+                category, "set_device_token_active", actor_id, label,
+                request_id)
+        with self.store.transaction():
+            t = self.store.get_device_token(token_id)
+            if t is None:
+                raise NotFoundError("Device token not found.")
+            if active:
+                self._reject_dangling_recipient(t.recipient_ref)
+            t.active = bool(active)
+            self.store.save_device_token(t)
+            # Read-back disclosure of the stored token (#124) — same
+            # transaction as the fetch+mutation, see the docstring.
+            self._record_sensitive_read(
+                category, [("recipient", t.recipient_ref)],
+                "set_device_token_active", actor_id, label,
+                ACCESS_ALLOWED, request_id)
         return self._device_token_row(t)
 
     # -- user accounts (#67) ------------------------------------------------

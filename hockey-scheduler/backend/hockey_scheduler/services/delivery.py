@@ -124,9 +124,33 @@ def _resolve_and_audit_destination(store, clock, recipient: str, channel,
                                    request_id: str,
                                    purpose: str = "delivery_resolve") -> str:
     """Resolve (recipient, channel)'s real delivery destination AND, if a
-    stored ContactDestination row is what that resolution actually used,
-    durably audit reading it — both derived from exactly ONE store read
-    (#426 round-2 review finding 3).
+    stored ContactDestination OR DeviceToken row is what that resolution
+    actually used, durably audit reading it — both derived from exactly
+    ONE store read (#426 round-2 review finding 3).
+
+    PUSH TOKEN BRANCH (#426 round-3 review finding 1). Until this fix, a
+    resolved active device token was returned directly from inside the
+    ``read_only`` transaction below — before ever reaching the
+    ``store.add_data_access`` call beneath it, which only the
+    ContactDestination branch was wired to run. The reviewer's own repro:
+    plant a ``push-secret-token-426`` device token, and both
+    ``ApiService.list_device_tokens()`` (a separate #426 round-3 finding 1
+    fix, see ``api/service.py``) and THIS function returned/sent it with
+    ``list_data_access()`` staying empty — a stored, real push destination
+    disclosed with no trace, exactly the class of gap #124 exists to
+    close. A device token is, for audit purposes, the SAME kind of "real
+    stored contact destination" a ContactDestination row is (``resolve_
+    destination``'s own docstring already lists them as the two ranked
+    sources of "the real stored destination") — so it is audited under
+    the SAME ``SensitiveFieldCategory.CONTACT_DESTINATION`` category,
+    ``subject_type="recipient"`` shape, and ``SYSTEM_PRINCIPAL``
+    attribution as the ContactDestination branch, just with ``purpose``
+    suffixed ``"_push_token"`` so a reader of the ledger can still tell
+    WHICH underlying stored row a given ``delivery_resolve``-family row
+    disclosed, without needing a second category or a second gate (the
+    external review's own instruction: "one CONTACT_DESTINATION-category
+    gate that both ContactDestination and DeviceToken route through, not
+    two similar-but-separate gates").
 
     The bug this replaces: ``enqueue()`` and
     ``DeliveryWorker._process_pending_locked()`` used to call a separate
@@ -174,8 +198,10 @@ def _resolve_and_audit_destination(store, clock, recipient: str, channel,
     separate, audit-free, single-shot utility several OTHER call sites —
     none of them the delivery worker — still use directly, see its
     docstring):
-      1. push only — the recipient's first *active* device token (#65),
-         never audited (not a ContactDestination read at all);
+      1. push only — the recipient's first *active* device token (#65) —
+         audited HERE, from the SAME row this branch returns, when
+         reached (#426 round-3 review finding 1: previously never
+         audited at all, as if it weren't a stored disclosure);
       2. an *active* registered contact destination (#60) — audited HERE,
          from the SAME row this branch returns, when reached;
       3. the synthesized placeholder (#59) — never audited (nothing
@@ -185,16 +211,36 @@ def _resolve_and_audit_destination(store, clock, recipient: str, channel,
     caller/session principal — there is none here: this runs from the
     background worker loop and the manual drain endpoint alike, neither of
     which acts on behalf of a signed-in user), with the given ``purpose``
-    and a ``request_id`` shared by every row ONE enqueue/drain call writes
-    (#426 review finding 3's original "one request shares one safe id",
-    generalised to one worker run).
+    (suffixed ``"_push_token"`` for branch 1 above, see the PUSH TOKEN
+    BRANCH section) and a ``request_id`` shared by every row ONE
+    enqueue/drain call writes (#426 review finding 3's original "one
+    request shares one safe id", generalised to one worker run).
     """
+    token = None
     with store.transaction(read_only=True):
         if channel == NotificationChannel.PUSH:
-            token = store.active_device_token_for(recipient)
-            if token is not None and token.token:
-                return token.token
-        stored = store.get_contact_destination(recipient, channel)
+            candidate = store.active_device_token_for(recipient)
+            if candidate is not None and candidate.token:
+                token = candidate.token
+        stored = None if token is not None else store.get_contact_destination(
+            recipient, channel)
+    if token is not None:
+        # Same durable-id-allocation contract as the ContactDestination
+        # write below — see that comment and domain/privacy.py's DURABLE
+        # ID ALLOCATION section — and the SAME CONTACT_DESTINATION
+        # category/gate a DeviceToken read now shares with a
+        # ContactDestination one (#426 round-3 review finding 1).
+        store.add_data_access(DataAccessLog(
+            category=SensitiveFieldCategory.CONTACT_DESTINATION,
+            subject_type="recipient",
+            subject_id=visibility_policy.canonical_subject_id(recipient),
+            purpose=purpose + "_push_token",
+            at=clock(),
+            actor_user_id=None,
+            actor_role="system",
+            outcome=ACCESS_ALLOWED,
+            request_id=request_id))
+        return token
     if stored is None or not stored.destination or not stored.active:
         return destination_for(recipient, channel)
     # `id` is deliberately left unset: the store assigns it (#426
