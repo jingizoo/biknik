@@ -3460,8 +3460,8 @@ class Handler(BaseHTTPRequestHandler):
         if not authorize(role, path):
             # #426 round-2 review finding 2 (closing the residual gap the
             # FIRST #426 review round's own note here left open — see the
-            # module docstring's #426 history and the PR body for the full
-            # accounting): a Coach/Viewer refused HERE
+            # PR body's #426 history for the full accounting): a
+            # Coach/Viewer refused HERE
             # (MANAGE_SETUP/MANAGE_SCHEDULE, for the contacts-active-toggle
             # / deliveries retry|ignore routes) now durably audits a
             # CONTACT_DESTINATION denial row too, the SAME way the GET
