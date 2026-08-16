@@ -140,7 +140,8 @@ class SqlStoreParityTest(unittest.TestCase):
         # A registered device token (#65) persists and overrides the push
         # placeholder on the next emission, through the SQL store.
         self.api.register_device_token("scheduler", "fcm", "tok-sql")
-        listed = self.api.list_device_tokens()["device_tokens"]
+        listed = self.api.list_device_tokens(
+            actor_role=Role.LEAGUE_ADMIN)["device_tokens"]
         self.assertEqual(listed[0]["token"], "tok-sql")
         self.api.respond_assignment(self.ids["ref_assignment_id"], accept=True)
         ov = self.api.get_delivery_overview(actor_role=Role.LEAGUE_ADMIN)

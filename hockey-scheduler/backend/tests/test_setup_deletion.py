@@ -1175,10 +1175,12 @@ class DeletionContract:
         official = self._official()
         ref = f"official:{official}"
         tok = self.api.register_device_token(ref, "fcm", "tok_o_react")
-        self.api.set_device_token_active(tok["id"], False)
+        self.api.set_device_token_active(
+            tok["id"], False, actor_id=self.ACTOR, actor_role=Role.LEAGUE_ADMIN)
         self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
                            self.store.get_official, official, "official_deleted")
-        result = self.api.set_device_token_active(tok["id"], True)
+        result = self.api.set_device_token_active(
+            tok["id"], True, actor_id=self.ACTOR, actor_role=Role.LEAGUE_ADMIN)
         self.assertEqual(result["error"]["code"], "validation_error", result)
         self.assertFalse(self.store.get_device_token(tok["id"]).active)
 
@@ -1186,7 +1188,8 @@ class DeletionContract:
         official = self._official()
         ref = f"official:{official}"
         tok = self.api.register_device_token(ref, "fcm", "tok_o_reg")
-        self.api.set_device_token_active(tok["id"], False)
+        self.api.set_device_token_active(
+            tok["id"], False, actor_id=self.ACTOR, actor_role=Role.LEAGUE_ADMIN)
         self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
                            self.store.get_official, official, "official_deleted")
         result = self.api.register_device_token(ref, "fcm", "tok_o_reg")
@@ -1200,8 +1203,11 @@ class DeletionContract:
         ref = f"official:{official}"
         tok = self.api.register_device_token(ref, "fcm", "tok_o_live")
         self.assertNotIn("error", tok)
-        self.assertTrue(self.api.set_device_token_active(tok["id"], False)["active"] is False)
-        reactivated = self.api.set_device_token_active(tok["id"], True)
+        self.assertTrue(self.api.set_device_token_active(
+            tok["id"], False, actor_id=self.ACTOR,
+            actor_role=Role.LEAGUE_ADMIN)["active"] is False)
+        reactivated = self.api.set_device_token_active(
+            tok["id"], True, actor_id=self.ACTOR, actor_role=Role.LEAGUE_ADMIN)
         self.assertNotIn("error", reactivated)
         self.assertTrue(reactivated["active"])
 
@@ -1805,7 +1811,8 @@ class DeletionContract:
         # Clear each dependency through its own supported route — never a
         # silent cascade or erasure from delete_player itself.
         self.api.accounts.set_active(acc.id, False, actor_id=self.ACTOR)
-        self.api.set_device_token_active(tok.id, False)
+        self.api.set_device_token_active(
+            tok.id, False, actor_id=self.ACTOR, actor_role=Role.LEAGUE_ADMIN)
         contact = next(c for c in self.store.all_contact_destinations()
                       if c.recipient_ref == ref)
         self.api.set_contact_destination_active(
@@ -1830,10 +1837,12 @@ class DeletionContract:
         player = self._player(team)
         ref = f"player:{player}"
         tok = self.api.register_device_token(ref, "fcm", "tok_p_react")
-        self.api.set_device_token_active(tok["id"], False)
+        self.api.set_device_token_active(
+            tok["id"], False, actor_id=self.ACTOR, actor_role=Role.LEAGUE_ADMIN)
         self.assertDeleted(self.api.delete_player(player, actor_id=self.ACTOR),
                            self.store.get_player, player, "player_deleted")
-        result = self.api.set_device_token_active(tok["id"], True)
+        result = self.api.set_device_token_active(
+            tok["id"], True, actor_id=self.ACTOR, actor_role=Role.LEAGUE_ADMIN)
         self.assertEqual(result["error"]["code"], "validation_error", result)
         self.assertFalse(self.store.get_device_token(tok["id"]).active)
 
@@ -1844,7 +1853,8 @@ class DeletionContract:
         player = self._player(team)
         ref = f"player:{player}"
         tok = self.api.register_device_token(ref, "fcm", "tok_p_reg")
-        self.api.set_device_token_active(tok["id"], False)
+        self.api.set_device_token_active(
+            tok["id"], False, actor_id=self.ACTOR, actor_role=Role.LEAGUE_ADMIN)
         self.assertDeleted(self.api.delete_player(player, actor_id=self.ACTOR),
                            self.store.get_player, player, "player_deleted")
         result = self.api.register_device_token(ref, "fcm", "tok_p_reg")
@@ -1861,8 +1871,11 @@ class DeletionContract:
         ref = f"player:{player}"
         tok = self.api.register_device_token(ref, "fcm", "tok_p_live")
         self.assertNotIn("error", tok)
-        self.assertFalse(self.api.set_device_token_active(tok["id"], False)["active"])
-        reactivated = self.api.set_device_token_active(tok["id"], True)
+        self.assertFalse(self.api.set_device_token_active(
+            tok["id"], False, actor_id=self.ACTOR,
+            actor_role=Role.LEAGUE_ADMIN)["active"])
+        reactivated = self.api.set_device_token_active(
+            tok["id"], True, actor_id=self.ACTOR, actor_role=Role.LEAGUE_ADMIN)
         self.assertNotIn("error", reactivated)
         self.assertTrue(reactivated["active"])
 
