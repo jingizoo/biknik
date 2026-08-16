@@ -36,8 +36,24 @@ gateChrome = function gateChromeWithOnboarding() {
 };
 
 const onboardingBasePost = post;
-post = async function postWithOnboardingRefresh(path, body) {
-  const result = await onboardingBasePost(path, body);
+// FORWARDS EVERY ARGUMENT, not just the two this decorator reads. A wrapper
+// that fixes its own arity silently DROPS whatever a later parameter adds, and
+// does so INVISIBLY: the call still succeeds, the caller still gets a result,
+// and only the new behaviour goes missing — on every page that loads this file,
+// which is every page.
+//
+// NOT HYPOTHETICAL, and worth recording even though nothing in the tree passes
+// a third argument today. An earlier revision of #159's late-arrival work gave
+// post() a third parameter carrying a request header on the context switch's
+// POST; this decorator swallowed it, and the symptom was not an error but the
+// silent return of the very 404 that change existed to remove. That design was
+// replaced by the context epoch, which travels on the READ rather than on the
+// POST and so needs no third argument — the defect here is independent of it,
+// survived it, and would have been re-found the hard way by whatever grew the
+// next parameter. The rest parameter makes this wrapper transparent to that one
+// too.
+post = async function postWithOnboardingRefresh(path, body, ...rest) {
+  const result = await onboardingBasePost(path, body, ...rest);
   const changedSetup = path.startsWith("/api/setup/")
     || path.startsWith("/api/v2/setup/")
     || path === "/api/accounts"

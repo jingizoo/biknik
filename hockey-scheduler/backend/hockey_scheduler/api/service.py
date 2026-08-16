@@ -73,9 +73,19 @@ from ..services import (
     material_input_snapshot,
     resolve_scenario_scope,
 )
+# round-N+1 (finding 1 Memory/SQLite rework): the SAME two process-wide
+# `ContextSwitchGate` instances `web/server.py` uses for the reader side
+# (`CONTEXT_GATE`/`LIFECYCLE_GATE`, relocated to `services/context_gate.py`
+# for exactly this reason — see that module's own "process-wide instances"
+# comment) — writer-side wraps here give Memory (and same-process SQLite) a
+# genuine hold-across-produce() guarantee for every writer the database-
+# coordinated fence already reaches, with no new deadlock class: these are
+# pure in-process objects, never held while a store lock is held.
+from ..services.context_gate import CONTEXT_GATE, LIFECYCLE_GATE
 # #411: the import-context gate must normalize a lookup key EXACTLY as the
 # commit that writes it does, or the gate is bypassable by whitespace (and
 # "NA" would stop meaning "no Club"). Imported verbatim rather than re-spelled.
+from ..services.epoch_fence import EPOCH_FENCE_GLOBAL_KEY, user_fence_key
 from ..services.setup_service import (
     _blank as _import_blank,
     _clean as _import_clean,
@@ -284,9 +294,9 @@ class ApiService:
             user_id, role, scope)
         return self._context_view(program, season, league)
 
-    @catch
     def set_active_context(self, user_id, role, scope,
-                           program_id, season_id, league_id=None) -> dict:
+                           program_id, season_id, league_id=None,
+                           include_epoch=False):
         """Record a Program/Season(/League) selection.
 
         ``league_id`` is appended LAST and defaults to None (#345) so the
@@ -296,10 +306,74 @@ class ApiService:
         two-axis ``ContextService.set`` produced (``league_id`` NULL), so the
         legacy behavior — including CLEARING a previously-saved League rather
         than carrying it onto a Program/Season it was not chosen for — is
-        preserved exactly."""
-        program, season, league = self.context.set_with_league(
-            user_id, role, scope, program_id, season_id, league_id)
-        return self._context_view(program, season, league)
+        preserved exactly.
+
+        ``include_epoch=True`` (round-N review finding 3, KEYWORD-ONLY in
+        practice — every existing caller passes at most five positionals)
+        returns ``(payload, epoch)`` instead of the plain dict: the response
+        epoch derived from the SAME serializable snapshot as the write
+        (``ContextService.set_with_league_and_epoch``, PR #423 design §8.1 —
+        wired to the facade for the first time this round). Defaulted
+        ``False`` so the ~200 other callers across this codebase's test
+        suite keep this method's exact dict-only return shape untouched.
+        Used ONLY by ``web/server.py``'s ``POST /api/context`` handler.
+
+        THE RACE ``include_epoch=True`` CLOSES. That handler used to call
+        this method (one transaction, the write) and THEN a SEPARATE
+        ``ContextService.current_epoch()`` call (a second, independent
+        transaction) to build the response epoch — both inside the same
+        in-process ``CONTEXT_GATE.exclusive(user_id)`` hold, which fully
+        closes the race for two switches racing WITHIN one process, but NOT
+        across two independent replicas: replica B could commit a second
+        switch for the SAME user between replica A's write and A's separate
+        epoch read, and A would then hand its caller an epoch describing B's
+        selection rather than the tuple A's own response just rendered.
+        Folding the write and the epoch derivation into ONE ``_snapshot``
+        (what ``set_with_league_and_epoch`` already does, and already has
+        its own dedicated test coverage for) makes "the epoch matches the
+        row this response carries" true by construction rather than by the
+        in-process gate's cooperation. ``web/server.py``'s
+        ``_with_context_epoch`` is still where the epoch is ATTACHED to the
+        response dict (transport metadata, kept out of this domain-facing
+        module) — this method only hands the two values back paired.
+
+        SAME NAME, ON PURPOSE — this is a widened SIGNATURE, not a new
+        method. ``tests/test_context_switch_server_exit.py`` wraps this
+        exact bound method, by this exact name (``self._wrap(self.api,
+        "set_active_context", ...)``, four separate tests), to park a switch
+        mid-flight and assert the writer-vs-writer/reader-vs-writer ORDERING
+        the whole gate exists to prove; every one of those wrap factories
+        forwards ``*args, **kwargs`` generically, so calling this method with
+        ``include_epoch=True`` still runs through the SAME wrapped call site
+        the tests park. Adding a second, differently-named method for the
+        HTTP handler to call instead would have silently stopped exercising
+        that instrumentation for the real production path — not break
+        loudly, just never park, which is worse; a defaulted keyword
+        argument on the one name already being called is what keeps the
+        write itself as the ONE code path both concerns share.
+
+        NOT wrapped in the module-level ``@catch`` decorator (removed from
+        this method this round): ``catch``'s wrapper returns a BARE ``dict``
+        on a caught ``DomainError`` (``exc.to_dict()``), which the
+        ``include_epoch=True`` two-value return shape cannot absorb — a
+        caller unpacking ``payload, epoch = ...`` would crash trying to
+        unpack a one-key error dict. This method instead catches
+        ``DomainError`` itself, inline, and shapes it via ``exc.to_dict()``
+        — BYTE-IDENTICAL to what ``@catch`` produced — returning it ALONE
+        when ``include_epoch`` is False (preserving the exact historical
+        return type for every other caller) or paired with ``epoch=None``
+        when True. Any non-``DomainError`` exception propagates uncaught,
+        exactly matching ``@catch``'s own behavior for everything it does
+        not recognize."""
+        try:
+            program, season, league, epoch = (
+                self.context.set_with_league_and_epoch(
+                    user_id, role, scope, program_id, season_id, league_id))
+        except DomainError as exc:
+            error = exc.to_dict()
+            return (error, None) if include_epoch else error
+        payload = self._context_view(program, season, league)
+        return (payload, epoch) if include_epoch else payload
 
     def _season_option(self, season) -> dict:
         """A Season as the switcher needs it: id + name + lifecycle, with the
@@ -443,6 +517,30 @@ class ApiService:
         "ice_slot": "get_ice_slot_for_update",
         "organization": "get_organization_for_update",
     }
+
+    # PR #423 (design §8.3): the (already hyphen-folded, see
+    # setup_guarded_mutation) kinds whose guarded mutation is epoch-material
+    # — Season/Program/League/LeagueSeason lifecycle or deletion, and the
+    # season_venue_access BRIDGE kind (its Season parent's access grants are
+    # what `context_epoch`'s effective-Season resolution can depend on).
+    # `division` is DELIBERATELY excluded — it is not part of
+    # `context_epoch`'s hashed material and no epoch input traces through it
+    # (see the design's own note at §8.3).
+    #
+    # ALSO, incidentally but by design, covers row 12 (design §8.4,
+    # `transfer_team_to_league`'s `("team","league")` v2 reassignment):
+    # `_V2_REASSIGN_DEST` always adds the DESTINATION League as a second
+    # guarded target for that combo (`web/server.py`'s
+    # `_V2_REASSIGN_DEST[("team","league")] = ("league", "league_id")`, and
+    # a `league_id` is body-required for that exact combo), so `"league"`
+    # being in this set already fences that writer too — no separate
+    # `"team"` entry needed (which would over-broadly fence every OTHER
+    # guarded Team mutation, most of which do not touch `league_id` and are
+    # not epoch-material). Confirmed by `tests/test_epoch_fence.py`'s
+    # ``test_row12_team_league_transfer``, which asserts on this exact path.
+    _EPOCH_FENCE_KINDS = frozenset({
+        "season", "program", "league", "league_season", "season_venue_access",
+    })
 
     # (action, entity_type) pairs a "this user created this record" audit row
     # can legitimately carry, per canonical kind. NOT simply
@@ -1552,6 +1650,21 @@ class ApiService:
         # store's own per-instance transaction lock already serializes the
         # block.
         #
+        # read_only=True (round-N+2, PR #423): this whole block — rules 3
+        # through 6 — never writes (verified directly: every store call
+        # beneath it is a `get_*`/`all_*` read; see `SqlStore.transaction`'s
+        # own docstring for the general mechanism and
+        # `ContextService._snapshot`'s for the sibling regression this same
+        # round-N+2 fixed at the OTHER #409 preflight). This is not merely a
+        # correctness nicety here, it is A SECOND INSTANCE OF THAT SAME
+        # REGRESSION, on this exact request path: `_guarded_mutation`
+        # (`web/server.py`) reaches `_reject_target_outside_scope` ->
+        # `setup_target_allowed` -> here, UNGATED, immediately after its own
+        # `_refuse_unchosen_context` check — so fixing only the #409
+        # preflight and leaving this one at its old default (write-strength
+        # `BEGIN IMMEDIATE`) would have left the exact same class of stall
+        # reachable one call later on the identical archive/reopen request.
+        #
         # Requesting isolation is legal on the outermost transaction, and also
         # on a join whose open transaction ALREADY guarantees at least this much
         # (#369) — which is how `setup_guarded_mutation` runs this predicate,
@@ -1561,33 +1674,55 @@ class ApiService:
         # own bounded retry owns any conflict.
         #
         # WHY THERE IS STILL NO RETRY LOOP HERE, stated precisely, because the
-        # reason this comment used to give is no longer true. It said READ-ONLY
-        # at REPEATABLE READ cannot raise a serialization conflict. That remains
-        # true of SERIALIZATION conflicts, but it was never the whole set: since
-        # #392 the SQLite branch opens with `BEGIN IMMEDIATE`, so this block can
-        # now raise `ConcurrencyConflictError` from LOCK ACQUISITION — a
-        # `database is locked` at BEGIN, classified `lock_not_available` — and
-        # read-only says nothing about that. Unlike `ContextService._snapshot`
-        # this call site has no bounded retry, so the claim needed re-deciding
-        # rather than re-wording.
+        # reason this comment used to give is no longer true, TWICE over —
+        # once when #392 shipped, and again when round-N+1 shipped. It said
+        # READ-ONLY at REPEATABLE READ cannot raise a serialization conflict.
+        # That remains true of SERIALIZATION conflicts, but it was never the
+        # whole set: since #392 the SQLite branch opened with `BEGIN
+        # IMMEDIATE` regardless of intent, so this block could raise
+        # `ConcurrencyConflictError` from LOCK ACQUISITION — a `database is
+        # locked` at BEGIN, classified `lock_not_available` — and read-only
+        # said nothing about that. Unlike `ContextService._snapshot` this call
+        # site has no bounded retry, so the claim needed re-deciding rather
+        # than re-wording, and it was re-decided BELOW under a claim ("no
+        # in-process second connection exists in production") that round-N+1
+        # then made false without this comment being revisited: file-backed
+        # SQLite scoped reads (`_read_under_context_gate_sqlite`'s
+        # `fresh_store`, `web/server.py`) are now EXACTLY that second
+        # in-process connection to the LIVE file, opened on every ordinary
+        # scoped-read request, not merely in a test or a backup drill. This
+        # comment's own reachability argument was therefore already wrong by
+        # the time this predicate was next read closely enough to matter, and
+        # the fix that closed it (`read_only=True` above, round-N+2) is a
+        # response to that false claim having gone uncorrected, not merely a
+        # style pass.
         #
-        # The decision is still no retry, for reasons about reachability and
-        # about what a retry would mean:
+        # The decision is still no retry, but the reachability argument that
+        # justifies it now rests on `read_only=True`, not on "no second
+        # connection exists":
         #
-        # * Contending needs a SECOND connection to the same file. A serving
-        #   process has exactly ONE store (`create_store()` at web/server.py and
-        #   bootstrap.py), and `SqlStore._lock` — reentrant, per instance —
-        #   already serializes every transaction taken through it, so no two
-        #   in-process transactions can be at BEGIN at once. The one production
-        #   path that opens a second SQLite connection (`backup_sqlite`) opens
-        #   it on the DESTINATION file, never the live one.
-        # * Where a second connection does exist — the `*_lock_sqlite_file`
-        #   tests, or an operator pointing the backup drill at a live database —
-        #   BEGIN blocks in the busy handler for the full 5s `busy_timeout`
-        #   first. Anything that surfaces here has therefore ALREADY waited five
-        #   seconds. That is not a transient blip a tight retry would paper
-        #   over; it is a writer that is genuinely wedged, and the retryable
-        #   409 is the honest answer for the caller to act on.
+        # * `read_only=True` takes SQLite's SHARED lock (`BEGIN DEFERRED`),
+        #   not RESERVED (`BEGIN IMMEDIATE`) — and SHARED is COMPATIBLE with
+        #   another connection's already-held RESERVED (only PENDING/
+        #   EXCLUSIVE conflict with SHARED; see `SqlStore.transaction`'s own
+        #   docstring for the full argument). `fresh_store` only ever holds
+        #   RESERVED — it is itself a read, never an actual write — so this
+        #   block no longer contends with it AT ALL, regardless of how long a
+        #   scoped read's `produce()` takes. That closes the reachable-in-
+        #   production case entirely, not merely documents it.
+        # * What is left is a genuinely ACTIVE writer — one that has reached
+        #   PENDING/EXCLUSIVE to actually flush its commit, a window normally
+        #   far under a millisecond, not the open-ended duration of an
+        #   unrelated read. Where that does contend — the `*_lock_sqlite_file`
+        #   tests deliberately construct it, or a pathologically wedged real
+        #   writer could — BEGIN blocks in the busy handler for the full
+        #   `HS_CONTEXT_GATE_TIMEOUT` first. Anything that surfaces here has
+        #   therefore ALREADY waited that long. That is not a transient blip a
+        #   tight retry would paper over; it is a writer that is genuinely
+        #   wedged, and the retryable 409 is the honest answer for the caller
+        #   to act on — the ORIGINAL reasoning this comment gave, restored to
+        #   being actually true now that the false "no second connection"
+        #   premise it depended on is not what makes it true anymore.
         # * A retry here would also be dead weight on PostgreSQL, where the
         #   original read-only argument still holds in full.
         #
@@ -1595,7 +1730,8 @@ class ApiService:
         # for the instant it read, and by the time a caller acts on the answer
         # the chain may have moved. Only `setup_guarded_mutation`, which holds
         # the row locks and the transaction across the mutation, is.
-        with self.store.transaction(isolation="REPEATABLE READ"):
+        with self.store.transaction(
+                isolation="REPEATABLE READ", read_only=True):
             # -- rule 3: existence (indistinguishable from inaccessible) ---
             record = self._setup_target_record(normalized, record_id)
             if record is None:
@@ -1991,35 +2127,92 @@ class ApiService:
 
     def _guarded_attempt(self, checks, mutation, user_id, role, scope):
         """One all-or-nothing attempt. See ``setup_guarded_mutation``."""
-        with self.store.transaction(isolation="SERIALIZABLE"):
-            # #409, and FIRST — before any target row is even looked up, so a
-            # caller who has chosen nothing learns nothing about which records
-            # exist, and before any setup row is LOCKED, so ActiveContext keeps
-            # its place at the head of the repo's canonical lock order.
-            #
-            # `setup_target_accessible` judges targets against the RESOLVED
-            # tuple, and `_fallback()` resolves one for every `_GLOBAL_ROLES`
-            # caller. So the #369 gate that correctly refuses a cross-Program
-            # delete happily authorized the same delete the moment the resolve
-            # fell back — the target now sat inside the Program the fallback
-            # had just picked on the operator's behalf.
-            #
-            # RAISED, not returned: the transaction rolls back, so a refusal
-            # costs zero domain rows and zero audit rows.
-            error = self._mutation_context_error(
-                [(kind, record_id) for _index, kind, record_id, _rule
-                 in checks],
-                user_id, role, scope, lock=True)
-            if error is not None:
-                raise error
-            refused = self._authorize_setup_targets(
-                checks, user_id, role, scope)
-            if refused is not None:
-                raise _SetupTargetRefused(refused)
-            payload = mutation()
-            if isinstance(payload, dict) and "error" in payload:
-                raise _SetupMutationRefused(payload)
-            return payload, None
+        # PR #423 (design §8.3), fence key gated on whether ANY named target
+        # is epoch-material (`_EPOCH_FENCE_KINDS`) — computed ONCE, outside
+        # the transaction, and used for BOTH holds below so they can never
+        # disagree about whether this attempt is fence-material.
+        fence_needed = any(kind in self._EPOCH_FENCE_KINDS
+                           for _index, kind, _record_id, _rule in checks)
+        # round-N+1 (finding 1 Memory/SQLite rework): `LIFECYCLE_GATE.exclusive`
+        # taken HERE, OUTSIDE `store.transaction()` — never inside it. This is
+        # not a style choice: `ContextSwitchGate`'s own LOCK ORDER invariant
+        # (`services/context_gate.py`) is that this gate is level 0, strictly
+        # OUTERMOST, above the store's own lock (level 2), because a gate
+        # holder must never hold a store lock while waiting for the gate, and
+        # a store-lock holder must never wait for the gate. Acquiring it
+        # INSIDE `store.transaction()` would recreate the EXACT AB-BA hazard
+        # `SqlStore.epoch_fence_acquire_exclusive`'s own docstring documents
+        # for a real dedicated-connection SQLite lock (and, on Memory, would
+        # deadlock this thread against itself: `self._lock` is already held
+        # for the whole transaction body by the time the gate call runs, and
+        # a scoped read's `produce()` — parked mid-service, holding
+        # `LIFECYCLE_GATE` SHARED — needs that SAME `self._lock` for its own
+        # reads, so this thread would hold `self._lock` and wait on the gate,
+        # exactly what the reader is waiting on `self._lock` to release).
+        #
+        # `LIFECYCLE_GATE.exclusive(None)` (the `not fence_needed` case) is
+        # the primitive's own documented no-op — see
+        # `ContextSwitchGate.exclusive`'s falsy-key short-circuit — so an
+        # ordinary, non-epoch-material guarded mutation (most of them) pays
+        # nothing extra here.
+        #
+        # THIS REPLACES `web/server.py`'s former explicit archive/reopen-only
+        # wrap (see that dispatch site's own comment for why keeping both
+        # would have self-blocked one thread on its own outer ticket) — every
+        # `_EPOCH_FENCE_KINDS` kind now gets the SAME in-process ordering
+        # archive/reopen always had, including the 8 writers (Season/
+        # Program/League/LeagueSeason DELETE, season-venue-access revoke/
+        # delete, and — incidentally, via the destination "league" target,
+        # exactly like the database-coordinated fence already covers it, see
+        # `_EPOCH_FENCE_KINDS`'s own comment — Team/League transfer) that had
+        # NO in-process gate at all before this.
+        with LIFECYCLE_GATE.exclusive(
+                EPOCH_FENCE_GLOBAL_KEY if fence_needed else None):
+            with self.store.transaction(isolation="SERIALIZABLE"):
+                # PR #423 (design §8.3): the epoch fence's GLOBAL exclusive
+                # hold, matching "truly first" (§4.2/§4.4) — before #409's
+                # own context-error check immediately below. Bumps the
+                # persisted version counter on every backend (round-N
+                # finding 1's defense-in-depth layer, kept as a regression
+                # backstop alongside — not instead of — the in-process gate
+                # above, which is what now does the PRIMARY work of
+                # preventing a torn read's `produce()` call in the first
+                # place on Memory/SQLite; see `_read_under_context_gate`'s
+                # own docstring for the full division of labour across all
+                # three backends).
+                if fence_needed:
+                    self.store.epoch_fence_acquire_exclusive(
+                        EPOCH_FENCE_GLOBAL_KEY)
+                # #409, and FIRST — before any target row is even looked up,
+                # so a caller who has chosen nothing learns nothing about
+                # which records exist, and before any setup row is LOCKED, so
+                # ActiveContext keeps its place at the head of the repo's
+                # canonical lock order.
+                #
+                # `setup_target_accessible` judges targets against the
+                # RESOLVED tuple, and `_fallback()` resolves one for every
+                # `_GLOBAL_ROLES` caller. So the #369 gate that correctly
+                # refuses a cross-Program delete happily authorized the same
+                # delete the moment the resolve fell back — the target now
+                # sat inside the Program the fallback had just picked on the
+                # operator's behalf.
+                #
+                # RAISED, not returned: the transaction rolls back, so a
+                # refusal costs zero domain rows and zero audit rows.
+                error = self._mutation_context_error(
+                    [(kind, record_id) for _index, kind, record_id, _rule
+                     in checks],
+                    user_id, role, scope, lock=True)
+                if error is not None:
+                    raise error
+                refused = self._authorize_setup_targets(
+                    checks, user_id, role, scope)
+                if refused is not None:
+                    raise _SetupTargetRefused(refused)
+                payload = mutation()
+                if isinstance(payload, dict) and "error" in payload:
+                    raise _SetupMutationRefused(payload)
+                return payload, None
 
     def _authorize_setup_targets(self, checks, user_id, role, scope):
         """Lock every named row, then authorize every target under those locks.
@@ -5432,7 +5625,22 @@ class ApiService:
     @catch
     def set_user_account_active(self, account_id: str, active: bool,
                                 actor_id: Optional[str] = None) -> dict:
-        account = self.accounts.set_active(account_id, active, actor_id=actor_id)
+        # round-N+1 (finding 1 Memory/SQLite rework, design §8.2 row 3):
+        # `CONTEXT_GATE.exclusive`, OUTSIDE `AccountService.set_active`'s own
+        # `@_transactional` — same key convention as the context-switch
+        # writer (`web/server.py`'s `POST /api/context` handler): the RAW
+        # account id, not `user_fence_key(...)`'s "user:"-prefixed form,
+        # because `CONTEXT_GATE` is a separate gate OBJECT from the
+        # database-coordinated fence and shares no key namespace with it —
+        # only ever compared against other calls through this SAME gate.
+        # Released before `_account_row` renders the response, matching
+        # every other gate hold in this codebase. A deactivation can change
+        # what THIS account's own scoped reads resolve to (a deactivated
+        # login is refused entirely) exactly like a context switch, so the
+        # same per-user gate — not the global one — is the correct match.
+        with CONTEXT_GATE.exclusive(account_id):
+            account = self.accounts.set_active(
+                account_id, active, actor_id=actor_id)
         return self._account_row(account)
 
     @catch
@@ -5440,8 +5648,14 @@ class ApiService:
                                   actor_id: Optional[str] = None) -> dict:
         """Repair/change an account's scope binding (#266) — e.g. rebind an
         unscoped or dangling-team Coach to a real team. Audited."""
-        account = self.accounts.rebind_account_scope(
-            account_id, scope, actor_id=actor_id)
+        # round-N+1 (finding 1 Memory/SQLite rework, design §8.2 row 2): same
+        # placement/reasoning as `set_user_account_active` immediately
+        # above — a scope rebind can move which Program/Season/League this
+        # account's own scoped reads resolve to, exactly like a context
+        # switch.
+        with CONTEXT_GATE.exclusive(account_id):
+            account = self.accounts.rebind_account_scope(
+                account_id, scope, actor_id=actor_id)
         return self._account_row(account)
 
     @catch
@@ -5706,8 +5920,16 @@ class ApiService:
         """Operator creates an unverified guardian↔junior link (#35) — the
         first HTTP-reachable path for this; previously only deterministic
         demo seeding could create one."""
-        return _serialize(self.guardians.link_guardian(
-            guardian_user_id, player_id, actor_id=actor_id))
+        # round-N+1 (finding 1 Memory/SQLite rework, design §8.7 row 16):
+        # `LIFECYCLE_GATE.exclusive`, OUTSIDE `GuardianService.link_guardian`'s
+        # own `@_transactional` — this writer's affected user (the guardian)
+        # is found only by a lookup the writer performs itself, so it takes
+        # the GLOBAL key exactly like the database-coordinated fence already
+        # does (see `GuardianService.link_guardian`'s own docstring for why).
+        with LIFECYCLE_GATE.exclusive(EPOCH_FENCE_GLOBAL_KEY):
+            link = self.guardians.link_guardian(
+                guardian_user_id, player_id, actor_id=actor_id)
+        return _serialize(link)
 
     @catch
     def verify_guardian_link(self, link_id: str, consent_method: str,
@@ -5722,8 +5944,12 @@ class ApiService:
             raise ValidationError(
                 "consent_method is required to verify a guardian link "
                 "(e.g. 'signed_form', 'verbal_confirmed', 'email_reply').")
-        return _serialize(self.guardians.verify_link(
-            link_id, actor_id=actor_id, consent_method=consent_method))
+        # round-N+1 (design §8.7 row 17): same placement/reasoning as
+        # `create_guardian_link` immediately above.
+        with LIFECYCLE_GATE.exclusive(EPOCH_FENCE_GLOBAL_KEY):
+            link = self.guardians.verify_link(
+                link_id, actor_id=actor_id, consent_method=consent_method)
+        return _serialize(link)
 
     @catch
     def list_guardian_links(self) -> List[dict]:
@@ -5834,9 +6060,16 @@ class ApiService:
     def assign_official(self, game_id: str, official_id: str, role: str,
                         actor_id: Optional[str] = None,
                         override_unavailable: bool = False) -> dict:
-        a = self.setup.assign_official(
-            game_id, official_id, _parse_enum(OfficialRole, role, "role"),
-            actor_id, override_unavailable=override_unavailable)
+        # round-N+1 (finding 1 Memory/SQLite rework, design §8.5 row 13):
+        # `LIFECYCLE_GATE.exclusive`, OUTSIDE `SetupService.assign_official`'s
+        # own `@_transactional` — the assigned Official's own scoped reads
+        # can be affected, and that user is found only by a lookup, so this
+        # takes the GLOBAL key exactly like the database-coordinated fence
+        # already does (see `SetupService.assign_official`'s own docstring).
+        with LIFECYCLE_GATE.exclusive(EPOCH_FENCE_GLOBAL_KEY):
+            a = self.setup.assign_official(
+                game_id, official_id, _parse_enum(OfficialRole, role, "role"),
+                actor_id, override_unavailable=override_unavailable)
         return _serialize(a)
 
     # -- official availability (#88) ---------------------------------------
@@ -5876,7 +6109,12 @@ class ApiService:
     @catch
     def unassign_official(self, assignment_id: str,
                           actor_id: Optional[str] = None) -> dict:
-        return _serialize(self.setup.unassign_official(assignment_id, actor_id))
+        # round-N+1 (design §8.5 row 14): same placement/reasoning as
+        # `assign_official` above — an unassignment is an authorization
+        # WITHDRAWAL for the affected Official's own scoped reads.
+        with LIFECYCLE_GATE.exclusive(EPOCH_FENCE_GLOBAL_KEY):
+            a = self.setup.unassign_official(assignment_id, actor_id)
+        return _serialize(a)
 
     # -- results & standings (#31) -----------------------------------------
     @catch

@@ -26,7 +26,12 @@ THAT IS NOT THE SAME AS CURRENT, and this file does not claim it is. The
 hierarchy read and the candidate request are two separate reads and CAN describe
 different moments: a Season archived between them still takes the deliberate
 404. Closing that window needs a server-side binding (a version/epoch on the
-follow-up read), which is deliberately NOT in this change.
+follow-up read), which was deliberately NOT in this change — it landed
+afterwards as the CONTEXT EPOCH: the selected Season's lifecycle is part of the
+epoch material (``services/context_epoch.py``), so a follow-up read that echoes
+the epoch it was rendered under is DISCARDED (204) when an archive lands
+between the two reads. ``tests/test_context_epoch_lifecycle.py`` proves that
+binding; this file keeps proving the freshness of the fact itself.
 
 These tests are therefore about AGREEMENT, not about a field existing. The
 field is asserted to track the refusal at every step (active -> archived ->

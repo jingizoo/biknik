@@ -125,6 +125,19 @@ class InMemoryStore:
         self._lock = threading.RLock()
         # Depth of the current (possibly nested) transaction; 0 = none open.
         self._txn_depth = 0
+        # The epoch fence's persisted version counters (PR #423 round-N
+        # review finding 1) — bumped by epoch_fence_acquire_exclusive, on the
+        # SAME transaction as everything else that call's writer does, so it
+        # rolls back with the rest via _snapshot()/_restore() (a plain dict
+        # attribute, not in _NON_SNAPSHOT — dicts are already handled
+        # generically by _snapshot_value's shallow-copy branch). Keyed PER
+        # FENCE KEY (mirroring the advisory lock's own user:<id>/global
+        # split — migration 052's own docstring explains why a single shared
+        # counter was tried and reverted: it broke cross-user independence).
+        # A key with no entry has never been bumped and reads as version 0 —
+        # see SqlStore.current_epoch_fence_version's own docstring for the
+        # read-side contract this mirrors.
+        self._epoch_fence_versions: Dict[str, int] = {}
 
     # Instance attributes that are NOT part of the persisted state and so must
     # never be snapshotted/restored by a transaction (the lock is unpicklable
@@ -212,7 +225,7 @@ class InMemoryStore:
                 value.clear()
 
     @contextmanager
-    def transaction(self, isolation=None):
+    def transaction(self, isolation=None, read_only=False):
         """Atomic, reentrant unit of work — the shared store transaction contract.
 
         ``isolation`` (e.g. ``"SERIALIZABLE"``) is accepted for parity with
@@ -220,6 +233,21 @@ class InMemoryStore:
         lock already fully serializes every transaction, so all reads inside one
         transaction observe a single consistent snapshot with no concurrent
         interleaving — the strongest isolation, for free.
+
+        ``read_only`` (round-N+2 regression fix, PR #423) is likewise accepted
+        for parity with :class:`SqlStore` and is likewise a **no-op** here: the
+        re-entrant lock this method takes below (``self._lock``, a single
+        per-instance ``threading.RLock`` — see its many "transaction() holds
+        self._lock for its whole body" call-site comments throughout this
+        file) is already the ONLY thing serializing access to this store, at
+        full strength, regardless of whether the caller intends to write —
+        there is no second, weaker lock tier for a promise of read-only-ness
+        to relax. The SQLite store's own ``read_only`` fixes a real contention
+        bug specific to ITS two-tier SHARED/RESERVED FILE locking, which this
+        store has no analogue of at all (there is no second connection, and no
+        file); so nothing here needed to change — the parameter exists purely
+        so a caller (e.g. ``ContextService._snapshot``) can pass the identical
+        keyword to whichever backend it happens to be holding.
 
         Contract (identical observable behavior in every store implementation):
 
@@ -1118,6 +1146,89 @@ class InMemoryStore:
         — strictly stronger than the cross-transaction mutex PostgreSQL needs.
         """
         yield
+
+    # -- epoch fence (PR #423 redesign) -------------------------------------
+    def epoch_fence_acquire_exclusive(self, key: str) -> None:
+        """The LOCK side stays a documented no-op, matching ``SqlStore``'s
+        spelling, and for the analogous reason: ``self._lock`` (this store's
+        process-wide, per-INSTANCE RLock) already wraps the WHOLE
+        ``transaction()`` body this method is always called from inside, on
+        the only Python object that could ever be racing (``InMemoryStore``
+        cannot participate in independent workers at all -- two separate
+        instances share zero state, so "independent Memory workers
+        coordinating" is not a deployment shape this store needs to defend
+        against; see the design's §5). That serialization already gives every
+        OTHER ``transaction()``-wrapped writer full mutual exclusion against
+        this one.
+
+        A REAL BLOCKING acquire here would still be wrong, for the same
+        reason it is on SQLite: waiting on any lock/condition while
+        ``self._lock`` is already held by this same call frame (it always is;
+        this method's contract requires it be called from inside an open
+        ``transaction()``) can deadlock against a scoped read whose shared
+        hold spans a ``produce()`` call that itself needs ``self._lock``:
+        this thread holds ``self._lock`` and blocks waiting for the read to
+        release; the read, mid-``produce()``, blocks waiting for
+        ``self._lock``. Proven directly (a real ``ContextSwitchGate``-backed
+        attempt at this method reproduces the deadlock on demand) before
+        settling on the no-op, exactly mirroring the AB-BA hazard
+        ``context_gate.py:107-115``'s LOCK ORDER note already documents for
+        the in-process gate.
+
+        THE VERSION BUMP (round-N review finding 1) is NOT a no-op, though,
+        and is what actually closes the same-process torn-read window this
+        docstring used to just document as an accepted gap. Every one of the
+        17 fenced writers already calls this method as its first fence
+        action; bumping ``self._epoch_fence_versions[key]`` here — a plain
+        dict write, already covered by ``self._lock`` (held by the caller's
+        open ``transaction()``) and by this store's own
+        ``_snapshot()``/``_restore()`` rollback machinery — needs no NEW lock
+        of any kind, so it cannot reintroduce the AB-BA hazard above. A
+        scoped read samples ``current_epoch_fence_version(key)`` — for its
+        OWN user key and separately for the global key, mirroring the
+        advisory lock's own two acquisitions — before deriving its epoch and
+        again after ``produce()`` returns, with NOTHING held in between; if a
+        writer's bump for that SAME key landed inside that window, the two
+        samples disagree and the read is discarded rather than served — see
+        ``current_epoch_fence_version``'s own docstring and
+        ``web/server.py``'s ``_read_under_context_gate``. This closes exactly
+        the gap this docstring previously named as the accepted CONSEQUENCE
+        of the lock staying a no-op: the newly-listed writers (account scope
+        rebind/activate, Season/Program/League/LeagueSeason delete,
+        venue-access revoke/delete, Team transfer, Official assign/unassign,
+        Player/Guardian reassignment, selected-Season delete among them) now
+        DO have a real backstop on Memory, without a lock ever crossing a
+        ``produce()`` call.
+        """
+        self._epoch_fence_versions[key] = (
+            self._epoch_fence_versions.get(key, 0) + 1)
+
+    @contextmanager
+    def epoch_fence_acquire_shared(self, key: str):
+        """A documented no-op, for the same reason as the exclusive side
+        above: since nothing on Memory ever holds this primitive's exclusive
+        side as a genuine LOCK (the version bump it now also does is not a
+        hold this shared side needs to wait for), there is never a genuine
+        holder for this method to defer to — a real gate object here would be
+        exercised but never actually contended, which is observationally
+        identical to not having one. Yields ``True`` (not ``False``/fail-open)
+        since this call never times out — it never even tries to wait. The
+        real protection on Memory is the version counter
+        (``current_epoch_fence_version``), sampled by the caller OUTSIDE this
+        hold — see ``web/server.py``'s ``_read_under_context_gate``."""
+        yield True
+
+    def current_epoch_fence_version(self, key: str) -> int:
+        """The CURRENT value of the persisted epoch-fence version counter FOR
+        ``key`` (round-N review finding 1) — see ``SqlStore``'s own copy for
+        the full contract this mirrors, including why this is keyed rather
+        than a single shared counter. On Memory this is simply the live dict
+        entry (``0`` if ``key`` has never been bumped), read under
+        ``self._lock`` for the same reason every other read here is: two
+        concurrent callers on this ONE shared instance (the web server's
+        shape) must never tear each other's read of it."""
+        with self._lock:
+            return self._epoch_fence_versions.get(key, 0)
 
     def get_active_context(self, user_id: str) -> Optional[ActiveContext]:
         return self.user_active_context.get(user_id)

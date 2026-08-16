@@ -21,6 +21,7 @@ from ..domain.errors import (
     ValidationError,
 )
 from ..store import InMemoryStore
+from .epoch_fence import user_fence_key
 from .passwords import (
     DUMMY_PASSWORD_HASH,
     hash_password,
@@ -368,6 +369,13 @@ class AccountService:
         # commit together — an audit failure after the save would otherwise
         # leave an unaudited activation/deactivation.
         #
+        # PR #423 (design §8.2): the epoch fence's EXCLUSIVE hold, truly
+        # FIRST — before the lock-order-sensitive subject/account locking
+        # below, not between its two steps. Per-user key: this writer already
+        # holds the affected account's own id (row 3 of the design's writer
+        # table).
+        self.store.epoch_fence_acquire_exclusive(user_fence_key(account_id))
+        #
         # Lock order (#270 review concurrency): a REACTIVATION must row-lock the
         # scoped subject (Player/Official/Team) so a concurrent delete /
         # Player-deactivation can't strand a resurrected login. That subject
@@ -424,7 +432,12 @@ class AccountService:
         (``user_account_scope_changed``) with the before/after scope. Works on
         active or inactive accounts, so a deactivated legacy coach can be rebound
         and then reactivated.
-        """
+
+        PR #423 (design §8.2): acquires the epoch fence's EXCLUSIVE hold
+        first (row 2 of the design's writer table) — a scope rebind can move
+        which Program/Season/League this account's own scoped reads resolve
+        to, exactly like a context switch."""
+        self.store.epoch_fence_acquire_exclusive(user_fence_key(account_id))
         if scope is not None and not isinstance(scope, dict):
             raise ValidationError(
                 "Account scope must be a JSON object.",

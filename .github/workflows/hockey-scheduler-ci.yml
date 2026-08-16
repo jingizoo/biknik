@@ -318,13 +318,17 @@ jobs:
         # runner.
         include:
           - shard: 1
-            # context-switch-read-settlement and context-switch-server-exit
-            # both land HERE deliberately: shard 1 is where the 390px
-            # `venue-candidates -> 404` was caught, so BOTH halves of its
-            # regression run on the shard that produced the evidence — the
-            # client barrier (#412) and the server-side ordering gate (#159
-            # follow-up), which close different halves of the same race.
-            scripts: "smoke setup-claim onboarding-wizard hierarchy-import season-participation hierarchy-duplicate-registration season-rollover season-dates scheduling-policy breakpoint-boundaries shell-accessibility-coverage seven-area-navigation setup-state-matrix context-switch-read-settlement context-switch-server-exit"
+            # context-switch-read-settlement, context-switch-server-exit and
+            # context-switch-late-arrival all land HERE deliberately: shard 1
+            # is where the `venue-candidates -> 404` was caught (at 390px, and
+            # again on desktop after the gate landed), so ALL THREE parts of
+            # its regression run on the shard that produced the evidence — the
+            # client barrier (#412), the server-side ordering gate (#415), and
+            # the context epoch that covers the interval neither of them can
+            # reach, a read dispatched before the switch and arriving after it
+            # (#159 follow-up). Their ports do not overlap: 8811-8814,
+            # 8821-8824(+8921-8924), and 8831-8834/8841-8844(+893x/894x).
+            scripts: "smoke setup-claim onboarding-wizard hierarchy-import season-participation hierarchy-duplicate-registration season-rollover season-dates scheduling-policy breakpoint-boundaries shell-accessibility-coverage seven-area-navigation setup-state-matrix context-switch-read-settlement context-switch-server-exit context-switch-late-arrival"
           - shard: 2
             scripts: "team-division-participation scheduler-empty-state scheduler-already-scheduled scheduler-team-overlap scheduler-games-per-team scheduler-turnaround allowed-venues venue-access-cleanup facilities-venue-access venue-sharing permanent-teams player-edit accessibility-foundations setup-workflow-hub setup-v2-context-scope context-identity-withdrawal"
           - shard: 3
