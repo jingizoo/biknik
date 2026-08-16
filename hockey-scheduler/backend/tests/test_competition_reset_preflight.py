@@ -145,6 +145,30 @@ def _snapshot(store):
 
 
 class CompetitionResetPreflightTest(unittest.TestCase):
+    def tearDown(self):
+        # Every test in this class downgrades a SHARED PostgreSQL database's
+        # live schema (_fresh -> _downgrade_to_pre028) to simulate the
+        # pre-migration-028 shape; _downgrade_to_pre028 does not touch
+        # schema_migrations, so a later SqlStore(url).migrate() sees every
+        # migration already marked applied and skips re-running any of
+        # them, leaving the ACTUAL schema stuck downgraded (missing
+        # schedule_scenarios/league_seasons/etc) rather than re-migrated.
+        # reset_schema() heals that back to the canonical baseline after
+        # each test — #426 review round-2 postmortem: a differently-named
+        # test file that merely happened to land right after this one in
+        # the -j2 parallel test runner's alphabetical-round-robin shard
+        # assignment inherited the downgraded schema and failed with
+        # `psycopg.errors.UndefinedTable: relation "schedule_scenarios"
+        # does not exist` in its own unrelated setUp — this file's own
+        # tests never noticed because each one starts with its own fresh
+        # _fresh() call, but nothing here previously restored the shared
+        # database for whatever OTHER file's tests run next in the same
+        # worker process. SQLite's ":memory:" backend needs no cleanup —
+        # each test gets a brand new in-process database already.
+        url = os.environ.get("TEST_DATABASE_URL")
+        if url:
+            SqlStore(url).reset_schema()
+
     # -- clean paths --------------------------------------------------------
     def test_fresh_install_is_clean(self):
         for label, url in _sql_backends():
