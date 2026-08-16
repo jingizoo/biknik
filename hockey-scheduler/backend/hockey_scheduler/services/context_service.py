@@ -575,12 +575,29 @@ class ContextService:
         boundary detaches them first (see :meth:`resolve_epoch_state`).
 
         Deliberately NOT built on top of :meth:`resolve_with_league`: that
-        method opens its OWN ``_snapshot``, and a caller that needs this
-        material read inside a WIDER transaction it already holds open — the
-        epoch comparison in front of a dependent scoped read,
-        :meth:`run_scoped_read`, #159 review finding 3 — needs the
-        un-snapshotted form so the whole thing stays ONE transaction rather
-        than two independent ones a lifecycle mutation could land between.
+        method opens its OWN ``_snapshot``, so a caller already holding a
+        transaction needs this un-snapshotted form to join it rather than
+        nesting a second one — the same reason every other ``_locked``
+        helper in this class exists (:meth:`_resolve_locked`,
+        :meth:`_saved_locked`, :meth:`_options_locked`,
+        :meth:`_resolve_league_locked`).
+
+        CORRECTION (round-N+3 review finding 2): an earlier revision of this
+        sentence named that caller as ``ContextService.run_scoped_read``,
+        "#159 review finding 3" — NO SUCH METHOD EXISTS. It named a revision
+        that was BUILT AND REJECTED (see this class's own NOTE below, on
+        #159 review finding 3, for the full account of why; and
+        ``services/context_epoch.py``'s module docstring for the
+        client-facing half of the same correction, already accurate). The
+        ordering guarantee in front of a dependent scoped read is bought by
+        GATES — ``web/server.py``'s ``Handler._read_under_context_gate``
+        (the in-process ``ContextSwitchGate``/``LIFECYCLE_GATE`` holds) and
+        the PostgreSQL ``epoch_fence`` advisory locks layered alongside
+        them — never a shared database transaction. THE ACTUAL CALLER
+        TODAY, singular, is :meth:`resolve_epoch_state`, which opens its OWN
+        ``_snapshot`` around exactly this helper and nothing wider; this
+        extraction exists for the reuse stated above, not because a wider
+        caller currently exists.
         """
         row = self.store.get_active_context(user_id) if user_id else None
         generation = (getattr(row, "generation", 0) or 0) if row else 0
