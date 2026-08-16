@@ -1319,18 +1319,38 @@ def assert_no_duplicate_rink_external_refs(conn):
 
 
 def find_duplicate_device_tokens(conn):
-    """Concrete ``(recipient_ref, token)`` pairs shared by more than one
-    DeviceToken row.
+    """``(recipient_ref, token, [row_id, ...])`` for every ``(recipient_ref,
+    token)`` pair shared by more than one DeviceToken row.
 
     Only non-null pairs are considered — matching migration 055's partial
     unique index, which excludes NULL-bearing rows because both SQLite and
-    PostgreSQL treat NULLs as distinct."""
+    PostgreSQL treat NULLs as distinct.
+
+    The recipient_ref/token VALUES are returned here because this function's
+    own job is to identify the concrete duplicate key (and this module's
+    tests need to assert detection is correct) — but a device token is a
+    live push credential, so no caller may place the value in an exception,
+    log line, or any other place an operator or CI run might capture its
+    output. ``assert_no_duplicate_device_tokens`` below, the only production
+    caller, reports the row ids only, never the value (#426 round-5 review
+    finding 1)."""
     cur = conn.cursor()
     cur.execute(
         "SELECT recipient_ref, token FROM device_tokens "
         "WHERE recipient_ref IS NOT NULL AND token IS NOT NULL "
         "GROUP BY recipient_ref, token HAVING COUNT(*) > 1")
-    return sorted((row["recipient_ref"], row["token"]) for row in cur.fetchall())
+    dup_keys = {(row["recipient_ref"], row["token"]) for row in cur.fetchall()}
+    if not dup_keys:
+        return []
+    cur.execute(
+        "SELECT id, recipient_ref, token FROM device_tokens "
+        "WHERE recipient_ref IS NOT NULL AND token IS NOT NULL")
+    grouped = {}
+    for r in cur.fetchall():
+        key = (r["recipient_ref"], r["token"])
+        if key in dup_keys:
+            grouped.setdefault(key, []).append(r["id"])
+    return sorted((k[0], k[1], sorted(ids)) for k, ids in grouped.items())
 
 
 def assert_no_duplicate_device_tokens(conn):
@@ -1339,13 +1359,29 @@ def assert_no_duplicate_device_tokens(conn):
     unlocked read-then-save/insert this migration's index backstops could
     persist exact duplicates pre-fix, so on a deployed database
     ``CREATE UNIQUE INDEX`` might otherwise fail with an opaque driver
-    error; naming the conflicting pair lets an operator resolve it first."""
+    error; naming the conflicting row ids lets an operator resolve it
+    first.
+
+    Deliberately never interpolates the recipient_ref or token VALUE into
+    the exception (#426 round-5 review finding 1): a device token is a live
+    production push credential, and this check's failure is exactly the
+    kind of message a startup/deployment log captures verbatim — the
+    review's own reproduction planted two rows and found the raw token
+    inside the raised ``MigrationDataError``. Row ids are both sufficient
+    to repair the row directly (look the id up, then deactivate or delete
+    it) and safe to disclose, so no fingerprint or other reversible/
+    correlatable encoding of the secret value is used — the ids alone
+    already suffice for an operator to act."""
     duplicates = find_duplicate_device_tokens(conn)
     if duplicates:
-        shown = "; ".join(f"{ref}/{tok}" for ref, tok in duplicates[:20])
+        shown = "; ".join(
+            f"rows {', '.join(ids)}" for _ref, _tok, ids in duplicates[:20])
         more = "" if len(duplicates) <= 20 else f" (+{len(duplicates) - 20} more)"
         raise MigrationDataError(
             "Cannot enforce one DeviceToken per (recipient_ref, token): "
-            f"{len(duplicates)} pair(s) already back more than one row: "
-            f"{shown}{more}. Deactivate or delete the extra row(s) before "
+            f"{len(duplicates)} pair(s) already back more than one row. "
+            "The recipient_ref/token values are withheld from this message "
+            "because a device token is a live push credential -- the "
+            f"offending row id(s): {shown}{more}. Look up those rows "
+            "directly and deactivate or delete the extra one(s) before "
             "upgrading.")

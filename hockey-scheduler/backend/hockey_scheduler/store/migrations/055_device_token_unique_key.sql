@@ -39,8 +39,10 @@
 --
 -- Forward-only, so existing data may already violate this: registers
 -- assert_no_duplicate_device_tokens (see _PRE_MIGRATION_CHECKS), which
--- names the conflicting (recipient_ref, token) pair + row ids before this
--- DDL runs, rather than an opaque index error.
+-- reports the conflicting row ids before this DDL runs, rather than an
+-- opaque index error -- deliberately never the (recipient_ref, token)
+-- value itself, a live push credential this check must not copy into a
+-- startup/deployment log (#426 round-5 review finding 1).
 CREATE UNIQUE INDEX IF NOT EXISTS ux_device_tokens_recipient_token
     ON device_tokens (recipient_ref, token)
     WHERE recipient_ref IS NOT NULL AND token IS NOT NULL;
