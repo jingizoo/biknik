@@ -115,6 +115,7 @@ from .privacy import (
     ACCESS_DENIED,
     DataAccessLog,
     SensitiveFieldCategory,
+    VALID_OUTCOMES,
 )
 from .time_utils import intervals_overlap
 
@@ -213,6 +214,7 @@ __all__ = [
     "ACCESS_DENIED",
     "DataAccessLog",
     "SensitiveFieldCategory",
+    "VALID_OUTCOMES",
     "TeamLeagueMigrationDecision",
     "FactoryResetEvent",
     "FactoryResetChallenge",

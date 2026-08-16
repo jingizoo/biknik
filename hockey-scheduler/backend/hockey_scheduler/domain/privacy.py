@@ -23,6 +23,18 @@ birthdate or contact destination was read must never copy the birthdate or
 the destination into the log (#124: "Never copy the sensitive value itself
 into the log"). Keeping the schema closed is the enforcement: a future field
 addition has to survive review here, not slip through a dict.
+
+ORDERING (#426 review finding 5). ``id`` is a textual ``daccess_<n>`` label
+(#124's existing id-generation convention) and was never a sound sort key —
+SQL's ``ORDER BY id`` sorts it LEXICOGRAPHICALLY, so ``daccess_10`` lands
+before ``daccess_2``. ``seq`` is the real ordering key: a per-store INTEGER
+assigned atomically, once, at the moment a row becomes durable (mirroring
+PR #423's persisted-generation-counter pattern — ``ContextService``'s
+switch generation / ``epoch_fence``'s version columns — rather than
+inventing a new mechanism). Every caller that constructs a
+``DataAccessLog`` leaves ``seq=None``; the STORE assigns the real value on
+``add_data_access``/``add_data_access_durable`` and it is never
+caller-supplied, so it cannot be spoofed to reorder history.
 """
 
 from dataclasses import dataclass
@@ -56,6 +68,14 @@ class SensitiveFieldCategory(str, Enum):
 # of the record, not inferred.
 ACCESS_ALLOWED = "allowed"
 ACCESS_DENIED = "denied"
+
+# Closed vocabulary (#426 review finding 5): both stores validate every write
+# against these sets — an invalid outcome (or a category outside
+# ``SensitiveFieldCategory``) is refused at the store boundary, not merely by
+# convention, so a future caller cannot silently write an unrecognised value
+# that ``migration 053``'s CHECK constraints (SQL) and
+# ``_validate_data_access`` (Memory) both enforce identically.
+VALID_OUTCOMES = frozenset({ACCESS_ALLOWED, ACCESS_DENIED})
 
 
 @dataclass
@@ -97,3 +117,8 @@ class DataAccessLog:
     actor_role: Optional[str] = None
     outcome: str = ACCESS_ALLOWED
     request_id: Optional[str] = None
+    # Persisted monotonic ordering key (#426 review finding 5) — see the
+    # module docstring's ORDERING section. Always store-assigned; a caller
+    # never sets this (constructing one with an explicit seq is only for the
+    # store's own row-hydration code).
+    seq: Optional[int] = None
