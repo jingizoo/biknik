@@ -17,6 +17,16 @@ same-process Memory/two-thread parity check.
 Every test asserts the FULL agreement set the review asked for: the
 selected destination, whether the audit fired at all, the audited
 subject, the purpose, and (positive audits) the shared run correlation id.
+
+PUSH / DeviceToken matrix (#426 round-3 review finding 1). The EMAIL/
+ContactDestination matrix above proves the "one read decides both
+outputs" property for _resolve_and_audit_destination's ContactDestination
+branch; ``_FullRaceMatrixTests``' PUSH-suffixed tests below prove the
+SAME property for its DeviceToken branch, across the SAME CREATE/UPDATE/
+RETIRE x before/after matrix, adapted to DeviceToken's actual mechanism
+(see ``_update_push_race``'s own docstring for why "update" means
+something structurally different there than it does for
+ContactDestination's in-place value overwrite).
 """
 
 import os
@@ -42,6 +52,10 @@ from hockey_scheduler.store import InMemoryStore, SqlStore
 EMAIL = NotificationChannel.EMAIL
 OLD_DESTINATION = "pre-race-old@leak-probe.invalid"
 NEW_DESTINATION = "post-race-new@leak-probe.invalid"
+
+PUSH = NotificationChannel.PUSH
+OLD_PUSH_TOKEN = "pre-race-old-push-token"
+NEW_PUSH_TOKEN = "post-race-new-push-token"
 
 
 def _clock():
@@ -120,6 +134,20 @@ class _RaceHelpers:
             return orig(recipient, channel)
         store.get_contact_destination = instrumented
 
+    def _pause_before_push_read(self, store, paused, resume):
+        """The PUSH-branch analogue of ``_pause_before_read`` (#426
+        round-3 review finding 1): patches ``store.active_device_token_
+        for`` instead of ``store.get_contact_destination``, since that is
+        the call ``_resolve_and_audit_destination``'s read-only
+        transaction makes when ``channel == PUSH``."""
+        orig = store.active_device_token_for
+
+        def instrumented(recipient):
+            paused.set()
+            resume.wait(15)
+            return orig(recipient)
+        store.active_device_token_for = instrumented
+
     def _run_sequential(self, mutate_fn, target_fn):
         """The 'after' interleaving: run ``target_fn`` (the read side) to
         FULL completion FIRST, only then run ``mutate_fn`` (the racer).
@@ -144,16 +172,23 @@ class _RaceHelpers:
         mutate_fn()
         return value
 
-    def _run_race_before(self, read_store, mutate_fn, target_fn):
+    def _run_race_before(self, read_store, mutate_fn, target_fn, pause_fn=None):
         """The 'before' interleaving: the racer's write commits, and fully
         releases every lock it held, strictly BEFORE ``target_fn``'s (the
         read side, against ``read_store``) own read ever executes — proven
         with a genuine two-thread barrier, since this direction needs real
-        concurrency to construct at all. Returns ``target_fn``'s result."""
+        concurrency to construct at all. Returns ``target_fn``'s result.
+
+        ``pause_fn`` (#426 round-3 review finding 1): which read to pause —
+        defaults to ``_pause_before_read`` (the ContactDestination branch,
+        every EMAIL-matrix call site's existing behavior, unchanged); the
+        PUSH-matrix call sites pass ``_pause_before_push_read`` instead.
+        """
+        pause_fn = pause_fn or self._pause_before_read
         paused = threading.Event()
         resume = threading.Event()
         racer_done = threading.Event()
-        self._pause_before_read(read_store, paused, resume)
+        pause_fn(read_store, paused, resume)
 
         result = {}
         errors = {}
@@ -209,11 +244,64 @@ class _RaceHelpers:
             self.assertNotIn("error", result, result)
         return go
 
+    # -- the three PUSH/DeviceToken racing mutations (#426 round-3 review
+    # finding 1) ------------------------------------------------------------
+    def _create_push_race(self, ref):
+        racer_api = ApiService(self._store())
+        return lambda: racer_api.register_device_token(
+            ref, "fcm", NEW_PUSH_TOKEN)
+
+    def _update_push_race(self, store, api, ref):
+        """DeviceToken's 'update' analogue.
+
+        Unlike ContactDestination's ``set_contact_destination``, which
+        overwrites ONE existing row's ``destination`` value in place,
+        ``register_device_token``'s upsert key is ``(recipient_ref,
+        token)`` — a DIFFERENT token value is always a DIFFERENT row, so
+        there is no in-place value edit to race against.
+        ``active_device_token_for`` returns the FIRST *active* token by
+        id (``resolve_destination``'s own docstring), so seeding TWO
+        active tokens ahead of the race — OLD (registered first, lower
+        id) and NEW (registered second, higher id) — and having the racer
+        deactivate ONLY OLD moves resolution from OLD's value to NEW's
+        value in ONE atomic write: the real-value-to-a-DIFFERENT-real-
+        value transition an 'update' race is meant to exercise, through
+        DeviceToken's actual mechanism rather than forcing
+        ContactDestination's shape onto a domain that doesn't have it.
+        """
+        api.register_device_token(ref, "fcm", OLD_PUSH_TOKEN)
+        api.register_device_token(ref, "fcm", NEW_PUSH_TOKEN)
+        old_id = next(t.id for t in store.device_tokens_for(ref)
+                     if t.token == OLD_PUSH_TOKEN)
+        racer_api = ApiService(self._store())
+
+        def go():
+            result = racer_api.set_device_token_active(
+                old_id, False, actor_id="ops", actor_role=Role.LEAGUE_ADMIN)
+            self.assertNotIn("error", result, result)
+        return go
+
+    def _retire_push_race(self, store, api, ref):
+        tok_id = api.register_device_token(ref, "fcm", OLD_PUSH_TOKEN)["id"]
+        racer_api = ApiService(self._store())
+
+        def go():
+            result = racer_api.set_device_token_active(
+                tok_id, False, actor_id="ops", actor_role=Role.LEAGUE_ADMIN)
+            self.assertNotIn("error", result, result)
+        return go
+
     # -- enqueue() target --------------------------------------------------
     def _enqueue_target(self, store, notification):
         def go():
             created = enqueue(store, notification, channels=(EMAIL,))
             return next(d for d in created if d.channel == EMAIL)
+        return go
+
+    def _enqueue_push_target(self, store, notification):
+        def go():
+            created = enqueue(store, notification, channels=(PUSH,))
+            return next(d for d in created if d.channel == PUSH)
         return go
 
     # -- retry-worker target ------------------------------------------------
@@ -225,6 +313,14 @@ class _RaceHelpers:
                         if d.channel == EMAIL)
         return go
 
+    def _worker_push_target(self, store):
+        def go():
+            worker = DeliveryWorker(store, _clock)
+            worker.process_pending()
+            return next(d for d in store.all_notification_deliveries()
+                        if d.channel == PUSH)
+        return go
+
     def _seed_pending_delivery(self, store, api):
         # enqueue() with no destination registered yet -> a PENDING row
         # addressed to `ref`, resolved to the placeholder at emission time
@@ -234,16 +330,26 @@ class _RaceHelpers:
         enqueue(store, notification, channels=(EMAIL,))
         return ref
 
+    def _seed_pending_push_delivery(self, store, api):
+        oid, ref = self._seed_official(store, api)
+        notification = _mk_notification(store, api, oid)
+        enqueue(store, notification, channels=(PUSH,))
+        return ref
+
     def _assert_agreement(self, store, ref, destination, expect_destination,
-                          expect_audited):
+                          expect_audited, purpose="delivery_resolve"):
         self.assertEqual(destination, expect_destination)
         # Filtered to THIS resolution's own purpose — a retire racer's own
-        # set_contact_destination_active call is ITSELF an independent,
-        # already-covered sensitive read (its own purpose=
-        # "set_contact_destination_active" row) and must not be mistaken
-        # for (or mask) the delivery-resolution audit under test here.
+        # set_contact_destination_active/set_device_token_active call is
+        # ITSELF an independent, already-covered sensitive read (its own
+        # purpose="set_contact_destination_active"/"set_device_token_
+        # active" row) and must not be mistaken for (or mask) the
+        # delivery-resolution audit under test here. ``purpose`` defaults
+        # to the ContactDestination branch's own value; PUSH-matrix call
+        # sites pass "delivery_resolve_push_token" (#426 round-3 review
+        # finding 1).
         rows = [r for r in store.list_data_access()
-               if r.subject_id == ref and r.purpose == "delivery_resolve"]
+               if r.subject_id == ref and r.purpose == purpose]
         if not expect_audited:
             self.assertEqual(rows, [], rows)
             return
@@ -252,7 +358,7 @@ class _RaceHelpers:
         self.assertEqual(row.outcome, "allowed")
         self.assertEqual(row.actor_role, "system")
         self.assertIsNone(row.actor_user_id)
-        self.assertEqual(row.purpose, "delivery_resolve")
+        self.assertEqual(row.purpose, purpose)
         self.assertTrue(row.request_id.startswith("req_"))
 
 
@@ -383,6 +489,145 @@ class _FullRaceMatrixTests(_RaceHelpers):
         d = self._run_sequential(mutate, self._worker_target(store))
         self._assert_agreement(store, ref, d.destination, OLD_DESTINATION, True)
 
+    # -- PUSH/DeviceToken matrix (#426 round-3 review finding 1) — the
+    # SAME 12-test shape as the EMAIL matrix above, against the worker's
+    # DeviceToken branch instead of its ContactDestination one. See
+    # _update_push_race's own docstring for why "update" here means
+    # "the FIRST-active-by-id token changes", not an in-place value edit.
+
+    def test_enqueue_push_create_race_before_uses_racers_value(self):
+        store = self._store()
+        api = ApiService(store)
+        oid, ref = self._seed_official(store, api)
+        notification = _mk_notification(store, api, oid)
+        mutate = self._create_push_race(ref)
+        d = self._run_race_before(store, mutate,
+                                  self._enqueue_push_target(store, notification),
+                                  pause_fn=self._pause_before_push_read)
+        self._assert_agreement(store, ref, d.destination, NEW_PUSH_TOKEN,
+                               True, purpose="delivery_resolve_push_token")
+
+    def test_enqueue_push_create_race_after_uses_pre_race_placeholder(self):
+        store = self._store()
+        api = ApiService(store)
+        oid, ref = self._seed_official(store, api)
+        notification = _mk_notification(store, api, oid)
+        mutate = self._create_push_race(ref)
+        d = self._run_sequential(
+            mutate, self._enqueue_push_target(store, notification))
+        self.assertNotEqual(d.destination, NEW_PUSH_TOKEN)
+        self._assert_agreement(store, ref, d.destination, d.destination,
+                               False, purpose="delivery_resolve_push_token")
+
+    def test_enqueue_push_update_race_before_uses_racers_value(self):
+        store = self._store()
+        api = ApiService(store)
+        oid, ref = self._seed_official(store, api)
+        notification = _mk_notification(store, api, oid)
+        mutate = self._update_push_race(store, api, ref)
+        d = self._run_race_before(store, mutate,
+                                  self._enqueue_push_target(store, notification),
+                                  pause_fn=self._pause_before_push_read)
+        self._assert_agreement(store, ref, d.destination, NEW_PUSH_TOKEN,
+                               True, purpose="delivery_resolve_push_token")
+
+    def test_enqueue_push_update_race_after_uses_pre_race_value(self):
+        store = self._store()
+        api = ApiService(store)
+        oid, ref = self._seed_official(store, api)
+        notification = _mk_notification(store, api, oid)
+        mutate = self._update_push_race(store, api, ref)
+        d = self._run_sequential(
+            mutate, self._enqueue_push_target(store, notification))
+        self._assert_agreement(store, ref, d.destination, OLD_PUSH_TOKEN,
+                               True, purpose="delivery_resolve_push_token")
+
+    def test_enqueue_push_retire_race_before_uses_placeholder(self):
+        store = self._store()
+        api = ApiService(store)
+        oid, ref = self._seed_official(store, api)
+        notification = _mk_notification(store, api, oid)
+        mutate = self._retire_push_race(store, api, ref)
+        d = self._run_race_before(store, mutate,
+                                  self._enqueue_push_target(store, notification),
+                                  pause_fn=self._pause_before_push_read)
+        self.assertNotEqual(d.destination, OLD_PUSH_TOKEN)
+        self._assert_agreement(store, ref, d.destination, d.destination,
+                               False, purpose="delivery_resolve_push_token")
+
+    def test_enqueue_push_retire_race_after_uses_pre_race_value(self):
+        store = self._store()
+        api = ApiService(store)
+        oid, ref = self._seed_official(store, api)
+        notification = _mk_notification(store, api, oid)
+        mutate = self._retire_push_race(store, api, ref)
+        d = self._run_sequential(
+            mutate, self._enqueue_push_target(store, notification))
+        self._assert_agreement(store, ref, d.destination, OLD_PUSH_TOKEN,
+                               True, purpose="delivery_resolve_push_token")
+
+    def test_worker_push_create_race_before_uses_racers_value(self):
+        store = self._store()
+        api = ApiService(store)
+        ref = self._seed_pending_push_delivery(store, api)
+        mutate = self._create_push_race(ref)
+        d = self._run_race_before(store, mutate,
+                                  self._worker_push_target(store),
+                                  pause_fn=self._pause_before_push_read)
+        self._assert_agreement(store, ref, d.destination, NEW_PUSH_TOKEN,
+                               True, purpose="delivery_resolve_push_token")
+
+    def test_worker_push_create_race_after_uses_pre_race_placeholder(self):
+        store = self._store()
+        api = ApiService(store)
+        ref = self._seed_pending_push_delivery(store, api)
+        mutate = self._create_push_race(ref)
+        d = self._run_sequential(mutate, self._worker_push_target(store))
+        self.assertNotEqual(d.destination, NEW_PUSH_TOKEN)
+        self._assert_agreement(store, ref, d.destination, d.destination,
+                               False, purpose="delivery_resolve_push_token")
+
+    def test_worker_push_update_race_before_uses_racers_value(self):
+        store = self._store()
+        api = ApiService(store)
+        ref = self._seed_pending_push_delivery(store, api)
+        mutate = self._update_push_race(store, api, ref)
+        d = self._run_race_before(store, mutate,
+                                  self._worker_push_target(store),
+                                  pause_fn=self._pause_before_push_read)
+        self._assert_agreement(store, ref, d.destination, NEW_PUSH_TOKEN,
+                               True, purpose="delivery_resolve_push_token")
+
+    def test_worker_push_update_race_after_uses_pre_race_value(self):
+        store = self._store()
+        api = ApiService(store)
+        ref = self._seed_pending_push_delivery(store, api)
+        mutate = self._update_push_race(store, api, ref)
+        d = self._run_sequential(mutate, self._worker_push_target(store))
+        self._assert_agreement(store, ref, d.destination, OLD_PUSH_TOKEN,
+                               True, purpose="delivery_resolve_push_token")
+
+    def test_worker_push_retire_race_before_uses_placeholder(self):
+        store = self._store()
+        api = ApiService(store)
+        ref = self._seed_pending_push_delivery(store, api)
+        mutate = self._retire_push_race(store, api, ref)
+        d = self._run_race_before(store, mutate,
+                                  self._worker_push_target(store),
+                                  pause_fn=self._pause_before_push_read)
+        self.assertNotEqual(d.destination, OLD_PUSH_TOKEN)
+        self._assert_agreement(store, ref, d.destination, d.destination,
+                               False, purpose="delivery_resolve_push_token")
+
+    def test_worker_push_retire_race_after_uses_pre_race_value(self):
+        store = self._store()
+        api = ApiService(store)
+        ref = self._seed_pending_push_delivery(store, api)
+        mutate = self._retire_push_race(store, api, ref)
+        d = self._run_sequential(mutate, self._worker_push_target(store))
+        self._assert_agreement(store, ref, d.destination, OLD_PUSH_TOKEN,
+                               True, purpose="delivery_resolve_push_token")
+
 
 class SqliteRaceTest(_FullRaceMatrixTests, unittest.TestCase):
     def setUp(self):
@@ -452,11 +697,20 @@ class MemoryRaceParityTest(unittest.TestCase):
         enqueue(store, notification, channels=(EMAIL,))
         return store, ref
 
+    def _fresh_pending_push_delivery(self):
+        store = InMemoryStore()
+        api = ApiService(store)
+        oid = api.create_official("Race Official", actor_id="seed")["id"]
+        ref = f"official:{oid}"
+        notification = _mk_notification(store, api, oid)
+        enqueue(store, notification, channels=(PUSH,))
+        return store, ref
+
     def _assert_agreement(self, store, ref, destination, expect_destination,
-                          expect_audited):
+                          expect_audited, purpose="delivery_resolve"):
         self.assertEqual(destination, expect_destination)
         rows = [r for r in store.list_data_access()
-               if r.subject_id == ref and r.purpose == "delivery_resolve"]
+               if r.subject_id == ref and r.purpose == purpose]
         if not expect_audited:
             self.assertEqual(rows, [], rows)
             return
@@ -464,7 +718,7 @@ class MemoryRaceParityTest(unittest.TestCase):
         row = rows[0]
         self.assertEqual(row.outcome, "allowed")
         self.assertEqual(row.actor_role, "system")
-        self.assertEqual(row.purpose, "delivery_resolve")
+        self.assertEqual(row.purpose, purpose)
 
     def test_enqueue_create_before_uses_created_value(self):
         store = InMemoryStore()
@@ -505,6 +759,56 @@ class MemoryRaceParityTest(unittest.TestCase):
         ApiService(store).set_contact_destination(ref, "email", NEW_DESTINATION)
         self.assertNotEqual(d.destination, NEW_DESTINATION)
         self._assert_agreement(store, ref, d.destination, d.destination, False)
+
+    # -- PUSH/DeviceToken parity (#426 round-3 review finding 1) — same
+    # CREATE-only scope as the EMAIL parity above, for the same reason
+    # (this class's own docstring): Memory's full-lock model only ever
+    # produces one of two total orderings, and plain sequential calls,
+    # in each order, are a complete parity proof for both of them.
+
+    def test_enqueue_push_create_before_uses_created_value(self):
+        store = InMemoryStore()
+        api = ApiService(store)
+        oid = api.create_official("Race Official", actor_id="seed")["id"]
+        ref = f"official:{oid}"
+        notification = _mk_notification(store, api, oid)
+        api.register_device_token(ref, "fcm", NEW_PUSH_TOKEN)
+        created = enqueue(store, notification, channels=(PUSH,))
+        d = next(x for x in created if x.channel == PUSH)
+        self._assert_agreement(store, ref, d.destination, NEW_PUSH_TOKEN,
+                               True, purpose="delivery_resolve_push_token")
+
+    def test_enqueue_push_create_after_uses_pre_race_placeholder(self):
+        store = InMemoryStore()
+        api = ApiService(store)
+        oid = api.create_official("Race Official", actor_id="seed")["id"]
+        ref = f"official:{oid}"
+        notification = _mk_notification(store, api, oid)
+        created = enqueue(store, notification, channels=(PUSH,))
+        d = next(x for x in created if x.channel == PUSH)
+        api.register_device_token(ref, "fcm", NEW_PUSH_TOKEN)
+        self.assertNotEqual(d.destination, NEW_PUSH_TOKEN)
+        self._assert_agreement(store, ref, d.destination, d.destination,
+                               False, purpose="delivery_resolve_push_token")
+
+    def test_worker_push_create_before_uses_created_value(self):
+        store, ref = self._fresh_pending_push_delivery()
+        ApiService(store).register_device_token(ref, "fcm", NEW_PUSH_TOKEN)
+        DeliveryWorker(store, _clock).process_pending()
+        d = next(x for x in store.all_notification_deliveries()
+                if x.channel == PUSH)
+        self._assert_agreement(store, ref, d.destination, NEW_PUSH_TOKEN,
+                               True, purpose="delivery_resolve_push_token")
+
+    def test_worker_push_create_after_uses_pre_race_placeholder(self):
+        store, ref = self._fresh_pending_push_delivery()
+        DeliveryWorker(store, _clock).process_pending()
+        d = next(x for x in store.all_notification_deliveries()
+                if x.channel == PUSH)
+        ApiService(store).register_device_token(ref, "fcm", NEW_PUSH_TOKEN)
+        self.assertNotEqual(d.destination, NEW_PUSH_TOKEN)
+        self._assert_agreement(store, ref, d.destination, d.destination,
+                               False, purpose="delivery_resolve_push_token")
 
     def test_concurrent_threads_never_split_destination_from_audit(self):
         # Bonus sanity check, not a substitute for the deterministic pairs
