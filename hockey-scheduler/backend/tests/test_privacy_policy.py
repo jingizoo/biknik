@@ -183,12 +183,18 @@ class VocabularyTest(unittest.TestCase):
         # copied into the log: exactly these fields, and none that could
         # carry a stored value (no destination/value/detail field). `seq`
         # (#426 review finding 5) is the persisted ordering key, always
-        # store-assigned — never a value the caller supplies.
+        # store-assigned — never a value the caller supplies. `id` sits
+        # next to `seq` (#426 round-2 review finding 1), not first: it is
+        # now store-assigned at the SAME moment `seq` is, the same
+        # "caller leaves it None" contract `seq` already established, so
+        # it moved to sit beside it rather than staying a required
+        # leading field.
         from dataclasses import fields
         self.assertEqual(
             [f.name for f in fields(DataAccessLog)],
-            ["id", "category", "subject_type", "subject_id", "purpose", "at",
-             "actor_user_id", "actor_role", "outcome", "request_id", "seq"])
+            ["category", "subject_type", "subject_id", "purpose", "at",
+             "actor_user_id", "actor_role", "outcome", "request_id",
+             "id", "seq"])
 
 
 if __name__ == "__main__":

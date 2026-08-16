@@ -111,7 +111,28 @@ class TransactionBoundaryTest(unittest.TestCase):
     fails before the fix (assign=0, set_availability=1) and passes after
     (assign=1, set_availability=0). InMemoryStore's no-op transaction can't
     distinguish these, so SqlStore is used.
+
+    assign/unassign's expected count is no longer bare 1 (#426 round-2
+    review finding 3): both notify through ``enqueue()``, which now calls
+    ``_resolve_and_audit_destination`` ONCE per channel
+    (``DEFAULT_CHANNELS`` = email + push, #58) — each call is its own
+    ``store.transaction(read_only=True)``, a real, additional Python-level
+    call this counting proxy sees even though the store's OWN
+    ``transaction()`` correctly JOINS the outer unit rather than opening a
+    second real database transaction (SqlStore's nested-call branch never
+    reaches `BEGIN` again). ``_TRANSACTIONAL_WRAP + _CHANNELS_PER_NOTIFY``
+    names that arithmetic instead of a bare literal, so a future change to
+    either number breaks loudly at the right place rather than silently
+    passing a stale count. The referee this fixture assigns/unassigns has
+    no registered ContactDestination, so no THIRD, audit-writing
+    transaction ever joins in addition to these — if that ever changes,
+    this count must grow again for the same reason.
     """
+
+    # Named constants the expected call counts below are built from, not
+    # guessed at.
+    _TRANSACTIONAL_WRAP = 1  # the method's own @_transactional decorator
+    _CHANNELS_PER_NOTIFY = 2  # services.delivery.DEFAULT_CHANNELS: email, push
 
     def _api_counting(self):
         store, gid, ids = build_full_demo_store(SqlStore(":memory:"))
@@ -119,9 +140,16 @@ class TransactionBoundaryTest(unittest.TestCase):
         calls = {"n": 0}
         real = store.transaction
 
-        def counting():
+        def counting(*args, **kwargs):
+            # Forward whatever the real caller passed (e.g.
+            # `read_only=True`, #426 round-2 review finding 3's
+            # `_resolve_and_audit_destination`) — a counting proxy that
+            # only worked for zero-argument calls would silently start
+            # rejecting any FUTURE caller that (correctly) passes one,
+            # which is a fragility bug in the harness, not a signal about
+            # the code under test.
             calls["n"] += 1
-            return real()
+            return real(*args, **kwargs)
 
         store.transaction = counting  # patch AFTER the demo build
         return api, store, gid, ids, calls
@@ -135,7 +163,12 @@ class TransactionBoundaryTest(unittest.TestCase):
         calls["n"] = 0  # reset after the unassign setup
         res = api.assign_official(gid, ref, "referee")
         self.assertNotIn("error", res)
-        self.assertEqual(calls["n"], 1)  # was 0 while the decorator was orphaned
+        # Was 0 while the decorator was orphaned; the OUTER unit is still
+        # exactly one real transaction (this class's own docstring explains
+        # the two nested read_only joins the notify fan-out now legitimately
+        # contributes on top of it).
+        self.assertEqual(calls["n"],
+                         self._TRANSACTIONAL_WRAP + self._CHANNELS_PER_NOTIFY)
 
     def test_set_official_availability_opens_no_transaction(self):
         api, store, gid, ids, calls = self._api_counting()
@@ -154,7 +187,11 @@ class TransactionBoundaryTest(unittest.TestCase):
                           if a.official_id == ref)
         calls["n"] = 0
         api.unassign_official(assignment.id)
-        self.assertEqual(calls["n"], 1)
+        # See this class's own docstring: one real outer transaction plus
+        # the two per-channel read_only joins the notify fan-out now
+        # legitimately contributes.
+        self.assertEqual(calls["n"],
+                         self._TRANSACTIONAL_WRAP + self._CHANNELS_PER_NOTIFY)
 
 
 class AvailabilityHttpAccessTest(unittest.TestCase):
