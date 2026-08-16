@@ -31,7 +31,7 @@ from ..bootstrap import (
 )
 from ..domain import (
     AvailabilityStatus, ConcurrencyConflictError, DomainError, ROLE_LABELS,
-    Permission, Role, can, permissions_for,
+    Permission, Role, SensitiveFieldCategory, can, permissions_for,
 )
 from ..full_demo import build_full_demo_store
 from ..services import (
@@ -922,18 +922,78 @@ class Handler(BaseHTTPRequestHandler):
                        "shortly."}}, 429)
         return True
 
-    def _operator_only(self, guard: str) -> bool:
+    def _sensitive_get(self, facade_method) -> None:
+        """Send the response for a sensitive-read GET route (#426 review
+        finding 1): ``facade_method`` is an ``ApiService`` method
+        (``list_contact_destinations`` / ``get_delivery_overview``).
+
+        The caller has already passed ``_operator_only(guard,
+        audit_category=...)`` (its OWN refusal durably audited there —
+        see that method's docstring) before reaching this point, so this
+        method's job is narrower than it once was: resolve the session
+        ONE more time and pass it straight through as the facade's
+        ``actor_role``/``actor_user_id``, so the facade's OWN policy+audit
+        gate — never a no-principal placeholder — makes the actual
+        disclosure decision and records the real actor. Re-resolving here
+        (rather than threading ``_operator_only``'s own resolution through)
+        costs one extra cheap, side-effect-free cookie parse; it does NOT
+        reopen the bug this fixes, because neither resolution can disagree
+        with itself inside one synchronous request handler, and it keeps
+        this method usable standalone should a future sensitive GET route
+        need it without an ``_operator_only`` pre-gate.
+
+        An invalid/missing session (``err`` from ``_resolve_role()``) still
+        reaches the facade — its ``role=None`` fails closed exactly like
+        any other unrecognised principal — so the refusal is STILL durably
+        audited ("durably audit transport-level refusals", #426 review
+        finding 1), but the HTTP RESPONSE sent back is the ORIGINAL 401
+        from ``_resolve_role()``, not the facade's generic 403: the more
+        accurate status for "no session at all", matching every other
+        route's convention. In practice this is now unreachable from the
+        two live call sites below (``_operator_only`` already turned a
+        missing session into its OWN audited 401 first), but it stays
+        correct rather than assuming that will always be true.
+        """
+        role, scope, user_id, err = self._resolve_role()
+        request_id = STATE.api._mint_request_id()
+        result = facade_method(
+            actor_role=role, actor_user_id=user_id, request_id=request_id)
+        if err is not None:
+            code, payload = err
+            return self._send_json(payload, code)
+        return self._send_api(result)
+
+    def _operator_only(self, guard: str, *, audit_category=None) -> bool:
         """For read-only operator routes: send 401/403 and return True if the
         caller may not operate, else False. Same resolution as the feed —
         invalid cookie → 401, and the ``guard`` path's permission → 403 for
         non-operators.
+
+        ``audit_category`` (#426 review finding 1, optional, default
+        ``None``): when supplied, EVERY refusal this call sends — the 401
+        for a missing/invalid session exactly as much as the 403 for an
+        authenticated-but-insufficient role — is ALSO durably audited as a
+        denied read of that sensitive-field category, attributed to
+        whatever principal THIS SAME resolution produced (``None`` for the
+        401 case, which ``ApiService._privacy_principal`` labels
+        ``NO_PRINCIPAL``, never a disclosure). Closes "A Viewer refusal
+        stopped at ``_operator_only`` and recorded no denial" (#426 review
+        finding 1) without turning every OTHER ``_operator_only`` call
+        site — none of which pass this — into an unrelated audit source:
+        every existing caller keeps today's exact silent 401/403 behavior.
         """
-        role, scope, _uid, err = self._resolve_role()
+        role, scope, uid, err = self._resolve_role()
         if err is not None:
+            if audit_category is not None:
+                STATE.api._audit_transport_denial(
+                    audit_category, "http_operator_gate", uid, None)
             code, payload = err
             self._send_json(payload, code)
             return True
         if not authorize(role, guard):
+            if audit_category is not None:
+                STATE.api._audit_transport_denial(
+                    audit_category, "http_operator_gate", uid, role)
             perm = required_permission(guard)
             self._send_json({"error": {
                 "code": "forbidden",
@@ -2387,17 +2447,34 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(
                 api.get_notifications(role.value, scope, user_id=user_id))
         if path == "/api/notifications/deliveries":
-            # Delivery-queue overview for operators (#58). Exposes internal
-            # queue state, so it is operator-only (invalid cookie → 401,
-            # non-operator → 403 via the drain endpoint's permission).
-            if self._operator_only("/api/notifications/deliveries/process"):
+            # Delivery-queue overview for operators (#58) — every row
+            # includes a stored contact destination, so this is a SENSITIVE
+            # read (#124/#426 review finding 2). _operator_only's own
+            # refusal (401/403) is now durably audited (#426 review
+            # finding 1: "A Viewer refusal stopped at _operator_only and
+            # recorded no denial") via audit_category; an ALLOWED caller
+            # falls through to _sensitive_get, whose OWN policy+audit gate
+            # makes the actual disclosure decision on the real actor,
+            # exactly like the contacts route below.
+            if self._operator_only(
+                    "/api/notifications/deliveries/process",
+                    audit_category=SensitiveFieldCategory.CONTACT_DESTINATION):
                 return
-            return self._send_api(api.get_delivery_overview())
+            return self._sensitive_get(api.get_delivery_overview)
         if path == "/api/notifications/contacts":
-            # Contact registry listing for operators (#60); same guard.
-            if self._operator_only("/api/notifications/contacts"):
+            # Contact registry listing (#60) — a sensitive read (#124).
+            # _operator_only durably audits its OWN refusal (#426 review
+            # finding 1, see its docstring); an ALLOWED caller falls
+            # through to _sensitive_get, which passes the real
+            # role/user_id/request_id straight into the facade's OWN
+            # policy+audit gate — never the no-principal shape a signed-in
+            # Admin used to be recorded under. See _sensitive_get's own
+            # docstring for the 401-vs-403 handling on ITS OWN resolution.
+            if self._operator_only(
+                    "/api/notifications/contacts",
+                    audit_category=SensitiveFieldCategory.CONTACT_DESTINATION):
                 return
-            return self._send_api(api.list_contact_destinations())
+            return self._sensitive_get(api.list_contact_destinations)
         if path == "/api/notifications/preferences":
             # A recipient's channel preferences (#81). Operator → any recipient;
             # a signed-in user → only their own. recipient_ref via query string.
@@ -3313,6 +3390,38 @@ class Handler(BaseHTTPRequestHandler):
             code, payload = err
             return self._send_json(payload, code)
         if not authorize(role, path):
+            # NOTE (#426 review finding 1, residual gap — see PR body): a
+            # Coach/Viewer refused HERE (MANAGE_SETUP/MANAGE_SCHEDULE, for
+            # the contacts-active-toggle / deliveries retry|ignore routes)
+            # is correctly denied with zero disclosure, but does not durably
+            # audit a CONTACT_DESTINATION denial row the way the GET routes'
+            # _operator_only(audit_category=...) now does. Two shapes were
+            # tried here and reverted, each failing for a DIFFERENT reason
+            # that both confirm the same conclusion: (1) passing `path`
+            # itself into a new helper call — `web/route_extract.py` (#422,
+            # forbidden/read-only for this PR) fails closed on any call
+            # whose arguments mention the dispatch `path` variable it has
+            # not been taught; (2) a fresh `path`-testing `if` nested inside
+            # this one, and separately, an `audit_denial=` keyword added to
+            # THIS EXACT `authorize(role, path)` call (moving the `path`
+            # pattern-match into web/authz.py, invoking a callback with only
+            # `role`, never `path`) — both change the recognized TEXT of
+            # this specific `if not authorize(role, path):` node closely
+            # enough that route_extract stops recognizing it as the
+            # standard generic-gate shape at all, and then fails closed on
+            # the OTHERWISE-fine `required_permission(path)` two lines
+            # below too. This is a static analyzer hardened against exactly
+            # this kind of escape across 13 prior review rounds — by
+            # design, it does not offer a low-risk edit-around from outside
+            # itself. Closing this gap for real needs either a reviewed
+            # edit to route_extract.py itself (forbidden for this PR) or a
+            # different generic-gate architecture entirely (a larger,
+            # riskier change than this round's time budget allows to get
+            # right and prove); left as a documented, honest gap rather
+            # than guessed at under time pressure. Every OTHER refusal path
+            # this review named IS durably audited: GET contacts/deliveries
+            # via _operator_only above, and every raw-read site in finding
+            # 2 below — see the PR body for the full accounting.
             perm = required_permission(path)
             return self._send_json({"error": {
                 "code": "forbidden",
@@ -3824,12 +3933,20 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_api(api.process_notification_deliveries())
 
         # Dead-letter operations (#80): requeue or permanently ignore one row.
+        # Both echo the row's stored destination — a sensitive read (#124/
+        # #426 review finding 2) — so the ONE role/user_id this route's
+        # generic authorize() gate (above) already resolved is propagated
+        # through, with a fresh per-request correlation id.
         dr = re.match(r"^/api/notifications/deliveries/([^/]+)/retry$", path)
         if dr:
-            return self._send_api(api.retry_notification_delivery(dr.group(1)))
+            return self._send_api(api.retry_notification_delivery(
+                dr.group(1), actor_role=role, actor_user_id=user_id,
+                request_id=api._mint_request_id()))
         di = re.match(r"^/api/notifications/deliveries/([^/]+)/ignore$", path)
         if di:
-            return self._send_api(api.ignore_notification_delivery(di.group(1)))
+            return self._send_api(api.ignore_notification_delivery(
+                di.group(1), actor_role=role, actor_user_id=user_id,
+                request_id=api._mint_request_id()))
 
         # Contact registry: register/update a real destination (#60). No
         # delete route — a contact destination is never erased, only
@@ -3847,9 +3964,18 @@ class Handler(BaseHTTPRequestHandler):
         # longer counted as live.
         cda = re.match(r"^/api/notifications/contacts/([^/]+)/active$", path)
         if cda:
-            _role, _scope, actor_uid, _err = self._resolve_role()
+            # The response echoes the stored destination — a sensitive read
+            # (#124/#426 review finding 1) — so this route propagates the
+            # ONE role/user_id this route's generic authorize() gate
+            # (above) already resolved, instead of re-resolving the session
+            # a second time and discarding the role. A second
+            # `_resolve_role()` call here previously threw away the
+            # already-known role, which is exactly what defaulted this
+            # route's disclosure to the retired no-principal
+            # "operator_boundary" shape rather than the real actor.
             return self._send_api(api.set_contact_destination_active(
-                cda.group(1), bool(body.get("active")), actor_id=actor_uid))
+                cda.group(1), bool(body.get("active")), actor_id=user_id,
+                actor_role=role, request_id=api._mint_request_id()))
 
         # Device token registry: register / activate-deactivate (#65).
         if path == "/api/notifications/device-tokens":
