@@ -1316,3 +1316,36 @@ def assert_no_duplicate_rink_external_refs(conn):
             f"{len(duplicates)} rink_code value(s) already back more than "
             f"one Rink: {shown}{more}. Merge or retag the duplicate Rink(s) "
             "before upgrading.")
+
+
+def find_duplicate_device_tokens(conn):
+    """Concrete ``(recipient_ref, token)`` pairs shared by more than one
+    DeviceToken row.
+
+    Only non-null pairs are considered — matching migration 055's partial
+    unique index, which excludes NULL-bearing rows because both SQLite and
+    PostgreSQL treat NULLs as distinct."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT recipient_ref, token FROM device_tokens "
+        "WHERE recipient_ref IS NOT NULL AND token IS NOT NULL "
+        "GROUP BY recipient_ref, token HAVING COUNT(*) > 1")
+    return sorted((row["recipient_ref"], row["token"]) for row in cur.fetchall())
+
+
+def assert_no_duplicate_device_tokens(conn):
+    """Abort migration 055 if any (recipient_ref, token) pair already backs
+    more than one DeviceToken row (#426 round-4 review finding 1) — the
+    unlocked read-then-save/insert this migration's index backstops could
+    persist exact duplicates pre-fix, so on a deployed database
+    ``CREATE UNIQUE INDEX`` might otherwise fail with an opaque driver
+    error; naming the conflicting pair lets an operator resolve it first."""
+    duplicates = find_duplicate_device_tokens(conn)
+    if duplicates:
+        shown = "; ".join(f"{ref}/{tok}" for ref, tok in duplicates[:20])
+        more = "" if len(duplicates) <= 20 else f" (+{len(duplicates) - 20} more)"
+        raise MigrationDataError(
+            "Cannot enforce one DeviceToken per (recipient_ref, token): "
+            f"{len(duplicates)} pair(s) already back more than one row: "
+            f"{shown}{more}. Deactivate or delete the extra row(s) before "
+            "upgrading.")

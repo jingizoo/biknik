@@ -1151,6 +1151,39 @@ class InMemoryStore:
     def get_device_token(self, token_id: str) -> Optional[DeviceToken]:
         return self.device_tokens.get(token_id)
 
+    def get_device_token_for_update(
+            self, token_id: str) -> Optional[DeviceToken]:
+        # No row locking needed (#426 round-4 review finding 1, mirroring
+        # get_contact_destination_for_update's identical comment):
+        # transaction() holds self._lock for its entire body, so a
+        # concurrent upsert can't interleave with the caller's
+        # fetch-then-write. Provided for interface parity with SqlStore.
+        return self.device_tokens.get(token_id)
+
+    def upsert_device_token(
+            self, recipient_ref: str, provider: str, token: str,
+            label: Optional[str]) -> DeviceToken:
+        """Insert-or-update a DeviceToken keyed by its natural key
+        (recipient_ref, token) — the Memory-store sibling of
+        SqlStore.upsert_device_token (#426 round-4 review finding 1), same
+        docstring contract. Callers wrap this in ``store.transaction()``
+        (same requirement as every other multi-step Memory mutation), whose
+        ``self._lock`` fully serializes the find-then-mutate-or-create
+        below against any concurrent store access — the SAME "strongest
+        isolation, for free" guarantee ``transaction()``'s own docstring
+        describes, not a per-call lock here."""
+        existing = self.get_device_token_by_value(recipient_ref, token)
+        if existing is not None:
+            existing.provider = provider
+            existing.label = label
+            existing.active = True
+            return existing
+        t = DeviceToken(
+            id=self.next_id("devtok"), recipient_ref=recipient_ref,
+            provider=provider, token=token, label=label, active=True)
+        self.device_tokens[t.id] = t
+        return t
+
     def get_device_token_by_value(
             self, recipient_ref: str, token: str) -> Optional[DeviceToken]:
         for t in self.device_tokens.values():

@@ -107,6 +107,7 @@ from .integrity_checks import (
     assert_reassignment_fks_ready,
     assert_regular_games_resolve_league_season,
     assert_no_duplicate_active_ice_slots,
+    assert_no_duplicate_device_tokens,
     assert_no_duplicate_ice_slot_times,
     assert_no_duplicate_result_games,
     assert_no_duplicate_roster_players,
@@ -410,6 +411,7 @@ _PRE_MIGRATION_CHECKS = {
     "047_official_import_unique_keys":
         assert_officials_availability_import_constraints_ready,
     "048_rink_external_ref_unique": assert_no_duplicate_rink_external_refs,
+    "055_device_token_unique_key": assert_no_duplicate_device_tokens,
 }
 
 
@@ -2183,6 +2185,79 @@ class SqlStore:
     def save_device_token(self, t): return self._update(t)
     def get_device_token(self, token_id):
         return self._get(DeviceToken, token_id)
+    def get_device_token_for_update(self, token_id):
+        """Like ``get_contact_destination_for_update`` — a row lock so a
+        concurrent ``upsert_device_token`` (``register_device_token``'s
+        re-registration path) targeting the SAME row is fully ordered
+        before or after this transaction, never interleaved with a stale
+        pre-read (#426 round-4 review finding 1)."""
+        return self._get_for_update(DeviceToken, token_id)
+
+    # Migration 055's partial unique index predicate, repeated verbatim in
+    # every ON CONFLICT target below: both PostgreSQL and SQLite require an
+    # ON CONFLICT clause targeting a PARTIAL unique index to restate that
+    # index's own WHERE clause exactly, or neither engine will recognize it
+    # as the conflict arbiter (PostgreSQL raises "there is no unique or
+    # exclusion constraint matching the ON CONFLICT specification"; SQLite's
+    # UPSERT docs state the same requirement). recipient_ref/token are
+    # always non-null in practice — register_device_token rejects a blank
+    # value before ever reaching the store — so this predicate is always
+    # true at insert time; it exists to satisfy the arbiter match, not to
+    # filter anything.
+    _DEVICE_TOKEN_CONFLICT_TARGET = (
+        "(recipient_ref, token) WHERE recipient_ref IS NOT NULL "
+        "AND token IS NOT NULL")
+
+    def upsert_device_token(self, recipient_ref, provider, token, label):
+        """Insert-or-update a DeviceToken keyed by its natural key
+        (recipient_ref, token) as ONE atomic statement (#426 round-4 review
+        finding 1).
+
+        Migration 055's UNIQUE index on (recipient_ref, token) backstops
+        this in the database, and ``INSERT ... ON CONFLICT ... DO UPDATE``
+        resolves a concurrent duplicate INSIDE that single statement — so
+        two concurrent FIRST registrations of the same pair can never both
+        observe "no row" and both insert, the way the previous
+        ``get_device_token_by_value()`` read followed by a separate,
+        unlocked ``save_device_token``/``add_device_token`` outside any
+        transaction could.
+
+        This also closes the toggle-vs-reregistration lost update the
+        review described: PostgreSQL's conflict detection takes a real row
+        lock on the existing row before applying the UPDATE branch — the
+        SAME kind of lock ``get_device_token_for_update`` takes explicitly
+        for ``set_device_token_active`` — so the two writer paths are fully
+        ordered against each other on the SAME physical row in EITHER
+        commit order: whichever transaction reaches the row second blocks
+        until the first commits or rolls back, then acts on the now-
+        current values instead of a stale pre-race snapshot.
+
+        Always sets ``active=True``, mirroring the previous upsert's exact
+        contract on both its insert and reactivate branches — see
+        ``register_device_token``'s own docstring and
+        ``test_device_tokens.test_register_is_upsert_and_reactivates``.
+        The returned row's ``id`` is the EXISTING row's id on a conflict
+        (``id`` is deliberately excluded from the UPDATE SET list below),
+        never the freshly allocated candidate id that conflict discarded.
+        """
+        spec = SPECS[DeviceToken]
+        candidate = DeviceToken(
+            id=self.next_id("devtok"), recipient_ref=recipient_ref,
+            provider=provider, token=token, label=label, active=True)
+        vals = [c.to_db(getattr(candidate, c.name)) for c in spec.cols]
+        ph = ", ".join("?" for _ in spec.cols)
+        setp = ", ".join(f"{c.name} = excluded.{c.name}" for c in spec.cols
+                         if c.name not in ("id", "recipient_ref", "token"))
+        with self._lock:
+            cur = self._exec(
+                f"INSERT INTO {spec.table} ({', '.join(spec.names)}) "
+                f"VALUES ({ph}) "
+                f"ON CONFLICT {self._DEVICE_TOKEN_CONFLICT_TARGET} "
+                f"DO UPDATE SET {setp} "
+                f"RETURNING {', '.join(spec.names)}", vals)
+            row = cur.fetchone()
+        return self._row_to_obj(DeviceToken, row)
+
     def get_device_token_by_value(self, recipient_ref, token):
         rows = self._query(
             DeviceToken, "recipient_ref = ? AND token = ?",
