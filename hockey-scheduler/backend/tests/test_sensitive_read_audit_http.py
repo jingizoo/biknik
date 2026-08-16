@@ -45,6 +45,9 @@ from hockey_scheduler.web.server import STATE, Handler
 
 PASSWORD = "demo"
 SENTINEL_EMAIL = "sentinel-http-leak-probe@leak-probe.invalid"
+# A real DeviceToken sentinel (#426 round-3 review finding 1) — distinct
+# from SENTINEL_EMAIL, which only ever backs ContactDestination rows here.
+SENTINEL_PUSH_TOKEN = "sentinel-http-push-leak-probe-426"
 
 # role -> demo persona username, per the six real seeded accounts every
 # other HTTP test file in this suite logs in as.
@@ -95,6 +98,12 @@ class SensitiveReadHttpContract:
         self.player_cid = self.api.set_contact_destination(
             self.official_ref, "email", SENTINEL_EMAIL,
             label="Ref")["id"]
+        # A real device token (#426 round-3 review finding 1) — the SAME
+        # official the contact-destination toggle above uses, so the
+        # active-toggle route has a real player:/official:-scoped row.
+        self.device_token_id = self.api.register_device_token(
+            self.official_ref, "fcm", SENTINEL_PUSH_TOKEN, label="Ref phone"
+        )["id"]
         self._delivery_seq = 0
 
     def _fresh_delivery_id(self):
@@ -260,6 +269,69 @@ class SensitiveReadHttpContract:
         self.assertEqual(len(new_rows), 1, new_rows)
         self.assertEqual(new_rows[0].outcome, ACCESS_DENIED)
 
+    # -- GET /api/notifications/device-tokens (#426 round-3 review finding
+    # 1) — the SAME contract as /api/notifications/contacts above, real
+    # HTTP, real sentinel token, mirroring each test 1:1 rather than
+    # parameterising: the two routes' authz/audit wiring is independent
+    # code in server.py even though it now shares the SAME facade gate.
+    def test_device_tokens_authorized_roles_get_real_reads_with_exact_attribution(self):
+        for role in AUTHORIZED:
+            with self.subTest(role=role):
+                before = len(self._rows())
+                op = self._login(PERSONA[role])
+                status, body, _ = self._req(
+                    "GET", "/api/notifications/device-tokens", opener=op)
+                self.assertEqual(status, 200, body)
+                self.assertIn(SENTINEL_PUSH_TOKEN,
+                              [t["token"] for t in body["device_tokens"]])
+                new_rows = self._rows()[before:]
+                official_rows = [r for r in new_rows
+                                 if r.subject_id == self.official_ref]
+                self.assertEqual(len(official_rows), 1, new_rows)
+                row = official_rows[0]
+                self.assertEqual(row.outcome, ACCESS_ALLOWED)
+                self.assertEqual(row.actor_role, role)
+                self.assertIsNotNone(row.actor_user_id)
+                self.assertEqual(row.purpose, "list_device_tokens")
+
+    def test_device_tokens_unauthorized_signed_in_roles_get_zero_disclosure_and_a_denial(self):
+        for role in UNAUTHORIZED:
+            with self.subTest(role=role):
+                before = len(self._rows())
+                op = self._login(PERSONA[role])
+                status, body, _ = self._req(
+                    "GET", "/api/notifications/device-tokens", opener=op)
+                self.assertEqual(status, 403, body)
+                self.assertNotIn(SENTINEL_PUSH_TOKEN, json.dumps(body))
+                self.assertNotIn("device_tokens", body)
+                new_rows = self._rows()[before:]
+                self.assertEqual(len(new_rows), 1, new_rows)
+                self.assertEqual(new_rows[0].outcome, ACCESS_DENIED)
+                self.assertEqual(new_rows[0].actor_role, role)
+                self.assertEqual(new_rows[0].subject_id, "*")
+
+    def test_device_tokens_public_no_session_gets_401_and_a_durable_denial(self):
+        before = len(self._rows())
+        status, body, _ = self._req("GET", "/api/notifications/device-tokens")
+        self.assertEqual(status, 401, body)
+        self.assertNotIn(SENTINEL_PUSH_TOKEN, json.dumps(body))
+        new_rows = self._rows()[before:]
+        self.assertEqual(len(new_rows), 1, new_rows)
+        self.assertEqual(new_rows[0].outcome, ACCESS_DENIED)
+        self.assertEqual(new_rows[0].actor_role, vp.NO_PRINCIPAL)
+        self.assertIsNone(new_rows[0].actor_user_id)
+
+    def test_device_tokens_invalid_session_cookie_gets_401_and_a_durable_denial(self):
+        before = len(self._rows())
+        status, body, _ = self._req(
+            "GET", "/api/notifications/device-tokens",
+            cookie=f"{srv.SESSION_COOKIE}=totally-bogus-session-token")
+        self.assertEqual(status, 401, body)
+        new_rows = self._rows()[before:]
+        self.assertEqual(len(new_rows), 1, new_rows)
+        self.assertEqual(new_rows[0].outcome, ACCESS_DENIED)
+        self.assertEqual(new_rows[0].actor_role, vp.NO_PRINCIPAL)
+
     # -- active-toggle / retry / ignore: real actor propagation + audit -----
     # (#426 round-2 review finding 2). Three routes, each gated by
     # do_POST's GENERIC authorize(role, path) transport gate BEFORE their
@@ -298,6 +370,25 @@ class SensitiveReadHttpContract:
     def _toggle_path(self):
         return f"/api/notifications/contacts/{self.player_cid}/active"
 
+    def _device_token_prepare(self):
+        # #426 round-3 review finding 1 — the same table-driven shape as
+        # the contacts toggle above, added as a THIRD `_route_fixtures()`
+        # entry so it is automatically exercised by every existing
+        # allowed/denied/public/GET-405 table-driven test below, not just
+        # a hand-written duplicate of each.
+        path = self._device_token_toggle_path()
+        before = next(t for t in self.store.all_device_tokens()
+                     if t.id == self.device_token_id).active
+
+        def check_unchanged():
+            still = next(t for t in self.store.all_device_tokens()
+                        if t.id == self.device_token_id)
+            self.assertEqual(still.active, before)
+        return path, check_unchanged
+
+    def _device_token_toggle_path(self):
+        return f"/api/notifications/device-tokens/{self.device_token_id}/active"
+
     def _delivery_prepare(self, action):
         did = self._fresh_delivery_id()
         path = f"/api/notifications/deliveries/{did}/{action}"
@@ -315,6 +406,14 @@ class SensitiveReadHttpContract:
                      ("league_admin", "arena_manager"), ("coach", "viewer")),
             "ignore": (lambda: self._delivery_prepare("ignore"), {},
                       ("league_admin", "arena_manager"), ("coach", "viewer")),
+            # Device-token active-toggle (#426 round-3 review finding 1):
+            # gated at MANAGE_SCHEDULE (web/authz.py), the SAME permission
+            # retry/ignore use — both League Admin and Arena Manager hold
+            # it, unlike the contacts toggle's stricter League-Admin-only
+            # MANAGE_SETUP.
+            "device_token_toggle": (
+                self._device_token_prepare, {"active": False},
+                ("league_admin", "arena_manager"), ("coach", "viewer")),
         }
 
     def test_toggle_propagates_the_real_signed_in_actor(self):
@@ -330,6 +429,28 @@ class SensitiveReadHttpContract:
         self.assertEqual(new_rows[0].actor_role, "league_admin")
         self.assertIsNotNone(new_rows[0].actor_user_id)
         self.assertNotEqual(new_rows[0].actor_role, "operator_boundary")
+
+    def test_device_token_toggle_propagates_the_real_signed_in_actor(self):
+        # #426 round-3 review finding 1: the exact SENT/returned token
+        # agrees with the exact audited subject/purpose/request id for
+        # ONE real HTTP round trip — not just "some row appeared".
+        before = len(self._rows())
+        op = self._login("arena")
+        status, body, _ = self._req(
+            "POST", self._device_token_toggle_path(), {"active": False},
+            opener=op)
+        self.assertEqual(status, 200, body)
+        self.assertFalse(body["active"])
+        self.assertEqual(body["token"], SENTINEL_PUSH_TOKEN)
+        new_rows = self._rows()[before:]
+        self.assertEqual(len(new_rows), 1, new_rows)
+        row = new_rows[0]
+        self.assertEqual(row.outcome, ACCESS_ALLOWED)
+        self.assertEqual(row.actor_role, "arena_manager")
+        self.assertIsNotNone(row.actor_user_id)
+        self.assertEqual(row.purpose, "set_device_token_active")
+        self.assertEqual(row.subject_id, self.official_ref)
+        self.assertTrue(row.request_id.startswith("req_"))
 
     def test_allowed_personas_get_normal_behavior_for_every_route(self):
         # The fix is additive to the DENIAL paths only — every route's

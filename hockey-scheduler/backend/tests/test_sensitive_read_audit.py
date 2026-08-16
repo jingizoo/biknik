@@ -1,12 +1,24 @@
-"""Facade sensitive-read gate + durable audit for ContactDestination (#124).
+"""Facade sensitive-read gate + durable audit for ContactDestination (#124)
+and DeviceToken (#426 round-3 review finding 1).
 
-The concrete application of the privacy foundation to the one protected
-surface that exists on main today: every facade read of stored contact
-destinations passes the visibility policy and leaves DataAccessLog rows —
-one per disclosed recipient on success, one collection-level row on refusal
-or an empty registry — and the log NEVER contains a protected value
-(proven by scanning every stored row against planted sentinels, with a
-positive control showing the sentinels ARE where they live).
+The concrete application of the privacy foundation to the protected
+surfaces that exist on main today: every facade read of stored contact
+destinations OR device tokens passes the visibility policy and leaves
+DataAccessLog rows — one per disclosed recipient on success, one
+collection-level row on refusal or an empty registry — and the log NEVER
+contains a protected value (proven by scanning every stored row against
+planted sentinels, with a positive control showing the sentinels ARE
+where they live).
+
+DeviceToken shares the EXACT SAME CONTACT_DESTINATION category/gate
+ContactDestination uses (#426 round-3 review finding 1: "one
+CONTACT_DESTINATION-category gate that both ... route through, not two
+similar-but-separate gates") — so the ContactDestination classes above
+already prove the shared sanitizer/durability machinery
+(safe_request_id/canonical_subject_id, durable-denial-survives-rollback
+id/seq allocation) works; the DeviceToken classes below focus on what is
+actually NEW: gating list_device_tokens/set_device_token_active
+specifically, not re-proving the shared machinery a second time.
 
 Server-level (HTTP) assertions live in test_sensitive_read_audit_http.py
 (#426 review finding 1) — these tests pin the facade contract that wiring
@@ -36,6 +48,10 @@ C = SensitiveFieldCategory
 # Deliberately loud, unmistakable protected values (never real PII).
 SENTINEL_EMAIL = "sentinel-secret-email@leak-probe.invalid"
 SENTINEL_PUSH = "sentinel-secret-push-token-XYZZY"
+# Distinct from SENTINEL_PUSH above, which is a ContactDestination row
+# (channel=push) — this one plants a REAL DeviceToken row (#426 round-3
+# review finding 1's own repro shape: "push-secret-token-426").
+SENTINEL_DEVICE_TOKEN = "sentinel-secret-device-token-QWERTY"
 
 
 class _Base(unittest.TestCase):
@@ -49,6 +65,12 @@ class _Base(unittest.TestCase):
             "official:" + oid, "email", SENTINEL_EMAIL, label="Ref")
         self.api.set_contact_destination("scheduler", "push", SENTINEL_PUSH)
         return "official:" + oid
+
+    def seed_device_token(self):
+        oid = self.ids["referee_id"]
+        row = self.api.register_device_token(
+            "official:" + oid, "fcm", SENTINEL_DEVICE_TOKEN, label="Ref phone")
+        return "official:" + oid, row["id"]
 
     def rows(self, **kw):
         return self.store.list_data_access(**kw)
@@ -223,32 +245,44 @@ class FailClosedRefusalTest(_Base):
 class ValueNeverInLogTest(_Base):
     def test_no_stored_row_field_contains_a_protected_value(self):
         ref = self.seed_contacts()
+        dt_ref, dt_id = self.seed_device_token()
         # Exercise every emitting path: allowed list, refused list
         # (explicit unauthorized role AND no principal at all), allowed
-        # read-back toggle.
+        # read-back toggle — for BOTH ContactDestination and DeviceToken
+        # (#426 round-3 review finding 1: same category, same log, so a
+        # planted device-token sentinel must be just as absent).
         self.api.list_contact_destinations(actor_role=Role.LEAGUE_ADMIN)
         self.api.list_contact_destinations(actor_role=Role.COACH)
         self.api.list_contact_destinations()
+        self.api.list_device_tokens(actor_role=Role.LEAGUE_ADMIN)
+        self.api.list_device_tokens(actor_role=Role.COACH)
+        self.api.list_device_tokens()
         cid = next(c.id for c in self.store.all_contact_destinations()
                    if c.recipient_ref == ref)
         self.api.set_contact_destination_active(
             cid, False, actor_id="user_1", actor_role=Role.ARENA_MANAGER)
+        self.api.set_device_token_active(
+            dt_id, False, actor_id="user_1", actor_role=Role.ARENA_MANAGER)
 
         rows = self.rows()
-        self.assertGreaterEqual(len(rows), 4)
+        self.assertGreaterEqual(len(rows), 8)
         for row in rows:
             for field_name, value in vars(row).items():
                 text = str(value)
                 self.assertNotIn(SENTINEL_EMAIL, text,
                                  f"{field_name} leaked the email value")
                 self.assertNotIn(SENTINEL_PUSH, text,
-                                 f"{field_name} leaked the push value")
+                                 f"{field_name} leaked the push contact value")
+                self.assertNotIn(SENTINEL_DEVICE_TOKEN, text,
+                                 f"{field_name} leaked the device token value")
 
         # POSITIVE CONTROL: the probe finds the sentinels where they DO live,
         # so an accidental copy into the log could not hide from it.
         stored = [c.destination for c in self.store.all_contact_destinations()]
         self.assertIn(SENTINEL_EMAIL, stored)
         self.assertIn(SENTINEL_PUSH, stored)
+        stored_tokens = [t.token for t in self.store.all_device_tokens()]
+        self.assertIn(SENTINEL_DEVICE_TOKEN, stored_tokens)
 
 
 class RequestIdSanitizationTest(_Base):
@@ -455,6 +489,206 @@ class ReadBackToggleAuditTest(_Base):
         self.api.set_contact_destination("scheduler", "email",
                                          "ops@contacts.invalid")
         self.assertEqual(self.rows(), [])
+
+
+# -- DeviceToken (#426 round-3 review finding 1) -----------------------------
+#
+# DeviceToken shares the EXACT SAME CONTACT_DESTINATION category/gate the
+# ContactDestination classes above already exercise — the three classes
+# below therefore focus on what changed (list_device_tokens/
+# set_device_token_active themselves), not on re-proving the SHARED
+# sanitizer/durability machinery those ContactDestination classes already
+# cover for both surfaces at once (safe_request_id/canonical_subject_id
+# and durable-denial-survives-rollback id/seq allocation apply identically
+# here, since it is the SAME _record_sensitive_read/_refuse_sensitive_read
+# code path, not a second copy).
+
+class DeviceTokenListAuditTest(_Base):
+    def test_allowed_list_returns_rows_and_audits_the_subject(self):
+        ref, _tok_id = self.seed_device_token()
+        result = self.api.list_device_tokens(
+            actor_role=Role.LEAGUE_ADMIN, actor_user_id="user_admin")
+        self.assertNotIn("error", result, result)
+        self.assertEqual(len(result["device_tokens"]), 1)
+        self.assertEqual(result["device_tokens"][0]["token"],
+                         SENTINEL_DEVICE_TOKEN)
+
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row.category, C.CONTACT_DESTINATION)
+        self.assertEqual(row.subject_type, "recipient")
+        self.assertEqual(row.subject_id, ref)
+        self.assertEqual(row.purpose, "list_device_tokens")
+        self.assertEqual(row.outcome, ACCESS_ALLOWED)
+        self.assertEqual(row.actor_role, "league_admin")
+        self.assertEqual(row.actor_user_id, "user_admin")
+        self.assertTrue(row.request_id.startswith("req_"))
+
+    def test_no_principal_no_arg_call_fails_closed(self):
+        self.seed_device_token()
+        result = self.api.list_device_tokens()
+        self.assertEqual(result["error"]["code"], "forbidden", result)
+        self.assertNotIn("device_tokens", result)
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].outcome, ACCESS_DENIED)
+        self.assertEqual(rows[0].actor_role, vp.NO_PRINCIPAL)
+
+    def test_every_unauthorized_role_is_refused_with_a_denial_row(self):
+        self.seed_device_token()
+        unauthorized = (Role.COACH, Role.VIEWER, Role.PLAYER, Role.GUARDIAN,
+                        Role.OFFICIAL)
+        for n, role in enumerate(unauthorized, start=1):
+            result = self.api.list_device_tokens(
+                actor_role=role, actor_user_id=f"user_{role.value}")
+            self.assertEqual(result["error"]["code"], "forbidden", role)
+            self.assertNotIn(SENTINEL_DEVICE_TOKEN, json.dumps(result))
+            rows = self.rows()
+            self.assertEqual(len(rows), n, role)
+            self.assertEqual(rows[-1].outcome, ACCESS_DENIED, role)
+            self.assertEqual(rows[-1].actor_role, role.value, role)
+            self.assertEqual(rows[-1].subject_id, "*", role)
+
+    def test_empty_registry_read_still_leaves_a_trace(self):
+        result = self.api.list_device_tokens(actor_role=Role.ARENA_MANAGER)
+        self.assertEqual(result["device_tokens"], [])
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0].subject_type, rows[0].subject_id),
+                         ("recipient", "*"))
+        self.assertEqual(rows[0].outcome, ACCESS_ALLOWED)
+
+
+class DeviceTokenReadBackToggleAuditTest(_Base):
+    def test_toggle_readback_is_audited_with_the_actor(self):
+        ref, tok_id = self.seed_device_token()
+        result = self.api.set_device_token_active(
+            tok_id, False, actor_id="user_ops", actor_role=Role.ARENA_MANAGER)
+        self.assertNotIn("error", result, result)
+        self.assertEqual(result["token"], SENTINEL_DEVICE_TOKEN)
+        rows = self.rows(subject_id=ref)
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row.purpose, "set_device_token_active")
+        self.assertEqual(row.outcome, ACCESS_ALLOWED)
+        self.assertEqual(row.actor_user_id, "user_ops")
+        self.assertEqual(row.actor_role, "arena_manager")
+
+    def test_toggle_with_no_principal_fails_closed(self):
+        ref, tok_id = self.seed_device_token()
+        result = self.api.set_device_token_active(tok_id, False,
+                                                   actor_id="user_ops")
+        self.assertEqual(result["error"]["code"], "forbidden", result)
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].outcome, ACCESS_DENIED)
+        self.assertEqual(rows[0].actor_role, vp.NO_PRINCIPAL)
+        t = self.store.get_device_token(tok_id)
+        self.assertTrue(t.active)  # untouched
+
+    def test_toggle_refused_for_unauthorized_role_before_any_mutation(self):
+        ref, tok_id = self.seed_device_token()
+        result = self.api.set_device_token_active(
+            tok_id, False, actor_id="user_coach", actor_role=Role.COACH)
+        self.assertEqual(result["error"]["code"], "forbidden")
+        t = self.store.get_device_token(tok_id)
+        self.assertTrue(t.active)  # fail-closed BEFORE the lookup/mutation
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].outcome, ACCESS_DENIED)
+        self.assertEqual(rows[0].subject_id, "*")
+
+    def test_unauthorized_caller_cannot_probe_row_existence(self):
+        # Same refusal for an id that does not exist — the privacy gate
+        # runs first, so forbidden vs not_found never leaks existence.
+        self.seed_device_token()
+        result = self.api.set_device_token_active(
+            "devtok_missing", False, actor_role=Role.COACH)
+        self.assertEqual(result["error"]["code"], "forbidden")
+
+    def test_not_found_toggle_leaves_no_read_row(self):
+        result = self.api.set_device_token_active(
+            "devtok_missing", False, actor_id="user_ops",
+            actor_role=Role.LEAGUE_ADMIN)
+        self.assertEqual(result["error"]["code"], "not_found")
+        self.assertEqual(self.rows(), [])
+
+    def test_register_write_is_not_treated_as_a_sensitive_read(self):
+        # register_device_token's response echoes only the caller's own
+        # submitted token — no stored value is disclosed, so no read row,
+        # on both the create AND the reactivate-existing path.
+        self.api.register_device_token("scheduler", "fcm", "tok-own-value")
+        self.api.register_device_token(
+            "scheduler", "fcm", "tok-own-value", label="renamed")
+        self.assertEqual(self.rows(), [])
+
+
+class SqliteDeviceTokenFacadeDurabilityTest(unittest.TestCase):
+    """The full path through a REAL database: facade reads emit rows that
+    survive closing and reopening the store — durable auditing, not
+    in-process bookkeeping (mirrors SqliteFacadeDurabilityTest, DeviceToken
+    side, #426 round-3 review finding 1)."""
+
+    def _store(self):
+        fd, self._tmp = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.addCleanup(os.remove, self._tmp)
+        self._reopen = lambda: SqlStore(self._tmp)
+        return SqlStore(self._tmp)
+
+    def test_allowed_and_denied_rows_survive_reopen(self):
+        store = self._store()
+        self.addCleanup(store.close)
+        api = ApiService(store)
+        api.register_device_token("scheduler", "fcm", SENTINEL_DEVICE_TOKEN)
+        self.assertNotIn(
+            "error",
+            api.list_device_tokens(actor_role=Role.LEAGUE_ADMIN),
+            "allowed read")
+        refusal = api.list_device_tokens(
+            actor_role=Role.COACH, actor_user_id="user_coach")
+        self.assertEqual(refusal["error"]["code"], "forbidden")
+        store.close()
+
+        reopened = self._reopen()
+        self.addCleanup(reopened.close)
+        rows = reopened.list_data_access()
+        self.assertEqual(len(rows), 2)
+        outcomes = {r.outcome for r in rows}
+        self.assertEqual(outcomes, {ACCESS_ALLOWED, ACCESS_DENIED})
+        for row in rows:
+            self.assertNotIn(SENTINEL_DEVICE_TOKEN, str(vars(row)))
+        # Positive control on the reopened store, same as the memory probe.
+        self.assertIn(SENTINEL_DEVICE_TOKEN,
+                      [t.token for t in reopened.all_device_tokens()])
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL suite only (TEST_DATABASE_URL not set)")
+class PostgresDeviceTokenFacadeDurabilityTest(unittest.TestCase):
+    def test_allowed_and_denied_rows_survive_reopen(self):
+        url = os.environ["TEST_DATABASE_URL"]
+        store = fresh_sql_store(url)
+        self.addCleanup(store.close)
+        api = ApiService(store)
+        api.register_device_token("scheduler", "fcm", SENTINEL_DEVICE_TOKEN)
+        self.assertNotIn(
+            "error",
+            api.list_device_tokens(actor_role=Role.LEAGUE_ADMIN),
+            "allowed read")
+        refusal = api.list_device_tokens(actor_role=Role.COACH)
+        self.assertEqual(refusal["error"]["code"], "forbidden")
+        store.close()
+
+        reopened = SqlStore(url)
+        self.addCleanup(reopened.close)
+        rows = reopened.list_data_access()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({r.outcome for r in rows},
+                         {ACCESS_ALLOWED, ACCESS_DENIED})
+        for row in rows:
+            self.assertNotIn(SENTINEL_DEVICE_TOKEN, str(vars(row)))
 
 
 class SqliteFacadeDurabilityTest(unittest.TestCase):
