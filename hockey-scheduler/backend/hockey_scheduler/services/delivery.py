@@ -10,14 +10,19 @@ sender is pluggable, so success / failure / retry are all unit-testable.
 """
 
 import threading
+from datetime import datetime, timezone
 
 from ..domain import (
+    ACCESS_ALLOWED,
+    DataAccessLog,
     DeliveryStatus,
     NotificationAudience,
     NotificationChannel,
     NotificationDelivery,
+    SensitiveFieldCategory,
 )
 from ..domain.errors import ValidationError
+from . import visibility_policy
 from .email_transport import DryRunEmailTransport
 from .push_transport import DryRunPushTransport
 
@@ -105,6 +110,45 @@ def resolve_destination(store, recipient: str, channel) -> str:
     return destination_for(recipient, channel)
 
 
+def _audit_system_contact_read(store, clock, recipient: str, channel,
+                               request_id: str) -> None:
+    """Durable, SYSTEM-attributed audit of a stored contact destination
+    actually read to deliver a notification (#426 review finding 2:
+    "delivery worker resolution... read... stored destinations outside
+    this gate — system/worker reads need a real system principal, purpose,
+    and correlation too").
+
+    A no-op unless an ACTIVE ContactDestination row is what
+    ``resolve_destination`` actually used — a push resolved from a device
+    token, or a recipient with nothing stored at all (the synthesized
+    ``.invalid``/``push-token:`` placeholder), reads no CONTACT_DESTINATION
+    value and leaves no row, exactly like the facade's own gate only
+    records an access when something was actually disclosed.
+
+    Attributed to ``visibility_policy.SYSTEM_PRINCIPAL`` (never a
+    caller/session principal — there is none here: this runs from the
+    background worker loop and the manual drain endpoint alike, neither of
+    which acts on behalf of a signed-in user) with ``purpose=
+    "delivery_resolve"`` and a request_id shared by every row ONE
+    enqueue/drain call writes (#426 review finding 3's "one request shares
+    one safe id", generalised to one worker run).
+    """
+    stored = store.get_contact_destination(recipient, channel)
+    if stored is None or not stored.active:
+        return
+    store.add_data_access(DataAccessLog(
+        id=store.next_id("daccess"),
+        category=SensitiveFieldCategory.CONTACT_DESTINATION,
+        subject_type="recipient",
+        subject_id=visibility_policy.canonical_subject_id(recipient),
+        purpose="delivery_resolve",
+        at=clock(),
+        actor_user_id=None,
+        actor_role="system",
+        outcome=ACCESS_ALLOWED,
+        request_id=request_id))
+
+
 def channel_enabled(store, recipient: str, channel) -> bool:
     """Whether ``recipient`` accepts deliveries on ``channel`` (#81).
 
@@ -124,7 +168,7 @@ def _guardian_recipient_refs(store, player_id) -> list:
             for g in store.guardian_links_for_player(player_id) if g.verified]
 
 
-def enqueue(store, notification, channels=DEFAULT_CHANNELS):
+def enqueue(store, notification, channels=DEFAULT_CHANNELS, clock=None):
     """Create the pending delivery rows for a freshly emitted notification.
 
     A channel the recipient has disabled in their preferences (#81) is skipped
@@ -136,7 +180,15 @@ def enqueue(store, notification, channels=DEFAULT_CHANNELS):
     delivery layer itself, so every existing and future PLAYER-audience
     emission site (today: substitute offers) gets it automatically without
     each call site needing to know guardians exist.
+
+    ``clock`` defaults to the real UTC clock (#426 review finding 2's
+    SYSTEM-attributed audit needs a timestamp; existing call sites — none of
+    which had a clock to pass — keep working unchanged). Every destination
+    this call resolves from a REAL stored ContactDestination shares ONE
+    request_id, minted once per call.
     """
+    clock = clock or (lambda: datetime.now(timezone.utc))
+    request_id = visibility_policy.mint_request_id()
     recipients = [recipient_ref(notification)]
     if notification.audience == NotificationAudience.PLAYER:
         recipients.extend(
@@ -146,6 +198,8 @@ def enqueue(store, notification, channels=DEFAULT_CHANNELS):
         for channel in channels:
             if not channel_enabled(store, recipient, channel):
                 continue
+            _audit_system_contact_read(
+                store, clock, recipient, channel, request_id)
             d = NotificationDelivery(
                 id=store.next_id("notif_delivery"),
                 notification_id=notification.id,
@@ -229,6 +283,11 @@ class DeliveryWorker:
         rows = self.store.pending_deliveries(self.max_attempts)
         if limit is not None:
             rows = rows[:limit]
+        # One correlation id for this WHOLE drain run (#426 review finding
+        # 2/3) — every row's re-resolution below that actually reads a
+        # stored ContactDestination shares it, mirroring the facade's own
+        # "one request shares one safe id" contract.
+        run_request_id = visibility_policy.mint_request_id()
         for d in rows:
             notification = self.store.get_notification_feed(d.notification_id)
             # Re-resolve the destination on every attempt so a contact or
@@ -236,6 +295,9 @@ class DeliveryWorker:
             # retrying deliveries (they would otherwise fail forever on the
             # placeholder stamped at enqueue time).
             if d.recipient_ref:
+                _audit_system_contact_read(
+                    self.store, self.clock, d.recipient_ref, d.channel,
+                    run_request_id)
                 d.destination = resolve_destination(
                     self.store, d.recipient_ref, d.channel)
             now = self.clock()
