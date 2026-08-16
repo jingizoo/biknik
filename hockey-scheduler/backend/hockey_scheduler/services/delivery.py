@@ -99,6 +99,16 @@ def resolve_destination(store, recipient: str, channel) -> str:
     delete. Every retry/re-resolution (below) re-checks this, so a delivery
     enqueued before retirement falls back to the placeholder on its very
     next attempt rather than continuing to reach the retired address.
+
+    Audit-free by design — several call sites (import/reactivation checks,
+    contact-registry tests, device-token tests) need the resolved value
+    with no system-attributed DataAccessLog side effect. The delivery
+    worker's OWN two call sites (below) do not use this function directly;
+    they use ``_resolve_and_audit_destination``, which performs the SAME
+    resolution but from exactly ONE store read shared with its audit
+    decision (#426 round-2 review finding 3 — see that function's own
+    docstring for why splitting the read from the audit, as this function
+    and a separate audit call used to be combined, is unsafe).
     """
     if channel == NotificationChannel.PUSH:
         token = store.active_device_token_for(recipient)
@@ -110,45 +120,97 @@ def resolve_destination(store, recipient: str, channel) -> str:
     return destination_for(recipient, channel)
 
 
-def _audit_system_contact_read(store, clock, recipient: str, channel,
-                               request_id: str) -> None:
-    """Durable, SYSTEM-attributed audit of a stored contact destination
-    actually read to deliver a notification (#426 review finding 2:
-    "delivery worker resolution... read... stored destinations outside
-    this gate — system/worker reads need a real system principal, purpose,
-    and correlation too").
+def _resolve_and_audit_destination(store, clock, recipient: str, channel,
+                                   request_id: str,
+                                   purpose: str = "delivery_resolve") -> str:
+    """Resolve (recipient, channel)'s real delivery destination AND, if a
+    stored ContactDestination row is what that resolution actually used,
+    durably audit reading it — both derived from exactly ONE store read
+    (#426 round-2 review finding 3).
 
-    A no-op unless an ACTIVE ContactDestination row is what
-    ``resolve_destination`` actually used — a push resolved from a device
-    token, or a recipient with nothing stored at all (the synthesized
-    ``.invalid``/``push-token:`` placeholder), reads no CONTACT_DESTINATION
-    value and leaves no row, exactly like the facade's own gate only
-    records an access when something was actually disclosed.
+    The bug this replaces: ``enqueue()`` and
+    ``DeliveryWorker._process_pending_locked()`` used to call a separate
+    ``_audit_system_contact_read()`` (its OWN
+    ``store.get_contact_destination()`` call) and THEN, independently,
+    ``resolve_destination()`` (a SECOND, unrelated
+    ``store.get_contact_destination()`` call) — two unlocked reads with no
+    shared transaction or snapshot between them. A concurrent upsert or
+    retire landing in the gap could make the audit describe a row that was
+    never actually delivered to, or — the reviewer's own repro — let the
+    delivery use a destination that observed a DIFFERENT (later) write
+    than the one the audit recorded (or never audited at all): "the
+    delivery used race-secret@example.com while list_data_access() stayed
+    empty." Reading ONCE and deriving both outputs from that SAME value
+    closes the gap structurally — there is no second read left to race
+    against the first, and no way for the returned destination and the
+    audited row to describe different snapshots.
+
+    The READ half runs under ``store.transaction(read_only=True)`` —
+    NOT a plain (write-capable) ``store.transaction()``. A write-capable
+    transaction takes SQLite's file-level RESERVED lock at ``BEGIN``
+    (see ``SqlStore.transaction``'s own docstring) for its ENTIRE
+    duration, which would make this purely-reading half of the function
+    block every OTHER connection's write for as long as it runs — and,
+    worse, DEADLOCK against the very concurrent writer this fix exists to
+    be race-safe against: that writer's own commit cannot proceed until
+    this transaction releases the lock, and this transaction was never
+    going to release it before observing whatever the test/caller was
+    waiting to see the writer commit. ``read_only=True`` takes SQLite's
+    weaker SHARED lock instead (compatible with another connection's
+    RESERVED — see that flag's own docstring) — this read still observes
+    one consistent value, and it isn't the transaction's lock STRENGTH
+    that makes the audit and the destination agree, it is that there is
+    only ONE read total, feeding both.
+
+    The AUDIT WRITE (when it fires) happens SEPARATELY, in
+    ``add_data_access``'s own transaction, exactly as it did before this
+    fix — an audit write that failed for any reason still propagates as
+    an exception rather than silently letting the destination be used
+    with no trace of it (matching ``_refuse_sensitive_read``'s OWN "every
+    access attempt leaves a trace" contract), it is simply not forced
+    into the SAME lock-holding unit as the read.
+
+    Resolution order mirrors ``resolve_destination()``'s own (kept as a
+    separate, audit-free, single-shot utility several OTHER call sites —
+    none of them the delivery worker — still use directly, see its
+    docstring):
+      1. push only — the recipient's first *active* device token (#65),
+         never audited (not a ContactDestination read at all);
+      2. an *active* registered contact destination (#60) — audited HERE,
+         from the SAME row this branch returns, when reached;
+      3. the synthesized placeholder (#59) — never audited (nothing
+         stored was disclosed).
 
     Attributed to ``visibility_policy.SYSTEM_PRINCIPAL`` (never a
     caller/session principal — there is none here: this runs from the
     background worker loop and the manual drain endpoint alike, neither of
-    which acts on behalf of a signed-in user) with ``purpose=
-    "delivery_resolve"`` and a request_id shared by every row ONE
-    enqueue/drain call writes (#426 review finding 3's "one request shares
-    one safe id", generalised to one worker run).
+    which acts on behalf of a signed-in user), with the given ``purpose``
+    and a ``request_id`` shared by every row ONE enqueue/drain call writes
+    (#426 review finding 3's original "one request shares one safe id",
+    generalised to one worker run).
     """
-    stored = store.get_contact_destination(recipient, channel)
-    if stored is None or not stored.active:
-        return
-    # `id` is deliberately left unset: the store assigns it (#426 round-2
-    # review finding 1) — see domain/privacy.py's DURABLE ID ALLOCATION
-    # section.
+    with store.transaction(read_only=True):
+        if channel == NotificationChannel.PUSH:
+            token = store.active_device_token_for(recipient)
+            if token is not None and token.token:
+                return token.token
+        stored = store.get_contact_destination(recipient, channel)
+    if stored is None or not stored.destination or not stored.active:
+        return destination_for(recipient, channel)
+    # `id` is deliberately left unset: the store assigns it (#426
+    # round-2 review finding 1) — see domain/privacy.py's DURABLE ID
+    # ALLOCATION section.
     store.add_data_access(DataAccessLog(
         category=SensitiveFieldCategory.CONTACT_DESTINATION,
         subject_type="recipient",
         subject_id=visibility_policy.canonical_subject_id(recipient),
-        purpose="delivery_resolve",
+        purpose=purpose,
         at=clock(),
         actor_user_id=None,
         actor_role="system",
         outcome=ACCESS_ALLOWED,
         request_id=request_id))
+    return stored.destination
 
 
 def channel_enabled(store, recipient: str, channel) -> bool:
@@ -200,14 +262,17 @@ def enqueue(store, notification, channels=DEFAULT_CHANNELS, clock=None):
         for channel in channels:
             if not channel_enabled(store, recipient, channel):
                 continue
-            _audit_system_contact_read(
+            # ONE read drives both the destination and its audit (#426
+            # round-2 review finding 3) — see
+            # _resolve_and_audit_destination's own docstring.
+            destination = _resolve_and_audit_destination(
                 store, clock, recipient, channel, request_id)
             d = NotificationDelivery(
                 id=store.next_id("notif_delivery"),
                 notification_id=notification.id,
                 channel=channel,
                 recipient_ref=recipient,
-                destination=resolve_destination(store, recipient, channel),
+                destination=destination,
             )
             created.append(store.add_notification_delivery(d))
     return created
@@ -297,11 +362,12 @@ class DeliveryWorker:
             # retrying deliveries (they would otherwise fail forever on the
             # placeholder stamped at enqueue time).
             if d.recipient_ref:
-                _audit_system_contact_read(
+                # ONE read drives both the destination and its audit
+                # (#426 round-2 review finding 3) — see
+                # _resolve_and_audit_destination's own docstring.
+                d.destination = _resolve_and_audit_destination(
                     self.store, self.clock, d.recipient_ref, d.channel,
                     run_request_id)
-                d.destination = resolve_destination(
-                    self.store, d.recipient_ref, d.channel)
             now = self.clock()
             d.attempts += 1
             d.last_attempt_at = now
