@@ -145,6 +145,27 @@ class SensitiveReadHttpContract:
                 pass
 
     def _req(self, method, path, body=None, opener=None, cookie=None):
+        """#426 round-4 review finding 2: the ``except`` branch below used to
+        read ``e`` and return without ever closing it — unlike the success
+        path, which already closes its response via ``with op.open(req) as
+        r:``. ``urllib.error.HTTPError`` IS an ``addinfourl``/``addbase`` (it
+        subclasses both ``OSError`` and the response-wrapper class urlopen()
+        itself returns), so it supports the SAME context-manager protocol as
+        the success path's ``r`` — ``with e:`` below closes the underlying
+        socket/file the moment this method returns, exactly like the success
+        branch, instead of leaving it for the garbage collector to find at
+        some later, unpredictable point. Left unclosed, every 401/403/405
+        response this file's whole matrix provokes (the common case for a
+        denial-proving test) leaked one open response per call: reproduced
+        verbatim before this fix (see the PR history for the captured
+        transcript) as two ``ResourceWarning: Implicitly cleaning up
+        <HTTPError ...>`` warnings from a single test method, invisible to
+        plain ``python3 -m unittest`` because the warning fires from a
+        ``__del__`` at garbage-collection time, well after the test already
+        recorded "ok" — see test_resource_warning_leak.py for the permanent
+        regression that actually catches this class of leak, which trusting
+        the process exit code cannot.
+        """
         url = f"http://127.0.0.1:{self.port}{path}"
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(url, data=data, method=method)
@@ -158,8 +179,9 @@ class SensitiveReadHttpContract:
                 raw = r.read()
                 return r.status, (json.loads(raw) if raw else {}), dict(r.headers)
         except urllib.error.HTTPError as e:
-            raw = e.read()
-            return e.code, (json.loads(raw) if raw else {}), dict(e.headers)
+            with e:
+                raw = e.read()
+                return e.code, (json.loads(raw) if raw else {}), dict(e.headers)
 
     def _login(self, username):
         op = urllib.request.build_opener(
