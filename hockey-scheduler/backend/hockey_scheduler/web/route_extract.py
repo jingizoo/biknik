@@ -3338,6 +3338,38 @@ _AUDIT_WAIVERS = {
         "a bare call directly forming the whole if-test was never even "
         "scanned for tracked arguments; now it is, and gets this "
         "explicit, reviewed waiver instead",
+    # #426 round-2 review finding 2: durably audit a denial at do_POST's
+    # own two generic refusal points (the resolve_role() 401 three lines
+    # above this if, and the authorize() 403 this if itself gates) for the
+    # sensitive routes _sensitive_post_audit_target (a module-level table,
+    # not a hidden dispatcher -- see its own docstring) names. Both calls
+    # are bare statements taking the tracked `path` -- the SAME "a call
+    # consuming a tracked name needs its own review" shape every other
+    # entry in this dict already covers, e.g. `required_permission(path)`
+    # a few entries above. Neither call chooses a route: THIS if/else pair
+    # (and the `err is not None` one above it) already fully decided
+    # 401-vs-403-vs-continue before either audit call runs; both are pure
+    # side effects recording that decision, never influencing it.
+    ("do_POST", "self._audit_sensitive_post_denial(path, None, user_id)",
+     "bare_stmt", "err is not None"):
+        "the resolve_role() 401 case's own audit call -- see the shared "
+        "comment on the sibling 403-case entry immediately below for the "
+        "full rationale; this is the SAME call, at the OTHER of the two "
+        "refusal points _sensitive_post_audit_target covers, with `role` "
+        "passed as `None` (no session at all resolved) matching every "
+        "other missing-principal transport denial audit's own convention",
+    ("do_POST", "self._audit_sensitive_post_denial(path, role, user_id)",
+     "bare_stmt", "not authorize(role, path)"):
+        "the authorize()-refused 403 case's own audit call, reached only "
+        "AFTER `not authorize(role, path)` (waived immediately above) has "
+        "already refused the request -- a pure side effect recording that "
+        "already-made decision, not a second dispatch. `path` is tracked "
+        "only because `_sensitive_post_audit_target` (a module-level "
+        "lookup table matched against 3 fixed regexes, not a callable "
+        "chosen by `path`) needs it to decide WHICH category/purpose (or "
+        "none) to audit under -- the SAME 'derives a value FROM path, "
+        "chooses no route' shape `required_permission(path)`'s own "
+        "waiver two entries above already covers for an identical reason",
     ("do_POST", "self._guardian_link_or_403(guid, jid)", "if_test", "mga"):
         "POST sibling of get_me_guardian_id_substitute_opportunities_id's "
         "own identical-text waiver above (see that entry for the general "

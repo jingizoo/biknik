@@ -538,6 +538,39 @@ def is_context_scoped_read(path: str) -> bool:
     return any(rx.match(path) for rx in CONTEXT_SCOPED_READ_ROUTES)
 
 
+# Sensitive POST routes that must durably audit a denial at do_POST's
+# GENERIC per-request gate (#426 round-2 review finding 2: "the generic
+# do_POST authorize(role, path) gate still returns 403 without a
+# DataAccessLog denial for contact active-toggle and delivery retry/
+# ignore" — closing the residual gap #426's own first round left
+# documented, now ruled in scope). Each entry is
+# (pattern, SensitiveFieldCategory, purpose) — purpose mirrors the
+# facade method the SAME route reaches when authorized, so an allowed
+# and a denied attempt at the identical action share one vocabulary in
+# the audit trail. Consulted by do_POST's OWN two refusal points below
+# (the resolve_role() 401 and the authorize() 403), never by
+# _operator_only's GET-side gate, which already has its own
+# per-call-site audit_category parameter.
+_SENSITIVE_POST_AUDIT_ROUTES = (
+    (re.compile(r"^/api/notifications/contacts/[^/]+/active$"),
+     SensitiveFieldCategory.CONTACT_DESTINATION, "set_contact_destination_active"),
+    (re.compile(r"^/api/notifications/deliveries/[^/]+/retry$"),
+     SensitiveFieldCategory.CONTACT_DESTINATION, "retry_notification_delivery"),
+    (re.compile(r"^/api/notifications/deliveries/[^/]+/ignore$"),
+     SensitiveFieldCategory.CONTACT_DESTINATION, "ignore_notification_delivery"),
+)
+
+
+def _sensitive_post_audit_target(path: str):
+    """The ``(category, purpose)`` a denial of this POST ``path`` must be
+    durably audited under, or ``(None, None)`` for every other route —
+    see ``_SENSITIVE_POST_AUDIT_ROUTES`` above."""
+    for pattern, category, purpose in _SENSITIVE_POST_AUDIT_ROUTES:
+        if pattern.match(path):
+            return category, purpose
+    return None, None
+
+
 # ONE gate per process, beside STATE and with the same lifetime — it orders
 # REQUESTS, not data, so it deliberately survives STATE.reset()/store swaps.
 # See services/context_gate.py for the ordering argument, the lock level, and
@@ -1004,6 +1037,33 @@ class Handler(BaseHTTPRequestHandler):
             }}, 403)
             return True
         return False
+
+    def _audit_sensitive_post_denial(self, path: str, role, uid) -> None:
+        """Durably audit a denial at do_POST's GENERIC per-request
+        ``authorize(role, path)`` gate, for the sensitive routes named in
+        ``_SENSITIVE_POST_AUDIT_ROUTES`` (#426 round-2 review finding 2 —
+        the residual gap the FIRST #426 review round documented and left
+        open; the owner has since ruled it in scope). A no-op for every
+        OTHER POST route — every other route's 401/403 keeps today's exact
+        silent behavior, the SAME "existing caller unaffected" contract
+        ``_operator_only``'s own ``audit_category`` parameter already
+        keeps for the GET side.
+
+        ``role`` is ``None`` for the missing/invalid-session (401) case,
+        matching every other transport-boundary denial audit — see
+        ``ApiService._audit_transport_denial``'s own docstring.
+
+        Deliberately a SEPARATE call, not a change to ``authorize(role,
+        path)`` or the ``if not authorize(role, path):``/``if err is not
+        None:`` nodes themselves: those two are do_POST's own generic,
+        blanket-gate shapes, already reviewed and recognized as such by
+        ``web/route_extract.py``'s dispatch analysis (#202) — this
+        function is called from beside them, not folded into their own
+        text, so neither node's recognized shape changes.
+        """
+        category, purpose = _sensitive_post_audit_target(path)
+        if category is not None:
+            STATE.api._audit_transport_denial(category, purpose, uid, role)
 
     # -- setup TARGET-RECORD authorization (#369) --------------------------
     #
@@ -3387,41 +3447,30 @@ class Handler(BaseHTTPRequestHandler):
         # cookie is authoritative; the X-Demo-Role header is a dev fallback.
         role, scope, user_id, err = self._resolve_role()
         if err is not None:
+            # #426 round-2 review finding 2: durably audit a denial HERE
+            # too — a missing/invalid session refused at THIS generic gate,
+            # for one of the sensitive routes _audit_sensitive_post_denial
+            # recognizes, is exactly as much an access attempt as the
+            # authorize()-refused case three lines below, and the GET
+            # side's _operator_only(audit_category=...) already covers its
+            # own 401 the same way.
+            self._audit_sensitive_post_denial(path, None, user_id)
             code, payload = err
             return self._send_json(payload, code)
         if not authorize(role, path):
-            # NOTE (#426 review finding 1, residual gap — see PR body): a
-            # Coach/Viewer refused HERE (MANAGE_SETUP/MANAGE_SCHEDULE, for
-            # the contacts-active-toggle / deliveries retry|ignore routes)
-            # is correctly denied with zero disclosure, but does not durably
-            # audit a CONTACT_DESTINATION denial row the way the GET routes'
-            # _operator_only(audit_category=...) now does. Two shapes were
-            # tried here and reverted, each failing for a DIFFERENT reason
-            # that both confirm the same conclusion: (1) passing `path`
-            # itself into a new helper call — `web/route_extract.py` (#422,
-            # forbidden/read-only for this PR) fails closed on any call
-            # whose arguments mention the dispatch `path` variable it has
-            # not been taught; (2) a fresh `path`-testing `if` nested inside
-            # this one, and separately, an `audit_denial=` keyword added to
-            # THIS EXACT `authorize(role, path)` call (moving the `path`
-            # pattern-match into web/authz.py, invoking a callback with only
-            # `role`, never `path`) — both change the recognized TEXT of
-            # this specific `if not authorize(role, path):` node closely
-            # enough that route_extract stops recognizing it as the
-            # standard generic-gate shape at all, and then fails closed on
-            # the OTHERWISE-fine `required_permission(path)` two lines
-            # below too. This is a static analyzer hardened against exactly
-            # this kind of escape across 13 prior review rounds — by
-            # design, it does not offer a low-risk edit-around from outside
-            # itself. Closing this gap for real needs either a reviewed
-            # edit to route_extract.py itself (forbidden for this PR) or a
-            # different generic-gate architecture entirely (a larger,
-            # riskier change than this round's time budget allows to get
-            # right and prove); left as a documented, honest gap rather
-            # than guessed at under time pressure. Every OTHER refusal path
-            # this review named IS durably audited: GET contacts/deliveries
-            # via _operator_only above, and every raw-read site in finding
-            # 2 below — see the PR body for the full accounting.
+            # #426 round-2 review finding 2 (closing the residual gap the
+            # FIRST #426 review round's own note here left open — see the
+            # module docstring's #426 history and the PR body for the full
+            # accounting): a Coach/Viewer refused HERE
+            # (MANAGE_SETUP/MANAGE_SCHEDULE, for the contacts-active-toggle
+            # / deliveries retry|ignore routes) now durably audits a
+            # CONTACT_DESTINATION denial row too, the SAME way the GET
+            # routes' _operator_only(audit_category=...) already does.
+            # _audit_sensitive_post_denial is a call BESIDE this node, not
+            # a change to it or to `required_permission(path)` below — the
+            # generic-gate shape route_extract.py recognizes here is
+            # unchanged.
+            self._audit_sensitive_post_denial(path, role, user_id)
             perm = required_permission(path)
             return self._send_json({"error": {
                 "code": "forbidden",
