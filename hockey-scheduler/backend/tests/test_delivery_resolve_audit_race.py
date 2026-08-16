@@ -60,7 +60,49 @@ class _RaceHelpers:
     """Shared, non-test helper body; subclasses provide ``self._store()``
     -> a fresh connection/instance onto the backing database/store (a
     genuinely separate SQL connection for SQLite/Postgres, or the SAME
-    shared InMemoryStore for the Memory parity check)."""
+    shared InMemoryStore for the Memory parity check).
+
+    CONNECTION LIFECYCLE (#426 round-3 review finding 2). Every concrete
+    ``self._store()`` implementation below routes through
+    :meth:`_track_store`, so every SqlStore this class's 12 tests open —
+    the per-test PRIMARY connection AND the SEPARATE racer connection
+    ``_create_race``/``_update_race``/``_retire_race`` each open via their
+    own ``ApiService(self._store())`` — is registered for a guaranteed
+    ``addCleanup`` close. Before this fix, NONE of them were ever closed:
+    running ``python3 -W always::ResourceWarning -m unittest -v
+    test_delivery_resolve_audit_race`` against ``SqliteRaceTest`` alone
+    emitted 24 ``ResourceWarning: unclosed database`` warnings (12 tests
+    x 2 leaked connections each — the primary plus one racer; every test
+    exercises exactly one of the three racing mutations) — reproduced
+    verbatim before this fix, see the PR history for the captured count.
+    """
+
+    def _track_store(self, store):
+        """Register a freshly opened SqlStore for a guaranteed close.
+
+        ``addCleanup`` is unittest's own "runs no matter what" hook: it
+        fires after ``tearDown`` regardless of whether ``setUp``, the test
+        method, or ``tearDown`` itself raised — including when the store
+        was opened inside a racer/target thread body that then errors
+        (the thread's own exception is re-raised on the MAIN thread by
+        ``_run_race_before`` above, well before ``doCleanups`` ever runs,
+        so the store this method already registered is still closed
+        regardless of THAT failure path). See
+        ``CloseTrackingHarnessTest`` below for a direct, isolated proof of
+        this guarantee under an injected failure — this method itself
+        stays a thin, obviously-correct delegation to ``addCleanup``
+        rather than hand-rolling try/finally bookkeeping that could drift
+        from unittest's own well-tested semantics.
+
+        Every concrete subclass's OWN ``setUp`` registers ITS cleanup
+        (removing the SQLite temp file; nothing extra for Postgres, which
+        never deletes its database) BEFORE any test method runs and
+        therefore before any call to this method — ``addCleanup``'s LIFO
+        order then guarantees every store this method tracks is closed
+        BEFORE that file-removal cleanup runs, never after.
+        """
+        self.addCleanup(store.close)
+        return store
 
     def _seed_official(self, store, api):
         oid = api.create_official("Race Official", actor_id="seed")["id"]
@@ -347,12 +389,14 @@ class SqliteRaceTest(_FullRaceMatrixTests, unittest.TestCase):
         fd, self._tmp = tempfile.mkstemp(suffix=".db")
         os.close(fd)
         SqlStore(self._tmp).close()  # migrate, then release
-
-    def tearDown(self):
-        os.remove(self._tmp)
+        # Registered BEFORE any test method (and therefore any _store()
+        # call) runs, so addCleanup's LIFO order closes every tracked
+        # store first and removes the file last (#426 round-3 review
+        # finding 2) — see _RaceHelpers._track_store's own docstring.
+        self.addCleanup(os.remove, self._tmp)
 
     def _store(self):
-        return SqlStore(self._tmp)
+        return self._track_store(SqlStore(self._tmp))
 
 
 @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
@@ -360,10 +404,13 @@ class SqliteRaceTest(_FullRaceMatrixTests, unittest.TestCase):
 class PostgresRaceTest(_FullRaceMatrixTests, unittest.TestCase):
     def setUp(self):
         self.url = os.environ["TEST_DATABASE_URL"]
-        SqlStore(self.url).clear_all_data()
+        # The one-off connection used only to reset the schema is tracked
+        # too (#426 round-3 review finding 2) — it used to be a bare,
+        # never-closed `SqlStore(self.url)`.
+        self._track_store(SqlStore(self.url)).clear_all_data()
 
     def _store(self):
-        return SqlStore(self.url)
+        return self._track_store(SqlStore(self.url))
 
 
 class MemoryRaceParityTest(unittest.TestCase):
@@ -493,6 +540,102 @@ class MemoryRaceParityTest(unittest.TestCase):
             self._assert_agreement(
                 store, ref, d.destination, d.destination,
                 d.destination == NEW_DESTINATION)
+
+
+class CloseTrackingHarnessTest(_RaceHelpers, unittest.TestCase):
+    """Proves ``_RaceHelpers._track_store`` — the actual fix above, not a
+    reimplementation of it — really closes every SqlStore it registers on
+    the ordinary SUCCESS path AND when the code between opening a store
+    and the test method returning RAISES (a racer/target failure), rather
+    than merely asserting the code SHAPE looks right (#426 round-3 review
+    finding 2). Mixing in ``_RaceHelpers`` itself (the SAME base
+    ``SqliteRaceTest``/``PostgresRaceTest`` use) means ``self._store()``
+    below IS the identical ``_track_store(SqlStore(...))`` call those
+    classes make — this harness exercises the real method, not a parallel
+    stand-in that could quietly drift from it.
+
+    Forces ``doCleanups()`` to run MID-test (a legitimate, public
+    ``unittest.TestCase`` API — cleanups are a LIFO stack that
+    ``doCleanups()`` drains; calling it early just runs what is queued so
+    far, and the automatic post-``tearDown`` call that follows finds an
+    empty stack and no-ops) so the close can be observed and asserted on
+    directly, rather than trusting the framework's own documented
+    "cleanups always run" guarantee on faith.
+    """
+
+    def setUp(self):
+        fd, self._tmp = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        SqlStore(self._tmp).close()  # migrate, then release
+        self.addCleanup(os.remove, self._tmp)
+
+    def _store(self):
+        return self._track_store(SqlStore(self._tmp))
+
+    def _new_tracked_store(self):
+        return self._store()
+
+    def test_tracked_stores_are_closed_after_a_successful_test(self):
+        stores = [self._new_tracked_store() for _ in range(3)]
+        for s in stores:
+            self.assertFalse(s._closed)
+        self.doCleanups()
+        for s in stores:
+            self.assertTrue(s._closed)
+
+    def test_tracked_stores_are_still_closed_when_the_body_raises(self):
+        stores = [self._new_tracked_store() for _ in range(3)]
+
+        def racer():
+            raise RuntimeError("injected racer failure")
+
+        with self.assertRaises(RuntimeError):
+            racer()
+        # The injected failure propagated (proving it was never
+        # swallowed) — now prove doCleanups() STILL closes every tracked
+        # store, exactly as unittest will do automatically once this
+        # method itself returns/raises.
+        self.doCleanups()
+        for s in stores:
+            self.assertTrue(s._closed)
+
+    def test_a_racer_that_opens_a_store_then_raises_still_closes_it(self):
+        # Closer to the real shape this fix protects: a store is opened
+        # (mirroring _create_race/_update_race/_retire_race's
+        # racer_api = ApiService(self._store())), THEN the operation that
+        # uses it raises — the store must already be tracked BEFORE that
+        # failure, not after, since there is no "after" for a raise.
+        store = self._new_tracked_store()
+        api = ApiService(store)
+
+        def racer():
+            api.set_contact_destination("official:missing", "email", "x")
+            raise RuntimeError("injected failure after using the store")
+
+        with self.assertRaises(RuntimeError):
+            racer()
+        self.doCleanups()
+        self.assertTrue(store._closed)
+
+    def test_multiple_racers_all_close_even_when_one_of_them_raises(self):
+        # The exact _create_race/_update_race/_retire_race shape: TWO
+        # stores open per test (primary + racer) — one succeeds, the
+        # other's operation raises. Neither store's close may be skipped
+        # because of the other's failure.
+        primary = self._new_tracked_store()
+        racer_store = self._new_tracked_store()
+        ApiService(primary).create_official("Race Official", actor_id="seed")
+
+        def racer():
+            ApiService(racer_store).set_contact_destination(
+                "official:missing", "email", "x")
+            raise RuntimeError("injected racer failure")
+
+        with self.assertRaises(RuntimeError):
+            racer()
+        self.doCleanups()
+        self.assertTrue(primary._closed)
+        self.assertTrue(racer_store._closed)
 
 
 if __name__ == "__main__":

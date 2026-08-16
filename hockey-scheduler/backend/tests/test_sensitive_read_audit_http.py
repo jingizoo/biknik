@@ -469,7 +469,15 @@ class PostgresSensitiveReadHttpTest(SensitiveReadHttpContract, unittest.TestCase
 
     def setUp(self):
         from hockey_scheduler.store import SqlStore
-        SqlStore(os.environ["TEST_DATABASE_URL"]).clear_all_data()
+        # Tracked and closed via addCleanup (#426 round-3 review finding
+        # 2) — this one-off schema-reset connection used to be a bare
+        # `SqlStore(...)` with no `.close()`, leaking one connection per
+        # test. addCleanup runs regardless of what setUp/the test/
+        # tearDown do afterward, so it closes even if super().setUp()
+        # below raises.
+        store = SqlStore(os.environ["TEST_DATABASE_URL"])
+        self.addCleanup(store.close)
+        store.clear_all_data()
         super().setUp()
 
 
