@@ -42,21 +42,68 @@ Decisions this module encodes (owner ruling on #212, 2026-08-09, and #124):
   their OWN data (or a guardian's to a linked junior's) is subject-scoped
   self-service — #275's consent/provenance surface — not a role-wide grant,
   and deliberately absent from this role-keyed table.
+
+PRINCIPALS (#426 review finding 1 — retired the transitional
+``OPERATOR_BOUNDARY`` shape). Every HTTP-originated call now propagates the
+real, session-resolved :class:`Role` (``web/server.py``'s ``_resolve_role()``
+never returns a live request with ``role=None`` — a missing/invalid session
+is an ``err``, resolved to an HTTP status BEFORE any facade call, never to a
+silent default-allow principal). Two non-:class:`Role` principals remain,
+both fail-closed by construction:
+
+* :data:`NO_PRINCIPAL` — the label recorded when a caller passes no role
+  information at all (or an unparseable one). Resolves to ``NONE`` on every
+  category, same as any other unrecognised principal — there is no more
+  "missing principal defaults to RAW on CONTACT_DESTINATION" carve-out. Kept
+  distinct from ``"unknown"`` (an unparseable string) purely so an audit row
+  reads WHY nothing was resolved, never to grant anything.
+* :data:`SYSTEM_PRINCIPAL` — a real, explicit, NON-Role sentinel for
+  legitimate background/worker code that is not acting on behalf of any
+  signed-in user (the notification delivery worker resolving a stored
+  contact destination to actually send a message, #426 review finding 2). A
+  Python object identity, never a string — so no HTTP-supplied value (a
+  header, a body field, a role claim) can ever equal it; only trusted
+  first-party call sites that import this module and pass the sentinel
+  object itself can invoke it. Granted RAW on exactly
+  :data:`SYSTEM_ATTESTED_CATEGORIES`, checked in :func:`access_level` the
+  same fail-closed way every other principal is.
 """
 
+import hashlib
+import re
+import uuid
 from enum import IntEnum
 
 from ..domain import Role
 from ..domain.privacy import SensitiveFieldCategory as _C
 
-#: Transitional principal label (#124) for facade calls that arrive through a
-#: server route which already enforced the operator gate (``_operator_only`` /
-#: ``authorize()`` in ``web/server.py``) but does not yet propagate the acting
-#: account into the facade. Those call sites keep working — and keep being
-#: AUDITED, attributed to this marker — until the post-#159 wiring passes the
-#: real actor through. NOT a :class:`Role`; never grants anything outside
-#: :func:`boundary_attested_categories`.
-OPERATOR_BOUNDARY = "operator_boundary"
+#: Recorded when a caller supplied no role information at all (``None``) —
+#: fails closed exactly like an unparseable claim; see the module docstring's
+#: PRINCIPALS section. NOT a :class:`Role` and never looked up in `_POLICY`.
+NO_PRINCIPAL = "no_principal"
+
+
+class _SystemPrincipal:
+    """Sentinel type for :data:`SYSTEM_PRINCIPAL` — identity-only, never
+    stringified for comparison, so nothing caller-supplied can ever equal
+    it. A single module-level instance exists; see the module docstring."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:
+        return "SYSTEM_PRINCIPAL"
+
+
+#: The one instance. Trusted, first-party, non-HTTP callers only (e.g.
+#: ``services/delivery.py``'s worker) — see the module docstring's
+#: PRINCIPALS section.
+SYSTEM_PRINCIPAL = _SystemPrincipal()
+
+#: Categories :data:`SYSTEM_PRINCIPAL` may read RAW. Deliberately narrow and
+#: separately named from :func:`raw_categories` (which is keyed by
+#: :class:`Role`) — a future sensitive category must extend this set on
+#: purpose, in review, not inherit it implicitly.
+SYSTEM_ATTESTED_CATEGORIES = frozenset({_C.CONTACT_DESTINATION})
 
 
 class AccessLevel(IntEnum):
@@ -101,9 +148,18 @@ _POLICY = {
 
 def access_level(role, category) -> AccessLevel:
     """The fidelity ``role`` may read ``category`` at. Fail-closed: any
-    role or category not explicitly granted in ``_POLICY`` — including
-    ``None``, an unknown role string, or a brand-new category — is
-    ``NONE``."""
+    role or category not explicitly granted — including ``None``, an
+    unknown role string, ``NO_PRINCIPAL``, or a brand-new category — is
+    ``NONE``.
+
+    :data:`SYSTEM_PRINCIPAL` is the one non-:class:`Role` key with any
+    grant at all (:data:`SYSTEM_ATTESTED_CATEGORIES`, RAW) — checked here
+    by identity (``is``), never by value, so nothing derived from caller
+    input can ever match it (see the module docstring's PRINCIPALS
+    section)."""
+    if role is SYSTEM_PRINCIPAL:
+        return (AccessLevel.RAW if category in SYSTEM_ATTESTED_CATEGORIES
+                else AccessLevel.NONE)
     return _POLICY.get(role, {}).get(category, AccessLevel.NONE)
 
 
@@ -124,15 +180,64 @@ def raw_categories(role) -> frozenset:
                      if lvl >= AccessLevel.RAW)
 
 
-def boundary_attested_categories() -> frozenset:
-    """The categories the transitional :data:`OPERATOR_BOUNDARY` principal
-    may read RAW.
+# -- correlation-id / subject-id sanitization (#426 review finding 3) -------
+#
+# Shared here (not on ApiService) so every writer of a DataAccessLog row —
+# the HTTP-facing facade AND trusted non-HTTP callers like the delivery
+# worker (services/delivery.py), which cannot import api/service.py without
+# a circular import — sanitizes caller-controlled metadata through the SAME
+# one function, never two copies that could drift.
 
-    Exactly the sensitive surface whose operator-only server gate exists
-    today: the ContactDestination registry (``/api/notifications/contacts``,
-    gated by ``_operator_only`` → MANAGE_SCHEDULE before the facade is
-    called). Kept to this ONE category on purpose — a future sensitive
-    surface must arrive with real actor propagation, not ride the legacy
-    no-actor call shape; the pinning test fails if this set ever grows.
+#: Bounded, opaque correlation-id shape. Anything that doesn't match — an
+#: email, a token, a newline, anything oversized — is never persisted
+#: verbatim; see safe_request_id.
+_REQUEST_ID_RE = re.compile(r"^req_[A-Za-z0-9_-]{1,80}$")
+
+#: Bounded, opaque subject-id shape. Ordinary recipient refs
+#: (player:<id>, official:<id>, scheduler, *, ...) are already this shape
+#: — ``*`` included: the collection-level "nothing disclosed" sentinel every
+#: refusal and every empty-registry read already uses is a deliberate,
+#: fixed, one-character convention (never raw caller input), not something
+#: this boundary needs to protect against; see canonical_subject_id.
+_SUBJECT_ID_RE = re.compile(r"^[A-Za-z0-9_:.*-]{1,200}$")
+
+
+def mint_request_id() -> str:
+    """A fresh, trusted correlation id for one sensitive-read call."""
+    return f"req_{uuid.uuid4().hex}"
+
+
+def safe_request_id(candidate) -> str:
+    """A trusted, bounded, opaque correlation id.
+
+    ``candidate`` is honoured ONLY when it already looks like an opaque id
+    this module itself would mint — never because the caller asked nicely.
+    A value that doesn't match (an email or token planted AS a request_id,
+    a newline, anything oversized) is discarded and a fresh one minted
+    instead, exactly as if no id had been supplied at all — so the
+    "value-free" log can never be made to persist a protected value riding
+    along disguised as a correlation id.
     """
-    return frozenset({_C.CONTACT_DESTINATION})
+    if isinstance(candidate, str) and _REQUEST_ID_RE.match(candidate):
+        return candidate
+    return mint_request_id()
+
+
+def canonical_subject_id(raw) -> str:
+    """A bounded, opaque subject identifier.
+
+    Ordinary recipient refs (``player:<id>``, ``official:<id>``,
+    ``scheduler``, ``*``, a bare team/guardian id, ...) already match the
+    safe shape and pass through unchanged. Anything that doesn't — an email
+    or token planted AS a recipient_ref, a newline, anything oversized — is
+    NEVER persisted verbatim: it is replaced with a stable, deterministic,
+    collision-resistant pseudonym derived from it, so the row still exists
+    and still groups repeat reads of the SAME (unsafe) subject together,
+    without ever copying the original string's content into the
+    "structurally value-free" log.
+    """
+    if isinstance(raw, str) and _SUBJECT_ID_RE.match(raw):
+        return raw
+    text = "" if raw is None else str(raw)
+    digest = hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+    return f"opaque:{digest[:24]}"
