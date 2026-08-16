@@ -491,12 +491,27 @@ class InMemoryStore:
             entry.id = self.next_id("daccess")
 
     def add_data_access(self, entry: DataAccessLog) -> DataAccessLog:
+        """Append one durable row and return it.
+
+        The CALLER's ``entry`` object is mutated with its real id/seq (a
+        courtesy — existing callers already read them back off the object
+        they passed in), but neither the STORED row nor the RETURNED value
+        is that same object (#426 round-2 review finding 4: "the exact
+        caller-owned DataAccessLog object" stayed mutable through the write
+        API — mutating it, or the return value, after insertion silently
+        corrupted the durable record). Three distinct objects exist once
+        this returns: the caller's ``entry``, the private copy appended to
+        ``self.data_access``, and the private copy handed back — mutating
+        any one of them can never reach either of the other two, matching
+        SQL's inherent immutability (a Python object mutated after
+        ``INSERT`` cannot retroactively change what was already written).
+        """
         with self._lock:
             self._assign_data_access_id(entry)
             self._validate_data_access(entry)
             entry.seq = self._next_data_access_seq()
-            self.data_access.append(entry)
-        return entry
+            self.data_access.append(copy.copy(entry))
+            return copy.copy(entry)
 
     def add_data_access_durable(self, entry: DataAccessLog) -> DataAccessLog:
         """Write a row that survives regardless of what an AMBIENT
@@ -507,13 +522,15 @@ class InMemoryStore:
         ``_txn_depth``/``_restore()`` instead of a real database connection.
 
         Not nested (``_txn_depth == 0``): id/seq are assigned right here,
-        exactly like ``add_data_access``. Nested: id/seq are deliberately
-        NOT assigned here (#426 round-2 review finding 1) — this entry's
-        row is queued and both are assigned at FLUSH time instead, by
+        exactly like ``add_data_access`` — including that method's own
+        caller/stored/returned detachment (#426 round-2 review finding 4).
+        Nested: id/seq are deliberately NOT assigned here (#426 round-2
+        review finding 1) — this entry's row is queued and both are
+        assigned at FLUSH time instead, by
         ``_flush_pending_durable_data_access``, once the ambient transaction
         that could still roll back has FULLY concluded. Allocating either
         one now, inside that still-open ambient transaction, is the exact
-        bug this closes: the queued row survives a rollback by construction
+        bug that closes: the queued row survives a rollback by construction
         (see below), but ``next_id()``'s counter does NOT — it rolls back
         with everything else — so an id allocated here would already be
         orphaned from the counter by the time this row is flushed, and the
@@ -524,19 +541,30 @@ class InMemoryStore:
         flush; the id-uniqueness half of that same check is there today a
         no-op (no id exists to compare yet) and is re-run in full, id
         included, at flush time.
+
+        The QUEUED row is ALSO a private detached copy, made HERE before it
+        is ever appended to ``_pending_durable_data_access`` (#426 round-2
+        review finding 4's "including durable queued rows") — so mutating
+        the caller's ``entry`` (or the value this method returns) ANY time
+        between queueing and the eventual flush can never reach the row
+        that actually gets persisted.
         """
         with self._lock:
             if self._txn_depth == 0:
                 self._assign_data_access_id(entry)
                 self._validate_data_access(entry)
                 entry.seq = self._next_data_access_seq()
-                self.data_access.append(entry)
+                self.data_access.append(copy.copy(entry))
             else:
                 self._validate_data_access(entry)
-                self._pending_durable_data_access.append(entry)
-        return entry
+                self._pending_durable_data_access.append(copy.copy(entry))
+        return copy.copy(entry)
 
     def _flush_pending_durable_data_access(self) -> None:
+        # Each queued entry is ALREADY a private copy add_data_access_durable
+        # made before queueing it (#426 round-2 review finding 4) — no
+        # caller holds a reference to it, so assigning id/seq in place and
+        # appending it directly (no further copy) is safe.
         pending, self._pending_durable_data_access = (
             self._pending_durable_data_access, [])
         for entry in pending:

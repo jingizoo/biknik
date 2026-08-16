@@ -202,6 +202,97 @@ class _StoreContract:
         self.assertEqual(still.outcome, ACCESS_ALLOWED)
         self.assertEqual(still.actor_role, "league_admin")
 
+    # -- #426 round-2 review finding 4: the WRITE api's own caller-mutable ---
+    # object identity — "InMemoryStore.add_data_access() stores and returns
+    # the exact caller-owned DataAccessLog object; changing the original
+    # object or the returned value after insertion changes the durable
+    # row". Distinct from test_listed_rows_are_immutable_snapshots above,
+    # which only pins list_data_access()'s OWN read-side copying; these
+    # pin add_data_access()/add_data_access_durable()'s WRITE-side identity
+    # instead — proven on all three backends, so the SQL-parity claim
+    # itself ("still differs from SQL") is asserted, not merely assumed.
+
+    def test_add_original_object_not_mutable_after_insert(self):
+        row = _row(self.store, 1)
+        self.store.add_data_access(row)
+        row.outcome = ACCESS_DENIED
+        row.actor_role = "tampered"
+        stored = self.store.list_data_access()[0]
+        self.assertEqual(stored.outcome, ACCESS_ALLOWED)
+        self.assertEqual(stored.actor_role, "league_admin")
+
+    def test_add_return_value_not_mutable_after_insert(self):
+        row = _row(self.store, 1)
+        returned = self.store.add_data_access(row)
+        returned.outcome = ACCESS_DENIED
+        returned.actor_role = "tampered"
+        stored = self.store.list_data_access()[0]
+        self.assertEqual(stored.outcome, ACCESS_ALLOWED)
+        self.assertEqual(stored.actor_role, "league_admin")
+
+    def test_durable_add_not_nested_original_object_not_mutable(self):
+        row = _row(self.store, 1)
+        self.store.add_data_access_durable(row)
+        row.outcome = ACCESS_DENIED
+        stored = self.store.list_data_access()[0]
+        self.assertEqual(stored.outcome, ACCESS_ALLOWED)
+
+    def test_durable_add_not_nested_return_value_not_mutable(self):
+        row = _row(self.store, 1)
+        returned = self.store.add_data_access_durable(row)
+        returned.outcome = ACCESS_DENIED
+        stored = self.store.list_data_access()[0]
+        self.assertEqual(stored.outcome, ACCESS_ALLOWED)
+
+    def test_durable_add_nested_original_object_immune_before_and_after_flush(self):
+        # Nested (queued) durable write, ambient transaction COMMITS: the
+        # original object is mutated once WHILE STILL QUEUED (before the
+        # flush its own transaction triggers on exit) and once more AFTER
+        # the flush — neither mutation may reach the persisted row.
+        row = _row(self.store, 1)
+        with self.store.transaction():
+            self.store.add_data_access_durable(row)
+            row.outcome = ACCESS_DENIED  # mutate pre-flush, still nested
+        stored = self.store.list_data_access()[0]
+        self.assertEqual(stored.outcome, ACCESS_ALLOWED)
+        row.actor_role = "tampered-post-flush"  # mutate again, post-flush
+        stored_again = self.store.list_data_access()[0]
+        self.assertEqual(stored_again.actor_role, "league_admin")
+
+    def test_durable_add_nested_return_value_immune_before_and_after_flush(self):
+        row = _row(self.store, 1)
+        with self.store.transaction():
+            returned = self.store.add_data_access_durable(row)
+            returned.outcome = ACCESS_DENIED
+        stored = self.store.list_data_access()[0]
+        self.assertEqual(stored.outcome, ACCESS_ALLOWED)
+        returned.actor_role = "tampered-post-flush"
+        stored_again = self.store.list_data_access()[0]
+        self.assertEqual(stored_again.actor_role, "league_admin")
+
+    def test_durable_add_nested_survives_rollback_immune_to_post_mutation(self):
+        # The compound case: a nested durable write inside a transaction
+        # that then ROLLS BACK still durably persists (finding 1/4's own
+        # core property), and mutating the caller's object OR the return
+        # value afterward must not reach the row that survived either.
+        class Boom(Exception):
+            pass
+
+        row = _row(self.store, 1)
+        try:
+            with self.store.transaction():
+                returned = self.store.add_data_access_durable(row)
+                raise Boom()
+        except Boom:
+            pass
+        stored = self.store.list_data_access()
+        self.assertEqual(len(stored), 1, stored)
+        self.assertEqual(stored[0].outcome, ACCESS_ALLOWED)
+        row.outcome = ACCESS_DENIED
+        returned.outcome = ACCESS_DENIED
+        stored_after = self.store.list_data_access()[0]
+        self.assertEqual(stored_after.outcome, ACCESS_ALLOWED)
+
 
 class MemoryDataAccessTest(_StoreContract, unittest.TestCase):
     def setUp(self):

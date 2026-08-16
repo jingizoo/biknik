@@ -6,6 +6,7 @@ across SQLite and Postgres: TEXT/INTEGER columns only, datetimes stored as
 ISO-8601 text, booleans as 0/1, and dict payloads as JSON text.
 """
 
+import copy
 import json
 import os
 import threading
@@ -1909,6 +1910,20 @@ class SqlStore:
         transaction that might still roll back out from under the queued
         row. Category/outcome are still checked eagerly here so a malformed
         entry fails loudly at the ORIGINAL call site.
+
+        The QUEUED row is a private detached copy (#426 round-2 review
+        finding 4), made HERE before it is ever appended to
+        ``_pending_durable_data_access``. The non-nested branch needs no
+        such copy — by the time ``_insert_data_access`` returns, the row is
+        already a committed database row, and no further Python-side
+        mutation of the object handed back can retroactively change it, the
+        SAME "differs from Memory" immunity finding 4 describes. But a
+        QUEUED row is NOT yet in the database — it is a plain Python object
+        sitting in ``_pending_durable_data_access`` until the ambient
+        transaction concludes and the flush below actually inserts it — so
+        without this copy, mutating the caller's ``entry`` (or the value
+        this method returns) at ANY point before that flush would change
+        what eventually gets persisted, even on this store.
         """
         with self._lock:
             if self._txn_depth == 0:
@@ -1916,8 +1931,8 @@ class SqlStore:
                     return self._insert_data_access(entry)
             else:
                 self._validate_data_access(entry)
-                self._pending_durable_data_access.append(entry)
-        return entry
+                self._pending_durable_data_access.append(copy.copy(entry))
+        return copy.copy(entry)
 
     def list_data_access(self, subject_type=None, subject_id=None,
                          category=None):
