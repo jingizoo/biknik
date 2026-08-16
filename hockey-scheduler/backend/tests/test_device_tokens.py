@@ -3,7 +3,7 @@ import unittest
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import NotificationChannel
+from hockey_scheduler.domain import NotificationChannel, Role
 from hockey_scheduler.full_demo import build_full_demo_store
 from hockey_scheduler.services.delivery import resolve_destination
 
@@ -83,7 +83,7 @@ class DeviceTokenTest(unittest.TestCase):
 
     # -- overview placeholder flag ----------------------------------------
     def test_overview_flags_placeholder_pushes(self):
-        ov = self.api.get_delivery_overview()
+        ov = self.api.get_delivery_overview(actor_role=Role.LEAGUE_ADMIN)
         pushes = [d for d in ov["deliveries"] if d["channel"] == "push"]
         self.assertTrue(pushes)
         self.assertTrue(all(d["placeholder"] for d in pushes))  # none registered

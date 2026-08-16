@@ -8,8 +8,9 @@ or an empty registry — and the log NEVER contains a protected value
 (proven by scanning every stored row against planted sentinels, with a
 positive control showing the sentinels ARE where they live).
 
-Server-level (HTTP) assertions belong to the post-#159 wiring follow-up;
-these tests pin the facade contract that wiring will call.
+Server-level (HTTP) assertions live in test_sensitive_read_audit_http.py
+(#426 review finding 1) — these tests pin the facade contract that wiring
+calls.
 """
 
 import json
@@ -54,9 +55,10 @@ class _Base(unittest.TestCase):
 
 
 class AllowedReadAuditTest(_Base):
-    def test_operator_boundary_list_returns_rows_and_audits_each_subject(self):
+    def test_explicit_role_list_returns_rows_and_audits_each_subject(self):
         ref = self.seed_contacts()
-        result = self.api.list_contact_destinations()  # legacy no-arg shape
+        result = self.api.list_contact_destinations(
+            actor_role=Role.LEAGUE_ADMIN, actor_user_id="user_admin")
         self.assertNotIn("error", result, result)
         self.assertEqual(len(result["contacts"]), 2)
 
@@ -69,18 +71,32 @@ class AllowedReadAuditTest(_Base):
             self.assertEqual(r.subject_type, "recipient")
             self.assertEqual(r.purpose, "list_contact_destinations")
             self.assertEqual(r.outcome, ACCESS_ALLOWED)
-            self.assertEqual(r.actor_role, vp.OPERATOR_BOUNDARY)
-            self.assertIsNone(r.actor_user_id)
+            self.assertEqual(r.actor_role, "league_admin")
+            self.assertEqual(r.actor_user_id, "user_admin")
             self.assertIsNotNone(r.at.tzinfo)
             self.assertTrue((r.request_id or "").startswith("req_"))
         # One read call = one correlation id across its rows.
         self.assertEqual(len({r.request_id for r in rows}), 1)
         self.assertEqual(len({r.id for r in rows}), 2)
 
+    def test_no_principal_no_arg_call_now_fails_closed(self):
+        # #426 review finding 1: the legacy no-arg "operator_boundary"
+        # default-allow shape is retired. A call with no principal at all
+        # now refuses exactly like any other unrecognised one, durably
+        # audited as NO_PRINCIPAL.
+        self.seed_contacts()
+        result = self.api.list_contact_destinations()
+        self.assertEqual(result["error"]["code"], "forbidden", result)
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].outcome, ACCESS_DENIED)
+        self.assertEqual(rows[0].actor_role, vp.NO_PRINCIPAL)
+        self.assertIsNone(rows[0].actor_user_id)
+
     def test_two_reads_mint_distinct_request_ids(self):
         self.seed_contacts()
-        self.api.list_contact_destinations()
-        self.api.list_contact_destinations()
+        self.api.list_contact_destinations(actor_role=Role.LEAGUE_ADMIN)
+        self.api.list_contact_destinations(actor_role=Role.LEAGUE_ADMIN)
         ids = {r.request_id for r in self.rows()}
         self.assertEqual(len(ids), 2)
 
@@ -111,7 +127,8 @@ class AllowedReadAuditTest(_Base):
         self.assertEqual(len(by_actor[("user_arena", "arena_manager")]), 2)
 
     def test_empty_registry_read_still_leaves_a_trace(self):
-        result = self.api.list_contact_destinations()
+        result = self.api.list_contact_destinations(
+            actor_role=Role.ARENA_MANAGER)
         self.assertEqual(result["contacts"], [])
         rows = self.rows()
         self.assertEqual(len(rows), 1)
@@ -123,7 +140,7 @@ class AllowedReadAuditTest(_Base):
         self.seed_contacts()
         setup_audits = len(self.store.all_setup_audit())
         roster_audits = len(self.store.audit)
-        self.api.list_contact_destinations()
+        self.api.list_contact_destinations(actor_role=Role.LEAGUE_ADMIN)
         self.assertEqual(len(self.store.all_setup_audit()), setup_audits)
         self.assertEqual(len(self.store.audit), roster_audits)
 
@@ -206,13 +223,16 @@ class FailClosedRefusalTest(_Base):
 class ValueNeverInLogTest(_Base):
     def test_no_stored_row_field_contains_a_protected_value(self):
         ref = self.seed_contacts()
-        # Exercise every emitting path: allowed list, refused list, allowed
+        # Exercise every emitting path: allowed list, refused list
+        # (explicit unauthorized role AND no principal at all), allowed
         # read-back toggle.
-        self.api.list_contact_destinations()
+        self.api.list_contact_destinations(actor_role=Role.LEAGUE_ADMIN)
         self.api.list_contact_destinations(actor_role=Role.COACH)
+        self.api.list_contact_destinations()
         cid = next(c.id for c in self.store.all_contact_destinations()
                    if c.recipient_ref == ref)
-        self.api.set_contact_destination_active(cid, False, actor_id="user_1")
+        self.api.set_contact_destination_active(
+            cid, False, actor_id="user_1", actor_role=Role.ARENA_MANAGER)
 
         rows = self.rows()
         self.assertGreaterEqual(len(rows), 4)
@@ -231,6 +251,129 @@ class ValueNeverInLogTest(_Base):
         self.assertIn(SENTINEL_PUSH, stored)
 
 
+class RequestIdSanitizationTest(_Base):
+    """#426 review finding 3: "request_id is honored verbatim; passing the
+    planted email as request_id stored that email in
+    DataAccessLog.request_id" — exact sentinel-through-persisted-column
+    proofs for ``safe_request_id`` (services/visibility_policy.py), on
+    both the ALLOWED and DENIED emission paths, plus the "one request
+    shares one id, distinct requests differ" contract the field-name-only
+    schema test alone could not have caught.
+    """
+
+    MALFORMED_REQUEST_IDS = (
+        SENTINEL_EMAIL,                       # an email planted as an id
+        SENTINEL_PUSH,                        # a token planted as an id
+        "req_line1\nline2",                   # embedded newline
+        "req_" + "a" * 200,                   # oversized (limit is 80)
+        "",                                   # empty
+        "not-even-req-shaped",                # missing the req_ prefix
+    )
+
+    def test_sentinel_request_id_never_persisted_on_an_allowed_read(self):
+        self.seed_contacts()
+        self.api.list_contact_destinations(
+            actor_role=Role.LEAGUE_ADMIN, request_id=SENTINEL_EMAIL)
+        rows = self.rows()
+        self.assertGreaterEqual(len(rows), 1)
+        for row in rows:
+            self.assertNotEqual(row.request_id, SENTINEL_EMAIL)
+            self.assertTrue(row.request_id.startswith("req_"), row.request_id)
+
+    def test_sentinel_request_id_never_persisted_on_a_denied_read(self):
+        self.seed_contacts()
+        self.api.list_contact_destinations(
+            actor_role=Role.COACH, request_id=SENTINEL_PUSH)
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertNotEqual(rows[0].request_id, SENTINEL_PUSH)
+        self.assertTrue(rows[0].request_id.startswith("req_"))
+
+    def test_every_malformed_request_id_shape_is_replaced_not_persisted(self):
+        for planted in self.MALFORMED_REQUEST_IDS:
+            with self.subTest(planted=repr(planted)[:40]):
+                store, _gid, ids = build_full_demo_store()
+                api = ApiService(store)
+                oid = ids["referee_id"]
+                api.set_contact_destination(
+                    "official:" + oid, "email", SENTINEL_EMAIL)
+                api.list_contact_destinations(
+                    actor_role=Role.LEAGUE_ADMIN, request_id=planted)
+                for row in store.list_data_access():
+                    self.assertNotEqual(row.request_id, planted)
+                    if row.request_id is not None:
+                        self.assertRegex(row.request_id, r"^req_[A-Za-z0-9_-]{1,80}$")
+
+    def test_a_validly_shaped_caller_supplied_request_id_IS_honored(self):
+        # The sanitizer is not a blanket "always mint fresh" — a value that
+        # already looks like this module's own opaque shape passes through,
+        # which is what lets ONE real request thread ONE id across several
+        # DataAccessLog rows (see the next test).
+        self.seed_contacts()
+        valid_id = "req_" + "a" * 20
+        self.api.list_contact_destinations(
+            actor_role=Role.LEAGUE_ADMIN, request_id=valid_id)
+        rows = self.rows()
+        self.assertTrue(rows, "expected at least one row")
+        for row in rows:
+            self.assertEqual(row.request_id, valid_id)
+
+    def test_one_request_shares_one_id_distinct_requests_differ(self):
+        self.seed_contacts()
+        self.api.list_contact_destinations(actor_role=Role.LEAGUE_ADMIN)
+        self.api.list_contact_destinations(actor_role=Role.ARENA_MANAGER)
+        rows = self.rows()
+        by_request = {}
+        for row in rows:
+            by_request.setdefault(row.request_id, set()).add(row.actor_role)
+        # Two distinct top-level calls -> two distinct request ids, and
+        # neither id is shared across the two different calls' rows.
+        self.assertEqual(len(by_request), 2, rows)
+        for actors in by_request.values():
+            self.assertEqual(len(actors), 1)
+
+
+class SubjectIdSanitizationTest(_Base):
+    """#426 review finding 3: "Arbitrary legacy recipient_ref is likewise
+    copied verbatim into subject_id; setting recipient and destination to
+    the same sentinel persisted it there" — exact sentinel-through-
+    persisted-column proof for ``canonical_subject_id``. A bare (non
+    ``player:``/``official:``-prefixed) ``recipient_ref`` is not rejected
+    by ``_reject_dangling_recipient`` (see its own docstring: only those
+    two structured prefixes are validated), so an arbitrary legacy value —
+    exactly the shape the review demonstrated — reaches this boundary
+    unfiltered from the write side.
+    """
+
+    def test_arbitrary_recipient_ref_subject_id_is_never_the_raw_value(self):
+        # SENTINEL_EMAIL as the recipient_ref itself (not just the
+        # destination) -- the review's own repro shape.
+        self.api.set_contact_destination(
+            SENTINEL_EMAIL, "email", "unrelated@example.invalid")
+        self.api.list_contact_destinations(actor_role=Role.LEAGUE_ADMIN)
+        rows = self.rows()
+        self.assertTrue(rows, "expected at least one row")
+        for row in rows:
+            self.assertNotEqual(row.subject_id, SENTINEL_EMAIL)
+            self.assertNotIn(SENTINEL_EMAIL, row.subject_id)
+        # Deterministic: the SAME unsafe input pseudonymises to the SAME
+        # opaque id every time, so repeat reads of the same subject still
+        # group together in a "who read this person's data" query.
+        self.api.list_contact_destinations(actor_role=Role.ARENA_MANAGER)
+        opaque_ids = {r.subject_id for r in self.rows()
+                     if r.purpose == "list_contact_destinations"}
+        matching = [i for i in opaque_ids if i.startswith("opaque:")]
+        self.assertEqual(len(matching), 1, opaque_ids)
+
+    def test_normal_recipient_ref_shape_passes_through_unchanged(self):
+        # Contrast case: a well-formed ref is NOT obscured -- the
+        # sanitizer only intervenes on what does not already look safe.
+        ref = self.seed_contacts()
+        self.api.list_contact_destinations(actor_role=Role.LEAGUE_ADMIN)
+        rows = [r for r in self.rows() if r.subject_id == ref]
+        self.assertTrue(rows, self.rows())
+
+
 class ReadBackToggleAuditTest(_Base):
     def _seed_official_contact(self):
         ref = self.seed_contacts()
@@ -240,7 +383,7 @@ class ReadBackToggleAuditTest(_Base):
     def test_toggle_readback_is_audited_with_the_actor(self):
         ref, cid = self._seed_official_contact()
         result = self.api.set_contact_destination_active(
-            cid, False, actor_id="user_ops")
+            cid, False, actor_id="user_ops", actor_role=Role.ARENA_MANAGER)
         self.assertNotIn("error", result, result)
         rows = self.rows(subject_id=ref)
         self.assertEqual(len(rows), 1)
@@ -248,7 +391,21 @@ class ReadBackToggleAuditTest(_Base):
         self.assertEqual(row.purpose, "set_contact_destination_active")
         self.assertEqual(row.outcome, ACCESS_ALLOWED)
         self.assertEqual(row.actor_user_id, "user_ops")
-        self.assertEqual(row.actor_role, vp.OPERATOR_BOUNDARY)
+        self.assertEqual(row.actor_role, "arena_manager")
+
+    def test_toggle_with_no_principal_now_fails_closed(self):
+        # #426 review finding 1: no more no-arg default-allow.
+        ref, cid = self._seed_official_contact()
+        result = self.api.set_contact_destination_active(
+            cid, False, actor_id="user_ops")
+        self.assertEqual(result["error"]["code"], "forbidden", result)
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].outcome, ACCESS_DENIED)
+        self.assertEqual(rows[0].actor_role, vp.NO_PRINCIPAL)
+        c = next(c for c in self.store.all_contact_destinations()
+                if c.id == cid)
+        self.assertTrue(c.active)  # untouched
 
     def test_toggle_refused_for_unauthorized_role_before_any_mutation(self):
         ref, cid = self._seed_official_contact()
@@ -275,7 +432,8 @@ class ReadBackToggleAuditTest(_Base):
 
     def test_not_found_toggle_leaves_no_read_row(self):
         result = self.api.set_contact_destination_active(
-            "contact_missing", False, actor_id="user_ops")
+            "contact_missing", False, actor_id="user_ops",
+            actor_role=Role.LEAGUE_ADMIN)
         self.assertEqual(result["error"]["code"], "not_found")
         self.assertEqual(self.rows(), [])
 
@@ -287,7 +445,7 @@ class ReadBackToggleAuditTest(_Base):
         cid = next(c.id for c in self.store.all_contact_destinations()
                    if c.recipient_ref == "team:team_1")
         result = self.api.set_contact_destination_active(
-            cid, False, actor_id="user_ops")
+            cid, False, actor_id="user_ops", actor_role=Role.LEAGUE_ADMIN)
         self.assertEqual(result["error"]["code"], "validation_error")
         self.assertEqual(self.rows(), [])
 
@@ -316,7 +474,9 @@ class SqliteFacadeDurabilityTest(unittest.TestCase):
         api = ApiService(store)
         api.set_contact_destination("scheduler", "email", SENTINEL_EMAIL)
         self.assertNotIn(
-            "error", api.list_contact_destinations(), "boundary read")
+            "error",
+            api.list_contact_destinations(actor_role=Role.LEAGUE_ADMIN),
+            "allowed read")
         refusal = api.list_contact_destinations(
             actor_role=Role.COACH, actor_user_id="user_coach")
         self.assertEqual(refusal["error"]["code"], "forbidden")
@@ -345,7 +505,9 @@ class PostgresFacadeDurabilityTest(unittest.TestCase):
         api = ApiService(store)
         api.set_contact_destination("scheduler", "email", SENTINEL_EMAIL)
         self.assertNotIn(
-            "error", api.list_contact_destinations(), "boundary read")
+            "error",
+            api.list_contact_destinations(actor_role=Role.LEAGUE_ADMIN),
+            "allowed read")
         refusal = api.list_contact_destinations(actor_role=Role.COACH)
         self.assertEqual(refusal["error"]["code"], "forbidden")
         store.close()

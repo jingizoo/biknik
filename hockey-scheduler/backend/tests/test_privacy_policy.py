@@ -108,8 +108,11 @@ class PolicyMatrixTest(unittest.TestCase):
 
     # -- fail-closed defaults ----------------------------------------------
     def test_unknown_or_missing_principal_gets_nothing(self):
+        # #426 review finding 1: OPERATOR_BOUNDARY is retired — a missing
+        # principal (None) now fails closed exactly like any other
+        # unrecognised one, with no special-case grant anywhere.
         for principal in (None, "public", "root", "", "LEAGUE_ADMIN",
-                          vp.OPERATOR_BOUNDARY):
+                          vp.NO_PRINCIPAL):
             for category in C:
                 self.assertEqual(vp.access_level(principal, category), L.NONE,
                                  f"{principal!r} x {category.value}")
@@ -122,16 +125,38 @@ class PolicyMatrixTest(unittest.TestCase):
             vp.access_level(Role.LEAGUE_ADMIN, "future_category"), L.NONE)
         self.assertFalse(vp.may_read_raw(Role.LEAGUE_ADMIN, "future_category"))
 
-    def test_boundary_attested_set_is_exactly_contact_destination(self):
-        # The transitional no-actor call shape may never quietly widen to a
-        # new category: a future sensitive surface must ship with real actor
-        # propagation instead of riding the legacy shape.
-        self.assertEqual(vp.boundary_attested_categories(),
+    def test_no_principal_is_not_a_role(self):
+        self.assertEqual(vp.NO_PRINCIPAL, "no_principal")
+        self.assertNotIn(vp.NO_PRINCIPAL, [r.value for r in Role])
+
+    # -- SYSTEM_PRINCIPAL (#426 review finding 2) ---------------------------
+    def test_system_principal_is_raw_on_exactly_contact_destination(self):
+        for category in C:
+            expected = (L.RAW if category == C.CONTACT_DESTINATION
+                       else L.NONE)
+            self.assertEqual(
+                vp.access_level(vp.SYSTEM_PRINCIPAL, category), expected,
+                category.value)
+        self.assertTrue(
+            vp.may_read_raw(vp.SYSTEM_PRINCIPAL, C.CONTACT_DESTINATION))
+        self.assertEqual(vp.SYSTEM_ATTESTED_CATEGORIES,
                          frozenset({C.CONTACT_DESTINATION}))
 
-    def test_operator_boundary_is_not_a_role(self):
-        self.assertEqual(vp.OPERATOR_BOUNDARY, "operator_boundary")
-        self.assertNotIn(vp.OPERATOR_BOUNDARY, [r.value for r in Role])
+    def test_system_principal_is_not_reachable_by_value(self):
+        # Identity-only sentinel: no string an HTTP caller could ever
+        # supply (the label it prints as, its class name, a plain "system"
+        # claim) may substitute for the real object and gain SYSTEM's
+        # grant. NOTE: a role's OWN string value (e.g. "league_admin") is
+        # a DIFFERENT, legitimate case — Role is a (str, Enum), so it
+        # correctly resolves to that role's OWN grant, not SYSTEM's; that
+        # is exercised by test_matrix_is_exhaustive_and_exact, not here.
+        for spoof in ("system", "SYSTEM_PRINCIPAL", "SYSTEM", None, ""):
+            self.assertFalse(
+                vp.may_read_raw(spoof, C.CONTACT_DESTINATION), repr(spoof))
+
+    def test_system_principal_is_a_singleton_not_a_role(self):
+        self.assertNotIsInstance(vp.SYSTEM_PRINCIPAL, Role)
+        self.assertNotIn(vp.SYSTEM_PRINCIPAL, list(Role))
 
 
 class VocabularyTest(unittest.TestCase):
@@ -156,12 +181,14 @@ class VocabularyTest(unittest.TestCase):
     def test_data_access_log_is_structurally_value_free(self):
         # The schema itself is the guarantee that no protected value can be
         # copied into the log: exactly these fields, and none that could
-        # carry a stored value (no destination/value/detail field).
+        # carry a stored value (no destination/value/detail field). `seq`
+        # (#426 review finding 5) is the persisted ordering key, always
+        # store-assigned — never a value the caller supplies.
         from dataclasses import fields
         self.assertEqual(
             [f.name for f in fields(DataAccessLog)],
             ["id", "category", "subject_type", "subject_id", "purpose", "at",
-             "actor_user_id", "actor_role", "outcome", "request_id"])
+             "actor_user_id", "actor_role", "outcome", "request_id", "seq"])
 
 
 if __name__ == "__main__":

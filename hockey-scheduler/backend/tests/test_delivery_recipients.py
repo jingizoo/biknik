@@ -9,6 +9,7 @@ from hockey_scheduler.domain import (
     NotificationAudience,
     NotificationChannel,
     NotificationKind,
+    Role,
 )
 from hockey_scheduler.domain.errors import ValidationError
 from hockey_scheduler.full_demo import build_full_demo_store
@@ -79,7 +80,7 @@ class DeliveryRecipientTest(unittest.TestCase):
                 self.assertTrue(d.destination.startswith("push-token:"))
 
     def test_overview_row_exposes_recipient_and_destination(self):
-        ov = self.api.get_delivery_overview()
+        ov = self.api.get_delivery_overview(actor_role=Role.LEAGUE_ADMIN)
         self.assertTrue(all("recipient_ref" in row and "destination" in row
                             for row in ov["deliveries"]))
 

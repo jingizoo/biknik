@@ -23,6 +23,7 @@ from hockey_scheduler.domain import (
     DataAccessLog,
     SensitiveFieldCategory,
 )
+from hockey_scheduler.domain.errors import IntegrityConflictError, ValidationError
 from hockey_scheduler.store import InMemoryStore, SqlStore
 
 C = SensitiveFieldCategory
@@ -125,6 +126,82 @@ class _StoreContract:
             self.store.clear_all_data()
         self.assertEqual(self.store.list_data_access(), [])
 
+    # -- #426 review finding 5: ordering / integrity / immutability --------
+    def test_chronological_order_survives_a_double_digit_row_count(self):
+        # The bug this proves fixed: SQL's OLD `ORDER BY id` sorted the
+        # TEXTUAL "daccess_<n>" label lexicographically, so row 10 sorted
+        # before row 2. `seq` is a real integer, assigned in insertion
+        # order, so >9 rows must list back in the SAME order they were
+        # inserted regardless of backend.
+        ids = []
+        for n in range(1, 12):  # 11 rows: crosses the 9->10 digit boundary
+            row = _row(self.store, n, subject_id=f"official:o{n}")
+            self.store.add_data_access(row)
+            ids.append(row.id)
+        listed = [r.id for r in self.store.list_data_access()]
+        self.assertEqual(listed, ids)
+        seqs = [r.seq for r in self.store.list_data_access()]
+        self.assertEqual(seqs, sorted(seqs))
+        self.assertEqual(len(set(seqs)), len(seqs))  # no collisions
+
+    def test_seq_is_stable_across_a_restart(self):
+        # Chronological order must survive a close/reopen, not merely hold
+        # for the life of one open connection/process.
+        for n in range(1, 4):
+            self.store.add_data_access(
+                _row(self.store, n, subject_id=f"official:o{n}"))
+        before = [(r.id, r.seq) for r in self.store.list_data_access()]
+        reopened = self._reopen_same_backend()
+        if reopened is None:
+            self.skipTest("no reopen for this backend")
+        try:
+            after = [(r.id, r.seq) for r in reopened.list_data_access()]
+        finally:
+            if reopened is not self.store:
+                reopened.close()
+        self.assertEqual(before, after)
+
+    def _reopen_same_backend(self):
+        return None  # overridden by SQL subclasses; Memory has no restart
+
+    def test_duplicate_id_is_refused_not_silently_accepted(self):
+        first = _row(self.store, 1)
+        self.store.add_data_access(first)
+        dup = _row(self.store, 2)
+        dup.id = first.id  # same id, otherwise distinct content
+        with self.assertRaises(IntegrityConflictError):
+            self.store.add_data_access(dup)
+        # The rejected duplicate left no trace and did not corrupt the
+        # original row.
+        self.assertEqual(len(self.store.list_data_access()), 1)
+        self.assertEqual(self.store.list_data_access()[0], first)
+
+    def test_invalid_outcome_is_refused(self):
+        row = _row(self.store, 1)
+        row.outcome = "maybe"
+        with self.assertRaises((ValidationError, IntegrityConflictError)):
+            self.store.add_data_access(row)
+        self.assertEqual(self.store.list_data_access(), [])
+
+    def test_invalid_category_is_refused(self):
+        row = _row(self.store, 1)
+        row.category = "ssn"  # not in SensitiveFieldCategory
+        with self.assertRaises((ValidationError, IntegrityConflictError)):
+            self.store.add_data_access(row)
+        self.assertEqual(self.store.list_data_access(), [])
+
+    def test_listed_rows_are_immutable_snapshots(self):
+        # #426 review finding 5: "Memory also returns live mutable audit
+        # objects... unlike SQL" — mutating a row a caller received back
+        # must never corrupt the durable record.
+        self.store.add_data_access(_row(self.store, 1))
+        got = self.store.list_data_access()[0]
+        got.outcome = ACCESS_DENIED
+        got.actor_role = "tampered"
+        still = self.store.list_data_access()[0]
+        self.assertEqual(still.outcome, ACCESS_ALLOWED)
+        self.assertEqual(still.actor_role, "league_admin")
+
 
 class MemoryDataAccessTest(_StoreContract, unittest.TestCase):
     def setUp(self):
@@ -140,6 +217,9 @@ class SqliteDataAccessTest(_StoreContract, unittest.TestCase):
     def tearDown(self):
         self.store.close()
         os.remove(self._tmp)
+
+    def _reopen_same_backend(self):
+        return SqlStore(self._tmp)
 
     def test_rows_survive_reopen(self):
         row = _row(self.store, 1)
@@ -182,6 +262,9 @@ class PostgresDataAccessTest(_StoreContract, unittest.TestCase):
 
     def tearDown(self):
         self.store.close()
+
+    def _reopen_same_backend(self):
+        return SqlStore(self.url)
 
     def test_rows_survive_reopen(self):
         row = _row(self.store, 1)
