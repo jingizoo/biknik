@@ -35,6 +35,27 @@ inventing a new mechanism). Every caller that constructs a
 ``DataAccessLog`` leaves ``seq=None``; the STORE assigns the real value on
 ``add_data_access``/``add_data_access_durable`` and it is never
 caller-supplied, so it cannot be spoofed to reorder history.
+
+DURABLE ID ALLOCATION (#426 round-2 review finding 1). ``id`` is, for the
+SAME reason, ALSO store-assigned rather than caller-precomputed — every
+caller leaves ``id=None`` (unless it deliberately wants to force a specific
+value, e.g. to test the uniqueness constraint directly at the store
+boundary) exactly like ``seq``. The bug this closes: the old contract had
+every caller allocate its OWN id up front via ``store.next_id("daccess")``
+before ever reaching ``add_data_access_durable`` — but that allocation ran
+INSIDE whatever ambient transaction the caller happened to be nested in,
+and rolled back with it if that transaction later failed, even though the
+QUEUED durable row (deliberately excluded from rollback, see
+``add_data_access_durable``'s own docstring) survived carrying the
+now-orphaned id. The counter and the row it named then permanently
+disagreed: the next allocation handed out the SAME id again and collided
+with the durable row already sitting there, turning one ordinary rollback
+into a standing denial-of-audit for every sensitive read that followed.
+Deferring id allocation to the SAME moment ``seq`` is already allocated —
+immediately for a non-nested write, at FLUSH time (outside any transaction
+that could roll back) for a nested durable write — closes it structurally:
+an id can never be handed out by a counter state a rollback is about to
+erase.
 """
 
 from dataclasses import dataclass
@@ -107,7 +128,6 @@ class DataAccessLog:
     module docstring.
     """
 
-    id: str
     category: SensitiveFieldCategory
     subject_type: str
     subject_id: str
@@ -117,6 +137,14 @@ class DataAccessLog:
     actor_role: Optional[str] = None
     outcome: str = ACCESS_ALLOWED
     request_id: Optional[str] = None
+    # Durable row id (#426 round-2 review finding 1) — see the module
+    # docstring's DURABLE ID ALLOCATION section. Always store-assigned at the
+    # SAME moment `seq` is (immediately, or at flush time for a queued
+    # durable write); a caller leaves this None unless it deliberately wants
+    # to force a specific value (e.g. to exercise the uniqueness check
+    # directly at the store boundary) or is the store's own row-hydration
+    # code reconstructing an already-persisted row.
+    id: Optional[str] = None
     # Persisted monotonic ordering key (#426 review finding 5) — see the
     # module docstring's ORDERING section. Always store-assigned; a caller
     # never sets this (constructing one with an explicit seq is only for the

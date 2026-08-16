@@ -940,13 +940,19 @@ class SqlStore:
         """Insert every queued durable row, each in its OWN fresh commit
         (#426 review finding 4) — swapped out first so a flush triggered
         from inside this very flush's nested transaction() calls can never
-        re-process the same rows."""
+        re-process the same rows.
+
+        Routed through ``_insert_data_access`` (#426 round-2 review
+        finding 1), the SAME id/seq-allocating insert path every other
+        write uses — so a queued row's id is allocated HERE, in this fresh,
+        independent, already-clean-of-any-rollback transaction, never in
+        the (possibly doomed) ambient transaction that queued it.
+        """
         pending, self._pending_durable_data_access = (
             self._pending_durable_data_access, [])
         for entry in pending:
             with self.transaction():
-                entry.seq = self._next_data_access_seq()
-                self._insert(entry)
+                self._insert_data_access(entry)
 
     def _enrich_jersey_conflict(self, exc) -> None:
         """Add the conflicting player to a rolled-back jersey conflict (#292).
@@ -1837,10 +1843,25 @@ class SqlStore:
                 f"Unknown DataAccessLog outcome {entry.outcome!r}.")
 
     def _insert_data_access(self, entry) -> "DataAccessLog":
-        """Validate, assign the persisted ordering key, and insert — the ONE
-        code path both ``add_data_access`` and the durable-write flush
-        (below) fall through to, so neither can skip a check the other
-        applies."""
+        """Assign the id (if the caller left it unset), validate, assign the
+        persisted ordering key, and insert — the ONE code path
+        ``add_data_access``, ``add_data_access_durable``'s non-nested branch,
+        AND the durable-write flush (below) all fall through to, so none of
+        the three can skip a check or an allocation the others apply.
+
+        The id assignment (#426 round-2 review finding 1) happens HERE,
+        immediately before insert, in every one of those three call
+        contexts — never earlier, in particular never in
+        ``add_data_access_durable``'s NESTED branch, which queues the entry
+        and defers reaching this method at all until flush time, once the
+        ambient transaction that could still roll back has FULLY concluded.
+        See ``domain/privacy.py``'s DURABLE ID ALLOCATION section for why:
+        an id allocated any earlier could be handed out by a ``counters``
+        row this same still-open ambient transaction later rolls back,
+        orphaning it from the durable row it named.
+        """
+        if entry.id is None:
+            entry.id = self.next_id("daccess")
         self._validate_data_access(entry)
         entry.seq = self._next_data_access_seq()
         return self._insert(entry)
@@ -1879,14 +1900,22 @@ class SqlStore:
         alternative to a second physical connection — the same shape as
         ``_dependent_conflict_resolver``'s existing "invoked only from the
         OUTERMOST transaction()'s post-conclusion handler" contract.
+
+        The id (like ``seq``) is deliberately NOT assigned in the nested
+        branch (#426 round-2 review finding 1) — ``_insert_data_access``
+        (called from the non-nested branch, and again from the flush below)
+        is the ONLY place either is allocated, always immediately before
+        the actual insert, so neither can ever be allocated inside a
+        transaction that might still roll back out from under the queued
+        row. Category/outcome are still checked eagerly here so a malformed
+        entry fails loudly at the ORIGINAL call site.
         """
         with self._lock:
-            self._validate_data_access(entry)
             if self._txn_depth == 0:
                 with self.transaction():
-                    entry.seq = self._next_data_access_seq()
-                    self._insert(entry)
+                    return self._insert_data_access(entry)
             else:
+                self._validate_data_access(entry)
                 self._pending_durable_data_access.append(entry)
         return entry
 

@@ -11,6 +11,17 @@ Two separate properties, two separate test classes:
   failure left zero denial rows"). Proven by literally nesting a facade
   refusal inside a transaction() this test then forces to raise.
 
+  The SAME class also carries #426 ROUND-2 review finding 1's own
+  regression coverage: a durable row surviving a rollback is not enough
+  on its own — the id/seq COUNTER that named it must agree with it
+  afterward, or the very next sensitive read (allowed or denied) collides
+  with the row that just survived. Exact reviewer repro: nested Coach
+  denial -> forced outer rollback -> durable row exists -> the next read
+  hits ``unique_violation`` instead of its normal result. Covered here:
+  single and multiple nested denials, both rollback and commit, a
+  subsequent ALLOWED read and a subsequent DENIED read, and (SQL backends)
+  a close/reopen between the rollback and the next read.
+
 * ``ToggleRaceTest`` (SQLite file-backed + PostgreSQL, TWO real
   connections): a ``set_contact_destination`` upsert racing
   ``set_contact_destination_active``'s fetch-mutate-audit window must never
@@ -32,7 +43,7 @@ import unittest
 from helpers import BACKEND  # noqa: F401
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import ACCESS_DENIED, Role
+from hockey_scheduler.domain import ACCESS_ALLOWED, ACCESS_DENIED, Role
 from hockey_scheduler.full_demo import build_full_demo_store
 from hockey_scheduler.store import InMemoryStore, SqlStore
 
@@ -108,6 +119,127 @@ class _DurableDenialContract:
             pass
         self.assertEqual(self.store.list_data_access(), [])
 
+    # -- #426 round-2 review finding 1: id/seq must survive a rollback ------
+    # atomically WITH the row they name, or the counter and the durable row
+    # it produced disagree and the NEXT allocation collides with it.
+
+    def _reopen_same_backend(self):
+        return None  # overridden by SQL subclasses; Memory has no restart
+
+    @staticmethod
+    def _assert_all_unique_and_ordered(rows):
+        ids = [r.id for r in rows]
+        seqs = [r.seq for r in rows]
+        assert len(set(ids)) == len(rows), f"id collision: {ids!r}"
+        assert len(set(seqs)) == len(rows), f"seq collision: {seqs!r}"
+        assert seqs == sorted(seqs), f"seq not increasing: {seqs!r}"
+
+    def test_next_allowed_read_gets_a_unique_id_after_a_forced_rollback(self):
+        # Exact reviewer repro: nested Coach denial -> forced outer
+        # rollback -> durable row exists -> the NEXT read (here: an
+        # ALLOWED League Admin read) must still succeed, not hit
+        # unique_violation.
+        try:
+            with self.store.transaction():
+                self.api.list_contact_destinations(actor_role=Role.COACH)
+                raise Boom("outer unit fails after the nested denial")
+        except Boom:
+            pass
+        self.assertEqual(len(self.store.list_data_access()), 1)
+
+        result = self.api.list_contact_destinations(
+            actor_role=Role.LEAGUE_ADMIN, actor_user_id="user_admin")
+        self.assertNotIn("error", result, result)
+
+        rows = self.store.list_data_access()
+        self.assertEqual(len(rows), 2, rows)
+        self._assert_all_unique_and_ordered(rows)
+        self.assertEqual(rows[0].outcome, ACCESS_DENIED)
+        self.assertEqual(rows[1].outcome, ACCESS_ALLOWED)
+
+    def test_next_denied_read_gets_a_unique_id_after_a_forced_rollback(self):
+        # Same shape, but the NEXT read is ALSO a denial (a Viewer, not a
+        # League Admin) — proving denied-after-denied-after-rollback works,
+        # not merely denied-after-allowed.
+        try:
+            with self.store.transaction():
+                self.api.list_contact_destinations(actor_role=Role.COACH)
+                raise Boom("outer unit fails after the nested denial")
+        except Boom:
+            pass
+        result = self.api.list_contact_destinations(actor_role=Role.VIEWER)
+        self.assertEqual(result["error"]["code"], "forbidden", result)
+
+        rows = self.store.list_data_access()
+        self.assertEqual(len(rows), 2, rows)
+        self._assert_all_unique_and_ordered(rows)
+        self.assertEqual([r.outcome for r in rows],
+                         [ACCESS_DENIED, ACCESS_DENIED])
+
+    def test_multiple_nested_denials_then_rollback_all_get_unique_ids(self):
+        # MULTIPLE nested denials queued in the SAME outer transaction that
+        # then rolls back: every queued row must get a unique id/seq at
+        # flush time, and a SUBSEQUENT read must not collide with any of
+        # them either.
+        try:
+            with self.store.transaction():
+                self.api.list_contact_destinations(actor_role=Role.COACH)
+                self.api.list_contact_destinations(actor_role=Role.VIEWER)
+                self.api.get_delivery_overview(actor_role=Role.COACH)
+                raise Boom("outer unit fails after three nested denials")
+        except Boom:
+            pass
+        rows = self.store.list_data_access()
+        self.assertEqual(len(rows), 3, rows)
+        self._assert_all_unique_and_ordered(rows)
+        self.assertTrue(all(r.outcome == ACCESS_DENIED for r in rows), rows)
+
+        result = self.api.list_contact_destinations(
+            actor_role=Role.LEAGUE_ADMIN, actor_user_id="user_admin")
+        self.assertNotIn("error", result, result)
+        rows2 = self.store.list_data_access()
+        self.assertEqual(len(rows2), 4, rows2)
+        self._assert_all_unique_and_ordered(rows2)
+
+    def test_nested_denial_that_actually_commits_then_next_read_unique(self):
+        # Parity check: the SAME nested-denial-then-subsequent-read shape,
+        # but the outer transaction COMMITS instead of rolling back —
+        # proving the fix does not merely paper over the rollback path
+        # while relying on some accident of the ordinary commit path.
+        with self.store.transaction():
+            self.api.list_contact_destinations(actor_role=Role.COACH)
+        result = self.api.list_contact_destinations(
+            actor_role=Role.LEAGUE_ADMIN, actor_user_id="user_admin")
+        self.assertNotIn("error", result, result)
+        rows = self.store.list_data_access()
+        self.assertEqual(len(rows), 2, rows)
+        self._assert_all_unique_and_ordered(rows)
+
+    def test_next_read_after_reopen_still_gets_a_unique_id(self):
+        # "reopen where applicable": the durable denial and the counter it
+        # must agree with both have to survive a close/reopen, not merely
+        # the life of one connection/process.
+        try:
+            with self.store.transaction():
+                self.api.list_contact_destinations(actor_role=Role.COACH)
+                raise Boom("outer unit fails after the nested denial")
+        except Boom:
+            pass
+        reopened_store = self._reopen_same_backend()
+        if reopened_store is None:
+            self.skipTest("no reopen for this backend")
+        try:
+            reopened_api = ApiService(reopened_store)
+            result = reopened_api.list_contact_destinations(
+                actor_role=Role.LEAGUE_ADMIN, actor_user_id="user_admin")
+            self.assertNotIn("error", result, result)
+            rows = reopened_store.list_data_access()
+            self.assertEqual(len(rows), 2, rows)
+            self._assert_all_unique_and_ordered(rows)
+        finally:
+            if reopened_store is not self.store:
+                reopened_store.close()
+
 
 class MemoryDurableDenialTest(_DurableDenialContract, unittest.TestCase):
     def setUp(self):
@@ -126,6 +258,9 @@ class SqliteDurableDenialTest(_DurableDenialContract, unittest.TestCase):
         self.store.close()
         os.remove(self._tmp)
 
+    def _reopen_same_backend(self):
+        return SqlStore(self._tmp)
+
 
 @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
                      "PostgreSQL suite only (TEST_DATABASE_URL not set)")
@@ -138,6 +273,9 @@ class PostgresDurableDenialTest(_DurableDenialContract, unittest.TestCase):
 
     def tearDown(self):
         self.store.close()
+
+    def _reopen_same_backend(self):
+        return SqlStore(self.url)
 
 
 # ---------------------------------------------------------------------------

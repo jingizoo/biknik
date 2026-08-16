@@ -136,8 +136,10 @@ def _audit_system_contact_read(store, clock, recipient: str, channel,
     stored = store.get_contact_destination(recipient, channel)
     if stored is None or not stored.active:
         return
+    # `id` is deliberately left unset: the store assigns it (#426 round-2
+    # review finding 1) — see domain/privacy.py's DURABLE ID ALLOCATION
+    # section.
     store.add_data_access(DataAccessLog(
-        id=store.next_id("daccess"),
         category=SensitiveFieldCategory.CONTACT_DESTINATION,
         subject_type="recipient",
         subject_id=visibility_policy.canonical_subject_id(recipient),

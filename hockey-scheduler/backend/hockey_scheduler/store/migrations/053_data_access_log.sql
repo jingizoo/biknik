@@ -41,13 +41,17 @@
 -- table has never shipped to a released main (still on the #426 draft PR),
 -- so the CREATE TABLE below is the complete, final shape rather than an
 -- ALTER TABLE follow-up.
--- Column order matches ``fields(DataAccessLog)`` exactly (id ... request_id,
--- seq LAST) — asserted by ``test_table_columns_match_the_dataclass_exactly``.
--- Functionally the mapper always names columns explicitly (never
--- ``SELECT *``), so physical order cannot break a read/write either way;
--- matching it anyway keeps the schema legible next to the dataclass.
+-- Column order matches ``fields(DataAccessLog)`` exactly (category ...
+-- request_id, THEN id, THEN seq — #426 round-2 review finding 1 moved `id`
+-- next to `seq` at the end of the dataclass, both now store-assigned at the
+-- same moment rather than caller-precomputed; see domain/privacy.py's
+-- DURABLE ID ALLOCATION section) — asserted by
+-- ``test_table_columns_match_the_dataclass_exactly``. Functionally the
+-- mapper always names columns explicitly (never ``SELECT *``), so physical
+-- order cannot break a read/write either way; matching it anyway keeps the
+-- schema legible next to the dataclass. `id` stays the PRIMARY KEY
+-- regardless of its column position.
 CREATE TABLE IF NOT EXISTS data_access_logs (
-    id TEXT PRIMARY KEY,
     category TEXT NOT NULL
         CHECK (category IN ('birthdate', 'registration_number',
                              'contact_destination', 'emergency_contact',
@@ -60,6 +64,7 @@ CREATE TABLE IF NOT EXISTS data_access_logs (
     actor_role TEXT,
     outcome TEXT NOT NULL CHECK (outcome IN ('allowed', 'denied')),
     request_id TEXT,
+    id TEXT PRIMARY KEY,
     seq INTEGER NOT NULL
 );
 

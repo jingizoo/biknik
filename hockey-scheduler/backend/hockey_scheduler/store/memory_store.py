@@ -450,7 +450,20 @@ class InMemoryStore:
         UNIQUE constraints — so a MemoryStore-backed demo/test run rejects
         exactly what a real database would, rather than silently accepting
         an invalid outcome/category or a duplicate id list.append() never
-        would have caught on its own (a plain list has no primary key)."""
+        would have caught on its own (a plain list has no primary key).
+
+        The uniqueness half is skipped while ``entry.id`` is still ``None``
+        (#426 round-2 review finding 1): a durable write nested inside an
+        ambient transaction is validated once EAGERLY, before an id has
+        been assigned (id allocation is deferred to flush time — see
+        ``add_data_access_durable``), and re-validated in full, id
+        included, once flushed. Comparing on ``id`` while it is still
+        unset would be worse than a no-op — TWO SEPARATE unassigned
+        entries queued in the same ambient transaction both carry
+        ``id=None``, and ``None == None`` is True, so an unguarded
+        comparison here would misreport the second of any two legitimate
+        nested denials as a duplicate of the first.
+        """
         cat = entry.category
         cat_value = cat.value if isinstance(cat, SensitiveFieldCategory) else cat
         if cat_value not in {c.value for c in SensitiveFieldCategory}:
@@ -459,15 +472,27 @@ class InMemoryStore:
         if entry.outcome not in VALID_OUTCOMES:
             raise ValidationError(
                 f"Unknown DataAccessLog outcome {entry.outcome!r}.")
-        if (any(r.id == entry.id for r in self.data_access)
+        if entry.id is not None and (
+                any(r.id == entry.id for r in self.data_access)
                 or any(r.id == entry.id
                        for r in self._pending_durable_data_access)):
             raise IntegrityConflictError(
                 "The change conflicts with an existing record.",
                 details={"reason": "unique_violation"})
 
+    def _assign_data_access_id(self, entry: DataAccessLog) -> None:
+        """Assign ``entry.id`` if the caller left it unset (#426 round-2
+        review finding 1). Called at the SAME moment ``entry.seq`` is
+        assigned in every path below — never earlier — so an id is never
+        handed out by a counter state an enclosing rollback could later
+        erase; see ``domain/privacy.py``'s DURABLE ID ALLOCATION section.
+        """
+        if entry.id is None:
+            entry.id = self.next_id("daccess")
+
     def add_data_access(self, entry: DataAccessLog) -> DataAccessLog:
         with self._lock:
+            self._assign_data_access_id(entry)
             self._validate_data_access(entry)
             entry.seq = self._next_data_access_seq()
             self.data_access.append(entry)
@@ -480,13 +505,34 @@ class InMemoryStore:
         method for the full rationale; this store's version is the SAME
         "failure-safe transaction lifecycle hook" shape, just against
         ``_txn_depth``/``_restore()`` instead of a real database connection.
+
+        Not nested (``_txn_depth == 0``): id/seq are assigned right here,
+        exactly like ``add_data_access``. Nested: id/seq are deliberately
+        NOT assigned here (#426 round-2 review finding 1) — this entry's
+        row is queued and both are assigned at FLUSH time instead, by
+        ``_flush_pending_durable_data_access``, once the ambient transaction
+        that could still roll back has FULLY concluded. Allocating either
+        one now, inside that still-open ambient transaction, is the exact
+        bug this closes: the queued row survives a rollback by construction
+        (see below), but ``next_id()``'s counter does NOT — it rolls back
+        with everything else — so an id allocated here would already be
+        orphaned from the counter by the time this row is flushed, and the
+        NEXT allocation would hand out the identical id again and collide
+        with the durable row already sitting there. Category/outcome are
+        still checked eagerly, below, so a malformed entry fails loudly at
+        the ORIGINAL call site rather than much later during an unrelated
+        flush; the id-uniqueness half of that same check is there today a
+        no-op (no id exists to compare yet) and is re-run in full, id
+        included, at flush time.
         """
         with self._lock:
-            self._validate_data_access(entry)
             if self._txn_depth == 0:
+                self._assign_data_access_id(entry)
+                self._validate_data_access(entry)
                 entry.seq = self._next_data_access_seq()
                 self.data_access.append(entry)
             else:
+                self._validate_data_access(entry)
                 self._pending_durable_data_access.append(entry)
         return entry
 
@@ -494,6 +540,8 @@ class InMemoryStore:
         pending, self._pending_durable_data_access = (
             self._pending_durable_data_access, [])
         for entry in pending:
+            self._assign_data_access_id(entry)
+            self._validate_data_access(entry)
             entry.seq = self._next_data_access_seq()
             self.data_access.append(entry)
 

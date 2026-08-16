@@ -5413,13 +5413,18 @@ class ApiService:
         Every subject id and the shared request id are passed through the
         canonicalization/validation boundary (#426 review finding 3) before
         they ever reach the store.
+
+        ``id`` is deliberately left unset (#426 round-2 review finding 1):
+        the STORE assigns it, at the same moment it assigns ``seq``, never
+        here — eagerly allocating it in THIS ambient transaction is exactly
+        the bug that fix closes (see ``domain/privacy.py``'s DURABLE ID
+        ALLOCATION section and ``add_data_access_durable`` on both stores).
         """
         at = self.roster.clock()
         write = (self.store.add_data_access_durable if durable
                 else self.store.add_data_access)
         for subject_type, subject_id in subjects:
             write(DataAccessLog(
-                id=self.store.next_id("daccess"),
                 category=category,
                 subject_type=subject_type,
                 subject_id=self._canonical_subject_id(subject_id),
