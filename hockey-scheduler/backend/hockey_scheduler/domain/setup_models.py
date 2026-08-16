@@ -609,12 +609,22 @@ class ActiveContext:
     binding — the context never creates one implicitly, and never stands in for
     the Program/Season-shared invariant enforced elsewhere.
 
-    **Field order is deliberately append-only.** ``league_id`` is declared LAST,
-    after ``updated_at``, rather than in hierarchy order after ``season_id``:
-    callers already construct this dataclass with four POSITIONAL arguments
-    (``ActiveContext("u", "p", "s", ts)``), so inserting a field ahead of
-    ``updated_at`` would silently reinterpret an existing caller's timestamp as
-    a League id. Read the logical hierarchy from the docstring, not from the
+    ``generation`` (#159 review findings 2+5, migration 051) is a MONOTONIC
+    counter, atomically incremented by ``ContextService.set``/``set_with_
+    league`` on EVERY commit for this user — independent of the wall clock,
+    unlike ``updated_at``, which two commits landing in the same tick can
+    share. It backfills to 0 for every pre-migration row. Consulted by
+    ``services/context_epoch.py`` alongside the EFFECTIVE resolved tuple so
+    an A -> B -> A round trip moves the epoch even when the tuple returns to
+    where it started; see that module for why the tuple alone is not enough.
+
+    **Field order is deliberately append-only.** ``league_id`` and
+    ``generation`` are declared LAST, after ``updated_at``, rather than in
+    hierarchy order after ``season_id``: callers already construct this
+    dataclass with four POSITIONAL arguments (``ActiveContext("u", "p", "s",
+    ts)``), so inserting a field ahead of ``updated_at`` would silently
+    reinterpret an existing caller's timestamp as a League id or a
+    generation. Read the logical hierarchy from the docstring, not from the
     field order.
     """
     id: str
@@ -622,6 +632,7 @@ class ActiveContext:
     season_id: Optional[str]
     updated_at: datetime
     league_id: Optional[str] = None
+    generation: int = 0
 
 
 @dataclass

@@ -69,6 +69,12 @@ async function checkViewport(browser, viewport) {
         BOOTSTRAP_ADMIN_USER: ADMIN_USER,
         BOOTSTRAP_ADMIN_PASSWORD: ADMIN_PASSWORD,
         INITIAL_SETUP_CODE: "",
+        // Required in production (#159 review finding 4): serve() now fails
+        // closed at startup without it rather than falling back to an
+        // unkeyed context-epoch hash. Test-only value, well above the
+        // 32-byte floor; never a real deployment secret.
+        HS_CONTEXT_EPOCH_SECRET:
+          "e2e-harness-context-epoch-secret-do-not-use-in-production",
       },
       stdio: ["ignore", "pipe", "pipe"],
     },

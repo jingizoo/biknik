@@ -68,6 +68,7 @@ from ..domain.errors import (
     ValidationError,
 )
 from ..store import InMemoryStore
+from .epoch_fence import EPOCH_FENCE_GLOBAL_KEY
 from .import_validator import validate_import, validate_official_availability
 from .ice_availability import (plan_ice_windows, parse_hhmm,
                                curfew_instant, WEEKDAY_NAMES)
@@ -3092,6 +3093,19 @@ class SetupService:
     @_transactional
     def assign_player_team(self, player_id: str, team_id: str,
                            actor_id: Optional[str] = None) -> Player:
+        # PR #423 (design §8.6): the epoch fence's GLOBAL exclusive hold,
+        # first (row 15 of the design's writer table) — a Player/Team
+        # reassignment can change what a Player's or Guardian's own scoped
+        # reads resolve to (context_scope walks Player.team_id), and the
+        # affected user is found only by a lookup this method doesn't even
+        # need to perform itself, so it takes the GLOBAL key rather than a
+        # per-user one (§4.2's classification rule). `@_transactional`
+        # already opened this method's transaction; when called from
+        # `_guarded_attempt` (the v2 reassignment dispatch) this simply joins
+        # that already-open, already-SERIALIZABLE transaction (reentrant, see
+        # `SqlStore.transaction`), so "same transaction as the write" holds
+        # either way.
+        self.store.epoch_fence_acquire_exclusive(EPOCH_FENCE_GLOBAL_KEY)
         # #159 r15 — row-lock the Player (not an unlocked read): update_player /
         # set_player_active / delete_player all lock this row, so without the
         # lock a concurrent profile edit or deactivation would be clobbered (or a
@@ -7863,7 +7877,13 @@ class SetupService:
         If the official has declared an overlapping UNAVAILABLE window (#88),
         the assignment is blocked unless ``override_unavailable`` is set — an
         explicit operator override, which is audited.
-        """
+
+        PR #423 (design §8.5): acquires the epoch fence's GLOBAL exclusive
+        hold first (row 13 of the design's writer table) — an assignment can
+        change what the assigned Official's own scoped reads resolve to, and
+        the affected user is found only by a lookup, so this uses the GLOBAL
+        key (§4.2's classification rule)."""
+        self.store.epoch_fence_acquire_exclusive(EPOCH_FENCE_GLOBAL_KEY)
         game = self.store.get_game(game_id)
         if game is None:
             raise NotFoundError(f"Game {game_id} not found.")
@@ -7981,7 +8001,13 @@ class SetupService:
     @_transactional
     def unassign_official(self, assignment_id: str,
                           actor_id: Optional[str] = None) -> OfficialAssignment:
-        """Remove an official assignment from a game entirely."""
+        """Remove an official assignment from a game entirely.
+
+        PR #423 (design §8.5): acquires the epoch fence's GLOBAL exclusive
+        hold first (row 14 of the design's writer table) — an unassignment is
+        an authorization WITHDRAWAL for the affected Official's own scoped
+        reads, found only by a lookup, so this uses the GLOBAL key."""
+        self.store.epoch_fence_acquire_exclusive(EPOCH_FENCE_GLOBAL_KEY)
         a = self.store.get_official_assignment(assignment_id)
         if a is None:
             raise NotFoundError(f"Assignment {assignment_id} not found.")

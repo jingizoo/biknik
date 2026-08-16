@@ -173,7 +173,10 @@ import sys
 import threading
 from contextlib import contextmanager
 
-__all__ = ["ContextSwitchGate", "DEFAULT_WAIT_TIMEOUT"]
+from .epoch_fence import EPOCH_FENCE_GLOBAL_KEY
+
+__all__ = ["ContextSwitchGate", "DEFAULT_WAIT_TIMEOUT",
+          "CONTEXT_GATE", "LIFECYCLE_GATE", "LIFECYCLE_GATE_KEY"]
 
 # Long enough that no honest read on a healthy server ever reaches it, short
 # enough that a wedged one cannot hold an operator's context switch hostage for
@@ -467,3 +470,65 @@ class ContextSwitchGate:
                                        if w.waiting),
                 "timeouts": self._timeouts,
             }
+
+
+# -- the two process-wide instances (round-N+1 relocation) ------------------
+#
+# THESE USED TO BE INSTANTIATED IN ``web/server.py``. Moved here, unchanged in
+# every other respect (same class, same construction, same objects once the
+# module has loaded — Python caches module imports, so every importer below
+# gets the SAME ``CONTEXT_GATE``/``LIFECYCLE_GATE``, never a second instance
+# that would silently stop contending with the first), because round-N+1's
+# fix for finding 1 (the Memory/SQLite "produce() already ran before the
+# discard" defect) needs writers OUTSIDE ``web/server.py`` — ``api/service.py``
+# (``_guarded_attempt``, ``assign_official``/``unassign_official``/
+# ``assign_player_team``/``create_guardian_link``/``verify_guardian_link``/
+# ``rebind_user_account_scope``/``set_user_account_active``) — to take these
+# SAME gates the way the context-switch and archive/reopen writers already do.
+# ``api/service.py`` cannot import them FROM ``web/server.py``: ``web/server.py``
+# already imports ``ApiService`` from ``api/service.py``, so the reverse
+# import would be circular. ``services/context_gate.py`` imports nothing from
+# either module (pure ``threading``, per this file's own opening docstring),
+# so it is the natural shared home — exactly how ``services/epoch_fence.py``
+# already serves as the shared home for the per-user/global KEY convention
+# both layers use.
+#
+# ONE gate per process, beside ``STATE`` and with the same lifetime — it
+# orders REQUESTS, not data, so it deliberately survives ``STATE.reset()``/
+# store swaps. See this module's own docstring above for the ordering
+# argument, the lock level, and the honest per-process scope limit.
+CONTEXT_GATE = ContextSwitchGate()
+
+# A SECOND, INDEPENDENT instance of the SAME primitive, ordering scoped reads
+# (and, as of round-N+1, every global-keyed writer — see below) against Season
+# and other installation-wide LIFECYCLE mutations instead of per-user context
+# switches. See ``web/server.py``'s historical comment (now here) for the full
+# defect/fix argument this gate exists to satisfy — repeated in brief:
+#
+# WHY A GATE, NOT A SHARED DATABASE TRANSACTION. Holding the store's own
+# process-wide lock across an unbounded dependent read stalls every OTHER
+# request touching the store and can deadlock a caller that parks a read
+# INSIDE a wrapped service call while reading the store directly on another
+# thread. A GATE holds nothing but its own lightweight condition variable, so
+# a held reader never blocks unrelated store access.
+#
+# WHY GLOBAL, NOT PER-USER LIKE ``CONTEXT_GATE``. A Season's lifecycle (and,
+# as of round-N+1, every OTHER writer keyed globally by
+# ``services/epoch_fence.py``'s ``EPOCH_FENCE_GLOBAL_KEY`` — Program/League/
+# LeagueSeason lifecycle+delete, venue-access revoke/delete, Team transfer,
+# Official assign/unassign, Player/Guardian reassignment, Guardian link
+# create/verify) is SHARED state: it can affect every user who currently has
+# it in view, not only the acting operator, so keying this gate by the
+# acting user's own id would not order it against ANOTHER user's in-flight
+# scoped read at all. ``LIFECYCLE_GATE_KEY`` is therefore one constant every
+# participant uses, making this gate's shared/exclusive split GLOBAL rather
+# than per-identity.
+LIFECYCLE_GATE = ContextSwitchGate()
+
+# THE SAME OBJECT as ``services/epoch_fence.py``'s ``EPOCH_FENCE_GLOBAL_KEY``
+# (imported, not a re-spelled duplicate) — one wire/log value for "the one
+# shared, global epoch-affecting concern" across BOTH the in-process gate and
+# the database-coordinated fence, so the two can never drift apart the way two
+# independently-maintained string literals could. ``tests/test_epoch_fence.py``
+# already asserts this constant equals ``EPOCH_FENCE_GLOBAL_KEY``.
+LIFECYCLE_GATE_KEY = EPOCH_FENCE_GLOBAL_KEY

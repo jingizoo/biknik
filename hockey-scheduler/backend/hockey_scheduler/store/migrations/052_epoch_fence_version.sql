@@ -1,0 +1,54 @@
+-- The database-coordinated epoch fence's persisted VERSION COUNTERS (PR #423
+-- round-N review finding 1) -- the optimistic-validation half of the fence,
+-- alongside the advisory-lock half `epoch_fence_acquire_exclusive`/`_shared`
+-- already implement on PostgreSQL. See services/epoch_fence.py and
+-- web/server.py's `_read_under_context_gate` for the read side, and
+-- SqlStore.epoch_fence_acquire_exclusive / InMemoryStore's own copy for the
+-- write side that bumps a counter.
+--
+-- WHY A COUNTER IN ADDITION TO THE ADVISORY LOCK. The lock genuinely blocks
+-- on PostgreSQL (a separate axis from `self._lock`/row locks), but SQLite has
+-- only ONE lock axis and holding a dedicated connection's SHARED lock across
+-- an unbounded `produce()` call -- while `produce()` itself needs
+-- `self._lock` for its own reads -- is a real AB-BA deadlock against a writer
+-- that takes `self._lock` first and blocks on that SAME file lock (measured
+-- directly, see `epoch_fence_acquire_shared`'s own docstring). This counter
+-- sidesteps that class of hazard entirely: a reader samples it before
+-- deriving its epoch, calls `produce()` with NO LOCK held across that call at
+-- all, then re-samples it afterwards in a fresh, separate read -- if the
+-- value moved, some fenced writer's WHOLE transaction landed inside the read
+-- window and the result is discarded (204, matching an epoch mismatch)
+-- rather than served. No lock, no deadlock class to have.
+--
+-- ONE ROW PER FENCE KEY -- mirroring the advisory lock's own two-key
+-- granularity (`services/epoch_fence.py`'s `user_fence_key`/
+-- `EPOCH_FENCE_GLOBAL_KEY`), NOT one single row for every writer. A single
+-- shared counter was tried first and reverted: it made ANY writer anywhere
+-- on the server -- including an UNRELATED user's own context switch, a
+-- per-user-keyed writer with nothing to do with the reader in question --
+-- discard every OTHER user's concurrently in-flight scoped read, breaking
+-- the cross-user independence `ContextSwitchGate`/`CONTEXT_GATE` was
+-- specifically built to bound (measured directly:
+-- `test_one_operators_switch_is_not_stalled_by_anothers_scoped_read` and its
+-- sibling went from 200 to 204 the moment a single global counter shipped).
+-- Keying the counter the SAME way the lock is keyed restores that bound: a
+-- reader checks its OWN user's row plus the one global row, so only a
+-- writer that could ACTUALLY have raced it -- a switch/scope-rebind/
+-- activation for the SAME user, or any of the fourteen genuinely
+-- installation-wide writers -- can ever cause a discard.
+--
+-- No pre-seeded rows: a key nobody has ever bumped simply has no row, and
+-- the store layer reads that as version 0 (see
+-- `current_epoch_fence_version`'s own docstring) -- identical to a
+-- freshly-migrated key that HAS a zeroed row, so there is nothing to
+-- backfill and no "the row doesn't exist yet" special case for a reader to
+-- get wrong. The bump itself is a portable upsert (the same
+-- INSERT ... ON CONFLICT idiom `next_id()`'s own counters table already
+-- uses), so a key's first bump and its hundredth are the same statement.
+--
+-- Portable across SQLite/PostgreSQL (plain DDL, no dialect-specific syntax),
+-- so this ships as one file rather than a dialect pair.
+CREATE TABLE epoch_fence_version (
+    fence_key TEXT PRIMARY KEY,
+    version INTEGER NOT NULL
+);
