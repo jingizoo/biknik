@@ -76,7 +76,14 @@ _INDEX = "ux_device_tokens_recipient_token"
 # for both.
 SENT_RECIPIENT = "official:o1-dup-disclosure-426r5"
 SENT_TOKEN = "secret-push-token-dup-disclosure-426r5"  # pragma: allowlist secret
-DT1_ID, DT2_ID = "dtdup-1", "dtdup-2"
+# Shaped like a REAL ``SqlStore.next_id("devtok")`` output (#426 round-6
+# review finding 1 requires row ids to pass a strict ``devtok_<n>`` grammar
+# before they are named directly in the diagnostic — see
+# ``integrity_checks._DEVICE_TOKEN_ROW_ID_RE``). Large, arbitrary-looking
+# counter values so they can never collide with an id this test's own
+# fresh, isolated store would organically allocate via ``next_id`` (none of
+# these tests call the real upsert path, but the margin costs nothing).
+DT1_ID, DT2_ID = "devtok_94261001", "devtok_94261002"
 
 # Run as a genuine separate process (see SubprocessRealBootDisclosureTest):
 # the exact real entry point every app boot calls, letting a raised
