@@ -23,7 +23,6 @@ from ..domain import (
     DeliveryStatus,
     Game,
     GameType,
-    DeviceToken,
     IceSlotStatus,
     IceSlotType,
     NotificationAudience,
@@ -5949,7 +5948,29 @@ class ApiService:
     @catch
     def register_device_token(self, recipient_ref: str, provider: str,
                               token: str, label=None) -> dict:
-        """Register (or reactivate) a real push device token for a recipient."""
+        """Register (or reactivate) a real push device token for a recipient.
+
+        THE UPSERT IS ONE ATOMIC STATEMENT (#426 round-4 review finding 1):
+        ``store.upsert_device_token`` uses migration 055's UNIQUE index on
+        (recipient_ref, token) and a real ``INSERT ... ON CONFLICT ... DO
+        UPDATE`` so two concurrent registrations of the SAME
+        (recipient_ref, token) pair can never both observe "no row" and
+        insert two rows — and a concurrent ``set_device_token_active``
+        toggle of the SAME row (which now takes a real row lock via
+        ``get_device_token_for_update``) is fully ordered against this
+        write rather than silently overwriting it with a stale in-memory
+        copy. Replaces the previous unlocked ``get_device_token_by_value``
+        -> ``save_device_token``/``add_device_token`` shape, which
+        performed its read and its write as two independent, unlocked
+        operations with no transaction around either — see
+        ``store.upsert_device_token``'s own docstring for the full
+        mechanism. Wrapped in ``store.transaction()`` for Memory-store
+        parity (its equivalent find-or-create is two dict operations, not
+        atomic on its own — see ``InMemoryStore.upsert_device_token``);
+        harmless and consistent with every other mutating method here on
+        the SQL backends, where the upsert statement is already atomic by
+        itself.
+        """
         if not recipient_ref:
             raise ValidationError("A recipient_ref is required.")
         self._reject_dangling_recipient(recipient_ref)
@@ -5964,17 +5985,8 @@ class ApiService:
             raise ValidationError(
                 "That looks like a placeholder token — register a real device "
                 "token from the provider.")
-        existing = self.store.get_device_token_by_value(recipient_ref, token)
-        if existing is not None:
-            existing.provider = provider
-            existing.label = label
-            existing.active = True
-            self.store.save_device_token(existing)
-            return self._device_token_row(existing)
-        t = DeviceToken(
-            id=self.store.next_id("devtok"), recipient_ref=recipient_ref,
-            provider=provider, token=token, label=label, active=True)
-        self.store.add_device_token(t)
+        with self.store.transaction():
+            t = self.store.upsert_device_token(recipient_ref, provider, token, label)
         return self._device_token_row(t)
 
     @catch
@@ -5993,6 +6005,24 @@ class ApiService:
         rolled-back toggle whose response never reached the caller leaves
         no phantom read row. Mirrors ``set_contact_destination_active``'s
         exact shape; see that method's own docstring.
+
+        FETCH-MUTATE-AUDIT IS ONE ATOMIC UNIT, ROW-LOCKED (#426 round-4
+        review finding 1): the row is looked up via
+        ``get_device_token_for_update`` — unlike its ContactDestination
+        sibling before round-2's fix, this used to be a PLAIN
+        ``get_device_token`` read with no lock at all. On PostgreSQL, a
+        plain read is not blocked by another transaction's row lock (only a
+        genuine write is), so a concurrent ``register_device_token``
+        re-registration of the SAME token value could commit a new
+        provider/label in the gap between this read and this method's own
+        ``UPDATE``, and this method's stale full-row ``save_device_token``
+        would then silently overwrite that committed change back to the
+        value it read before the race — the exact "lost update" the review
+        described. Locking the row for the fetch (a real row lock on
+        PostgreSQL; the whole-transaction file/process lock on
+        SQLite/Memory) fully orders this toggle against
+        ``upsert_device_token``'s own conflict-resolution lock on the SAME
+        row, in EITHER commit order — see that method's own docstring.
         """
         request_id = self._safe_request_id(request_id)
         role, label = self._privacy_principal(actor_role)
@@ -6002,7 +6032,7 @@ class ApiService:
                 category, "set_device_token_active", actor_id, label,
                 request_id)
         with self.store.transaction():
-            t = self.store.get_device_token(token_id)
+            t = self.store.get_device_token_for_update(token_id)
             if t is None:
                 raise NotFoundError("Device token not found.")
             if active:
