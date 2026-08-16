@@ -100,6 +100,7 @@ from .db_errors import (
     translate_venue_hierarchy_fk_exception,
 )
 from .integrity_checks import (
+    MigrationDataError,
     assert_competition_hierarchy_reset_ready,
     assert_competition_reset_ready_c1b,
     assert_iceslot_venue_fks_ready,
@@ -392,6 +393,15 @@ def _load_migrations(backend=None):
 # (#201): a constraint migration first reports any existing rows that would
 # violate it, so an upgrade fails with the offending records named rather than
 # an opaque driver error. Keyed by migration version (filename stem).
+#
+# These run ONCE, read-only, BEFORE this migration's own transaction even
+# opens (see ``migrate`` below) — sound for a point-in-time data-shape audit
+# against a table nothing else is concurrently racing to write in a way that
+# matters here. ``055_device_token_unique_key`` is deliberately NOT in this
+# dict: device_tokens is actively written by a running application (possibly
+# a different replica already upgraded, or an old one not yet upgraded), so
+# its check needs the stronger, atomic guarantee ``_ATOMIC_PRE_MIGRATION_
+# CHECKS`` below provides instead (#426 round-6 review finding 2).
 _PRE_MIGRATION_CHECKS = {
     "022_one_active_game_per_slot": assert_no_duplicate_active_ice_slots,
     "023_one_roster_row_per_player": assert_no_duplicate_roster_players,
@@ -411,7 +421,30 @@ _PRE_MIGRATION_CHECKS = {
     "047_official_import_unique_keys":
         assert_officials_availability_import_constraints_ready,
     "048_rink_external_ref_unique": assert_no_duplicate_rink_external_refs,
-    "055_device_token_unique_key": assert_no_duplicate_device_tokens,
+}
+
+# Migrations whose pre-check must be ATOMIC with their own DDL with respect
+# to a concurrent writer on a specific table (#426 round-6 review finding 2).
+#
+# The review reproduced this exact window with two real PostgreSQL
+# connections: connection A's ``assert_no_duplicate_device_tokens`` ran
+# BEFORE any transaction/lock existed and returned clean; connection B then
+# committed a fresh duplicate; A's later ``CREATE UNIQUE INDEX`` discovered
+# it and PostgreSQL raised a raw ``UniqueViolation`` whose ``DETAIL`` text
+# named the conflicting ``(recipient_ref, token)`` pair verbatim — a live
+# push credential, straight into whatever captures a startup traceback.
+#
+# Unlike ``_PRE_MIGRATION_CHECKS`` above, the check function here runs
+# INSIDE ``_apply_migration``'s own transaction, AFTER a lock excluding
+# concurrent writers on ``lock_table`` is taken (see ``_apply_migration``) —
+# so no writer can land a fresh violation in the window between "check
+# passed" and "DDL applied": the lock closes the window the round-5 fix
+# (naming only safe row ids) could not, because round-5 never addressed
+# WHEN the check ran relative to the DDL, only WHAT it was allowed to say.
+# Keyed by migration version; value is ``(check_fn, lock_table)``.
+_ATOMIC_PRE_MIGRATION_CHECKS = {
+    "055_device_token_unique_key":
+        (assert_no_duplicate_device_tokens, "device_tokens"),
 }
 
 
@@ -430,8 +463,13 @@ def migrate(conn, dialect) -> None:
     all-or-nothing; it is never an in-place no-op. Take a backup before upgrading.
 
     A version with a registered pre-migration check (``_PRE_MIGRATION_CHECKS``)
-    runs that check first; it raises (aborting the upgrade) if existing data
-    would violate the constraint the migration adds.
+    runs that check first, read-only, before this migration's own transaction
+    opens; it raises (aborting the upgrade) if existing data would violate the
+    constraint the migration adds. A version in ``_ATOMIC_PRE_MIGRATION_CHECKS``
+    instead runs its check INSIDE the migration's own transaction, behind a lock
+    that excludes concurrent writers on a named table, for the migrations where
+    a plain pre-transaction check would leave a real TOCTOU window open (#426
+    round-6 review finding 2) — see ``_apply_migration``.
 
     Each pending version's statements and its ledger row are applied as one
     atomic unit, so a migration that fails part-way (e.g. a SQLite table rebuild)
@@ -446,18 +484,109 @@ def migrate(conn, dialect) -> None:
     for version, statements in _load_migrations(dialect.backend):
         if version in applied:
             continue
+        atomic_check = _ATOMIC_PRE_MIGRATION_CHECKS.get(version)
+        if atomic_check is not None:
+            _apply_migration(conn, dialect, version, statements,
+                             atomic_check=atomic_check)
+            continue
         check = _PRE_MIGRATION_CHECKS.get(version)
         if check is not None:
             check(conn)  # read-only; safe to run before opening the txn
         _apply_migration(conn, dialect, version, statements)
 
 
-def _apply_migration(conn, dialect, version, statements) -> None:
-    """Run one migration's statements plus its ledger row in a single txn."""
+def _sanitize_atomic_check_ddl_exception(exc: BaseException):
+    """A sanitized :class:`MigrationDataError` for a raw unique-violation
+    surfacing from an ``atomic_check`` migration's own DDL, or ``None`` for
+    anything else — the caller re-raises the original unchanged (#426
+    round-6 review finding 2, belt and suspenders UNDERNEATH the
+    ``LOCK TABLE``/``BEGIN IMMEDIATE`` fix in ``_apply_migration``, which is
+    what actually prevents this from firing in normal operation).
+
+    Reuses :func:`~.db_errors.translate_db_exception` — already audited to
+    never place driver text, SQL, or a constraint/table/column name in its
+    generic message — rather than a second, parallel detection path here.
+    Only a ``unique_violation`` classification is treated as this scenario;
+    anything else ``translate_db_exception`` recognizes (e.g. a concurrency
+    failure) or does not recognize at all returns ``None``, so an unrelated
+    failure during an ``atomic_check`` migration's DDL keeps surfacing
+    exactly as it always has.
+
+    The statements an ``atomic_check`` migration executes are that one
+    migration's own DDL and nothing else, so a unique-violation at this
+    exact call site can only be the constraint that DDL itself is adding —
+    there is no ambiguity to resolve about WHICH constraint fired, unlike
+    the multi-constraint call sites ``db_errors.py``'s other translators
+    disambiguate by name.
+    """
+    translated = translate_db_exception(exc)
+    if translated is None or translated.details.get("reason") != "unique_violation":
+        return None
+    return MigrationDataError(
+        "Cannot apply this migration's uniqueness constraint: a "
+        "conflicting row was written during the upgrade window. This "
+        "migration's own pre-check and DDL run under a lock that excludes "
+        "concurrent writers on the affected table, so this should not be "
+        "reachable in normal operation -- if it recurs, retry the upgrade "
+        "and check for a writer bypassing that lock.")
+
+
+def _atomic_check_lock_hook(version: str) -> None:
+    """No-op by default — a TEST SEAM ONLY (#426 round-6 review finding 2).
+
+    ``_apply_migration`` calls this from inside ``body()``, immediately
+    after an ``atomic_check`` migration's writer-excluding lock has been
+    acquired (``LOCK TABLE`` on PostgreSQL / ``BEGIN IMMEDIATE`` on SQLite)
+    and before ``check_fn`` runs. A test can monkeypatch this to pause here
+    and, with a REAL second connection, prove that a concurrent writer
+    genuinely blocks (or is genuinely rejected) until this migration's
+    transaction concludes — a deterministic barrier, not a timing
+    coincidence. Never used by production code, which leaves this at its
+    default no-op.
+    """
+    return None
+
+
+def _apply_migration(conn, dialect, version, statements, atomic_check=None) -> None:
+    """Run one migration's statements plus its ledger row in a single txn.
+
+    ``atomic_check``, when given, is a ``(check_fn, lock_table)`` pair (#426
+    round-6 review finding 2). ``check_fn`` runs from INSIDE ``body()`` below
+    — i.e. inside this transaction, and (see the per-backend branches below)
+    AFTER a lock excluding concurrent writers on ``lock_table`` has been
+    taken — so no writer can land a fresh violation in the window between
+    "check passed" and "this migration's DDL applied". This is what actually
+    closes the review's reproduced TOCTOU window; the two backend branches
+    below each explain how they provide that lock.
+
+    As a defensive backstop UNDERNEATH that lock (not a replacement for it —
+    engine error message formats such as PostgreSQL's ``DETAIL`` text are not
+    fully within this codebase's control, so this is belt and suspenders in
+    case a future edit narrows the lock's scope), a statement failing with a
+    raw unique-violation while ``atomic_check`` is active is caught and
+    re-raised as a sanitized :class:`~.integrity_checks.MigrationDataError`
+    instead of allowed to propagate with driver text intact. Anything else —
+    any other exception shape, or any failure when ``atomic_check`` is
+    ``None`` — is untouched, exactly as before.
+    """
     def body():
         cur = conn.cursor()
+        if atomic_check is not None:
+            check_fn, _lock_table = atomic_check
+            # By the time body() runs, the lock is already held on both
+            # backends (LOCK TABLE / BEGIN IMMEDIATE, just before this
+            # call) — see the per-backend branches below.
+            _atomic_check_lock_hook(version)
+            check_fn(conn)
         for stmt in statements:
-            cur.execute(stmt)
+            try:
+                cur.execute(stmt)
+            except Exception as exc:
+                translated = (_sanitize_atomic_check_ddl_exception(exc)
+                             if atomic_check is not None else None)
+                if translated is None:
+                    raise
+                raise translated from exc
         cur.execute(dialect.sql(
             "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)"),
             (version, _utcnow().isoformat()))
@@ -467,6 +596,18 @@ def _apply_migration(conn, dialect, version, statements) -> None:
         # runs inside an outer transaction (e.g. the demo reset), this opens a
         # savepoint rather than a second transaction.
         with conn.transaction():
+            if atomic_check is not None:
+                _, lock_table = atomic_check
+                # SHARE ROW EXCLUSIVE conflicts with ROW EXCLUSIVE — the lock
+                # every INSERT/UPDATE/DELETE takes — so any concurrent writer
+                # on lock_table blocks until THIS transaction concludes
+                # (commit OR rollback), closing exactly the window a bare
+                # pre-transaction check leaves open. Ordinary reads (ACCESS
+                # SHARE) are unaffected. Taken BEFORE check_fn runs (inside
+                # body(), called next) so the check itself — not just the
+                # DDL after it — is covered.
+                conn.cursor().execute(
+                    f"LOCK TABLE {lock_table} IN SHARE ROW EXCLUSIVE MODE")
             body()
     elif conn.in_transaction:
         # Already inside a transaction (e.g. reset_schema called within the demo
@@ -518,6 +659,16 @@ def _apply_migration(conn, dialect, version, statements) -> None:
             # IMMEDIATE deletes the invariant instead of documenting it, and it
             # is free: interleaved cold builds of the full migration set, 32
             # samples each, median 34.90ms plain vs 35.00ms IMMEDIATE.
+            # For an ``atomic_check`` migration, this line is ALSO what gives
+            # SQLite the same guarantee the PostgreSQL branch above gets from
+            # ``LOCK TABLE``: BEGIN IMMEDIATE takes SQLite's RESERVED lock,
+            # which blocks (or, absent an explicit busy_timeout, immediately
+            # rejects) ANY other connection's attempt to begin its own write
+            # — a coarser, whole-database lock rather than one table, but it
+            # still means no writer can complete a conflicting write between
+            # here and this transaction's conclusion. body() (next) runs
+            # check_fn from inside that same window (#426 round-6 review
+            # finding 2).
             conn.execute("BEGIN IMMEDIATE")
             body()
             violations = conn.execute("PRAGMA foreign_key_check").fetchall()
