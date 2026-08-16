@@ -82,9 +82,10 @@ from ..domain import (
     Team,
     UserAccount,
     Venue,
+    VALID_OUTCOMES,
 )
 from ..domain.enums import NotificationType
-from ..domain.errors import IntegrityConflictError
+from ..domain.errors import IntegrityConflictError, ValidationError
 from .db import connect
 from .db_errors import (
     DependentDeleteConflict,
@@ -601,6 +602,11 @@ class SqlStore:
         # the losing delete was nested inside a caller's transaction() and the
         # connection was transaction-aborted mid-flight.
         self._dependent_conflict_resolver = None
+        # Rows queued by add_data_access_durable() while nested inside an
+        # ambient transaction, to be flushed once that transaction has FULLY
+        # concluded (#426 review finding 4) — see transaction()'s outermost
+        # finally and add_data_access_durable()'s own docstring.
+        self._pending_durable_data_access = []
         migrate(self.conn, self.dialect)
 
     def set_dependent_conflict_resolver(self, resolver) -> None:
@@ -919,6 +925,28 @@ class SqlStore:
                 self._txn_depth = 0
                 self._txn_isolation = None
                 self._txn_read_only = None
+                # #426 review finding 4: flush any DataAccessLog rows queued
+                # by add_data_access_durable() while nested inside the
+                # transaction that JUST concluded — commit or rollback makes
+                # no difference, a durable row is never contingent on the
+                # ambient unit's own outcome. Runs here (not in the `except`
+                # above) so it fires on the plain-success path too, and AFTER
+                # depth/isolation are reset so the flush's own nested
+                # transaction() calls are themselves genuinely outermost.
+                if self._pending_durable_data_access:
+                    self._flush_pending_durable_data_access()
+
+    def _flush_pending_durable_data_access(self) -> None:
+        """Insert every queued durable row, each in its OWN fresh commit
+        (#426 review finding 4) — swapped out first so a flush triggered
+        from inside this very flush's nested transaction() calls can never
+        re-process the same rows."""
+        pending, self._pending_durable_data_access = (
+            self._pending_durable_data_access, [])
+        for entry in pending:
+            with self.transaction():
+                entry.seq = self._next_data_access_seq()
+                self._insert(entry)
 
     def _enrich_jersey_conflict(self, exc) -> None:
         """Add the conflicting player to a rolled-back jersey conflict (#292).
@@ -1772,13 +1800,109 @@ class SqlStore:
     def add_setup_audit(self, entry): return self._insert(entry)
     def all_setup_audit(self): return self._query(SetupAuditLog, order="id")
 
-    # -- sensitive-read audit (#124) ---------------------------------------
-    def add_data_access(self, entry): return self._insert(entry)
+    # -- sensitive-read audit (#124; ordering/validation/durability #426) ---
+    #: Dedicated ``counters`` row for the audit log's own monotonic ordering
+    #: key — deliberately NOT an id prefix (``next_id`` already owns the
+    #: ``daccess`` prefix for row ids; this is a SEPARATE counter, see
+    #: domain/privacy.py's ORDERING section).
+    _DATA_ACCESS_SEQ_PREFIX = "__data_access_seq__"
+
+    def _next_data_access_seq(self) -> int:
+        """Atomically issue the next ordering key, via the SAME ``counters``
+        table primitive ``next_id`` uses (``INSERT ... ON CONFLICT DO
+        UPDATE ... RETURNING``) — no new store mechanism, just a private
+        counter row `next_id` never hands out as a prefix to callers."""
+        with self._lock:
+            cur = self._exec(
+                "INSERT INTO counters(prefix, value) VALUES (?, 1) "
+                "ON CONFLICT(prefix) DO UPDATE SET value = counters.value + 1 "
+                "RETURNING value", (self._DATA_ACCESS_SEQ_PREFIX,))
+            row = cur.fetchone()
+        return row["value"]
+
+    @staticmethod
+    def _validate_data_access(entry) -> None:
+        """Closed-vocabulary guard (#426 review finding 5), enforced in
+        Python BEFORE the write in addition to migration 053's own CHECK
+        constraints — so the same rejection happens on every backend, not
+        only the ones with an engine to ask, and a caller gets a clear
+        domain error rather than a raw driver exception either way."""
+        cat = entry.category
+        cat_value = cat.value if isinstance(cat, SensitiveFieldCategory) else cat
+        if cat_value not in {c.value for c in SensitiveFieldCategory}:
+            raise ValidationError(
+                f"Unknown sensitive-field category {cat_value!r}.")
+        if entry.outcome not in VALID_OUTCOMES:
+            raise ValidationError(
+                f"Unknown DataAccessLog outcome {entry.outcome!r}.")
+
+    def _insert_data_access(self, entry) -> "DataAccessLog":
+        """Validate, assign the persisted ordering key, and insert — the ONE
+        code path both ``add_data_access`` and the durable-write flush
+        (below) fall through to, so neither can skip a check the other
+        applies."""
+        self._validate_data_access(entry)
+        entry.seq = self._next_data_access_seq()
+        return self._insert(entry)
+
+    def add_data_access(self, entry):
+        # A real transaction() wrap (not merely self._lock), reentrant with
+        # any ambient caller transaction: a raw driver exception (e.g. a
+        # UNIQUE violation from _validate_data_access's own uniqueness
+        # check racing a concurrent duplicate) must come out through
+        # transaction()'s own translate_db_exception boundary as a stable
+        # IntegrityConflictError, not an untranslated driver exception —
+        # exactly like every other store write.
+        with self.transaction():
+            return self._insert_data_access(entry)
+
+    def add_data_access_durable(self, entry):
+        """Write a DataAccessLog row that survives regardless of what any
+        AMBIENT (already-open, possibly nested) transaction on THIS store
+        instance later does — including a later rollback (#426 review
+        finding 4: "the denial helper's OWN transaction joins an outer
+        transaction... a forbidden result followed by an outer failure left
+        zero denial rows").
+
+        Not nested right now (``_txn_depth == 0``): commits immediately, in
+        its own dedicated transaction — the common case (an HTTP request
+        refused with no ambient caller transaction at all).
+
+        Nested (``_txn_depth > 0``): a Python-level join here (like every
+        other nested ``transaction()`` call) would still be subject to the
+        OUTER transaction's eventual commit/rollback — precisely finding 4's
+        bug — so instead of joining, the row is QUEUED and flushed, in its
+        OWN fresh transaction, from ``transaction()``'s own outermost
+        ``finally`` (below) once the ambient transaction has FULLY
+        concluded, whichever way it concludes. This is the "failure-safe
+        transaction lifecycle hook" the review names as an accepted
+        alternative to a second physical connection — the same shape as
+        ``_dependent_conflict_resolver``'s existing "invoked only from the
+        OUTERMOST transaction()'s post-conclusion handler" contract.
+        """
+        with self._lock:
+            self._validate_data_access(entry)
+            if self._txn_depth == 0:
+                with self.transaction():
+                    entry.seq = self._next_data_access_seq()
+                    self._insert(entry)
+            else:
+                self._pending_durable_data_access.append(entry)
+        return entry
 
     def list_data_access(self, subject_type=None, subject_id=None,
                          category=None):
         """Sensitive-read rows, optionally filtered to one subject and/or one
-        category — the "who read this person's data" query (#124)."""
+        category — the "who read this person's data" query (#124).
+
+        Ordered by ``seq`` (#426 review finding 5), NOT ``id``: ``id`` is the
+        textual ``daccess_<n>`` label, and SQL's ``ORDER BY id`` sorts that
+        LEXICOGRAPHICALLY (``daccess_10`` before ``daccess_2``) — a real,
+        observed corruption of chronological order once the count crosses a
+        digit boundary. ``seq`` is a persisted INTEGER assigned once, atomic
+        with the insert, and UNIQUE (migration 053) — a stable, immutable,
+        collision-free chronological key on every backend.
+        """
         clauses, params = [], []
         if subject_type is not None:
             clauses.append("subject_type = ?")
@@ -1792,7 +1916,7 @@ class SqlStore:
                           if isinstance(category, SensitiveFieldCategory)
                           else category)
         return self._query(DataAccessLog, " AND ".join(clauses) or None,
-                           tuple(params), order="id")
+                           tuple(params), order="seq")
 
     def add_factory_reset_event(self, event): return self._insert(event)
     def all_factory_reset_events(self):
@@ -1995,6 +2119,13 @@ class SqlStore:
     # -- contact registry (#60) --------------------------------------------
     def add_contact_destination(self, c): return self._insert(c)
     def save_contact_destination(self, c): return self._update(c)
+    def get_contact_destination_for_update(self, contact_id):
+        """Like ``_get_for_update`` — a row lock so a concurrent upsert
+        (``set_contact_destination``) or another toggle of the SAME
+        contact_id is fully ordered before or after this transaction, never
+        interleaved with a stale pre-read (#426 review finding 4)."""
+        return self._get_for_update(ContactDestination, contact_id)
+
     def get_contact_destination(self, recipient_ref, channel):
         rows = self._query(
             ContactDestination, "recipient_ref = ? AND channel = ?",

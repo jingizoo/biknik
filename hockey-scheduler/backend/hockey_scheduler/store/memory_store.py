@@ -50,6 +50,7 @@ from ..domain import (
     Season,
     SeasonTeamRegistration,
     SeasonVenueAccess,
+    SensitiveFieldCategory,
     TeamLeagueMigrationDecision,
     Session,
     SetupAuditLog,
@@ -57,8 +58,10 @@ from ..domain import (
     Team,
     UserAccount,
     Organization,
+    VALID_OUTCOMES,
     Venue,
 )
+from ..domain.errors import IntegrityConflictError, ValidationError
 
 
 class InMemoryStore:
@@ -143,11 +146,20 @@ class InMemoryStore:
         # see SqlStore.current_epoch_fence_version's own docstring for the
         # read-side contract this mirrors.
         self._epoch_fence_versions: Dict[str, int] = {}
+        # DataAccessLog rows queued by add_data_access_durable() while nested
+        # inside an ambient transaction, to be flushed once that transaction
+        # has FULLY concluded regardless of outcome (#426 review finding 4)
+        # — see transaction()'s finally and add_data_access_durable()'s own
+        # docstring. Bookkeeping, not application data: excluded from
+        # _NON_SNAPSHOT below like _lock/_txn_depth, never itself rolled
+        # back.
+        self._pending_durable_data_access: List[DataAccessLog] = []
 
     # Instance attributes that are NOT part of the persisted state and so must
     # never be snapshotted/restored by a transaction (the lock is unpicklable
     # and the depth counter drives the rollback machinery itself).
-    _NON_SNAPSHOT = frozenset({"_lock", "_txn_depth"})
+    _NON_SNAPSHOT = frozenset(
+        {"_lock", "_txn_depth", "_pending_durable_data_access"})
 
     # Snapshot invariant: a stored dataclass's nested mutable fields (the only
     # ones today are AuditLog.detail, SetupAuditLog.detail and
@@ -283,6 +295,18 @@ class InMemoryStore:
                 raise
             finally:
                 self._txn_depth -= 1
+                # #426 review finding 4: flush any DataAccessLog rows queued
+                # by add_data_access_durable() while nested inside the
+                # transaction that JUST concluded. Runs AFTER _restore()
+                # above (so a flushed row is never itself wiped by the
+                # rollback it is surviving) and regardless of commit vs
+                # rollback — a durable row is never contingent on the
+                # ambient unit's own outcome. Guarded by `outermost` (via
+                # the depth check) so a nested transaction() never triggers
+                # a premature flush of its enclosing caller's still-open
+                # unit.
+                if self._txn_depth == 0 and self._pending_durable_data_access:
+                    self._flush_pending_durable_data_access()
 
     def close(self) -> None:
         pass
@@ -407,23 +431,100 @@ class InMemoryStore:
         self.audit.append(entry)
         return entry
 
-    # -- sensitive-read audit (#124) ---------------------------------------
+    # -- sensitive-read audit (#124; ordering/validation/durability #426) ---
+    #: Dedicated counter key for the audit log's own monotonic ordering key
+    #: — deliberately NOT an id prefix (``next_id("daccess")`` already owns
+    #: row ids; this is a separate counter, see domain/privacy.py's
+    #: ORDERING section and SqlStore's identical ``_DATA_ACCESS_SEQ_PREFIX``).
+    _DATA_ACCESS_SEQ_KEY = "__data_access_seq__"
+
+    def _next_data_access_seq(self) -> int:
+        with self._lock:
+            value = self._counters.get(self._DATA_ACCESS_SEQ_KEY, 0) + 1
+            self._counters[self._DATA_ACCESS_SEQ_KEY] = value
+            return value
+
+    def _validate_data_access(self, entry: DataAccessLog) -> None:
+        """Closed-vocabulary + uniqueness guard (#426 review finding 5),
+        mirroring SqlStore's Python-side check and migration 053's CHECK/
+        UNIQUE constraints — so a MemoryStore-backed demo/test run rejects
+        exactly what a real database would, rather than silently accepting
+        an invalid outcome/category or a duplicate id list.append() never
+        would have caught on its own (a plain list has no primary key)."""
+        cat = entry.category
+        cat_value = cat.value if isinstance(cat, SensitiveFieldCategory) else cat
+        if cat_value not in {c.value for c in SensitiveFieldCategory}:
+            raise ValidationError(
+                f"Unknown sensitive-field category {cat_value!r}.")
+        if entry.outcome not in VALID_OUTCOMES:
+            raise ValidationError(
+                f"Unknown DataAccessLog outcome {entry.outcome!r}.")
+        if (any(r.id == entry.id for r in self.data_access)
+                or any(r.id == entry.id
+                       for r in self._pending_durable_data_access)):
+            raise IntegrityConflictError(
+                "The change conflicts with an existing record.",
+                details={"reason": "unique_violation"})
+
     def add_data_access(self, entry: DataAccessLog) -> DataAccessLog:
-        self.data_access.append(entry)
+        with self._lock:
+            self._validate_data_access(entry)
+            entry.seq = self._next_data_access_seq()
+            self.data_access.append(entry)
         return entry
+
+    def add_data_access_durable(self, entry: DataAccessLog) -> DataAccessLog:
+        """Write a row that survives regardless of what an AMBIENT
+        (already-open, possibly nested) transaction later does — including a
+        later rollback (#426 review finding 4). See SqlStore's identical
+        method for the full rationale; this store's version is the SAME
+        "failure-safe transaction lifecycle hook" shape, just against
+        ``_txn_depth``/``_restore()`` instead of a real database connection.
+        """
+        with self._lock:
+            self._validate_data_access(entry)
+            if self._txn_depth == 0:
+                entry.seq = self._next_data_access_seq()
+                self.data_access.append(entry)
+            else:
+                self._pending_durable_data_access.append(entry)
+        return entry
+
+    def _flush_pending_durable_data_access(self) -> None:
+        pending, self._pending_durable_data_access = (
+            self._pending_durable_data_access, [])
+        for entry in pending:
+            entry.seq = self._next_data_access_seq()
+            self.data_access.append(entry)
 
     def list_data_access(self, subject_type=None, subject_id=None,
                          category=None) -> List[DataAccessLog]:
         """Sensitive-read rows, optionally filtered to one subject and/or one
-        category — the "who read this person's data" query (#124)."""
+        category — the "who read this person's data" query (#124).
+
+        Returns immutable snapshots (#426 review finding 5), NOT the live
+        stored objects: this store used to hand back the SAME dataclass
+        instances it holds internally, so a caller mutating one field of a
+        "returned" row silently corrupted the durable record — an audit
+        trail that is not append-only is not an audit trail. Ordered by
+        ``seq``, matching SqlStore's ``ORDER BY seq`` (never by ``id``,
+        which is a textual label sorted lexicographically, not
+        chronologically — see domain/privacy.py's ORDERING section).
+        """
         rows = self.data_access
         if subject_type is not None:
             rows = [r for r in rows if r.subject_type == subject_type]
         if subject_id is not None:
             rows = [r for r in rows if r.subject_id == subject_id]
         if category is not None:
-            rows = [r for r in rows if r.category == category]
-        return list(rows)
+            cat_value = (category.value
+                        if isinstance(category, SensitiveFieldCategory)
+                        else category)
+            rows = [r for r in rows
+                   if (r.category.value
+                       if isinstance(r.category, SensitiveFieldCategory)
+                       else r.category) == cat_value]
+        return [copy.copy(r) for r in sorted(rows, key=lambda r: r.seq)]
 
     def audit_for_game(self, game_id: str) -> List[AuditLog]:
         return [a for a in self.audit if a.game_id == game_id]
@@ -949,6 +1050,15 @@ class InMemoryStore:
             if c.recipient_ref == recipient_ref and c.channel == channel:
                 return c
         return None
+
+    def get_contact_destination_for_update(
+            self, contact_id: str) -> Optional[ContactDestination]:
+        # No row locking needed (#426 review finding 4, mirroring
+        # get_team_for_update's identical comment): transaction() holds
+        # self._lock for its entire body, so a concurrent upsert can't
+        # interleave with the caller's fetch-then-write. Provided for
+        # interface parity with SqlStore.
+        return self.contact_destinations.get(contact_id)
 
     def all_contact_destinations(self) -> List[ContactDestination]:
         return list(self.contact_destinations.values())
