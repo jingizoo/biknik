@@ -354,6 +354,50 @@ class NewSeasonCopyForwardServiceTest(unittest.TestCase):
         self.assertEqual(len(src_active), 1)
         self.assertEqual(src_active[0].id, self.fx.reg["id"])
 
+    def test_second_commit_reusing_the_same_fingerprint_is_idempotent(self):
+        """Memory-backend sequential-replay coverage (#159 review round 2)
+        of the same guarantee ``NewSeasonCopyForwardSqlTest`` proves over a
+        real transactional store: replaying the SAME, still-valid
+        fingerprint a second time returns the FIRST commit's exact
+        season/registrations/totals rather than minting a second Season."""
+        fp = self._preview()["copy_forward_fingerprint"]
+        before_seasons = self._season_ids()
+        first = self._commit(fp)
+        self.assertNotIn("error", first, first)
+        after_first_seasons = self._season_ids()
+        self.assertEqual(after_first_seasons,
+                         before_seasons | {first["season"]["id"]})
+        after_first_audits = self._audit_count()
+        second = self._commit(fp)
+        self.assertNotIn("error", second, second)
+        self.assertEqual(second["season"]["id"], first["season"]["id"])
+        self.assertEqual(second["registrations"], first["registrations"])
+        self.assertEqual(second["totals"], first["totals"])
+        # No second Season, no new audit rows from the losing attempt.
+        self.assertEqual(self._season_ids(), after_first_seasons)
+        self.assertEqual(self._audit_count(), after_first_audits)
+        new_regs = self.api.store.registrations_for_season(
+            first["season"]["id"])
+        self.assertEqual(len(new_regs), 1)
+
+    def test_third_commit_reusing_the_same_fingerprint_is_also_idempotent(self):
+        """Idempotency holds for an arbitrary NUMBER of replays, not just a
+        single retry -- a third (or Nth) resubmission still returns the
+        SAME original result (#159 review round 2)."""
+        before_seasons = self._season_ids()
+        fp = self._preview()["copy_forward_fingerprint"]
+        first = self._commit(fp)
+        self.assertNotIn("error", first, first)
+        self._commit(fp)
+        third = self._commit(fp)
+        self.assertNotIn("error", third, third)
+        self.assertEqual(third["season"]["id"], first["season"]["id"])
+        self.assertEqual(self._season_ids(),
+                         before_seasons | {first["season"]["id"]})
+        new_regs = self.api.store.registrations_for_season(
+            first["season"]["id"])
+        self.assertEqual(len(new_regs), 1)
+
     def test_commit_success_with_source_division_lands_division_less(self):
         fp = self._preview(selections=[
             self.fx.selection(division_id=self.fx.div["id"])]
@@ -518,26 +562,27 @@ class NewSeasonCopyForwardSqlTest(unittest.TestCase):
                 len(store.registrations_for_season(fx.src["id"])), 1)
         self._run(case)
 
-    def test_second_commit_reusing_a_valid_fingerprint_mints_a_second_season(self):
-        """A commit fingerprint is NOT single-use / consumed on success.
+    def test_second_commit_reusing_the_same_fingerprint_is_idempotent(self):
+        """A commit fingerprint IS single-use in effect (#159 review round
+        2 -- supersedes the old ``test_second_commit_reusing_a_valid_
+        fingerprint_mints_a_second_season``, which pinned the exact
+        double-submit/retry bug the owner ruled a real blocker, not an
+        acceptable tradeoff).
 
         Unlike ``commit_ice_availability`` (#158) -- whose own idempotency
         comes from the WRITE TARGET having a natural dedup key (the
-        ``(rink, start, end)`` unique index, so a rerun of the identical
-        template is a no-op skip) -- this facade's write target is a brand
-        new Season, which has no such natural key: two Seasons created with
-        identical inputs are, by the domain model, two genuinely different
-        rows (the same as calling ``create_season`` itself twice). So a
-        second commit that reuses the exact same, still-valid fingerprint
-        does NOT skip -- it passes all three preview-binding gates again
-        (nothing about them is one-shot) and mints a SECOND, DISTINCT
-        Season with its own copy of the carried-forward registrations. This
-        is deliberate ("each commit mints its own new Season by design"),
-        not a bypass of the preview-required contract: every commit here,
-        including this second one, is still preceded by a genuine preview
-        by the same actor. Guarding against an accidental double-submit
-        (double-click, client retry) would need a SEPARATE, single-use
-        consumption mechanism this slice does not build.
+        ``(rink, start, end)`` unique index) -- this facade's write target,
+        a brand new Season, has no such natural key of its own, so the
+        idempotency here comes from an EXPLICIT ledger
+        (``season_copy_forward_commits``, migration 053's UNIQUE index on
+        ``copy_forward_fingerprint``) rather than the write target's own
+        shape. A second commit that reuses the exact same, still-valid
+        fingerprint does NOT mint a second Season and does NOT re-apply the
+        registrations a second time -- it returns the SAME season /
+        registrations / totals the first successful commit produced,
+        exactly as if the client's original request had simply been
+        re-delivered. See ``NewSeasonCopyForwardConcurrencyTest`` for the
+        genuine two-connection race version of this same guarantee.
         """
         def case(api, store):
             fx = _Fixture(api)
@@ -545,22 +590,152 @@ class NewSeasonCopyForwardSqlTest(unittest.TestCase):
                 program_id=fx.program["id"], name="2026-27",
                 source_season_id=fx.src["id"],
                 selections=[fx.selection()], actor_id=ADMIN)
+            fp = preview["copy_forward_fingerprint"]
+            before_seasons = len(store.all_seasons())
             first = api.commit_new_season_copy_forward(
                 program_id=fx.program["id"], name="2026-27",
                 source_season_id=fx.src["id"],
                 selections=[fx.selection()],
-                copy_forward_fingerprint=preview["copy_forward_fingerprint"],
-                actor_id=ADMIN)
+                copy_forward_fingerprint=fp, actor_id=ADMIN)
             self.assertNotIn("error", first, first)
+            after_first_seasons = len(store.all_seasons())
+            self.assertEqual(after_first_seasons, before_seasons + 1)
+            after_first_audits = len(store.all_setup_audit())
             second = api.commit_new_season_copy_forward(
                 program_id=fx.program["id"], name="2026-27",
                 source_season_id=fx.src["id"],
                 selections=[fx.selection()],
-                copy_forward_fingerprint=preview["copy_forward_fingerprint"],
-                actor_id=ADMIN)
+                copy_forward_fingerprint=fp, actor_id=ADMIN)
             self.assertNotIn("error", second, second)
-            self.assertNotEqual(first["season"]["id"], second["season"]["id"])
+            self.assertEqual(second["season"]["id"], first["season"]["id"])
+            self.assertEqual(second["registrations"], first["registrations"])
+            self.assertEqual(second["totals"], first["totals"])
+            # No second Season, no second registration batch, no new audit
+            # rows: the second attempt's own writes were fully rolled back
+            # when its ledger insert lost the fingerprint race.
+            self.assertEqual(len(store.all_seasons()), after_first_seasons)
+            self.assertEqual(len(store.all_setup_audit()), after_first_audits)
+            new_regs = store.registrations_for_season(first["season"]["id"])
+            self.assertEqual(len(new_regs), 1)  # not duplicated
         self._run(case)
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL required (set TEST_DATABASE_URL)")
+class NewSeasonCopyForwardConcurrencyTest(unittest.TestCase):
+    """Real two-connection PostgreSQL races (#159 review round 2): two
+    GENUINELY concurrent ``commit_new_season_copy_forward`` calls -- two
+    real database connections, launched together via ``threading.Barrier``
+    so neither starts before the other is ready, not two sequential calls
+    -- carrying the IDENTICAL ``copy_forward_fingerprint``. Exactly one
+    Season is ever created for that fingerprint; the loser receives the
+    winner's exact result, never a second Season, never a partial/torn
+    write. Mirrors ``test_season_lifecycle_concurrency.py``'s
+    ``SeasonArchiveRaceTest`` barrier pattern -- the house pattern for a
+    real two-connection race in this codebase."""
+
+    def setUp(self):
+        self.url = os.environ["TEST_DATABASE_URL"]
+        SqlStore(self.url).clear_all_data()
+
+    def _seed(self):
+        store = SqlStore(self.url)
+        api = ApiService(store)
+        fx = _Fixture(api)
+        sel = [fx.selection()]
+        preview = api.preview_new_season_copy_forward(
+            program_id=fx.program["id"], name="2026-27",
+            source_season_id=fx.src["id"], selections=sel, actor_id=ADMIN)
+        return fx, sel, preview["copy_forward_fingerprint"]
+
+    def test_concurrent_commits_with_the_same_fingerprint_create_exactly_one_season(self):
+        fx, sel, fp = self._seed()
+        before_seasons = {s.id for s in SqlStore(self.url).all_seasons()}
+        api_a = ApiService(SqlStore(self.url))
+        api_b = ApiService(SqlStore(self.url))
+        barrier = threading.Barrier(2)
+        results = {}
+
+        def commit(api, key):
+            barrier.wait()
+            results[key] = api.commit_new_season_copy_forward(
+                program_id=fx.program["id"], name="2026-27",
+                source_season_id=fx.src["id"], selections=sel,
+                copy_forward_fingerprint=fp, actor_id=ADMIN)
+
+        ta = threading.Thread(target=commit, args=(api_a, "a"))
+        tb = threading.Thread(target=commit, args=(api_b, "b"))
+        ta.start(); tb.start(); ta.join(20); tb.join(20)
+
+        # Neither side ever sees an error: the loser gets the winner's
+        # result, not a refusal.
+        self.assertNotIn("error", results.get("a", {}), results)
+        self.assertNotIn("error", results.get("b", {}), results)
+        # Both calls report the SAME Season -- never two distinct ones,
+        # regardless of which connection's INSERT actually won the race.
+        self.assertEqual(results["a"]["season"]["id"],
+                         results["b"]["season"]["id"], results)
+        self.assertEqual(results["a"]["totals"], results["b"]["totals"])
+        self.assertEqual(results["a"]["registrations"],
+                         results["b"]["registrations"])
+        check = SqlStore(self.url)
+        new_season_ids = {s.id for s in check.all_seasons()} - before_seasons
+        self.assertEqual(len(new_season_ids), 1, new_season_ids)  # exactly one
+        won_season_id = next(iter(new_season_ids))
+        self.assertEqual(results["a"]["season"]["id"], won_season_id)
+        # Registrations applied exactly once, not twice.
+        regs = check.registrations_for_season(won_season_id)
+        self.assertEqual(len(regs), 1, regs)
+        # Exactly one ledger row for this fingerprint, naming the winner.
+        ledger = check.get_season_copy_forward_commit_by_fingerprint(fp)
+        self.assertIsNotNone(ledger)
+        self.assertEqual(ledger.season_id, won_season_id)
+        # No orphaned audit trail from the loser's rolled-back attempt: the
+        # winner's own season_created / registered / committed rows are the
+        # only ones naming this Season.
+        season_audits = [a for a in check.all_setup_audit()
+                         if a.entity_id == won_season_id
+                         and a.action == "season_created"]
+        self.assertEqual(len(season_audits), 1, season_audits)
+
+    def test_concurrent_commit_racing_a_sequential_replay_still_one_season(self):
+        """The reverse arrival order (#159 review round 2's "both possible
+        arrival orders"): a commit already succeeded SEQUENTIALLY before the
+        second one starts, so by the time this test's own two threads race,
+        one of them is really racing an ALREADY-COMMITTED fingerprint --
+        exactly the sequential-replay case, but launched through the same
+        concurrent barrier harness to prove it converges the same way even
+        under real thread/connection scheduling."""
+        fx, sel, fp = self._seed()
+        first = ApiService(SqlStore(self.url)).commit_new_season_copy_forward(
+            program_id=fx.program["id"], name="2026-27",
+            source_season_id=fx.src["id"], selections=sel,
+            copy_forward_fingerprint=fp, actor_id=ADMIN)
+        self.assertNotIn("error", first, first)
+        before_seasons = {s.id for s in SqlStore(self.url).all_seasons()}
+        api_a = ApiService(SqlStore(self.url))
+        api_b = ApiService(SqlStore(self.url))
+        barrier = threading.Barrier(2)
+        results = {}
+
+        def commit(api, key):
+            barrier.wait()
+            results[key] = api.commit_new_season_copy_forward(
+                program_id=fx.program["id"], name="2026-27",
+                source_season_id=fx.src["id"], selections=sel,
+                copy_forward_fingerprint=fp, actor_id=ADMIN)
+
+        ta = threading.Thread(target=commit, args=(api_a, "a"))
+        tb = threading.Thread(target=commit, args=(api_b, "b"))
+        ta.start(); tb.start(); ta.join(20); tb.join(20)
+
+        self.assertNotIn("error", results.get("a", {}), results)
+        self.assertNotIn("error", results.get("b", {}), results)
+        self.assertEqual(results["a"]["season"]["id"], first["season"]["id"])
+        self.assertEqual(results["b"]["season"]["id"], first["season"]["id"])
+        check = SqlStore(self.url)
+        # No NEW season beyond the one the sequential first commit created.
+        self.assertEqual({s.id for s in check.all_seasons()}, before_seasons)
 
 
 class NewSeasonCopyForwardHttpTest(unittest.TestCase):
@@ -679,6 +854,68 @@ class NewSeasonCopyForwardHttpTest(unittest.TestCase):
         self.assertTrue(committed["committed"])
         self.assertEqual(committed["season"]["program_id"], program["id"])
         self.assertEqual(len(committed["registrations"]), 1)
+
+    def test_sequential_commit_replay_over_http_is_idempotent(self):
+        """#159 review round 2: two SEQUENTIAL authenticated HTTP commits
+        carrying the SAME copy_forward_fingerprint return the SAME Season,
+        not two distinct ones -- the exact double-submit shape the owner's
+        review demonstrated as a live bug against this route."""
+        c, program, src, league, team = self._hierarchy("H4")
+        body = self._preview_body(program, src, league, team)
+        status, preview = self._session(
+            c, "/api/v2/setup/seasons/copy-forward/preview", body)
+        self.assertEqual(status, 200, preview)
+        commit_body = dict(body, copy_forward_fingerprint=preview[
+            "copy_forward_fingerprint"])
+        status1, first = self._session(
+            c, "/api/v2/setup/seasons/copy-forward/commit", commit_body)
+        self.assertEqual(status1, 200, first)
+        status2, second = self._session(
+            c, "/api/v2/setup/seasons/copy-forward/commit", commit_body)
+        self.assertEqual(status2, 200, second)
+        self.assertEqual(first["season"]["id"], second["season"]["id"])
+        self.assertEqual(first["registrations"], second["registrations"])
+        self.assertEqual(first["totals"], second["totals"])
+        program_seasons = [s for s in STATE.api.store.all_seasons()
+                          if s.program_id == program["id"]
+                          and s.id != src["id"]]
+        self.assertEqual(len(program_seasons), 1, program_seasons)
+
+    def test_concurrent_commit_replay_over_http_is_idempotent(self):
+        """#159 review round 2, GENUINE concurrent replay: two real
+        concurrent authenticated HTTP requests (two threads, two separate
+        client connections) carrying the SAME copy_forward_fingerprint --
+        not two sequential calls -- still produce exactly one Season, and
+        both responses name it."""
+        c, program, src, league, team = self._hierarchy("H6")
+        body = self._preview_body(program, src, league, team)
+        status, preview = self._session(
+            c, "/api/v2/setup/seasons/copy-forward/preview", body)
+        self.assertEqual(status, 200, preview)
+        commit_body = dict(body, copy_forward_fingerprint=preview[
+            "copy_forward_fingerprint"])
+        barrier = threading.Barrier(2)
+        results = {}
+
+        def commit(key):
+            barrier.wait()
+            results[key] = self._session(
+                c, "/api/v2/setup/seasons/copy-forward/commit", commit_body)
+
+        ta = threading.Thread(target=commit, args=("a",))
+        tb = threading.Thread(target=commit, args=("b",))
+        ta.start(); tb.start(); ta.join(20); tb.join(20)
+
+        status_a, body_a = results["a"]
+        status_b, body_b = results["b"]
+        self.assertEqual(status_a, 200, body_a)
+        self.assertEqual(status_b, 200, body_b)
+        self.assertEqual(body_a["season"]["id"], body_b["season"]["id"])
+        self.assertEqual(body_a["totals"], body_b["totals"])
+        program_seasons = [s for s in STATE.api.store.all_seasons()
+                          if s.program_id == program["id"]
+                          and s.id != src["id"]]
+        self.assertEqual(len(program_seasons), 1, program_seasons)
 
     def test_commit_without_a_prior_preview_is_refused(self):
         c, program, src, league, team = self._hierarchy("H2")
