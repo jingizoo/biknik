@@ -161,6 +161,23 @@ class SeasonCopyForwardCommit:
     between). ``rolled_forward``/``skipped`` are copied from the same
     original call for the identical reason: ``skipped`` in particular has
     no row of its own to re-derive from current state.
+
+    ``response_snapshot`` (#159 review round 3, owner P1) is the
+    FULLY-RESOLVED response payload itself -- ``{"season": {...},
+    "registrations": [{...}, ...], "totals": {...}}``, every value already
+    JSON-safe -- captured in the SAME transaction as the Season and
+    registrations it describes. ``registration_ids`` above still names
+    which rows were created (kept for that record and for any external
+    reader that wants the raw ids), but it is no longer how a replay is
+    built: re-deriving the response by re-fetching those ids' CURRENT rows
+    was the root cause of a whole class of bugs -- the source Team getting
+    unregistered, the target registration getting deleted, or the target
+    Season itself getting deleted all silently changed what a replay of an
+    old, already-successful commit returned, or broke it outright. A
+    replay now deserializes ``response_snapshot`` directly and touches
+    neither the ``seasons`` nor ``season_team_registrations`` tables at
+    all, so it is immune to every later mutation of either. See
+    ``SetupService._copy_forward_result_from_ledger_row``.
     """
     id: str
     copy_forward_fingerprint: str
@@ -170,6 +187,7 @@ class SeasonCopyForwardCommit:
     rolled_forward: int = 0
     skipped: int = 0
     committed_at: Optional[datetime] = None
+    response_snapshot: dict = field(default_factory=dict)
 
 
 @dataclass
