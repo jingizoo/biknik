@@ -192,6 +192,12 @@ class MigrationApplyTest(unittest.TestCase):
             # adoption's re-run of 052 lands on a table that genuinely does
             # not exist yet, rather than "table already exists".
             cur.execute("DROP TABLE IF EXISTS epoch_fence_version")
+            # #159 review round 2, migration 053: the copy-forward commit
+            # idempotency ledger is another brand-new CREATE TABLE, same
+            # shape as epoch_fence_version (052) immediately above — drop it
+            # (its UNIQUE index goes with it) so adoption's re-run of 053
+            # lands on a table that genuinely does not exist yet.
+            cur.execute("DROP TABLE IF EXISTS season_copy_forward_commits")
             cur.execute("DELETE FROM schema_migrations")
             cur.execute("INSERT INTO schema_migrations(version, applied_at) "
                         "VALUES ('0001_initial', '2026-01-01')")
@@ -258,6 +264,15 @@ class MigrationApplyTest(unittest.TestCase):
                 0,
                 "an unbumped key on a freshly-adopted database must read 0, "
                 "not raise or read something stale")
+            # #159 review round 2, migration 053: the copy-forward commit
+            # idempotency ledger re-created on adoption, same shape as the
+            # epoch fence check immediately above.
+            self.assertIn("season_copy_forward_commits", adopted_tables)
+            self.assertIsNone(
+                adopted.get_season_copy_forward_commit_by_fingerprint(
+                    "some-fingerprint-nobody-committed"),
+                "an unknown fingerprint on a freshly-adopted database must "
+                "read None, not raise or read something stale")
             self.assertIn("league_season_id", _table_columns(adopted, "divisions"))
             self.assertIn("program_id", _table_columns(adopted, "leagues"))
             self.assertIn("league_id", _table_columns(adopted, "teams"))
