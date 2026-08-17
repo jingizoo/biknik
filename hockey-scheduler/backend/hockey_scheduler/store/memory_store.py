@@ -1301,6 +1301,17 @@ class InMemoryStore:
                 return row
         return None
 
+    def season_copy_forward_commits_for_season(
+            self, season_id: str) -> List[SeasonCopyForwardCommit]:
+        """Every ledger row naming ``season_id`` as the Season a copy-forward
+        commit produced (#159 review round 3) -- at most one in practice
+        (each commit mints a brand-new Season and writes exactly one row
+        for it, in the same transaction), but returned as a list like every
+        other ``*_for_season`` dependency query so ``delete_season`` can
+        itemize it the same way as team registrations/games/venue access."""
+        return [row for row in self.season_copy_forward_commits.values()
+                if row.season_id == season_id]
+
     def add_factory_reset_event(self, event: FactoryResetEvent) -> FactoryResetEvent:
         self.factory_reset_events.append(event)
         return event

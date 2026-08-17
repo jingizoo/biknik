@@ -199,7 +199,8 @@ SPECS = {
         SeasonTeamRegistration, "season_team_registrations", {"active": _bool()}),
     SeasonCopyForwardCommit: Spec(
         SeasonCopyForwardCommit, "season_copy_forward_commits",
-        {"registration_ids": _jsonl(), "committed_at": _dt()}),
+        {"registration_ids": _jsonl(), "committed_at": _dt(),
+         "response_snapshot": _jsonc()}),
     TeamLeagueMigrationDecision: Spec(
         TeamLeagueMigrationDecision, "team_league_migration_decisions"),
     SeasonVenueAccess: Spec(
@@ -1803,6 +1804,14 @@ class SqlStore:
     def get_season_copy_forward_commit_by_fingerprint(self, fingerprint):
         return self._first(SeasonCopyForwardCommit,
                            "copy_forward_fingerprint = ?", (fingerprint,))
+
+    def season_copy_forward_commits_for_season(self, season_id):
+        """Every ledger row naming ``season_id`` (#159 review round 3) --
+        mirrors ``season_venue_access_for_season``'s shape so
+        ``delete_season`` can itemize it the same way as its other
+        dependency groups."""
+        return self._query(SeasonCopyForwardCommit, "season_id = ?",
+                           (season_id,), order="id")
 
     def add_factory_reset_event(self, event): return self._insert(event)
     def all_factory_reset_events(self):
