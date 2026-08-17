@@ -3033,6 +3033,76 @@ class SetupService:
     # a Division and need one assigned afterward (create the Division under
     # the new Season, then reassign — both already-existing tools, out of
     # scope to extend further here).
+    # -- copy-forward commit ledger: immutable response snapshot (#159
+    # review round 3, owner P1, structural change 1) ------------------------
+    # Explicit, non-generic (de)serializers for exactly the two dataclasses
+    # a commit's response carries — NOT a reflective/generic dataclass walk
+    # — so a datetime/enum field is never silently handed to ``json.dumps``
+    # unconverted, and reconstruction always produces a real ``Season``/
+    # ``SeasonTeamRegistration`` instance (not a plain dict) so the facade's
+    # existing ``_serialize``/``_registration_dict`` keep working completely
+    # unchanged on a replay — they cannot tell a reconstructed row from a
+    # freshly queried one. Deliberately local to this module rather than
+    # importing api/service.py's own ``_jsonify``: services/ must not depend
+    # on api/, the reverse of this codebase's layering (see CLAUDE.md).
+    @staticmethod
+    def _copy_forward_season_snapshot(season: Season) -> dict:
+        return {
+            "id": season.id, "program_id": season.program_id,
+            "name": season.name,
+            "start_date": (season.start_date.isoformat()
+                           if season.start_date else None),
+            "end_date": (season.end_date.isoformat()
+                        if season.end_date else None),
+            "external_ref": season.external_ref,
+            "status": season.status.value if season.status else None,
+            "archived_at": (season.archived_at.isoformat()
+                            if season.archived_at else None),
+        }
+
+    @staticmethod
+    def _copy_forward_season_from_snapshot(data: dict) -> Season:
+        return Season(
+            id=data["id"], program_id=data.get("program_id"),
+            name=data.get("name"),
+            start_date=(datetime.fromisoformat(data["start_date"])
+                       if data.get("start_date") else None),
+            end_date=(datetime.fromisoformat(data["end_date"])
+                     if data.get("end_date") else None),
+            external_ref=data.get("external_ref"),
+            status=(SeasonStatus(data["status"]) if data.get("status")
+                   else SeasonStatus.ACTIVE),
+            archived_at=(datetime.fromisoformat(data["archived_at"])
+                        if data.get("archived_at") else None))
+
+    @staticmethod
+    def _copy_forward_registration_snapshot(
+            reg: SeasonTeamRegistration) -> dict:
+        return {"id": reg.id, "league_season_id": reg.league_season_id,
+                "team_id": reg.team_id, "division_id": reg.division_id,
+                "active": reg.active}
+
+    @staticmethod
+    def _copy_forward_registration_from_snapshot(
+            data: dict) -> SeasonTeamRegistration:
+        return SeasonTeamRegistration(
+            id=data["id"], league_season_id=data.get("league_season_id"),
+            team_id=data.get("team_id"), division_id=data.get("division_id"),
+            active=bool(data.get("active")))
+
+    def _copy_forward_response_snapshot(self, *, season, registrations,
+                                        totals) -> dict:
+        """The full immutable snapshot stored on the ledger row at commit
+        time — season + registrations + totals, every value already
+        JSON-safe. See migration 054 and ``SeasonCopyForwardCommit.
+        response_snapshot``."""
+        return {
+            "season": self._copy_forward_season_snapshot(season),
+            "registrations": [self._copy_forward_registration_snapshot(r)
+                              for r in registrations],
+            "totals": dict(totals),
+        }
+
     def _has_matching_copy_forward_preview_audit(self, actor_id, fingerprint):
         """True if ``actor_id`` recorded a successful
         ``new_season_copy_forward_previewed`` audit for exactly
@@ -3288,11 +3358,39 @@ class SetupService:
         — does NOT mint a second, distinct Season. A durable ledger
         (``season_copy_forward_commits``, migration 053's UNIQUE index on
         ``copy_forward_fingerprint``) records which Season each fingerprint
-        actually produced; a PRE-CHECK below, run AFTER the preview-binding
-        checks but BEFORE any write, returns that Season's exact original
-        season/registrations/totals instead of creating a second one — the
-        standard REST idempotency-key replay, exactly as if this caller's
-        own request had simply been re-delivered.
+        actually produced and — since #159 review round 3 — the FULLY-
+        RESOLVED response itself (``response_snapshot``, migration 054); a
+        replay returns that immutable snapshot instead of creating a
+        second Season — the standard REST idempotency-key replay, exactly
+        as if this caller's own request had simply been re-delivered.
+
+        REPLAY ORDER, AND WHY IT CHANGED (#159 review round 3, owner P1):
+        the ledger is now consulted FIRST — keyed by the caller-supplied
+        ``copy_forward_fingerprint`` directly, before any Team/League lock
+        and before ``_resolve_copy_forward_plan`` re-validates anything —
+        and, on a hit, ``_copy_forward_result_from_ledger_row`` deserializes
+        ``response_snapshot`` and returns it WITHOUT touching the
+        ``seasons`` or ``season_team_registrations`` tables at all. Before
+        this round, the plan was re-resolved (and the ledger only checked
+        AFTER) — which re-validated the SOURCE Season's current
+        registrations, so once the selected Team was unregistered from the
+        source Season, a byte-identical replay of an already-successful
+        fingerprint raised ``Team ... is not registered in the source
+        season`` instead of returning the original result. Worse, the OLD
+        replay path rebuilt its response by re-fetching
+        ``registration_ids`` from the CURRENT store — so once the target
+        registration (or the target Season itself) was deleted through an
+        otherwise fully supported operation, a replay silently returned
+        ``registrations: []`` beside a ledger that still said
+        ``rolled_forward: 1``, or (worse) ``season: null``. All three are
+        closed the same way: the ledger hit is authoritative and
+        self-contained, so nothing that happens to the source Season, the
+        target registrations, or (per ``delete_season``'s own itemized
+        ``copy_forward_commit`` dependency, added the same round) the
+        target Season can ever change what a replay of a given fingerprint
+        returns. The full plan re-resolution below still runs — but ONLY
+        when there is no ledger hit, i.e. either a genuinely new
+        fingerprint or the race-loser path the next paragraph describes.
 
         WHY A PRE-CHECK, NOT A CATCH-ON-CONFLICT (the design this replaced
         in self-review): this method runs under ``setup_guarded_create``
@@ -3333,8 +3431,48 @@ class SetupService:
         ``test_sequential_commit_replay_over_http_is_idempotent`` /
         ``test_concurrent_commit_replay_over_http_is_idempotent`` for both
         proved again through the REAL nested ``setup_guarded_create``
-        transaction this docstring describes.
+        transaction this docstring describes. See (same file)
+        ``test_replay_survives_source_team_unregistered_after_commit``,
+        ``test_replay_survives_target_registration_deleted_after_commit``,
+        and ``test_target_season_delete_is_blocked_then_replay_stays_
+        stable`` / ``test_target_season_delete_blocked_by_copy_forward_
+        commit_never_raw_fk`` for the three #159 review round 3 scenarios
+        this reordering and the itemized ``delete_season`` dependency
+        close, and ``test_delete_vs_replay_race_delete_stays_blocked_
+        replay_stays_stable`` for the required real two-connection
+        delete-vs-replay race.
         """
+        # #159 review round 3 (owner P1, structural change 1): authenticate
+        # + authorize already happened at the HTTP boundary (server.py) —
+        # this is the service entrypoint — so the FIRST thing this method
+        # does is validate the fingerprint is well-formed and, if so, check
+        # the idempotency ledger BEFORE anything else: before either
+        # Team/League lock below and before _resolve_copy_forward_plan
+        # re-validates ANY mutable state (the source Season's current
+        # registrations, the selections, the Program). ``None`` is refused
+        # immediately, exactly as before this round. Anything else that is
+        # not a non-blank string can never correctly be a store lookup key
+        # (a non-string bound straight to a SQL parameter would crash the
+        # driver instead of raising a structured error — see
+        # SqlStore._query's ``?`` binding), so it is deliberately left
+        # untouched for the UNCHANGED plan/fingerprint-mismatch path below
+        # to refuse in the usual, structured ``preview_mismatch`` shape —
+        # exactly what a malformed fingerprint already got before this
+        # round, since the OLD code never used the raw caller-supplied
+        # value as a lookup key either (only ``plan["fingerprint"]``, a
+        # value this method always computes itself).
+        if copy_forward_fingerprint is None:
+            raise ValidationError(
+                "Preview this copy-forward before committing it.",
+                details={"reason": "preview_required"})
+        if (isinstance(copy_forward_fingerprint, str)
+                and not _blank(copy_forward_fingerprint)):
+            early_replay = (
+                self.store.get_season_copy_forward_commit_by_fingerprint(
+                    copy_forward_fingerprint))
+            if early_replay is not None:
+                return self._copy_forward_result_from_ledger_row(
+                    early_replay)
         # Lock every distinct Team/League named in selections FIRST, sorted —
         # roll_forward_registrations_v2's own canonical lock order (#159), so
         # a batch can never deadlock Team-vs-Team or League-vs-League, and
@@ -3369,12 +3507,10 @@ class SetupService:
             selections=selections)
         # Preview binding (#158-review pattern): a commit MUST be preceded by
         # a preview of the SAME resolved plan BY THE SAME actor — the
-        # fingerprint alone is not a capability, so all three checks below
-        # must hold, and they run BEFORE any write.
-        if copy_forward_fingerprint is None:
-            raise ValidationError(
-                "Preview this copy-forward before committing it.",
-                details={"reason": "preview_required"})
+        # fingerprint alone is not a capability, so both checks below must
+        # hold, and they run BEFORE any write. (The "is None" refusal now
+        # lives at the very top of this method, before the early ledger
+        # check — copy_forward_fingerprint can never be None by this point.)
         if copy_forward_fingerprint != plan["fingerprint"]:
             raise ScheduleConflictError(
                 "This copy-forward plan changed since it was previewed. "
@@ -3387,15 +3523,18 @@ class SetupService:
                 "No matching preview by this operator for this "
                 "copy-forward plan. Preview it before committing.",
                 details={"reason": "preview_required"})
-        # Idempotent-replay pre-check (#159 review round 2 — see this
-        # method's own docstring for WHY a pre-check rather than a
-        # catch-on-conflict): this exact fingerprint may already have been
-        # committed, either by an earlier sequential call or by a
-        # concurrent racer that reached this point first and fully
-        # committed while THIS call was still blocked on the Team/League
-        # locks above. A plain read, no exception, no write attempted — so
-        # it is correct and side-effect-free whether this transaction is
-        # this call's own outermost one or nested inside an ancestor's.
+        # SECOND idempotent-replay check (#159 review round 2 originally;
+        # round 3 narrows what it is FOR). The EARLY check at the top of
+        # this method already handles every ordinary replay of an
+        # already-committed fingerprint without reaching here at all. This
+        # one exists purely for the residual genuine-race window: a
+        # fingerprint that was BRAND NEW when this call started (the early
+        # check found nothing) but has since been committed by a concurrent
+        # racer that reached the ledger INSERT below first, while THIS call
+        # was still blocked acquiring the Team/League locks above. A plain
+        # read, no exception, no write attempted — so it is correct and
+        # side-effect-free whether this transaction is this call's own
+        # outermost one or nested inside an ancestor's.
         already_committed = (
             self.store.get_season_copy_forward_commit_by_fingerprint(
                 plan["fingerprint"]))
@@ -3424,6 +3563,9 @@ class SetupService:
                 "copy_forward_fingerprint": plan["fingerprint"],
                 "rolled_forward": applied["rolled_forward"],
                 "skipped": applied["skipped"]})
+        result = {"season": season, "registrations": applied["registrations"],
+                  "totals": {"rolled_forward": applied["rolled_forward"],
+                            "skipped": applied["skipped"]}}
         # Atomically consume the fingerprint (#159 review round 2): the
         # LAST statement of this transaction, so migration 053's UNIQUE
         # index is the final word on whether THIS attempt or a racing one
@@ -3443,6 +3585,18 @@ class SetupService:
         # retry (already used for the same class of row-moved-under-us
         # race elsewhere in that method) re-runs this method from scratch
         # and lands cleanly on the pre-check above.
+        #
+        # ``response_snapshot`` (#159 review round 3, structural change 1)
+        # is built from ``result`` — the season/registrations THIS
+        # transaction just created — right here, still inside the same
+        # transaction, so it is a byte-accurate record of what this commit
+        # actually produced. Every future replay of this fingerprint
+        # deserializes this blob and returns it verbatim; it is never
+        # rebuilt by re-querying ``seasons``/``season_team_registrations``
+        # again, so nothing that later mutates either table (unregistering
+        # the source Team, deleting the target registration — deleting the
+        # target Season itself is refused outright, see delete_season's own
+        # itemized ``copy_forward_commit`` dependency) can change it.
         try:
             self.store.add_season_copy_forward_commit(
                 SeasonCopyForwardCommit(
@@ -3452,7 +3606,11 @@ class SetupService:
                     registration_ids=[r.id
                                      for r in applied["registrations"]],
                     rolled_forward=applied["rolled_forward"],
-                    skipped=applied["skipped"], committed_at=self.clock()))
+                    skipped=applied["skipped"], committed_at=self.clock(),
+                    response_snapshot=self._copy_forward_response_snapshot(
+                        season=result["season"],
+                        registrations=result["registrations"],
+                        totals=result["totals"])))
         except IntegrityConflictError as exc:
             if exc.details.get("reason") != "copy_forward_already_committed":
                 raise
@@ -3461,24 +3619,37 @@ class SetupService:
                 "please retry.",
                 details={"reason": "copy_forward_fingerprint_conflict",
                          "retryable": True}) from exc
-        return {"season": season, "registrations": applied["registrations"],
-                "totals": {"rolled_forward": applied["rolled_forward"],
-                           "skipped": applied["skipped"]}}
+        return result
 
     def _copy_forward_result_from_ledger_row(self, row) -> dict:
         """Rebuild the exact success shape ``commit_new_season_copy_
-        forward`` returns from an ALREADY-committed ledger row (#159
-        review round 2's idempotent-replay pre-check). ``registration_ids``
-        is the snapshot the original commit recorded, not a fresh query, so
-        this returns precisely what THAT commit produced even if the
-        Season has since been legitimately extended by other means."""
-        season = self.store.get_season(row.season_id)
-        registrations = [r for r in (
-            self.store.get_season_team_registration(rid)
-            for rid in row.registration_ids) if r is not None]
-        return {"season": season, "registrations": registrations,
-                "totals": {"rolled_forward": row.rolled_forward,
-                           "skipped": row.skipped}}
+        forward`` returns from an ALREADY-committed ledger row, by
+        deserializing its immutable ``response_snapshot`` (#159 review
+        round 3, structural change 1) — NEVER by touching the ``seasons``
+        or ``season_team_registrations`` tables. The OLD implementation
+        (#159 review round 2) re-fetched ``row.season_id`` and each id in
+        ``row.registration_ids`` from those live tables, which is exactly
+        what let a later, unrelated mutation of either — unregistering the
+        source Team (which the plan re-resolution this replay path used to
+        run BEFORE reaching here would then reject), deleting the target
+        registration, or deleting the target Season — silently change or
+        break what a replay of an already-successful commit returned. This
+        version returns precisely, byte-for-byte, what THAT original
+        commit produced, regardless of anything that has happened to
+        either table since — reconstructing real ``Season``/
+        ``SeasonTeamRegistration`` instances (not plain dicts) so the
+        facade's existing ``_serialize``/``_registration_dict`` calls on
+        the result work completely unchanged, exactly as they do for a
+        freshly-created commit."""
+        snap = row.response_snapshot or {}
+        return {
+            "season": self._copy_forward_season_from_snapshot(snap["season"]),
+            "registrations": [
+                self._copy_forward_registration_from_snapshot(r)
+                for r in snap.get("registrations", [])],
+            "totals": snap.get("totals") or {
+                "rolled_forward": row.rolled_forward, "skipped": row.skipped},
+        }
 
     # -- reassignment: move a record under a new parent (#166 PR D) --------
     # Each records the old→new parent id in the audit detail so a move is
@@ -8967,6 +9138,27 @@ class SetupService:
         venue_access = self.store.season_venue_access_for_season(season_id)
         scenarios = [s for s in self.store.all_schedule_scenarios()
                      if s.season_id == season_id]
+        # Copy-forward commit ledger (#159 review round 3, owner P1,
+        # structural change 2): a Season this route MINTED is named by
+        # exactly the row(s) SeasonCopyForwardCommit.season_id points at
+        # it — the same itemized-dependency pattern as every group above,
+        # not a silent orphan and not a raw/generic FK failure. Checked
+        # (and blocked) here, BEFORE ``self.store.delete_season`` below
+        # ever runs, so migration 053's ``season_copy_forward_commits.
+        # season_id`` foreign key is never actually violated: on SQLite
+        # and PostgreSQL alike that would otherwise surface as the
+        # unhelpful generic ``foreign_key_violation`` conflict this same
+        # review reproduced, rather than a named, itemized reason. There
+        # is deliberately no separate "clear this dependency" tool (unlike
+        # team registrations/venue access/games, an operator never creates
+        # or removes a ledger row directly — it exists purely to make a
+        # committed copy-forward's replay response stable) — a Season a
+        # copy-forward commit produced stays permanently undeletable
+        # through this route, which is the tradeoff that guarantees the
+        # replay contract below can never observe a torn or missing
+        # Season. See _copy_forward_result_from_ledger_row.
+        copy_forward_commits = (
+            self.store.season_copy_forward_commits_for_season(season_id))
         self._block_if_dependents("season", season_id, "season", [
             self._dep_group("level", levels, lambda lv: lv.name,
                             display="league"),
@@ -8977,7 +9169,10 @@ class SetupService:
             self._dep_group("schedule scenario", scenarios,
                             lambda s: s.name),
             self._dep_group("venue access", venue_access,
-                            lambda a: self._venue_name(a.venue_id))])
+                            lambda a: self._venue_name(a.venue_id)),
+            self._dep_group("copy_forward_commit", copy_forward_commits,
+                            lambda c: c.copy_forward_fingerprint,
+                            display="copy-forward commit")])
         self._cascade_scheduling_policy(
             PolicyScopeType.SEASON, season_id, actor_id)
         self.store.delete_season(season_id)
