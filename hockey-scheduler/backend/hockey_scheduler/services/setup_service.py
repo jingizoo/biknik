@@ -45,6 +45,7 @@ from ..domain import (
     Rink,
     SchedulingPolicy,
     Season,
+    SeasonCopyForwardCommit,
     SeasonStatus,
     SeasonTeamRegistration,
     SeasonVenueAccess,
@@ -3279,16 +3280,60 @@ class SetupService:
         exactly. A refused commit mutates nothing: no Season row, no
         registrations, no audit beyond the refusal itself.
 
-        UNLIKE ``commit_ice_availability``, this fingerprint is not
-        single-use / consumed on success: a second commit that reuses the
-        same still-valid fingerprint passes all three checks again and
-        mints a SECOND, DISTINCT Season (each commit mints its own new
-        Season by design — the write target here has no natural dedup key
-        the way ice-availability's ``(rink, start, end)`` unique index
-        gives it one). See
-        ``test_second_commit_reusing_a_valid_fingerprint_mints_a_second_season``
-        (tests/test_new_season_copy_forward.py) for the guarantee this
-        implies and does not imply.
+        IDEMPOTENT on the fingerprint (#159 review round 2 — supersedes the
+        original "not single-use" design, which the owner ruled a real
+        double-submit/retry blocker, not an acceptable tradeoff): a second
+        commit that reuses the SAME still-valid fingerprint — a client
+        retry, a double-click, or two genuinely concurrent requests racing
+        — does NOT mint a second, distinct Season. A durable ledger
+        (``season_copy_forward_commits``, migration 053's UNIQUE index on
+        ``copy_forward_fingerprint``) records which Season each fingerprint
+        actually produced; a PRE-CHECK below, run AFTER the preview-binding
+        checks but BEFORE any write, returns that Season's exact original
+        season/registrations/totals instead of creating a second one — the
+        standard REST idempotency-key replay, exactly as if this caller's
+        own request had simply been re-delivered.
+
+        WHY A PRE-CHECK, NOT A CATCH-ON-CONFLICT (the design this replaced
+        in self-review): this method runs under ``setup_guarded_create``
+        (server.py's ``/api/v2/setup/seasons/copy-forward/commit`` route)
+        INSIDE that caller's OWN already-open transaction — ``@_transactional``
+        above then only JOINS it (``SqlStore.transaction()`` is reentrant),
+        it does not become a second, independently-rollback-able unit. A
+        losing attempt that instead caught the ledger INSERT's unique-
+        violation and swallowed it into a normal return would let THAT
+        outer transaction commit normally afterward — persisting the
+        loser's own un-rolled-back Season, exactly the duplicate this fix
+        exists to prevent (caught live: two sequential HTTP commits each
+        returned the SAME season id in their JSON, yet a THIRD Season row
+        with no client-visible id was left behind in the store). The
+        pre-check sidesteps the whole hazard: it is a plain read with no
+        side effect, so it is correct whether this transaction is the
+        outermost one (a direct/test caller) or nested inside an ancestor's
+        (the HTTP route) — nothing here ever needs to unwind a transaction
+        it does not own. The residual INSERT-vs-INSERT race below (the
+        narrow window between this pre-check and the write) still exists
+        for defense in depth, but is vanishingly rare in practice: the SAME
+        fingerprint implies the SAME selections (it hashes them), so two
+        commits racing on one fingerprint already fully serialize on the
+        Team/League locks taken below, before either ever reaches the
+        pre-check — by the time a loser gets past those locks, the winner
+        has already committed, and the pre-check finds it. When that
+        residual race IS lost, this raises a retryable
+        ConcurrencyConflictError rather than catching it: propagating
+        unwinds to whichever transaction is genuinely outermost for this
+        call, and for the HTTP route, ``setup_guarded_create``'s own
+        ``except ConcurrencyConflictError`` retry (already used for the
+        SAME class of row-moved-under-us race elsewhere in that method)
+        re-runs this method from scratch, landing cleanly on the pre-check.
+        See ``test_second_commit_reusing_the_same_fingerprint_is_idempotent``
+        (tests/test_new_season_copy_forward.py) for the sequential guarantee,
+        ``test_concurrent_commits_with_the_same_fingerprint_create_exactly_
+        one_season`` for the genuine two-connection race, and
+        ``test_sequential_commit_replay_over_http_is_idempotent`` /
+        ``test_concurrent_commit_replay_over_http_is_idempotent`` for both
+        proved again through the REAL nested ``setup_guarded_create``
+        transaction this docstring describes.
         """
         # Lock every distinct Team/League named in selections FIRST, sorted —
         # roll_forward_registrations_v2's own canonical lock order (#159), so
@@ -3296,7 +3341,13 @@ class SetupService:
         # the plan rebuilt below can't be shifted by a concurrent transfer or
         # delete landing between this lock and the write. No lock is taken
         # for the Season being minted — nothing can reference its id before
-        # this transaction, which creates it, commits.
+        # this transaction, which creates it, commits. Note: since the SAME
+        # fingerprint implies the SAME selections (it hashes them), two
+        # commits racing on one fingerprint already serialize here — the
+        # ledger pre-check/insert below is the backstop that still holds
+        # even if that ever stops being true (e.g. a future caller re-using
+        # a fingerprint against a hand-built, differently-ordered
+        # selections list).
         if isinstance(selections, list):
             for _tid in sorted({sel.get("team_id") for sel in selections
                                 if isinstance(sel, dict)
@@ -3336,6 +3387,21 @@ class SetupService:
                 "No matching preview by this operator for this "
                 "copy-forward plan. Preview it before committing.",
                 details={"reason": "preview_required"})
+        # Idempotent-replay pre-check (#159 review round 2 — see this
+        # method's own docstring for WHY a pre-check rather than a
+        # catch-on-conflict): this exact fingerprint may already have been
+        # committed, either by an earlier sequential call or by a
+        # concurrent racer that reached this point first and fully
+        # committed while THIS call was still blocked on the Team/League
+        # locks above. A plain read, no exception, no write attempted — so
+        # it is correct and side-effect-free whether this transaction is
+        # this call's own outermost one or nested inside an ancestor's.
+        already_committed = (
+            self.store.get_season_copy_forward_commit_by_fingerprint(
+                plan["fingerprint"]))
+        if already_committed is not None:
+            return self._copy_forward_result_from_ledger_row(
+                already_committed)
         # create_season's own validation already ran above (inside
         # _resolve_copy_forward_plan's _resolve_season_creation call), so
         # build and insert the Season directly rather than re-validating.
@@ -3358,9 +3424,61 @@ class SetupService:
                 "copy_forward_fingerprint": plan["fingerprint"],
                 "rolled_forward": applied["rolled_forward"],
                 "skipped": applied["skipped"]})
+        # Atomically consume the fingerprint (#159 review round 2): the
+        # LAST statement of this transaction, so migration 053's UNIQUE
+        # index is the final word on whether THIS attempt or a racing one
+        # gets to keep the Season just created above. This is the RESIDUAL
+        # race the pre-check above does not close (the narrow window
+        # between that read and this write) — vanishingly rare per this
+        # method's own docstring, but still enforced rather than assumed.
+        # A race-losing INSERT is translated to IntegrityConflictError and
+        # re-raised here as a RETRYABLE ConcurrencyConflictError — NEVER
+        # caught in this method — so it always unwinds to whichever
+        # transaction is genuinely outermost for this call: this method's
+        # own, for a direct caller (which surfaces the retryable conflict,
+        # matching this codebase's house style for an exhausted race, e.g.
+        # commit_ice_availability's own final `raise` after its retry
+        # budget), or setup_guarded_create's wrapping transaction for the
+        # HTTP route, whose existing `except ConcurrencyConflictError`
+        # retry (already used for the same class of row-moved-under-us
+        # race elsewhere in that method) re-runs this method from scratch
+        # and lands cleanly on the pre-check above.
+        try:
+            self.store.add_season_copy_forward_commit(
+                SeasonCopyForwardCommit(
+                    id=self.store.next_id("cfcommit"),
+                    copy_forward_fingerprint=plan["fingerprint"],
+                    season_id=season.id, actor_id=actor_id,
+                    registration_ids=[r.id
+                                     for r in applied["registrations"]],
+                    rolled_forward=applied["rolled_forward"],
+                    skipped=applied["skipped"], committed_at=self.clock()))
+        except IntegrityConflictError as exc:
+            if exc.details.get("reason") != "copy_forward_already_committed":
+                raise
+            raise ConcurrencyConflictError(
+                "This copy-forward was just committed by another request; "
+                "please retry.",
+                details={"reason": "copy_forward_fingerprint_conflict",
+                         "retryable": True}) from exc
         return {"season": season, "registrations": applied["registrations"],
                 "totals": {"rolled_forward": applied["rolled_forward"],
                            "skipped": applied["skipped"]}}
+
+    def _copy_forward_result_from_ledger_row(self, row) -> dict:
+        """Rebuild the exact success shape ``commit_new_season_copy_
+        forward`` returns from an ALREADY-committed ledger row (#159
+        review round 2's idempotent-replay pre-check). ``registration_ids``
+        is the snapshot the original commit recorded, not a fresh query, so
+        this returns precisely what THAT commit produced even if the
+        Season has since been legitimately extended by other means."""
+        season = self.store.get_season(row.season_id)
+        registrations = [r for r in (
+            self.store.get_season_team_registration(rid)
+            for rid in row.registration_ids) if r is not None]
+        return {"season": season, "registrations": registrations,
+                "totals": {"rolled_forward": row.rolled_forward,
+                           "skipped": row.skipped}}
 
     # -- reassignment: move a record under a new parent (#166 PR D) --------
     # Each records the old→new parent id in the audit detail so a move is
