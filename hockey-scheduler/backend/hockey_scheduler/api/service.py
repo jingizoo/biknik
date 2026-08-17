@@ -11057,6 +11057,43 @@ class ApiService:
                 "registrations": [self._registration_dict(r)
                                   for r in result["registrations"]]}
 
+    # New-Season copy-forward (#159): preview then atomically create a Season
+    # AND carry forward Team/League registrations from a source Season in one
+    # guarded step. Modeled on preview_ice_availability/commit_ice_availability
+    # (#158)'s fingerprint pattern; see SetupService.preview_new_season_copy_
+    # forward for the full division-carry-forward contract.
+    @catch
+    def preview_new_season_copy_forward(
+            self, program_id: str = None, name: str = None,
+            start_date: Optional[str] = None, end_date: Optional[str] = None,
+            source_season_id: str = None, selections: Optional[list] = None,
+            actor_id: Optional[str] = None) -> dict:
+        return self.setup.preview_new_season_copy_forward(
+            program_id=program_id, name=name, start_date=start_date,
+            end_date=end_date, source_season_id=source_season_id,
+            selections=selections, actor_id=actor_id)
+
+    @catch
+    def commit_new_season_copy_forward(
+            self, program_id: str = None, name: str = None,
+            start_date: Optional[str] = None, end_date: Optional[str] = None,
+            source_season_id: str = None, selections: Optional[list] = None,
+            copy_forward_fingerprint: Optional[str] = None,
+            actor_id: Optional[str] = None) -> dict:
+        result = self.setup.commit_new_season_copy_forward(
+            program_id=program_id, name=name, start_date=start_date,
+            end_date=end_date, source_season_id=source_season_id,
+            selections=selections,
+            copy_forward_fingerprint=copy_forward_fingerprint,
+            actor_id=actor_id)
+        return {
+            "committed": True,
+            "season": _serialize(result["season"]),
+            "registrations": [self._registration_dict(r)
+                              for r in result["registrations"]],
+            "totals": result["totals"],
+        }
+
     @catch
     def list_season_team_registrations(self, season_id: str) -> dict:
         rows = [self._registration_dict(r)

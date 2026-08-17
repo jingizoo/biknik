@@ -2302,6 +2302,48 @@ REGISTRY = (
               auth="session+MANAGE_SETUP",
               scope_axis='cross',
               note=("#202: Permission.MANAGE_SETUP (authz.py:74-82 default) -- League Admin only. _guarded_mutation([('season', id)], ...) (server.py:4446-4482); service.py:1858-1859 season in _SEASON_OWNED_TARGET_KINDS -> both Program AND Season required (service.py:1899-1972 _mutation_context_error)")),
+    RouteSpec("POST", r"^/api/v2/setup/seasons/copy-forward/commit$",
+              "/api/v2/setup/seasons/copy-forward/commit",
+              "post_v2_setup_seasons_copy_forward_commit", "_handle_setup_v2",
+              auth="session+MANAGE_SETUP",
+              scope_axis='program',
+              note=("#159: Permission.MANAGE_SETUP (authz.py new "
+                    "seasons/copy-forward/(preview|commit) rule, mirroring "
+                    "the roll-forward/archive/reopen rule just above it). "
+                    "_guarded_create('season', [('program', pid), "
+                    "('season', source_season_id, 'program')], ...) "
+                    "(server.py:5163-5191); service.py:2369 season in "
+                    "_CREATE_PROGRAM_AXIS -- SAME kind create_season itself "
+                    "mints (server.py:5291), reused here because the write "
+                    "target is a Season this call MINTS, not one it "
+                    "consumes, exactly like create_season. source_season_id "
+                    "is READ (its registrations are carried forward), "
+                    "narrowed to the 'program' rule per the roll-forward "
+                    "precedent just above -- see setup_service.py:3050 "
+                    "_resolve_copy_forward_plan / 3266 "
+                    "commit_new_season_copy_forward for the full contract, "
+                    "including the fingerprint-preview-binding gate "
+                    "(mirrors preview_ice_availability/"
+                    "commit_ice_availability, #158)")),
+    RouteSpec("POST", r"^/api/v2/setup/seasons/copy-forward/preview$",
+              "/api/v2/setup/seasons/copy-forward/preview",
+              "post_v2_setup_seasons_copy_forward_preview",
+              "_handle_setup_v2",
+              auth="session+MANAGE_SETUP",
+              scope_axis='program',
+              note=("#159: Permission.MANAGE_SETUP (authz.py new "
+                    "seasons/copy-forward/(preview|commit) rule). "
+                    "_guarded_create('season', [('program', pid), "
+                    "('season', source_season_id, 'program')], ...) "
+                    "(server.py:5163-5191) -- SAME targets/kind as the "
+                    "commit entry just above (one _guarded_create call "
+                    "ternary-selects the mutation callable on "
+                    "mcf.group(1), server.py:5179-5191); service.py:2369 "
+                    "season in _CREATE_PROGRAM_AXIS. Side-effect-free aside "
+                    "from a server-attributed preview audit row on success "
+                    "(setup_service.py:3234 preview_new_season_copy_"
+                    "forward) -- mirrors preview_ice_availability's own "
+                    "identical role (#158)")),
     RouteSpec("POST", r"^/api/v2/setup/seasons/[^/]+/archive$",
               "/api/v2/setup/seasons/{}/archive",
               "post_v2_setup_seasons_id_archive", "_handle_setup_v2",

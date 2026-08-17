@@ -89,10 +89,13 @@ class RegistryCoversTheDispatchTests(unittest.TestCase):
         #202 repair: 74 GET -> 75 (root cause 6, the static tail: +1) and
         163 POST -> 164 (root cause 1: -12 assign-\\w+ wildcard families +
         13 concrete combo leaves = +1).
+
+        #159: 164 POST -> 166 (new-Season copy-forward preview/commit, two
+        new literal leaves under ``seasons/copy-forward/``).
         """
         self.assertEqual(len(REGISTRY), len(LIVE))
         self.assertEqual(sum(1 for s in REGISTRY if s.method == "GET"), 75)
-        self.assertEqual(sum(1 for s in REGISTRY if s.method == "POST"), 164)
+        self.assertEqual(sum(1 for s in REGISTRY if s.method == "POST"), 166)
 
 
 class RegistryInternalConsistencyTests(unittest.TestCase):
@@ -519,6 +522,8 @@ _EXPECTED_CLASSIFICATION = {
     ("POST", '/api/v2/setup/season-venue-access/{}/delete'): ('session+MANAGE_SETUP', 'cross'),  # post_v2_setup_season_venue_access_id_delete
     ("POST", '/api/v2/setup/season-venue-access/{}/remove'): ('session+MANAGE_SETUP', 'cross'),  # post_v2_setup_season_venue_access_id_remove
     ("POST", '/api/v2/setup/season/{}/delete'): ('session+MANAGE_SETUP', 'cross'),  # post_v2_setup_season_id_delete
+    ("POST", '/api/v2/setup/seasons/copy-forward/commit'): ('session+MANAGE_SETUP', 'program'),  # post_v2_setup_seasons_copy_forward_commit
+    ("POST", '/api/v2/setup/seasons/copy-forward/preview'): ('session+MANAGE_SETUP', 'program'),  # post_v2_setup_seasons_copy_forward_preview
     ("POST", '/api/v2/setup/seasons/{}/archive'): ('session+MANAGE_SETUP', 'cross'),  # post_v2_setup_seasons_id_archive
     ("POST", '/api/v2/setup/seasons/{}/reopen'): ('session+MANAGE_SETUP', 'cross'),  # post_v2_setup_seasons_id_reopen
     ("POST", '/api/v2/setup/seasons/{}/roll-forward'): ('session+MANAGE_SETUP', 'cross'),  # post_v2_setup_seasons_id_roll_forward
