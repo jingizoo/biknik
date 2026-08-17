@@ -518,7 +518,27 @@ class NewSeasonCopyForwardSqlTest(unittest.TestCase):
                 len(store.registrations_for_season(fx.src["id"])), 1)
         self._run(case)
 
-    def test_commit_is_atomic_second_commit_with_same_fingerprint_is_idempotent_skip(self):
+    def test_second_commit_reusing_a_valid_fingerprint_mints_a_second_season(self):
+        """A commit fingerprint is NOT single-use / consumed on success.
+
+        Unlike ``commit_ice_availability`` (#158) -- whose own idempotency
+        comes from the WRITE TARGET having a natural dedup key (the
+        ``(rink, start, end)`` unique index, so a rerun of the identical
+        template is a no-op skip) -- this facade's write target is a brand
+        new Season, which has no such natural key: two Seasons created with
+        identical inputs are, by the domain model, two genuinely different
+        rows (the same as calling ``create_season`` itself twice). So a
+        second commit that reuses the exact same, still-valid fingerprint
+        does NOT skip -- it passes all three preview-binding gates again
+        (nothing about them is one-shot) and mints a SECOND, DISTINCT
+        Season with its own copy of the carried-forward registrations. This
+        is deliberate ("each commit mints its own new Season by design"),
+        not a bypass of the preview-required contract: every commit here,
+        including this second one, is still preceded by a genuine preview
+        by the same actor. Guarding against an accidental double-submit
+        (double-click, client retry) would need a SEPARATE, single-use
+        consumption mechanism this slice does not build.
+        """
         def case(api, store):
             fx = _Fixture(api)
             preview = api.preview_new_season_copy_forward(
@@ -532,10 +552,6 @@ class NewSeasonCopyForwardSqlTest(unittest.TestCase):
                 copy_forward_fingerprint=preview["copy_forward_fingerprint"],
                 actor_id=ADMIN)
             self.assertNotIn("error", first, first)
-            # A SECOND commit reusing the exact same (still-valid) fingerprint
-            # mints a SECOND, DISTINCT Season (each commit mints its own new
-            # Season by design -- unlike roll-forward there is no existing
-            # target to be idempotent against).
             second = api.commit_new_season_copy_forward(
                 program_id=fx.program["id"], name="2026-27",
                 source_season_id=fx.src["id"],

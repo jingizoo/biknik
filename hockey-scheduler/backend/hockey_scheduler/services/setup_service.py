@@ -3278,6 +3278,17 @@ class SetupService:
         BEFORE any write, mirroring ``commit_ice_availability`` (#158)
         exactly. A refused commit mutates nothing: no Season row, no
         registrations, no audit beyond the refusal itself.
+
+        UNLIKE ``commit_ice_availability``, this fingerprint is not
+        single-use / consumed on success: a second commit that reuses the
+        same still-valid fingerprint passes all three checks again and
+        mints a SECOND, DISTINCT Season (each commit mints its own new
+        Season by design — the write target here has no natural dedup key
+        the way ice-availability's ``(rink, start, end)`` unique index
+        gives it one). See
+        ``test_second_commit_reusing_a_valid_fingerprint_mints_a_second_season``
+        (tests/test_new_season_copy_forward.py) for the guarantee this
+        implies and does not imply.
         """
         # Lock every distinct Team/League named in selections FIRST, sorted —
         # roll_forward_registrations_v2's own canonical lock order (#159), so
