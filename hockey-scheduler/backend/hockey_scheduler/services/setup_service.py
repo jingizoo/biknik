@@ -492,10 +492,16 @@ class SetupService:
                     if operator_organization_id else None)
         return program
 
-    @_transactional
-    def create_season(self, program_id: str, name: str,
-                      start_date=None, end_date=None,
-                      actor_id: Optional[str] = None) -> Season:
+    def _resolve_season_creation(self, program_id: str, name: str,
+                                 start_date, end_date):
+        """Read-only resolution shared by ``create_season`` and the new-Season
+        copy-forward preview/commit (#159): Program exists, timezone-anchored
+        date parsing (#272), end >= start. No write of its own — extracted
+        verbatim from ``create_season`` so the copy-forward preview can run
+        the IDENTICAL checks before the target Season exists (to build its
+        fingerprint) and commit can re-run them again under its own locks,
+        without a caller ever risking drift from ``create_season``'s own
+        rules. Returns ``(program, cleaned_name, start, end)``."""
         program = self.store.get_program(program_id)
         if program is None:
             raise NotFoundError(f"Program {program_id} not found.")
@@ -510,8 +516,16 @@ class SetupService:
             raise ValidationError(
                 "end_date cannot be before start_date.",
                 {"reason": "end_before_start", "field": "end_date"})
+        return program, self._require_name(name), start, end
+
+    @_transactional
+    def create_season(self, program_id: str, name: str,
+                      start_date=None, end_date=None,
+                      actor_id: Optional[str] = None) -> Season:
+        _program, clean_name, start, end = self._resolve_season_creation(
+            program_id, name, start_date, end_date)
         season = Season(id=self.store.next_id("season"), program_id=program_id,
-                        name=self._require_name(name), start_date=start, end_date=end)
+                        name=clean_name, start_date=start, end_date=end)
         self.store.add_season(season)
         self._audit("season_created", "season", season.id, actor_id,
                     {"league_id": program_id})
@@ -2895,6 +2909,38 @@ class SetupService:
                      "actual_division_id": existing.division_id})
             wanted[tid] = (lid, div_id)
 
+        return self._apply_registration_selections(
+            to_season_id=to_season_id, from_season_id=from_season_id,
+            wanted=wanted, actor_id=actor_id)
+
+    def _apply_registration_selections(self, *, to_season_id: str,
+                                       from_season_id: str, wanted: dict,
+                                       actor_id: Optional[str]) -> dict:
+        """Shared write-application core for "apply these Team/League/Division
+        selections to this target Season" (#159 copy-forward), extracted
+        verbatim from ``roll_forward_registrations_v2``'s own apply phase so
+        there is exactly ONE implementation both it and the new-Season
+        copy-forward commit call — never two that could silently drift.
+
+        Takes an ALREADY-VALIDATED ``wanted: {team_id: (league_id,
+        division_id)}`` mapping (each caller runs its own pre-write gate first
+        — see ``roll_forward_registrations_v2`` and
+        ``_resolve_copy_forward_plan`` — because what counts as a valid
+        selection differs between "the target Season already exists" and "the
+        target Season does not exist until this very commit creates it"); this
+        helper only performs the upsert/reactivate + per-row and summary audit
+        that is identical either way.
+
+        MUST run inside the caller's transaction, with ``to_season_id`` (if it
+        already existed before this call) and every League named in
+        ``wanted`` already row-locked by the caller in the canonical
+        Team -> League -> Season order (#159) — this helper acquires no lock
+        of its own beyond ``_link_league_season``'s own re-entrant League
+        lock when it creates a new binding. A freshly-minted ``to_season_id``
+        (the copy-forward commit's own case) needs no lock: nothing else can
+        reference a Season id before this transaction that created it
+        commits.
+        """
         rolled, skipped, created = 0, 0, []
         for tid, (lid, div_id) in wanted.items():
             # #283: the registration is stored against the League's LeagueSeason
