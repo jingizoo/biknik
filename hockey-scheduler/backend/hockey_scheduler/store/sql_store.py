@@ -68,6 +68,7 @@ from ..domain import (
     RosterRole,
     Season,
     ScheduleScenario,
+    SeasonCopyForwardCommit,
     SeasonStatus,
     SeasonTeamRegistration,
     SeasonVenueAccess,
@@ -87,6 +88,7 @@ from .db import connect
 from .db_errors import (
     DependentDeleteConflict,
     dependent_delete_conflict,
+    translate_copy_forward_commit_conflict_exception,
     translate_db_exception,
     translate_ice_slot_conflict_exception,
     translate_ice_slot_time_conflict_exception,
@@ -140,6 +142,15 @@ def _jsonc():
             lambda v: json.loads(v) if v else {})
 
 
+def _jsonl():
+    """Like ``_jsonc`` but list-biased: an EMPTY list is a legitimate value
+    (a copy-forward commit that created zero registrations), so this must
+    round-trip ``[]`` as ``[]`` rather than folding it into ``{}`` the way
+    ``_jsonc``'s dict-biased ``v or {}`` would."""
+    return (lambda v: json.dumps(v if v is not None else []),
+            lambda v: json.loads(v) if v else [])
+
+
 class Col:
     __slots__ = ("name", "to_db", "from_db")
 
@@ -186,6 +197,9 @@ SPECS = {
     Division: Spec(Division, "divisions"),
     SeasonTeamRegistration: Spec(
         SeasonTeamRegistration, "season_team_registrations", {"active": _bool()}),
+    SeasonCopyForwardCommit: Spec(
+        SeasonCopyForwardCommit, "season_copy_forward_commits",
+        {"registration_ids": _jsonl(), "committed_at": _dt()}),
     TeamLeagueMigrationDecision: Spec(
         TeamLeagueMigrationDecision, "team_league_migration_decisions"),
     SeasonVenueAccess: Spec(
@@ -1766,6 +1780,29 @@ class SqlStore:
 
     def add_setup_audit(self, entry): return self._insert(entry)
     def all_setup_audit(self): return self._query(SetupAuditLog, order="id")
+
+    # -- copy-forward commit idempotency ledger (#159 review round 2) ------
+    def _write_season_copy_forward_commit(self, write, row):
+        try:
+            return write(row)
+        except Exception as exc:
+            # One committed Season per copy_forward_fingerprint (migration
+            # 053): a race-losing INSERT — sequential replay or a genuine
+            # concurrent commit racing on the SAME fingerprint — is
+            # translated to a stable conflict rather than a raw driver
+            # error; the commit path treats it as an idempotent replay
+            # (#159 review round 2).
+            dup = translate_copy_forward_commit_conflict_exception(exc)
+            if dup is not None:
+                raise dup from exc
+            raise
+
+    def add_season_copy_forward_commit(self, row):
+        return self._write_season_copy_forward_commit(self._insert, row)
+
+    def get_season_copy_forward_commit_by_fingerprint(self, fingerprint):
+        return self._first(SeasonCopyForwardCommit,
+                           "copy_forward_fingerprint = ?", (fingerprint,))
 
     def add_factory_reset_event(self, event): return self._insert(event)
     def all_factory_reset_events(self):
