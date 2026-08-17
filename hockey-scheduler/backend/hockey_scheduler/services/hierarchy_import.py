@@ -425,6 +425,22 @@ def _check_player_jersey_conflicts(report, player_rows, store, existing_teams,
     active player. The store-side service check + partial unique index remain
     the authoritative guarantee at commit (a conflict rolls back the whole
     batch), so this is the operator-facing early report, not the enforcement.
+
+    #424 round-4 review: reuses the SAME post-import effective-state
+    uniqueness plan the SAME-team registration_number check in
+    ``_check_player_duplicates`` below already shares between both import
+    paths (``domain.identity.plan_effective_registration_state``, #273
+    review round 3 finding 1) — applied here to ``(team, jersey_number)``
+    instead of ``(team, registration_number)`` — rather than a second,
+    jersey-only re-implementation of the same "final state, not a per-row
+    mid-scan snapshot" reasoning. The naive per-row scan this replaced
+    treated a blank jersey cell as ABSENT and skipped the row outright, so a
+    retained jersey moved onto an already-occupied number on the destination
+    team (the row's own cell is blank, but the EFFECTIVE value — the
+    matching existing player's current number — is not) previewed clean; a
+    same-team swap or longer cycle already previewed clean before this fix,
+    since every row's own SUPPLIED cell already described its true final
+    value, and continues to under the shared plan.
     """
     def team_key(code):
         # Existing teams resolve to their real id (shared with existing players);
@@ -442,23 +458,25 @@ def _check_player_jersey_conflicts(report, player_rows, store, existing_teams,
     # so its current number must not seed occupancy — its own row re-places it.
     upload_player_codes = {_clean(r.get("player_code")) for r in player_rows
                            if not _blank(r.get("player_code"))}
-    existing_players = {
-        player.external_ref: player for player in store.all_players()
-        if player.external_ref}
-    occupancy = {}  # (team_key, jersey) -> existing active Players
+    existing_players = {}
+    players_by_id = {}
+    conflict_entries = []
     for player in store.all_players():
+        players_by_id[player.id] = player
+        if player.external_ref:
+            existing_players[player.external_ref] = player
         if not player.is_active or player.jersey_number is None:
             continue
         if player.external_ref and player.external_ref in upload_player_codes:
             continue
-        occupancy.setdefault((player.team_id, player.jersey_number), []).append(
-            player)
+        conflict_entries.append(
+            (("existing", player.id), player.team_id, player.jersey_number))
 
-    grouped = {}
+    row_slot = {}
     for index, row in enumerate(player_rows, start=1):
         jersey_number, reason = parse_jersey_cell(row.get("jersey_number"))
-        if reason is not None or jersey_number is None:
-            continue  # invalid/absent jersey handled by the range check
+        if reason is not None:
+            continue  # invalid jersey already reported by the range check
         team_code = _optional(row.get("team_code"))
         if team_code is None:
             continue
@@ -471,27 +489,41 @@ def _check_player_jersey_conflicts(report, player_rows, store, existing_teams,
         # inactive Player therefore does not reserve a number after this row.
         if existing is not None and not existing.is_active:
             continue
-        grouped.setdefault((key, jersey_number), []).append(
-            (index, team_code, player_code or f"row {index}"))
+        # Blank cell RETAINS the matching existing player's current number
+        # (never a clear) — the SAME effective-value contract every other
+        # optional identity cell in this import follows, now including
+        # jersey_number (#424 round-4).
+        effective = (jersey_number if jersey_number is not None
+                    else (existing.jersey_number if existing is not None
+                          else None))
+        if effective is None:
+            continue  # nothing to reserve — absent cell, nothing to retain
+        row_slot[index] = (key, effective, team_code)
+        conflict_entries.append((("row", index), key, effective))
+
+    conflicts = plan_effective_registration_state(conflict_entries)
 
     # Report every imported row participating in a collision. Reporting only
     # the later row leaves the operator guessing which earlier row must change.
-    for occ_key, participants in grouped.items():
-        existing_holders = occupancy.get(occ_key, [])
-        if len(participants) < 2 and not existing_holders:
+    for index, (key, jersey_number, team_code) in row_slot.items():
+        entities = conflicts.get((key, jersey_number))
+        if entities is None:
             continue
-        upload_rows = ", ".join(str(item[0]) for item in participants)
+        upload_row_indices = sorted(i for kind, i in entities
+                                    if kind == "row")
+        existing_ids = sorted(pid for kind, pid in entities
+                              if kind == "existing")
+        upload_rows = ", ".join(str(i) for i in upload_row_indices)
         holder_text = ""
-        if existing_holders:
+        if existing_ids:
             holders = ", ".join(
-                f"{player.name} ({player.id})" for player in existing_holders)
+                f"{players_by_id[pid].name} ({pid})" for pid in existing_ids)
             holder_text = f"; existing active player(s): {holders}"
-        for index, team_code, _player_code in participants:
-            report.error(
-                "players", index, "duplicate_jersey_number",
-                f"Jersey number {occ_key[1]} on team {team_code} conflicts "
-                f"with upload row(s) {upload_rows}{holder_text}.",
-                "jersey_number")
+        report.error(
+            "players", index, "duplicate_jersey_number",
+            f"Jersey number {jersey_number} on team {team_code} conflicts "
+            f"with upload row(s) {upload_rows}{holder_text}.",
+            "jersey_number")
 
 
 def _identity_pair_proven_different(a_birth, a_reg, b_birth, b_reg) -> bool:
@@ -1725,11 +1757,33 @@ def commit_hierarchy_import(setup, sheets: Dict[str, List[dict]],
                 # the per-row upsert diffs against the operator's real before-value, not
                 # the transient NULL (a Team-only move keeping the same number must not
                 # falsely audit a jersey change).
+                #
+                # #424 round-4 review: the FINAL jersey fed into the release
+                # pass must be the row's EFFECTIVE value -- a blank cell
+                # RETAINS the matching existing player's current number,
+                # never a clear -- exactly like ``_final_registration`` just
+                # below (mirroring #273 review round 3 finding 1). Before
+                # this fix, a blank cell passed ``None`` as the "final"
+                # jersey unconditionally, so this pre-pass treated EVERY
+                # blank-cell existing player as moving to "no jersey" and
+                # released (NULLed) their real number even when nothing
+                # about their jersey was actually changing -- the release
+                # itself was harmless in isolation (the per-row upsert used
+                # to restore the released original before diffing), but it
+                # fed a "final slot" of ``None`` into a batch-wide plan that
+                # never got the chance to see the RETAINED value collide
+                # with another row or an existing player at the destination.
+                def _final_jersey(row):
+                    existing_for_row = players.get(
+                        _clean(row.get("player_code")))
+                    supplied = _optional(row.get("jersey_number"))
+                    return (int(supplied) if supplied is not None
+                            else (existing_for_row.jersey_number
+                                  if existing_for_row is not None else None))
                 released = setup.release_batch_player_jerseys(
                     (players.get(_clean(row.get("player_code"))),
                      teams[_clean(row.get("team_code"))].id,
-                     int(_optional(row.get("jersey_number")))
-                     if _optional(row.get("jersey_number")) else None)
+                     _final_jersey(row))
                     for row in rows["players"])
 
                 # Swap-safe apply, registration_number (#273 review round 3

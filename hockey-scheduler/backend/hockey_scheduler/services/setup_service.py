@@ -6745,6 +6745,25 @@ class SetupService:
         ``staged_original_jersey`` immediately below for why a caller running
         that pre-pass must pass its result back here rather than let this
         method read ``existing.registration_number`` directly.
+
+        ``jersey_number`` (#269, predates the ``identity_values`` pattern
+        above) now follows the SAME "leave as-is" contract, computed the
+        SAME way as ``registration_number``'s ``effective_registration``
+        just below (#424 round-4 review): a blank cell (``jersey_number is
+        None``) RETAINS the pre-staging original — ``staged_original_jersey``
+        when a :meth:`release_batch_player_jerseys` pre-pass supplied one,
+        else ``existing.jersey_number`` — rather than landing ``None`` and
+        silently clearing a real number. Before this fix, ``jersey_number``
+        was placed into ``values`` unconditionally as the raw (possibly
+        ``None``) argument and checked for availability the same raw way, so
+        a blank cell on a Team move both evaded the destination team's
+        uniqueness check (a ``None`` availability check is a deliberate
+        no-op — an absent jersey never collides) AND then overwrote the
+        retained value with ``None`` at write time, once
+        ``staged_original_jersey`` had already restored ``obj.jersey_number``
+        for diffing. A brand-new player (``existing is None``) has nothing to
+        retain, so its effective value is simply the supplied one, exactly as
+        before.
         """
         self._validate_jersey_number(jersey_number)
         # Validate/canonicalize the email BEFORE any player write (#268 review):
@@ -6791,6 +6810,21 @@ class SetupService:
             # match zero rows while still reporting success (SQLite), or
             # lose a concurrent update (PostgreSQL).
             existing = self.store.get_player_for_update(existing.id)
+        # #424 round-4 review: the RETAINED fallback must be the TRUE
+        # pre-staging value — ``staged_original_jersey`` when the caller ran
+        # a swap-safe :meth:`release_batch_player_jerseys` pre-pass (mirrors
+        # #292), never ``existing.jersey_number`` read directly, which may
+        # already carry the transient released NULL. The EFFECTIVE value —
+        # the row's own supplied number, or that true original when the cell
+        # is blank — is what both the availability check and the actual
+        # write use from here on, exactly like ``effective_registration``
+        # below; ``jersey_number`` itself (the raw, possibly-``None``
+        # argument) is never used again past this point.
+        original_jersey = (
+            staged_original_jersey if staged_original_jersey is not _UNSET
+            else (existing.jersey_number if existing is not None else None))
+        effective_jersey_number = (
+            jersey_number if jersey_number is not None else original_jersey)
         # Enforce active-team jersey uniqueness on the IMPORTED target state
         # before any write (#269), so a conflicting row aborts the whole
         # one-transaction batch with zero committed players. An import never
@@ -6800,10 +6834,11 @@ class SetupService:
         target_active = True if existing is None else existing.is_active
         if target_active:
             self._assert_jersey_available(
-                team_id, jersey_number,
+                team_id, effective_jersey_number,
                 exclude_player_id=None if existing is None else existing.id)
         values = {"name": canonical_name, "team_id": team_id,
-                  "position": position, "jersey_number": jersey_number,
+                  "position": position,
+                  "jersey_number": effective_jersey_number,
                   **identity_values}
         # Same-team duplicate governing-body id (#273): refuse BEFORE any
         # write, excluding the row's own player when this is an update.
@@ -6871,18 +6906,32 @@ class SetupService:
             # set reflects the operator's true before→after — a Team-only move
             # that keeps the same number must NOT report a jersey change, and a
             # blank/keep-current cell must land the original, not the NULL.
+            # ``values["jersey_number"]`` is always the EFFECTIVE value
+            # computed above (#424 round-4 review) — the row's own supplied
+            # number, or this SAME restored original when the cell was blank
+            # — so a genuine blank-cell retain now diffs original-vs-original
+            # (no reported change) and a genuine supplied change still diffs
+            # original-vs-new (reported and applied) exactly as before.
             if staged_original_jersey is not _UNSET:
                 obj.jersey_number = staged_original_jersey
             # Same restore-before-diff for registration_number (#273 review
-            # round 3 finding 1). Unlike jersey_number, this field is placed
-            # into ``values`` ONLY when the sheet supplies a new one (the
-            # same "absent key = leave as-is" contract every other optional
-            # identity cell in ``identity_values`` follows) -- so the restore
-            # alone is enough here: a blank cell's ``values`` carries no
-            # "registration_number" key at all, ``_apply_changes`` never
-            # touches the just-restored original, and no false "changed"
-            # report follows; an explicitly re-supplied value is still in
-            # ``values`` and still overwrites + reports exactly as before.
+            # round 3 finding 1) — but registration_number reaches ``values``
+            # by a DIFFERENT route than jersey_number's effective-value
+            # computation above: it is placed into ``values`` ONLY when the
+            # sheet supplies a new one (the same "absent key = leave as-is"
+            # contract every other optional identity cell in
+            # ``identity_values`` follows), so the restore alone is enough
+            # here: a blank cell's ``values`` carries no "registration_number"
+            # key at all, ``_apply_changes`` never touches the just-restored
+            # original, and no false "changed" report follows; an explicitly
+            # re-supplied value is still in ``values`` and still overwrites +
+            # reports exactly as before. Both routes land on the same
+            # "blank retains, ``_apply_changes`` never sees a spurious diff"
+            # outcome; only the mechanism (unconditional effective value vs.
+            # conditional key placement) differs, because jersey_number is a
+            # required top-level field on every ``Player`` and
+            # registration_number is one of the purely-optional identity
+            # cells.
             if staged_original_registration is not _UNSET:
                 obj.registration_number = staged_original_registration
             changed = self._apply_changes(obj, values)
