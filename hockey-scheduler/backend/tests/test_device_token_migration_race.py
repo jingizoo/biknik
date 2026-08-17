@@ -57,12 +57,62 @@ Covers, on SQLite + PostgreSQL:
   would echo it into failure output -- only whether the FINAL row count is
   correct is checked, so this test's own stdout/stderr can never carry the
   secret regardless of what B's private exception object contains.
+
+#426 round-7 review: ``AtomicCheckDdlTranslationUnitTest`` above proved the
+*message* the translator produces never carries the secret, but
+``_apply_migration``'s own re-raise -- `raise translated from exc` --
+still left the RAW driver exception reachable via `translated.__cause__`
+(explicitly) and `translated.__context__` (implicitly, via CPython's
+exception chaining, regardless of the `from` clause). `str(ctx.exception)`
+can never see that: a live, uncaught startup crash renders the FULL chain
+by default, and the review reproduced it on real PostgreSQL -- stderr
+showed the driver's own ``DETAIL: Key (recipient_ref, token)=(...) is
+duplicated.`` line immediately before the sanitized ``MigrationDataError``.
+
+THE FIX (``store/sql_store.py``, ``_apply_migration``): the translated
+exception is no longer raised from inside the `except` block that caught
+the raw one at all -- not even `raise translated from None` there, which
+the review noted still leaves `__context__` pointing at the raw exception
+(only `__suppress_context__` hides it from the *default* printer; a
+structured logger walking `__context__` directly would still see it). The
+`except` block now only records `translated`; the actual `raise
+translated from None` happens AFTER that block has exited, when there is
+no exception being handled, so CPython's implicit chaining has nothing to
+attach and `__context__` comes out genuinely ``None``.
+
+Adds, on SQLite + PostgreSQL:
+
+* Two new assertions appended to ``AtomicCheckDdlTranslationUnitTest``'s
+  existing ``_run`` (both ``test_sqlite`` and ``test_postgres`` already
+  call it): ``ctx.exception.__cause__`` and ``ctx.exception.__context__``
+  are both asserted ``None`` directly on the captured exception OBJECT --
+  not its stringified message -- which a bare `from None` fix (still
+  inside the `except` block) would NOT satisfy, since `__context__` would
+  still be the raw exception there. This is what actually distinguishes
+  the full fix from the insufficient half-fix the review warned against.
+* :class:`AtomicCheckDdlUncaughtSubprocessTest` -- the review's own exact
+  diagnostic: ``_migration_atomic_check_uncaught_child.py`` runs the same
+  no-op-check/duplicate-sentinel scenario as a REAL, genuinely UNCAUGHT
+  top-level script (not `python -m unittest`, which intercepts exceptions
+  through its own result formatting rather than Python's default
+  excepthook) via `subprocess.run`, and this test scans the child's ACTUAL
+  captured stdout+stderr for both sentinel values plus the raw driver
+  exception's own class name / message markers (``UniqueViolation``,
+  ``DETAIL``, ``IntegrityError``) -- proving what the review proved by
+  hand: nothing about the raw exception, values or otherwise, reaches a
+  real uncaught rendering. The child process is still asserted to exit
+  non-zero with the sanitized ``MigrationDataError`` as the sole reported
+  exception, so this is not silently swallowing the failure, only its
+  driver text.
 """
 
 import os
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
+import uuid
 from unittest import mock
 
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
@@ -77,6 +127,10 @@ from hockey_scheduler.store.sql_store import (
     _ATOMIC_PRE_MIGRATION_CHECKS,
     migrate,
 )
+
+_UNCAUGHT_CHILD = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "_migration_atomic_check_uncaught_child.py")
 
 _VERSION = "055_device_token_unique_key"
 _INDEX = "ux_device_tokens_recipient_token"
@@ -162,6 +216,20 @@ class AtomicCheckDdlTranslationUnitTest(unittest.TestCase):
             msg = str(ctx.exception)
             self.assertNotIn(SECRET_TOKEN, msg, msg)
             self.assertNotIn(RECIPIENT, msg, msg)
+            # #426 round-7 review: str(ctx.exception) alone cannot see a
+            # live chained cause/context -- assert directly on the
+            # exception OBJECT's own attributes too. A bare `raise
+            # translated from None` INSIDE the `except` block (the
+            # insufficient half-fix the review explicitly warned against)
+            # would still leave __context__ pointing at the raw driver
+            # exception; only deferring the raise past the handler (see
+            # _apply_migration's docstring) makes it genuinely None, not
+            # merely __suppress_context__-flagged.
+            self.assertIsNone(
+                ctx.exception.__cause__, repr(ctx.exception.__cause__))
+            self.assertIsNone(
+                ctx.exception.__context__, repr(ctx.exception.__context__))
+            self.assertTrue(ctx.exception.__suppress_context__)
             # No partial state: the DDL's own transaction rolled back.
             self.assertNotIn(
                 _VERSION, store.migration_status()["applied"])
@@ -304,6 +372,106 @@ class MigrationLockBarrierTest(unittest.TestCase):
         finally:
             conn_b.close()
             _restore(store_a, url)
+
+
+class AtomicCheckDdlUncaughtSubprocessTest(unittest.TestCase):
+    """#426 round-7 review's own exact diagnostic: force the same no-op-
+    check/duplicate-sentinel scenario as :class:`AtomicCheckDdlTranslation
+    UnitTest`, but run ``migrate()`` in a REAL, genuinely UNCAUGHT
+    subprocess (``_migration_atomic_check_uncaught_child.py`` -- a plain
+    top-level script with no try/except at all, so Python's own default
+    excepthook is what renders the traceback) and inspect the child's
+    ACTUAL captured stdout+stderr -- never the exit code alone, and never
+    an in-process ``assertRaises``, which cannot see what a real uncaught
+    startup crash would print. Confirms both that neither sentinel value
+    appears, AND that the raw driver exception's own class name/message
+    markers don't either -- not just the two literal secrets -- and that
+    the process still exits non-zero reporting the sanitized
+    ``MigrationDataError`` as the sole exception, so this is not silently
+    swallowing the failure, only its driver text."""
+
+    def _run(self, url, label, token, recipient):
+        proc = subprocess.run(
+            [sys.executable, _UNCAUGHT_CHILD, url, token, recipient],
+            capture_output=True, text=True, timeout=60)
+        combined = proc.stdout + proc.stderr
+        self.assertNotEqual(
+            proc.returncode, 0,
+            f"{label}: the child should have crashed on the sanitized "
+            f"MigrationDataError, not exited cleanly:\n{combined}")
+        self.assertIn("ABOUT_TO_MIGRATE", proc.stdout, combined)
+        self.assertNotIn(
+            "MIGRATE_SUCCEEDED_UNEXPECTEDLY", proc.stdout,
+            f"{label}: migrate() should have raised, not returned:\n{combined}")
+        # The two literal secrets -- the review's exact concern.
+        self.assertNotIn(
+            token, combined,
+            f"{label}: secret token leaked into the real uncaught-process "
+            f"output:\n{combined}")
+        self.assertNotIn(
+            recipient, combined,
+            f"{label}: recipient leaked into the real uncaught-process "
+            f"output:\n{combined}")
+        # This must actually have exercised the translation path, not some
+        # unrelated early crash that would make the assertions above
+        # vacuously true.
+        self.assertIn("MigrationDataError", combined, combined)
+        self.assertIn(
+            "Cannot apply this migration's uniqueness constraint", combined,
+            combined)
+        # And the raw driver exception itself -- class name and message
+        # shape, not just the sentinel VALUES -- must be fully absent too,
+        # proving __context__/__cause__ are genuinely detached rather than
+        # merely stripped of the two specific literals this run happened
+        # to use.
+        self.assertNotIn("UniqueViolation", combined, combined)
+        self.assertNotIn("DETAIL", combined, combined)
+        self.assertNotIn("IntegrityError", combined, combined)
+        self.assertNotIn("direct cause of the following exception", combined,
+                         combined)
+        self.assertNotIn("During handling of the above exception", combined,
+                         combined)
+
+    def test_sqlite_real_uncaught_process(self):
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            token = f"secret-push-token-r7-uncaught-sqlite-{uuid.uuid4().hex[:10]}"
+            recipient = f"official:o1-r7-uncaught-sqlite-{uuid.uuid4().hex[:10]}"
+            self._run(path, "sqlite", token, recipient)
+        finally:
+            os.remove(path)
+
+    @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                         "PostgreSQL suite only (TEST_DATABASE_URL not set)")
+    def test_postgres_real_uncaught_process(self):
+        url = os.environ["TEST_DATABASE_URL"]
+        token = f"secret-push-token-r7-uncaught-postgres-{uuid.uuid4().hex[:10]}"
+        recipient = f"official:o1-r7-uncaught-postgres-{uuid.uuid4().hex[:10]}"
+        _restore(_fresh(url), url)  # clean slate before the child connects
+        try:
+            self._run(url, "postgres", token, recipient)
+        finally:
+            # The child's seed rows persist past its own crash (committed
+            # in their own transaction before migrate() ever ran);
+            # migration 055 itself never got a chance to re-apply (its DDL
+            # transaction rolled back). Connect RAW -- bypassing
+            # SqlStore's auto-migrate, which would otherwise immediately
+            # re-hit this same still-duplicate, still-055-downgraded state
+            # and raise before cleanup could run -- to delete the
+            # duplicate pair directly, then let a normal SqlStore() bring
+            # the shared database fully back to a clean HEAD for the next
+            # test.
+            raw_conn, raw_dialect, _ = connect(url)
+            try:
+                cur = raw_conn.cursor()
+                cur.execute(raw_dialect.sql(
+                    "DELETE FROM device_tokens WHERE recipient_ref = ?"),
+                    (recipient,))
+                raw_conn.commit()
+            finally:
+                raw_conn.close()
+            _restore(_fresh(url), url)
 
 
 if __name__ == "__main__":
