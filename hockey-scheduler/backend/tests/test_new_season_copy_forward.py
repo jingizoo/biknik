@@ -457,6 +457,126 @@ class NewSeasonCopyForwardServiceTest(unittest.TestCase):
             {r["league_id"] for r in res["registrations"]},
             {self.fx.league["id"], league2["id"]})
 
+    # -- #159 review round 3 (owner P1): replay is immune to LATER mutation
+    # of the source Season / target registrations, and a malformed
+    # fingerprint never reaches a store lookup ----------------------------
+    def test_replay_survives_source_team_unregistered_after_commit(self):
+        """Reproduces the owner's first named scenario: commit once, THEN
+        unregister the selected Team from the SOURCE season, THEN replay
+        the exact same fingerprint. Before #159 review round 3 this raised
+        ``Team ... is not registered in the source season`` because the
+        replay path re-resolved the plan (and so re-validated the source
+        Season's CURRENT registrations) before ever consulting the ledger.
+        The ledger is now consulted FIRST, keyed on the caller-supplied
+        fingerprint, so this mutation of unrelated state can never affect
+        an already-committed replay."""
+        fp = self._preview()["copy_forward_fingerprint"]
+        first = self._commit(fp)
+        self.assertNotIn("error", first, first)
+        unreg = self.api.unregister_team_from_season(
+            self.fx.reg["id"], actor_id=ADMIN)
+        self.assertNotIn("error", unreg, unreg)
+        # The source Team really is no longer registered -- a FRESH preview
+        # of the identical inputs now correctly refuses (proving the
+        # mutation is real, not a no-op), while the REPLAY of the old,
+        # already-successful fingerprint still succeeds.
+        fresh_preview = self._preview()
+        self.assertEqual(fresh_preview["error"]["code"], "validation_error")
+        replay = self._commit(fp)
+        self.assertNotIn("error", replay, replay)
+        self.assertEqual(replay["season"], first["season"])
+        self.assertEqual(replay["registrations"], first["registrations"])
+        self.assertEqual(replay["totals"], first["totals"])
+
+    def test_replay_survives_target_registration_deleted_after_commit(self):
+        """Reproduces the owner's second named scenario: commit once, THEN
+        unregister + delete the registration the commit itself created in
+        the TARGET season, THEN replay. Before #159 review round 3 the
+        replay path rebuilt its response by re-fetching each id in
+        ``registration_ids`` from the live store, so a deleted row silently
+        vanished from the response (``registrations: []``) while the SAME
+        ledger row still reported ``rolled_forward: 1`` -- a self-
+        contradictory result. The response is now a byte-accurate snapshot
+        taken at commit time, so it is unaffected by the later delete."""
+        fp = self._preview()["copy_forward_fingerprint"]
+        first = self._commit(fp)
+        self.assertNotIn("error", first, first)
+        target_reg_id = first["registrations"][0]["id"]
+        unreg = self.api.unregister_team_from_season(
+            target_reg_id, actor_id=ADMIN)
+        self.assertNotIn("error", unreg, unreg)
+        deleted = self.api.delete_season_team_registration(
+            target_reg_id, actor_id=ADMIN)
+        self.assertNotIn("error", deleted, deleted)
+        self.assertEqual(
+            self.api.store.registrations_for_season(first["season"]["id"]),
+            [])
+        replay = self._commit(fp)
+        self.assertNotIn("error", replay, replay)
+        self.assertEqual(replay["season"], first["season"])
+        self.assertEqual(replay["registrations"], first["registrations"])
+        self.assertEqual(len(replay["registrations"]), 1)
+        self.assertEqual(replay["totals"], first["totals"])
+        self.assertEqual(replay["totals"]["rolled_forward"], 1)
+
+    def test_target_season_delete_is_blocked_then_replay_stays_stable(self):
+        """Reproduces the owner's third named scenario end to end: commit,
+        clear every ORDINARY dependent of the generated Season (the
+        registration the commit made, and its League binding), attempt to
+        delete the Season anyway -- now blocked by the itemized
+        ``copy_forward_commit`` dependency (#159 review round 3, structural
+        change 2) -- then replay, which returns the ORIGINAL result,
+        never ``season: null``."""
+        fp = self._preview()["copy_forward_fingerprint"]
+        first = self._commit(fp)
+        self.assertNotIn("error", first, first)
+        target_season_id = first["season"]["id"]
+        target_reg_id = first["registrations"][0]["id"]
+        unreg = self.api.unregister_team_from_season(
+            target_reg_id, actor_id=ADMIN)
+        self.assertNotIn("error", unreg, unreg)
+        deleted_reg = self.api.delete_season_team_registration(
+            target_reg_id, actor_id=ADMIN)
+        self.assertNotIn("error", deleted_reg, deleted_reg)
+        for ls in self.api.store.league_seasons_for_season(target_season_id):
+            unbound = self.api.delete_league_season(ls.id, actor_id=ADMIN)
+            self.assertNotIn("error", unbound, unbound)
+        audits_before = len(self.api.store.all_setup_audit())
+        delete_result = self.api.delete_season(
+            target_season_id, actor_id=ADMIN)
+        self.assertEqual(delete_result["error"]["code"], "has_dependencies")
+        deps = {g["type"] for g in
+               delete_result["error"]["details"]["dependencies"]}
+        self.assertEqual(deps, {"copy_forward_commit"})
+        # Zero-write on block.
+        self.assertIsNotNone(self.api.store.get_season(target_season_id))
+        self.assertEqual(
+            len(self.api.store.all_setup_audit()), audits_before)
+        replay = self._commit(fp)
+        self.assertNotIn("error", replay, replay)
+        self.assertEqual(replay["season"], first["season"])
+        self.assertIsNotNone(replay["season"])
+        self.assertEqual(replay["season"]["id"], target_season_id)
+
+    def test_commit_with_a_non_string_fingerprint_is_refused_not_500(self):
+        """A malformed ``copy_forward_fingerprint`` (any JSON type other
+        than a non-empty string) must never reach a store lookup -- binding
+        a list/dict straight to a SQL parameter crashes the driver instead
+        of raising a structured error. #159 review round 3 added an early
+        ledger check keyed on the caller-supplied value directly, so this
+        guards THAT new code path specifically (the OLD code only ever used
+        an internally-computed fingerprint as a lookup key)."""
+        fp = self._preview()["copy_forward_fingerprint"]
+        for bad in (["not", "a", "string"], {"nope": 1}, 12345, True):
+            res = self._commit(bad)
+            self.assertIn("error", res, res)
+            self.assertIn(res["error"]["code"],
+                         ("validation_error", "schedule_conflict"))
+        # The genuinely valid fingerprint still works afterward -- the
+        # malformed attempts wrote nothing that could have consumed it.
+        ok = self._commit(fp)
+        self.assertNotIn("error", ok, ok)
+
 
 class NewSeasonCopyForwardSqlTest(unittest.TestCase):
     """Runs each case against a REAL SqlStore -- SQLite always, PostgreSQL
@@ -619,6 +739,129 @@ class NewSeasonCopyForwardSqlTest(unittest.TestCase):
             self.assertEqual(len(new_regs), 1)  # not duplicated
         self._run(case)
 
+    # -- #159 review round 3 (owner P1), over REAL transactional stores
+    # (SQLite always, PostgreSQL too when TEST_DATABASE_URL is set) --------
+    def test_replay_survives_source_team_unregistered_after_commit(self):
+        def case(api, store):
+            fx = _Fixture(api)
+            preview = api.preview_new_season_copy_forward(
+                program_id=fx.program["id"], name="2026-27",
+                source_season_id=fx.src["id"],
+                selections=[fx.selection()], actor_id=ADMIN)
+            fp = preview["copy_forward_fingerprint"]
+            first = api.commit_new_season_copy_forward(
+                program_id=fx.program["id"], name="2026-27",
+                source_season_id=fx.src["id"],
+                selections=[fx.selection()],
+                copy_forward_fingerprint=fp, actor_id=ADMIN)
+            self.assertNotIn("error", first, first)
+            unreg = api.unregister_team_from_season(
+                fx.reg["id"], actor_id=ADMIN)
+            self.assertNotIn("error", unreg, unreg)
+            replay = api.commit_new_season_copy_forward(
+                program_id=fx.program["id"], name="2026-27",
+                source_season_id=fx.src["id"],
+                selections=[fx.selection()],
+                copy_forward_fingerprint=fp, actor_id=ADMIN)
+            self.assertNotIn("error", replay, replay)
+            self.assertEqual(replay["season"], first["season"])
+            self.assertEqual(replay["registrations"], first["registrations"])
+            self.assertEqual(replay["totals"], first["totals"])
+        self._run(case)
+
+    def test_replay_survives_target_registration_deleted_after_commit(self):
+        def case(api, store):
+            fx = _Fixture(api)
+            preview = api.preview_new_season_copy_forward(
+                program_id=fx.program["id"], name="2026-27",
+                source_season_id=fx.src["id"],
+                selections=[fx.selection()], actor_id=ADMIN)
+            fp = preview["copy_forward_fingerprint"]
+            first = api.commit_new_season_copy_forward(
+                program_id=fx.program["id"], name="2026-27",
+                source_season_id=fx.src["id"],
+                selections=[fx.selection()],
+                copy_forward_fingerprint=fp, actor_id=ADMIN)
+            self.assertNotIn("error", first, first)
+            target_reg_id = first["registrations"][0]["id"]
+            unreg = api.unregister_team_from_season(
+                target_reg_id, actor_id=ADMIN)
+            self.assertNotIn("error", unreg, unreg)
+            deleted = api.delete_season_team_registration(
+                target_reg_id, actor_id=ADMIN)
+            self.assertNotIn("error", deleted, deleted)
+            self.assertEqual(
+                store.registrations_for_season(first["season"]["id"]), [])
+            replay = api.commit_new_season_copy_forward(
+                program_id=fx.program["id"], name="2026-27",
+                source_season_id=fx.src["id"],
+                selections=[fx.selection()],
+                copy_forward_fingerprint=fp, actor_id=ADMIN)
+            self.assertNotIn("error", replay, replay)
+            self.assertEqual(replay["season"], first["season"])
+            self.assertEqual(replay["registrations"], first["registrations"])
+            self.assertEqual(len(replay["registrations"]), 1)
+            self.assertEqual(replay["totals"]["rolled_forward"], 1)
+        self._run(case)
+
+    def test_target_season_delete_blocked_by_copy_forward_commit_never_raw_fk(self):
+        """The specific SQL-only half of the owner's third scenario: a
+        Season delete that would otherwise succeed (every ordinary
+        dependent cleared) must be refused with the SAME itemized
+        ``copy_forward_commit`` ``has_dependencies`` error SQLite AND
+        PostgreSQL get -- migration 053's real ``season_copy_forward_
+        commits.season_id`` foreign key must never be the thing that
+        stops this delete; ``delete_season``'s pre-write dependency scan
+        must stop it first, so the raw/generic ``foreign_key_violation``
+        conflict this exact fixture reproduced pre-fix never surfaces."""
+        def case(api, store):
+            fx = _Fixture(api)
+            preview = api.preview_new_season_copy_forward(
+                program_id=fx.program["id"], name="2026-27",
+                source_season_id=fx.src["id"],
+                selections=[fx.selection()], actor_id=ADMIN)
+            fp = preview["copy_forward_fingerprint"]
+            first = api.commit_new_season_copy_forward(
+                program_id=fx.program["id"], name="2026-27",
+                source_season_id=fx.src["id"],
+                selections=[fx.selection()],
+                copy_forward_fingerprint=fp, actor_id=ADMIN)
+            self.assertNotIn("error", first, first)
+            target_season_id = first["season"]["id"]
+            target_reg_id = first["registrations"][0]["id"]
+            unreg = api.unregister_team_from_season(
+                target_reg_id, actor_id=ADMIN)
+            self.assertNotIn("error", unreg, unreg)
+            deleted_reg = api.delete_season_team_registration(
+                target_reg_id, actor_id=ADMIN)
+            self.assertNotIn("error", deleted_reg, deleted_reg)
+            for ls in store.league_seasons_for_season(target_season_id):
+                unbound = api.delete_league_season(ls.id, actor_id=ADMIN)
+                self.assertNotIn("error", unbound, unbound)
+            audits_before = len(store.all_setup_audit())
+            blocked = api.delete_season(target_season_id, actor_id=ADMIN)
+            self.assertIn("error", blocked, blocked)
+            self.assertEqual(blocked["error"]["code"], "has_dependencies")
+            deps = {g["type"] for g in
+                   blocked["error"]["details"]["dependencies"]}
+            self.assertEqual(deps, {"copy_forward_commit"})
+            self.assertIsNotNone(store.get_season(target_season_id))
+            self.assertEqual(len(store.all_setup_audit()), audits_before)
+            self.assertIsNotNone(
+                store.get_season_copy_forward_commit_by_fingerprint(fp))
+            # The ledger row was never touched by the refused delete -- a
+            # replay of the SAME fingerprint right afterward still returns
+            # the ORIGINAL stable result.
+            replay = api.commit_new_season_copy_forward(
+                program_id=fx.program["id"], name="2026-27",
+                source_season_id=fx.src["id"],
+                selections=[fx.selection()],
+                copy_forward_fingerprint=fp, actor_id=ADMIN)
+            self.assertNotIn("error", replay, replay)
+            self.assertEqual(replay["season"]["id"], target_season_id)
+            self.assertIsNotNone(replay["season"])
+        self._run(case)
+
 
 @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
                      "PostgreSQL required (set TEST_DATABASE_URL)")
@@ -736,6 +979,106 @@ class NewSeasonCopyForwardConcurrencyTest(unittest.TestCase):
         check = SqlStore(self.url)
         # No NEW season beyond the one the sequential first commit created.
         self.assertEqual({s.id for s in check.all_seasons()}, before_seasons)
+
+    def test_delete_vs_replay_race_delete_stays_blocked_replay_stays_stable(self):
+        """#159 review round 3's required delete-vs-replay race: a real
+        two-connection race between (A) replaying an already-committed
+        fingerprint and (B) attempting to delete the Season that commit
+        produced, launched together via ``threading.Barrier`` so neither
+        starts before the other is ready. The ledger row that blocks (B) is
+        written in the SAME transaction as the Season and its registration
+        (B) needs cleared first, so there is no window in which the Season
+        exists without it -- (B) must be refused regardless of which
+        thread's connection is scheduled first, and (A)'s replay -- which
+        touches neither ``seasons`` nor ``season_team_registrations`` at
+        all -- must return the exact original result regardless of (B)'s
+        outcome or timing."""
+        fx, sel, fp = self._seed()
+        seed_api = ApiService(SqlStore(self.url))
+        first = seed_api.commit_new_season_copy_forward(
+            program_id=fx.program["id"], name="2026-27",
+            source_season_id=fx.src["id"], selections=sel,
+            copy_forward_fingerprint=fp, actor_id=ADMIN)
+        self.assertNotIn("error", first, first)
+        target_season_id = first["season"]["id"]
+        target_reg_id = first["registrations"][0]["id"]
+        # Clear the ordinary dependents SEQUENTIALLY, before the race, so
+        # only the copy_forward_commit ledger dependency remains to block
+        # (B) -- isolates the race to the property this test is actually
+        # proving.
+        unreg = seed_api.unregister_team_from_season(
+            target_reg_id, actor_id=ADMIN)
+        self.assertNotIn("error", unreg, unreg)
+        deleted_reg = seed_api.delete_season_team_registration(
+            target_reg_id, actor_id=ADMIN)
+        self.assertNotIn("error", deleted_reg, deleted_reg)
+        for ls in SqlStore(self.url).league_seasons_for_season(
+                target_season_id):
+            unbound = seed_api.delete_league_season(ls.id, actor_id=ADMIN)
+            self.assertNotIn("error", unbound, unbound)
+
+        before_seasons = {s.id for s in SqlStore(self.url).all_seasons()}
+        before_audits = len(SqlStore(self.url).all_setup_audit())
+        api_replay = ApiService(SqlStore(self.url))
+        api_delete = ApiService(SqlStore(self.url))
+        barrier = threading.Barrier(2)
+        results = {}
+
+        def replay():
+            barrier.wait()
+            results["replay"] = api_replay.commit_new_season_copy_forward(
+                program_id=fx.program["id"], name="2026-27",
+                source_season_id=fx.src["id"], selections=sel,
+                copy_forward_fingerprint=fp, actor_id=ADMIN)
+
+        def delete():
+            barrier.wait()
+            results["delete"] = api_delete.delete_season(
+                target_season_id, actor_id=ADMIN)
+
+        t_replay = threading.Thread(target=replay)
+        t_delete = threading.Thread(target=delete)
+        t_replay.start(); t_delete.start()
+        t_replay.join(20); t_delete.join(20)
+
+        replay_result = results["replay"]
+        delete_result = results["delete"]
+        self.assertNotIn("error", replay_result, replay_result)
+        self.assertEqual(replay_result["season"], first["season"])
+        # Compare the STABLE registration fields the snapshot owns (id,
+        # team_id, division_id, active), not the full dict: this test
+        # deliberately unbound the LeagueSeason above (the only way to
+        # legitimately clear a Season's "level" dependent, so the delete
+        # attempt below is blocked by copy_forward_commit ALONE). The
+        # facade's ``_registration_dict`` resolves ``season_id``/
+        # ``league_id`` from ``league_season_id`` with a LIVE store lookup
+        # on EVERY call, replay or fresh -- a general, pre-existing
+        # property of that denormalization step, not something this
+        # round's immutable-snapshot fix touches or is scoped to change
+        # -- so those two derived fields correctly read back None once the
+        # binding they are resolved from is gone, on a fresh call exactly
+        # as much as on a replay.
+        self.assertEqual(len(replay_result["registrations"]),
+                         len(first["registrations"]))
+        for got, want in zip(replay_result["registrations"],
+                             first["registrations"]):
+            self.assertEqual(got["id"], want["id"])
+            self.assertEqual(got["team_id"], want["team_id"])
+            self.assertEqual(got["division_id"], want["division_id"])
+            self.assertEqual(got["active"], want["active"])
+        self.assertEqual(replay_result["totals"], first["totals"])
+        self.assertIn("error", delete_result, delete_result)
+        self.assertEqual(delete_result["error"]["code"], "has_dependencies")
+        deps = {g["type"] for g in
+               delete_result["error"]["details"]["dependencies"]}
+        self.assertEqual(deps, {"copy_forward_commit"})
+        check = SqlStore(self.url)
+        # No new/removed Season, no new audit row from the blocked delete.
+        self.assertEqual({s.id for s in check.all_seasons()}, before_seasons)
+        self.assertIsNotNone(check.get_season(target_season_id))
+        self.assertEqual(len(check.all_setup_audit()), before_audits)
+        self.assertIsNotNone(
+            check.get_season_copy_forward_commit_by_fingerprint(fp))
 
 
 class NewSeasonCopyForwardHttpTest(unittest.TestCase):
@@ -876,6 +1219,44 @@ class NewSeasonCopyForwardHttpTest(unittest.TestCase):
         self.assertEqual(first["season"]["id"], second["season"]["id"])
         self.assertEqual(first["registrations"], second["registrations"])
         self.assertEqual(first["totals"], second["totals"])
+        program_seasons = [s for s in STATE.api.store.all_seasons()
+                          if s.program_id == program["id"]
+                          and s.id != src["id"]]
+        self.assertEqual(len(program_seasons), 1, program_seasons)
+
+    def test_replay_over_http_survives_source_team_unregistered(self):
+        """#159 review round 3, over REAL HTTP: commit once, THEN
+        unregister the source Team through the real, authenticated
+        ``season-team-registration/{id}/remove`` route, THEN replay the
+        exact same authenticated commit request. Before this round the
+        replay path re-validated the source Season's CURRENT registrations
+        before ever checking the ledger, so this returned a 400
+        validation_error instead of the original committed result."""
+        c, program, src, league, team = self._hierarchy("H8")
+        body = self._preview_body(program, src, league, team)
+        status, preview = self._session(
+            c, "/api/v2/setup/seasons/copy-forward/preview", body)
+        self.assertEqual(status, 200, preview)
+        commit_body = dict(body, copy_forward_fingerprint=preview[
+            "copy_forward_fingerprint"])
+        status1, first = self._session(
+            c, "/api/v2/setup/seasons/copy-forward/commit", commit_body)
+        self.assertEqual(status1, 200, first)
+
+        src_reg = next(r for r in
+                       STATE.api.store.registrations_for_season(src["id"])
+                       if r.team_id == team["id"])
+        status_u, unreg = self._session(
+            c, f"/api/v2/setup/season-team-registration/{src_reg.id}/remove",
+            {})
+        self.assertEqual(status_u, 200, unreg)
+
+        status2, replay = self._session(
+            c, "/api/v2/setup/seasons/copy-forward/commit", commit_body)
+        self.assertEqual(status2, 200, replay)
+        self.assertEqual(replay["season"], first["season"])
+        self.assertEqual(replay["registrations"], first["registrations"])
+        self.assertEqual(replay["totals"], first["totals"])
         program_seasons = [s for s in STATE.api.store.all_seasons()
                           if s.program_id == program["id"]
                           and s.id != src["id"]]

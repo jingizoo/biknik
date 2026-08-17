@@ -273,6 +273,13 @@ class MigrationApplyTest(unittest.TestCase):
                     "some-fingerprint-nobody-committed"),
                 "an unknown fingerprint on a freshly-adopted database must "
                 "read None, not raise or read something stale")
+            # #159 review round 3, migration 054: the immutable response
+            # snapshot column re-added on adoption too -- the whole table was
+            # dropped above (pre-053 shape), so 054's ADD COLUMN lands on a
+            # freshly re-created table exactly as it would on a genuinely
+            # legacy database that stopped at 053.
+            self.assertIn("response_snapshot",
+                          _table_columns(adopted, "season_copy_forward_commits"))
             self.assertIn("league_season_id", _table_columns(adopted, "divisions"))
             self.assertIn("program_id", _table_columns(adopted, "leagues"))
             self.assertIn("league_id", _table_columns(adopted, "teams"))
