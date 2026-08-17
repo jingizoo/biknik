@@ -5180,12 +5180,23 @@ class Handler(BaseHTTPRequestHandler):
             # #202: same "one guarded call, ternary-selected mutation"
             # shape as the archive/reopen pair just below -- kind and
             # targets are identical for preview and commit (both MINT the
-            # same "season" axis), so only the callable differs, chosen
-            # once here (waived below: route_extract.py's dispatch-shape
-            # walker does not yet follow a bool captured from `mcf.group(1)`
-            # through a SECOND `if`, only a DIRECT `mcf.group(1) == ...`
-            # test -- narrower than restructuring the extractor for one
-            # route pair).
+            # same "season" axis), so only the callable differs. The
+            # boolean is resolved to a plain local (`is_commit`) BEFORE
+            # the ternary, deliberately: route_extract.py's dispatch-shape
+            # walker refuses outright ("does not model ternaries; rewrite
+            # as if/elif") the moment an ``ast.IfExp`` test directly
+            # mentions a tracked match object like `mcf` -- see
+            # route_extract.py's own ``if isinstance(node, ast.IfExp):``
+            # handling. This SAME function's two PRE-EXISTING ternaries of
+            # that exact direct-test shape (``mar.group(2) == 'archive'``
+            # just below, and ``kind == 'venue'`` elsewhere in
+            # ``_handle_setup_v2``) each carry their own reviewed
+            # ``_AUDIT_WAIVERS`` entry for it; testing `is_commit` here
+            # instead of `mcf.group(1) == "commit"` directly keeps the
+            # ternary's test a bare name the walker has no objection to,
+            # so this route needs neither a new waiver nor any other
+            # touch to route_extract.py at all -- narrower than adding
+            # one, per this slice's own scope.
             mutation = ((lambda: api.commit_new_season_copy_forward(
                             copy_forward_fingerprint=b.get(
                                 "copy_forward_fingerprint"),
