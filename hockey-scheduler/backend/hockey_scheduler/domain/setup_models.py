@@ -139,6 +139,40 @@ class SeasonTeamRegistration:
 
 
 @dataclass
+class SeasonCopyForwardCommit:
+    """Idempotency ledger for new-Season copy-forward commits (#159 review
+    round 2: double-submit/retry blocker). One row per SUCCESSFUL
+    ``commit_new_season_copy_forward`` call, keyed by the exact
+    ``copy_forward_fingerprint`` that produced it -- migration 053's
+    ``ux_season_copy_forward_commits_fingerprint`` UNIQUE index is the
+    atomic backstop: a second commit (sequential replay OR a genuine
+    concurrent race) that reuses the same fingerprint loses this row's
+    INSERT, and the service treats that as an idempotent request for the
+    SAME result this row already records -- never a second Season (mirrors
+    ``commit_ice_availability``'s own idempotent-duplicate handling, #158,
+    adapted for a write target -- a brand-new Season -- that has no natural
+    dedup key of its own).
+
+    ``registration_ids`` is the EXACT set of SeasonTeamRegistration rows
+    this commit created, snapshotted so a later idempotent replay returns
+    precisely what the original commit produced -- not whatever a season's
+    registrations happen to look like by the time the replay lands (an
+    operator could legitimately register more teams into the new Season in
+    between). ``rolled_forward``/``skipped`` are copied from the same
+    original call for the identical reason: ``skipped`` in particular has
+    no row of its own to re-derive from current state.
+    """
+    id: str
+    copy_forward_fingerprint: str
+    season_id: str
+    actor_id: Optional[str] = None
+    registration_ids: list = field(default_factory=list)
+    rolled_forward: int = 0
+    skipped: int = 0
+    committed_at: Optional[datetime] = None
+
+
+@dataclass
 class TeamLeagueMigrationDecision:
     """An operator-supplied permanent-League assignment for a Team whose
     historical registrations span more than one League (#283 migration 035).
