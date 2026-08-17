@@ -2999,6 +2999,358 @@ class SetupService:
         return {"rolled_forward": rolled, "skipped": skipped,
                 "registrations": created}
 
+    # -- new-Season copy-forward preview/commit (#159) ----------------------
+    # "A new Season can be previewed/copied forward without mutating the
+    # prior Season." Composes create_season (via _resolve_season_creation)
+    # with roll_forward_registrations_v2's own selection machinery (via
+    # _apply_registration_selections), modeled directly on
+    # preview_ice_availability/commit_ice_availability's fingerprint pattern
+    # (#158): preview is side-effect-free (plus an optional audit row) and
+    # returns a ``copy_forward_fingerprint`` binding the ENTIRE resolved plan;
+    # commit refuses before any write unless that fingerprint (a) is
+    # supplied, (b) matches a FRESH re-resolution of the plan against current
+    # state, and (c) matches a successful preview audit by the SAME actor —
+    # then creates the Season and applies the selections in ONE transaction.
+    #
+    # DIVISION CONTRACT (the trickiest part of this slice, decided and
+    # documented here): a selection's optional ``division_id`` cannot name a
+    # row in the TARGET Season the way roll_forward_registrations_v2's own
+    # ``division_id`` does, because the target Season (and therefore any
+    # target LeagueSeason/Division) does not exist until commit creates it,
+    # and this slice deliberately builds no machinery to fabricate a matching
+    # target Division. So ``division_id`` here instead names a Division the
+    # team occupies TODAY, under the SOURCE Season's LeagueSeason for the
+    # same League — proving the selection is a coherent "carry this team's
+    # current division assignment forward" request rather than a fabricated
+    # id — and a division_id that does not resolve there refuses the ENTIRE
+    # batch (``division_needs_target_creation``) rather than silently
+    # guessing. Even a VALID source-side division_id is never written onto
+    # the new registration (no target Division can exist yet): the created
+    # registration always carries ``division_id=None``, and the preview
+    # response marks each such selection ``division_pending: true`` so the
+    # operator sees, before committing, exactly which teams will land without
+    # a Division and need one assigned afterward (create the Division under
+    # the new Season, then reassign — both already-existing tools, out of
+    # scope to extend further here).
+    def _has_matching_copy_forward_preview_audit(self, actor_id, fingerprint):
+        """True if ``actor_id`` recorded a successful
+        ``new_season_copy_forward_previewed`` audit for exactly
+        ``fingerprint`` — the commit preview gate, mirroring
+        ``_has_matching_preview_audit`` (#158) exactly."""
+        if actor_id is None or fingerprint is None:
+            return False
+        for entry in self.store.all_setup_audit():
+            if (entry.action == "new_season_copy_forward_previewed"
+                    and entry.actor_id == actor_id
+                    and entry.detail.get("copy_forward_fingerprint")
+                    == fingerprint):
+                return True
+        return False
+
+    def _resolve_copy_forward_plan(self, *, program_id, name, start_date,
+                                   end_date, source_season_id, selections):
+        """Deterministic, side-effect-free planning shared by preview and
+        commit (#159 — mirrors ``_plan_ice_availability``'s #158 role
+        exactly): resolve the would-be Season's fields via
+        ``_resolve_season_creation`` (Program exists, timezone-anchored
+        dates, end >= start — the SAME checks ``create_season`` itself runs),
+        validate the source Season and every selection the same way
+        ``roll_forward_registrations_v2`` validates its own (team exists,
+        belongs to the program, has a permanent league_id matching the
+        selection, a named division belongs to the SOURCE LeagueSeason — see
+        the division contract above), and hash the resolved, operator-visible
+        plan into a fingerprint. Commit calls this AGAIN under its own Team/
+        League locks, so the bound snapshot is the one its write acts on —
+        any drift (a source registration deactivated, a team moved to
+        another league, a division renamed) changes the fingerprint and
+        forces a fresh preview, exactly like the ice-availability pattern.
+        """
+        program, clean_name, start, end = self._resolve_season_creation(
+            program_id, name, start_date, end_date)
+        if not isinstance(source_season_id, str) or _blank(source_season_id):
+            raise ValidationError(
+                "source_season_id must be a non-empty string.")
+        src = self.store.get_season(source_season_id)
+        if src is None:
+            raise NotFoundError(f"Season {source_season_id} not found.")
+        # Cross-Program refusal (#159): mirrors roll_forward_registrations_v2's
+        # own src.program_id != dst.program_id check, except the "destination"
+        # here is the REQUESTED program_id for the new Season (it has no
+        # Season of its own yet to compare against).
+        if (src.program_id or None) != (program_id or None):
+            raise ValidationError(
+                "The source season belongs to a different program than the "
+                "new season.",
+                {"reason": "cross_program_source_season",
+                 "program_id": program_id,
+                 "source_season_id": source_season_id})
+        if not isinstance(selections, list) or not selections:
+            raise ValidationError(
+                "Copy-forward requires a non-empty selections list; each "
+                "selection needs a target league_id.")
+        source_active = {
+            r.team_id for r in self.store.registrations_for_season(
+                source_season_id) if r.active}
+        # Same round-19 defense roll_forward_registrations_v2 uses: two
+        # selections for the same team_id in one batch is unresolvable
+        # ambiguity, caught before any selection is otherwise processed.
+        team_id_counts = {}
+        for sel in selections:
+            if isinstance(sel, dict) and isinstance(sel.get("team_id"), str):
+                team_id_counts[sel["team_id"]] = (
+                    team_id_counts.get(sel["team_id"], 0) + 1)
+        rows = []
+        for sel in selections:
+            if not isinstance(sel, dict):
+                raise ValidationError(
+                    "Each selection must be an object with a team_id and "
+                    "league_id.")
+            tid = sel.get("team_id")
+            if not isinstance(tid, str) or _blank(tid):
+                raise ValidationError(
+                    "Each selection needs a non-empty team_id.")
+            if tid not in source_active:
+                raise ValidationError(
+                    f"Team {tid} is not registered in the source season.")
+            if team_id_counts.get(tid, 0) > 1:
+                raise ValidationError(
+                    f"Team {tid} has more than one selection in this "
+                    "copy-forward batch; submit only one selection per team.",
+                    {"reason": "rollover_duplicate_team_selection",
+                     "team_id": tid})
+            # Optional explicit source registration identity (#331 round 19
+            # parity): when supplied, must resolve to an ACTIVE row for
+            # EXACTLY this team in the source season.
+            reg_id = sel.get("registration_id")
+            if reg_id is not None:
+                if not isinstance(reg_id, str) or _blank(reg_id):
+                    raise ValidationError(
+                        "A selection's registration_id must be a "
+                        "non-empty string when present.")
+                src_reg = self.store.get_season_team_registration(reg_id)
+                if (src_reg is None or src_reg.team_id != tid
+                        or not src_reg.active
+                        or self._season_of_league_season(
+                            src_reg.league_season_id) != source_season_id):
+                    raise ValidationError(
+                        f"Registration {reg_id} is not an active "
+                        f"source-season registration for team {tid}.",
+                        {"reason": "rollover_registration_mismatch",
+                         "team_id": tid, "registration_id": reg_id})
+            lid = sel.get("league_id")
+            if not isinstance(lid, str) or _blank(lid):
+                raise ValidationError(
+                    f"Selection for team {tid} needs a target league_id.")
+            league = self.store.get_league(lid)
+            if league is None:
+                raise NotFoundError(f"League {lid} not found.")
+            if (league.program_id or None) != (program_id or None):
+                raise ValidationError(
+                    f"League {lid} belongs to a different program than the "
+                    "new season.",
+                    {"reason": "league_program_mismatch", "league_id": lid})
+            team = self.store.get_team(tid)
+            if team is None:
+                raise ValidationError(
+                    f"Team {tid} in the source season no longer exists; it "
+                    "cannot be copied forward.")
+            if (team.program_id or None) != (program_id or None):
+                raise ValidationError(
+                    f"Team {tid} belongs to a different program than this "
+                    "copy-forward; it cannot be carried into the new "
+                    "season.")
+            # #283 Slice E parity: a Team may only be carried into its OWN
+            # permanent League (rule 7) — never a sole/latest/default guess.
+            if (team.league_id or None) != lid:
+                raise ValidationError(
+                    f"Team {tid} can only roll into its permanent league "
+                    f"{team.league_id or 'none'}, not {lid}.",
+                    {"reason": "rollover_league_not_team_league",
+                     "team_id": tid, "team_league_id": team.league_id,
+                     "selected_league_id": lid})
+            div_id = sel.get("division_id")
+            source_division_id = None
+            source_division_name = None
+            if div_id is not None:
+                if not isinstance(div_id, str):
+                    raise ValidationError(
+                        "A selection's division_id must be a string or "
+                        "null.")
+                division = self.store.get_division(div_id)
+                div_ls = (self.store.get_league_season(
+                    division.league_season_id)
+                    if division is not None else None)
+                # The DIVISION CONTRACT above: resolved against the SOURCE
+                # season's LeagueSeason for this selection's league, never a
+                # target one (it does not exist yet).
+                if (division is None or div_ls is None
+                        or div_ls.season_id != source_season_id
+                        or div_ls.league_id != lid):
+                    raise ValidationError(
+                        f"Division {div_id} does not exist under the source "
+                        f"season's league {lid}; the new season will need "
+                        "this Division created before this team's division "
+                        "can be carried forward. Remove this selection's "
+                        "division_id, or create the matching Division in "
+                        "the source season first.",
+                        {"reason": "division_needs_target_creation",
+                         "team_id": tid, "division_id": div_id,
+                         "league_id": lid})
+                source_division_id = division.id
+                source_division_name = division.name
+            rows.append({
+                "team_id": tid, "team_name": team.name,
+                "league_id": lid, "league_name": league.name,
+                "registration_id": reg_id,
+                "source_division_id": source_division_id,
+                "source_division_name": source_division_name,
+            })
+        reviewed = {
+            "program_id": program_id, "program_name": program.name,
+            "name": clean_name,
+            "start_date": start.isoformat() if start else None,
+            "end_date": end.isoformat() if end else None,
+            "source_season_id": source_season_id,
+            "source_season_name": src.name,
+            "selections": [
+                {**row, "division_pending": row["source_division_id"]
+                 is not None}
+                for row in rows],
+            "totals": {
+                "teams": len(rows),
+                "leagues": len({row["league_id"] for row in rows}),
+                "divisions_pending": sum(
+                    1 for row in rows
+                    if row["source_division_id"] is not None),
+            },
+        }
+        fingerprint = hashlib.sha256(json.dumps(
+            reviewed, sort_keys=True, separators=(",", ":"), default=str
+        ).encode()).hexdigest()[:16]
+        return {"program": program, "name": clean_name, "start": start,
+                "end": end, "src": src, "rows": rows, "reviewed": reviewed,
+                "fingerprint": fingerprint}
+
+    def preview_new_season_copy_forward(self, *, program_id=None, name=None,
+                                        start_date=None, end_date=None,
+                                        source_season_id=None,
+                                        selections=None, actor_id=None
+                                        ) -> dict:
+        """Preview a new-Season copy-forward (#159): the fully-resolved plan
+        for creating ``name`` under ``program_id`` and carrying
+        ``selections`` forward from ``source_season_id`` — side-effect-free
+        except for a server-attributed ``new_season_copy_forward_previewed``
+        audit row on a SUCCESSFUL preview by an authenticated caller (an
+        invalid plan raises before the audit; ``actor_id`` None records
+        nothing), mirroring ``preview_ice_availability`` (#158) exactly."""
+        plan = self._resolve_copy_forward_plan(
+            program_id=program_id, name=name, start_date=start_date,
+            end_date=end_date, source_season_id=source_season_id,
+            selections=selections)
+        resp = {**plan["reviewed"],
+                "copy_forward_fingerprint": plan["fingerprint"]}
+        if actor_id is not None:
+            with self.store.transaction():
+                self._audit(
+                    "new_season_copy_forward_previewed", "program",
+                    program_id, actor_id, {
+                        "copy_forward_fingerprint": plan["fingerprint"],
+                        "program_id": program_id,
+                        "source_season_id": source_season_id,
+                        "team_ids": [row["team_id"] for row in plan["rows"]],
+                        "totals": resp["totals"],
+                    })
+        return resp
+
+    @_transactional
+    def commit_new_season_copy_forward(self, *, program_id=None, name=None,
+                                       start_date=None, end_date=None,
+                                       source_season_id=None,
+                                       selections=None,
+                                       copy_forward_fingerprint=None,
+                                       actor_id=None) -> dict:
+        """Commit a previewed new-Season copy-forward (#159): atomically
+        create the Season and carry the previewed Team/League selections
+        forward (never Division — see the contract above), requiring
+        ``copy_forward_fingerprint`` to (a) be supplied, (b) match a FRESH
+        re-resolution of the plan against current state, and (c) match a
+        successful preview audit for this SAME actor — all three checked
+        BEFORE any write, mirroring ``commit_ice_availability`` (#158)
+        exactly. A refused commit mutates nothing: no Season row, no
+        registrations, no audit beyond the refusal itself.
+        """
+        # Lock every distinct Team/League named in selections FIRST, sorted —
+        # roll_forward_registrations_v2's own canonical lock order (#159), so
+        # a batch can never deadlock Team-vs-Team or League-vs-League, and
+        # the plan rebuilt below can't be shifted by a concurrent transfer or
+        # delete landing between this lock and the write. No lock is taken
+        # for the Season being minted — nothing can reference its id before
+        # this transaction, which creates it, commits.
+        if isinstance(selections, list):
+            for _tid in sorted({sel.get("team_id") for sel in selections
+                                if isinstance(sel, dict)
+                                and isinstance(sel.get("team_id"), str)
+                                and not _blank(sel.get("team_id"))}):
+                self.store.get_team_for_update(_tid)
+            for _lid in sorted({sel.get("league_id") for sel in selections
+                                if isinstance(sel, dict)
+                                and isinstance(sel.get("league_id"), str)
+                                and not _blank(sel.get("league_id"))}):
+                self._lock_league_for_binding(_lid)
+        # Build the ENTIRE plan UNDER the locks (#158-review pattern): Program
+        # existence, date parsing, the source Season and every selection are
+        # (re)resolved here, so nothing the fingerprint check compares against
+        # can be stale relative to committed state.
+        plan = self._resolve_copy_forward_plan(
+            program_id=program_id, name=name, start_date=start_date,
+            end_date=end_date, source_season_id=source_season_id,
+            selections=selections)
+        # Preview binding (#158-review pattern): a commit MUST be preceded by
+        # a preview of the SAME resolved plan BY THE SAME actor — the
+        # fingerprint alone is not a capability, so all three checks below
+        # must hold, and they run BEFORE any write.
+        if copy_forward_fingerprint is None:
+            raise ValidationError(
+                "Preview this copy-forward before committing it.",
+                details={"reason": "preview_required"})
+        if copy_forward_fingerprint != plan["fingerprint"]:
+            raise ScheduleConflictError(
+                "This copy-forward plan changed since it was previewed. "
+                "Preview again before committing.",
+                details={"reason": "preview_mismatch",
+                         "expected": plan["fingerprint"]})
+        if not self._has_matching_copy_forward_preview_audit(
+                actor_id, plan["fingerprint"]):
+            raise ValidationError(
+                "No matching preview by this operator for this "
+                "copy-forward plan. Preview it before committing.",
+                details={"reason": "preview_required"})
+        # create_season's own validation already ran above (inside
+        # _resolve_copy_forward_plan's _resolve_season_creation call), so
+        # build and insert the Season directly rather than re-validating.
+        season = Season(id=self.store.next_id("season"),
+                        program_id=program_id, name=plan["name"],
+                        start_date=plan["start"], end_date=plan["end"])
+        self.store.add_season(season)
+        self._audit("season_created", "season", season.id, actor_id,
+                    {"league_id": program_id})
+        wanted = {row["team_id"]: (row["league_id"], None)
+                 for row in plan["rows"]}
+        applied = self._apply_registration_selections(
+            to_season_id=season.id, from_season_id=source_season_id,
+            wanted=wanted, actor_id=actor_id)
+        self._audit(
+            "new_season_copy_forward_committed", "season", season.id,
+            actor_id, {
+                "program_id": program_id,
+                "source_season_id": source_season_id,
+                "copy_forward_fingerprint": plan["fingerprint"],
+                "rolled_forward": applied["rolled_forward"],
+                "skipped": applied["skipped"]})
+        return {"season": season, "registrations": applied["registrations"],
+                "totals": {"rolled_forward": applied["rolled_forward"],
+                           "skipped": applied["skipped"]}}
+
     # -- reassignment: move a record under a new parent (#166 PR D) --------
     # Each records the old→new parent id in the audit detail so a move is
     # traceable. Nullable links (venue→org, division→level, team→club) accept
