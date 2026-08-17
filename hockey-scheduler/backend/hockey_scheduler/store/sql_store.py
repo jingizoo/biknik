@@ -568,6 +568,23 @@ def _apply_migration(conn, dialect, version, statements, atomic_check=None) -> N
     instead of allowed to propagate with driver text intact. Anything else —
     any other exception shape, or any failure when ``atomic_check`` is
     ``None`` — is untouched, exactly as before.
+
+    The re-raise happens OUTSIDE the ``except`` block that caught the raw
+    driver exception, not `raise translated from exc` (or even
+    ``from None``) at that same spot (#426 round-7 review). While still
+    inside the handler, CPython's implicit exception chaining sets
+    ``translated.__context__`` to the raw exception regardless of the
+    ``from`` clause — ``from None``/``from exc`` only control ``__cause__``
+    and ``__suppress_context__``, so a structured logger that walks
+    ``__context__`` directly (ignoring ``__suppress_context__``, which only
+    the *default* traceback printer and well-behaved loggers respect) could
+    still reach the driver's ``DETAIL`` text (e.g. a live push token).
+    Deferring the raise to after the handler has exited means there is no
+    exception being handled at the moment ``translated`` is raised, so
+    nothing gets attached: ``__context__`` comes out actually ``None``, not
+    merely suppressed — confirmed empirically (see test coverage) and not
+    just asserted from the docs. ``from None`` is kept too, for
+    explicitness and as a second, independent guarantee on ``__cause__``.
     """
     def body():
         cur = conn.cursor()
@@ -579,6 +596,7 @@ def _apply_migration(conn, dialect, version, statements, atomic_check=None) -> N
             _atomic_check_lock_hook(version)
             check_fn(conn)
         for stmt in statements:
+            translated = None
             try:
                 cur.execute(stmt)
             except Exception as exc:
@@ -586,7 +604,12 @@ def _apply_migration(conn, dialect, version, statements, atomic_check=None) -> N
                              if atomic_check is not None else None)
                 if translated is None:
                     raise
-                raise translated from exc
+                # Do NOT `raise translated from exc` here — see the
+                # docstring above. `translated` is only recorded; the
+                # actual raise happens below, after this `except` block
+                # (and the raw `exc` it caught) has gone out of scope.
+            if translated is not None:
+                raise translated from None
         cur.execute(dialect.sql(
             "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)"),
             (version, _utcnow().isoformat()))
