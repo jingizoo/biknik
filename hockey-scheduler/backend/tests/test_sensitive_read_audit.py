@@ -1002,6 +1002,31 @@ class PlayerDuplicateReportAuditTest(_IdentityAuditBase):
         self.assertIn(SENTINEL_REGISTRATION, dumped)
 
 
+def _fresh_eligibility_fixture():
+    """A standalone, minimal fixture (own store/api/setup) for the
+    role-matrix test below, which needs a FRESH player+store per role so
+    each iteration's audit rows and eligibility state never leak into the
+    next -- same minimal-fixture shape ``_IdentityAuditBase.setUp`` uses,
+    factored out since the matrix test can't reuse ``self.store`` across
+    ``subTest`` iterations without cross-contaminating row counts."""
+    from datetime import datetime, timezone
+    from hockey_scheduler.domain import Division, League, LeagueSeason, Season
+    store = InMemoryStore()
+    store.add_program(Program(id="pr", name="P"))
+    store.add_season(Season(
+        id="se", program_id="pr", name="Fall",
+        start_date=datetime(2026, 9, 1, tzinfo=timezone.utc)))
+    store.add_league(League(id="lg", program_id="pr", name="L"))
+    store.add_league_season(
+        LeagueSeason(id="ls", league_id="lg", season_id="se"))
+    store.add_division(Division(id="d", league_season_id="ls", name="D1",
+                                age_group="U10"))
+    store.add_team(Team(id="t1", name="T1", program_id="pr"))
+    store.add_team(Team(id="t2", name="T2", program_id="pr"))
+    api = ApiService(store)
+    return store, api, api.setup
+
+
 # =========================================================================== #
 # #424 audit-wiring: evaluate_player_eligibility — BIRTHDATE at SUMMARY       #
 # fidelity (may_read_summary, not may_read_raw), whole-call refusal.         #
@@ -1040,6 +1065,101 @@ class EligibilitySummaryAuditTest(_IdentityAuditBase):
             actor_user_id="user_admin")
         self.assertNotIn("error", result)
         self.assertIsNotNone(result.get("age_at_cutoff"))
+
+    def test_coach_requesting_details_gets_summary_masked_not_refused(self):
+        # #424 round-N owner review finding 3: COACH holds SUMMARY (not
+        # RAW) on BIRTHDATE, so include_details=True must NOT hand COACH
+        # the operator-only age_at_cutoff/cutoff_date fields -- but the
+        # call itself still succeeds with the SUMMARY-safe subset (mask,
+        # not refuse), since that subset remains meaningful on its own.
+        p = self._seed()
+        result = self.api.evaluate_player_eligibility(
+            p.id, "d", include_details=True, actor_role=Role.COACH,
+            actor_user_id="user_coach")
+        self.assertNotIn("error", result, result)
+        self.assertNotIn("age_at_cutoff", result)
+        self.assertNotIn("cutoff_date", result)
+        # The SUMMARY-safe fields are still present and correct.
+        self.assertEqual(result["status"], "eligible")
+        self.assertEqual(result["tier_code"], "U10")
+
+        rows = self.rows()
+        self.assertEqual(len(rows), 2)
+        summary_rows = [r for r in rows
+                        if r.purpose == "evaluate_player_eligibility"]
+        detail_rows = [r for r in rows
+                       if r.purpose == "evaluate_player_eligibility_details"]
+        self.assertEqual(len(summary_rows), 1)
+        self.assertEqual(summary_rows[0].outcome, ACCESS_ALLOWED)
+        self.assertEqual(len(detail_rows), 1)
+        self.assertEqual(detail_rows[0].outcome, ACCESS_DENIED)
+        self.assertEqual(detail_rows[0].actor_role, "coach")
+        self.assertEqual(detail_rows[0].subject_id, f"player:{p.id}")
+
+    def test_league_admin_requesting_details_gets_an_allowed_detail_row(self):
+        p = self._seed()
+        self.api.evaluate_player_eligibility(
+            p.id, "d", include_details=True, actor_role=Role.LEAGUE_ADMIN,
+            actor_user_id="user_admin")
+        rows = self.rows()
+        detail_rows = [r for r in rows
+                       if r.purpose == "evaluate_player_eligibility_details"]
+        self.assertEqual(len(detail_rows), 1)
+        self.assertEqual(detail_rows[0].outcome, ACCESS_ALLOWED)
+        self.assertEqual(detail_rows[0].category, C.BIRTHDATE)
+
+    def test_include_details_false_never_writes_a_detail_row(self):
+        p = self._seed()
+        for role in (Role.COACH, Role.LEAGUE_ADMIN):
+            self.api.evaluate_player_eligibility(
+                p.id, "d", actor_role=role, actor_user_id="u")
+        self.assertEqual(
+            [r for r in self.rows()
+             if r.purpose == "evaluate_player_eligibility_details"], [])
+
+    def test_role_matrix_summary_vs_raw_tier_for_every_role(self):
+        # #424 round-N owner review finding 3: enumerate every role's
+        # actual grant/deny/tier at BOTH the SUMMARY (whole-call) gate and
+        # the RAW (detail-field) gate, mirroring test_privacy_policy.py's
+        # PolicyMatrixTest convention -- no sampling.
+        EXPECTED = {
+            Role.LEAGUE_ADMIN: ("summary_ok", "details_ok"),
+            Role.ARENA_MANAGER: ("refused", None),
+            Role.COACH: ("summary_ok", "details_masked"),
+            Role.PLAYER: ("refused", None),
+            Role.GUARDIAN: ("refused", None),
+            Role.OFFICIAL: ("refused", None),
+            Role.VIEWER: ("refused", None),
+        }
+        self.assertEqual(set(EXPECTED), set(Role))
+        for role, (whole_call, detail_tier) in EXPECTED.items():
+            with self.subTest(role=role.value):
+                store, api, setup = _fresh_eligibility_fixture()
+                setup.set_age_eligibility_rule(
+                    "ls", 12, 31, [{"code": "U10", "max_age": 30}])
+                p = setup.add_player(
+                    "t1", None, Position.FORWARD, first_name="Priv",
+                    last_name="Fields", birthdate=SENTINEL_BIRTHDATE)
+                result = api.evaluate_player_eligibility(
+                    p.id, "d", include_details=True, actor_role=role,
+                    actor_user_id=f"user_{role.value}")
+                if whole_call == "refused":
+                    self.assertEqual(result["error"]["code"], "forbidden",
+                                     role.value)
+                else:
+                    self.assertNotIn("error", result, (role.value, result))
+                    if detail_tier == "details_ok":
+                        self.assertIsNotNone(result.get("age_at_cutoff"),
+                                             role.value)
+                        self.assertIsNotNone(result.get("cutoff_date"),
+                                             role.value)
+                    else:
+                        self.assertIsNone(result.get("age_at_cutoff"),
+                                          role.value)
+                        self.assertIsNone(result.get("cutoff_date"),
+                                          role.value)
+                        self.assertEqual(result["status"], "eligible",
+                                         role.value)
 
     def test_unauthorized_role_refuses_the_whole_call_default_and_details(self):
         p = self._seed()

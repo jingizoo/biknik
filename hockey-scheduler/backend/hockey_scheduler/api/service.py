@@ -12183,24 +12183,48 @@ class ApiService:
         ``age_at_cutoff`` + ``cutoff_date`` for operator surfaces, to be
         MANAGE_SETUP-gated at the HTTP layer like ``include_email``.
 
-        Gated on ``visibility_policy.may_read_summary`` for BIRTHDATE (#424
-        audit-wiring), not ``may_read_raw``: the response is derived
-        SUMMARY-fidelity data (the raw birthdate is never returned by any
-        mode of this method), matching the exact grant ``COACH`` holds for
-        this category. The gate covers the WHOLE method, not just
-        ``include_details`` — the default status/reason/tier response is
-        itself derived from a read of the athlete's birthdate, so an
-        unauthorized caller must not reach even the summary shape. Refuses
-        the WHOLE call on denial, the same as ``player_duplicate_report``:
-        there is no separate field to mask here the way ``list_players``
-        masks identity columns on an otherwise-legitimate roster row — the
-        entire payload IS the gated summary, so a partial result would be
-        meaningless. Audited on both outcomes (ALLOWED/DENIED) via the same
-        ``_record_sensitive_read`` call the RAW-fidelity gates use — a
+        TWO INDEPENDENT tiers, gated separately (#424 round-N owner review
+        finding 3 — fixes a bug where a single ``may_read_summary`` check
+        covered the WHOLE response, so an authorized ``include_details=True``
+        call from ANY SUMMARY-holding caller — i.e. ``COACH`` — returned the
+        operator-only detail fields too, even though ``COACH`` never holds
+        ``may_read_raw`` for BIRTHDATE):
+
+        * The base SUMMARY response (``status``/``reason``/``tier_code``/
+          ``max_age``/rule identity) is gated on ``visibility_policy.
+          may_read_summary`` — the response is derived SUMMARY-fidelity data
+          (the raw birthdate is never returned by any mode of this method),
+          matching the exact grant ``COACH`` holds for this category. This
+          gate covers the WHOLE method, not just ``include_details`` — the
+          default response is itself derived from a read of the athlete's
+          birthdate, so an unauthorized caller must not reach even the
+          summary shape. Refuses the WHOLE call on denial, the same as
+          ``player_duplicate_report``: there is no separate field to mask
+          here the way ``list_players`` masks identity columns on an
+          otherwise-legitimate roster row — the entire SUMMARY payload IS
+          the gated summary, so a partial result would be meaningless.
+        * ``age_at_cutoff``/``cutoff_date`` — the operator-only detail
+          fields this method's own docstring already called out as "for
+          operator surfaces, to be MANAGE_SETUP-gated" — additionally
+          require ``visibility_policy.may_read_raw`` for BIRTHDATE (the
+          exact grant ``LEAGUE_ADMIN`` holds and ``COACH`` does not). Unlike
+          the SUMMARY gate, this one MASKS rather than refuses: a caller who
+          passes SUMMARY but not RAW still gets its legitimate SUMMARY
+          response, just with the two detail fields omitted — the same
+          mask-not-refuse shape ``list_players`` uses for its own extra
+          columns on an otherwise-legitimate row, since the SUMMARY portion
+          remains meaningful on its own (unlike the whole-call case above,
+          where there is no meaningful SUMMARY-minus-something to return).
+
+        Both outcomes are audited via ``_record_sensitive_read`` — a
         deliberate decision to keep #426's "audit every sensitive read"
         posture uniform across fidelity levels rather than carve out a
         silent exception for SUMMARY reads; if that proves too noisy in
-        practice, dropping the ALLOWED audit here is a one-line change.
+        practice, dropping either ALLOWED audit is a one-line change. The
+        detail-tier's DENIED row is written ``durable=True`` (like every
+        other masked-field denial in this facade), because the surrounding
+        call still succeeds — there is no enclosing refusal for it to stay
+        atomic with.
 
         ``actor_role``/``actor_user_id`` are purely additive (no existing
         caller passed them before this method had a way to).
@@ -12209,7 +12233,7 @@ class ApiService:
         ``self.setup.evaluate_player_age_eligibility``'s internal
         ``self.store.get_player(player_id)`` — runs INSIDE the SAME
         ``with self.store.transaction():`` block as the ALLOWED audit
-        write below, not as a separate already-autocommitted statement
+        write(s) below, not as a separate already-autocommitted statement
         beforehand, mirroring ``list_contact_destinations``'/
         ``get_delivery_overview``'s own "read + record in one transaction"
         shape.
@@ -12221,6 +12245,8 @@ class ApiService:
             self._refuse_sensitive_read(
                 category, "evaluate_player_eligibility", actor_user_id,
                 label, request_id)
+        raw_allowed = (visibility_policy.may_read_raw(role, category)
+                      if include_details else None)
         with self.store.transaction():
             result = self.setup.evaluate_player_age_eligibility(
                 player_id, division_id)
@@ -12228,7 +12254,20 @@ class ApiService:
                 category, [("recipient", f"player:{player_id}")],
                 "evaluate_player_eligibility", actor_user_id, label,
                 ACCESS_ALLOWED, request_id)
-        if not include_details:
+            if include_details:
+                subjects = [("recipient", f"player:{player_id}")]
+                if raw_allowed:
+                    self._record_sensitive_read(
+                        category, subjects,
+                        "evaluate_player_eligibility_details",
+                        actor_user_id, label, ACCESS_ALLOWED, request_id)
+                else:
+                    self._record_sensitive_read(
+                        category, subjects,
+                        "evaluate_player_eligibility_details",
+                        actor_user_id, label, ACCESS_DENIED, request_id,
+                        durable=True)
+        if not include_details or not raw_allowed:
             for key in ("age_at_cutoff", "cutoff_date"):
                 result.pop(key, None)
         return result

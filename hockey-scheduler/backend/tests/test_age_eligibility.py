@@ -242,12 +242,29 @@ class EligibilityRuleServiceTest(unittest.TestCase):
             self.assertNotIn("age_at_cutoff", summary, label)
             self.assertNotIn("cutoff_date", summary, label)
             self.assertNotIn("birthdate", summary, label)
-            details = api.evaluate_player_eligibility(
+            # #424 round-N owner review finding 3: include_details is an
+            # OPERATOR-tier opt-in (visibility_policy.may_read_raw), not a
+            # COACH one -- COACH holds only SUMMARY on BIRTHDATE, so
+            # include_details=True from COACH masks the detail fields
+            # (mask, not refuse: the call still succeeds with the
+            # SUMMARY-safe subset) rather than disclosing them.
+            coach_details = api.evaluate_player_eligibility(
                 player.id, "d", include_details=True,
                 actor_role=Role.COACH, actor_user_id="coach1")
-            self.assertEqual(details["age_at_cutoff"], 9, label)
-            self.assertEqual(details["cutoff_date"], "2026-12-31", label)
-            self.assertNotIn("birthdate", details, label)
+            self.assertNotIn("error", coach_details, label)
+            self.assertNotIn("age_at_cutoff", coach_details, label)
+            self.assertNotIn("cutoff_date", coach_details, label)
+            self.assertNotIn("birthdate", coach_details, label)
+            # LEAGUE_ADMIN holds RAW on BIRTHDATE -- the actual
+            # "details opt-in" path this test's name describes.
+            admin_details = api.evaluate_player_eligibility(
+                player.id, "d", include_details=True,
+                actor_role=Role.LEAGUE_ADMIN, actor_user_id="admin1")
+            self.assertNotIn("error", admin_details, label)
+            self.assertEqual(admin_details["age_at_cutoff"], 9, label)
+            self.assertEqual(admin_details["cutoff_date"], "2026-12-31",
+                             label)
+            self.assertNotIn("birthdate", admin_details, label)
             rules = api.list_age_eligibility_rules("ls")
             self.assertEqual(rules[0]["version"], 1, label)
             self.assertEqual(rules[0]["tiers"][0], {"code": "U10",
