@@ -1,4 +1,31 @@
--- 051_athlete_identity: durable athlete identity + versioned age eligibility (#273).
+-- 058_athlete_identity: durable athlete identity + versioned age eligibility (#273).
+--
+-- NUMBERING NOTE (parallel lanes, #424 owner review): originally authored as
+-- 051_athlete_identity against a main whose own migrations stopped at 050.
+-- By the time this branch's PR reached review, main had independently
+-- advanced through 057 (051_active_context_generation, 052_epoch_fence_
+-- version, 053_season_copy_forward_commits, 054_copy_forward_response_
+-- snapshot, 055_copy_forward_request_identity, and #426's own renumbered
+-- 056_data_access_log / 057_device_token_unique_key) -- a same-leading-
+-- number collision with main's OWN 051 file (different filename, so git's
+-- merge saw no textual conflict and both files coexisted in migrations/).
+-- That was not a mere cosmetic collision: on a database already migrated
+-- through main's 057 BEFORE this file ever existed, migrate() applies this
+-- file chronologically LAST (never previously recorded, so it lands
+-- whenever the loop first reaches it) -- but on a FRESH database the same
+-- file sorts and applies BEFORE 052-057, since "051_athlete_identity" <
+-- "052_epoch_fence_version" lexicographically. Two different real DDL-
+-- execution orders for the same file depending on install history,
+-- reproduced empirically (SQLite + PostgreSQL) against the real migrate()/
+-- _load_migrations() before this rename. Resolved the same way #426's own
+-- 053/055->056/057 collision was: renumbering past main's claimed range, to
+-- 058. No functional statement below changed; only the version stem
+-- (filename, and its references in the identity-migration-upgrade tests'
+-- ``_MIGRATION``/helper/method names, test_reassignment_fks.py's replay
+-- assertion, and the "migration 051" prose naming this migration across
+-- domain/models.py, services/setup_service.py, store/db_errors.py,
+-- store/sql_store.py, and the competition-reset/age-eligibility/
+-- registration-number tests) moved from 051 to 058.
 --
 -- Players gain structured names, a private birthdate (ISO "YYYY-MM-DD" text),
 -- a stable governing-body registration number, and the 1-7 skill rating the

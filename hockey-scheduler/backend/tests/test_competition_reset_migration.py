@@ -104,11 +104,11 @@ def _downgrade_035(store):
         # this historical test can rewind 035. Replaying 050 below proves the
         # current schema still composes over the legacy upgrade path.
         cur.execute("DROP TABLE IF EXISTS schedule_scenarios")
-        # 051 (#273) age_eligibility_rules ALSO references league_seasons, for
-        # the SAME PostgreSQL reason -- but unlike schedule_scenarios, 051 is
+        # 058 (#273) age_eligibility_rules ALSO references league_seasons, for
+        # the SAME PostgreSQL reason -- but unlike schedule_scenarios, 058 is
         # NOT un-recorded below: it also ALTERs the (unrelated-to-this-test)
         # players table, and those columns are never reversed here, so
-        # replaying 051 in full would fail on "column already exists". 051
+        # replaying 058 in full would fail on "column already exists". 058
         # stays recorded as applied (its players-side effects are genuinely
         # still there and correct); only its league_seasons-dependent TABLE
         # is dropped to unblock this historical rewind. age_eligibility_rules

@@ -64,7 +64,7 @@ def _downgrade_to_pre028(store):
     database, so only the SCHEMA is reversed."""
     cur = store.conn.cursor()
     # -- reverse 035 (#283) back to the post-028 competition shape --
-    # 050 and 051 are later children of the hierarchy being rewound.
+    # 050 and 058 are later children of the hierarchy being rewound.
     # PostgreSQL requires the dependent tables to go before league_seasons
     # can be removed; these read-only preflight tests never exercise later
     # scenario persistence or age-eligibility rules (#273).

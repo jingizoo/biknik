@@ -93,7 +93,7 @@ def translate_player_jersey_exception(
 def translate_registration_number_exception(
         exc: BaseException, team_id: str,
         registration_number) -> Optional[DomainError]:
-    """Translate migration 051's ``(team_id, registration_number)`` unique
+    """Translate migration 058's ``(team_id, registration_number)`` unique
     violation with domain-safe context (#273 review round 2 finding 2).
 
     ``SetupService._assert_registration_number_available`` already rejects a
@@ -421,7 +421,7 @@ def _is_active_team_jersey_violation(exc: BaseException) -> bool:
 
 def _is_team_registration_number_violation(exc: BaseException) -> bool:
     """A unique violation of ``ux_players_team_registration_number``
-    specifically (migration 051, #273 review round 2 finding 2).
+    specifically (migration 058, #273 review round 2 finding 2).
 
     PostgreSQL/psycopg carry the authoritative constraint name on ``.diag`` (a
     23505 for a different unique index on ``players`` — e.g. the active-jersey

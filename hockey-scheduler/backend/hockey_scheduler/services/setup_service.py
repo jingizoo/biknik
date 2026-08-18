@@ -962,7 +962,7 @@ class SetupService:
         # rows entirely, so removing a LeagueSeason left its
         # age_eligibility_rules orphaned — pointing at a binding that no
         # longer existed, with no operator-facing signal that history would
-        # be stranded. Also the SAME invariant migration 051's new FK on
+        # be stranded. Also the SAME invariant migration 058's new FK on
         # age_eligibility_rules.league_season_id now enforces at the
         # database level (a DB-level backstop against a create-rule-vs-
         # delete-binding race this service-level gate alone cannot close —
@@ -7160,7 +7160,7 @@ class SetupService:
         (#292) above, applied to ``registration_number`` instead of
         ``jersey_number``, with the one difference the invariant itself
         already draws: a registration number is reserved by an INACTIVE
-        player too (migration 051, ``_assert_registration_number_available``),
+        player too (migration 058, ``_assert_registration_number_available``),
         so this release is NOT conditioned on ``is_active`` the way the
         jersey release is.
 
@@ -7171,7 +7171,7 @@ class SetupService:
         transaction: for every EXISTING player (active or inactive) whose
         final ``(team, registration_number)`` differs from its current one,
         release the number it holds now (set ``registration_number = NULL`` —
-        always unconstrained; migration 051's partial unique index excludes
+        always unconstrained; migration 058's partial unique index excludes
         NULL), so the subsequent per-row assignment lands the validated final
         state with no transient uniqueness failure. Only
         ``registration_number`` is touched — the id, the team, the jersey,

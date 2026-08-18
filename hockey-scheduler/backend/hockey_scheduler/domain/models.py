@@ -68,7 +68,7 @@ class Player:
     external_ref: Optional[str] = None
     # -- durable athlete identity (#273) --------------------------------
     # Structured names. Nullable: legacy players keep only the flattened
-    # ``name`` until an edit/import supplies real parts — migration 051 never
+    # ``name`` until an edit/import supplies real parts — migration 058 never
     # guesses a first/last split from the display name.
     first_name: Optional[str] = None
     last_name: Optional[str] = None

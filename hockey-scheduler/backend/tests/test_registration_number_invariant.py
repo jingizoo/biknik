@@ -15,7 +15,7 @@ paths could still land two rows with one registration number on ONE team:
   moved it onto a different team than it started on.
 * Even with every service-layer check firing, a check-then-write is not
   safe under a cross-process race: two concurrent writers can each observe
-  the number as free before either commits. Migration 051 now adds a
+  the number as free before either commits. Migration 058 now adds a
   partial ``UNIQUE (team_id, registration_number) WHERE registration_number
   IS NOT NULL`` index as the database backstop, translated at the store
   boundary into the SAME stable ``duplicate_registration_number`` conflict.

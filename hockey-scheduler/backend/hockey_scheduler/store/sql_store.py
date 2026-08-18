@@ -1550,7 +1550,7 @@ class SqlStore:
         except Exception as exc:
             translated = translate_player_jersey_exception(
                 exc, player.team_id, player.jersey_number)
-            # ux_players_team_registration_number (migration 051, #273 review
+            # ux_players_team_registration_number (migration 058, #273 review
             # round 2 finding 2): the database backstop for the same-team
             # registration-number invariant, checked after the jersey
             # violation (a different unique index on this same table) so a

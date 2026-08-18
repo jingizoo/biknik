@@ -22,7 +22,7 @@ computation -- closing the archived-write hole AND serializing version
 assignment in one mechanism, since a second writer for the SAME
 league_season_id blocks on the SAME Season row until the first commits.
 ``delete_league_season`` now includes rule rows in its itemized dependency
-gate, and migration 051 adds a NOT NULL + FK backstop at the database level.
+gate, and migration 058 adds a NOT NULL + FK backstop at the database level.
 
 Covers, on Memory/SQLite/[PostgreSQL]:
 
