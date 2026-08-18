@@ -25,7 +25,7 @@ import unittest
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import Position, Team
+from hockey_scheduler.domain import Position, Program, Role, Team
 from hockey_scheduler.domain.errors import ValidationError
 from hockey_scheduler.store import InMemoryStore, SqlStore
 
@@ -294,6 +294,26 @@ class FacadePrivacyTest(AthleteIdentityTestBase):
     """AC[2]: birthdate + registration identifiers absent from default
     payloads; the operator opt-in is explicit, like include_email (#268)."""
 
+    def _each_with_program(self):
+        """Like ``_each()``, but ``t1`` belongs to a real Program a
+        LEAGUE_ADMIN can be authorized into -- required for the #424
+        audit-wiring identity gate's ALLOW path: ``list_players``'s
+        pre-existing #369 Program-scoping gate (triggered whenever a
+        ``role`` is supplied) resolves to zero Teams on a Program-less
+        fixture regardless of privacy grants, which would make an ALLOW
+        assertion here indistinguishable from a scoping accident."""
+        for label, store in _service_backends():
+            with self.subTest(backend=label):
+                store.add_program(Program(id="pr", name="P"))
+                store.add_team(Team(id="t1", name="Team One",
+                                    program_id="pr"))
+                api = ApiService(store)
+                try:
+                    yield label, store, api, api.setup
+                finally:
+                    if isinstance(store, SqlStore):
+                        store.close()
+
     def test_default_player_payloads_never_carry_private_fields(self):
         for label, store, api, setup in self._each():
             created = api.create_player(
@@ -317,6 +337,33 @@ class FacadePrivacyTest(AthleteIdentityTestBase):
             self.assertEqual(row["skill_rating"], 6, label)
 
     def test_operator_opt_in_returns_private_fields(self):
+        # #424 audit-wiring: include_identity now reaches the SAME #426
+        # policy+audit boundary include_email already used (see
+        # ApiService.list_players's BIRTHDATE/REGISTRATION_NUMBER gate,
+        # right above the include_email block it mirrors) -- an authorized
+        # role is required for BOTH opt-ins now, closing the gap this
+        # test's comment used to describe as future work. Uses
+        # _each_with_program (not _each) so the pre-existing #369 Program-
+        # scoping gate a supplied `role` also triggers actually authorizes
+        # `t1`, isolating this assertion to the privacy gate.
+        for label, store, api, setup in self._each_with_program():
+            api.create_player(
+                "t1", first_name="Jane", last_name="Smith",
+                position="forward", birthdate="2015-03-02",
+                registration_number="HC-1", email="j@x.com")
+            row = api.list_players(
+                team_id="t1", include_identity=True, include_email=True,
+                role=Role.LEAGUE_ADMIN, user_id="admin1")[0]
+            self.assertEqual(row["birthdate"], "2015-03-02", label)
+            self.assertEqual(row["registration_number"], "HC-1", label)
+            self.assertEqual(row["email"], "j@x.com", label)
+
+    def test_operator_opt_in_masks_identity_for_an_unauthorized_caller(self):
+        """#424 audit-wiring: a bare call (no role/user_id) now masks
+        BIRTHDATE/REGISTRATION_NUMBER exactly like include_email already
+        masked CONTACT_DESTINATION -- the roster itself still comes back
+        (mask, not refuse), with one durable DENIED audit row per masked
+        category."""
         for label, store, api, setup in self._each():
             api.create_player(
                 "t1", first_name="Jane", last_name="Smith",
@@ -324,23 +371,16 @@ class FacadePrivacyTest(AthleteIdentityTestBase):
                 registration_number="HC-1", email="j@x.com")
             row = api.list_players(team_id="t1", include_identity=True,
                                    include_email=True)[0]
-            self.assertEqual(row["birthdate"], "2015-03-02", label)
-            self.assertEqual(row["registration_number"], "HC-1", label)
-            # email is a DIFFERENT opt-in than include_identity, and the two
-            # have diverged post-merge (main's #426, merged after this test
-            # was first written): include_email now reaches the same
-            # CONTACT_DESTINATION sensitive-read gate the #268 contacts
-            # registry uses, which requires an authorized role/user_id
-            # (ApiService._privacy_principal/_sensitive_read_allowed) --
-            # #426 review finding 1 deliberately removed the old "missing
-            # principal defaults to RAW" behavior this test originally
-            # relied on, closing a real disclosure hole. This bare call
-            # supplies no role, so email is correctly withheld; #273's own
-            # include_identity fields above are UNAFFECTED because they are
-            # not yet wired through that same policy gate -- a disclosed,
-            # separate integration gap (see the PR body), not something
-            # this assertion should paper over.
+            self.assertIsNone(row["birthdate"], label)
+            self.assertIsNone(row["registration_number"], label)
             self.assertIsNone(row["email"], label)
+            outcomes = sorted(
+                (r.category.value, r.outcome)
+                for r in store.list_data_access())
+            self.assertEqual(outcomes, [
+                ("birthdate", "denied"),
+                ("contact_destination", "denied"),
+                ("registration_number", "denied")], label)
 
     def test_facade_error_shape_for_bad_identity_fields(self):
         for label, store, api, setup in self._each():

@@ -37,11 +37,17 @@ Scope note: HTTP-level opt-in wiring (an operator ``include_identity=true``
 query param) is explicitly deferred, like ``include_email`` was before #268
 wired it — no route in ``web/server.py`` passes ``include_identity`` yet, so
 every HTTP player response is necessarily the default-minimized shape today.
-Synchronous access auditing of a privileged identity read (the bounded #124
-boundary, PR #426) is a stated follow-up: #426 is a separate, unmerged
-branch that has not yet wired #273's Player fields into its own
-``DataAccessLog`` boundary, and this slice does not reach across branches to
-add that here.
+Synchronous access auditing of a privileged identity read is CLOSED as of
+#424 audit-wiring: ``include_identity`` now routes through the same #426
+policy+audit boundary ``include_email`` already used — BIRTHDATE and
+REGISTRATION_NUMBER are independent ``_sensitive_read_allowed`` checks
+(mask-not-refuse on denial, one durable DENIED row per masked category, one
+ALLOWED row per disclosed player per allowed category), proved in
+``test_athlete_identity.py``'s ``FacadePrivacyTest`` and exercised again
+here in ``test_explicit_identity_opt_in_still_returns_the_values`` /
+``test_include_identity_keyword_still_works`` (now both authorized calls,
+since a bare call is masked). HTTP role enforcement and the operator UI
+remain separate, later follow-up items.
 """
 
 import inspect
@@ -57,7 +63,7 @@ from http.server import ThreadingHTTPServer
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api.service import ApiService
-from hockey_scheduler.domain import Team
+from hockey_scheduler.domain import Program, Role, Team
 from hockey_scheduler.store import InMemoryStore, SqlStore
 
 BIRTHDATE = "1999-05-05"
@@ -80,6 +86,26 @@ class _FacadeTestBase(unittest.TestCase):
             with self.subTest(backend=label):
                 store.add_team(Team(id="t1", name="Team One"))
                 store.add_team(Team(id="t2", name="Team Two"))
+                api = ApiService(store)
+                try:
+                    yield label, api
+                finally:
+                    if isinstance(store, SqlStore):
+                        store.close()
+
+    def _each_with_program(self):
+        """Like ``_each()``, but ``t1``/``t2`` belong to a real Program a
+        LEAGUE_ADMIN can be authorized into (#424 audit-wiring): supplying
+        a ``role`` to ``list_players`` also triggers the pre-existing #369
+        Program-scoping gate, which resolves to zero Teams on a Program-
+        less fixture regardless of privacy grants."""
+        for label, store in _backends():
+            with self.subTest(backend=label):
+                store.add_program(Program(id="pr", name="P"))
+                store.add_team(Team(id="t1", name="Team One",
+                                    program_id="pr"))
+                store.add_team(Team(id="t2", name="Team Two",
+                                    program_id="pr"))
                 api = ApiService(store)
                 try:
                     yield label, api
@@ -130,13 +156,20 @@ class PlayerPayloadTableTest(_FacadeTestBase):
 
     def test_explicit_identity_opt_in_still_returns_the_values(self):
         """Positive control: proves the DTO plumbing is exercised, not just
-        never triggered by the table above."""
-        for label, api in self._each():
+        never triggered by the table above. #424 audit-wiring: an
+        authorized role is now required to actually see the values (a
+        bare call masks them, see test_athlete_identity.py's
+        FacadePrivacyTest for that path) -- _each_with_program supplies a
+        real Program so the pre-existing #369 Program-scoping gate a
+        supplied `role` also triggers does not itself hide the row."""
+        for label, api in self._each_with_program():
             api.create_player(
                 "t1", first_name="Priv", last_name="Fields",
                 position="forward", birthdate=BIRTHDATE,
                 registration_number=REGISTRATION, actor_id="op")
-            row = api.list_players(team_id="t1", include_identity=True)[0]
+            row = api.list_players(
+                team_id="t1", include_identity=True,
+                role=Role.LEAGUE_ADMIN, user_id="admin1")[0]
             self.assertEqual(row["birthdate"], BIRTHDATE, label)
             self.assertEqual(row["registration_number"], REGISTRATION, label)
 
@@ -177,13 +210,17 @@ class ListPlayersPositionalCompatibilityTest(_FacadeTestBase):
                 api.list_players("t1", False, None, None, None, True)
 
     def test_include_identity_keyword_still_works(self):
-        for label, api in self._each():
+        # #424 audit-wiring: positions 3/4 (user_id/role) now need to name
+        # an authorized principal for include_identity's values to survive
+        # the gate -- _each_with_program supplies the Program that role
+        # needs to be authorized into (see its docstring).
+        for label, api in self._each_with_program():
             api.create_player(
                 "t1", first_name="Priv", last_name="Fields",
                 position="forward", birthdate=BIRTHDATE,
                 registration_number=REGISTRATION, actor_id="op")
-            rows = api.list_players("t1", False, None, None, None,
-                                    include_identity=True)
+            rows = api.list_players("t1", False, "admin1", Role.LEAGUE_ADMIN,
+                                    None, include_identity=True)
             self.assertEqual(rows[0]["birthdate"], BIRTHDATE, label)
 
 

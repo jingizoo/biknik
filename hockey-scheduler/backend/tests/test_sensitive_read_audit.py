@@ -33,7 +33,7 @@ import unittest
 from helpers import BACKEND, fresh_sql_store  # noqa: F401
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import Role
+from hockey_scheduler.domain import Position, Program, Role, Team
 from hockey_scheduler.domain.privacy import (
     ACCESS_ALLOWED,
     ACCESS_DENIED,
@@ -41,7 +41,7 @@ from hockey_scheduler.domain.privacy import (
 )
 from hockey_scheduler.full_demo import build_full_demo_store
 from hockey_scheduler.services import visibility_policy as vp
-from hockey_scheduler.store import SqlStore
+from hockey_scheduler.store import InMemoryStore, SqlStore
 
 C = SensitiveFieldCategory
 
@@ -52,6 +52,11 @@ SENTINEL_PUSH = "sentinel-secret-push-token-XYZZY"
 # (channel=push) — this one plants a REAL DeviceToken row (#426 round-3
 # review finding 1's own repro shape: "push-secret-token-426").
 SENTINEL_DEVICE_TOKEN = "sentinel-secret-device-token-QWERTY"
+# #424 audit-wiring: BIRTHDATE/REGISTRATION_NUMBER sentinels for the three
+# newly-gated call sites below (list_players include_identity,
+# player_duplicate_report, evaluate_player_eligibility).
+SENTINEL_BIRTHDATE = "2015-03-02"
+SENTINEL_REGISTRATION = "sentinel-secret-registration-QWERTY"
 
 
 class _Base(unittest.TestCase):
@@ -754,6 +759,142 @@ class PostgresFacadeDurabilityTest(unittest.TestCase):
                          {ACCESS_ALLOWED, ACCESS_DENIED})
         for row in rows:
             self.assertNotIn(SENTINEL_EMAIL, str(vars(row)))
+
+
+
+
+class _IdentityAuditBase(unittest.TestCase):
+    """A MINIMAL, isolated fixture (its own Program/Season/League/
+    LeagueSeason/Division/Team, not the noisy pilot-scale full_demo_store
+    the classes above use) so ALLOW/DENY row counts are exact and never
+    entangled with the demo's own dozens of pre-seeded players or with
+    #369 Program-scoping for a role that has no assignment into the demo's
+    Program. See test_athlete_identity.py's FacadePrivacyTest and
+    test_age_eligibility.py's EligibilityRuleServiceTest for the same
+    fixture shape used the same way."""
+
+    def setUp(self):
+        from datetime import datetime, timezone
+        from hockey_scheduler.domain import (
+            Division, League, LeagueSeason, Season)
+        self.store = InMemoryStore()
+        self.store.add_program(Program(id="pr", name="P"))
+        self.store.add_season(Season(
+            id="se", program_id="pr", name="Fall",
+            start_date=datetime(2026, 9, 1, tzinfo=timezone.utc)))
+        self.store.add_league(League(id="lg", program_id="pr", name="L"))
+        self.store.add_league_season(
+            LeagueSeason(id="ls", league_id="lg", season_id="se"))
+        self.store.add_division(Division(
+            id="d", league_season_id="ls", name="D1", age_group="U10"))
+        self.store.add_team(Team(id="t1", name="T1", program_id="pr"))
+        self.store.add_team(Team(id="t2", name="T2", program_id="pr"))
+        self.api = ApiService(self.store)
+
+    def rows(self, **kw):
+        return self.store.list_data_access(**kw)
+
+
+# =========================================================================== #
+# #424 audit-wiring: list_players(include_identity=True) — BIRTHDATE and      #
+# REGISTRATION_NUMBER, gated as two INDEPENDENT categories.                   #
+# =========================================================================== #
+class IdentityFieldReadAuditTest(_IdentityAuditBase):
+    """Mirrors AllowedReadAuditTest/FailClosedRefusalTest/ValueNeverInLogTest
+    above, but for ``list_players(include_identity=True)`` — the LIST
+    itself is never gated (mask, not refuse), matching ``include_email``'s
+    own precedent two branches below it in ``ApiService.list_players``."""
+
+    def _seed(self):
+        return self.api.setup.add_player(
+            "t1", None, Position.FORWARD, first_name="Priv",
+            last_name="Fields", birthdate=SENTINEL_BIRTHDATE,
+            registration_number=SENTINEL_REGISTRATION)
+
+    def test_authorized_role_gets_both_fields_and_one_allowed_row_per_category(self):
+        p = self._seed()
+        rows_out = self.api.list_players(
+            team_id="t1", include_identity=True, role=Role.LEAGUE_ADMIN,
+            user_id="user_admin")
+        self.assertEqual(len(rows_out), 1)
+        row = rows_out[0]
+        self.assertEqual(row["birthdate"], SENTINEL_BIRTHDATE)
+        self.assertEqual(row["registration_number"], SENTINEL_REGISTRATION)
+
+        rows = self.rows()
+        self.assertEqual(len(rows), 2)  # one per category, per #424 design
+        self.assertEqual({r.category for r in rows},
+                         {C.BIRTHDATE, C.REGISTRATION_NUMBER})
+        for r in rows:
+            self.assertEqual(r.outcome, ACCESS_ALLOWED)
+            self.assertEqual(r.actor_role, "league_admin")
+            self.assertEqual(r.actor_user_id, "user_admin")
+            self.assertEqual(r.subject_id, f"player:{p.id}")
+            self.assertEqual(r.purpose, "list_players_identity")
+        # One call = one correlation id across both category rows.
+        self.assertEqual(len({r.request_id for r in rows}), 1)
+
+    def test_unauthorized_but_scoped_role_masks_both_fields_and_records_denials(self):
+        # VIEWER is a #369 GLOBAL scoping role (so the roster itself is NOT
+        # hidden by Program-scoping) but has NO privacy grant for either
+        # category (see visibility_policy._POLICY) — isolating the
+        # assertion to the IDENTITY gate specifically, not scoping.
+        self._seed()
+        rows_out = self.api.list_players(
+            team_id="t1", include_identity=True, role=Role.VIEWER,
+            user_id="user_viewer")
+        self.assertEqual(len(rows_out), 1)
+        row = rows_out[0]
+        self.assertIsNone(row["birthdate"])
+        self.assertIsNone(row["registration_number"])
+
+        rows = self.rows()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({r.category for r in rows},
+                         {C.BIRTHDATE, C.REGISTRATION_NUMBER})
+        for r in rows:
+            self.assertEqual(r.outcome, ACCESS_DENIED)
+            self.assertEqual((r.subject_type, r.subject_id),
+                             ("recipient", "*"))
+
+    def test_no_principal_masks_and_records_denials(self):
+        self._seed()
+        rows_out = self.api.list_players(team_id="t1",
+                                         include_identity=True)
+        for row in rows_out:
+            self.assertIsNone(row.get("birthdate"))
+            self.assertIsNone(row.get("registration_number"))
+        rows = self.rows()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({r.actor_role for r in rows}, {vp.NO_PRINCIPAL})
+
+    def test_include_identity_false_gates_nothing_and_audits_nothing(self):
+        self._seed()
+        self.api.list_players(team_id="t1")
+        self.assertEqual(len(self.rows()), 0)
+
+    def test_no_stored_row_contains_the_sentinel_values(self):
+        self._seed()
+        self.api.list_players(team_id="t1", include_identity=True,
+                              role=Role.LEAGUE_ADMIN)
+        self.api.list_players(team_id="t1", include_identity=True,
+                              role=Role.VIEWER)
+        self.api.list_players(team_id="t1", include_identity=True)
+        for row in self.rows():
+            text = str(vars(row))
+            self.assertNotIn(SENTINEL_BIRTHDATE, text)
+            self.assertNotIn(SENTINEL_REGISTRATION, text)
+        # Positive control: the sentinels DO live on the stored Player.
+        players = self.store.players_for_team("t1")
+        self.assertIn(SENTINEL_BIRTHDATE, [p.birthdate for p in players])
+        self.assertIn(SENTINEL_REGISTRATION,
+                      [p.registration_number for p in players])
+
+
+# =========================================================================== #
+# #424 audit-wiring: player_duplicate_report — REGISTRATION_NUMBER,           #
+# whole-call refusal (no partial/masked report).                             #
+# =========================================================================== #
 
 
 if __name__ == "__main__":

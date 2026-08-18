@@ -11994,7 +11994,53 @@ class ApiService:
         # so private values never ride a coach/public payload.
         rows = [_player_dto(p, include_identity=include_identity)
                 for p in players]
-        # The include_email opt-in below IS a sensitive read of the SAME
+        # include_identity's own read below is a sensitive read of the
+        # BIRTHDATE and REGISTRATION_NUMBER categories (#424 audit-wiring:
+        # this opt-in built the DTO fields but never routed them through the
+        # #426 policy+audit boundary include_email uses two branches below —
+        # a facade-only gap, since no HTTP route reaches this flag yet).
+        # BIRTHDATE and REGISTRATION_NUMBER are checked as two INDEPENDENT
+        # categories, not one combined gate: they happen to resolve
+        # identically per role today (see visibility_policy._POLICY), but
+        # the two enum members exist separately on purpose, and checking
+        # them independently keeps this mechanism correct the day a role's
+        # grants for the two fields diverge. Same mask-not-refuse shape as
+        # include_email (the player LIST itself is not privacy-gated, only
+        # the identity columns are): an allowed category keeps its already-
+        # built field value and gets one ALLOWED audit row per disclosed
+        # player; a denied category is masked back to None on every row and
+        # gets one durable, collection-level DENIED row — never a broken
+        # listing.
+        if include_identity:
+            request_id = self._safe_request_id(None)
+            identity_role, identity_label = self._privacy_principal(role)
+            identity_categories = (
+                (SensitiveFieldCategory.BIRTHDATE, "birthdate"),
+                (SensitiveFieldCategory.REGISTRATION_NUMBER,
+                 "registration_number"))
+            allowed_categories = [
+                category for category, _field in identity_categories
+                if self._sensitive_read_allowed(identity_role, category)]
+            denied_categories = [
+                (category, field) for category, field in identity_categories
+                if category not in allowed_categories]
+            if allowed_categories:
+                with self.store.transaction():
+                    subjects = [("recipient", f"player:{p.id}")
+                               for p in players] or [("recipient", "*")]
+                    for category in allowed_categories:
+                        self._record_sensitive_read(
+                            category, subjects, "list_players_identity",
+                            user_id, identity_label, ACCESS_ALLOWED,
+                            request_id)
+            for category, field in denied_categories:
+                for row in rows:
+                    row[field] = None
+                self._record_sensitive_read(
+                    category, [("recipient", "*")],
+                    "list_players_identity", user_id, identity_label,
+                    ACCESS_DENIED, request_id, durable=True)
+        # include_email's own read below IS a sensitive read of the SAME
         # CONTACT_DESTINATION category the contacts registry gates (#426
         # review finding 2: "Player-email reads... also read or return
         # stored destinations outside this gate") — policy-checked and
