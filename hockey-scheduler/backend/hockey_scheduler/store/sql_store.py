@@ -199,8 +199,16 @@ SPECS = {
         SeasonTeamRegistration, "season_team_registrations", {"active": _bool()}),
     SeasonCopyForwardCommit: Spec(
         SeasonCopyForwardCommit, "season_copy_forward_commits",
+        # request_identity: no codec override (#159 review round 5) -- the
+        # field is now ALREADY a canonical JSON string by the time it
+        # reaches here (SetupService._copy_forward_canonical_json), so it
+        # is stored as plain TEXT via Col's default identity codec rather
+        # than being JSON-encoded a SECOND time through _jsonc(), which
+        # would wrap it in an extra layer of quoting/escaping for no
+        # benefit -- the string itself is already the immutable, portable
+        # representation this TEXT column exists to hold.
         {"registration_ids": _jsonl(), "committed_at": _dt(),
-         "response_snapshot": _jsonc(), "request_identity": _jsonc()}),
+         "response_snapshot": _jsonc()}),
     TeamLeagueMigrationDecision: Spec(
         TeamLeagueMigrationDecision, "team_league_migration_decisions"),
     SeasonVenueAccess: Spec(

@@ -199,6 +199,25 @@ class SeasonCopyForwardCommit:
     this stored identity, canonicalized the same way, before the
     ``response_snapshot`` is ever returned; see
     ``SetupService._copy_forward_request_identity_matches``.
+
+    Stored as the CANONICAL JSON STRING itself (#159 review round 5, owner
+    P1 finding 1) -- ``SetupService._copy_forward_canonical_json`` applied
+    to the raw dict above, the SAME canonicalization ``copy_forward_
+    fingerprint`` is already hashed from -- rather than the raw, still-
+    mutable dict a naive reading of "captured verbatim" two paragraphs up
+    might suggest. A plain Python ``str`` is immutable by construction, so
+    once this field is set it can never be affected by a later mutation of
+    whatever mutable ``selections`` list/dicts the ORIGINAL caller passed
+    to ``commit_new_season_copy_forward`` and may still hold a reference to
+    -- closing a real bug where ``InMemoryStore`` retained that dict BY
+    REFERENCE: mutating the caller's own list after commit silently
+    changed what the "frozen" ledger identity appeared to be, so replaying
+    the original fingerprint with the mutated list wrongly matched. SQLite/
+    PostgreSQL never had this hazard (their JSON write already copied the
+    value); this collapses Memory onto the exact same guarantee by
+    construction, with no reliance on any store remembering to copy on
+    every read/write boundary. See ``SetupService._copy_forward_request_
+    identity`` and ``_copy_forward_request_identity_matches``.
     """
     id: str
     copy_forward_fingerprint: str
@@ -209,7 +228,7 @@ class SeasonCopyForwardCommit:
     skipped: int = 0
     committed_at: Optional[datetime] = None
     response_snapshot: dict = field(default_factory=dict)
-    request_identity: dict = field(default_factory=dict)
+    request_identity: str = ""
 
 
 @dataclass
