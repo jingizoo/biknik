@@ -971,7 +971,7 @@ class UnlistedCallTaintDetachmentTests(unittest.TestCase):
         ...)`` authorisation calls -- must still extract cleanly: each is a
         reviewed, declared ``_AUDIT_WAIVERS`` entry, not a scoping hole."""
         walker = extract_walker()
-        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(len(walker.routes), 241)
         self.assertEqual(walker.unreachable, [])
 
 
@@ -1139,7 +1139,7 @@ class SiblingOverlapTests(unittest.TestCase):
         schema/dest-lookup pairing above, which shares every key but is not
         ambiguous. Not vacuous: the earlier tests prove the check fires."""
         walker = extract_walker()
-        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(len(walker.routes), 241)
         self.assertEqual(walker.unreachable, [])
 
 
@@ -1890,7 +1890,7 @@ class HelperPredicateCallEscapeTests(unittest.TestCase):
         POST) -- must still extract cleanly: each is a reviewed, declared
         _AUDIT_WAIVERS entry, not a scoping hole."""
         walker = extract_walker()
-        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(len(walker.routes), 241)
         self.assertEqual(walker.unreachable, [])
 
 
@@ -2174,7 +2174,7 @@ class CallWrappedOperandTests(unittest.TestCase):
         _AUDIT_WAIVERS entry (see that dict's own round-3 comments), not
         a scoping hole."""
         walker = extract_walker()
-        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(len(walker.routes), 241)
         self.assertEqual(walker.unreachable, [])
 
 
@@ -2227,7 +2227,7 @@ class WalrusOperatorTests(unittest.TestCase):
         fixture, exactly as WhileLoopGuardTests' own real-server control
         documents for the analogous while-loop case."""
         walker = extract_walker()
-        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(len(walker.routes), 241)
         self.assertEqual(walker.unreachable, [])
 
 
@@ -2304,7 +2304,7 @@ class BareStatementDispatchCallTests(unittest.TestCase):
 
     def test_the_real_server_extracts_with_no_new_raises(self):
         walker = extract_walker()
-        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(len(walker.routes), 241)
         self.assertEqual(walker.unreachable, [])
 
 
@@ -2661,7 +2661,7 @@ def do_GET(self):
         do, so nothing new should join ``tracked`` and nothing new should
         raise."""
         walker = extract_walker()
-        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(len(walker.routes), 241)
         self.assertEqual(walker.unreachable, [])
 
 
@@ -2784,7 +2784,7 @@ class WaiverTaintPropagationTests(unittest.TestCase):
         waivers (see ``_AUDIT_WAIVERS``'s own round-5, finding-1 entries
         for ``do_POST``), and the real file extracts cleanly with them."""
         walker = extract_walker()
-        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(len(walker.routes), 241)
         self.assertEqual(walker.unreachable, [])
         # The two round-5 do_POST waivers this docstring names are each
         # consulted for precisely the one line they name -- not zero
@@ -2807,7 +2807,7 @@ class WaiverTaintPropagationTests(unittest.TestCase):
         the total from 29 to 39 -- see WaiverFingerprintTests' own pinned
         count), not a scoping hole."""
         walker = extract_walker()
-        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(len(walker.routes), 241)
         self.assertEqual(walker.unreachable, [])
         self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 114)
 
@@ -3019,7 +3019,7 @@ class SubscriptCalleeAndReturnDispatchTests(unittest.TestCase):
         on `_mentions_tracked` having already fired (see
         `_propagates_taint`'s own inline comment at that exact point)."""
         walker = extract_walker()
-        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(len(walker.routes), 241)
         self.assertEqual(walker.unreachable, [])
 
     def test_the_real_server_extracts_with_no_new_raises(self):
@@ -3034,7 +3034,7 @@ class SubscriptCalleeAndReturnDispatchTests(unittest.TestCase):
         WaiverFingerprintTests' own pinned count and docstring for the
         CURRENT exact accounting), not a scoping hole."""
         walker = extract_walker()
-        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(len(walker.routes), 241)
         self.assertEqual(walker.unreachable, [])
         self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 114)
 
@@ -3190,7 +3190,7 @@ class DefaultDenyExpressionOperandTests(unittest.TestCase):
         no new waivers needed: 239 routes, the SAME 51 waivers as finding
         2 left it (see WaiverFingerprintTests' own pinned count)."""
         walker = extract_walker()
-        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(len(walker.routes), 241)
         self.assertEqual(walker.unreachable, [])
         self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 114)
 
@@ -3432,7 +3432,7 @@ class ExceptionDrivenRoutingTests(unittest.TestCase):
         pinned count for the CURRENT total -- later rounds grow it
         further) -- no new waiver needed for finding 6 itself."""
         walker = extract_walker()
-        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(len(walker.routes), 241)
         self.assertEqual(walker.unreachable, [])
         self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 114)
 
@@ -3746,7 +3746,7 @@ class CompositionalTaintTests(unittest.TestCase):
         count for the CURRENT total, which round 6 finding 2 grows
         further)."""
         walker = extract_walker()
-        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(len(walker.routes), 241)
         self.assertEqual(walker.unreachable, [])
         self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 114)
 
@@ -4383,7 +4383,7 @@ class ExecutionControlAndDataFlowTests(unittest.TestCase):
         WaiverFingerprintTests' own pinned count and docstring for the
         exact accounting)."""
         walker = extract_walker()
-        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(len(walker.routes), 241)
         self.assertEqual(walker.unreachable, [])
         self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 114)
 
@@ -4736,7 +4736,7 @@ class LoopIterableAndReceiverChainDispatchTests(unittest.TestCase):
         WaiverFingerprintTests' own pinned count and docstring for the
         exact accounting)."""
         walker = extract_walker()
-        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(len(walker.routes), 241)
         self.assertEqual(walker.unreachable, [])
         self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 114)
 
@@ -5122,7 +5122,7 @@ class TransparentCompositionCalleeTests(unittest.TestCase):
         (see WaiverFingerprintTests' own pinned count and docstring for
         the exact accounting)."""
         walker = extract_walker()
-        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(len(walker.routes), 241)
         self.assertEqual(walker.unreachable, [])
         self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 114)
 
@@ -5505,7 +5505,7 @@ class CapturedArgumentTransferTests(unittest.TestCase):
         ``_AUDIT_WAIVERS`` dict, entries tagged "round 13 finding 1", for
         each one's own review comment)."""
         walker = extract_walker()
-        self.assertEqual(len(walker.routes), 239)
+        self.assertEqual(len(walker.routes), 241)
         self.assertEqual(walker.unreachable, [])
         self.assertEqual(len(route_extract_module._AUDIT_WAIVERS), 114)
 
