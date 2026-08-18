@@ -11967,47 +11967,75 @@ class ApiService:
         #369 Program-scoping gate below, since ``role`` then never arrives
         either). Keyword-only closes both holes at once: no positional slot
         can ever reach this parameter again.
+
+        When ``include_identity`` is set (#424 round-N owner review finding
+        2), the Player read that embeds BIRTHDATE/REGISTRATION_NUMBER into
+        the returned rows runs INSIDE the SAME ``with self.store.
+        transaction():`` block as the ALLOWED audit write, not as a separate
+        already-autocommitted statement beforehand — mirroring
+        ``list_contact_destinations``'/``get_delivery_overview``'s own
+        "read + record in one transaction" shape, so the two commit or roll
+        back together instead of being two independent units of work.
+        ``resolve_with_league`` runs BEFORE that transaction opens, not
+        inside it: it takes its own SERIALIZABLE snapshot as the OUTERMOST
+        transaction (``context_service.py``'s own contract — a nested join
+        can never RAISE the isolation of an already-open plain
+        transaction), and Program/League scoping carries no BIRTHDATE/
+        REGISTRATION_NUMBER sensitivity of its own, so hoisting it out
+        reintroduces none of finding 2's gap.
         """
-        players = (self.store.players_for_team(team_id) if team_id
-                  else self.store.all_players())
-        # The Program ceiling applies to BOTH forms. An earlier revision
-        # scoped only the unfiltered form (`team_id is None and role is not
-        # None`), which left an IDOR: `?team_id=<another Program's team>`
-        # skipped the gate entirely and returned that Team's players -- and,
-        # on this MANAGE_SETUP route, their emails. `team_id` is a caller-
-        # supplied identifier, so it selects WHICH rows to consider; it can
-        # never be evidence of authorization for them.
-        if role is not None:
+        program = league = None
+        scope_resolved = role is not None
+        if scope_resolved:
             program, _season, league = self.context.resolve_with_league(
                 user_id, role, scope)
-            if program is None:
-                players = []
-            else:
-                # A selected League narrows here too, via the Team's REAL
-                # permanent competition League (`Team.league_id`, #283 -- not
-                # any of the legacy `league_id` fields that store a Program).
-                # Players are League-narrowable in a way Clubs/Organizations/
-                # Venues are not, and the rest of the surface already treats
-                # them that way: get_setup_progress's "roster" workflow and
-                # the Setup roster summary both League-filter players, and
-                # get_setup_overview_v2 League-narrows teams. Leaving the
-                # Players card Program-wide contradicted its own screen.
-                in_scope = {t.id for t in self.store.all_teams()
-                            if t.program_id == program.id
-                            and (league is None or t.league_id == league.id)}
-                players = [p for p in players if p.team_id in in_scope]
-        # The default Player DTO carries no email and (#273) no birthdate or
-        # registration number — it reaches coach/roster views. Only the
-        # MANAGE_SETUP-gated operator list opts in (include_email for the
-        # #268 edit drawer; include_identity for the #273 identity fields),
-        # so private values never ride a coach/public payload.
-        rows = [_player_dto(p, include_identity=include_identity)
-                for p in players]
-        # include_identity's own read below is a sensitive read of the
-        # BIRTHDATE and REGISTRATION_NUMBER categories (#424 audit-wiring:
-        # this opt-in built the DTO fields but never routed them through the
-        # #426 policy+audit boundary include_email uses two branches below —
-        # a facade-only gap, since no HTTP route reaches this flag yet).
+
+        def _fetch_rows():
+            players = (self.store.players_for_team(team_id) if team_id
+                      else self.store.all_players())
+            # The Program ceiling applies to BOTH forms. An earlier revision
+            # scoped only the unfiltered form (`team_id is None and role is
+            # not None`), which left an IDOR: `?team_id=<another Program's
+            # team>` skipped the gate entirely and returned that Team's
+            # players -- and, on this MANAGE_SETUP route, their emails.
+            # `team_id` is a caller-supplied identifier, so it selects WHICH
+            # rows to consider; it can never be evidence of authorization
+            # for them.
+            if scope_resolved:
+                if program is None:
+                    scoped = []
+                else:
+                    # A selected League narrows here too, via the Team's
+                    # REAL permanent competition League (`Team.league_id`,
+                    # #283 -- not any of the legacy `league_id` fields that
+                    # store a Program). Players are League-narrowable in a
+                    # way Clubs/Organizations/Venues are not, and the rest
+                    # of the surface already treats them that way:
+                    # get_setup_progress's "roster" workflow and the Setup
+                    # roster summary both League-filter players, and
+                    # get_setup_overview_v2 League-narrows teams. Leaving
+                    # the Players card Program-wide contradicted its own
+                    # screen.
+                    in_scope = {t.id for t in self.store.all_teams()
+                               if t.program_id == program.id
+                               and (league is None
+                                    or t.league_id == league.id)}
+                    scoped = [p for p in players if p.team_id in in_scope]
+                players = scoped
+            # The default Player DTO carries no email and (#273) no
+            # birthdate or registration number — it reaches coach/roster
+            # views. Only the MANAGE_SETUP-gated operator list opts in
+            # (include_email for the #268 edit drawer; include_identity for
+            # the #273 identity fields), so private values never ride a
+            # coach/public payload.
+            return players, [_player_dto(p, include_identity=include_identity)
+                             for p in players]
+
+        # include_identity's own read is a sensitive read of the BIRTHDATE
+        # and REGISTRATION_NUMBER categories (#424 audit-wiring: this opt-in
+        # built the DTO fields but never routed them through the #426
+        # policy+audit boundary include_email uses two branches below — a
+        # facade-only gap, since no HTTP route reaches this flag yet).
         # BIRTHDATE and REGISTRATION_NUMBER are checked as two INDEPENDENT
         # categories, not one combined gate: they happen to resolve
         # identically per role today (see visibility_policy._POLICY), but
@@ -12021,20 +12049,21 @@ class ApiService:
         # gets one durable, collection-level DENIED row — never a broken
         # listing.
         if include_identity:
-            request_id = self._safe_request_id(None)
-            identity_role, identity_label = self._privacy_principal(role)
-            identity_categories = (
-                (SensitiveFieldCategory.BIRTHDATE, "birthdate"),
-                (SensitiveFieldCategory.REGISTRATION_NUMBER,
-                 "registration_number"))
-            allowed_categories = [
-                category for category, _field in identity_categories
-                if self._sensitive_read_allowed(identity_role, category)]
-            denied_categories = [
-                (category, field) for category, field in identity_categories
-                if category not in allowed_categories]
-            if allowed_categories:
-                with self.store.transaction():
+            with self.store.transaction():
+                players, rows = _fetch_rows()
+                request_id = self._safe_request_id(None)
+                identity_role, identity_label = self._privacy_principal(role)
+                identity_categories = (
+                    (SensitiveFieldCategory.BIRTHDATE, "birthdate"),
+                    (SensitiveFieldCategory.REGISTRATION_NUMBER,
+                     "registration_number"))
+                allowed_categories = [
+                    category for category, _field in identity_categories
+                    if self._sensitive_read_allowed(identity_role, category)]
+                denied_categories = [
+                    (category, field) for category, field in
+                    identity_categories if category not in allowed_categories]
+                if allowed_categories:
                     subjects = [("recipient", f"player:{p.id}")
                                for p in players] or [("recipient", "*")]
                     for category in allowed_categories:
@@ -12042,13 +12071,15 @@ class ApiService:
                             category, subjects, "list_players_identity",
                             user_id, identity_label, ACCESS_ALLOWED,
                             request_id)
-            for category, field in denied_categories:
-                for row in rows:
-                    row[field] = None
-                self._record_sensitive_read(
-                    category, [("recipient", "*")],
-                    "list_players_identity", user_id, identity_label,
-                    ACCESS_DENIED, request_id, durable=True)
+                for category, field in denied_categories:
+                    for row in rows:
+                        row[field] = None
+                    self._record_sensitive_read(
+                        category, [("recipient", "*")],
+                        "list_players_identity", user_id, identity_label,
+                        ACCESS_DENIED, request_id, durable=True)
+        else:
+            players, rows = _fetch_rows()
         # include_email's own read below IS a sensitive read of the SAME
         # CONTACT_DESTINATION category the contacts registry gates (#426
         # review finding 2: "Player-email reads... also read or return
@@ -12173,6 +12204,15 @@ class ApiService:
 
         ``actor_role``/``actor_user_id`` are purely additive (no existing
         caller passed them before this method had a way to).
+
+        The sensitive read (#424 round-N owner review finding 2) —
+        ``self.setup.evaluate_player_age_eligibility``'s internal
+        ``self.store.get_player(player_id)`` — runs INSIDE the SAME
+        ``with self.store.transaction():`` block as the ALLOWED audit
+        write below, not as a separate already-autocommitted statement
+        beforehand, mirroring ``list_contact_destinations``'/
+        ``get_delivery_overview``'s own "read + record in one transaction"
+        shape.
         """
         request_id = self._safe_request_id(None)
         role, label = self._privacy_principal(actor_role)
@@ -12181,16 +12221,16 @@ class ApiService:
             self._refuse_sensitive_read(
                 category, "evaluate_player_eligibility", actor_user_id,
                 label, request_id)
-        result = self.setup.evaluate_player_age_eligibility(
-            player_id, division_id)
-        if not include_details:
-            for key in ("age_at_cutoff", "cutoff_date"):
-                result.pop(key, None)
         with self.store.transaction():
+            result = self.setup.evaluate_player_age_eligibility(
+                player_id, division_id)
             self._record_sensitive_read(
                 category, [("recipient", f"player:{player_id}")],
                 "evaluate_player_eligibility", actor_user_id, label,
                 ACCESS_ALLOWED, request_id)
+        if not include_details:
+            for key in ("age_at_cutoff", "cutoff_date"):
+                result.pop(key, None)
         return result
 
     @catch
@@ -12245,6 +12285,15 @@ class ApiService:
         (no existing caller passed them before this method had a way to);
         every existing internal caller is updated to route a real principal
         through here now that the boundary exists.
+
+        The sensitive read (#424 round-N owner review finding 2) —
+        ``self.setup.player_duplicate_report``'s internal
+        ``players_for_team``/``all_players`` fetch — runs INSIDE the SAME
+        ``with self.store.transaction():`` block as the ALLOWED audit
+        writes below, not as a separate already-autocommitted statement
+        beforehand, mirroring ``list_contact_destinations``'/
+        ``get_delivery_overview``'s own "read + record in one transaction"
+        shape.
         """
         request_id = self._safe_request_id(request_id)
         role, label = self._privacy_principal(actor_role)
@@ -12255,8 +12304,8 @@ class ApiService:
                 self._refuse_sensitive_read(
                     category, "player_duplicate_report", actor_user_id,
                     label, request_id)
-        warnings = self.setup.player_duplicate_report(team_id)
         with self.store.transaction():
+            warnings = self.setup.player_duplicate_report(team_id)
             registration_subjects = sorted({
                 ("recipient", f"player:{pid}")
                 for w in warnings if w["type"] == "shared_registration_number"

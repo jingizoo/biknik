@@ -1153,7 +1153,11 @@ class PostgresIdentityAuditDurabilityTest(unittest.TestCase):
         reopened = SqlStore(url)
         self.addCleanup(reopened.close)
         rows = reopened.list_data_access()
-        self.assertEqual(len(rows), 6)
+        # 2 (identity ALLOW) + 2 (identity DENY) + 2 (dup ALLOW: REGISTRATION_
+        # NUMBER + BIRTHDATE, #424 round-N owner review finding 1) +
+        # 1 (dup DENY: whole-call refusal writes one row, on the first
+        # denied category checked)
+        self.assertEqual(len(rows), 7)
         self.assertEqual({r.outcome for r in rows},
                          {ACCESS_ALLOWED, ACCESS_DENIED})
         for row in rows:
