@@ -1,12 +1,17 @@
-"""DataAccessLog store surface: tri-store parity + migration 053 (#124).
+"""DataAccessLog store surface: tri-store parity + migration 056 (#124).
 
 The same assertions run against InMemoryStore, SqlStore on a SQLite temp
 file, and SqlStore on PostgreSQL when ``TEST_DATABASE_URL`` is set (CI's
 postgres job) — add/list roundtrip, subject/category filters, transaction
 atomicity, durability across reopen, and the factory-reset wipe parity with
 the other audit surfaces. Plus the schema gates: migration
-``053_data_access_log`` is applied and its column set matches the dataclass
+``056_data_access_log`` is applied and its column set matches the dataclass
 exactly, so hand-written DDL cannot drift from the mapper.
+
+(Originally authored/numbered 053_data_access_log; renumbered to 056 at
+#426's merge time when main had independently claimed 053-055 for PR #430's
+copy-forward idempotency ledger — see the migration file's own NUMBERING
+NOTE.)
 """
 
 import os
@@ -322,10 +327,10 @@ class SqliteDataAccessTest(_StoreContract, unittest.TestCase):
         finally:
             reopened.close()
 
-    def test_migration_053_is_applied(self):
+    def test_migration_056_is_applied(self):
         status = self.store.migration_status()
-        self.assertIn("053_data_access_log", status["applied"])
-        self.assertIn("053_data_access_log", status["expected"])
+        self.assertIn("056_data_access_log", status["applied"])
+        self.assertIn("056_data_access_log", status["expected"])
         self.assertTrue(status["current"])
 
     def test_table_columns_match_the_dataclass_exactly(self):
@@ -364,9 +369,9 @@ class PostgresDataAccessTest(_StoreContract, unittest.TestCase):
         self.store = SqlStore(self.url)  # tearDown closes it
         self.assertEqual(self.store.list_data_access(), [row])
 
-    def test_migration_053_is_applied(self):
+    def test_migration_056_is_applied(self):
         status = self.store.migration_status()
-        self.assertIn("053_data_access_log", status["applied"])
+        self.assertIn("056_data_access_log", status["applied"])
         self.assertTrue(status["current"])
 
     def test_table_columns_match_the_dataclass_exactly(self):

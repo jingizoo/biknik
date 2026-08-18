@@ -139,6 +139,99 @@ class SeasonTeamRegistration:
 
 
 @dataclass
+class SeasonCopyForwardCommit:
+    """Idempotency ledger for new-Season copy-forward commits (#159 review
+    round 2: double-submit/retry blocker). One row per SUCCESSFUL
+    ``commit_new_season_copy_forward`` call, keyed by the exact
+    ``copy_forward_fingerprint`` that produced it -- migration 053's
+    ``ux_season_copy_forward_commits_fingerprint`` UNIQUE index is the
+    atomic backstop: a second commit (sequential replay OR a genuine
+    concurrent race) that reuses the same fingerprint loses this row's
+    INSERT, and the service treats that as an idempotent request for the
+    SAME result this row already records -- never a second Season (mirrors
+    ``commit_ice_availability``'s own idempotent-duplicate handling, #158,
+    adapted for a write target -- a brand-new Season -- that has no natural
+    dedup key of its own).
+
+    ``registration_ids`` is the EXACT set of SeasonTeamRegistration rows
+    this commit created, snapshotted so a later idempotent replay returns
+    precisely what the original commit produced -- not whatever a season's
+    registrations happen to look like by the time the replay lands (an
+    operator could legitimately register more teams into the new Season in
+    between). ``rolled_forward``/``skipped`` are copied from the same
+    original call for the identical reason: ``skipped`` in particular has
+    no row of its own to re-derive from current state.
+
+    ``response_snapshot`` (#159 review round 3, owner P1) is the
+    FULLY-RESOLVED response payload itself -- ``{"season": {...},
+    "registrations": [{...}, ...], "totals": {...}}``, every value already
+    JSON-safe -- captured in the SAME transaction as the Season and
+    registrations it describes. ``registration_ids`` above still names
+    which rows were created (kept for that record and for any external
+    reader that wants the raw ids), but it is no longer how a replay is
+    built: re-deriving the response by re-fetching those ids' CURRENT rows
+    was the root cause of a whole class of bugs -- the source Team getting
+    unregistered, the target registration getting deleted, or the target
+    Season itself getting deleted all silently changed what a replay of an
+    old, already-successful commit returned, or broke it outright. A
+    replay now deserializes ``response_snapshot`` directly and touches
+    neither the ``seasons`` nor ``season_team_registrations`` tables at
+    all, so it is immune to every later mutation of either. Each
+    registration entry ALSO freezes its ``season_id``/``league_id`` (#159
+    review round 4, owner P1 finding 2), resolved via its LeagueSeason
+    ONCE at commit time -- see ``SetupService._copy_forward_result_from_
+    ledger_row``, which stops re-deriving them through a live LeagueSeason
+    lookup on every replay.
+
+    ``request_identity`` (#159 review round 4, owner P1 finding 1) is the
+    RAW caller-supplied identity this commit was actually validated
+    against -- ``{"actor_id":, "program_id":, "name":, "start_date":,
+    "end_date":, "source_season_id":, "selections":}`` -- captured
+    verbatim, with no store lookup and no normalization, in the SAME
+    transaction as ``response_snapshot``. Before this round, the early-
+    replay shortcut trusted ANY caller-supplied ``copy_forward_fingerprint``
+    that happened to match this row, regardless of who was asking or what
+    they actually submitted: a second actor, submitting an entirely
+    different Program/Season/selections/name, who reused another actor's
+    already-committed fingerprint received that OTHER actor's full
+    response verbatim -- the submitted request was never checked against
+    what the fingerprint was actually bound to. A replay must now match
+    this stored identity, canonicalized the same way, before the
+    ``response_snapshot`` is ever returned; see
+    ``SetupService._copy_forward_request_identity_matches``.
+
+    Stored as the CANONICAL JSON STRING itself (#159 review round 5, owner
+    P1 finding 1) -- ``SetupService._copy_forward_canonical_json`` applied
+    to the raw dict above, the SAME canonicalization ``copy_forward_
+    fingerprint`` is already hashed from -- rather than the raw, still-
+    mutable dict a naive reading of "captured verbatim" two paragraphs up
+    might suggest. A plain Python ``str`` is immutable by construction, so
+    once this field is set it can never be affected by a later mutation of
+    whatever mutable ``selections`` list/dicts the ORIGINAL caller passed
+    to ``commit_new_season_copy_forward`` and may still hold a reference to
+    -- closing a real bug where ``InMemoryStore`` retained that dict BY
+    REFERENCE: mutating the caller's own list after commit silently
+    changed what the "frozen" ledger identity appeared to be, so replaying
+    the original fingerprint with the mutated list wrongly matched. SQLite/
+    PostgreSQL never had this hazard (their JSON write already copied the
+    value); this collapses Memory onto the exact same guarantee by
+    construction, with no reliance on any store remembering to copy on
+    every read/write boundary. See ``SetupService._copy_forward_request_
+    identity`` and ``_copy_forward_request_identity_matches``.
+    """
+    id: str
+    copy_forward_fingerprint: str
+    season_id: str
+    actor_id: Optional[str] = None
+    registration_ids: list = field(default_factory=list)
+    rolled_forward: int = 0
+    skipped: int = 0
+    committed_at: Optional[datetime] = None
+    response_snapshot: dict = field(default_factory=dict)
+    request_identity: str = ""
+
+
+@dataclass
 class TeamLeagueMigrationDecision:
     """An operator-supplied permanent-League assignment for a Team whose
     historical registrations span more than one League (#283 migration 035).

@@ -65,6 +65,8 @@ _CONCURRENCY_REASONS = frozenset(_PG_CONCURRENCY.values())
 _ACTIVE_TEAM_JERSEY_CONSTRAINT = "ux_players_active_team_jersey"
 _ACTIVE_ICE_SLOT_CONSTRAINT = "ux_games_active_ice_slot"
 _ICE_SLOT_TIME_CONSTRAINT = "ux_ice_slots_rink_time"
+_COPY_FORWARD_FINGERPRINT_CONSTRAINT = \
+    "ux_season_copy_forward_commits_fingerprint"
 
 
 def translate_player_jersey_exception(
@@ -213,6 +215,34 @@ def translate_ice_slot_time_conflict_exception(
         details={"reason": "ice_slot_time_taken", "rink_id": rink_id})
 
 
+def translate_copy_forward_commit_conflict_exception(
+        exc: BaseException) -> Optional[DomainError]:
+    """Translate migration 053's one-Season-per-fingerprint violation (#159
+    review round 2: double-submit/retry blocker).
+
+    ux_season_copy_forward_commits_fingerprint is the atomic backstop that
+    stops two ``commit_new_season_copy_forward`` calls — sequential replay
+    or a genuine concurrent race, two real connections both racing to
+    INSERT the same ``copy_forward_fingerprint`` — from ever minting two
+    Seasons for the SAME fingerprint. A race-losing INSERT surfaces this
+    stable IntegrityConflictError (reason ``copy_forward_already_
+    committed``), which the commit path re-raises as a retryable
+    ConcurrencyConflictError so it unwinds to whichever transaction is
+    genuinely outermost for that call; a subsequent attempt's own
+    idempotent-replay pre-check then finds this row and returns the
+    ALREADY-COMMITTED season/registrations/totals — the standard REST
+    idempotency-key replay, never a raw driver error, SQL, or constraint
+    name.
+    """
+    if isinstance(exc, DomainError):
+        return None
+    if not _is_copy_forward_fingerprint_violation(exc):
+        return None
+    return IntegrityConflictError(
+        "This copy-forward was already committed.",
+        details={"reason": "copy_forward_already_committed"})
+
+
 class DependentDeleteConflict(Exception):
     """Internal signal — a parent delete was rejected by an INCOMING foreign key
     because a concurrent create committed a dependent in the pre-check→delete
@@ -303,6 +333,27 @@ def _is_ice_slot_time_violation(exc: BaseException) -> bool:
         text = str(exc)
         return ("UNIQUE constraint failed" in text
                 and "ice_slots.start_time" in text)
+    return False
+
+
+def _is_copy_forward_fingerprint_violation(exc: BaseException) -> bool:
+    """A unique violation of ``ux_season_copy_forward_commits_fingerprint``
+    specifically (migration 053). PostgreSQL carries the authoritative
+    constraint name on ``.diag`` (a 23505 for a different index is not
+    matched). SQLite names the index's column on ``UNIQUE constraint
+    failed: season_copy_forward_commits.copy_forward_fingerprint`` —
+    distinct from the table's primary key (``season_copy_forward_
+    commits.id``), the only other unique constraint on this table."""
+    sqlstate = getattr(exc, "sqlstate", None)
+    if sqlstate == "23505":
+        diag = getattr(exc, "diag", None)
+        return (getattr(diag, "constraint_name", None)
+                == _COPY_FORWARD_FINGERPRINT_CONSTRAINT)
+    if isinstance(exc, sqlite3.IntegrityError):
+        text = str(exc)
+        return ("UNIQUE constraint failed" in text
+                and "season_copy_forward_commits.copy_forward_fingerprint"
+                in text)
     return False
 
 

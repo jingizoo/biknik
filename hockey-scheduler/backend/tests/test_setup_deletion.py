@@ -876,6 +876,75 @@ class DeletionContract:
         self.assertIn("game", deps)
         self.assertIsNotNone(self.store.get_season(s))
 
+    # -- season blocked by its OWN copy-forward commit ledger row (#159
+    # review round 3, owner P1, structural change 2) -----------------------
+    def test_season_blocked_by_its_own_copy_forward_commit(self):
+        """A Season a copy-forward commit MINTED is named by the ledger row
+        that produced it -- itemized exactly like team registrations/games/
+        venue access above, never a silent Memory orphan and never SQL's
+        raw/generic ``foreign_key_violation`` from migration 053's FK. Every
+        ORDINARY dependent is cleared first (the registration the commit
+        created, and the League binding a Season with any League gets) so
+        this isolates the block to the ledger dependency alone -- mirroring
+        the owner review's own repro ("after clearing the ordinary Season
+        dependencies")."""
+        lg = self._league()
+        src = self._season(lg, "Source")
+        level = self._level(src)
+        d = self.api.create_division(
+            src, "Division", league_id=level, actor_id=self.ACTOR)["id"]
+        club = self._club()
+        team = self._team(club, lg)
+        self._register_v2(src, team, d, level)
+        sel = [{"team_id": team, "league_id": level}]
+        preview = self.api.preview_new_season_copy_forward(
+            program_id=lg, name="Copied", source_season_id=src,
+            selections=sel, actor_id=self.ACTOR)
+        self.assertNotIn("error", preview, preview)
+        committed = self.api.commit_new_season_copy_forward(
+            program_id=lg, name="Copied", source_season_id=src,
+            selections=sel,
+            copy_forward_fingerprint=preview["copy_forward_fingerprint"],
+            actor_id=self.ACTOR)
+        self.assertNotIn("error", committed, committed)
+        target = committed["season"]["id"]
+        target_reg = committed["registrations"][0]["id"]
+
+        # Clear the ordinary dependents: the ONE registration the commit
+        # created, and the League binding (an auto-provisioned LeagueSeason
+        # participates in any Season with a League, blocking it exactly
+        # like test_season_blocked_by_division_and_registration above).
+        unreg = self.api.unregister_team_from_season(
+            target_reg, actor_id=self.ACTOR)
+        self.assertNotIn("error", unreg, unreg)
+        deleted_reg = self.api.delete_season_team_registration(
+            target_reg, actor_id=self.ACTOR)
+        self.assertNotIn("error", deleted_reg, deleted_reg)
+        for ls in self.store.league_seasons_for_season(target):
+            unbound = self.api.delete_league_season(ls.id, actor_id=self.ACTOR)
+            self.assertNotIn("error", unbound, unbound)
+
+        # Only the copy-forward commit ledger row remains -- isolates the
+        # block to exactly the new dependency type.
+        audits_before = len(self.store.all_setup_audit())
+        blocked = self.api.delete_season(target, actor_id=self.ACTOR)
+        self.assertBlocked(blocked, expect_types={"copy_forward_commit"})
+        dep = blocked["error"]["details"]["dependencies"][0]
+        self.assertEqual(dep["count"], 1)
+        self.assertEqual(
+            dep["items"][0]["name"], preview["copy_forward_fingerprint"])
+        # Zero-write on block: the Season survives, untouched.
+        self.assertIsNotNone(self.store.get_season(target))
+        self.assertEqual(self.store.get_season(target).name, "Copied")
+        self.assertEqual(len(self.store.all_setup_audit()), audits_before,
+                         "a blocked delete must not append any audit row")
+        # The ledger row itself is untouched -- still resolves the ORIGINAL
+        # committed season/registrations, unaffected by the refused delete.
+        ledger = self.store.get_season_copy_forward_commit_by_fingerprint(
+            preview["copy_forward_fingerprint"])
+        self.assertIsNotNone(ledger)
+        self.assertEqual(ledger.season_id, target)
+
     # -- ice slot state rules: only an unused future available slot --------
     def test_past_slot_not_deletable(self):
         slot = self.api.create_ice_slot(

@@ -98,6 +98,7 @@ from .setup_models import (
     Rink,
     ScheduleScenario,
     Season,
+    SeasonCopyForwardCommit,
     SeasonTeamRegistration,
     SeasonVenueAccess,
     SetupAuditLog,

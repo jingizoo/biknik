@@ -2,11 +2,18 @@
 -- review finding 1) -- the atomic DB backstop for register_device_token's
 -- upsert.
 --
--- NUMBERING NOTE (parallel lanes): 054 is claimed by PR #427 (#205 consumer
--- cutover, stacked on #425 -- migration 054_league_ranking_policies, #287
--- slice 1 persistence); confirmed via `git log --all` and `gh pr list`
--- before numbering this one 055. Renumbering happens at merge-time rebase
--- per the queue agreement (see 053's own NUMBERING NOTE).
+-- NUMBERING NOTE (parallel lanes): originally authored as
+-- 055_device_token_unique_key (054 was claimed by PR #427; confirmed via
+-- `git log --all` and `gh pr list` before numbering it 055). At #426's own
+-- merge time, main had independently advanced with PR #430's copy-forward
+-- idempotency ledger, whose own 055_copy_forward_request_identity collided
+-- on the same filename. Resolved per the queue agreement by renumbering
+-- this file past main's claimed 053-055, to 057 (see 056_data_access_log.sql
+-- for the sibling 053 collision, renumbered the same way). No functional
+-- statement below changed; only the version stem (filename, and its
+-- references in sql_store.py's _ATOMIC_PRE_MIGRATION_CHECKS and the
+-- device-token regression tests' ``_VERSION`` sentinels) moved from 055
+-- to 057.
 --
 -- register_device_token's own upsert key IS (recipient_ref, token) --
 -- confirmed by its docstring and by test_device_tokens.py's

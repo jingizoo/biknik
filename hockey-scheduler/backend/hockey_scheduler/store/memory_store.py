@@ -48,6 +48,7 @@ from ..domain import (
     Rink,
     ScheduleScenario,
     Season,
+    SeasonCopyForwardCommit,
     SeasonTeamRegistration,
     SeasonVenueAccess,
     SensitiveFieldCategory,
@@ -84,6 +85,8 @@ class InMemoryStore:
         self.league_seasons: Dict[str, LeagueSeason] = {}
         self.divisions: Dict[str, Division] = {}
         self.season_team_registrations: Dict[str, SeasonTeamRegistration] = {}
+        self.season_copy_forward_commits: Dict[
+            str, SeasonCopyForwardCommit] = {}
         self.team_league_migration_decisions: Dict[
             str, TeamLeagueMigrationDecision] = {}
         self.season_venue_access: Dict[str, SeasonVenueAccess] = {}
@@ -1505,6 +1508,50 @@ class InMemoryStore:
     def add_setup_audit(self, entry: SetupAuditLog) -> SetupAuditLog:
         self.setup_audit.append(entry)
         return entry
+
+    # -- copy-forward commit idempotency ledger (#159 review round 2) ------
+    def add_season_copy_forward_commit(
+            self, row: SeasonCopyForwardCommit) -> SeasonCopyForwardCommit:
+        """One committed Season per copy_forward_fingerprint, mirroring
+        SqlStore's migration-053 UNIQUE index: a second attempt to record
+        the SAME fingerprint raises the IDENTICAL IntegrityConflictError
+        shape SqlStore's translated unique-violation raises (same message,
+        same ``reason``), so ``commit_new_season_copy_forward``'s
+        idempotent-replay handling (pre-check + retryable
+        ConcurrencyConflictError on this residual race) is backend-
+        agnostic. Safe under this store's own concurrency model without a
+        real index: every call runs inside ``transaction()``'s process-wide
+        lock (see its docstring), so the check-then-set below can never
+        itself race, and a failed caller's writes are undone by
+        ``transaction()``'s own snapshot/restore — the same atomicity
+        SqlStore gets from the database rolling back an aborted
+        transaction."""
+        for existing in self.season_copy_forward_commits.values():
+            if (existing.copy_forward_fingerprint
+                    == row.copy_forward_fingerprint):
+                raise IntegrityConflictError(
+                    "This copy-forward was already committed.",
+                    details={"reason": "copy_forward_already_committed"})
+        self.season_copy_forward_commits[row.id] = row
+        return row
+
+    def get_season_copy_forward_commit_by_fingerprint(
+            self, fingerprint: str) -> Optional[SeasonCopyForwardCommit]:
+        for row in self.season_copy_forward_commits.values():
+            if row.copy_forward_fingerprint == fingerprint:
+                return row
+        return None
+
+    def season_copy_forward_commits_for_season(
+            self, season_id: str) -> List[SeasonCopyForwardCommit]:
+        """Every ledger row naming ``season_id`` as the Season a copy-forward
+        commit produced (#159 review round 3) -- at most one in practice
+        (each commit mints a brand-new Season and writes exactly one row
+        for it, in the same transaction), but returned as a list like every
+        other ``*_for_season`` dependency query so ``delete_season`` can
+        itemize it the same way as team registrations/games/venue access."""
+        return [row for row in self.season_copy_forward_commits.values()
+                if row.season_id == season_id]
 
     def add_factory_reset_event(self, event: FactoryResetEvent) -> FactoryResetEvent:
         self.factory_reset_events.append(event)

@@ -132,7 +132,7 @@ _UNCAUGHT_CHILD = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "_migration_atomic_check_uncaught_child.py")
 
-_VERSION = "055_device_token_unique_key"
+_VERSION = "057_device_token_unique_key"
 _INDEX = "ux_device_tokens_recipient_token"
 _LOCK_HOOK = "hockey_scheduler.store.sql_store._atomic_check_lock_hook"
 _CHECKS_PATCH_TARGET = "hockey_scheduler.store.sql_store._ATOMIC_PRE_MIGRATION_CHECKS"

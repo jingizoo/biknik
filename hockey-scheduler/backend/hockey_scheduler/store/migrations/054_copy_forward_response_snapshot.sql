@@ -1,0 +1,33 @@
+-- Immutable response snapshot on the copy-forward commit ledger (#159 review
+-- round 3, owner P1).
+--
+-- Before this migration, `season_copy_forward_commits` stored only
+-- `registration_ids` -- a list of ids the service re-fetched from the LIVE
+-- `seasons`/`season_team_registrations` tables to rebuild a replay's
+-- response. That re-fetch was the root cause of a whole class of bugs: once
+-- the source Team was unregistered, the target registration was deleted, or
+-- the target Season itself was deleted, replaying an already-successful
+-- commit's fingerprint returned a validation error, a totals/registrations
+-- mismatch ("registrations: []" beside "rolled_forward: 1"), or
+-- "season: null" -- never the stable result the original commit produced.
+--
+-- `response_snapshot` holds the FULLY-RESOLVED response payload itself --
+-- season snapshot + registrations snapshot + totals, every value already
+-- JSON-safe -- written in the SAME transaction that creates the Season and
+-- registrations it describes. A replay now deserializes this column
+-- directly and never touches `seasons` or `season_team_registrations` at
+-- all, so it is immune to anything that later mutates either. See
+-- SetupService._copy_forward_result_from_ledger_row.
+--
+-- Additive and portable (a TEXT column with a constant default, no rebuild,
+-- no index): the table itself is brand new in this same unreleased feature
+-- (migration 053, one migration back), so no pre-existing row can carry a
+-- real commit without a snapshot -- the default only backfills a
+-- hypothetical legacy row to a harmless empty object, matching the
+-- codebase's existing `_jsonc()` column convention (e.g.
+-- ScheduleScenario.request_input/proposal).
+--
+-- Forward-only. Rollback reality: reverting application code does not drop
+-- this column; dropping it is a separate manual database operation.
+ALTER TABLE season_copy_forward_commits
+    ADD COLUMN response_snapshot TEXT NOT NULL DEFAULT '{}';

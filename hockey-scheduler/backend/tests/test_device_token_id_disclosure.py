@@ -76,7 +76,7 @@ from hockey_scheduler.store.integrity_checks import (
 )
 from hockey_scheduler.store.sql_store import migrate
 
-_VERSION = "055_device_token_unique_key"
+_VERSION = "057_device_token_unique_key"
 _INDEX = "ux_device_tokens_recipient_token"
 
 # One id per named attack shape the review called out by name. Distinct

@@ -46,6 +46,7 @@ arrays for the in-memory demo store instead):
 | --- | --- | --- |
 | `APP_MODE` | `production` disables demo conveniences (X-Demo-Role header, headerless-admin fallback, demo seeding, `/api/reset`) and enables `Secure` cookies. Anything else = demo. | `demo` |
 | `DATABASE_URL` | `postgres://…` (or a real SQLite file path) → durable `SqlStore`. Unset, or a value that resolves to SQLite `:memory:`/empty (ephemeral, #143) → readiness fails in production. | in-memory |
+| `HS_CONTEXT_EPOCH_SECRET` | Keys the context-scoped-read epoch (`X-Context-Epoch`) as a MAC rather than a plain hash, so a leaked token cannot be correlated back to an account by dictionary-hashing candidate ids (#159). **REQUIRED in production — the server refuses to start without it** (`services/context_epoch.py`). Generate a high-entropy value, e.g. `python3 -c "import secrets; print(secrets.token_hex(32))"`, and deploy the SAME value to every replica — a token issued by one process must verify on another. Rotating it discards every outstanding context-scoped read in flight at the moment of rotation (a safe `204`, never an error); no other coordination is required. | — (unkeyed demo hash outside production) |
 | `HOST` / `PORT` | Bind address/port for `python3 -m hockey_scheduler.web` (also settable via `--host`/`--port`). Many container platforms inject `PORT` automatically. | `127.0.0.1` / `8000` |
 | `BOOTSTRAP_ADMIN_USER` / `BOOTSTRAP_ADMIN_PASSWORD` | First League Admin, created on boot only when the store has no accounts (idempotent). | — |
 | `DELIVERY_WORKER_ENABLED` / `_INTERVAL` / `_BATCH` | Opt-in background delivery worker (#79). | disabled / 30s / 50 |
@@ -109,6 +110,8 @@ the environment:
 
 - [ ] `APP_MODE=production`.
 - [ ] `DATABASE_URL` points at the durable database.
+- [ ] `HS_CONTEXT_EPOCH_SECRET` set to the same high-entropy value on every
+      replica — the app refuses to start in production without it (#159).
 - [ ] Migrations current — `GET /api/health` shows `migrations.current: true`
       (they run automatically on boot, forward-only, #75).
 - [ ] At least one active League Admin — `GET /api/readiness` `active_admin` ok.

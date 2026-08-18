@@ -1,9 +1,15 @@
--- 053_data_access_log: durable sensitive-read audit rows (#124).
+-- 056_data_access_log: durable sensitive-read audit rows (#124).
 --
--- NUMBERING NOTE (parallel lanes): versions 051 and 052 are now claimed by
--- PR #423 (context-epoch), merged to main ahead of this slice. This PR (#426)
--- lands before #424 (athlete identity)/#425 (SeasonRosterMembership), which
--- must renumber past 053 at their own merge time per the queue agreement.
+-- NUMBERING NOTE (parallel lanes): originally authored as 053_data_access_log
+-- against a main where 051/052 were PR #423's (context-epoch). At #426's own
+-- merge time, main had independently advanced with PR #430's copy-forward
+-- idempotency ledger claiming 053-055 (season_copy_forward_commits /
+-- response_snapshot / request_identity) — a real filename collision on both
+-- 053 and 055 (see 057_device_token_unique_key.sql's own note), caught and
+-- resolved per the queue agreement by renumbering this file's version past
+-- main's, to 056. No functional statement below changed; only the version
+-- stem (filename, and its two references in sql_store.py's
+-- _PRE_MIGRATION_CHECKS-adjacent code/tests) moved from 053 to 056.
 --
 -- One row per sensitive read — or refused read attempt — of one subject's
 -- protected data (domain/privacy.py: DataAccessLog). Deliberately SEPARATE

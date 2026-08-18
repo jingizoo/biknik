@@ -52,7 +52,7 @@ from hockey_scheduler.store.sql_store import (  # noqa: E402
     migrate,
 )
 
-_VERSION = "055_device_token_unique_key"
+_VERSION = "057_device_token_unique_key"
 _INDEX = "ux_device_tokens_recipient_token"
 
 if __name__ == "__main__":
