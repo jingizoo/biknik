@@ -562,12 +562,26 @@ class PostgresSnapshotConsistencyTest(unittest.TestCase):
         committed snapshots. Post-fix (isolation="REPEATABLE READ"), both
         observe the transaction's OPENING snapshot regardless of what the
         racer commits afterward -- so the racer's insert is invisible to
-        BOTH reads, and warnings/subjects always agree."""
+        BOTH reads, and warnings/subjects always agree.
+
+        The racer MUST collide on ``registration_number`` with an already-
+        seeded player (``REG-SHARED``, shared with ``p2``) -- otherwise the
+        racer's insert can never be mentioned in a ``shared_registration_
+        number`` warning at all, and the ``if racer_id in warning_ids``
+        branch below never executes on either isolation level, making this
+        test pass unconditionally regardless of the fix. Same-team
+        duplicate registration numbers are hard-refused synchronously at
+        write time (``SetupService._assert_registration_number_available``),
+        so the racer is inserted on a SECOND team (``t2``) -- cross-team
+        duplicates are allowed at write time and are exactly what ``shared_
+        registration_number`` warns about (see ``SetupService.player_
+        duplicate_report``'s docstring)."""
         store = self._store()
         api, p1 = _seed(store)
         p2 = api.setup.add_player(
             "t1", None, Position.GOALIE, first_name="Warn", last_name="Pair",
             registration_number="REG-SHARED")
+        store.add_team(Team(id="t2", name="T2", program_id="pr"))
 
         def pause_fn(paused, resume):
             _pause_duplicate_report(store, paused, resume)
@@ -577,8 +591,8 @@ class PostgresSnapshotConsistencyTest(unittest.TestCase):
         def mutate():
             racer_api = ApiService(self._store())
             inserted["p"] = racer_api.setup.add_player(
-                "t1", None, Position.DEFENSE, first_name="Race",
-                last_name="Inserted", registration_number="REG-RACE")
+                "t2", None, Position.DEFENSE, first_name="Race",
+                last_name="Inserted", registration_number="REG-SHARED")
 
         def go():
             return api.player_duplicate_report(
@@ -595,6 +609,14 @@ class PostgresSnapshotConsistencyTest(unittest.TestCase):
         racer_id = inserted["p"].id
         # THE PROOF: if the racer's insert is mentioned in a warning, it
         # MUST also be an audited subject -- never one without the other.
+        # With REPEATABLE READ (fix in place), the racer's REG-SHARED
+        # insert is invisible to the internal warnings-read too (same
+        # opening snapshot as the facade's subjects-read), so this always
+        # lands in the "else" branch below. Under READ COMMITTED (isolation
+        # reverted -- see falsifiability), the warnings-read sees the
+        # racer's already-committed row and pairs it with p2 under
+        # REG-SHARED, so this branch genuinely fires and the assertion
+        # below genuinely fails.
         if racer_id in warning_ids:
             self.assertIn(f"player:{racer_id}", reg_subjects,
                          "warning mentions a player never audited as an "
