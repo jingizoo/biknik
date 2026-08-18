@@ -12359,6 +12359,32 @@ class ApiService:
         autocommitted statement beforehand, mirroring ``list_contact_
         destinations``'/``get_delivery_overview``'s own "read + record in
         one transaction" shape.
+
+        ISOLATION (#424 round-N+1 owner review finding B, PostgreSQL two-
+        connection proof): fetching the SAME collection TWICE inside one
+        transaction — once here for ``subjects``, once again inside
+        ``self.setup.player_duplicate_report``'s own call for ``warnings`` —
+        is two SEPARATE statements on the same connection, not one shared
+        read. Under PostgreSQL's default READ COMMITTED (this store's
+        ``transaction()`` default when ``isolation`` is not given), each
+        statement independently sees the latest COMMITTED data as of ITS
+        OWN start, not the transaction's start — so a concurrent INSERT
+        landing between these two statements can make the SECOND read
+        (``warnings``) reference a player the FIRST read (``subjects``)
+        never saw, reproducing a narrower version of finding A's own gap
+        under real contention. ``isolation="REPEATABLE READ"`` closes this:
+        PostgreSQL takes its snapshot at the transaction's first statement
+        and holds it for every later statement in the SAME transaction
+        regardless of what commits afterward, so both reads are
+        guaranteed to observe the identical collection. SQLite already
+        gets this for free (``BEGIN IMMEDIATE``'s file-level RESERVED lock
+        serializes the whole transaction against any other writer, per
+        ``transaction()``'s own docstring); raising this to REPEATABLE
+        READ is a no-op there and on Memory (single global lock for
+        the transaction's duration) — see
+        ``test_sensitive_read_audit_race.PostgresSnapshotConsistencyTest
+        .test_player_duplicate_report_snapshot_consistent_under_race``
+        for the two-real-connection proof this closes.
         """
         request_id = self._safe_request_id(request_id)
         role, label = self._privacy_principal(actor_role)
@@ -12369,7 +12395,7 @@ class ApiService:
                 self._refuse_sensitive_read(
                     category, "player_duplicate_report", actor_user_id,
                     label, request_id)
-        with self.store.transaction():
+        with self.store.transaction(isolation="REPEATABLE READ"):
             players = (self.store.players_for_team(team_id) if team_id
                       else self.store.all_players())
             warnings = self.setup.player_duplicate_report(team_id)
