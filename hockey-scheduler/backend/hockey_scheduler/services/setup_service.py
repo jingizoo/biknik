@@ -3075,12 +3075,34 @@ class SetupService:
             archived_at=(datetime.fromisoformat(data["archived_at"])
                         if data.get("archived_at") else None))
 
-    @staticmethod
     def _copy_forward_registration_snapshot(
-            reg: SeasonTeamRegistration) -> dict:
+            self, reg: SeasonTeamRegistration) -> dict:
+        """... plus the registration's PUBLIC identity -- ``season_id``/
+        ``league_id`` -- resolved via its LeagueSeason ONCE, right now,
+        the SAME way ``ApiService._registration_dict`` resolves them (#159
+        review round 4, owner P1 finding 2). Before this round only the
+        domain fields were frozen; ``_registration_dict`` re-resolved
+        ``season_id``/``league_id`` from the LIVE LeagueSeason on EVERY
+        call, replay included, so deleting the target registration's
+        LeagueSeason binding after commit made a replay of an
+        already-successful fingerprint come back with
+        ``season_id: null, league_id: null`` instead of the values the
+        original commit actually returned -- response_snapshot was not
+        the immutable API response it claimed to be. Freezing them here,
+        alongside every other field this snapshot already freezes, closes
+        that: a replay never needs to touch ``league_seasons`` again. See
+        ``_copy_forward_result_from_ledger_row``, which builds
+        ``registration_identities`` from these two fields instead of
+        deferring to a live lookup, and
+        ``ApiService.commit_new_season_copy_forward``, which prefers that
+        map over ``_registration_dict``'s own resolution."""
+        ls = (self.store.get_league_season(reg.league_season_id)
+              if reg.league_season_id else None)
         return {"id": reg.id, "league_season_id": reg.league_season_id,
                 "team_id": reg.team_id, "division_id": reg.division_id,
-                "active": reg.active}
+                "active": reg.active,
+                "season_id": ls.season_id if ls else None,
+                "league_id": ls.league_id if ls else None}
 
     @staticmethod
     def _copy_forward_registration_from_snapshot(
@@ -3102,6 +3124,91 @@ class SetupService:
                               for r in registrations],
             "totals": dict(totals),
         }
+
+    @staticmethod
+    def _copy_forward_registration_identities(snapshot: dict) -> dict:
+        """``{registration_id: {"season_id":, "league_id":}}`` for every
+        registration a ``_copy_forward_response_snapshot`` snapshot
+        carries (#159 review round 4, owner P1 finding 2) -- the ONE place
+        that reads the ``season_id``/``league_id`` a registration snapshot
+        froze, so a fresh commit's own response and every future replay of
+        it are built from the exact same values, by construction. See
+        ``ApiService.commit_new_season_copy_forward``, the sole reader."""
+        return {r["id"]: {"season_id": r.get("season_id"),
+                          "league_id": r.get("league_id")}
+                for r in snapshot.get("registrations", []) if r.get("id")}
+
+    @staticmethod
+    def _copy_forward_request_identity(*, actor_id, program_id, name,
+                                       start_date, end_date,
+                                       source_season_id, selections) -> dict:
+        """The RAW caller-supplied identity of a copy-forward commit
+        request (#159 review round 4, owner P1 finding 1) -- the acting
+        actor plus every field ``_resolve_copy_forward_plan`` takes as
+        input, captured EXACTLY as submitted: no store lookup, no
+        normalization.
+
+        Deliberately NOT ``_resolve_copy_forward_plan``'s own ``reviewed``
+        dict (the structure ``fingerprint`` hashes), which is enriched
+        with Program/Team/League/Division NAMES looked up from the store.
+        Re-deriving that enrichment on every early-replay check would mean
+        re-running store-dependent resolution before the ledger is even
+        consulted -- reintroducing, for the REQUEST side of a replay
+        decision, the exact staleness hazard #159 review round 3 closed
+        for the RESPONSE side: a later, unrelated rename elsewhere must
+        never change whether an already-successful replay is honored, any
+        more than it may change what that replay returns. Comparing this
+        raw, input-only identity is what lets a replay decision stay a
+        pure function of "what did THIS caller just submit", with zero
+        store access -- see ``_copy_forward_request_identity_matches``.
+        """
+        return {
+            "actor_id": actor_id, "program_id": program_id, "name": name,
+            "start_date": start_date, "end_date": end_date,
+            "source_season_id": source_season_id, "selections": selections,
+        }
+
+    @staticmethod
+    def _copy_forward_canonical_json(value) -> str:
+        """The SAME canonicalization ``_resolve_copy_forward_plan`` already
+        uses to turn its resolved ``reviewed`` plan into ``fingerprint`` —
+        reused here (#159 review round 4) so two request-identity payloads
+        compare equal whenever they are STRUCTURALLY equal, regardless of
+        dict key order or a list-vs-tuple difference introduced by a JSON
+        round trip through SQL storage."""
+        return json.dumps(value, sort_keys=True, separators=(",", ":"),
+                          default=str)
+
+    def _copy_forward_request_identity_matches(self, row, *, actor_id,
+                                                program_id, name, start_date,
+                                                end_date, source_season_id,
+                                                selections) -> bool:
+        """True iff the CURRENT actor and submitted request, canonicalized
+        the same way, are byte-identical to the immutable
+        ``request_identity`` the ledger row ``row`` stored at the commit
+        that actually produced it (#159 review round 4, owner P1 finding
+        1). A pure comparison of caller-supplied values against an
+        immutable stored record -- no store access, so it can never be
+        affected by (and can never itself trigger) any later, unrelated
+        mutation. See ``_copy_forward_request_identity`` for exactly what
+        is compared and why it is the RAW request rather than the
+        resolved plan.
+
+        Called ONLY before an early-replay return: on a mismatch, the
+        caller must NOT raise here, but fall through to the ordinary
+        Team/League-lock + ``_resolve_copy_forward_plan`` path below, so a
+        genuinely foreign/stale fingerprint is refused with EXACTLY the
+        same ``preview_mismatch``/``preview_required`` shape any other
+        stale fingerprint gets — never a bespoke error that would itself
+        disclose that a DIFFERENT, already-committed fingerprint exists.
+        """
+        current = self._copy_forward_request_identity(
+            actor_id=actor_id, program_id=program_id, name=name,
+            start_date=start_date, end_date=end_date,
+            source_season_id=source_season_id, selections=selections)
+        stored = row.request_identity or {}
+        return (self._copy_forward_canonical_json(current)
+                == self._copy_forward_canonical_json(stored))
 
     def _has_matching_copy_forward_preview_audit(self, actor_id, fingerprint):
         """True if ``actor_id`` recorded a successful
@@ -3392,6 +3499,67 @@ class SetupService:
         when there is no ledger hit, i.e. either a genuinely new
         fingerprint or the race-loser path the next paragraph describes.
 
+        THE LEDGER HIT IS AUTHORITATIVE FOR ITS OWN REQUEST ONLY (#159
+        review round 4, owner P1 finding 1) — round 3's "authoritative and
+        self-contained" above described the RESPONSE side; it said nothing
+        about who may collect it. Before this round the early check
+        trusted ANY caller-supplied ``copy_forward_fingerprint`` that
+        matched a row, full stop — a fingerprint is only a hash of the
+        ORIGINAL committer's resolved plan, and this check ran before
+        ``_resolve_copy_forward_plan``/``_has_matching_copy_forward_
+        preview_audit`` ever looked at the CURRENT actor or CURRENT body
+        at all. A second actor who learned (or guessed) an already-
+        committed fingerprint — their own earlier preview response, a
+        browser history entry, a server log — could submit an entirely
+        different Program/source Season/selections/name alongside it and
+        receive the ORIGINAL committer's full response verbatim; their own
+        submitted request was never validated. Every ledger row now ALSO
+        carries ``request_identity`` (migration 055): the RAW actor +
+        body this commit was actually validated against, frozen in the
+        SAME transaction as ``response_snapshot``. Before any early-replay
+        return, the CURRENT actor and submitted request — canonicalized
+        the same way, no store lookup — must match that stored identity
+        exactly (``_copy_forward_request_identity_matches``); on a
+        mismatch this method does NOT raise a bespoke error — it falls
+        through to the UNCHANGED Team/League-lock + plan-resolution path
+        below, which naturally refuses a foreign/stale fingerprint with
+        the ordinary ``preview_mismatch``/``preview_required`` shape any
+        other stale fingerprint gets, so a mismatch is never
+        distinguishable from an everyday refusal and discloses nothing
+        about the original row. See ``test_replay_by_another_actor_who_
+        never_previewed_is_refused``, ``test_replay_with_changed_name_
+        after_commit_is_refused``, and ``test_replay_with_different_
+        program_and_source_season_is_refused`` (tests/test_new_season_
+        copy_forward.py, all three classes) for the required regression
+        matrix, and that file's ``NewSeasonCopyForwardHttpTest`` for the
+        HTTP-only case (d): the original actor's account deactivated
+        (loses ALL scope — the closest realizable form of "loses
+        original-Program scope" for a role that is already global; see
+        ``context_scope._GLOBAL_ROLES``) between the original commit and
+        the replay attempt, which the pre-existing session layer already
+        refuses independent of anything here — regression-tested so this
+        round's change can never accidentally weaken it.
+
+        RESPONSE_SNAPSHOT IS NOW THE COMPLETE PUBLIC DTO (#159 review
+        round 4, owner P1 finding 2): each registration entry in
+        ``response_snapshot`` also freezes its public ``season_id``/
+        ``league_id`` — resolved via its LeagueSeason ONCE, right here,
+        the same way ``ApiService._registration_dict`` resolves them —
+        instead of leaving the facade to re-resolve them from the LIVE
+        LeagueSeason on every read. Before this round that live
+        re-resolution ran on a replay exactly as it does on an ordinary
+        read, so once the target registration's LeagueSeason binding was
+        deleted (a fully supported operation this same round 3 already
+        made survivable for every OTHER field), a replay's season_id/
+        league_id silently came back null instead of the values the
+        original commit actually returned — ``response_snapshot`` claimed
+        to be the immutable API response but was not. See
+        ``_copy_forward_registration_identities`` and ``ApiService.
+        commit_new_season_copy_forward``, and this file's
+        ``test_replay_full_dto_equality_after_registration_and_league_
+        season_deleted`` (all three service/SQL test classes, plus the
+        HTTP twin) for the full-equality regression coverage.
+
         WHY A PRE-CHECK, NOT A CATCH-ON-CONFLICT (the design this replaced
         in self-review): this method runs under ``setup_guarded_create``
         (server.py's ``/api/v2/setup/seasons/copy-forward/commit`` route)
@@ -3470,7 +3638,35 @@ class SetupService:
             early_replay = (
                 self.store.get_season_copy_forward_commit_by_fingerprint(
                     copy_forward_fingerprint))
-            if early_replay is not None:
+            # #159 review round 4 (owner P1 finding 1): a fingerprint match
+            # ALONE is not enough to trust this row's response to THIS
+            # caller — it is only a hash of the ORIGINAL committer's
+            # resolved plan, and this early check runs BEFORE
+            # _resolve_copy_forward_plan / _has_matching_copy_forward_
+            # preview_audit ever look at the CURRENT actor or CURRENT
+            # body at all. Without this gate, any caller who learned
+            # (or guessed) an already-committed fingerprint — e.g. their
+            # own earlier preview response, a browser history entry, a
+            # server log — could submit an entirely different Program,
+            # source Season, selections, or name alongside it and receive
+            # the ORIGINAL committer's full response verbatim, never
+            # having validated their own submitted request at all. A
+            # mismatch here does NOT raise — it falls through to the
+            # unchanged Team/League-lock + _resolve_copy_forward_plan path
+            # below, which naturally refuses a foreign/stale fingerprint
+            # with the SAME preview_mismatch/preview_required shape any
+            # other stale fingerprint gets (this caller's OWN freshly
+            # resolved plan will not hash to a fingerprint that was
+            # computed over someone else's request) — so a mismatch is
+            # never distinguishable from an ordinary stale-fingerprint
+            # refusal, and discloses nothing about the original row.
+            if (early_replay is not None
+                    and self._copy_forward_request_identity_matches(
+                        early_replay, actor_id=actor_id,
+                        program_id=program_id, name=name,
+                        start_date=start_date, end_date=end_date,
+                        source_season_id=source_season_id,
+                        selections=selections)):
                 return self._copy_forward_result_from_ledger_row(
                     early_replay)
         # Lock every distinct Team/League named in selections FIRST, sorted —
@@ -3566,6 +3762,18 @@ class SetupService:
         result = {"season": season, "registrations": applied["registrations"],
                   "totals": {"rolled_forward": applied["rolled_forward"],
                             "skipped": applied["skipped"]}}
+        # Built ONCE, here, and reused for BOTH the ledger row's
+        # ``response_snapshot`` below AND this fresh commit's own
+        # ``registration_identities`` (#159 review round 4, owner P1
+        # finding 2) — so a fresh commit's response and every future
+        # replay of it read season_id/league_id from the exact same
+        # computation, by construction, rather than two separate
+        # resolutions that could in principle drift.
+        snapshot = self._copy_forward_response_snapshot(
+            season=result["season"], registrations=result["registrations"],
+            totals=result["totals"])
+        result["registration_identities"] = (
+            self._copy_forward_registration_identities(snapshot))
         # Atomically consume the fingerprint (#159 review round 2): the
         # LAST statement of this transaction, so migration 053's UNIQUE
         # index is the final word on whether THIS attempt or a racing one
@@ -3607,10 +3815,19 @@ class SetupService:
                                      for r in applied["registrations"]],
                     rolled_forward=applied["rolled_forward"],
                     skipped=applied["skipped"], committed_at=self.clock(),
-                    response_snapshot=self._copy_forward_response_snapshot(
-                        season=result["season"],
-                        registrations=result["registrations"],
-                        totals=result["totals"])))
+                    response_snapshot=snapshot,
+                    # #159 review round 4 (owner P1 finding 1): the RAW
+                    # request THIS transaction actually validated (via the
+                    # plan re-resolution and preview-audit checks above),
+                    # frozen alongside the response it produced — the
+                    # identity a FUTURE replay of this exact fingerprint
+                    # must match before ever reusing this row. See
+                    # _copy_forward_request_identity_matches.
+                    request_identity=self._copy_forward_request_identity(
+                        actor_id=actor_id, program_id=program_id, name=name,
+                        start_date=start_date, end_date=end_date,
+                        source_season_id=source_season_id,
+                        selections=selections)))
         except IntegrityConflictError as exc:
             if exc.details.get("reason") != "copy_forward_already_committed":
                 raise
@@ -3640,7 +3857,13 @@ class SetupService:
         ``SeasonTeamRegistration`` instances (not plain dicts) so the
         facade's existing ``_serialize``/``_registration_dict`` calls on
         the result work completely unchanged, exactly as they do for a
-        freshly-created commit."""
+        freshly-created commit.
+
+        ``registration_identities`` (#159 review round 4, owner P1
+        finding 2) carries each registration's FROZEN ``season_id``/
+        ``league_id`` — see ``_copy_forward_registration_identities`` —
+        so ``ApiService.commit_new_season_copy_forward`` never needs to
+        re-resolve them from the live LeagueSeason for a replay either."""
         snap = row.response_snapshot or {}
         return {
             "season": self._copy_forward_season_from_snapshot(snap["season"]),
@@ -3649,6 +3872,8 @@ class SetupService:
                 for r in snap.get("registrations", [])],
             "totals": snap.get("totals") or {
                 "rolled_forward": row.rolled_forward, "skipped": row.skipped},
+            "registration_identities": (
+                self._copy_forward_registration_identities(snap)),
         }
 
     # -- reassignment: move a record under a new parent (#166 PR D) --------
