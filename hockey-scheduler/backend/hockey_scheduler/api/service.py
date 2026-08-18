@@ -12325,14 +12325,40 @@ class ApiService:
         every existing internal caller is updated to route a real principal
         through here now that the boundary exists.
 
-        The sensitive read (#424 round-N owner review finding 2) —
-        ``self.setup.player_duplicate_report``'s internal
-        ``players_for_team``/``all_players`` fetch — runs INSIDE the SAME
-        ``with self.store.transaction():`` block as the ALLOWED audit
-        writes below, not as a separate already-autocommitted statement
-        beforehand, mirroring ``list_contact_destinations``'/
-        ``get_delivery_overview``'s own "read + record in one transaction"
-        shape.
+        AUDIT SUBJECTS (#424 round-N+1 owner review finding A): every ALLOWED
+        row is audited against the FULL player collection
+        ``SetupService.player_duplicate_report`` actually reads for this
+        ``team_id`` — every player in it, whether or not that player ends up
+        implicated in an emitted warning — never a set inferred from the
+        warnings themselves. ``by_registration``/``by_name_birthdate`` inside
+        that method dereference EVERY row's ``registration_number``/
+        ``birthdate`` unconditionally to build their grouping keys, so a
+        player who is examined but never collides with another row (a
+        singleton registration number, a unique name) is read exactly as
+        much as one who ends up in a warning; deriving subjects only from
+        warning ``player_ids`` (the pre-fix shape) silently dropped every
+        such player from the ledger even though the read happened. The two
+        categories share one ``subjects`` list, mirroring ``list_players``'s
+        own ALLOWED-identity block (lines ~12066-12068 above) exactly rather
+        than the DENIED-only always-``"*"`` shape used elsewhere in this
+        file: this method has no DENIED branch of its own (an unauthorized
+        caller is refused before any row is ever read, immediately above),
+        so every write it makes here is an ALLOWED disclosure and belongs to
+        the same per-subject convention ``list_players`` already established
+        for that case. Falls back to the collection-level ``("recipient",
+        "*")`` subject only when the collection itself is empty — never as a
+        size/convenience shortcut.
+
+        The sensitive read (#424 round-N owner review finding 2) — the SAME
+        ``players_for_team``/``all_players`` collection
+        ``SetupService.player_duplicate_report`` reads internally, fetched
+        here a second time (once for auditing, once inside the setup-service
+        call) against the SAME already-open transaction so both observe one
+        snapshot — runs INSIDE the SAME ``with self.store.transaction():``
+        block as the ALLOWED audit writes below, not as a separate already-
+        autocommitted statement beforehand, mirroring ``list_contact_
+        destinations``'/``get_delivery_overview``'s own "read + record in
+        one transaction" shape.
         """
         request_id = self._safe_request_id(request_id)
         role, label = self._privacy_principal(actor_role)
@@ -12344,28 +12370,17 @@ class ApiService:
                     category, "player_duplicate_report", actor_user_id,
                     label, request_id)
         with self.store.transaction():
+            players = (self.store.players_for_team(team_id) if team_id
+                      else self.store.all_players())
             warnings = self.setup.player_duplicate_report(team_id)
-            registration_subjects = sorted({
-                ("recipient", f"player:{pid}")
-                for w in warnings if w["type"] == "shared_registration_number"
-                for pid in w["player_ids"]}) or [("recipient", "*")]
+            subjects = [("recipient", f"player:{p.id}")
+                       for p in players] or [("recipient", "*")]
             self._record_sensitive_read(
-                registration_category, registration_subjects,
+                registration_category, subjects,
                 "player_duplicate_report", actor_user_id, label,
                 ACCESS_ALLOWED, request_id)
-            # BIRTHDATE-touching warning shapes: same_name_same_team_
-            # undisambiguated's "proven" check compares birthdate for
-            # every pair it considers (whether or not a differing birthdate
-            # is what ultimately proved the pair distinct), and
-            # same_name_same_birthdate is keyed on it directly.
-            birthdate_subjects = sorted({
-                ("recipient", f"player:{pid}")
-                for w in warnings
-                if w["type"] in ("same_name_same_team_undisambiguated",
-                                "same_name_same_birthdate")
-                for pid in w["player_ids"]}) or [("recipient", "*")]
             self._record_sensitive_read(
-                birthdate_category, birthdate_subjects,
+                birthdate_category, subjects,
                 "player_duplicate_report", actor_user_id, label,
                 ACCESS_ALLOWED, request_id)
         return {"warnings": warnings}

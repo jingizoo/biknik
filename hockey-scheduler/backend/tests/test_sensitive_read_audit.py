@@ -913,23 +913,23 @@ class PlayerDuplicateReportAuditTest(_IdentityAuditBase):
         self.assertEqual(shared[0]["registration_number"],
                          SENTINEL_REGISTRATION)
 
-        # One ALLOWED REGISTRATION_NUMBER row per DISTINCT player whose
-        # registration_number was actually disclosed (both p1 and p2 appear
-        # in the one warning) — the same "one per disclosed recipient"
-        # convention list_contact_destinations already uses. PLUS one
-        # collection-level ALLOWED BIRTHDATE row (#424 round-N owner review
-        # finding 1): neither player has a birthdate set, so no
-        # birthdate-typed warning fires and the birthdate read falls back
-        # to the "*" collection-level subject — same fallback
-        # REGISTRATION_NUMBER itself already uses on an empty match set.
+        # #424 round-N+1 owner review finding A: audit subjects are sourced
+        # from the FULL player collection the underlying service examined
+        # (here, both seeded players), never inferred from which players
+        # happen to be implicated in an emitted warning. Both p1 and p2 are
+        # examined for BOTH categories -- p1/p2's registration_number is
+        # what produced the one warning, and their birthdate is read (and
+        # found None) by the very same by_name_birthdate pass that would
+        # have raised a same_name_same_birthdate warning had it matched.
+        # One ALLOWED row per (player, category): 2 players x 2 categories.
         rows = self.rows()
-        self.assertEqual(len(rows), 3)
+        self.assertEqual(len(rows), 4)
         reg_rows = [r for r in rows if r.category == C.REGISTRATION_NUMBER]
         bd_rows = [r for r in rows if r.category == C.BIRTHDATE]
         self.assertEqual({r.subject_id for r in reg_rows},
                          {f"player:{p1.id}", f"player:{p2.id}"})
-        self.assertEqual([(r.subject_type, r.subject_id) for r in bd_rows],
-                         [("recipient", "*")])
+        self.assertEqual({r.subject_id for r in bd_rows},
+                         {f"player:{p1.id}", f"player:{p2.id}"})
         for row in rows:
             self.assertIn(row.category, (C.REGISTRATION_NUMBER, C.BIRTHDATE))
             self.assertEqual(row.outcome, ACCESS_ALLOWED)
@@ -937,6 +937,54 @@ class PlayerDuplicateReportAuditTest(_IdentityAuditBase):
             self.assertEqual(row.actor_user_id, "user_admin")
             self.assertEqual(row.purpose, "player_duplicate_report")
         self.assertEqual(len({r.request_id for r in rows}), 1)
+
+    def test_unrelated_examined_players_are_audited_too(self):
+        # #424 round-N+1 owner review finding A -- THE regression: a mixed
+        # collection where SOME players are implicated in a warning and
+        # OTHERS are merely examined (read, compared, found to collide with
+        # nothing) must audit every one of them for both categories, not
+        # just the ones whose ids happen to appear in an emitted warning's
+        # player_ids.
+        p1, p2 = self._seed_pair()  # the one shared_registration_number pair
+        unrelated1 = self.api.setup.add_player(
+            "t1", None, Position.DEFENSE, first_name="Uma", last_name="Ortiz",
+            registration_number="REG-UNRELATED-1", birthdate="2014-05-01")
+        unrelated2 = self.api.setup.add_player(
+            "t2", None, Position.FORWARD, first_name="Nia", last_name="Park",
+            registration_number="REG-UNRELATED-2", birthdate="2014-06-02")
+
+        report = self.api.player_duplicate_report(
+            actor_role=Role.LEAGUE_ADMIN, actor_user_id="user_admin")
+        self.assertNotIn("error", report)
+        # Only the p1/p2 pair produces a warning -- unrelated1/2 collide
+        # with nothing and appear in NO warning's player_ids.
+        for w in report["warnings"]:
+            self.assertNotIn(unrelated1.id, w["player_ids"])
+            self.assertNotIn(unrelated2.id, w["player_ids"])
+
+        all_ids = {f"player:{p.id}"
+                  for p in (p1, p2, unrelated1, unrelated2)}
+        rows = self.rows()
+        reg_subjects = {r.subject_id for r in rows
+                        if r.category == C.REGISTRATION_NUMBER}
+        bd_subjects = {r.subject_id for r in rows
+                      if r.category == C.BIRTHDATE}
+        self.assertEqual(reg_subjects, all_ids,
+                         "REGISTRATION_NUMBER audit must cover every "
+                         "examined player, not just warning-implicated ones")
+        self.assertEqual(bd_subjects, all_ids,
+                         "BIRTHDATE audit must cover every examined player, "
+                         "not just warning-implicated ones")
+        for row in rows:
+            self.assertEqual(row.outcome, ACCESS_ALLOWED)
+        # No protected value (registration number or birthdate) ever rides
+        # a log field.
+        for row in rows:
+            text = str(vars(row))
+            self.assertNotIn(SENTINEL_REGISTRATION, text)
+            self.assertNotIn("REG-UNRELATED", text)
+            self.assertNotIn("2014-05-01", text)
+            self.assertNotIn("2014-06-02", text)
 
     def test_birthdate_touching_warning_types_audit_the_implicated_players(self):
         # #424 round-N owner review finding 1: same_name_same_team_
@@ -1000,6 +1048,91 @@ class PlayerDuplicateReportAuditTest(_IdentityAuditBase):
             actor_role=Role.LEAGUE_ADMIN)
         dumped = json.dumps(report)
         self.assertIn(SENTINEL_REGISTRATION, dumped)
+
+
+# =========================================================================== #
+# #424 round-N+1 owner review finding A: same mixed-collection regression,   #
+# proven on all three backends (the fix reads the SAME players_for_team/     #
+# all_players collection SqlStore/InMemoryStore already serve identically). #
+# =========================================================================== #
+class PlayerDuplicateReportMixedCollectionTriBackendTest(unittest.TestCase):
+    """Finding A's exact required regression, run for real against Memory,
+    SQLite, AND PostgreSQL (not just the Memory-only fixture above): a
+    collection containing one warning pair PLUS unrelated players with
+    distinct identity values must audit every examined player -- not just
+    the warning-implicated ones -- for both BIRTHDATE and
+    REGISTRATION_NUMBER, and no protected value may ever appear in a log
+    field."""
+
+    def _backends(self):
+        stores = [("memory", InMemoryStore()), ("sqlite", SqlStore(":memory:"))]
+        url = os.environ.get("TEST_DATABASE_URL")
+        if url:
+            stores.append(("postgres", fresh_sql_store(url)))
+        return stores
+
+    def test_every_examined_player_audited_for_both_categories(self):
+        for label, store in self._backends():
+            with self.subTest(backend=label):
+                try:
+                    store.add_team(Team(id="t1", name="T1"))
+                    store.add_team(Team(id="t2", name="T2"))
+                    api = ApiService(store)
+                    p1 = api.setup.add_player(
+                        "t1", None, Position.FORWARD, first_name="Sam",
+                        last_name="Lee",
+                        registration_number="REG-SHARED-" + label)
+                    p2 = api.setup.add_player(
+                        "t2", None, Position.GOALIE, first_name="Alex",
+                        last_name="Wu",
+                        registration_number="REG-SHARED-" + label)
+                    unrelated1 = api.setup.add_player(
+                        "t1", None, Position.DEFENSE, first_name="Uma",
+                        last_name="Ortiz",
+                        registration_number="REG-U1-" + label,
+                        birthdate="2014-05-01")
+                    unrelated2 = api.setup.add_player(
+                        "t2", None, Position.FORWARD, first_name="Nia",
+                        last_name="Park",
+                        registration_number="REG-U2-" + label,
+                        birthdate="2014-06-02")
+
+                    report = api.player_duplicate_report(
+                        actor_role=Role.LEAGUE_ADMIN,
+                        actor_user_id="user_admin")
+                    self.assertNotIn("error", report, (label, report))
+                    for w in report["warnings"]:
+                        self.assertNotIn(unrelated1.id, w["player_ids"],
+                                         label)
+                        self.assertNotIn(unrelated2.id, w["player_ids"],
+                                         label)
+
+                    rows = store.list_data_access()
+                    all_subjects = {f"player:{p.id}"
+                                   for p in (p1, p2, unrelated1, unrelated2)}
+                    reg_subjects = {r.subject_id for r in rows
+                                   if r.category == C.REGISTRATION_NUMBER}
+                    bd_subjects = {r.subject_id for r in rows
+                                  if r.category == C.BIRTHDATE}
+                    self.assertEqual(
+                        reg_subjects, all_subjects,
+                        f"[{label}] REGISTRATION_NUMBER must audit every "
+                        "examined player, including non-warning ones")
+                    self.assertEqual(
+                        bd_subjects, all_subjects,
+                        f"[{label}] BIRTHDATE must audit every examined "
+                        "player, including non-warning ones")
+                    for row in rows:
+                        self.assertEqual(row.outcome, ACCESS_ALLOWED, label)
+                        text = str(vars(row))
+                        self.assertNotIn("REG-SHARED", text, label)
+                        self.assertNotIn("REG-U1", text, label)
+                        self.assertNotIn("REG-U2", text, label)
+                        self.assertNotIn("2014-05-01", text, label)
+                        self.assertNotIn("2014-06-02", text, label)
+                finally:
+                    if isinstance(store, SqlStore):
+                        store.close()
 
 
 def _fresh_eligibility_fixture():
