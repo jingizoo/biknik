@@ -1,0 +1,152 @@
+"""Sensitive-field categories and the durable sensitive-read record (#124).
+
+The privacy foundation the athlete-identity work (#273) and the future
+medical/discipline data (#274) land on. Two things live here, both pure data:
+
+* :class:`SensitiveFieldCategory` — the closed vocabulary of protected field
+  groups. Declared NOW, ahead of the fields themselves, so the policy and the
+  audit trail exist before the first birthdate is ever stored. The values are
+  stable snake_case strings on purpose: they are written into durable audit
+  rows, and the #202 route-contract work (RouteSpec sensitive-data
+  classification, PR #422's follow-up) can adopt the same strings without a
+  mapping layer.
+
+* :class:`DataAccessLog` — one durable row per sensitive read (or refused
+  attempt). Modeled on :class:`~.setup_models.SetupAuditLog` but kept as its
+  own record type and its own store surface: read auditing must never be
+  mixed into the mutation audit trail, where a retention or export decision
+  about one would silently apply to the other (#124 blocks 3–4).
+
+STRUCTURALLY VALUE-FREE. ``DataAccessLog`` has no free-form ``detail`` dict
+and no field that could carry the protected value — recording *that* a
+birthdate or contact destination was read must never copy the birthdate or
+the destination into the log (#124: "Never copy the sensitive value itself
+into the log"). Keeping the schema closed is the enforcement: a future field
+addition has to survive review here, not slip through a dict.
+
+ORDERING (#426 review finding 5). ``id`` is a textual ``daccess_<n>`` label
+(#124's existing id-generation convention) and was never a sound sort key —
+SQL's ``ORDER BY id`` sorts it LEXICOGRAPHICALLY, so ``daccess_10`` lands
+before ``daccess_2``. ``seq`` is the real ordering key: a per-store INTEGER
+assigned atomically, once, at the moment a row becomes durable (mirroring
+PR #423's persisted-generation-counter pattern — ``ContextService``'s
+switch generation / ``epoch_fence``'s version columns — rather than
+inventing a new mechanism). Every caller that constructs a
+``DataAccessLog`` leaves ``seq=None``; the STORE assigns the real value on
+``add_data_access``/``add_data_access_durable`` and it is never
+caller-supplied, so it cannot be spoofed to reorder history.
+
+DURABLE ID ALLOCATION (#426 round-2 review finding 1). ``id`` is, for the
+SAME reason, ALSO store-assigned rather than caller-precomputed — every
+caller leaves ``id=None`` (unless it deliberately wants to force a specific
+value, e.g. to test the uniqueness constraint directly at the store
+boundary) exactly like ``seq``. The bug this closes: the old contract had
+every caller allocate its OWN id up front via ``store.next_id("daccess")``
+before ever reaching ``add_data_access_durable`` — but that allocation ran
+INSIDE whatever ambient transaction the caller happened to be nested in,
+and rolled back with it if that transaction later failed, even though the
+QUEUED durable row (deliberately excluded from rollback, see
+``add_data_access_durable``'s own docstring) survived carrying the
+now-orphaned id. The counter and the row it named then permanently
+disagreed: the next allocation handed out the SAME id again and collided
+with the durable row already sitting there, turning one ordinary rollback
+into a standing denial-of-audit for every sensitive read that followed.
+Deferring id allocation to the SAME moment ``seq`` is already allocated —
+immediately for a non-nested write, at FLUSH time (outside any transaction
+that could roll back) for a nested durable write — closes it structurally:
+an id can never be handed out by a counter state a rollback is about to
+erase.
+"""
+
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
+from typing import Optional
+
+
+class SensitiveFieldCategory(str, Enum):
+    """Closed vocabulary of protected field groups (#124).
+
+    Only ``CONTACT_DESTINATION`` has stored data behind it on today's schema
+    (the ``ContactDestination`` registry, #60). ``BIRTHDATE`` and
+    ``REGISTRATION_NUMBER`` are populated by the athlete-identity slice
+    (#273); ``EMERGENCY_CONTACT``, ``MEDICAL_ALERT`` and ``DISCIPLINE_NOTE``
+    by their own future slices (#274). They are declared now so policy,
+    audit rows and tests use one vocabulary from the first slice on.
+    """
+
+    BIRTHDATE = "birthdate"
+    REGISTRATION_NUMBER = "registration_number"
+    CONTACT_DESTINATION = "contact_destination"
+    EMERGENCY_CONTACT = "emergency_contact"
+    MEDICAL_ALERT = "medical_alert"
+    DISCIPLINE_NOTE = "discipline_note"
+
+
+# ``DataAccessLog.outcome`` values. A refused attempt MUST still produce a row
+# (#124: auditable refusals), and a row that records a refusal must be
+# distinguishable from one that records a disclosure — so the outcome is part
+# of the record, not inferred.
+ACCESS_ALLOWED = "allowed"
+ACCESS_DENIED = "denied"
+
+# Closed vocabulary (#426 review finding 5): both stores validate every write
+# against these sets — an invalid outcome (or a category outside
+# ``SensitiveFieldCategory``) is refused at the store boundary, not merely by
+# convention, so a future caller cannot silently write an unrecognised value
+# that ``migration 053``'s CHECK constraints (SQL) and
+# ``_validate_data_access`` (Memory) both enforce identically.
+VALID_OUTCOMES = frozenset({ACCESS_ALLOWED, ACCESS_DENIED})
+
+
+@dataclass
+class DataAccessLog:
+    """One sensitive read — or refused attempt — of one subject's data (#124).
+
+    ``subject_type``/``subject_id`` name WHOSE data was touched (e.g. the
+    ``recipient_ref`` a contact destination belongs to — ``player:<id>``,
+    ``official:<id>``, ``scheduler`` — or, later, a Player id for a
+    birthdate read). A bulk read that discloses several subjects' values
+    writes one row per subject; a read that disclosed nothing (an empty
+    registry, or a refusal) writes a single collection-level row with
+    ``subject_id="*"`` so every access attempt leaves a trace.
+
+    ``actor_role`` is recorded as a plain string — a ``Role.value``, the
+    transitional ``operator_boundary`` principal (see
+    ``services.visibility_policy``), or ``"unknown"`` for an unparseable
+    claim — never trusted for policy decisions after the fact.
+
+    ``purpose`` is the facade method that performed the read (the facade maps
+    1:1 to REST endpoints, so this names the route without hardcoding URL
+    strings into durable rows).
+
+    ``request_id`` is the correlation id minted at the facade boundary (none
+    exists in the web layer today; the post-#159 server wiring can pass its
+    own so one HTTP request's reads share one id).
+
+    There is deliberately NO field for the value that was read — see the
+    module docstring.
+    """
+
+    category: SensitiveFieldCategory
+    subject_type: str
+    subject_id: str
+    purpose: str
+    at: datetime
+    actor_user_id: Optional[str] = None
+    actor_role: Optional[str] = None
+    outcome: str = ACCESS_ALLOWED
+    request_id: Optional[str] = None
+    # Durable row id (#426 round-2 review finding 1) — see the module
+    # docstring's DURABLE ID ALLOCATION section. Always store-assigned at the
+    # SAME moment `seq` is (immediately, or at flush time for a queued
+    # durable write); a caller leaves this None unless it deliberately wants
+    # to force a specific value (e.g. to exercise the uniqueness check
+    # directly at the store boundary) or is the store's own row-hydration
+    # code reconstructing an already-persisted row.
+    id: Optional[str] = None
+    # Persisted monotonic ordering key (#426 review finding 5) — see the
+    # module docstring's ORDERING section. Always store-assigned; a caller
+    # never sets this (constructing one with an explicit seq is only for the
+    # store's own row-hydration code).
+    seq: Optional[int] = None

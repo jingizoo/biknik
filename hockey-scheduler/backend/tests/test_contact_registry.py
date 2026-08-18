@@ -3,7 +3,7 @@ import unittest
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import NotificationChannel
+from hockey_scheduler.domain import NotificationChannel, Role
 from hockey_scheduler.full_demo import build_full_demo_store
 from hockey_scheduler.services.delivery import resolve_destination
 
@@ -21,7 +21,7 @@ class ContactRegistryTest(unittest.TestCase):
             label="Ref Stone")
         self.api.set_contact_destination(
             "scheduler", "email", "ops@contacts.invalid")
-        rows = self.api.list_contact_destinations()["contacts"]
+        rows = self.api.list_contact_destinations(actor_role=Role.LEAGUE_ADMIN)["contacts"]
         self.assertEqual(len(rows), 2)
         by_ref = {r["recipient_ref"]: r for r in rows}
         self.assertEqual(by_ref["official:" + oid]["destination"],
@@ -33,7 +33,7 @@ class ContactRegistryTest(unittest.TestCase):
     def test_set_is_an_upsert(self):
         self.api.set_contact_destination("scheduler", "email", "a@x.invalid")
         self.api.set_contact_destination("scheduler", "email", "b@x.invalid")
-        rows = self.api.list_contact_destinations()["contacts"]
+        rows = self.api.list_contact_destinations(actor_role=Role.LEAGUE_ADMIN)["contacts"]
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["destination"], "b@x.invalid")
 

@@ -12,6 +12,9 @@ before that version's statements run (see ``_PRE_MIGRATION_CHECKS`` in
 ``sql_store``). They are plain SELECTs — no writes — so they are safe to re-run.
 """
 
+import re
+import unicodedata
+
 from ..domain.jersey import MAX_JERSEY_NUMBER, MIN_JERSEY_NUMBER
 
 
@@ -1316,3 +1319,185 @@ def assert_no_duplicate_rink_external_refs(conn):
             f"{len(duplicates)} rink_code value(s) already back more than "
             f"one Rink: {shown}{more}. Merge or retag the duplicate Rink(s) "
             "before upgrading.")
+
+
+def find_duplicate_device_tokens(conn):
+    """``(recipient_ref, token, [row_id, ...])`` for every ``(recipient_ref,
+    token)`` pair shared by more than one DeviceToken row.
+
+    Only non-null pairs are considered — matching migration 055's partial
+    unique index, which excludes NULL-bearing rows because both SQLite and
+    PostgreSQL treat NULLs as distinct.
+
+    The recipient_ref/token VALUES are returned here because this function's
+    own job is to identify the concrete duplicate key (and this module's
+    tests need to assert detection is correct) — but a device token is a
+    live push credential, so no caller may place the value in an exception,
+    log line, or any other place an operator or CI run might capture its
+    output. ``assert_no_duplicate_device_tokens`` below, the only production
+    caller, reports the row ids only, never the value (#426 round-5 review
+    finding 1) — and even the id is treated as untrusted there, never
+    trusted just because it came off this table's PRIMARY KEY column (#426
+    round-6 review finding 1)."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT recipient_ref, token FROM device_tokens "
+        "WHERE recipient_ref IS NOT NULL AND token IS NOT NULL "
+        "GROUP BY recipient_ref, token HAVING COUNT(*) > 1")
+    dup_keys = {(row["recipient_ref"], row["token"]) for row in cur.fetchall()}
+    if not dup_keys:
+        return []
+    cur.execute(
+        "SELECT id, recipient_ref, token FROM device_tokens "
+        "WHERE recipient_ref IS NOT NULL AND token IS NOT NULL")
+    grouped = {}
+    for r in cur.fetchall():
+        key = (r["recipient_ref"], r["token"])
+        if key in dup_keys:
+            grouped.setdefault(key, []).append(r["id"])
+    return sorted((k[0], k[1], sorted(ids)) for k, ids in grouped.items())
+
+
+# device_tokens.id is an UNRESTRICTED ``TEXT PRIMARY KEY`` (migration 001) —
+# nothing in the schema constrains its shape or length. Every row this
+# process itself creates gets one via ``SqlStore.next_id("devtok")``
+# (sql_store.py's ``upsert_device_token``), which always yields exactly
+# ``devtok_`` followed by a positive decimal counter with no leading zero —
+# the SAME ``<prefix>_<n>`` convention ``next_id`` uses for every other
+# table in this store (e.g. DataAccessLog's ``daccess_<n>``, see
+# ``list_data_access``'s own docstring). But data a MIGRATION runs against
+# can predate any guarantee this process makes today, or have been written
+# by a bug, a restore, or a direct DB edit that never went through
+# ``next_id`` at all — a dirty-upgrade guard cannot assume the very column
+# it is diagnosing is trustworthy just because it happens to be a primary
+# key (#426 round-6 review finding 1: the reviewer planted a pre-055
+# duplicate whose id WAS the secret and had it echoed verbatim). Anchored
+# with ``\A``/``\Z``, not ``^``/``$``: Python's ``$`` also matches
+# immediately before a trailing newline, so ``^devtok_5$`` would (with
+# ``re.match``, though not with ``.fullmatch`` — this spells out the
+# anchors explicitly rather than leaning on that distinction) treat
+# ``"devtok_5\n"`` as if it had no suffix. ``\Z`` has no such exception.
+# The digit count is capped at 18 (not left unbounded via ``[0-9]*``) so an
+# otherwise-shaped but absurdly long counter value can never itself blow up
+# the message this backs — belt and suspenders alongside the hard cap
+# ``_sanitize_label`` applies to every label regardless of shape.
+_DEVICE_TOKEN_ROW_ID_RE = re.compile(r"\Adevtok_[1-9][0-9]{0,17}\Z")
+
+# Applied to EVERY label this module puts in a raised message, including
+# one that already matched the grammar above (#426 round-6 review finding
+# 1: "escape/strip control characters defensively even on values that do
+# pass the grammar, in case the grammar itself has a gap") and including
+# the ordinal fallback this module generates itself. Belt and suspenders,
+# not a substitute for the grammar check: a label that matched
+# ``_DEVICE_TOKEN_ROW_ID_RE`` cannot structurally contain a control
+# character (the pattern admits only ``devtok_`` plus digits), but this
+# still runs on it, in case that pattern is ever loosened without updating
+# this comment. ``Cc``/``Cf``/``Cs``/``Co``/``Cn`` cover control, format,
+# surrogate, private-use and unassigned code points respectively — the
+# categories a terminal, log shipper, or downstream parser could render as
+# something other than inert visible text (a raw newline or CR is Cc, for
+# instance, and is exactly what would forge a fake extra log line).
+_UNSAFE_LABEL_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Co", "Cn"})
+# Generous relative to any legitimate label: the longest a grammar-passing
+# id can be is ``len("devtok_") + 18 == 25`` characters, and the ordinal
+# fallback (``"row #" + a small int``) is shorter still.
+_MAX_SAFE_LABEL_CHARS = 40
+
+_MAX_DEVICE_TOKEN_GROUPS_SHOWN = 20
+_MAX_DEVICE_TOKEN_ROWS_SHOWN_PER_GROUP = 20
+# A final hard backstop on the whole assembled message, independent of (and
+# in addition to) the two caps above — so a future change to either cap, or
+# to the surrounding prose, can never itself reopen an unbounded message
+# (#426 round-6 review finding 1: "Bound the total message size").
+_MAX_DEVICE_TOKEN_MESSAGE_CHARS = 4000
+
+
+def _sanitize_label(label: str) -> str:
+    """Strip control/format/surrogate/private-use/unassigned characters and
+    hard-cap length. See ``_UNSAFE_LABEL_CATEGORIES``/``_MAX_SAFE_LABEL_CHARS``
+    above for why this runs on every label unconditionally (#426 round-6
+    review finding 1)."""
+    cleaned = "".join(
+        ch for ch in label
+        if unicodedata.category(ch) not in _UNSAFE_LABEL_CATEGORIES)
+    return cleaned[:_MAX_SAFE_LABEL_CHARS]
+
+
+def _safe_device_token_row_label(row_id, ordinal: int) -> str:
+    """One duplicate-group row id, safe to place in a migration-abort
+    message (#426 round-6 review finding 1).
+
+    ``row_id`` is a value read from the database this migration is about to
+    alter, not one this process generated — see ``_DEVICE_TOKEN_ROW_ID_RE``
+    above for why it is never trusted outright. A value that matches
+    this table's actual generated shape is named directly (sanitized
+    defensively regardless, per ``_sanitize_label``); anything else —
+    including a value that merely resembles the shape, or one that is a
+    plain non-string — is replaced by a bounded ordinal that carries no
+    information about the withheld id at all, so an operator still gets an
+    actionable, stable per-group position (``row #1``, ``row #2``, …)
+    without this module ever gambling on unknown row content."""
+    if isinstance(row_id, str) and _DEVICE_TOKEN_ROW_ID_RE.fullmatch(row_id):
+        return _sanitize_label(row_id)
+    return _sanitize_label(f"row #{ordinal}")
+
+
+def assert_no_duplicate_device_tokens(conn):
+    """Abort migration 055 if any (recipient_ref, token) pair already backs
+    more than one DeviceToken row (#426 round-4 review finding 1) — the
+    unlocked read-then-save/insert this migration's index backstops could
+    persist exact duplicates pre-fix, so on a deployed database
+    ``CREATE UNIQUE INDEX`` might otherwise fail with an opaque driver
+    error; naming the conflicting row ids lets an operator resolve it
+    first.
+
+    Deliberately never interpolates the recipient_ref or token VALUE into
+    the exception (#426 round-5 review finding 1): a device token is a live
+    production push credential, and this check's failure is exactly the
+    kind of message a startup/deployment log captures verbatim — the
+    review's own reproduction planted two rows and found the raw token
+    inside the raised ``MigrationDataError``. Row ids are both sufficient
+    to repair the row directly (look the id up, then deactivate or delete
+    it) and safe to disclose IF they actually look like an id this store
+    would generate — so no fingerprint or other reversible/correlatable
+    encoding of the secret value is used, the ids alone already suffice for
+    an operator to act.
+
+    Round-5's fix stopped there and trusted every row id unconditionally.
+    round-6's review went one step further and planted the SECRET IN THE
+    ID itself (``device_tokens.id`` is an unconstrained ``TEXT PRIMARY
+    KEY`` — nothing stops a pre-migration row, however it got there, from
+    having one) and had it echoed verbatim. Every id is now passed through
+    ``_safe_device_token_row_label``: only a value shaped exactly like this
+    store's own ``next_id("devtok")`` output is named directly (still
+    defensively re-sanitized even then); anything else — a live secret, a
+    newline that would forge a fake log line, an implausibly long value —
+    is replaced by a bounded per-group ordinal instead. The number of
+    groups shown, the number of rows shown per group, and the assembled
+    message's total length are each independently capped, so neither an
+    enormous fan-out of duplicate pairs nor an enormous fan-out of rows
+    within one pair can make this message unbounded."""
+    duplicates = find_duplicate_device_tokens(conn)
+    if duplicates:
+        group_strs = []
+        shown_groups = duplicates[:_MAX_DEVICE_TOKEN_GROUPS_SHOWN]
+        for _ref, _tok, ids in shown_groups:
+            shown_ids = ids[:_MAX_DEVICE_TOKEN_ROWS_SHOWN_PER_GROUP]
+            labels = [_safe_device_token_row_label(rid, i + 1)
+                      for i, rid in enumerate(shown_ids)]
+            hidden_rows = len(ids) - len(shown_ids)
+            more_rows = ("" if hidden_rows <= 0
+                        else f" (+{hidden_rows} more row(s))")
+            group_strs.append(f"rows {', '.join(labels)}{more_rows}")
+        shown = "; ".join(group_strs)
+        hidden_groups = len(duplicates) - len(shown_groups)
+        more = "" if hidden_groups <= 0 else f" (+{hidden_groups} more)"
+        message = (
+            "Cannot enforce one DeviceToken per (recipient_ref, token): "
+            f"{len(duplicates)} pair(s) already back more than one row. "
+            "The recipient_ref/token values are withheld from this message "
+            "because a device token is a live push credential -- the "
+            f"offending row id(s): {shown}{more}. Look up those rows "
+            "directly and deactivate or delete the extra one(s) before "
+            "upgrading.")
+        raise MigrationDataError(message[:_MAX_DEVICE_TOKEN_MESSAGE_CHARS])

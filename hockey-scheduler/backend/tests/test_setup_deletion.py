@@ -1144,7 +1144,7 @@ class DeletionContract:
         self.assertEqual(len(self.store.all_setup_audit()), audits_before)
 
         retired = self.api.set_contact_destination_active(
-            contact.id, False, actor_id=self.ACTOR)
+            contact.id, False, actor_id=self.ACTOR, actor_role=Role.LEAGUE_ADMIN)
         self.assertNotIn("error", retired, retired)
         self.assertFalse(retired["active"])
         self.assertEqual(retired["destination"], "retire-me@example.com",
@@ -1244,10 +1244,12 @@ class DeletionContract:
         official = self._official()
         ref = f"official:{official}"
         tok = self.api.register_device_token(ref, "fcm", "tok_o_react")
-        self.api.set_device_token_active(tok["id"], False)
+        self.api.set_device_token_active(
+            tok["id"], False, actor_id=self.ACTOR, actor_role=Role.LEAGUE_ADMIN)
         self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
                            self.store.get_official, official, "official_deleted")
-        result = self.api.set_device_token_active(tok["id"], True)
+        result = self.api.set_device_token_active(
+            tok["id"], True, actor_id=self.ACTOR, actor_role=Role.LEAGUE_ADMIN)
         self.assertEqual(result["error"]["code"], "validation_error", result)
         self.assertFalse(self.store.get_device_token(tok["id"]).active)
 
@@ -1255,7 +1257,8 @@ class DeletionContract:
         official = self._official()
         ref = f"official:{official}"
         tok = self.api.register_device_token(ref, "fcm", "tok_o_reg")
-        self.api.set_device_token_active(tok["id"], False)
+        self.api.set_device_token_active(
+            tok["id"], False, actor_id=self.ACTOR, actor_role=Role.LEAGUE_ADMIN)
         self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
                            self.store.get_official, official, "official_deleted")
         result = self.api.register_device_token(ref, "fcm", "tok_o_reg")
@@ -1269,8 +1272,11 @@ class DeletionContract:
         ref = f"official:{official}"
         tok = self.api.register_device_token(ref, "fcm", "tok_o_live")
         self.assertNotIn("error", tok)
-        self.assertTrue(self.api.set_device_token_active(tok["id"], False)["active"] is False)
-        reactivated = self.api.set_device_token_active(tok["id"], True)
+        self.assertTrue(self.api.set_device_token_active(
+            tok["id"], False, actor_id=self.ACTOR,
+            actor_role=Role.LEAGUE_ADMIN)["active"] is False)
+        reactivated = self.api.set_device_token_active(
+            tok["id"], True, actor_id=self.ACTOR, actor_role=Role.LEAGUE_ADMIN)
         self.assertNotIn("error", reactivated)
         self.assertTrue(reactivated["active"])
 
@@ -1328,7 +1334,8 @@ class DeletionContract:
         pref = self.store.save_notification_preference(NotificationPreference(
             id=self.store.next_id("notif_pref"), recipient_ref=ref,
             channel=NotificationChannel.PUSH, enabled=False))
-        self.api.set_contact_destination_active(contact.id, False, actor_id=self.ACTOR)
+        self.api.set_contact_destination_active(
+            contact.id, False, actor_id=self.ACTOR, actor_role=Role.LEAGUE_ADMIN)
         self.api.set_notification_preference_active(pref.id, False, actor_id=self.ACTOR)
 
         edited_contact = self.api.set_contact_destination(
@@ -1358,11 +1365,12 @@ class DeletionContract:
         contact = self.store.add_contact_destination(ContactDestination(
             id=self.store.next_id("contact"), recipient_ref=ref,
             channel=NotificationChannel.EMAIL, destination="react@example.com"))
-        self.api.set_contact_destination_active(contact.id, False, actor_id=self.ACTOR)
+        self.api.set_contact_destination_active(
+            contact.id, False, actor_id=self.ACTOR, actor_role=Role.LEAGUE_ADMIN)
         self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
                            self.store.get_official, official, "official_deleted")
         result = self.api.set_contact_destination_active(
-            contact.id, True, actor_id=self.ACTOR)
+            contact.id, True, actor_id=self.ACTOR, actor_role=Role.LEAGUE_ADMIN)
         self.assertEqual(result["error"]["code"], "validation_error", result)
         self.assertEqual(result["error"]["details"]["reason"], "scope_subject_missing")
         self.assertFalse(next(c for c in self.store.all_contact_destinations()
@@ -1391,9 +1399,11 @@ class DeletionContract:
         self.assertNotIn("error", c, c)
         contact_id = self.store.get_contact_destination(
             ref, NotificationChannel.EMAIL).id
-        retired = self.api.set_contact_destination_active(contact_id, False)
+        retired = self.api.set_contact_destination_active(
+            contact_id, False, actor_role=Role.LEAGUE_ADMIN)
         self.assertFalse(retired["active"])
-        reactivated = self.api.set_contact_destination_active(contact_id, True)
+        reactivated = self.api.set_contact_destination_active(
+            contact_id, True, actor_role=Role.LEAGUE_ADMIN)
         self.assertNotIn("error", reactivated, reactivated)
         self.assertTrue(reactivated["active"])
 
@@ -1428,7 +1438,8 @@ class DeletionContract:
         try:
             with self.assertRaises(RuntimeError):
                 self.api.set_contact_destination_active(
-                    contact.id, False, actor_id=self.ACTOR)
+                    contact.id, False, actor_id=self.ACTOR,
+                    actor_role=Role.LEAGUE_ADMIN)
         finally:
             self.store.add_setup_audit = original
 
@@ -1478,7 +1489,8 @@ class DeletionContract:
         self.assertEqual(
             resolve_destination(self.store, ref, NotificationChannel.EMAIL),
             "live@example.com")
-        self.api.set_contact_destination_active(contact.id, False, actor_id=self.ACTOR)
+        self.api.set_contact_destination_active(
+            contact.id, False, actor_id=self.ACTOR, actor_role=Role.LEAGUE_ADMIN)
         resolved = resolve_destination(self.store, ref, NotificationChannel.EMAIL)
         self.assertNotEqual(resolved, "live@example.com")
         self.assertTrue(resolved.endswith("@notify.invalid"))
@@ -1512,7 +1524,8 @@ class DeletionContract:
         self.assertEqual(email_delivery.destination, "original@example.com")
 
         # Retire (never delete) the contact to clear the way, then delete.
-        self.api.set_contact_destination_active(contact.id, False, actor_id=self.ACTOR)
+        self.api.set_contact_destination_active(
+            contact.id, False, actor_id=self.ACTOR, actor_role=Role.LEAGUE_ADMIN)
         self.assertDeleted(self.api.delete_official(official, actor_id=self.ACTOR),
                            self.store.get_official, official, "official_deleted")
 
@@ -1655,7 +1668,8 @@ class DeletionContract:
         ref = f"player:{player}"
         contact = self.store.get_contact_destination(ref, NotificationChannel.EMAIL)
         self.assertIsNotNone(contact)
-        self.api.set_contact_destination_active(contact.id, False, actor_id=self.ACTOR)
+        self.api.set_contact_destination_active(
+            contact.id, False, actor_id=self.ACTOR, actor_role=Role.LEAGUE_ADMIN)
         result = self.api.delete_player(player, actor_id=self.ACTOR)
         self.assertNotIn("error", result, result)
         self.assertIsNone(self.store.get_player(player))
@@ -1866,10 +1880,12 @@ class DeletionContract:
         # Clear each dependency through its own supported route — never a
         # silent cascade or erasure from delete_player itself.
         self.api.accounts.set_active(acc.id, False, actor_id=self.ACTOR)
-        self.api.set_device_token_active(tok.id, False)
+        self.api.set_device_token_active(
+            tok.id, False, actor_id=self.ACTOR, actor_role=Role.LEAGUE_ADMIN)
         contact = next(c for c in self.store.all_contact_destinations()
                       if c.recipient_ref == ref)
-        self.api.set_contact_destination_active(contact.id, False, actor_id=self.ACTOR)
+        self.api.set_contact_destination_active(
+            contact.id, False, actor_id=self.ACTOR, actor_role=Role.LEAGUE_ADMIN)
         self.api.set_notification_preference_active(pref.id, False, actor_id=self.ACTOR)
 
         self.assertDeleted(self.api.delete_player(player, actor_id=self.ACTOR),
@@ -1890,10 +1906,12 @@ class DeletionContract:
         player = self._player(team)
         ref = f"player:{player}"
         tok = self.api.register_device_token(ref, "fcm", "tok_p_react")
-        self.api.set_device_token_active(tok["id"], False)
+        self.api.set_device_token_active(
+            tok["id"], False, actor_id=self.ACTOR, actor_role=Role.LEAGUE_ADMIN)
         self.assertDeleted(self.api.delete_player(player, actor_id=self.ACTOR),
                            self.store.get_player, player, "player_deleted")
-        result = self.api.set_device_token_active(tok["id"], True)
+        result = self.api.set_device_token_active(
+            tok["id"], True, actor_id=self.ACTOR, actor_role=Role.LEAGUE_ADMIN)
         self.assertEqual(result["error"]["code"], "validation_error", result)
         self.assertFalse(self.store.get_device_token(tok["id"]).active)
 
@@ -1904,7 +1922,8 @@ class DeletionContract:
         player = self._player(team)
         ref = f"player:{player}"
         tok = self.api.register_device_token(ref, "fcm", "tok_p_reg")
-        self.api.set_device_token_active(tok["id"], False)
+        self.api.set_device_token_active(
+            tok["id"], False, actor_id=self.ACTOR, actor_role=Role.LEAGUE_ADMIN)
         self.assertDeleted(self.api.delete_player(player, actor_id=self.ACTOR),
                            self.store.get_player, player, "player_deleted")
         result = self.api.register_device_token(ref, "fcm", "tok_p_reg")
@@ -1921,8 +1940,11 @@ class DeletionContract:
         ref = f"player:{player}"
         tok = self.api.register_device_token(ref, "fcm", "tok_p_live")
         self.assertNotIn("error", tok)
-        self.assertFalse(self.api.set_device_token_active(tok["id"], False)["active"])
-        reactivated = self.api.set_device_token_active(tok["id"], True)
+        self.assertFalse(self.api.set_device_token_active(
+            tok["id"], False, actor_id=self.ACTOR,
+            actor_role=Role.LEAGUE_ADMIN)["active"])
+        reactivated = self.api.set_device_token_active(
+            tok["id"], True, actor_id=self.ACTOR, actor_role=Role.LEAGUE_ADMIN)
         self.assertNotIn("error", reactivated)
         self.assertTrue(reactivated["active"])
 
@@ -1986,11 +2008,12 @@ class DeletionContract:
         contact = self.store.add_contact_destination(ContactDestination(
             id=self.store.next_id("contact"), recipient_ref=ref,
             channel=NotificationChannel.EMAIL, destination="react@example.com"))
-        self.api.set_contact_destination_active(contact.id, False, actor_id=self.ACTOR)
+        self.api.set_contact_destination_active(
+            contact.id, False, actor_id=self.ACTOR, actor_role=Role.LEAGUE_ADMIN)
         self.assertDeleted(self.api.delete_player(player, actor_id=self.ACTOR),
                            self.store.get_player, player, "player_deleted")
         result = self.api.set_contact_destination_active(
-            contact.id, True, actor_id=self.ACTOR)
+            contact.id, True, actor_id=self.ACTOR, actor_role=Role.LEAGUE_ADMIN)
         self.assertEqual(result["error"]["code"], "validation_error", result)
         self.assertEqual(result["error"]["details"]["reason"], "scope_subject_missing")
 

@@ -9666,7 +9666,15 @@ class SetupService:
             self._dep_group("calendar feed", feeds,
                             lambda t: t.label or t.actor_ref),
             self._dep_group("contact destination", contacts,
-                            lambda c: c.label or c.destination),
+                            # Masked, never the raw destination (#426 review
+                            # finding 2): this itemisation is an
+                            # unaudited read path outside the
+                            # policy+audit boundary, and the raw value is
+                            # unnecessary here — the operator only needs
+                            # to know THAT a contact destination blocks
+                            # the delete, with an optional human label if
+                            # one was set.
+                            lambda c: c.label or "(unlabeled contact)"),
             self._dep_group("notification preference", prefs,
                             lambda p: p.channel.value),
             self._dep_group("device token", devices,
@@ -9726,7 +9734,15 @@ class SetupService:
             self._dep_group("calendar feed", feeds,
                             lambda t: t.label or t.actor_ref),
             self._dep_group("contact destination", contacts,
-                            lambda c: c.label or c.destination),
+                            # Masked, never the raw destination (#426 review
+                            # finding 2): this itemisation is an
+                            # unaudited read path outside the
+                            # policy+audit boundary, and the raw value is
+                            # unnecessary here — the operator only needs
+                            # to know THAT a contact destination blocks
+                            # the delete, with an optional human label if
+                            # one was set.
+                            lambda c: c.label or "(unlabeled contact)"),
             self._dep_group("notification preference", prefs,
                             lambda p: p.channel.value),
             self._dep_group("device token", devices,
@@ -9785,7 +9801,15 @@ class SetupService:
             self._dep_group("calendar feed", feeds,
                             lambda t: t.label or t.actor_ref),
             self._dep_group("contact destination", contacts,
-                            lambda c: c.label or c.destination),
+                            # Masked, never the raw destination (#426 review
+                            # finding 2): this itemisation is an
+                            # unaudited read path outside the
+                            # policy+audit boundary, and the raw value is
+                            # unnecessary here — the operator only needs
+                            # to know THAT a contact destination blocks
+                            # the delete, with an optional human label if
+                            # one was set.
+                            lambda c: c.label or "(unlabeled contact)"),
             self._dep_group("notification preference", prefs,
                             lambda p: p.channel.value),
             self._dep_group("device token", devices,

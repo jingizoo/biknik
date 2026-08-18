@@ -3,7 +3,7 @@ import unittest
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import NotificationChannel, NotificationDelivery
+from hockey_scheduler.domain import NotificationChannel, NotificationDelivery, Role
 from hockey_scheduler.full_demo import build_full_demo_store
 from hockey_scheduler.services import (
     DryRunEmailTransport,
@@ -90,14 +90,14 @@ class SmtpConfigTest(unittest.TestCase):
     # -- ApiService receives the configured transport + overview shows it -
     def test_apiservice_default_is_dry_run(self):
         store, _, _ = build_full_demo_store()
-        ov = ApiService(store).get_delivery_overview()
+        ov = ApiService(store).get_delivery_overview(actor_role=Role.LEAGUE_ADMIN)
         self.assertEqual(ov["email_mode"], "dry_run")
         self.assertIsNone(ov["email_sender"])
 
     def test_apiservice_uses_configured_smtp_transport(self):
         store, _, _ = build_full_demo_store()
         api = ApiService(store, email_transport=email_transport_from_env(SMTP_ENV))
-        ov = api.get_delivery_overview()
+        ov = api.get_delivery_overview(actor_role=Role.LEAGUE_ADMIN)
         self.assertEqual(ov["email_mode"], "smtp")
         self.assertEqual(ov["email_sender"], "league@club.example")
 

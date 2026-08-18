@@ -14,13 +14,15 @@ from enum import Enum
 from typing import Callable, List, Optional
 
 from ..domain import (
+    ACCESS_ALLOWED,
+    ACCESS_DENIED,
     AvailabilityStatus,
     CalendarFeedToken,
     ContactDestination,
+    DataAccessLog,
     DeliveryStatus,
     Game,
     GameType,
-    DeviceToken,
     IceSlotStatus,
     IceSlotType,
     NotificationAudience,
@@ -35,6 +37,7 @@ from ..domain import (
     ResultStatus,
     RosterEntryStatus,
     SeasonStatus,
+    SensitiveFieldCategory,
     SlotType,
     SubstituteStatus,
     can,
@@ -50,6 +53,7 @@ from ..domain.errors import (
     ScheduleConflictError,
     ValidationError,
 )
+from ..services import visibility_policy
 from ..services import (
     ACTOR_TYPES,
     AccountService,
@@ -4501,49 +4505,120 @@ class ApiService:
 
     @catch
     def process_notification_deliveries(self) -> dict:
-        """Drain the pending delivery queue through the mock sender."""
+        """Drain the pending delivery queue through the mock sender.
+
+        Returns only a run summary (counts) — never a delivery row, so no
+        raw destination reaches this response. The WORKER's own re-resolution
+        of each row's stored destination (needed to actually send) is
+        policy+audit-gated separately, attributed to the SYSTEM principal
+        (#426 review finding 2) — see ``services/delivery.py``.
+        """
         return self.delivery.process_pending()
 
     @catch
-    def retry_notification_delivery(self, delivery_id: str) -> dict:
+    def retry_notification_delivery(self, delivery_id: str,
+                                    actor_role=None, actor_user_id=None,
+                                    request_id=None) -> dict:
         """Requeue a failed/dead-lettered delivery for another attempt (#80).
 
         Resets the attempt budget and clears the dead-letter/error state so the
         worker will pick it up again. A sent delivery is not requeued (nothing
         to retry); an ignored one is — the operator explicitly asked for it.
+
+        The response echoes the row's STORED destination (#426 review
+        finding 2: "retry/ignore return the same raw _delivery_row") — gated
+        and audited exactly like ``set_contact_destination_active``'s
+        read-back: the policy check runs FIRST (before the row lookup, so an
+        unauthorized caller can't distinguish existing from missing ids),
+        and the disclosure is recorded in the SAME transaction as the
+        mutation it accompanies.
         """
-        d = self.store.get_notification_delivery(delivery_id)
-        if d is None:
-            raise NotFoundError("Delivery not found.")
-        if d.status == DeliveryStatus.SENT:
-            raise ValidationError("A delivered notification has nothing to retry.")
-        d.status = DeliveryStatus.PENDING
-        d.attempts = 0
-        d.last_error = None
-        d.dead_lettered_at = None
-        d.next_attempt_at = self.roster.clock()
-        self.store.save_notification_delivery(d)
+        request_id = self._safe_request_id(request_id)
+        role, label = self._privacy_principal(actor_role)
+        category = SensitiveFieldCategory.CONTACT_DESTINATION
+        if not self._sensitive_read_allowed(role, category):
+            self._refuse_sensitive_read(
+                category, "retry_notification_delivery",
+                actor_user_id, label, request_id)
+        with self.store.transaction():
+            d = self.store.get_notification_delivery(delivery_id)
+            if d is None:
+                raise NotFoundError("Delivery not found.")
+            if d.status == DeliveryStatus.SENT:
+                raise ValidationError(
+                    "A delivered notification has nothing to retry.")
+            d.status = DeliveryStatus.PENDING
+            d.attempts = 0
+            d.last_error = None
+            d.dead_lettered_at = None
+            d.next_attempt_at = self.roster.clock()
+            self.store.save_notification_delivery(d)
+            self._record_sensitive_read(
+                category, [("recipient", d.recipient_ref)],
+                "retry_notification_delivery", actor_user_id, label,
+                ACCESS_ALLOWED, request_id)
         return self._delivery_row(d)
 
     @catch
-    def ignore_notification_delivery(self, delivery_id: str) -> dict:
-        """Mark a delivery as ignored so the worker never retries it (#80)."""
-        d = self.store.get_notification_delivery(delivery_id)
-        if d is None:
-            raise NotFoundError("Delivery not found.")
-        if d.status == DeliveryStatus.SENT:
-            # A completed delivery is history; rewriting it to "won't deliver"
-            # would corrupt the record. Mirror retry's sent-row guard.
-            raise ValidationError("A delivered notification cannot be ignored.")
-        d.status = DeliveryStatus.IGNORED
-        d.next_attempt_at = None
-        self.store.save_notification_delivery(d)
+    def ignore_notification_delivery(self, delivery_id: str,
+                                     actor_role=None, actor_user_id=None,
+                                     request_id=None) -> dict:
+        """Mark a delivery as ignored so the worker never retries it (#80).
+
+        Same policy+audit gate as ``retry_notification_delivery`` — see its
+        docstring (#426 review finding 2).
+        """
+        request_id = self._safe_request_id(request_id)
+        role, label = self._privacy_principal(actor_role)
+        category = SensitiveFieldCategory.CONTACT_DESTINATION
+        if not self._sensitive_read_allowed(role, category):
+            self._refuse_sensitive_read(
+                category, "ignore_notification_delivery",
+                actor_user_id, label, request_id)
+        with self.store.transaction():
+            d = self.store.get_notification_delivery(delivery_id)
+            if d is None:
+                raise NotFoundError("Delivery not found.")
+            if d.status == DeliveryStatus.SENT:
+                # A completed delivery is history; rewriting it to "won't
+                # deliver" would corrupt the record. Mirror retry's
+                # sent-row guard.
+                raise ValidationError(
+                    "A delivered notification cannot be ignored.")
+            d.status = DeliveryStatus.IGNORED
+            d.next_attempt_at = None
+            self.store.save_notification_delivery(d)
+            self._record_sensitive_read(
+                category, [("recipient", d.recipient_ref)],
+                "ignore_notification_delivery", actor_user_id, label,
+                ACCESS_ALLOWED, request_id)
         return self._delivery_row(d)
 
     @catch
-    def get_delivery_overview(self) -> dict:
-        """Delivery-queue counts by status and channel, for observability."""
-        rows = self.store.all_notification_deliveries()
+    def get_delivery_overview(self, actor_role=None, actor_user_id=None,
+                              request_id=None) -> dict:
+        """Delivery-queue counts by status and channel, for observability —
+        PLUS every delivery row, including its stored destination (#426
+        review finding 2: "get_delivery_overview() returned it while
+        list_data_access() remained empty"). Policy-gated and audited
+        exactly like ``list_contact_destinations``: one row per distinct
+        disclosed recipient, or a single collection-level row when the
+        queue is empty.
+        """
+        request_id = self._safe_request_id(request_id)
+        role, label = self._privacy_principal(actor_role)
+        category = SensitiveFieldCategory.CONTACT_DESTINATION
+        if not self._sensitive_read_allowed(role, category):
+            self._refuse_sensitive_read(
+                category, "get_delivery_overview",
+                actor_user_id, label, request_id)
+        with self.store.transaction():
+            rows = self.store.all_notification_deliveries()
+            subjects = (sorted({("recipient", d.recipient_ref) for d in rows})
+                       or [("recipient", "*")])
+            self._record_sensitive_read(
+                category, subjects, "get_delivery_overview",
+                actor_user_id, label, ACCESS_ALLOWED, request_id)
         by_status: dict = {}
         by_channel: dict = {}
         for d in rows:
@@ -5240,6 +5315,173 @@ class ApiService:
                     "This official no longer exists.",
                     {"reason": "scope_subject_missing", "official_id": official_id})
 
+    # -- sensitive-read policy + audit (#124; #426 review) ------------------
+    #
+    # The facade is where every read of a protected field category passes
+    # through the visibility policy (services/visibility_policy.py) and emits
+    # a durable DataAccessLog row — synchronously, inside the same store
+    # transaction as the read it records, matching the repo's "everything is
+    # auditable" and snapshot-consistency invariants. The one category with
+    # stored data behind it today is CONTACT_DESTINATION (#60's registry);
+    # birthdate/registration land with #273 and route through the same gate.
+    #
+    # Recorded as its own log — NEVER AuditLog/SetupAuditLog — and the row
+    # never carries the protected value (domain/privacy.py).
+    #
+    # PRINCIPAL PROPAGATION (#426 review finding 1). Every HTTP call site now
+    # passes the ONE session-resolved Role web/server.py's _resolve_role()
+    # produced for this request (never None — a missing/invalid session is
+    # an HTTP error decided BEFORE the facade is ever called) plus the
+    # server-minted per-request correlation id. The former no-actor
+    # "operator_boundary" shape — a missing principal silently treated as
+    # RAW-authorized for CONTACT_DESTINATION — is RETIRED: a missing or
+    # unparseable principal now fails closed exactly like any other unknown
+    # one (visibility_policy.NO_PRINCIPAL / "unknown"), distinguished only
+    # in the audit row's label, never in what it is granted. The one
+    # surviving non-Role principal, visibility_policy.SYSTEM_PRINCIPAL, is a
+    # trusted, explicit, non-string sentinel for legitimate background code
+    # (the delivery worker, #426 review finding 2) — see that module's
+    # PRINCIPALS section.
+
+    #: actor_role label recorded when a caller passed a role claim that parses
+    #: to no known Role: the policy fails closed on it, and the durable row
+    #: records the fact without copying arbitrary caller input into the log.
+    _PRIVACY_UNKNOWN_ROLE = "unknown"
+
+    #: Thin delegations to services/visibility_policy.py's sanitizers (#426
+    #: review finding 3) — shared with services/delivery.py's SYSTEM-
+    #: attributed worker audit (finding 2), which cannot import THIS module
+    #: without a circular import, so the real logic lives there, not here.
+    _mint_request_id = staticmethod(visibility_policy.mint_request_id)
+    _safe_request_id = staticmethod(visibility_policy.safe_request_id)
+    _canonical_subject_id = staticmethod(visibility_policy.canonical_subject_id)
+
+    @classmethod
+    def _privacy_principal(cls, actor_role):
+        """Resolve a facade ``actor_role`` argument to ``(role, label)``
+        (#426 review finding 1).
+
+        ``actor_role`` is either a real :class:`Role` (enum or its string
+        value — the ONLY shape an HTTP-originated call passes, since
+        ``web/server.py``'s ``_resolve_role()`` never reaches a sensitive
+        route with ``role=None``) or ``visibility_policy.SYSTEM_PRINCIPAL``
+        (the explicit sentinel for trusted, non-HTTP background/worker
+        callers). Anything else — ``None`` (no principal supplied) or an
+        unparseable string — fails closed: there is no more "missing
+        principal defaults to RAW" carve-out. The two failure shapes are
+        labelled distinctly (``NO_PRINCIPAL`` vs ``"unknown"``) purely so an
+        audit row explains WHY nothing was resolved; both grant nothing.
+        """
+        if actor_role is visibility_policy.SYSTEM_PRINCIPAL:
+            return actor_role, "system"
+        if isinstance(actor_role, Role):
+            return actor_role, actor_role.value
+        if actor_role is None:
+            return None, visibility_policy.NO_PRINCIPAL
+        try:
+            role = Role(actor_role)
+        except ValueError:
+            return None, cls._PRIVACY_UNKNOWN_ROLE
+        return role, role.value
+
+    @staticmethod
+    def _sensitive_read_allowed(role, category) -> bool:
+        """The ONE predicate every sensitive-read gate in this facade uses
+        (#426 review finding 1) — a straight delegation to the policy
+        module. No special-casing here for a missing/unknown principal:
+        ``role`` is a real Role, the SYSTEM_PRINCIPAL sentinel, or None, and
+        ``visibility_policy.may_read_raw`` already fails closed on anything
+        it does not explicitly grant."""
+        return visibility_policy.may_read_raw(role, category)
+
+    def _record_sensitive_read(self, category, subjects, purpose,
+                               actor_user_id, actor_role_label, outcome,
+                               request_id, *, durable=False) -> None:
+        """Append one DataAccessLog row per subject.
+
+        ``durable=False`` (the default): callers hold the store transaction
+        that makes the rows atomic with the ALLOWED read they record — this
+        is the disclosure path, and an audit row for a read that never
+        happened (because the surrounding transaction rolled back) must not
+        survive either. ``durable=True`` is for REFUSALS
+        (``_refuse_sensitive_read``): a denial has no disclosure to stay
+        atomic with, and must survive regardless of what any ambient
+        transaction later does (#426 review finding 4) — see
+        ``add_data_access_durable`` on both stores.
+
+        Every subject id and the shared request id are passed through the
+        canonicalization/validation boundary (#426 review finding 3) before
+        they ever reach the store.
+
+        ``id`` is deliberately left unset (#426 round-2 review finding 1):
+        the STORE assigns it, at the same moment it assigns ``seq``, never
+        here — eagerly allocating it in THIS ambient transaction is exactly
+        the bug that fix closes (see ``domain/privacy.py``'s DURABLE ID
+        ALLOCATION section and ``add_data_access_durable`` on both stores).
+        """
+        at = self.roster.clock()
+        write = (self.store.add_data_access_durable if durable
+                else self.store.add_data_access)
+        for subject_type, subject_id in subjects:
+            write(DataAccessLog(
+                category=category,
+                subject_type=subject_type,
+                subject_id=self._canonical_subject_id(subject_id),
+                purpose=purpose,
+                at=at,
+                actor_user_id=actor_user_id,
+                actor_role=actor_role_label,
+                outcome=outcome,
+                request_id=request_id))
+
+    def _refuse_sensitive_read(self, category, purpose, actor_user_id,
+                               actor_role_label, request_id):
+        """Record the refused attempt DURABLY, then raise the refusal (#124:
+        an unauthorized read attempt produces an audit row AND a denial).
+
+        The denial row is written through ``add_data_access_durable``
+        (#426 review finding 4) — NOT a plain nested ``transaction()``: a
+        nested ``transaction()`` call JOINS whatever ambient transaction the
+        caller may already have open, so a forbidden result followed by an
+        OUTER failure used to leave zero denial rows. The durable write
+        survives that outer failure by construction (see
+        ``add_data_access_durable``'s own docstring on both stores). One
+        collection-level ``("recipient", "*")`` subject — a refused caller
+        learned nothing, so no per-subject rows are enumerated (the
+        enumeration itself would be a disclosure vector).
+        """
+        self._record_sensitive_read(
+            category, [("recipient", "*")], purpose,
+            actor_user_id, actor_role_label, ACCESS_DENIED, request_id,
+            durable=True)
+        raise NotAuthorizedError(
+            "Your role can't read stored contact destinations.",
+            {"reason": "sensitive_read_denied", "category": category.value,
+             "request_id": request_id})
+
+    def _audit_transport_denial(self, category, purpose, actor_user_id,
+                                actor_role) -> None:
+        """Durably audit a sensitive-route DENIAL decided ENTIRELY at the
+        HTTP transport boundary (#426 review finding 1) — by
+        ``web/server.py``'s own ``_operator_only()``/``authorize()`` gate,
+        before any facade method (whose own ``_refuse_sensitive_read``
+        already covers this) ever runs. The transport-boundary counterpart
+        to ``_refuse_sensitive_read``, not a second mechanism: both funnel
+        through the SAME ``_record_sensitive_read`` ``durable=True`` path,
+        with the SAME collection-level, value-free ``("recipient", "*")``
+        subject — a refused caller never learns which subjects exist.
+
+        ``actor_role`` may be ``None`` (no session at all resolved) —
+        ``_privacy_principal`` labels that ``NO_PRINCIPAL``, exactly like
+        every other missing-principal attempt, never a disclosure. Called
+        directly from ``web/server.py`` — the SAME reach-in convention
+        ``_mint_request_id``/``_privacy_principal`` already established.
+        """
+        role, label = self._privacy_principal(actor_role)
+        self._record_sensitive_read(
+            category, [("recipient", "*")], purpose, actor_user_id, label,
+            ACCESS_DENIED, self._mint_request_id(), durable=True)
+
     # -- contact registry (#60) --------------------------------------------
     @staticmethod
     def _contact_row(c) -> dict:
@@ -5248,9 +5490,38 @@ class ApiService:
                 "label": c.label, "active": c.active}
 
     @catch
-    def list_contact_destinations(self) -> dict:
-        rows = [self._contact_row(c)
-                for c in self.store.all_contact_destinations()]
+    def list_contact_destinations(self, actor_role=None, actor_user_id=None,
+                                  request_id=None) -> dict:
+        """Every stored contact destination — a bulk read of protected values
+        (#124: CONTACT_DESTINATION), policy-gated and audited.
+
+        ``actor_role``/``actor_user_id`` must be the ONE session-resolved
+        principal ``web/server.py`` produced for this HTTP request (#426
+        review finding 1) — there is no more no-argument default-allow
+        shape; an absent ``actor_role`` now fails closed like any other
+        unrecognised principal (see ``_privacy_principal``). Leaves durable
+        DataAccessLog rows: one per disclosed recipient, or a single
+        ``("recipient", "*")`` row when the registry is empty — every access
+        attempt leaves a trace. Audit emission happens INSIDE the same store
+        transaction as the read, so the subjects recorded and the rows
+        returned come from one consistent snapshot.
+        """
+        request_id = self._safe_request_id(request_id)
+        role, label = self._privacy_principal(actor_role)
+        category = SensitiveFieldCategory.CONTACT_DESTINATION
+        if not self._sensitive_read_allowed(role, category):
+            self._refuse_sensitive_read(
+                category, "list_contact_destinations",
+                actor_user_id, label, request_id)
+        with self.store.transaction():
+            rows = [self._contact_row(c)
+                    for c in self.store.all_contact_destinations()]
+            subjects = (sorted({("recipient", r["recipient_ref"])
+                                for r in rows})
+                        or [("recipient", "*")])
+            self._record_sensitive_read(
+                category, subjects, "list_contact_destinations",
+                actor_user_id, label, ACCESS_ALLOWED, request_id)
         rows.sort(key=lambda r: (r["recipient_ref"], r["channel"]))
         return {"contacts": rows}
 
@@ -5258,7 +5529,38 @@ class ApiService:
     def set_contact_destination(self, recipient_ref: str, channel: str,
                                 destination: str, label=None) -> dict:
         """Register (or update the value of) a recipient/channel's real
-        destination."""
+        destination.
+
+        The fetch-then-save is wrapped in ``transaction()`` (#426 review
+        finding 4) so this write takes SQLite's ``BEGIN IMMEDIATE`` lock
+        upfront, the SAME discipline ``set_contact_destination_active``
+        uses: without it, this write's own implicit per-statement
+        transaction has to PROMOTE from a read lock to a write lock
+        mid-statement when it races a connection that already holds
+        RESERVED (e.g. the toggle's own locked fetch) — and SQLite
+        deliberately refuses to honour ``busy_timeout`` for that specific
+        promotion, failing with "database is locked" immediately instead
+        of waiting. Taking the write lock as the FIRST statement (exactly
+        like every other guarded write in this codebase) lets a genuinely
+        concurrent caller correctly SERIALIZE behind this one instead.
+
+        The initial existence check is a PLAIN read; the row that is
+        actually mutated is re-fetched via ``get_contact_destination_for_
+        update`` (#426 review finding 4 round-2) before being written back.
+        SQLite's ``BEGIN IMMEDIATE`` (above) already makes this a no-op
+        there, but on PostgreSQL a plain read is NOT blocked by another
+        transaction's row lock (only a genuine write is) — so without the
+        re-fetch, this method could read a row an in-flight
+        ``set_contact_destination_active`` is about to change, then block
+        only at its OWN ``UPDATE``, and finally write back every OTHER
+        field (this method only ever means to change destination/label)
+        from that now-stale snapshot once the lock is free — silently
+        reverting the toggle's already-committed change. That is the exact
+        "lost update" shape finding 4 named, now closed on this side too:
+        re-fetching AFTER the row lock is held guarantees ``existing``
+        reflects the true current row before any field of it is echoed
+        back unchanged.
+        """
         if not recipient_ref:
             raise ValidationError("A recipient_ref is required.")
         self._reject_dangling_recipient(recipient_ref)
@@ -5271,26 +5573,31 @@ class ApiService:
             raise ValidationError("A destination is required.")
         if ch == NotificationChannel.EMAIL and "@" not in destination:
             raise ValidationError("An email destination must contain '@'.")
-        existing = self.store.get_contact_destination(recipient_ref, ch)
-        if existing is not None:
-            # Deliberately does NOT touch `active` (#232 review 6): a
-            # retired row must stay retired through an ordinary value edit —
-            # only the MANAGE_SETUP-gated set_contact_destination_active can
-            # reactivate one. Without this, a wider-permissioned caller
-            # could silently undo a retirement by editing the destination.
-            existing.destination = destination
-            existing.label = label
-            self.store.save_contact_destination(existing)
-            return self._contact_row(existing)
-        c = ContactDestination(
-            id=self.store.next_id("contact"), recipient_ref=recipient_ref,
-            channel=ch, destination=destination, label=label)
-        self.store.add_contact_destination(c)
-        return self._contact_row(c)
+        with self.store.transaction():
+            existing = self.store.get_contact_destination(recipient_ref, ch)
+            if existing is not None:
+                existing = self.store.get_contact_destination_for_update(
+                    existing.id)
+                # Deliberately does NOT touch `active` (#232 review 6): a
+                # retired row must stay retired through an ordinary value edit —
+                # only the MANAGE_SETUP-gated set_contact_destination_active can
+                # reactivate one. Without this, a wider-permissioned caller
+                # could silently undo a retirement by editing the destination.
+                existing.destination = destination
+                existing.label = label
+                self.store.save_contact_destination(existing)
+                return self._contact_row(existing)
+            c = ContactDestination(
+                id=self.store.next_id("contact"), recipient_ref=recipient_ref,
+                channel=ch, destination=destination, label=label)
+            self.store.add_contact_destination(c)
+            return self._contact_row(c)
 
     @catch
     def set_contact_destination_active(self, contact_id: str, active: bool,
-                                       actor_id: Optional[str] = None) -> dict:
+                                       actor_id: Optional[str] = None,
+                                       actor_role=None,
+                                       request_id=None) -> dict:
         """Retire (or reactivate) a contact destination (#232 review 4).
 
         A durable, audited lifecycle toggle — never a delete. Retiring a row
@@ -5302,26 +5609,51 @@ class ApiService:
         is. Restricted to Player/Official-scoped rows, same as the delete
         lifecycle it serves — not a general contact-management surface for
         other recipient kinds (team, guardian, …).
+
+        The RESPONSE echoes the row including its STORED destination — a
+        value the caller did not submit — so this is also a sensitive read
+        (#124): gated by the same policy as ``list_contact_destinations``
+        (checked FIRST, before the row lookup, so an unauthorized caller
+        can't distinguish existing from missing ids) and recorded as a
+        DataAccessLog row inside the mutation's own transaction — a rolled
+        back toggle whose response never reached the caller leaves no
+        phantom read row. Its sibling ``set_contact_destination`` is
+        deliberately NOT gated here: its response contains only the
+        caller's own submitted values (the upsert overwrites before it
+        echoes), so no stored protected value is disclosed.
+
+        FETCH-MUTATE-AUDIT IS ONE ATOMIC UNIT (#426 review finding 4): the
+        row is looked up via ``get_contact_destination_for_update`` INSIDE
+        this method's own transaction, not before it opens — a stale
+        pre-read fetched before the transaction started (the prior shape)
+        could be silently overwritten by a concurrent
+        ``set_contact_destination`` upsert that commits in the gap, toggling
+        (and disclosing) that stale value instead of the true current one.
+        Locking the row for the fetch (a real row lock on PostgreSQL; the
+        whole-transaction file/process lock on SQLite/Memory) fully orders
+        this toggle against any concurrent write to the SAME row.
         """
-        c = next((row for row in self.store.all_contact_destinations()
-                  if row.id == contact_id), None)
-        if c is None:
-            raise NotFoundError(f"Contact destination {contact_id} not found.")
-        if not (c.recipient_ref.startswith("player:")
-                or c.recipient_ref.startswith("official:")):
-            raise ValidationError(
-                "Only Player/Official-scoped contact destinations can be "
-                "retired through this action.",
-                {"reason": "recipient_not_cleanup_eligible",
-                 "recipient_ref": c.recipient_ref})
-        if active:
-            self._reject_dangling_recipient(c.recipient_ref)
-        # The mutation itself must happen INSIDE the transaction (#232 review
-        # 6): the in-memory store snapshots state at entry, so mutating `c`
-        # beforehand would already be reflected in that snapshot — a forced
-        # audit failure would then roll back to the already-mutated state
-        # instead of the true pre-image.
+        request_id = self._safe_request_id(request_id)
+        role, label = self._privacy_principal(actor_role)
+        category = SensitiveFieldCategory.CONTACT_DESTINATION
+        if not self._sensitive_read_allowed(role, category):
+            self._refuse_sensitive_read(
+                category, "set_contact_destination_active",
+                actor_id, label, request_id)
         with self.store.transaction():
+            c = self.store.get_contact_destination_for_update(contact_id)
+            if c is None:
+                raise NotFoundError(
+                    f"Contact destination {contact_id} not found.")
+            if not (c.recipient_ref.startswith("player:")
+                    or c.recipient_ref.startswith("official:")):
+                raise ValidationError(
+                    "Only Player/Official-scoped contact destinations can be "
+                    "retired through this action.",
+                    {"reason": "recipient_not_cleanup_eligible",
+                     "recipient_ref": c.recipient_ref})
+            if active:
+                self._reject_dangling_recipient(c.recipient_ref)
             c.active = bool(active)
             self.store.save_contact_destination(c)
             self.setup._audit(
@@ -5329,6 +5661,13 @@ class ApiService:
                 else "contact_destination_retired",
                 "contact_destination", contact_id, actor_id,
                 {"recipient_ref": c.recipient_ref, "channel": c.channel.value})
+            # Read-back disclosure of the stored destination (#124) — same
+            # transaction/lock as the fetch+mutation, see the docstring.
+            self._record_sensitive_read(
+                SensitiveFieldCategory.CONTACT_DESTINATION,
+                [("recipient", c.recipient_ref)],
+                "set_contact_destination_active", actor_id, label,
+                ACCESS_ALLOWED, request_id)
         return self._contact_row(c)
 
     # -- notification preferences (#81) ------------------------------------
@@ -5551,6 +5890,27 @@ class ApiService:
                          self.roster.clock(), calendar_name=name)
 
     # -- device token registry (#65) ---------------------------------------
+    #
+    # A raw device token is, for audit purposes, the SAME kind of protected
+    # value a ContactDestination's raw destination is — #426 round-3 review
+    # finding 1: "DeviceToken is architecturally the same class of problem
+    # ContactDestination already solved ... reuse that exact same
+    # boundary/mechanism ... rather than building a second parallel one".
+    # ``list_device_tokens``/``set_device_token_active`` below therefore
+    # route through the IDENTICAL policy+audit gate ``list_contact_
+    # destinations``/``set_contact_destination_active`` use — same
+    # ``SensitiveFieldCategory.CONTACT_DESTINATION`` category (not a new
+    # one), same ``_privacy_principal``/``_sensitive_read_allowed``/
+    # ``_refuse_sensitive_read``/``_record_sensitive_read`` calls, same
+    # sanitizers — just a different stored row shape underneath.
+    #
+    # ``register_device_token`` is deliberately NOT gated, for the SAME
+    # reason ``set_contact_destination`` (its ContactDestination sibling)
+    # is not: on both the create AND the reactivate-existing path, its
+    # response only ever echoes the ``token`` value the CALLER just
+    # submitted in this SAME call — never a stored value the caller didn't
+    # already have — so it discloses nothing new and is not a sensitive
+    # read.
     @staticmethod
     def _device_token_row(t) -> dict:
         return {"id": t.id, "recipient_ref": t.recipient_ref,
@@ -5558,16 +5918,59 @@ class ApiService:
                 "label": t.label, "active": t.active}
 
     @catch
-    def list_device_tokens(self) -> dict:
-        rows = [self._device_token_row(t)
-                for t in self.store.all_device_tokens()]
+    def list_device_tokens(self, actor_role=None, actor_user_id=None,
+                           request_id=None) -> dict:
+        """Every stored device token — a bulk read of protected values
+        (#124/#426 round-3 review finding 1: CONTACT_DESTINATION, the same
+        category a raw stored ContactDestination read uses), policy-gated
+        and audited exactly like ``list_contact_destinations`` (see that
+        method's own docstring for the full contract this mirrors).
+        """
+        request_id = self._safe_request_id(request_id)
+        role, label = self._privacy_principal(actor_role)
+        category = SensitiveFieldCategory.CONTACT_DESTINATION
+        if not self._sensitive_read_allowed(role, category):
+            self._refuse_sensitive_read(
+                category, "list_device_tokens", actor_user_id, label,
+                request_id)
+        with self.store.transaction():
+            rows = [self._device_token_row(t)
+                    for t in self.store.all_device_tokens()]
+            subjects = (sorted({("recipient", r["recipient_ref"])
+                                for r in rows})
+                       or [("recipient", "*")])
+            self._record_sensitive_read(
+                category, subjects, "list_device_tokens",
+                actor_user_id, label, ACCESS_ALLOWED, request_id)
         rows.sort(key=lambda r: (r["recipient_ref"], not r["active"], r["id"]))
         return {"device_tokens": rows}
 
     @catch
     def register_device_token(self, recipient_ref: str, provider: str,
                               token: str, label=None) -> dict:
-        """Register (or reactivate) a real push device token for a recipient."""
+        """Register (or reactivate) a real push device token for a recipient.
+
+        THE UPSERT IS ONE ATOMIC STATEMENT (#426 round-4 review finding 1):
+        ``store.upsert_device_token`` uses migration 055's UNIQUE index on
+        (recipient_ref, token) and a real ``INSERT ... ON CONFLICT ... DO
+        UPDATE`` so two concurrent registrations of the SAME
+        (recipient_ref, token) pair can never both observe "no row" and
+        insert two rows — and a concurrent ``set_device_token_active``
+        toggle of the SAME row (which now takes a real row lock via
+        ``get_device_token_for_update``) is fully ordered against this
+        write rather than silently overwriting it with a stale in-memory
+        copy. Replaces the previous unlocked ``get_device_token_by_value``
+        -> ``save_device_token``/``add_device_token`` shape, which
+        performed its read and its write as two independent, unlocked
+        operations with no transaction around either — see
+        ``store.upsert_device_token``'s own docstring for the full
+        mechanism. Wrapped in ``store.transaction()`` for Memory-store
+        parity (its equivalent find-or-create is two dict operations, not
+        atomic on its own — see ``InMemoryStore.upsert_device_token``);
+        harmless and consistent with every other mutating method here on
+        the SQL backends, where the upsert statement is already atomic by
+        itself.
+        """
         if not recipient_ref:
             raise ValidationError("A recipient_ref is required.")
         self._reject_dangling_recipient(recipient_ref)
@@ -5582,28 +5985,66 @@ class ApiService:
             raise ValidationError(
                 "That looks like a placeholder token — register a real device "
                 "token from the provider.")
-        existing = self.store.get_device_token_by_value(recipient_ref, token)
-        if existing is not None:
-            existing.provider = provider
-            existing.label = label
-            existing.active = True
-            self.store.save_device_token(existing)
-            return self._device_token_row(existing)
-        t = DeviceToken(
-            id=self.store.next_id("devtok"), recipient_ref=recipient_ref,
-            provider=provider, token=token, label=label, active=True)
-        self.store.add_device_token(t)
+        with self.store.transaction():
+            t = self.store.upsert_device_token(recipient_ref, provider, token, label)
         return self._device_token_row(t)
 
     @catch
-    def set_device_token_active(self, token_id: str, active: bool) -> dict:
-        t = self.store.get_device_token(token_id)
-        if t is None:
-            raise NotFoundError("Device token not found.")
-        if active:
-            self._reject_dangling_recipient(t.recipient_ref)
-        t.active = bool(active)
-        self.store.save_device_token(t)
+    def set_device_token_active(self, token_id: str, active: bool,
+                                actor_id: Optional[str] = None,
+                                actor_role=None, request_id=None) -> dict:
+        """Retire (or reactivate) a device token.
+
+        The RESPONSE echoes the row including its STORED raw token — a
+        value the caller did not submit — so this is also a sensitive read
+        (#124/#426 round-3 review finding 1), gated by the SAME policy as
+        ``list_device_tokens``/``set_contact_destination_active`` (checked
+        FIRST, before the row lookup, so an unauthorized caller can't
+        distinguish existing from missing ids) and recorded as a
+        DataAccessLog row inside the mutation's own transaction — a
+        rolled-back toggle whose response never reached the caller leaves
+        no phantom read row. Mirrors ``set_contact_destination_active``'s
+        exact shape; see that method's own docstring.
+
+        FETCH-MUTATE-AUDIT IS ONE ATOMIC UNIT, ROW-LOCKED (#426 round-4
+        review finding 1): the row is looked up via
+        ``get_device_token_for_update`` — unlike its ContactDestination
+        sibling before round-2's fix, this used to be a PLAIN
+        ``get_device_token`` read with no lock at all. On PostgreSQL, a
+        plain read is not blocked by another transaction's row lock (only a
+        genuine write is), so a concurrent ``register_device_token``
+        re-registration of the SAME token value could commit a new
+        provider/label in the gap between this read and this method's own
+        ``UPDATE``, and this method's stale full-row ``save_device_token``
+        would then silently overwrite that committed change back to the
+        value it read before the race — the exact "lost update" the review
+        described. Locking the row for the fetch (a real row lock on
+        PostgreSQL; the whole-transaction file/process lock on
+        SQLite/Memory) fully orders this toggle against
+        ``upsert_device_token``'s own conflict-resolution lock on the SAME
+        row, in EITHER commit order — see that method's own docstring.
+        """
+        request_id = self._safe_request_id(request_id)
+        role, label = self._privacy_principal(actor_role)
+        category = SensitiveFieldCategory.CONTACT_DESTINATION
+        if not self._sensitive_read_allowed(role, category):
+            self._refuse_sensitive_read(
+                category, "set_device_token_active", actor_id, label,
+                request_id)
+        with self.store.transaction():
+            t = self.store.get_device_token_for_update(token_id)
+            if t is None:
+                raise NotFoundError("Device token not found.")
+            if active:
+                self._reject_dangling_recipient(t.recipient_ref)
+            t.active = bool(active)
+            self.store.save_device_token(t)
+            # Read-back disclosure of the stored token (#124) — same
+            # transaction as the fetch+mutation, see the docstring.
+            self._record_sensitive_read(
+                category, [("recipient", t.recipient_ref)],
+                "set_device_token_active", actor_id, label,
+                ACCESS_ALLOWED, request_id)
         return self._device_token_row(t)
 
     # -- user accounts (#67) ------------------------------------------------
@@ -11487,9 +11928,38 @@ class ApiService:
         # views). Only the MANAGE_SETUP-gated operator list opts in, so the edit
         # drawer (#268) can prefill the current address without ever exposing it
         # on a coach/public payload.
+        #
+        # This IS a sensitive read of the SAME CONTACT_DESTINATION category
+        # the contacts registry gates (#426 review finding 2:
+        # "Player-email reads... also read or return stored destinations
+        # outside this gate") — policy-checked and audited using the SAME
+        # `role`/`user_id` this method already threads through for Program
+        # scoping. Masks rather than refuses on denial (the player LIST
+        # itself is not privacy-gated, only the email column is), so an
+        # unauthorized `include_email=True` caller still gets the roster,
+        # just with every email blanked — one durable denial row, not a
+        # broken listing.
         if include_email:
-            for player, row in zip(players, rows):
-                row["email"] = self.setup.active_player_email(player.id)
+            request_id = self._safe_request_id(None)
+            email_role, email_label = self._privacy_principal(role)
+            category = SensitiveFieldCategory.CONTACT_DESTINATION
+            if self._sensitive_read_allowed(email_role, category):
+                with self.store.transaction():
+                    subjects = []
+                    for player, row in zip(players, rows):
+                        row["email"] = self.setup.active_player_email(player.id)
+                        subjects.append(("recipient", f"player:{player.id}"))
+                    self._record_sensitive_read(
+                        category, subjects or [("recipient", "*")],
+                        "list_players_email", user_id, email_label,
+                        ACCESS_ALLOWED, request_id)
+            else:
+                for row in rows:
+                    row["email"] = None
+                self._record_sensitive_read(
+                    category, [("recipient", "*")], "list_players_email",
+                    user_id, email_label, ACCESS_DENIED, request_id,
+                    durable=True)
         return rows
 
     @catch

@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import Team
+from hockey_scheduler.domain import Role, Team
 from hockey_scheduler.domain.errors import ConcurrencyConflictError, NotFoundError
 from hockey_scheduler.full_demo import build_full_demo_store
 from hockey_scheduler.services import SetupService
@@ -110,12 +110,12 @@ class SqlStoreParityTest(unittest.TestCase):
     def test_delivery_queue_roundtrips_on_sql(self):
         # Emission fans out to notification_deliveries; the worker drains them
         # and the sent state persists through the SQL store (#58).
-        ov = self.api.get_delivery_overview()
+        ov = self.api.get_delivery_overview(actor_role=Role.LEAGUE_ADMIN)
         self.assertGreater(ov["total"], 0)
         self.assertEqual(ov["by_status"].get("pending"), ov["total"])
         res = self.api.process_notification_deliveries()
         self.assertEqual(res["sent"], ov["total"])
-        ov2 = self.api.get_delivery_overview()
+        ov2 = self.api.get_delivery_overview(actor_role=Role.LEAGUE_ADMIN)
         self.assertEqual(ov2["by_status"].get("sent"), ov2["total"])
         self.assertTrue(all(d["sent_at"] for d in ov2["deliveries"]))
         # Recipient targeting (#59) persists through the SQL store too.
@@ -127,10 +127,10 @@ class SqlStoreParityTest(unittest.TestCase):
         # next emission, all through the SQL store.
         self.api.set_contact_destination(
             "scheduler", "email", "ops@contacts.invalid")
-        listed = self.api.list_contact_destinations()["contacts"]
+        listed = self.api.list_contact_destinations(actor_role=Role.LEAGUE_ADMIN)["contacts"]
         self.assertEqual(listed[0]["destination"], "ops@contacts.invalid")
         self.api.respond_assignment(self.ids["ref_assignment_id"], accept=True)
-        ov = self.api.get_delivery_overview()
+        ov = self.api.get_delivery_overview(actor_role=Role.LEAGUE_ADMIN)
         accepted_email = next(
             d for d in ov["deliveries"]
             if d["recipient_ref"] == "scheduler" and d["channel"] == "email")
@@ -140,10 +140,11 @@ class SqlStoreParityTest(unittest.TestCase):
         # A registered device token (#65) persists and overrides the push
         # placeholder on the next emission, through the SQL store.
         self.api.register_device_token("scheduler", "fcm", "tok-sql")
-        listed = self.api.list_device_tokens()["device_tokens"]
+        listed = self.api.list_device_tokens(
+            actor_role=Role.LEAGUE_ADMIN)["device_tokens"]
         self.assertEqual(listed[0]["token"], "tok-sql")
         self.api.respond_assignment(self.ids["ref_assignment_id"], accept=True)
-        ov = self.api.get_delivery_overview()
+        ov = self.api.get_delivery_overview(actor_role=Role.LEAGUE_ADMIN)
         push = next(d for d in ov["deliveries"]
                     if d["recipient_ref"] == "scheduler" and d["channel"] == "push")
         self.assertEqual(push["destination"], "tok-sql")
