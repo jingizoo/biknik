@@ -11086,11 +11086,31 @@ class ApiService:
             selections=selections,
             copy_forward_fingerprint=copy_forward_fingerprint,
             actor_id=actor_id)
+        # #159 review round 4 (owner P1 finding 2): prefer the FROZEN
+        # season_id/league_id the service resolved and snapshotted once at
+        # commit time (``registration_identities``) over ``_registration_
+        # dict``'s own live LeagueSeason lookup, which returns null for
+        # either field the instant that binding is later deleted --
+        # exactly the read this facade otherwise performs on every call,
+        # replay included. Applies uniformly to a FRESH commit's own
+        # response too (not only a replay), so what a commit returns right
+        # now and what a later replay of the SAME fingerprint returns can
+        # never drift apart, by construction — see SetupService.
+        # _copy_forward_registration_identities, the sole producer of this
+        # map.
+        identities = result.get("registration_identities") or {}
+        registrations = []
+        for r in result["registrations"]:
+            row = self._registration_dict(r)
+            identity = identities.get(r.id)
+            if identity is not None:
+                row["season_id"] = identity.get("season_id")
+                row["league_id"] = identity.get("league_id")
+            registrations.append(row)
         return {
             "committed": True,
             "season": _serialize(result["season"]),
-            "registrations": [self._registration_dict(r)
-                              for r in result["registrations"]],
+            "registrations": registrations,
             "totals": result["totals"],
         }
 
