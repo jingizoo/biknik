@@ -15,7 +15,7 @@ from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
 from hockey_scheduler.domain import (
-    Division, League, LeagueSeason, Position, Program, Season, Team,
+    Division, League, LeagueSeason, Position, Program, Role, Season, Team,
     age_on, evaluate_age_eligibility, normalize_age_tiers, normalize_cutoff,
     normalize_enforcement)
 from hockey_scheduler.domain.errors import (
@@ -229,14 +229,22 @@ class EligibilityRuleServiceTest(unittest.TestCase):
             player = setup.add_player(
                 "t1", None, Position.FORWARD, first_name="Kid",
                 last_name="Nine", birthdate="2017-01-15")
-            summary = api.evaluate_player_eligibility(player.id, "d")
+            # #424 audit-wiring: the facade method is now gated on
+            # visibility_policy.may_read_summary(role, BIRTHDATE) -- COACH
+            # is exactly the role the bounded-#124 ruling grants SUMMARY
+            # fidelity to for this category.
+            summary = api.evaluate_player_eligibility(
+                player.id, "d", actor_role=Role.COACH,
+                actor_user_id="coach1")
+            self.assertNotIn("error", summary, label)
             self.assertEqual(summary["status"], "eligible", label)
             self.assertEqual(summary["rule_version"], 1, label)
             self.assertNotIn("age_at_cutoff", summary, label)
             self.assertNotIn("cutoff_date", summary, label)
             self.assertNotIn("birthdate", summary, label)
             details = api.evaluate_player_eligibility(
-                player.id, "d", include_details=True)
+                player.id, "d", include_details=True,
+                actor_role=Role.COACH, actor_user_id="coach1")
             self.assertEqual(details["age_at_cutoff"], 9, label)
             self.assertEqual(details["cutoff_date"], "2026-12-31", label)
             self.assertNotIn("birthdate", details, label)
@@ -244,8 +252,36 @@ class EligibilityRuleServiceTest(unittest.TestCase):
             self.assertEqual(rules[0]["version"], 1, label)
             self.assertEqual(rules[0]["tiers"][0], {"code": "U10",
                                                     "max_age": 10}, label)
-            missing = api.evaluate_player_eligibility("ghost", "d")
+            missing = api.evaluate_player_eligibility(
+                "ghost", "d", actor_role=Role.COACH, actor_user_id="coach1")
             self.assertEqual(missing["error"]["code"], "not_found", label)
+
+    def test_facade_refuses_an_unauthorized_caller_for_the_whole_call(self):
+        """#424 audit-wiring: a bare/unauthorized caller gets the WHOLE
+        call refused (no summary shape at all, not even the default
+        status/reason -- it is itself derived from a BIRTHDATE read), with
+        a durable DENIED audit row; an authorized ALLOW leaves exactly one
+        ALLOWED row naming the player subject."""
+        for label, store, api, setup in self._each():
+            setup.set_age_eligibility_rule("ls", 12, 31, TIERS)
+            player = setup.add_player(
+                "t1", None, Position.FORWARD, first_name="Kid",
+                last_name="Nine", birthdate="2017-01-15")
+            denied = api.evaluate_player_eligibility(player.id, "d")
+            self.assertEqual(denied["error"]["code"], "forbidden", label)
+            rows = store.list_data_access()
+            self.assertEqual(len(rows), 1, label)
+            self.assertEqual(rows[0].category.value, "birthdate", label)
+            self.assertEqual(rows[0].outcome, "denied", label)
+            allowed = api.evaluate_player_eligibility(
+                player.id, "d", actor_role=Role.LEAGUE_ADMIN,
+                actor_user_id="admin1")
+            self.assertNotIn("error", allowed, label)
+            rows2 = store.list_data_access()
+            self.assertEqual(len(rows2), 2, label)
+            self.assertEqual(rows2[1].outcome, "allowed", label)
+            self.assertEqual(rows2[1].subject_id, f"player:{player.id}",
+                             label)
 
 
 # =========================================================================== #
@@ -388,12 +424,15 @@ class NotBornAtCutoffFacadeTest(unittest.TestCase):
                 "t1", None, Position.FORWARD, first_name="Not",
                 last_name="YetBorn", birthdate="2020-03-01")
             detail = api.evaluate_player_eligibility(
-                player.id, "d", include_details=True)
+                player.id, "d", include_details=True,
+                actor_role=Role.LEAGUE_ADMIN, actor_user_id="admin1")
             self.assertEqual(detail["status"], "ineligible", label)
             self.assertEqual(detail["reason"], "not_born_at_cutoff", label)
             self.assertIsNone(detail["age_at_cutoff"], label)
             self.assertNotIn("birthdate", detail, label)
-            summary = api.evaluate_player_eligibility(player.id, "d")
+            summary = api.evaluate_player_eligibility(
+                player.id, "d", actor_role=Role.COACH,
+                actor_user_id="coach1")
             self.assertEqual(summary["status"], "ineligible", label)
             self.assertEqual(summary["reason"], "not_born_at_cutoff", label)
             self.assertNotIn("age_at_cutoff", summary, label)

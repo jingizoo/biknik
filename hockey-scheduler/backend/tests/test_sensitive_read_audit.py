@@ -761,8 +761,6 @@ class PostgresFacadeDurabilityTest(unittest.TestCase):
             self.assertNotIn(SENTINEL_EMAIL, str(vars(row)))
 
 
-
-
 class _IdentityAuditBase(unittest.TestCase):
     """A MINIMAL, isolated fixture (its own Program/Season/League/
     LeagueSeason/Division/Team, not the noisy pilot-scale full_demo_store
@@ -895,10 +893,6 @@ class IdentityFieldReadAuditTest(_IdentityAuditBase):
 # #424 audit-wiring: player_duplicate_report — REGISTRATION_NUMBER,           #
 # whole-call refusal (no partial/masked report).                             #
 # =========================================================================== #
-
-
-
-
 class PlayerDuplicateReportAuditTest(_IdentityAuditBase):
     def _seed_pair(self):
         p1 = self.api.setup.add_player(
@@ -973,6 +967,159 @@ class PlayerDuplicateReportAuditTest(_IdentityAuditBase):
 # #424 audit-wiring: evaluate_player_eligibility — BIRTHDATE at SUMMARY       #
 # fidelity (may_read_summary, not may_read_raw), whole-call refusal.         #
 # =========================================================================== #
+class EligibilitySummaryAuditTest(_IdentityAuditBase):
+    def _seed(self):
+        self.api.set_age_eligibility_rule(
+            "ls", 12, 31, [{"code": "U10", "max_age": 30}])
+        return self.api.setup.add_player(
+            "t1", None, Position.FORWARD, first_name="Priv",
+            last_name="Fields", birthdate=SENTINEL_BIRTHDATE)
+
+    def test_coach_gets_summary_fidelity_and_one_allowed_row(self):
+        p = self._seed()
+        result = self.api.evaluate_player_eligibility(
+            p.id, "d", actor_role=Role.COACH, actor_user_id="user_coach")
+        self.assertNotIn("error", result)
+        self.assertNotIn("birthdate", result)
+
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row.category, C.BIRTHDATE)
+        self.assertEqual(row.outcome, ACCESS_ALLOWED)
+        self.assertEqual(row.actor_role, "coach")
+        self.assertEqual(row.actor_user_id, "user_coach")
+        self.assertEqual(row.subject_id, f"player:{p.id}")
+        self.assertEqual(row.purpose, "evaluate_player_eligibility")
+
+    def test_league_admin_raw_grant_also_covers_the_summary_gate(self):
+        # may_read_summary(role, category) is >= SUMMARY: a RAW grant
+        # (LEAGUE_ADMIN) satisfies it too, not only an exact SUMMARY match.
+        p = self._seed()
+        result = self.api.evaluate_player_eligibility(
+            p.id, "d", include_details=True, actor_role=Role.LEAGUE_ADMIN,
+            actor_user_id="user_admin")
+        self.assertNotIn("error", result)
+        self.assertIsNotNone(result.get("age_at_cutoff"))
+
+    def test_unauthorized_role_refuses_the_whole_call_default_and_details(self):
+        p = self._seed()
+        for kwargs in ({}, {"include_details": True}):
+            result = self.api.evaluate_player_eligibility(
+                p.id, "d", actor_role=Role.VIEWER,
+                actor_user_id="user_viewer", **kwargs)
+            self.assertEqual(result["error"]["code"], "forbidden")
+        rows = self.rows()
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(r.outcome == ACCESS_DENIED for r in rows))
+
+    def test_no_principal_refuses_the_whole_call(self):
+        p = self._seed()
+        result = self.api.evaluate_player_eligibility(p.id, "d")
+        self.assertEqual(result["error"]["code"], "forbidden")
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].actor_role, vp.NO_PRINCIPAL)
+
+    def test_no_stored_row_contains_the_sentinel_birthdate(self):
+        p = self._seed()
+        self.api.evaluate_player_eligibility(p.id, "d",
+                                             actor_role=Role.COACH)
+        self.api.evaluate_player_eligibility(p.id, "d",
+                                             actor_role=Role.VIEWER)
+        self.api.evaluate_player_eligibility(p.id, "d")
+        for row in self.rows():
+            self.assertNotIn(SENTINEL_BIRTHDATE, str(vars(row)))
+        # Positive control: the sentinel lives on the stored Player.
+        self.assertEqual(self.store.get_player(p.id).birthdate,
+                         SENTINEL_BIRTHDATE)
+
+
+# =========================================================================== #
+# #424 audit-wiring: durability across a real database (SQLite/PostgreSQL),  #
+# mirroring SqliteFacadeDurabilityTest/PostgresFacadeDurabilityTest above.    #
+# =========================================================================== #
+class SqliteIdentityAuditDurabilityTest(unittest.TestCase):
+    def _store(self):
+        fd, self._tmp = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.addCleanup(os.remove, self._tmp)
+        self._reopen = lambda: SqlStore(self._tmp)
+        return SqlStore(self._tmp)
+
+    def test_all_three_call_sites_survive_reopen(self):
+        store = self._store()
+        api = ApiService(store)
+        store.add_program(Program(id="pr", name="P"))
+        store.add_team(Team(id="t1", name="T1", program_id="pr"))
+        p = api.setup.add_player(
+            "t1", None, Position.FORWARD, first_name="Priv",
+            last_name="Fields", birthdate=SENTINEL_BIRTHDATE,
+            registration_number=SENTINEL_REGISTRATION)
+
+        self.assertNotIn("error", api.list_players(
+            team_id="t1", include_identity=True, role=Role.LEAGUE_ADMIN,
+            user_id="user_admin"))
+        api.list_players(team_id="t1", include_identity=True,
+                         role=Role.COACH)
+        self.assertNotIn("error", api.player_duplicate_report(
+            actor_role=Role.LEAGUE_ADMIN))
+        refused = api.player_duplicate_report(actor_role=Role.COACH)
+        self.assertEqual(refused["error"]["code"], "forbidden")
+        store.close()
+
+        reopened = self._reopen()
+        self.addCleanup(reopened.close)
+        rows = reopened.list_data_access()
+        # 2 (identity ALLOW) + 2 (identity DENY) + 1 (dup ALLOW) + 1 (dup DENY)
+        self.assertEqual(len(rows), 6)
+        outcomes = {r.outcome for r in rows}
+        self.assertEqual(outcomes, {ACCESS_ALLOWED, ACCESS_DENIED})
+        for row in rows:
+            text = str(vars(row))
+            self.assertNotIn(SENTINEL_BIRTHDATE, text)
+            self.assertNotIn(SENTINEL_REGISTRATION, text)
+        self.assertEqual(reopened.get_player(p.id).birthdate,
+                         SENTINEL_BIRTHDATE)
+
+
+@unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
+                     "PostgreSQL suite only (TEST_DATABASE_URL not set)")
+class PostgresIdentityAuditDurabilityTest(unittest.TestCase):
+    def test_all_three_call_sites_survive_reopen(self):
+        url = os.environ["TEST_DATABASE_URL"]
+        store = fresh_sql_store(url)
+        api = ApiService(store)
+        store.add_program(Program(id="pr", name="P"))
+        store.add_team(Team(id="t1", name="T1", program_id="pr"))
+        p = api.setup.add_player(
+            "t1", None, Position.FORWARD, first_name="Priv",
+            last_name="Fields", birthdate=SENTINEL_BIRTHDATE,
+            registration_number=SENTINEL_REGISTRATION)
+
+        self.assertNotIn("error", api.list_players(
+            team_id="t1", include_identity=True, role=Role.LEAGUE_ADMIN,
+            user_id="user_admin"))
+        api.list_players(team_id="t1", include_identity=True,
+                         role=Role.COACH)
+        self.assertNotIn("error", api.player_duplicate_report(
+            actor_role=Role.LEAGUE_ADMIN))
+        refused = api.player_duplicate_report(actor_role=Role.COACH)
+        self.assertEqual(refused["error"]["code"], "forbidden")
+        store.close()
+
+        reopened = SqlStore(url)
+        self.addCleanup(reopened.close)
+        rows = reopened.list_data_access()
+        self.assertEqual(len(rows), 6)
+        self.assertEqual({r.outcome for r in rows},
+                         {ACCESS_ALLOWED, ACCESS_DENIED})
+        for row in rows:
+            text = str(vars(row))
+            self.assertNotIn(SENTINEL_BIRTHDATE, text)
+            self.assertNotIn(SENTINEL_REGISTRATION, text)
+        self.assertEqual(reopened.get_player(p.id).birthdate,
+                         SENTINEL_BIRTHDATE)
 
 
 if __name__ == "__main__":

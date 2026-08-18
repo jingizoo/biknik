@@ -12140,7 +12140,9 @@ class ApiService:
 
     @catch
     def evaluate_player_eligibility(self, player_id: str, division_id: str,
-                                    include_details: bool = False) -> dict:
+                                    include_details: bool = False,
+                                    actor_role=None,
+                                    actor_user_id=None) -> dict:
         """Is this athlete age-eligible for this Division? (#273 AC[1])
 
         The DEFAULT response is the Coach-safe eligibility SUMMARY the
@@ -12149,12 +12151,46 @@ class ApiService:
         this method returns). ``include_details`` adds the derived
         ``age_at_cutoff`` + ``cutoff_date`` for operator surfaces, to be
         MANAGE_SETUP-gated at the HTTP layer like ``include_email``.
+
+        Gated on ``visibility_policy.may_read_summary`` for BIRTHDATE (#424
+        audit-wiring), not ``may_read_raw``: the response is derived
+        SUMMARY-fidelity data (the raw birthdate is never returned by any
+        mode of this method), matching the exact grant ``COACH`` holds for
+        this category. The gate covers the WHOLE method, not just
+        ``include_details`` — the default status/reason/tier response is
+        itself derived from a read of the athlete's birthdate, so an
+        unauthorized caller must not reach even the summary shape. Refuses
+        the WHOLE call on denial, the same as ``player_duplicate_report``:
+        there is no separate field to mask here the way ``list_players``
+        masks identity columns on an otherwise-legitimate roster row — the
+        entire payload IS the gated summary, so a partial result would be
+        meaningless. Audited on both outcomes (ALLOWED/DENIED) via the same
+        ``_record_sensitive_read`` call the RAW-fidelity gates use — a
+        deliberate decision to keep #426's "audit every sensitive read"
+        posture uniform across fidelity levels rather than carve out a
+        silent exception for SUMMARY reads; if that proves too noisy in
+        practice, dropping the ALLOWED audit here is a one-line change.
+
+        ``actor_role``/``actor_user_id`` are purely additive (no existing
+        caller passed them before this method had a way to).
         """
+        request_id = self._safe_request_id(None)
+        role, label = self._privacy_principal(actor_role)
+        category = SensitiveFieldCategory.BIRTHDATE
+        if not visibility_policy.may_read_summary(role, category):
+            self._refuse_sensitive_read(
+                category, "evaluate_player_eligibility", actor_user_id,
+                label, request_id)
         result = self.setup.evaluate_player_age_eligibility(
             player_id, division_id)
         if not include_details:
             for key in ("age_at_cutoff", "cutoff_date"):
                 result.pop(key, None)
+        with self.store.transaction():
+            self._record_sensitive_read(
+                category, [("recipient", f"player:{player_id}")],
+                "evaluate_player_eligibility", actor_user_id, label,
+                ACCESS_ALLOWED, request_id)
         return result
 
     @catch

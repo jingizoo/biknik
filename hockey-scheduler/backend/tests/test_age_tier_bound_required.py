@@ -41,7 +41,8 @@ from datetime import timezone
 from helpers import BACKEND  # noqa: F401  (ensures sys.path is set up)
 
 from hockey_scheduler.api import ApiService
-from hockey_scheduler.domain import Division, Position, Team, normalize_age_tiers
+from hockey_scheduler.domain import (
+    Division, Position, Role, Team, normalize_age_tiers)
 from hockey_scheduler.domain.errors import ValidationError
 from hockey_scheduler.store import InMemoryStore, SqlStore
 
@@ -274,7 +275,9 @@ class ExplicitNullOpenTierSuccessTest(unittest.TestCase):
                 self.assertEqual(result["status"], "eligible", label)
                 self.assertIsNone(result["max_age"], label)
                 # Coach-safe facade summary agrees.
-                summary = api.evaluate_player_eligibility(elder.id, "d")
+                summary = api.evaluate_player_eligibility(
+                    elder.id, "d", actor_role=Role.COACH,
+                    actor_user_id="coach1")
                 self.assertEqual(summary["status"], "eligible", label)
                 if isinstance(store, SqlStore):
                     store.close()
