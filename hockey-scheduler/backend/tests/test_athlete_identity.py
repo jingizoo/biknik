@@ -326,7 +326,21 @@ class FacadePrivacyTest(AthleteIdentityTestBase):
                                    include_email=True)[0]
             self.assertEqual(row["birthdate"], "2015-03-02", label)
             self.assertEqual(row["registration_number"], "HC-1", label)
-            self.assertEqual(row["email"], "j@x.com", label)
+            # email is a DIFFERENT opt-in than include_identity, and the two
+            # have diverged post-merge (main's #426, merged after this test
+            # was first written): include_email now reaches the same
+            # CONTACT_DESTINATION sensitive-read gate the #268 contacts
+            # registry uses, which requires an authorized role/user_id
+            # (ApiService._privacy_principal/_sensitive_read_allowed) --
+            # #426 review finding 1 deliberately removed the old "missing
+            # principal defaults to RAW" behavior this test originally
+            # relied on, closing a real disclosure hole. This bare call
+            # supplies no role, so email is correctly withheld; #273's own
+            # include_identity fields above are UNAFFECTED because they are
+            # not yet wired through that same policy gate -- a disclosed,
+            # separate integration gap (see the PR body), not something
+            # this assertion should paper over.
+            self.assertIsNone(row["email"], label)
 
     def test_facade_error_shape_for_bad_identity_fields(self):
         for label, store, api, setup in self._each():
