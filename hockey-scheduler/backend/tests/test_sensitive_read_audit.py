@@ -913,21 +913,60 @@ class PlayerDuplicateReportAuditTest(_IdentityAuditBase):
         self.assertEqual(shared[0]["registration_number"],
                          SENTINEL_REGISTRATION)
 
-        # One ALLOWED row per DISTINCT player whose registration_number was
-        # actually disclosed (both p1 and p2 appear in the one warning) —
-        # the same "one per disclosed recipient" convention
-        # list_contact_destinations already uses.
+        # One ALLOWED REGISTRATION_NUMBER row per DISTINCT player whose
+        # registration_number was actually disclosed (both p1 and p2 appear
+        # in the one warning) — the same "one per disclosed recipient"
+        # convention list_contact_destinations already uses. PLUS one
+        # collection-level ALLOWED BIRTHDATE row (#424 round-N owner review
+        # finding 1): neither player has a birthdate set, so no
+        # birthdate-typed warning fires and the birthdate read falls back
+        # to the "*" collection-level subject — same fallback
+        # REGISTRATION_NUMBER itself already uses on an empty match set.
         rows = self.rows()
-        self.assertEqual(len(rows), 2)
-        self.assertEqual({r.subject_id for r in rows},
+        self.assertEqual(len(rows), 3)
+        reg_rows = [r for r in rows if r.category == C.REGISTRATION_NUMBER]
+        bd_rows = [r for r in rows if r.category == C.BIRTHDATE]
+        self.assertEqual({r.subject_id for r in reg_rows},
                          {f"player:{p1.id}", f"player:{p2.id}"})
+        self.assertEqual([(r.subject_type, r.subject_id) for r in bd_rows],
+                         [("recipient", "*")])
         for row in rows:
-            self.assertEqual(row.category, C.REGISTRATION_NUMBER)
+            self.assertIn(row.category, (C.REGISTRATION_NUMBER, C.BIRTHDATE))
             self.assertEqual(row.outcome, ACCESS_ALLOWED)
             self.assertEqual(row.actor_role, "league_admin")
             self.assertEqual(row.actor_user_id, "user_admin")
             self.assertEqual(row.purpose, "player_duplicate_report")
         self.assertEqual(len({r.request_id for r in rows}), 1)
+
+    def test_birthdate_touching_warning_types_audit_the_implicated_players(self):
+        # #424 round-N owner review finding 1: same_name_same_team_
+        # undisambiguated and same_name_same_birthdate both hinge on a
+        # birthdate comparison -- their player_ids must land in the
+        # BIRTHDATE audit row's subjects, not just the collection-level "*".
+        same_team_a = self.api.setup.add_player(
+            "t1", None, Position.FORWARD, first_name="Sam", last_name="Lee")
+        same_team_b = self.api.setup.add_player(
+            "t1", None, Position.GOALIE, first_name="Sam", last_name="Lee")
+        cross_team_a = self.api.setup.add_player(
+            "t1", None, Position.FORWARD, first_name="Cross",
+            last_name="Bday", birthdate=SENTINEL_BIRTHDATE)
+        cross_team_b = self.api.setup.add_player(
+            "t2", None, Position.FORWARD, first_name="Cross",
+            last_name="Bday", birthdate=SENTINEL_BIRTHDATE)
+
+        report = self.api.player_duplicate_report(
+            actor_role=Role.LEAGUE_ADMIN, actor_user_id="user_admin")
+        self.assertNotIn("error", report)
+        types = {w["type"] for w in report["warnings"]}
+        self.assertIn("same_name_same_team_undisambiguated", types)
+        self.assertIn("same_name_same_birthdate", types)
+
+        bd_rows = [r for r in self.rows() if r.category == C.BIRTHDATE]
+        self.assertEqual(len(bd_rows), 4)
+        self.assertEqual(
+            {r.subject_id for r in bd_rows},
+            {f"player:{same_team_a.id}", f"player:{same_team_b.id}",
+             f"player:{cross_team_a.id}", f"player:{cross_team_b.id}"})
 
     def test_unauthorized_role_refuses_the_whole_call(self):
         self._seed_pair()
@@ -1071,8 +1110,11 @@ class SqliteIdentityAuditDurabilityTest(unittest.TestCase):
         reopened = self._reopen()
         self.addCleanup(reopened.close)
         rows = reopened.list_data_access()
-        # 2 (identity ALLOW) + 2 (identity DENY) + 1 (dup ALLOW) + 1 (dup DENY)
-        self.assertEqual(len(rows), 6)
+        # 2 (identity ALLOW) + 2 (identity DENY) + 2 (dup ALLOW: REGISTRATION_
+        # NUMBER + BIRTHDATE, #424 round-N owner review finding 1) +
+        # 1 (dup DENY: whole-call refusal writes one row, on the first
+        # denied category checked)
+        self.assertEqual(len(rows), 7)
         outcomes = {r.outcome for r in rows}
         self.assertEqual(outcomes, {ACCESS_ALLOWED, ACCESS_DENIED})
         for row in rows:

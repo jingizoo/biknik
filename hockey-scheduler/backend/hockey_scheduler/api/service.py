@@ -12208,15 +12208,38 @@ class ApiService:
         the include_email/include_identity opt-ins; it is never part of a
         coach/public payload.
 
+        It is ALSO a BIRTHDATE sensitive read (#424 round-N owner review
+        finding 1): ``SetupService.player_duplicate_report``'s
+        ``same_name_same_team_undisambiguated`` "proven different" check
+        compares ``a.birthdate != b.birthdate`` for every same-name/same-team
+        pair it considers, and its ``same_name_same_birthdate`` warning is
+        keyed on the birthdate itself — never echoed into either warning
+        (see that method's own docstring), but read and compared nonetheless.
+        This codebase's own #426 audit philosophy is "value READ from the
+        store", not "value returned to the caller" (see ``list_players``'s
+        ``include_email`` docstring, which cites #426 review finding 2 for
+        exactly this read-vs-echo distinction) — so BIRTHDATE and
+        REGISTRATION_NUMBER are checked as two INDEPENDENT categories here,
+        mirroring ``list_players``'s ``identity_categories`` tuple, each one
+        refusing the WHOLE call on denial (not list_players's mask-not-
+        refuse shape): the birthdate comparison is intrinsic to every
+        warning shape this method can produce (even a report with zero
+        birthdate-typed warnings reached that verdict BY comparing
+        birthdates), so a caller without BIRTHDATE access would get a report
+        whose completeness it cannot evaluate — a masked/silently-narrowed
+        report here would misrepresent what was actually checked, exactly
+        the same reasoning the REGISTRATION_NUMBER gate below already uses.
+
         Unlike ``list_players``'s mask-not-refuse identity gate, an
         unauthorized caller gets the WHOLE call refused (``_refuse_
         sensitive_read``), not a partial/masked report: this method's own
         internal ``same_name_same_team_undisambiguated`` disambiguation
-        already compares raw registration_number values across every row it
-        considers (never echoing them into THAT warning, but reading them
-        nonetheless), so there is no warning shape this method can produce
-        without a REGISTRATION_NUMBER read — a masked partial result would
-        misrepresent what was actually checked, not just hide one field.
+        already compares raw registration_number AND birthdate values
+        across every row it considers (never echoing either into THAT
+        warning, but reading them nonetheless), so there is no warning
+        shape this method can produce without both a REGISTRATION_NUMBER
+        and a BIRTHDATE read — a masked partial result would misrepresent
+        what was actually checked, not just hide one field.
 
         ``actor_role``/``actor_user_id``/``request_id`` are purely additive
         (no existing caller passed them before this method had a way to);
@@ -12225,20 +12248,38 @@ class ApiService:
         """
         request_id = self._safe_request_id(request_id)
         role, label = self._privacy_principal(actor_role)
-        category = SensitiveFieldCategory.REGISTRATION_NUMBER
-        if not self._sensitive_read_allowed(role, category):
-            self._refuse_sensitive_read(
-                category, "player_duplicate_report", actor_user_id, label,
-                request_id)
+        birthdate_category = SensitiveFieldCategory.BIRTHDATE
+        registration_category = SensitiveFieldCategory.REGISTRATION_NUMBER
+        for category in (birthdate_category, registration_category):
+            if not self._sensitive_read_allowed(role, category):
+                self._refuse_sensitive_read(
+                    category, "player_duplicate_report", actor_user_id,
+                    label, request_id)
         warnings = self.setup.player_duplicate_report(team_id)
         with self.store.transaction():
-            subjects = sorted({
+            registration_subjects = sorted({
                 ("recipient", f"player:{pid}")
                 for w in warnings if w["type"] == "shared_registration_number"
                 for pid in w["player_ids"]}) or [("recipient", "*")]
             self._record_sensitive_read(
-                category, subjects, "player_duplicate_report",
-                actor_user_id, label, ACCESS_ALLOWED, request_id)
+                registration_category, registration_subjects,
+                "player_duplicate_report", actor_user_id, label,
+                ACCESS_ALLOWED, request_id)
+            # BIRTHDATE-touching warning shapes: same_name_same_team_
+            # undisambiguated's "proven" check compares birthdate for
+            # every pair it considers (whether or not a differing birthdate
+            # is what ultimately proved the pair distinct), and
+            # same_name_same_birthdate is keyed on it directly.
+            birthdate_subjects = sorted({
+                ("recipient", f"player:{pid}")
+                for w in warnings
+                if w["type"] in ("same_name_same_team_undisambiguated",
+                                "same_name_same_birthdate")
+                for pid in w["player_ids"]}) or [("recipient", "*")]
+            self._record_sensitive_read(
+                birthdate_category, birthdate_subjects,
+                "player_duplicate_report", actor_user_id, label,
+                ACCESS_ALLOWED, request_id)
         return {"warnings": warnings}
 
     @catch
