@@ -751,6 +751,225 @@ class NewSeasonCopyForwardServiceTest(unittest.TestCase):
         ok = self._commit(fp)
         self.assertNotIn("error", ok, ok)
 
+    # -- #159 review round 5 (owner P1): Memory did not actually store an
+    # immutable request identity, and the stored actor binding was
+    # bypassed by the SECOND (post-lock) ledger-return site -------------
+    def test_replay_with_mutated_selections_list_after_commit_is_refused(self):
+        """The owner's own repro: preview+commit with a caller-owned
+        ``selections`` list, mutate that SAME list's nested ``league_id``/
+        ``team_id`` afterward, then replay the ORIGINAL fingerprint with
+        the mutated list. Before this round, Memory wrongly returned the
+        original success/Season because the supposedly frozen ledger
+        identity changed along with the caller's list --
+        InMemoryStore.add_season_copy_forward_commit stored the row (and
+        so the raw dict _copy_forward_request_identity built) by
+        reference. See the SQL-backend twin of this test for the same
+        scenario over a REAL transactional store, which already refused
+        correctly (its JSON write copied the value) even before this
+        round -- Memory now matches that guarantee by construction."""
+        club2 = self.api.create_club("MutC2", actor_id=ADMIN)
+        league2 = self.api.create_league(
+            self.fx.src["id"], "MutComp2", actor_id=ADMIN)
+        div2 = self.api.create_division(
+            self.fx.src["id"], "MutDiv2", league_id=league2["id"],
+            actor_id=ADMIN)
+        team2 = self.api.create_team(club2["id"], div2["id"], "MutBears",
+                                     actor_id=ADMIN)
+        self.api.register_team_for_season(
+            self.fx.src["id"], team2["id"], div2["id"], actor_id=ADMIN)
+        selections = [self.fx.selection()]
+        preview = self.api.preview_new_season_copy_forward(
+            program_id=self.fx.program["id"], name="2026-27",
+            source_season_id=self.fx.src["id"], selections=selections,
+            actor_id=ADMIN)
+        fp = preview["copy_forward_fingerprint"]
+        first = self.api.commit_new_season_copy_forward(
+            program_id=self.fx.program["id"], name="2026-27",
+            source_season_id=self.fx.src["id"], selections=selections,
+            copy_forward_fingerprint=fp, actor_id=ADMIN)
+        self.assertNotIn("error", first, first)
+        stored_identity = (
+            self.api.store.get_season_copy_forward_commit_by_fingerprint(
+                fp).request_identity)
+        self.assertTrue(stored_identity)
+        before_seasons = self._season_ids()
+        before_audits = self._audit_count()
+
+        # Mutate the SAME list object's nested dict in place -- this test
+        # still holds this exact reference after the commit call returned,
+        # exactly as a same-process caller (a batch script, a retried
+        # internal call) plausibly could.
+        selections[0]["league_id"] = league2["id"]
+        selections[0]["team_id"] = team2["id"]
+
+        attack = self.api.commit_new_season_copy_forward(
+            program_id=self.fx.program["id"], name="2026-27",
+            source_season_id=self.fx.src["id"], selections=selections,
+            copy_forward_fingerprint=fp, actor_id=ADMIN)
+        self.assertEqual(attack["error"]["code"], "schedule_conflict",
+                         attack)
+        self.assertEqual(attack["error"]["details"]["reason"],
+                         "preview_mismatch")
+        # Zero domain/audit writes from the mutated attempt.
+        self.assertEqual(self._season_ids(), before_seasons)
+        self.assertEqual(self._audit_count(), before_audits)
+        # The ledger identity itself is byte-for-byte unchanged -- reading
+        # it straight from the store, not merely inferring it from the
+        # refusal above.
+        self.assertEqual(
+            self.api.store.get_season_copy_forward_commit_by_fingerprint(
+                fp).request_identity,
+            stored_identity)
+
+        # The ORIGINAL request still replays exactly -- the ledger row was
+        # never touched by the refused, mutated attempt above. _commit's
+        # own default rebuilds a FRESH, unmutated selections list, so this
+        # is a genuinely independent replay, not reusing the tampered one.
+        replay = self._commit(fp)
+        self.assertNotIn("error", replay, replay)
+        self.assertEqual(replay["season"], first["season"])
+        self.assertEqual(replay["registrations"], first["registrations"])
+        self.assertEqual(replay["totals"], first["totals"])
+
+    def test_concurrent_mutation_and_read_never_observes_a_changed_request_identity(self):
+        """Required coverage (#159 review round 5, owner P1 finding 1):
+        concurrent mutation/read coverage for Memory. One thread
+        repeatedly mutates the ORIGINAL caller-owned ``selections`` list
+        in place while another thread concurrently re-reads the ledger
+        row's ``request_identity`` through the store -- every read must
+        observe the EXACT SAME value captured immediately after the
+        commit, never a value reflecting whatever the mutator thread
+        happened to be doing at that instant. request_identity is now a
+        canonical, immutable string frozen once at commit time, so this
+        holds by construction with no store-level locking specific to this
+        field -- this test demonstrates that empirically under real
+        concurrent access rather than merely asserting it by design."""
+        selections = [self.fx.selection()]
+        preview = self.api.preview_new_season_copy_forward(
+            program_id=self.fx.program["id"], name="2026-27",
+            source_season_id=self.fx.src["id"], selections=selections,
+            actor_id=ADMIN)
+        fp = preview["copy_forward_fingerprint"]
+        first = self.api.commit_new_season_copy_forward(
+            program_id=self.fx.program["id"], name="2026-27",
+            source_season_id=self.fx.src["id"], selections=selections,
+            copy_forward_fingerprint=fp, actor_id=ADMIN)
+        self.assertNotIn("error", first, first)
+        expected = (
+            self.api.store.get_season_copy_forward_commit_by_fingerprint(
+                fp).request_identity)
+        self.assertTrue(expected)
+
+        mismatches = []
+        barrier = threading.Barrier(2)
+        ITERATIONS = 500
+
+        def mutate():
+            barrier.wait()
+            for i in range(ITERATIONS):
+                selections[0]["league_id"] = f"mutated-league-{i}"
+                selections[0]["team_id"] = f"mutated-team-{i}"
+
+        def read():
+            barrier.wait()
+            for _ in range(ITERATIONS):
+                row = (
+                    self.api.store
+                    .get_season_copy_forward_commit_by_fingerprint(fp))
+                if row.request_identity != expected:
+                    mismatches.append(row.request_identity)
+
+        t_mutate = threading.Thread(target=mutate)
+        t_read = threading.Thread(target=read)
+        t_mutate.start(); t_read.start()
+        t_mutate.join(20); t_read.join(20)
+
+        self.assertEqual(mismatches, [])
+        self.assertEqual(
+            self.api.store.get_season_copy_forward_commit_by_fingerprint(
+                fp).request_identity,
+            expected)
+
+    def test_second_actor_who_also_previewed_the_identical_plan_is_refused_not_given_the_winners_season(self):
+        """#159 review round 5 (owner P1 finding 2): actor_a and actor_b
+        EACH independently, legitimately preview the IDENTICAL plan (same
+        Program/Season/selections/name -- the fingerprint hashes the
+        resolved plan only, never the actor, so this is the SAME
+        fingerprint for both) and each hold their OWN valid preview audit
+        for it. actor_a commits first. actor_b's EARLY identity check
+        correctly fails (their stored identity differs from actor_a's),
+        falls through, and independently re-passes the fingerprint-match
+        + preview-audit gates using their OWN valid preview -- landing on
+        the post-lock race-check backstop. Before this round that
+        backstop returned ANY row with a matching fingerprint
+        unconditionally, handing actor_b actor_a's Season verbatim with
+        ZERO trace of actor_b's own attempt (no season minted, no audit
+        row). actor_b must now be refused instead, with the SAME
+        preview_required shape a caller who never previewed at all gets
+        -- and actor_a's own replay must remain idempotent afterward."""
+        selections = [self.fx.selection()]
+        kw = dict(program_id=self.fx.program["id"], name="2026-27",
+                 source_season_id=self.fx.src["id"], selections=selections)
+        fp_a = self.api.preview_new_season_copy_forward(
+            actor_id="actor_a", **kw)["copy_forward_fingerprint"]
+        fp_b = self.api.preview_new_season_copy_forward(
+            actor_id="actor_b", **kw)["copy_forward_fingerprint"]
+        self.assertEqual(fp_a, fp_b)
+        first = self.api.commit_new_season_copy_forward(
+            copy_forward_fingerprint=fp_a, actor_id="actor_a", **kw)
+        self.assertNotIn("error", first, first)
+        before_seasons = self._season_ids()
+        before_audits = self._audit_count()
+
+        attack = self.api.commit_new_season_copy_forward(
+            copy_forward_fingerprint=fp_b, actor_id="actor_b", **kw)
+        self.assertEqual(attack["error"]["code"], "validation_error",
+                         attack)
+        self.assertEqual(attack["error"]["details"]["reason"],
+                         "preview_required")
+        self.assertEqual(self._season_ids(), before_seasons)
+        self.assertEqual(self._audit_count(), before_audits)
+
+        replay = self.api.commit_new_season_copy_forward(
+            copy_forward_fingerprint=fp_a, actor_id="actor_a", **kw)
+        self.assertNotIn("error", replay, replay)
+        self.assertEqual(replay["season"]["id"], first["season"]["id"])
+        self.assertEqual(replay["registrations"], first["registrations"])
+
+    def test_second_actor_who_also_previewed_the_identical_plan_is_refused_reverse_order(self):
+        """The reverse arrival order of the test above: actor_b commits
+        FIRST this time, actor_a (who also independently previewed the
+        identical plan) second -- proving the refusal tracks IDENTITY,
+        not simply "whoever asks second by name"."""
+        selections = [self.fx.selection()]
+        kw = dict(program_id=self.fx.program["id"], name="2026-27",
+                 source_season_id=self.fx.src["id"], selections=selections)
+        fp_a = self.api.preview_new_season_copy_forward(
+            actor_id="actor_a", **kw)["copy_forward_fingerprint"]
+        fp_b = self.api.preview_new_season_copy_forward(
+            actor_id="actor_b", **kw)["copy_forward_fingerprint"]
+        self.assertEqual(fp_a, fp_b)
+        first = self.api.commit_new_season_copy_forward(
+            copy_forward_fingerprint=fp_b, actor_id="actor_b", **kw)
+        self.assertNotIn("error", first, first)
+        before_seasons = self._season_ids()
+        before_audits = self._audit_count()
+
+        attack = self.api.commit_new_season_copy_forward(
+            copy_forward_fingerprint=fp_a, actor_id="actor_a", **kw)
+        self.assertEqual(attack["error"]["code"], "validation_error",
+                         attack)
+        self.assertEqual(attack["error"]["details"]["reason"],
+                         "preview_required")
+        self.assertEqual(self._season_ids(), before_seasons)
+        self.assertEqual(self._audit_count(), before_audits)
+
+        replay = self.api.commit_new_season_copy_forward(
+            copy_forward_fingerprint=fp_b, actor_id="actor_b", **kw)
+        self.assertNotIn("error", replay, replay)
+        self.assertEqual(replay["season"]["id"], first["season"]["id"])
+        self.assertEqual(replay["registrations"], first["registrations"])
+
 
 class NewSeasonCopyForwardSqlTest(unittest.TestCase):
     """Runs each case against a REAL SqlStore -- SQLite always, PostgreSQL
@@ -1159,6 +1378,124 @@ class NewSeasonCopyForwardSqlTest(unittest.TestCase):
             self.assertIsNotNone(replay["season"])
         self._run(case)
 
+    # -- #159 review round 5 (owner P1), over REAL SQLite AND PostgreSQL -
+    def test_replay_with_mutated_selections_list_after_commit_is_refused(self):
+        """Finding 1's own required coverage over a REAL transactional
+        store: proves parity with the pre-existing correct SQL behavior
+        (its JSON write already copied the value, so this already refused
+        correctly even before this round) now that Memory has been
+        brought up to the same guarantee by construction -- see the
+        Memory-backend twin (test_new_season_copy_forward.py) for the
+        full rationale and the direct store-level identity-unchanged
+        assertion."""
+        def case(api, store):
+            fx = _Fixture(api)
+            other_club = api.create_club("OtherC", actor_id=ADMIN)
+            other_league = api.create_league(
+                fx.src["id"], "OtherComp", actor_id=ADMIN)
+            other_div = api.create_division(
+                fx.src["id"], "OtherDiv", league_id=other_league["id"],
+                actor_id=ADMIN)
+            other_team = api.create_team(
+                other_club["id"], other_div["id"], "OtherBears",
+                actor_id=ADMIN)
+            api.register_team_for_season(
+                fx.src["id"], other_team["id"], other_div["id"],
+                actor_id=ADMIN)
+            selections = [fx.selection()]
+            preview = api.preview_new_season_copy_forward(
+                program_id=fx.program["id"], name="2026-27",
+                source_season_id=fx.src["id"], selections=selections,
+                actor_id=ADMIN)
+            fp = preview["copy_forward_fingerprint"]
+            first = api.commit_new_season_copy_forward(
+                program_id=fx.program["id"], name="2026-27",
+                source_season_id=fx.src["id"], selections=selections,
+                copy_forward_fingerprint=fp, actor_id=ADMIN)
+            self.assertNotIn("error", first, first)
+            stored_identity = (
+                store.get_season_copy_forward_commit_by_fingerprint(
+                    fp).request_identity)
+            self.assertTrue(stored_identity)
+            before_seasons = {s.id for s in store.all_seasons()}
+            before_audits = len(store.all_setup_audit())
+
+            selections[0]["league_id"] = other_league["id"]
+            selections[0]["team_id"] = other_team["id"]
+
+            attack = api.commit_new_season_copy_forward(
+                program_id=fx.program["id"], name="2026-27",
+                source_season_id=fx.src["id"], selections=selections,
+                copy_forward_fingerprint=fp, actor_id=ADMIN)
+            self.assertEqual(attack["error"]["code"], "schedule_conflict",
+                             attack)
+            self.assertEqual(attack["error"]["details"]["reason"],
+                             "preview_mismatch")
+            self.assertEqual({s.id for s in store.all_seasons()},
+                             before_seasons)
+            self.assertEqual(len(store.all_setup_audit()), before_audits)
+            self.assertEqual(
+                store.get_season_copy_forward_commit_by_fingerprint(
+                    fp).request_identity,
+                stored_identity)
+
+            replay = api.commit_new_season_copy_forward(
+                program_id=fx.program["id"], name="2026-27",
+                source_season_id=fx.src["id"], selections=[fx.selection()],
+                copy_forward_fingerprint=fp, actor_id=ADMIN)
+            self.assertNotIn("error", replay, replay)
+            self.assertEqual(replay["season"], first["season"])
+            self.assertEqual(replay["registrations"], first["registrations"])
+        self._run(case)
+
+    def test_second_actor_who_also_previewed_the_identical_plan_is_refused_both_orders(self):
+        """Finding 2's own required coverage, over REAL SQLite AND
+        PostgreSQL, BOTH sequential arrival orders: two actors each
+        independently preview the IDENTICAL plan; whichever commits
+        SECOND must be refused with zero writes, and the WINNER's own
+        replay stays idempotent -- regardless of which of the two actors
+        happened to go first."""
+        def case(api, store):
+            for winner, loser in (("actor_a", "actor_b"),
+                                  ("actor_b", "actor_a")):
+                with self.subTest(winner=winner):
+                    fx = _Fixture(api, winner[-1] + loser[-1])
+                    selections = [fx.selection()]
+                    kw = dict(program_id=fx.program["id"], name="2026-27",
+                             source_season_id=fx.src["id"],
+                             selections=selections)
+                    fp_w = api.preview_new_season_copy_forward(
+                        actor_id=winner, **kw)["copy_forward_fingerprint"]
+                    fp_l = api.preview_new_season_copy_forward(
+                        actor_id=loser, **kw)["copy_forward_fingerprint"]
+                    self.assertEqual(fp_w, fp_l)
+                    first = api.commit_new_season_copy_forward(
+                        copy_forward_fingerprint=fp_w, actor_id=winner,
+                        **kw)
+                    self.assertNotIn("error", first, first)
+                    before_seasons = {s.id for s in store.all_seasons()}
+                    before_audits = len(store.all_setup_audit())
+
+                    attack = api.commit_new_season_copy_forward(
+                        copy_forward_fingerprint=fp_l, actor_id=loser,
+                        **kw)
+                    self.assertEqual(attack["error"]["code"],
+                                     "validation_error", attack)
+                    self.assertEqual(attack["error"]["details"]["reason"],
+                                     "preview_required")
+                    self.assertEqual({s.id for s in store.all_seasons()},
+                                     before_seasons)
+                    self.assertEqual(len(store.all_setup_audit()),
+                                     before_audits)
+
+                    replay = api.commit_new_season_copy_forward(
+                        copy_forward_fingerprint=fp_w, actor_id=winner,
+                        **kw)
+                    self.assertNotIn("error", replay, replay)
+                    self.assertEqual(replay["season"]["id"],
+                                     first["season"]["id"])
+        self._run(case)
+
 
 @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"),
                      "PostgreSQL required (set TEST_DATABASE_URL)")
@@ -1370,6 +1707,97 @@ class NewSeasonCopyForwardConcurrencyTest(unittest.TestCase):
         self.assertEqual(len(check.all_setup_audit()), before_audits)
         self.assertIsNotNone(
             check.get_season_copy_forward_commit_by_fingerprint(fp))
+
+    def _seed_two_actor(self):
+        """Like ``_seed`` above, but TWO actors each independently,
+        legitimately preview the IDENTICAL plan before the race -- so both
+        hold their OWN valid preview audit for the SAME deterministic
+        fingerprint (#159 review round 5, owner P1 finding 2)."""
+        store = SqlStore(self.url)
+        api = ApiService(store)
+        fx = _Fixture(api)
+        sel = [fx.selection()]
+        kw = dict(program_id=fx.program["id"], name="2026-27",
+                 source_season_id=fx.src["id"], selections=sel)
+        fp_a = api.preview_new_season_copy_forward(
+            actor_id="actor_a", **kw)["copy_forward_fingerprint"]
+        fp_b = api.preview_new_season_copy_forward(
+            actor_id="actor_b", **kw)["copy_forward_fingerprint"]
+        assert fp_a == fp_b, (fp_a, fp_b)
+        return fx, sel, fp_a
+
+    def test_two_actors_racing_the_identical_plan_only_the_winner_commits(self):
+        """#159 review round 5 (owner P1 finding 2): two actors who both
+        independently, legitimately previewed the IDENTICAL plan commit
+        GENUINELY concurrently -- two real connections, launched together
+        via ``threading.Barrier`` so neither starts before the other is
+        ready. Exactly one of them ends up with a real Season; the OTHER
+        is refused outright (never silently handed the winner's data),
+        regardless of which connection's transaction actually reaches the
+        ledger first -- mirroring ``test_concurrent_commits_with_the_same_
+        fingerprint_create_exactly_one_season``'s own "regardless of which
+        connection won" symmetry for the SAME-actor case, but this time
+        the loser must be REFUSED rather than receiving the winner's
+        result, because the two connections here are NOT the same
+        actor/request."""
+        fx, sel, fp = self._seed_two_actor()
+        before_seasons = {s.id for s in SqlStore(self.url).all_seasons()}
+        api_a = ApiService(SqlStore(self.url))
+        api_b = ApiService(SqlStore(self.url))
+        barrier = threading.Barrier(2)
+        results = {}
+
+        def commit(api, actor, key):
+            barrier.wait()
+            results[key] = api.commit_new_season_copy_forward(
+                program_id=fx.program["id"], name="2026-27",
+                source_season_id=fx.src["id"], selections=sel,
+                copy_forward_fingerprint=fp, actor_id=actor)
+
+        ta = threading.Thread(target=commit, args=(api_a, "actor_a", "a"))
+        tb = threading.Thread(target=commit, args=(api_b, "actor_b", "b"))
+        ta.start(); tb.start(); ta.join(20); tb.join(20)
+
+        a_ok = "error" not in results.get("a", {"error": True})
+        b_ok = "error" not in results.get("b", {"error": True})
+        # Exactly ONE side succeeds -- never both, never neither.
+        self.assertNotEqual(a_ok, b_ok, results)
+        winner_key, loser_key = ("a", "b") if a_ok else ("b", "a")
+        winner_actor = "actor_a" if winner_key == "a" else "actor_b"
+        loser_actor = "actor_b" if winner_key == "a" else "actor_a"
+        winner = results[winner_key]
+        loser = results[loser_key]
+        self.assertIn("error", loser, loser)
+        self.assertEqual(loser["error"]["details"]["reason"],
+                         "preview_required", loser)
+
+        check = SqlStore(self.url)
+        new_season_ids = {s.id for s in check.all_seasons()} - before_seasons
+        self.assertEqual(len(new_season_ids), 1, new_season_ids)  # exactly one
+        won_season_id = next(iter(new_season_ids))
+        self.assertEqual(winner["season"]["id"], won_season_id)
+        regs = check.registrations_for_season(won_season_id)
+        self.assertEqual(len(regs), 1, regs)  # applied exactly once
+        # Exactly one commit-audit row for this Season, and it names the
+        # WINNING actor -- zero trace of the loser's own attempt.
+        commit_audits = [a for a in check.all_setup_audit()
+                         if a.action == "new_season_copy_forward_committed"
+                         and a.entity_id == won_season_id]
+        self.assertEqual(len(commit_audits), 1, commit_audits)
+        self.assertEqual(commit_audits[0].actor_id, winner_actor)
+        season_audits = [a for a in check.all_setup_audit()
+                         if a.action == "season_created"
+                         and a.entity_id == won_season_id]
+        self.assertEqual(len(season_audits), 1, season_audits)
+        self.assertNotEqual(season_audits[0].actor_id, loser_actor)
+
+        # The winner's own replay remains idempotent afterward.
+        replay = ApiService(SqlStore(self.url)).commit_new_season_copy_forward(
+            program_id=fx.program["id"], name="2026-27",
+            source_season_id=fx.src["id"], selections=sel,
+            copy_forward_fingerprint=fp, actor_id=winner_actor)
+        self.assertNotIn("error", replay, replay)
+        self.assertEqual(replay["season"]["id"], won_season_id)
 
 
 class NewSeasonCopyForwardHttpTest(unittest.TestCase):
@@ -1829,6 +2257,107 @@ class NewSeasonCopyForwardHttpTest(unittest.TestCase):
         self.assertEqual(replay_reg, orig_reg)
         self.assertEqual(replay_reg["season_id"], target_season_id)
         self.assertEqual(replay_reg["league_id"], league["id"])
+
+    # -- #159 review round 5 (owner P1 finding 2), over real HTTP --------
+    def test_second_operator_who_also_previewed_the_identical_plan_over_http_is_refused(self):
+        """TWO signed-in League Admins each independently preview the
+        IDENTICAL plan -- so each receives the SAME deterministic
+        fingerprint (the fingerprint hashes the resolved plan only, never
+        the actor) and each holds their OWN valid preview audit for it.
+        Operator A commits first; operator B -- who genuinely did preview
+        it, unlike ``test_replay_by_another_actor_who_never_previewed_
+        over_http_is_refused`` above -- must still be refused, not handed
+        operator A's Season by the post-lock race-check backstop, which
+        used to return ANY row with a matching fingerprint
+        unconditionally."""
+        c1, program, src, league, team = self._hierarchy("HE1")
+        body = self._preview_body(program, src, league, team,
+                                  name="SeasonE1")
+        status, preview1 = self._session(
+            c1, "/api/v2/setup/seasons/copy-forward/preview", body)
+        self.assertEqual(status, 200, preview1)
+        fp1 = preview1["copy_forward_fingerprint"]
+
+        c2 = self._operator("cf_admin_he1b")
+        status, ctxres = self._session(
+            c2, "/api/context", {"program_id": program["id"],
+                                 "season_id": src["id"]})
+        self.assertEqual(status, 200, ctxres)
+        status, preview2 = self._session(
+            c2, "/api/v2/setup/seasons/copy-forward/preview", body)
+        self.assertEqual(status, 200, preview2)
+        fp2 = preview2["copy_forward_fingerprint"]
+        self.assertEqual(fp1, fp2)
+
+        commit_body = dict(body, copy_forward_fingerprint=fp1)
+        status, first = self._session(
+            c1, "/api/v2/setup/seasons/copy-forward/commit", commit_body)
+        self.assertEqual(status, 200, first)
+
+        before_seasons = {s.id for s in STATE.api.store.all_seasons()}
+        before_audits = len(STATE.api.store.all_setup_audit())
+        status, attack = self._session(
+            c2, "/api/v2/setup/seasons/copy-forward/commit", commit_body)
+        self.assertEqual(status, 400, attack)
+        self.assertEqual(attack["error"]["details"]["reason"],
+                         "preview_required")
+        self.assertEqual({s.id for s in STATE.api.store.all_seasons()},
+                         before_seasons)
+        self.assertEqual(len(STATE.api.store.all_setup_audit()),
+                         before_audits)
+
+        # Operator A's own replay remains idempotent afterward.
+        status, replay = self._session(
+            c1, "/api/v2/setup/seasons/copy-forward/commit", commit_body)
+        self.assertEqual(status, 200, replay)
+        self.assertEqual(replay["season"]["id"], first["season"]["id"])
+
+    def test_second_operator_who_also_previewed_the_identical_plan_over_http_is_refused_reverse_order(self):
+        """The reverse arrival order of the test above: operator B (the
+        SECOND to preview) commits FIRST this time; operator A second --
+        proving the refusal tracks IDENTITY, not simply "whoever asks
+        second by session order"."""
+        c1, program, src, league, team = self._hierarchy("HE2")
+        body = self._preview_body(program, src, league, team,
+                                  name="SeasonE2")
+        status, preview1 = self._session(
+            c1, "/api/v2/setup/seasons/copy-forward/preview", body)
+        self.assertEqual(status, 200, preview1)
+        fp1 = preview1["copy_forward_fingerprint"]
+
+        c2 = self._operator("cf_admin_he2b")
+        status, ctxres = self._session(
+            c2, "/api/context", {"program_id": program["id"],
+                                 "season_id": src["id"]})
+        self.assertEqual(status, 200, ctxres)
+        status, preview2 = self._session(
+            c2, "/api/v2/setup/seasons/copy-forward/preview", body)
+        self.assertEqual(status, 200, preview2)
+        fp2 = preview2["copy_forward_fingerprint"]
+        self.assertEqual(fp1, fp2)
+
+        commit_body = dict(body, copy_forward_fingerprint=fp1)
+        status, first = self._session(
+            c2, "/api/v2/setup/seasons/copy-forward/commit", commit_body)
+        self.assertEqual(status, 200, first)
+
+        before_seasons = {s.id for s in STATE.api.store.all_seasons()}
+        before_audits = len(STATE.api.store.all_setup_audit())
+        status, attack = self._session(
+            c1, "/api/v2/setup/seasons/copy-forward/commit", commit_body)
+        self.assertEqual(status, 400, attack)
+        self.assertEqual(attack["error"]["details"]["reason"],
+                         "preview_required")
+        self.assertEqual({s.id for s in STATE.api.store.all_seasons()},
+                         before_seasons)
+        self.assertEqual(len(STATE.api.store.all_setup_audit()),
+                         before_audits)
+
+        # Operator B's own replay remains idempotent afterward.
+        status, replay = self._session(
+            c2, "/api/v2/setup/seasons/copy-forward/commit", commit_body)
+        self.assertEqual(status, 200, replay)
+        self.assertEqual(replay["season"]["id"], first["season"]["id"])
 
 
 if __name__ == "__main__":
