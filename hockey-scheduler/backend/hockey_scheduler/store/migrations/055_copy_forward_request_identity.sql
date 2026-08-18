@@ -1,0 +1,38 @@
+-- Immutable request identity on the copy-forward commit ledger (#159 review
+-- round 4, owner P1 finding 1).
+--
+-- Before this migration, `commit_new_season_copy_forward`'s early-replay
+-- shortcut looked up `season_copy_forward_commits` by the caller-supplied
+-- `copy_forward_fingerprint` ALONE and returned that row's response --
+-- before `_resolve_copy_forward_plan` or `_has_matching_copy_forward_
+-- preview_audit` ever ran. A fingerprint is only a hash of the ORIGINAL
+-- committer's resolved plan; nothing checked that the CURRENT caller (actor
+-- and submitted body) had anything to do with it. A second actor who
+-- reused another actor's already-committed fingerprint alongside their OWN,
+-- entirely different Program/Season/selections/name received that OTHER
+-- actor's full response verbatim -- the submitted request was never
+-- validated at all.
+--
+-- `request_identity` freezes the RAW caller-supplied identity a commit was
+-- actually validated against -- actor_id plus every field
+-- `_resolve_copy_forward_plan` takes as input, captured verbatim with no
+-- store lookup and no normalization -- in the SAME transaction as
+-- `response_snapshot`. A replay must now match this stored identity,
+-- canonicalized the same way, before the snapshot is ever returned; any
+-- difference falls through to the ordinary (pre-existing) preview_mismatch/
+-- preview_required refusal path rather than an early return, so a
+-- mismatch's error is byte-identical to any other stale-fingerprint
+-- refusal and reveals nothing about the original requester's data. See
+-- SetupService._copy_forward_request_identity_matches.
+--
+-- Additive and portable (a TEXT column with a constant default, no
+-- rebuild, no index): every existing row was written by CURRENT code
+-- (migration 053, two migrations back, in this same unreleased feature),
+-- so no pre-existing row can carry a real commit without an identity --
+-- the default only backfills a hypothetical legacy row to a harmless empty
+-- object, matching response_snapshot's own migration-054 convention.
+--
+-- Forward-only. Rollback reality: reverting application code does not drop
+-- this column; dropping it is a separate manual database operation.
+ALTER TABLE season_copy_forward_commits
+    ADD COLUMN request_identity TEXT NOT NULL DEFAULT '{}';

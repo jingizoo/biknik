@@ -176,8 +176,29 @@ class SeasonCopyForwardCommit:
     old, already-successful commit returned, or broke it outright. A
     replay now deserializes ``response_snapshot`` directly and touches
     neither the ``seasons`` nor ``season_team_registrations`` tables at
-    all, so it is immune to every later mutation of either. See
-    ``SetupService._copy_forward_result_from_ledger_row``.
+    all, so it is immune to every later mutation of either. Each
+    registration entry ALSO freezes its ``season_id``/``league_id`` (#159
+    review round 4, owner P1 finding 2), resolved via its LeagueSeason
+    ONCE at commit time -- see ``SetupService._copy_forward_result_from_
+    ledger_row``, which stops re-deriving them through a live LeagueSeason
+    lookup on every replay.
+
+    ``request_identity`` (#159 review round 4, owner P1 finding 1) is the
+    RAW caller-supplied identity this commit was actually validated
+    against -- ``{"actor_id":, "program_id":, "name":, "start_date":,
+    "end_date":, "source_season_id":, "selections":}`` -- captured
+    verbatim, with no store lookup and no normalization, in the SAME
+    transaction as ``response_snapshot``. Before this round, the early-
+    replay shortcut trusted ANY caller-supplied ``copy_forward_fingerprint``
+    that happened to match this row, regardless of who was asking or what
+    they actually submitted: a second actor, submitting an entirely
+    different Program/Season/selections/name, who reused another actor's
+    already-committed fingerprint received that OTHER actor's full
+    response verbatim -- the submitted request was never checked against
+    what the fingerprint was actually bound to. A replay must now match
+    this stored identity, canonicalized the same way, before the
+    ``response_snapshot`` is ever returned; see
+    ``SetupService._copy_forward_request_identity_matches``.
     """
     id: str
     copy_forward_fingerprint: str
@@ -188,6 +209,7 @@ class SeasonCopyForwardCommit:
     skipped: int = 0
     committed_at: Optional[datetime] = None
     response_snapshot: dict = field(default_factory=dict)
+    request_identity: dict = field(default_factory=dict)
 
 
 @dataclass

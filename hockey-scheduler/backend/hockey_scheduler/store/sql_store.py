@@ -200,7 +200,7 @@ SPECS = {
     SeasonCopyForwardCommit: Spec(
         SeasonCopyForwardCommit, "season_copy_forward_commits",
         {"registration_ids": _jsonl(), "committed_at": _dt(),
-         "response_snapshot": _jsonc()}),
+         "response_snapshot": _jsonc(), "request_identity": _jsonc()}),
     TeamLeagueMigrationDecision: Spec(
         TeamLeagueMigrationDecision, "team_league_migration_decisions"),
     SeasonVenueAccess: Spec(
