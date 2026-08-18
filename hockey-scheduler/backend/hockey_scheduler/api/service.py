@@ -5476,13 +5476,22 @@ class ApiService:
         collection-level ``("recipient", "*")`` subject — a refused caller
         learned nothing, so no per-subject rows are enumerated (the
         enumeration itself would be a disclosure vector).
+
+        The message names ``category`` generically (#424 audit-wiring):
+        this method now gates BIRTHDATE and REGISTRATION_NUMBER reads too,
+        not only CONTACT_DESTINATION, so a hardcoded "contact destinations"
+        message would misdescribe a refused eligibility or duplicate-report
+        call. ``details["category"]`` already carried the real machine-
+        readable category value before this change; the human-readable text
+        now agrees with it instead of always naming the first category this
+        method was ever used for.
         """
         self._record_sensitive_read(
             category, [("recipient", "*")], purpose,
             actor_user_id, actor_role_label, ACCESS_DENIED, request_id,
             durable=True)
         raise NotAuthorizedError(
-            "Your role can't read stored contact destinations.",
+            "Your role can't read this protected data.",
             {"reason": "sensitive_read_denied", "category": category.value,
              "request_id": request_id})
 
@@ -12150,16 +12159,51 @@ class ApiService:
 
     @catch
     def player_duplicate_report(self,
-                                team_id: Optional[str] = None) -> dict:
+                                team_id: Optional[str] = None,
+                                actor_role=None, actor_user_id=None,
+                                request_id=None) -> dict:
         """Duplicate-candidate warnings (#273 AC[4]) — operator tooling.
 
         Read-only; never merges and never matches by name alone. Carries
         registration-number values (they are what an operator de-duplicates
-        by), so its future HTTP route is MANAGE_SETUP-gated like the
-        include_email/include_identity opt-ins; it is never part of a
+        by), so this is a REGISTRATION_NUMBER sensitive read (#424 audit-
+        wiring), policy-checked and audited like every other sensitive read
+        in this facade — its future HTTP route is MANAGE_SETUP-gated like
+        the include_email/include_identity opt-ins; it is never part of a
         coach/public payload.
+
+        Unlike ``list_players``'s mask-not-refuse identity gate, an
+        unauthorized caller gets the WHOLE call refused (``_refuse_
+        sensitive_read``), not a partial/masked report: this method's own
+        internal ``same_name_same_team_undisambiguated`` disambiguation
+        already compares raw registration_number values across every row it
+        considers (never echoing them into THAT warning, but reading them
+        nonetheless), so there is no warning shape this method can produce
+        without a REGISTRATION_NUMBER read — a masked partial result would
+        misrepresent what was actually checked, not just hide one field.
+
+        ``actor_role``/``actor_user_id``/``request_id`` are purely additive
+        (no existing caller passed them before this method had a way to);
+        every existing internal caller is updated to route a real principal
+        through here now that the boundary exists.
         """
-        return {"warnings": self.setup.player_duplicate_report(team_id)}
+        request_id = self._safe_request_id(request_id)
+        role, label = self._privacy_principal(actor_role)
+        category = SensitiveFieldCategory.REGISTRATION_NUMBER
+        if not self._sensitive_read_allowed(role, category):
+            self._refuse_sensitive_read(
+                category, "player_duplicate_report", actor_user_id, label,
+                request_id)
+        warnings = self.setup.player_duplicate_report(team_id)
+        with self.store.transaction():
+            subjects = sorted({
+                ("recipient", f"player:{pid}")
+                for w in warnings if w["type"] == "shared_registration_number"
+                for pid in w["player_ids"]}) or [("recipient", "*")]
+            self._record_sensitive_read(
+                category, subjects, "player_duplicate_report",
+                actor_user_id, label, ACCESS_ALLOWED, request_id)
+        return {"warnings": warnings}
 
     @catch
     def create_game(self, season_id: str, division_id: str, home_team_id: str,

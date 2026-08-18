@@ -897,5 +897,83 @@ class IdentityFieldReadAuditTest(_IdentityAuditBase):
 # =========================================================================== #
 
 
+
+
+class PlayerDuplicateReportAuditTest(_IdentityAuditBase):
+    def _seed_pair(self):
+        p1 = self.api.setup.add_player(
+            "t1", None, Position.FORWARD, first_name="Sam", last_name="Lee",
+            registration_number=SENTINEL_REGISTRATION)
+        p2 = self.api.setup.add_player(
+            "t2", None, Position.GOALIE, first_name="Alex", last_name="Wu",
+            registration_number=SENTINEL_REGISTRATION)
+        return p1, p2
+
+    def test_authorized_role_gets_the_report_and_one_allowed_row_per_disclosed_player(self):
+        p1, p2 = self._seed_pair()
+        report = self.api.player_duplicate_report(
+            actor_role=Role.LEAGUE_ADMIN, actor_user_id="user_admin")
+        self.assertNotIn("error", report)
+        shared = [w for w in report["warnings"]
+                 if w["type"] == "shared_registration_number"]
+        self.assertEqual(shared[0]["registration_number"],
+                         SENTINEL_REGISTRATION)
+
+        # One ALLOWED row per DISTINCT player whose registration_number was
+        # actually disclosed (both p1 and p2 appear in the one warning) —
+        # the same "one per disclosed recipient" convention
+        # list_contact_destinations already uses.
+        rows = self.rows()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({r.subject_id for r in rows},
+                         {f"player:{p1.id}", f"player:{p2.id}"})
+        for row in rows:
+            self.assertEqual(row.category, C.REGISTRATION_NUMBER)
+            self.assertEqual(row.outcome, ACCESS_ALLOWED)
+            self.assertEqual(row.actor_role, "league_admin")
+            self.assertEqual(row.actor_user_id, "user_admin")
+            self.assertEqual(row.purpose, "player_duplicate_report")
+        self.assertEqual(len({r.request_id for r in rows}), 1)
+
+    def test_unauthorized_role_refuses_the_whole_call(self):
+        self._seed_pair()
+        result = self.api.player_duplicate_report(
+            actor_role=Role.COACH, actor_user_id="user_coach")
+        self.assertEqual(result["error"]["code"], "forbidden")
+        self.assertNotIn("warnings", result)
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].outcome, ACCESS_DENIED)
+        self.assertEqual((rows[0].subject_type, rows[0].subject_id),
+                         ("recipient", "*"))
+
+    def test_no_principal_refuses_the_whole_call(self):
+        self._seed_pair()
+        result = self.api.player_duplicate_report()
+        self.assertEqual(result["error"]["code"], "forbidden")
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].actor_role, vp.NO_PRINCIPAL)
+
+    def test_no_stored_row_contains_the_sentinel_value(self):
+        self._seed_pair()
+        self.api.player_duplicate_report(actor_role=Role.LEAGUE_ADMIN)
+        self.api.player_duplicate_report(actor_role=Role.COACH)
+        self.api.player_duplicate_report()
+        for row in self.rows():
+            self.assertNotIn(SENTINEL_REGISTRATION, str(vars(row)))
+        # Positive control: the report ITSELF echoes the sentinel.
+        report = self.api.player_duplicate_report(
+            actor_role=Role.LEAGUE_ADMIN)
+        dumped = json.dumps(report)
+        self.assertIn(SENTINEL_REGISTRATION, dumped)
+
+
+# =========================================================================== #
+# #424 audit-wiring: evaluate_player_eligibility — BIRTHDATE at SUMMARY       #
+# fidelity (may_read_summary, not may_read_raw), whole-call refusal.         #
+# =========================================================================== #
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -396,10 +396,33 @@ class FacadePrivacyTest(AthleteIdentityTestBase):
         for label, store, api, setup in self._each():
             api.create_player("t1", name="Sam Lee", position="forward")
             api.create_player("t1", name="Sam Lee", position="goalie")
-            report = api.player_duplicate_report()
+            # #424 audit-wiring: the facade method is now a REGISTRATION_
+            # NUMBER sensitive read and requires an authorized principal.
+            report = api.player_duplicate_report(
+                actor_role=Role.LEAGUE_ADMIN, actor_user_id="admin1")
+            self.assertNotIn("error", report, label)
             self.assertEqual(
                 report["warnings"][0]["type"],
                 "same_name_same_team_undisambiguated", label)
+
+    def test_duplicate_report_facade_refuses_unauthorized_caller(self):
+        """#424 audit-wiring: a bare/unauthorized caller gets the WHOLE
+        call refused (not a masked partial result) and a durable denial
+        row — this method's disambiguation logic reads registration_number
+        internally even for warnings that never echo it."""
+        for label, store, api, setup in self._each():
+            api.create_player("t1", name="Sam Lee", position="forward",
+                              registration_number="HC-DUP-1")
+            api.create_player("t2", name="Alex Wu", position="goalie",
+                              registration_number="HC-DUP-1")
+            report = api.player_duplicate_report()
+            self.assertEqual(report["error"]["code"], "forbidden", label)
+            rows = store.list_data_access()
+            self.assertEqual(len(rows), 1, label)
+            self.assertEqual(rows[0].outcome, "denied", label)
+            self.assertNotIn("HC-DUP-1", json.dumps(
+                {"category": rows[0].category.value,
+                 "subject_id": rows[0].subject_id}), label)
 
 
 if __name__ == "__main__":
