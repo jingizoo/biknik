@@ -1,4 +1,7 @@
+import contextlib
+import io
 import json
+import os
 import threading
 import unittest
 import urllib.error
@@ -224,6 +227,69 @@ class WebServerTest(unittest.TestCase):
         self.assertIn("Operator Console", html)
         self.assertIn('class="sidebar"', html)
         self.assertIn('id="login-screen"', html)
+
+
+class AccessLogTest(unittest.TestCase):
+    """The opt-in per-request access log (#215 diagnostics).
+
+    It exists so a browser journey can tell "the click never issued the POST"
+    apart from "the backend received it and hung" — a distinction Playwright's
+    own `request` event cannot make, because that only proves the browser
+    EMITTED something. The two guarantees under test are therefore: silence
+    unless explicitly enabled, and an ARRIVAL line that does not wait for the
+    response (BaseHTTPRequestHandler's own logging fires from send_response,
+    which a hung handler never reaches).
+    """
+
+    def setUp(self):
+        self._saved = os.environ.get("WEB_ACCESS_LOG")
+
+    def tearDown(self):
+        if self._saved is None:
+            os.environ.pop("WEB_ACCESS_LOG", None)
+        else:
+            os.environ["WEB_ACCESS_LOG"] = self._saved
+
+    def _capture(self, method, path):
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            _request(method, path)
+        return [l for l in buf.getvalue().splitlines() if l.startswith("[access] ")]
+
+    def test_silent_unless_enabled(self):
+        os.environ.pop("WEB_ACCESS_LOG", None)
+        self.assertEqual(self._capture("GET", "/api/health"), [])
+
+    def test_logs_arrival_then_completion_scoped_by_method_and_path(self):
+        os.environ["WEB_ACCESS_LOG"] = "1"
+        lines = self._capture("GET", "/api/health")
+        self.assertEqual(len(lines), 2, lines)
+        # The ARRIVAL comes first and carries the method AND the path, so a
+        # diagnostic can scope by both rather than by path alone.
+        self.assertEqual(lines[0], "[access] recv GET /api/health")
+        self.assertTrue(lines[1].startswith("[access] done GET /api/health -> "),
+                        lines[1])
+
+    def test_arrival_is_logged_before_any_response_exists(self):
+        """The load-bearing half: `recv` must not depend on an answer.
+
+        A handler that never answers produces `recv` with no `done`, which is
+        exactly the "backend received it and hung" evidence — so this asserts
+        the arrival is emitted by request PARSING, independent of the response
+        path, rather than by the response path itself.
+        """
+        os.environ["WEB_ACCESS_LOG"] = "1"
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            # A route that does not exist still parses as a request: the
+            # arrival is recorded, and the completion carries the 404. If the
+            # arrival came from the response path the two would be
+            # indistinguishable.
+            _request("GET", "/api/definitely-not-a-route")
+        lines = [l for l in buf.getvalue().splitlines() if l.startswith("[access] ")]
+        self.assertEqual(lines[0],
+                         "[access] recv GET /api/definitely-not-a-route")
+        self.assertIn("-> 404", lines[1])
 
 
 if __name__ == "__main__":
