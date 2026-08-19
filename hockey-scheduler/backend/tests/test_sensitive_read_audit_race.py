@@ -326,6 +326,7 @@ class _GenuineBlockSnapshotTests:
     def _race(self, pause_fn, mutate_fn, target_fn):
         paused = threading.Event()
         resume = threading.Event()
+        racer_attempted = threading.Event()
         racer_done = threading.Event()
         pause_fn(paused, resume)
 
@@ -344,7 +345,15 @@ class _GenuineBlockSnapshotTests:
                     errors["racer"] = RuntimeError(
                         "target never reached the pause")
                     return
-                mutate_fn()
+                # ``mutate_fn`` is handed ``racer_attempted`` and sets it
+                # itself, immediately before its OWN store call (#424
+                # round-N+3 owner review GAP 2) -- never here, and never
+                # merely "the racer thread got CPU time at all": setting it
+                # any earlier (e.g. right after ``paused.wait`` returns)
+                # would only prove the OS scheduler ran this thread, not
+                # that it reached the actual mutating call that could
+                # contend with the target's lock.
+                mutate_fn(racer_attempted)
                 racer_done.set()
             except BaseException as exc:  # noqa: BLE001
                 errors["racer"] = exc
@@ -354,11 +363,31 @@ class _GenuineBlockSnapshotTests:
         t_target.start()
         t_racer.start()
 
-        # PROOF OF GENUINE BLOCKING: the racer's write cannot even START
+        self.assertTrue(paused.wait(15), "target never reached the pause")
+
+        # PROOF THE RACER GENUINELY REACHED ITS OWN WRITE ATTEMPT (#424
+        # round-N+3 owner review GAP 2): a bare ``racer_done.wait(0.3) ==
+        # False`` below is scheduler-dependent -- it is equally consistent
+        # with "the racer's write is genuinely blocked" and with "the OS
+        # simply never scheduled the racer thread within this 0.3s window",
+        # and the two are indistinguishable from that assertion alone. This
+        # wait is the fix: it blocks (up to 15s) for PROOF the racer thread
+        # is now actually contending for the target's lock -- set by
+        # ``mutate_fn`` itself, immediately before ITS OWN store call, never
+        # inferred from timing.
+        self.assertTrue(
+            racer_attempted.wait(15),
+            "racer thread never reached its own mutation/transaction -- "
+            "cannot prove genuine blocking without first proving the "
+            "racer was actually contending")
+
+        # PROOF OF GENUINE BLOCKING: NOW that the racer is proven to have
+        # actually reached its own write attempt, it still cannot COMPLETE
         # while our write-capable transaction holds the store's lock
         # (SQLite RESERVED / Memory's process-wide lock) -- poll a short,
-        # bounded window and assert it has NOT completed.
-        self.assertTrue(paused.wait(15), "target never reached the pause")
+        # bounded window and assert it has NOT completed. Unlike the old,
+        # unguarded version of this same assertion, a pass here can no
+        # longer be explained by "the racer thread just hadn't run yet".
         self.assertFalse(
             racer_done.wait(0.3),
             "racer completed its write while the target was still paused "
@@ -383,8 +412,12 @@ class _GenuineBlockSnapshotTests:
             def pause_fn(paused, resume):
                 _pause_list_players(store, paused, resume)
 
-            def mutate():
+            def mutate(racer_attempted):
                 racer_api = ApiService(self._racer_store(store))
+                # Set immediately before the racer's OWN store call -- the
+                # instant this fires, the racer is genuinely attempting its
+                # write, not merely "scheduled at some point" (GAP 2).
+                racer_attempted.set()
                 racer_api.update_player(p.id, registration_number="REG-DURING")
 
             def go():
@@ -425,8 +458,9 @@ class _GenuineBlockSnapshotTests:
 
             inserted = {}
 
-            def mutate():
+            def mutate(racer_attempted):
                 racer_api = ApiService(self._racer_store(store))
+                racer_attempted.set()
                 inserted["p"] = racer_api.setup.add_player(
                     "t1", None, Position.DEFENSE, first_name="Race",
                     last_name="Inserted", registration_number="REG-RACE")
@@ -463,8 +497,9 @@ class _GenuineBlockSnapshotTests:
             def pause_fn(paused, resume):
                 _pause_eligibility(store, paused, resume)
 
-            def mutate():
+            def mutate(racer_attempted):
                 racer_api = ApiService(self._racer_store(store))
+                racer_attempted.set()
                 racer_api.update_player(p.id, birthdate="1990-01-01")
 
             def go():
