@@ -17,6 +17,7 @@
 // a click handler reads back — can be torn away from the selection on screen.
 const { chromium } = require("playwright");
 const { spawn } = require("child_process");
+const fs = require("fs");
 const http = require("http");
 const path = require("path");
 
@@ -126,6 +127,65 @@ async function newPage(browser, viewport) {
 
 async function selectRole(page, role) {
   await page.selectOption("#new-account-role", role);
+}
+
+// STRUCTURAL half of the #215 module-state contract, next to the behavioural
+// half below.
+//
+// The fix is per-await by design (app.js, `renderPass`) -- a token recheck in
+// render()'s own frame after every await, before the response is applied to
+// any module-level name. That shape is exact, and its one weakness is
+// completeness: render() is ~750 lines with 39 awaits, and ONE added later
+// without its guard silently re-opens the tear for whatever that response
+// writes. The journey below can only catch the instance it drives
+// (`usersSelected`); this catches every future one, at the cost of reading a
+// file.
+//
+// Deliberately a source-shape assertion and not a behavioural one, because
+// there is no behaviour to assert until someone writes the code that breaks:
+// the point is to fail on the OMISSION, at the moment it is introduced.
+function auditRenderPassGuards() {
+  const appJs = path.resolve(
+    BACKEND_DIR, "hockey_scheduler", "web", "static", "app.js");
+  const lines = fs.readFileSync(appJs, "utf-8").split("\n");
+  const start = lines.indexOf("async function render() {");
+  const guardEnd = lines.indexOf("  } catch (e) {", start + 1);
+  if (start < 0 || guardEnd < 0) {
+    throw new Error("render()'s try block could not be located in app.js — this "
+      + "audit needs updating, not deleting");
+  }
+  const GUARD = "if (renderPass !== myRenderPass) return;";
+  const unguarded = [];
+  let total = 0;
+  let i = start;
+  while (i <= guardEnd) {
+    const trimmed = lines[i].trim();
+    if (lines[i].includes("await ") && !trimmed.startsWith("//")
+        && !trimmed.startsWith("*")) {
+      total += 1;
+      let end = i;                       // statements wrap over several lines
+      while (!lines[end].trimEnd().endsWith(";")) end += 1;
+      let next = end + 1;                // ...and a comment may sit in between
+      while (lines[next].trim().startsWith("//") || lines[next].trim() === "") {
+        next += 1;
+      }
+      if (!lines[next].trim().startsWith(GUARD)) {
+        unguarded.push(`  app.js:${i + 1}: ${trimmed}`);
+      }
+      i = end + 1;
+      continue;
+    }
+    i += 1;
+  }
+  if (unguarded.length) {
+    throw new Error(
+      `#215: ${unguarded.length} of ${total} awaits in render() are not followed `
+      + `by \`${GUARD}\`. A superseded pass resuming there would apply its stale `
+      + `response to module-level state that the newer pass's DOM does not `
+      + `agree with, and the next click would read it:\n${unguarded.join("\n")}`);
+  }
+  console.log(`OK — all ${total} awaits in render() recheck renderPass before `
+    + `applying their response.`);
 }
 
 async function checkViewport(browser, viewport) {
@@ -372,6 +432,7 @@ async function checkViewport(browser, viewport) {
 async function main() {
   let browser;
   try {
+    auditRenderPassGuards();
     browser = await chromium.launch(
       process.env.SMOKE_CHROMIUM_PATH ? { executablePath: process.env.SMOKE_CHROMIUM_PATH } : {});
     for (const viewport of VIEWPORTS) await checkViewport(browser, viewport);
