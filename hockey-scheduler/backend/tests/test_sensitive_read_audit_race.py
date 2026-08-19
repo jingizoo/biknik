@@ -107,41 +107,113 @@ def _seed(store):
 # 1. FORCED AUDIT-WRITE FAILURE -- 3 call sites x 3 backends                  #
 # =========================================================================== #
 class _FailureInjectionMatrixTests:
-    """Shared body; subclasses provide ``self._store()`` -> a fresh store."""
+    """Shared body; subclasses provide ``self._store()`` -> a fresh store.
+
+    (#424 round-N+3 owner review GAP 1): a ``boom`` that raises
+    unconditionally on the very FIRST ``add_data_access`` call can only ever
+    prove "zero audit rows if the earliest possible write fails" -- every
+    one of these three call sites makes at least TWO ALLOWED
+    ``add_data_access`` calls (one per sensitive-field category, or one per
+    SUMMARY/RAW tier for eligibility), and a fail-on-first boom never lets
+    the FIRST of those calls actually land, so it can never distinguish "no
+    insert ever ran" from "an insert ran, committed, and should have been
+    but was NOT rolled back when a LATER sibling write in the same
+    transaction failed". This ``boom`` instead lets the FIRST call through
+    to the real store method -- a real row really gets written -- and only
+    the SECOND call fails, so an empty ledger afterward is proof the
+    earlier, already-executed write was actually undone, not merely proof
+    that a write attempt never began.
+    """
 
     def _check(self, api_fn):
         store = self._store()
         try:
             api, p = _seed(store)
 
+            orig_add = store.add_data_access
+            call_count = {"n": 0}
+
             def boom(*a, **kw):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    # Let the FIRST write really happen, through the real
+                    # store method -- this is the row a fail-on-first-call
+                    # boom could never produce, and whose survival past the
+                    # second write's failure would prove the transaction is
+                    # not actually atomic.
+                    return orig_add(*a, **kw)
                 raise RuntimeError("simulated audit-write failure")
             store.add_data_access = boom
 
             with self.assertRaises(RuntimeError):
                 api_fn(api, p)
 
-            # No half-done state: the ALLOWED audit write and the sensitive
-            # read it was meant to pair with are the SAME transaction, so
-            # the raise unwinds BOTH -- zero durable rows, and (since the
-            # exception propagated before any `return`) no caller ever
-            # observed the sensitive payload either.
-            self.assertEqual(store.list_data_access(), [])
+            # This test is only a genuine rollback proof if a SECOND write
+            # was actually attempted (and hence a first one actually
+            # landed before the failure). If a call site only ever makes
+            # one ALLOWED add_data_access call under these arguments, this
+            # assertion catches that -- silently degrading back to the
+            # weaker "fails on first call" shape must never pass unnoticed.
+            self.assertGreaterEqual(
+                call_count["n"], 2,
+                "add_data_access was called fewer than twice -- this "
+                "call site/argument combination does not exercise a "
+                "second audit write, so this test cannot prove rollback "
+                "of an already-written earlier row")
+
+            # No half-done state: the FIRST audit write (which really
+            # landed, through the real store method above) must NOT
+            # survive the SECOND write's failure -- the sensitive read and
+            # BOTH audit writes are the SAME transaction, so the raise
+            # unwinds all of them together, not just the one that failed.
+            # Because the first write genuinely committed before the
+            # failure (unlike a fail-on-first-call boom, which never lets
+            # any write land), an empty ledger here is real proof of
+            # same-transaction rollback of an already-written row -- and
+            # (since the exception propagated before any `return`) no
+            # caller ever observed the sensitive payload either.
+            self.assertEqual(
+                store.list_data_access(), [],
+                "an audit row written before the later failure survived "
+                "the transaction's rollback -- the read and both audit "
+                "writes are not actually one atomic unit")
         finally:
             store.close()
 
     def test_list_players_include_identity(self):
+        # LEAGUE_ADMIN holds RAW on both BIRTHDATE and REGISTRATION_NUMBER
+        # (visibility_policy._POLICY), so list_players's include_identity
+        # block makes TWO ALLOWED add_data_access calls -- one per category,
+        # BIRTHDATE then REGISTRATION_NUMBER (api/service.py's
+        # ``identity_categories`` tuple order) -- exactly the two calls
+        # this test's ``boom`` needs to see.
         self._check(lambda api, p: api.list_players(
             team_id="t1", include_identity=True, role=Role.LEAGUE_ADMIN,
             user_id="user_admin"))
 
     def test_player_duplicate_report(self):
+        # LEAGUE_ADMIN also drives TWO ALLOWED add_data_access calls here --
+        # REGISTRATION_NUMBER then BIRTHDATE (api/service.py's
+        # ``player_duplicate_report``, which checks the two categories in
+        # that order and audits both against the same ``subjects`` list).
         self._check(lambda api, p: api.player_duplicate_report(
             actor_role=Role.LEAGUE_ADMIN, actor_user_id="user_admin"))
 
     def test_evaluate_player_eligibility(self):
+        # COACH (the pre-round-N+3 actor here) only ever reaches ONE
+        # ALLOWED add_data_access call -- the SUMMARY tier -- because COACH
+        # holds no RAW grant for BIRTHDATE, so ``include_details=True``
+        # would route the details-tier write through
+        # ``add_data_access_durable`` instead (a different store method
+        # this ``boom`` never intercepts), never through ``add_data_access``
+        # a second time. LEAGUE_ADMIN holds RAW too, so
+        # ``include_details=True`` here reaches the details tier via the
+        # SAME ALLOWED ``add_data_access`` path as the SUMMARY tier --
+        # SUMMARY succeeds (call 1), the details write fails (call 2), and
+        # this test can actually prove the SUMMARY row is rolled back too.
         self._check(lambda api, p: api.evaluate_player_eligibility(
-            p.id, "d", actor_role=Role.COACH, actor_user_id="user_coach"))
+            p.id, "d", actor_role=Role.LEAGUE_ADMIN,
+            actor_user_id="user_admin", include_details=True))
 
 
 class MemoryFailureInjectionTest(_FailureInjectionMatrixTests,
