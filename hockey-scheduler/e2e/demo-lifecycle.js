@@ -90,6 +90,57 @@ async function checkViewport(browser, viewport) {
   page.on("pageerror", (e) => errors.push(`[pageerror] ${e.message}`));
   page.on("console", (m) => { if (m.type() === "error") errors.push(`[console] ${m.text()}`); });
 
+  // Network trace (#215 flake diagnosis): the demo server silences its own
+  // per-request access log (Handler.log_message is a deliberate no-op, so
+  // "demo server output" in the thrown error below carries nothing for an
+  // ordinary request -- only an unhandled exception's traceback would show
+  // up there). A stalled lifecycle POST therefore left NO evidence at all
+  // distinguishing "the confirm click never fired the fetch" from "the
+  // backend received it and hung": both looked like a bare
+  // page.waitForResponse timeout. Recording every request/response/failure
+  // Playwright itself observes on this page closes that gap without
+  // touching the shared server logging every other journey also relies on
+  // being quiet.
+  const netLog = [];
+  page.on("request", (r) => netLog.push(
+    { t: Date.now(), type: "request", method: r.method(), url: r.url() }));
+  page.on("response", (r) => netLog.push(
+    { t: Date.now(), type: "response", status: r.status(),
+      method: r.request().method(), url: r.url() }));
+  page.on("requestfailed", (r) => netLog.push(
+    { t: Date.now(), type: "requestfailed", method: r.method(), url: r.url(),
+      failure: (r.failure() && r.failure().errorText) || "unknown" }));
+
+  // Click an element and wait for its resulting POST as ONE coordinated
+  // operation (Playwright's recommended pattern: page.waitForResponse
+  // begins listening the instant it's called, which Promise.all makes
+  // unambiguous rather than relying on call-order alone). On a timeout,
+  // report whether ANY network event ever matched the URL at all -- zero
+  // matches means the click did not issue the request (a frontend/DOM
+  // issue); a "request" event with no following "response" means the
+  // backend received it and did not answer in time (a server-side issue).
+  const clickAndAwaitResponse = async (url, method, clickFn, label) => {
+    const startedAt = Date.now();
+    try {
+      const [resp] = await Promise.all([
+        page.waitForResponse((r) => r.url() === url && r.request().method() === method),
+        clickFn(),
+      ]);
+      return resp;
+    } catch (err) {
+      const matched = netLog.filter((e) => e.url === url);
+      const recent = netLog.filter((e) => e.t >= startedAt - 250).slice(-40);
+      const diagnosis = matched.some((e) => e.type === "request")
+        ? "request WAS observed leaving the browser; no matching response arrived (backend-side stall or wrong route)."
+        : "NO request for this URL was ever observed leaving the browser (click did not fire the fetch).";
+      throw new Error(
+        `${label}: timed out waiting for ${method} ${url}.\n` +
+        `Diagnosis: ${diagnosis}\n` +
+        `Matching events: ${JSON.stringify(matched)}\n` +
+        `Recent network activity: ${JSON.stringify(recent)}`);
+    }
+  };
+
   const V = viewport.label;
   const getJson = (p) => page.evaluate(
     (u) => fetch(u, { credentials: "same-origin" }).then((r) => r.json()), p);
@@ -119,10 +170,10 @@ async function checkViewport(browser, viewport) {
     await page.fill("#demo-confirm-input", word);
     await page.waitForFunction(
       () => !document.querySelector("[data-demo-confirm]").disabled, null, { timeout: 5000 });
-    const resp = page.waitForResponse((r) =>
-      r.url() === `${base}${route}` && r.request().method() === "POST");
-    await page.click("[data-demo-confirm]");
-    if ((await resp).status() !== 200) throw new Error(`[${V}] ${action} returned non-200`);
+    const resp = await clickAndAwaitResponse(
+      `${base}${route}`, "POST", () => page.click("[data-demo-confirm]"),
+      `[${V}] ${action}`);
+    if (resp.status() !== 200) throw new Error(`[${V}] ${action} returned non-200`);
     await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
   };
 
@@ -150,10 +201,10 @@ async function checkViewport(browser, viewport) {
 
     // (2) Load from the empty-state card: the sample dataset appears, the card
     // is replaced by league trees, and the header flips to Reset.
-    const loadResp = page.waitForResponse((r) =>
-      r.url() === `${base}/api/demo/load` && r.request().method() === "POST");
-    await page.click("[data-demo-load]");
-    if ((await loadResp).status() !== 200) throw new Error(`[${V}] card Load returned non-200`);
+    const loadResp = await clickAndAwaitResponse(
+      `${base}/api/demo/load`, "POST", () => page.click("[data-demo-load]"),
+      `[${V}] card Load`);
+    if (loadResp.status() !== 200) throw new Error(`[${V}] card Load returned non-200`);
     await page.waitForSelector(".start-league", { state: "detached", timeout: 10000 });
     if (await leagueCount() === 0) throw new Error(`[${V}] Load did not build the dataset`);
     await waitDemoTitle("Reset demo data").catch(() => {
@@ -198,10 +249,10 @@ async function checkViewport(browser, viewport) {
     });
 
     // Re-load so Reset has a populated dataset to rebuild from.
-    const reload = page.waitForResponse((r) =>
-      r.url() === `${base}/api/demo/load` && r.request().method() === "POST");
-    await page.click("[data-demo-load]");
-    if ((await reload).status() !== 200) throw new Error(`[${V}] second Load returned non-200`);
+    const reload = await clickAndAwaitResponse(
+      `${base}/api/demo/load`, "POST", () => page.click("[data-demo-load]"),
+      `[${V}] second Load`);
+    if (reload.status() !== 200) throw new Error(`[${V}] second Load returned non-200`);
     await page.waitForSelector(".start-league", { state: "detached", timeout: 10000 });
 
     // (4) Reset from the header menu (typed RESET): the canonical dataset.
