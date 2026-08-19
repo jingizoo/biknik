@@ -107,29 +107,6 @@ def _allow_production_factory_reset() -> bool:
     return (os.environ.get("ALLOW_PRODUCTION_FACTORY_RESET") or "").strip().lower() in (
         "1", "true", "yes")
 
-
-def _access_log_enabled() -> bool:
-    """Whether to emit a two-line-per-request ARRIVAL/COMPLETION access log
-    (#215 diagnostics). Read fresh on every call, same idiom as ``_app_mode()``
-    above.
-
-    Off by default and deliberately opt-in per process: ``log_message`` is a
-    no-op precisely so the shared journeys stay quiet, and that is worth
-    keeping. Only the journey that needs to tell "the click never issued the
-    POST" apart from "the backend received it and hung" turns this on, for its
-    own server.
-
-    The ARRIVAL line is the whole point of the mechanism and is why this is not
-    just ``log_message``: ``BaseHTTPRequestHandler`` logs from
-    ``send_response``, i.e. at ANSWER time, so a request the server received
-    and then hung on would produce no line at all — exactly the case the
-    diagnostics exist to identify. ``parse_request`` below fires as soon as the
-    request line and headers are read, before dispatch, so a ``recv`` with no
-    matching ``done`` is positive evidence of receipt without completion.
-    """
-    return (os.environ.get("WEB_ACCESS_LOG") or "").strip().lower() in (
-        "1", "true", "yes")
-
 # Sessions live outside DemoState so signing in survives a demo-data reset.
 SESSIONS = SessionManager()
 
@@ -661,31 +638,6 @@ class Handler(BaseHTTPRequestHandler):
     # Quieter logging.
     def log_message(self, *args):  # noqa: D401
         pass
-
-    # -- opt-in access log (#215 diagnostics) ------------------------------
-    #
-    # Two lines per request, both on stderr, both no-ops unless WEB_ACCESS_LOG
-    # is set for this process — see ``_access_log_enabled``. A reader
-    # correlating them can distinguish, unambiguously:
-    #   recv, no done  -> the server RECEIVED the request and did not answer;
-    #   recv + done    -> the server received AND answered it;
-    #   neither        -> the request never reached this server at all.
-    # The path is logged verbatim (query string included) so a diagnostic can
-    # scope by method AND path rather than by path alone.
-    def _access(self, phase: str, extra: str = "") -> None:
-        if not _access_log_enabled():
-            return
-        print(f"[access] {phase} {self.command} {self.path}{extra}",
-              file=sys.stderr, flush=True)
-
-    def parse_request(self):
-        parsed = super().parse_request()
-        if parsed:
-            self._access("recv")
-        return parsed
-
-    def log_request(self, code="-", size="-"):
-        self._access("done", f" -> {code}")
 
     # -- error boundary (#302) --------------------------------------------
     #
