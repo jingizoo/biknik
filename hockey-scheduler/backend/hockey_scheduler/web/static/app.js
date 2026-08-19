@@ -91,6 +91,38 @@ let contextSwitchSeq = 0;
 // token issued."
 let iceOperationSeq = 0;
 let importOperationSeq = 0;
+// Monotonic pass token for render() ITSELF (#215 browser-shard-3 flake) --
+// the same idiom as iceOperationSeq/importOperationSeq above, and for exactly
+// the reason stated there: "a stale response can just as easily be wrong
+// within the SAME context ... firing two of the same kind back to back and
+// having them resolve out of order -- none of which touch contextRevision at
+// all." render() is that surface too, and it was the one that never got a
+// token of its own. It is `async`, the overwhelming majority of its ~170 call
+// sites fire it WITHOUT awaiting, and every one of its DOM writes happens
+// AFTER its fetch chain -- so two renders started back to back in ONE context
+// resolve in whatever order the network returns, and the LOSER paints last.
+//
+// The failure that motivated this: demo-lifecycle.js's step (4). The
+// empty-state "Load demo data" click (app.js:11277 -> afterDemoLifecycleChange
+// -> render()) was still awaiting /api/demo/overview when the header menu's
+// reset action fired its own un-awaited render() (app.js:13206). The newer
+// pass painted and wired the typed-confirmation modal; the older pass then
+// landed, ran `c.innerHTML = viewHtml` and rebuilt the modal from
+// demoConfirmModalHtml -- whose markup ALWAYS emits an empty
+// #demo-confirm-input and a `disabled` [data-demo-confirm]. So the operator's
+// typed RESET and the enabled button were destroyed in the window between the
+// enable check and the click: the confirm click could never become
+// actionable, and the lifecycle POST was never issued at all. In CI that read
+// as a bare `page.waitForResponse: Timeout 30000ms exceeded`, because the
+// click promise never settled either.
+//
+// Bumped SYNCHRONOUSLY at the top of render(), before any await, so the
+// newest pass always wins; each pass snapshots it and stands down at its DOM
+// boundaries if a newer pass has started since. Standing down is safe by
+// construction here (unlike the contextRevision guards, which rely on the
+// caller to schedule a follow-up render): the pass that superseded this one
+// is itself in flight and is the one that paints.
+let renderPass = 0;
 let publicState = { schedule: null, standings: null, division: null, game: null,
   feedUrl: null, feedLabel: null };  // feedUrl/feedLabel: freshly-minted public calendar subscription (#33)
 let publicTab = "schedule";        // "schedule" | "standings" (#83)
@@ -10361,6 +10393,11 @@ function setChrome(ov) {
 
 async function render() {
   updateToast();
+  // Claim this pass BEFORE anything else (see `renderPass` above): the claim
+  // must be synchronous and must precede the factory-reset early return
+  // below, so that a render already awaiting its fetch chain is superseded by
+  // that synchronous success paint too, not just by a fetching pass.
+  const myRenderPass = ++renderPass;
   const c = document.getElementById("content");
   document.body.dataset.view = view;
   // #367 review: a completed factory reset (#256) already cleared this
@@ -11059,6 +11096,12 @@ async function render() {
     // held model whose tuple has moved as stale, so blanking it from here
     // would only discard data the stale contract says to keep showing.
   } catch (e) {
+    // Superseded (see `renderPass`): a newer render() owns #content. This
+    // pass's failure is not the current pass's failure -- painting the
+    // backend-error banner here would replace whatever the newer pass has
+    // already put on screen with an error for a question nobody is still
+    // asking, and would settle its focus intent on this pass's behalf.
+    if (renderPass !== myRenderPass) return;
     setChrome(ov);
     c.innerHTML = `<div class="banner alert"><h2>Could not load data</h2>
       <p>The backend may not be running. ${esc(e.message || e)}</p></div>
@@ -11077,6 +11120,14 @@ async function render() {
     return;
   }
 
+  // THE stale-paint boundary (see `renderPass`). Everything below this line
+  // writes to the document -- the header chrome, the demo menu, the context
+  // switcher, the Restricted banner, and the `c.innerHTML = viewHtml` paint
+  // that rebuilds the modal from scratch. A pass that a newer render() has
+  // already superseded must write NONE of it: the newer pass is in flight and
+  // is the one that paints, so standing down here leaves the newest state on
+  // screen instead of overwriting it with this pass's older data.
+  if (renderPass !== myRenderPass) return;
   setChrome(ov);
   updateNotifBadge();
   // Keep the header demo control's Load↔Reset label in step with the actual
