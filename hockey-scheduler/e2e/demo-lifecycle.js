@@ -77,13 +77,7 @@ async function checkViewport(browser, viewport) {
   const server = spawn(
     process.env.PYTHON || "python3",
     ["-u", "-m", "hockey_scheduler.web.server", "--host", HOST, "--port", String(viewport.port)],
-    // WEB_ACCESS_LOG is what turns the SERVER's own arrival/completion log on
-    // (server.py, `_access_log_enabled`) -- see the diagnostics note below for
-    // why browser-side events alone cannot answer the question this journey
-    // needs answered. Set for THIS server only; every other journey's server
-    // stays as quiet as it has always been.
-    { cwd: BACKEND_DIR, stdio: ["ignore", "pipe", "pipe"],
-      env: { ...process.env, WEB_ACCESS_LOG: "1" } });
+    { cwd: BACKEND_DIR, stdio: ["ignore", "pipe", "pipe"] });
   let serverOutput = "";
   server.stdout.on("data", (d) => { serverOutput += d.toString(); });
   server.stderr.on("data", (d) => { serverOutput += d.toString(); });
@@ -96,37 +90,39 @@ async function checkViewport(browser, viewport) {
   page.on("pageerror", (e) => errors.push(`[pageerror] ${e.message}`));
   page.on("console", (m) => { if (m.type() === "error") errors.push(`[console] ${m.text()}`); });
 
-  // Network trace (#215 flake diagnosis). The question this has to answer is
-  // "did the click never issue the POST, or did the backend receive it and
-  // hang?", and the two halves of the evidence answer different halves of it:
+  // Network trace (#215 flake diagnosis). This records BROWSER-SIDE events
+  // only, and every sentence it prints is limited to what those events
+  // actually prove. There is no server-side evidence here, so nothing below
+  // may assert backend receipt: a Playwright `request` event proves the
+  // browser EMITTED a request and nothing more.
   //
-  //   * A Playwright `request` event proves the BROWSER EMITTED the request.
-  //     It does not prove the backend received it, so it can never on its own
-  //     support the sentence "the backend received it and hung" -- an earlier
-  //     version of this diagnosis said exactly that, on exactly that evidence
-  //     (owner correction). `requestfinished` / `requestfailed` / `response`
-  //     are recorded alongside it so an emitted-but-never-answered request is
-  //     distinguishable from one that failed at the transport and from one
-  //     that was answered but did not match the predicate.
+  // What the events do prove, and it is enough for the question that made
+  // these diagnostics necessary:
   //
-  //   * The SERVER's own arrival log proves RECEIPT. The demo server logs
-  //     nothing per-request by default (Handler.log_message is a deliberate
-  //     no-op) and `BaseHTTPRequestHandler` would only log at ANSWER time
-  //     anyway, so a hung request would leave no line. This server is
-  //     therefore started with WEB_ACCESS_LOG=1, which makes it emit an
-  //     ARRIVAL line from parse_request and a COMPLETION line from
-  //     log_request. `serverOutput` is already retained and already attached
-  //     to every failure below.
+  //   * `request`  -- the browser EMITTED the request.
+  //   * `response` -- the browser RECEIVED response headers for it.
+  //   * `requestfinished` / `requestfailed` -- the browser finished reading
+  //     the response, or the request failed at the transport with an
+  //     errorText.
   //
-  // Together they separate all four cases, with no inference left to the
-  // reader: no browser request at all; emitted but never received; received
-  // but never answered; answered but unmatched.
+  // Those two facts cleanly separate the two candidate causes this journey
+  // was flaking between:
   //
-  // Every netLog entry and every slice of server output below is scoped to the
-  // attempt in force when it was observed, so a counter from an earlier
-  // journey step (this journey issues five POSTs across three lifecycle
-  // routes, and re-visits /api/demo/load three times) can never be read as
-  // evidence for the step under test.
+  //   no `request`             -> the click never issued the fetch. A
+  //                               FRONTEND failure, and the actual root cause
+  //                               of the #215 flake.
+  //   `request`, no `response` -> the request went out and nothing came back.
+  //
+  // The second case is deliberately NOT subdivided. From the browser, a
+  // request the server received and stalled on and a request that never
+  // reached the server are indistinguishable -- both are simply "emitted, no
+  // response". Saying which one it is would require server-side evidence this
+  // journey does not collect.
+  //
+  // Every netLog entry is scoped to the attempt in force when it was observed,
+  // so a counter from an earlier journey step (this journey issues five POSTs
+  // across three lifecycle routes, and re-visits /api/demo/load three times)
+  // can never be read as evidence for the step under test.
   let currentAttempt = 0;
   const netLog = [];
   const record = (type, r, extra) => netLog.push({
@@ -138,9 +134,6 @@ async function checkViewport(browser, viewport) {
   page.on("requestfailed", (r) => record("requestfailed", r,
     { failure: (r.failure() && r.failure().errorText) || "unknown" }));
 
-  const serverAccessLines = () => serverOutput.split("\n")
-    .filter((l) => l.startsWith("[access] "));
-
   // Click an element and wait for its resulting POST as ONE coordinated
   // operation (Playwright's recommended pattern: page.waitForResponse
   // begins listening the instant it's called, which Promise.all makes
@@ -148,10 +141,6 @@ async function checkViewport(browser, viewport) {
   const clickAndAwaitResponse = async (url, method, clickFn, label) => {
     currentAttempt += 1;
     const attempt = currentAttempt;
-    // Attempt scoping for the SERVER's log: everything already printed is
-    // another step's evidence, so this attempt owns only what comes after.
-    const serverMark = serverAccessLines().length;
-    const path = new URL(url).pathname;
     try {
       const [resp] = await Promise.all([
         page.waitForResponse((r) => r.url() === url && r.request().method() === method),
@@ -165,33 +154,26 @@ async function checkViewport(browser, viewport) {
         && e.method === method;
       const matched = netLog.filter(mine);
       const emitted = matched.some((e) => e.type === "request");
-      const answered = matched.some((e) => e.type === "response");
+      const responseSeen = matched.some((e) => e.type === "response");
       const failed = matched.find((e) => e.type === "requestfailed");
-      // Same three-way scoping on the server side. The arrival line proves
-      // RECEIPT; an arrival with no completion proves the backend took the
-      // request and never answered it.
-      const since = serverAccessLines().slice(serverMark);
-      const recvd = since.filter((l) => l.startsWith(`[access] recv ${method} ${path}`));
-      const done = since.filter((l) => l.startsWith(`[access] done ${method} ${path}`));
+      // Every branch states a BROWSER-SIDE observation only. Where the request
+      // ended up once it left the browser is not observable from here, and is
+      // not claimed.
       const diagnosis =
         !emitted
-          ? "the browser never emitted this request at all -- the click did not fire the fetch (frontend/DOM)."
+          ? "the browser NEVER EMITTED this request -- the click did not fire the fetch at all (a frontend/DOM failure)."
           : failed
-            ? `the browser emitted it and the transport FAILED (${failed.failure}); the backend ${recvd.length ? "did" : "did not"} log an arrival.`
-            : recvd.length === 0
-              ? "the browser emitted it but the BACKEND LOGGED NO ARRIVAL -- it never reached this server (in flight, or sent somewhere else)."
-              : done.length === 0
-                ? "the backend RECEIVED it (arrival logged) and never answered -- a backend-side stall."
-                : answered
-                  ? "the backend received AND answered it; the wait predicate is what did not match."
-                  : "the backend received and answered it, but the browser never surfaced the response.";
+            ? `the browser emitted it and the transport FAILED (${failed.failure}); no response reached the browser.`
+            : !responseSeen
+              ? "the browser EMITTED it but NO RESPONSE reached the browser. Browser-side "
+                + "events cannot tell a server that received it and stalled apart from a "
+                + "request that never arrived -- both look identical from here."
+              : "the browser emitted it AND received a response for it; the wait predicate is what did not match.";
       const recent = netLog.filter((e) => e.attempt === attempt).slice(-40);
       throw new Error(
         `${label}: timed out waiting for ${method} ${url} (attempt ${attempt}).\n` +
-        `Diagnosis: ${diagnosis}\n` +
+        `Diagnosis (browser-side observation only): ${diagnosis}\n` +
         `Browser events for ${method} ${url} this attempt: ${JSON.stringify(matched)}\n` +
-        `Backend arrivals/completions for ${method} ${path} this attempt: ` +
-        `${JSON.stringify({ recv: recvd, done })}\n` +
         `All browser network activity this attempt: ${JSON.stringify(recent)}`);
     }
   };
@@ -418,19 +400,7 @@ async function checkViewport(browser, viewport) {
     console.log(`[${V}] OK — blank → load → clear → reset, header state-aware, `
       + `and a stale render() cannot destroy the confirm modal.`);
   } catch (error) {
-    // WEB_ACCESS_LOG makes the server print two lines per request, static
-    // assets included, so the raw tail would bury everything else. The
-    // non-access output (tracebacks, the startup banner) is kept verbatim
-    // because that is what it has always carried; the access log is reported
-    // as a count plus its tail, which is the part adjacent to the failure.
-    // Anything an individual step actually needs is already scoped and quoted
-    // by clickAndAwaitResponse above.
-    const access = serverAccessLines();
-    const other = serverOutput.split("\n")
-      .filter((l) => !l.startsWith("[access] ")).join("\n");
-    throw new Error(`${error.message}\n--- demo server output ---\n${other}\n`
-      + `--- demo server access log (${access.length} lines, last 40) ---\n`
-      + `${access.slice(-40).join("\n")}`);
+    throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {
     await context.close();
     await stopServer(server);
