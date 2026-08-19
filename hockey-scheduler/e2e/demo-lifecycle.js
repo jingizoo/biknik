@@ -262,8 +262,106 @@ async function checkViewport(browser, viewport) {
       throw new Error(`[${V}] header is not "Reset demo data" over a populated dataset`);
     });
 
+    // (5) REGRESSION, the browser-shard-3 flake this journey used to produce:
+    //     A STALE render() MUST NOT DESTROY A MODAL A NEWER render() PAINTED.
+    //
+    // What used to happen, non-deterministically, in step (4) above. render()
+    // is `async`, blanks #content SYNCHRONOUSLY and only then awaits its fetch
+    // chain, and almost every caller fires it without awaiting. So the Load
+    // click's render (app.js:11277 -> afterDemoLifecycleChange -> render())
+    // could still be mid-fetch when line 256's `.start-league` detached
+    // barrier was satisfied -- that barrier is met by the SYNCHRONOUS BLANK,
+    // not by the paint, so the journey walked on with a render still in
+    // flight. Opening the header menu then started a SECOND render
+    // (app.js:13206, also un-awaited). Whichever landed last won. When the
+    // older one landed last, `c.innerHTML = viewHtml` plus the modal rebuild
+    // wiped the filled, enabled confirm modal and replaced it with a fresh one
+    // -- demoConfirmModalHtml always emits an EMPTY #demo-confirm-input and a
+    // `disabled` [data-demo-confirm]. Landing in the window between the
+    // enable check and the click left Playwright waiting on `enabled`
+    // forever, and the lifecycle POST was never issued at all: the CI symptom
+    // was a bare `page.waitForResponse: Timeout 30000ms exceeded`.
+    //
+    // Here that interleaving is FORCED rather than raced, so this leg is
+    // deterministic where the flake was not: exactly ONE /api/demo/overview --
+    // the Load-triggered render's own -- is held until the journey has typed
+    // RESET and seen the button go enabled, then released. In CI nothing holds
+    // it; it is simply the slower of two in-flight renders. Nothing else is
+    // faked: same server, same app.js, same click path.
+    //
+    // The fix under test is app.js's `renderPass` token: a superseded render
+    // stands down at its DOM boundaries instead of painting. Revert it and
+    // this leg fails with the modal reading {disabled:true, inputValue:""}.
+    await runFromMenu("clear", "CLEAR", "/api/demo/clear");
+    await page.waitForSelector(".start-league", { timeout: 10000 });
+
+    let holdOverview = false;
+    let releaseOverview = null;
+    const overviewHeld = new Promise((r) => { releaseOverview = r; });
+    await page.route("**/api/demo/overview", async (route) => {
+      if (!holdOverview) return route.continue();
+      holdOverview = false;            // hold exactly one: the Load render's
+      await overviewHeld;
+      return route.continue();
+    });
+
+    holdOverview = true;
+    const staleLoad = await clickAndAwaitResponse(
+      `${base}/api/demo/load`, "POST", () => page.click("[data-demo-load]"),
+      `[${V}] stale-render Load`);
+    if (staleLoad.status() !== 200) {
+      throw new Error(`[${V}] stale-render Load returned non-200`);
+    }
+    // The same barrier step (4) relies on -- satisfied by the blank, with that
+    // render still awaiting the overview we are holding.
+    await page.waitForSelector(".start-league", { state: "detached", timeout: 10000 });
+
+    await page.click("#demo-btn");
+    await page.click('[data-demo-action="reset"]');
+    await page.waitForSelector(".modal.danger #demo-confirm-input", { timeout: 10000 });
+    await page.fill("#demo-confirm-input", "RESET");
+    await page.waitForFunction(
+      () => !document.querySelector("[data-demo-confirm]").disabled, null, { timeout: 5000 });
+
+    // Release the stale render and let it run all the way to its DOM
+    // boundary. networkidle (not a fixed pause) is the settle signal: it means
+    // that render's whole fetch chain has finished, so it has already either
+    // painted or stood down -- there is nothing further in flight to land.
+    releaseOverview();
+    await page.waitForLoadState("networkidle");
+
+    const modalState = await page.evaluate(() => {
+      const b = document.querySelector("[data-demo-confirm]");
+      const i = document.querySelector("#demo-confirm-input");
+      return { present: !!b && !!i, disabled: b ? b.disabled : null,
+               value: i ? i.value : null };
+    });
+    if (!modalState.present) {
+      throw new Error(`[${V}] a stale render() destroyed the confirm modal outright`);
+    }
+    if (modalState.disabled || modalState.value !== "RESET") {
+      throw new Error(
+        `[${V}] a stale render() rebuilt the confirm modal and discarded the typed `
+        + `confirmation: expected {disabled:false, value:"RESET"}, got `
+        + `{disabled:${modalState.disabled}, value:${JSON.stringify(modalState.value)}}`);
+    }
+    // And the click must still dispatch: the whole point is that the POST
+    // actually leaves the browser, which is what the flake denied.
+    const staleReset = await clickAndAwaitResponse(
+      `${base}/api/demo/reset`, "POST", () => page.click("[data-demo-confirm]"),
+      `[${V}] reset after a stale render landed`);
+    if (staleReset.status() !== 200) {
+      throw new Error(`[${V}] reset after a stale render returned non-200`);
+    }
+    await page.waitForSelector(".modal", { state: "detached", timeout: 10000 });
+    if (await leagueCount() === 0) {
+      throw new Error(`[${V}] reset after a stale render did not rebuild the dataset`);
+    }
+    await page.unroute("**/api/demo/overview");
+
     if (errors.length) throw new Error(`[${V}] console/page errors:\n${errors.join("\n")}`);
-    console.log(`[${V}] OK — blank → load → clear → reset, header state-aware.`);
+    console.log(`[${V}] OK — blank → load → clear → reset, header state-aware, `
+      + `and a stale render() cannot destroy the confirm modal.`);
   } catch (error) {
     throw new Error(`${error.message}\n--- demo server output ---\n${serverOutput}`);
   } finally {
