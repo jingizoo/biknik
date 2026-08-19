@@ -593,6 +593,22 @@ class PostgresSnapshotConsistencyTest(unittest.TestCase):
     def _store(self):
         return self._track(SqlStore(self.url))
 
+    def _txid(self, store):
+        """The database's OWN transaction id (mirrors ``test_sensitive_
+        read_audit_atomicity.PostgresAtomicityTest._txid``): proof of ONE
+        physical PostgreSQL backend transaction, not merely one Python-level
+        ``with self.store.transaction():`` block. Two calls made under the
+        SAME backend transaction always return the SAME value; two calls
+        under different transactions (or different connections) never do."""
+        cur = store.conn.cursor()
+        cur.execute("SELECT txid_current() AS tx")
+        row = cur.fetchone()
+        cur.close()
+        try:
+            return row["tx"]
+        except (TypeError, KeyError):
+            return row[0]
+
     def _race(self, pause_fn, mutate_fn, target_fn):
         paused = threading.Event()
         resume = threading.Event()
@@ -635,32 +651,177 @@ class PostgresSnapshotConsistencyTest(unittest.TestCase):
         return result["value"]
 
     def test_list_players_snapshot_consistent_under_race(self):
+        """(#424 round-N+3 owner review GAP 3): the pre-round-N+3 version of
+        this test raced a mutation of a FIELD on the one already-included
+        player and accepted EITHER value -- a shape that also passes if the
+        protected read and the audit write are split into two separate
+        transactions (nothing here ever depended on them sharing one). This
+        version closes both halves the review names:
+
+        1. The racer INSERTS A SECOND PLAYER instead of mutating the
+           existing one -- moving the RACE onto the RETURNED/AUDITED
+           SUBJECT SET itself. Whichever snapshot our read lands on (with
+           or without the new player), the set of player ids RETURNED and
+           the set of player ids AUDITED must be EXACTLY EQUAL -- a
+           genuinely discriminating check: if the read and the audit write
+           ran as two separate statements/transactions, a racer landing
+           between them could make one see the insert and the other not,
+           splitting the two sets.
+        2. ``txid_current()`` is captured at the protected read
+           (``players_for_team``) and at the ALLOWED audit write
+           (``add_data_access``) and asserted EQUAL -- proof of one
+           physical PostgreSQL backend transaction, not merely one
+           Python-level ``transaction()`` block. See this class's
+           ``test_list_players_txid_identity_negative_control`` for the
+           required falsifiability proof that this specific assertion
+           actually fails when the read is moved outside the transaction.
+        """
         store = self._store()
-        api, p = _seed(store)
+        api, p1 = _seed(store)
+
+        read_txids = []
+        write_txids = []
+
+        orig_players_for_team = store.players_for_team
+
+        def spy_read(team_id):
+            result = orig_players_for_team(team_id)
+            read_txids.append(self._txid(store))
+            return result
+        store.players_for_team = spy_read
+
+        orig_add_data_access = store.add_data_access
+
+        def spy_add(*a, **kw):
+            write_txids.append(self._txid(store))
+            return orig_add_data_access(*a, **kw)
+        store.add_data_access = spy_add
 
         def pause_fn(paused, resume):
-            _pause_list_players(store, paused, resume)
+            # Wraps the ALREADY-instrumented ``players_for_team`` (spy_read
+            # above) so txid capture still happens, exactly once, on every
+            # call -- the pause point stays AFTER the read returns, still
+            # inside the transaction, matching every other pause helper in
+            # this module.
+            orig = store.players_for_team
+
+            def instrumented(team_id):
+                result = orig(team_id)
+                paused.set()
+                resume.wait(15)
+                return result
+            store.players_for_team = instrumented
+
+        inserted = {}
 
         def mutate():
             racer_api = ApiService(self._store())
-            racer_api.update_player(p.id, registration_number="REG-DURING")
+            inserted["p"] = racer_api.setup.add_player(
+                "t1", None, Position.DEFENSE, first_name="Race",
+                last_name="Inserted", registration_number="REG-RACE")
 
         def go():
-            rows = api.list_players(team_id="t1", include_identity=True,
+            return api.list_players(team_id="t1", include_identity=True,
                                     role=Role.LEAGUE_ADMIN,
                                     user_id="user_admin")
-            return rows[0]
 
-        row = self._race(pause_fn, mutate, go)
-        rows_out = [r for r in store.list_data_access()
-                   if r.purpose == "list_players_identity"
-                   and r.category.name == "REGISTRATION_NUMBER"]
-        self.assertEqual(len(rows_out), 1, rows_out)
-        self.assertEqual(rows_out[0].subject_id, f"player:{p.id}")
-        # A single SELECT statement cannot tear -- whichever value it
-        # returned is unambiguous, and the ONE subject audited is the
-        # right player regardless of race timing.
-        self.assertIn(row["registration_number"], ("REG-1", "REG-DURING"))
+        rows = self._race(pause_fn, mutate, go)
+        returned_ids = {row["id"] for row in rows}
+
+        audit_rows = [r for r in store.list_data_access()
+                     if r.purpose == "list_players_identity"
+                     and r.category.name == "REGISTRATION_NUMBER"]
+        audited_ids = {r.subject_id.split(":", 1)[1] for r in audit_rows}
+
+        # THE DISCRIMINATING PROOF: whichever snapshot the read landed on,
+        # the RETURNED and AUDITED subject sets must be the identical set.
+        # This can only fail if the protected read and the audit write
+        # disagreed about which players were examined.
+        self.assertEqual(
+            returned_ids, audited_ids,
+            "returned player ids and audited subject ids disagree -- the "
+            "protected read and the audit write did not observe the same "
+            "snapshot")
+        # p1 (seeded before the race even starts) is unconditionally in
+        # both sets on every run -- a sanity floor under the discriminating
+        # check above, not itself the proof.
+        self.assertIn(p1.id, returned_ids)
+        self.assertIn(p1.id, audited_ids)
+        # The racer's insert is either fully absent from BOTH sets (read
+        # snapshot predates the insert) or fully present in BOTH (insert
+        # committed before the read) -- asserting membership rather than
+        # equality to either fixed set, since which snapshot wins is a
+        # genuine, expected race outcome the store's own lock behavior
+        # decides, not something this test dictates.
+        self.assertEqual(inserted["p"].id in returned_ids,
+                         inserted["p"].id in audited_ids)
+
+        # SAME PHYSICAL POSTGRESQL BACKEND TRANSACTION at the protected
+        # read and the ALLOWED audit write -- not merely "a python-level
+        # transaction() block was open".
+        self.assertTrue(read_txids, "protected read was never instrumented")
+        self.assertTrue(write_txids, "audit write was never instrumented")
+        self.assertEqual(
+            set(read_txids), set(write_txids),
+            f"protected read ran under txid(s) {set(read_txids)}, audit "
+            f"write under {set(write_txids)} -- two different PostgreSQL "
+            "backend transactions, not one atomic unit")
+
+    def test_list_players_txid_identity_negative_control(self):
+        """FALSIFIABILITY (#424 round-N+3 owner review GAP 3 -- the review's
+        own required negative control): temporarily route the protected
+        read through a SEPARATE physical PostgreSQL connection/transaction
+        -- reproducing the exact pre-round-N owner-review bug shape
+        ``test_sensitive_read_audit_atomicity.py``'s own module docstring
+        describes ("a bare read made outside transaction() is its own
+        already-committed unit of work, never joined to whatever
+        transaction opens later purely for the audit write") -- and confirm
+        THIS test's own txid-identity assertion actually FAILS against that
+        broken shape. If it did not, the assertion in the test above would
+        be decorative, not discriminating."""
+        store = self._store()
+        api, p1 = _seed(store)
+        separate = self._store()
+
+        read_txids = []
+        write_txids = []
+
+        orig_players_for_team = separate.players_for_team
+
+        def broken_read(team_id):
+            # THE BUG: this read runs on a SEPARATE connection, in its OWN
+            # transaction, never joined to the one that will make the
+            # audit write below.
+            with separate.transaction():
+                result = orig_players_for_team(team_id)
+                read_txids.append(self._txid(separate))
+            return result
+        store.players_for_team = broken_read
+
+        orig_add_data_access = store.add_data_access
+
+        def spy_add(*a, **kw):
+            write_txids.append(self._txid(store))
+            return orig_add_data_access(*a, **kw)
+        store.add_data_access = spy_add
+
+        api.list_players(team_id="t1", include_identity=True,
+                         role=Role.LEAGUE_ADMIN, user_id="user_admin")
+
+        self.assertTrue(read_txids, "protected read was never instrumented")
+        self.assertTrue(write_txids, "audit write was never instrumented")
+        self.assertNotEqual(
+            set(read_txids), set(write_txids),
+            "sanity check failed: the deliberately-broken read landed on "
+            "the SAME txid as the write -- the negative control did not "
+            "actually reproduce a split transaction, so it proves nothing")
+        # THE REQUIRED PROOF: the real test's own assertion, re-run here
+        # against the broken shape, must raise.
+        with self.assertRaises(AssertionError):
+            self.assertEqual(
+                set(read_txids), set(write_txids),
+                f"protected read ran under txid(s) {set(read_txids)}, "
+                f"audit write under {set(write_txids)}")
 
     def test_player_duplicate_report_snapshot_consistent_under_race(self):
         """THE bug this module found: pre-fix, under READ COMMITTED, the
@@ -735,11 +896,53 @@ class PostgresSnapshotConsistencyTest(unittest.TestCase):
                              "every warning read -- snapshot divergence")
 
     def test_evaluate_player_eligibility_snapshot_consistent_under_race(self):
+        """(#424 round-N+3 owner review GAP 3): eligibility examines exactly
+        ONE player by construction (``player_id`` is a caller-supplied
+        argument, not a collection this race could ever widen or narrow),
+        so -- unlike ``list_players``/``player_duplicate_report`` -- there
+        is no "returned/audited subject SET" for a race to move; the
+        pre-existing ``self.assertIn(result["status"], (...))`` shape was
+        already correct in that narrow sense. What it never proved is the
+        review's second, still-missing half: that the protected read
+        (``get_player``) and the ALLOWED audit write(s) (``add_data_access``
+        -- both the SUMMARY tier and, with ``include_details=True`` as
+        LEAGUE_ADMIN, the RAW/details tier) actually share ONE physical
+        PostgreSQL backend transaction, proven with ``txid_current()``, not
+        merely "a python-level transaction() block was open". See this
+        class's ``test_evaluate_player_eligibility_txid_identity_negative_
+        control`` for the required falsifiability proof that this specific
+        assertion actually fails when the read is moved outside the
+        transaction."""
         store = self._store()
         api, p = _seed(store)
 
+        read_txids = []
+        write_txids = []
+
+        orig_get_player = store.get_player
+
+        def spy_read(player_id):
+            result = orig_get_player(player_id)
+            read_txids.append(self._txid(store))
+            return result
+        store.get_player = spy_read
+
+        orig_add_data_access = store.add_data_access
+
+        def spy_add(*a, **kw):
+            write_txids.append(self._txid(store))
+            return orig_add_data_access(*a, **kw)
+        store.add_data_access = spy_add
+
         def pause_fn(paused, resume):
-            _pause_eligibility(store, paused, resume)
+            orig = store.get_player
+
+            def instrumented(player_id):
+                result = orig(player_id)
+                paused.set()
+                resume.wait(15)
+                return result
+            store.get_player = instrumented
 
         def mutate():
             racer_api = ApiService(self._store())
@@ -759,6 +962,67 @@ class PostgresSnapshotConsistencyTest(unittest.TestCase):
         # A single get_player() call cannot tear -- the status is
         # unambiguously derived from ONE birthdate value, old or new.
         self.assertIn(result["status"], ("eligible", "ineligible"))
+
+        # SAME PHYSICAL POSTGRESQL BACKEND TRANSACTION at the protected
+        # read and EVERY ALLOWED audit write (SUMMARY tier plus, since
+        # LEAGUE_ADMIN + include_details=True reaches it, the RAW/details
+        # tier) -- not merely "a python-level transaction() block was open".
+        self.assertTrue(read_txids, "protected read was never instrumented")
+        self.assertTrue(write_txids, "audit write was never instrumented")
+        self.assertEqual(
+            set(read_txids), set(write_txids),
+            f"protected read ran under txid(s) {set(read_txids)}, audit "
+            f"write under {set(write_txids)} -- two different PostgreSQL "
+            "backend transactions, not one atomic unit")
+
+    def test_evaluate_player_eligibility_txid_identity_negative_control(self):
+        """FALSIFIABILITY (#424 round-N+3 owner review GAP 3 -- the review's
+        own required negative control): temporarily route the protected
+        ``get_player`` read through a SEPARATE physical PostgreSQL
+        connection/transaction -- the same pre-round-N broken shape
+        ``test_list_players_txid_identity_negative_control`` reproduces for
+        ``list_players`` -- and confirm THIS test's own txid-identity
+        assertion actually FAILS against it."""
+        store = self._store()
+        api, p = _seed(store)
+        separate = self._store()
+
+        read_txids = []
+        write_txids = []
+
+        orig_get_player = separate.get_player
+
+        def broken_read(player_id):
+            with separate.transaction():
+                result = orig_get_player(player_id)
+                read_txids.append(self._txid(separate))
+            return result
+        store.get_player = broken_read
+
+        orig_add_data_access = store.add_data_access
+
+        def spy_add(*a, **kw):
+            write_txids.append(self._txid(store))
+            return orig_add_data_access(*a, **kw)
+        store.add_data_access = spy_add
+
+        result = api.evaluate_player_eligibility(
+            p.id, "d", actor_role=Role.LEAGUE_ADMIN,
+            actor_user_id="user_admin", include_details=True)
+        self.assertNotIn("error", result, result)
+
+        self.assertTrue(read_txids, "protected read was never instrumented")
+        self.assertTrue(write_txids, "audit write was never instrumented")
+        self.assertNotEqual(
+            set(read_txids), set(write_txids),
+            "sanity check failed: the deliberately-broken read landed on "
+            "the SAME txid as the write -- the negative control did not "
+            "actually reproduce a split transaction, so it proves nothing")
+        with self.assertRaises(AssertionError):
+            self.assertEqual(
+                set(read_txids), set(write_txids),
+                f"protected read ran under txid(s) {set(read_txids)}, "
+                f"audit write under {set(write_txids)}")
 
 
 if __name__ == "__main__":
