@@ -71,6 +71,7 @@ three. This module closes both gaps for ALL THREE call sites:
 import os
 import tempfile
 import threading
+import time
 import unittest
 from datetime import datetime, timezone
 
@@ -315,6 +316,127 @@ def _pause_eligibility(store, paused, resume):
     store.get_player = instrumented
 
 
+def _signal_at_transaction_entry(store, event):
+    """Set ``event`` at the ACTUAL store transaction/lock-acquisition
+    boundary -- ``store.transaction()`` -- not at some earlier facade call
+    several stack frames above it (#424 round-N+4 owner review: the prior
+    ``racer_attempted.set()`` fired immediately before ``ApiService.
+    update_player()``/``setup.add_player()``, high-level calls whose own
+    validation/dispatch can run for an arbitrary stretch BEFORE either one
+    ever reaches ``SetupService._transactional``'s ``with self.store.
+    transaction():`` -- the actual lock take, ``with self._lock:`` as the
+    very first line of both ``InMemoryStore.transaction`` and ``SqlStore.
+    transaction``. A scheduler pause or validation delay in that gap could
+    fire the old signal while the racer was not yet contending for
+    anything, which a bare ``racer_done.wait(0.3) == False`` cannot tell
+    apart from genuine blocking).
+
+    Wraps ``store.transaction`` so ``event`` fires immediately before
+    control reaches the real transaction context manager, mirroring the
+    ``store.transaction = <wrapper>`` monkeypatch convention already used
+    elsewhere in this suite for instrumenting store internals (e.g.
+    ``test_official_availability.py``'s ``_api_counting``,
+    ``test_hierarchy_import.py``, ``test_import_commit.py``). Every one of
+    ``update_player``/``setup.add_player``'s own ``@_transactional`` bodies
+    calls ``self.store.transaction()`` exactly once, as their very first
+    executed line -- so this fires at the ONE real entry point, with no
+    earlier call in the chain to leak through first."""
+    real = store.transaction
+
+    def wrapped(*args, **kwargs):
+        # The instant this fires, the calling frame is about to enter
+        # ``real(...)``'s own ``with self._lock:`` -- the genuine
+        # lock-acquisition attempt -- not merely "some Python code ran".
+        event.set()
+        return real(*args, **kwargs)
+    store.transaction = wrapped
+
+
+def _delay_then_call(racer_attempted, delay, call):
+    """Required regression coverage (a), scheduling-delay negative control
+    (#424 round-N+4 owner review): sleeps for ``delay`` BEFORE ``call()``
+    ever runs -- mirroring the owner's own repro (a scheduling/validation
+    delay landing in the gap between the racer's facade call and its real
+    ``store.transaction()`` boundary) -- then asserts ``racer_attempted``
+    is STILL unset at the end of that delay, before finally invoking
+    ``call()`` (which itself fires ``_signal_at_transaction_entry`` at the
+    real boundary). Raising here (via a plain ``assert``, propagated by
+    ``_race``'s ``run_racer`` into ``errors["racer"]``, and then re-raised
+    as an ``AssertionError`` by ``_race`` itself) is the proof that an
+    injected pre-boundary delay genuinely cannot satisfy the signal early
+    under the fixed wiring -- unlike the pre-round-N+4 code, which this
+    exact shape (0.5s injected between the old ``racer_attempted.set()``
+    and the high-level mutating call) demonstrably fooled (see this
+    module's git history / PR discussion for the captured "before"
+    evidence)."""
+    time.sleep(delay)
+    assert not racer_attempted.is_set(), (
+        "racer_attempted fired during an injected pre-transaction delay "
+        "-- the signal is not actually tied to the real "
+        "store.transaction() boundary")
+    call()
+
+
+def _direct_write_bypassing_lock(store, player_id, **updates):
+    """Required regression coverage (b), no-lock/broken-store negative
+    control (#424 round-N+4 owner review): writes DIRECTLY through the
+    store's own lowest-level write primitive -- no ``SetupService`` (so no
+    validation, no ``next_id`` call), and no ``store.transaction()`` call
+    of any kind -- exactly the "directly calling the underlying write
+    primitive without going through the locking transaction wrapper"
+    construction the owner's review itself names. Used ONLY to prove
+    ``_race``'s own "racer did not complete while the target was still
+    paused" assertion is load-bearing, not vacuous.
+
+    A wrapper around ``store.transaction()`` alone (e.g. a no-op context
+    manager) is NOT enough to build this: ``InMemoryStore.next_id`` and
+    ``SqlStore._update``/``_insert`` each independently re-acquire the
+    SAME ``self._lock`` a write-capable ``transaction()`` already holds
+    for its whole body (see each one's own docstring/comments), so a
+    racer that still goes through ``next_id()`` (i.e. still creates a new
+    row, or still audits its write) remains genuinely serialized against
+    the paused target even with ``transaction()`` itself bypassed -- this
+    function avoids ``next_id`` entirely (a plain field UPDATE on an
+    already-existing row) and, for SQLite, bypasses ``_update`` too by
+    executing straight on ``store.conn`` (opened with
+    ``check_same_thread=False`` specifically so a second thread may do
+    this) instead of through ``SqlStore._exec``.
+
+    SQLite specifically requires operating on the SAME connection/store
+    object the paused target itself is using, never a separate one: a
+    genuinely separate connection's write to the SAME file is
+    unconditionally blocked by SQLite's own native single-writer file
+    lock regardless of any Python-level wrapper at all -- confirmed
+    empirically (a bare write on a second connection while the target
+    holds ``BEGIN IMMEDIATE``'s RESERVED lock blocks for the connection's
+    full busy_timeout and then raises "database is locked", never
+    completing) -- so a construction that used a second connection would
+    demonstrate SQLite's own real engine guarantee, not this test's
+    assertion, and could never complete while genuinely paused.
+
+    Also deliberately never calls ``store.get_player``/``store.
+    save_player``/``store.players_for_team``/``store.all_players`` (even
+    though ``InMemoryStore``'s versions of these carry no lock of their
+    own): every ``pause_fn`` in this module replaces exactly one of those
+    METHOD ATTRIBUTES on the shared ``store`` object to make the target
+    pause, and calling the SAME (now-instrumented) method here would pause
+    the racer thread too, on the SAME ``resume`` -- an artifact of the
+    test's own instrumentation sharing one store, not of any lock. Raw
+    dict/attribute access on Memory, and a bare cursor on SQLite, both
+    route around every instrumented method entirely."""
+    if isinstance(store, SqlStore):
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        cur = store.conn.cursor()
+        cur.execute(f"UPDATE players SET {set_clause} WHERE id = ?",
+                   (*updates.values(), player_id))
+        store.conn.commit()
+        cur.close()
+    else:
+        player = store.players[player_id]
+        for key, value in updates.items():
+            setattr(player, key, value)
+
+
 class _GenuineBlockSnapshotTests:
     """Memory + SQLite: the racer's write is PROVEN to genuinely block for
     the target's whole paused duration, then both complete, racer second.
@@ -345,14 +467,20 @@ class _GenuineBlockSnapshotTests:
                     errors["racer"] = RuntimeError(
                         "target never reached the pause")
                     return
-                # ``mutate_fn`` is handed ``racer_attempted`` and sets it
-                # itself, immediately before its OWN store call (#424
-                # round-N+3 owner review GAP 2) -- never here, and never
-                # merely "the racer thread got CPU time at all": setting it
-                # any earlier (e.g. right after ``paused.wait`` returns)
-                # would only prove the OS scheduler ran this thread, not
-                # that it reached the actual mutating call that could
-                # contend with the target's lock.
+                # ``mutate_fn`` is handed ``racer_attempted`` and, via
+                # ``_signal_at_transaction_entry``, sets it itself at the
+                # racer's OWN ``store.transaction()`` call -- the actual
+                # lock-acquisition boundary (#424 round-N+3 owner review
+                # GAP 2; tightened further in round-N+4: the signal used to
+                # fire before the high-level facade call, e.g.
+                # ``update_player()``, several frames above the real
+                # ``with self.store.transaction():`` it eventually reaches
+                # -- never here, and never merely "the racer thread got CPU
+                # time at all": setting it any earlier (e.g. right after
+                # ``paused.wait`` returns, or before the facade call's own
+                # validation/dispatch has even run) would only prove the OS
+                # scheduler ran this thread, not that it reached the actual
+                # mutating call that could contend with the target's lock.
                 mutate_fn(racer_attempted)
                 racer_done.set()
             except BaseException as exc:  # noqa: BLE001
@@ -366,15 +494,22 @@ class _GenuineBlockSnapshotTests:
         self.assertTrue(paused.wait(15), "target never reached the pause")
 
         # PROOF THE RACER GENUINELY REACHED ITS OWN WRITE ATTEMPT (#424
-        # round-N+3 owner review GAP 2): a bare ``racer_done.wait(0.3) ==
-        # False`` below is scheduler-dependent -- it is equally consistent
-        # with "the racer's write is genuinely blocked" and with "the OS
-        # simply never scheduled the racer thread within this 0.3s window",
-        # and the two are indistinguishable from that assertion alone. This
-        # wait is the fix: it blocks (up to 15s) for PROOF the racer thread
-        # is now actually contending for the target's lock -- set by
-        # ``mutate_fn`` itself, immediately before ITS OWN store call, never
-        # inferred from timing.
+        # round-N+3 owner review GAP 2, tightened round-N+4): a bare
+        # ``racer_done.wait(0.3) == False`` below is scheduler-dependent --
+        # it is equally consistent with "the racer's write is genuinely
+        # blocked" and with "the OS simply never scheduled the racer thread
+        # within this 0.3s window", and the two are indistinguishable from
+        # that assertion alone. This wait is the fix: it blocks (up to 15s)
+        # for PROOF the racer thread is now actually contending for the
+        # target's lock -- set by ``_signal_at_transaction_entry`` at the
+        # racer's OWN ``store.transaction()`` call (the real
+        # ``with self._lock:`` acquisition, per that helper's docstring),
+        # never at the high-level facade call above it and never inferred
+        # from timing. A scheduling delay or validation stretch between the
+        # facade call and this real boundary cannot satisfy this wait
+        # early -- see each call site's own
+        # ``*_racer_attempted_scheduling_delay_negative_control`` test
+        # below for the permanent regression proof.
         self.assertTrue(
             racer_attempted.wait(15),
             "racer thread never reached its own mutation/transaction -- "
@@ -388,15 +523,29 @@ class _GenuineBlockSnapshotTests:
         # bounded window and assert it has NOT completed. Unlike the old,
         # unguarded version of this same assertion, a pass here can no
         # longer be explained by "the racer thread just hadn't run yet".
-        self.assertFalse(
-            racer_done.wait(0.3),
-            "racer completed its write while the target was still paused "
-            "mid-transaction -- the read and the audit write are not "
-            "actually atomic against a concurrent writer")
+        #
+        # The check itself is wrapped in try/finally (#424 round-N+4 owner
+        # review, required negative control b): a deliberately-broken racer
+        # (one whose write bypasses the real lock -- see
+        # ``_NoLockTransactionStore``) makes THIS assertion genuinely raise,
+        # and without the finally below the target thread would be stranded
+        # on ``resume.wait(15)`` for up to 15s with nobody ever calling
+        # ``resume.set()``. The finally guarantees both threads are always
+        # released and joined before this method returns OR raises, so a
+        # negative-control caller can safely do
+        # ``with self.assertRaises(AssertionError): self._race(...)``
+        # without leaking a live background thread into the next test.
+        try:
+            self.assertFalse(
+                racer_done.wait(0.3),
+                "racer completed its write while the target was still "
+                "paused mid-transaction -- the read and the audit write "
+                "are not actually atomic against a concurrent writer")
+        finally:
+            resume.set()
+            t_target.join(15)
+            t_racer.join(15)
 
-        resume.set()
-        t_target.join(15)
-        t_racer.join(15)
         if "target" in errors:
             raise errors["target"]
         if "racer" in errors:
@@ -413,11 +562,14 @@ class _GenuineBlockSnapshotTests:
                 _pause_list_players(store, paused, resume)
 
             def mutate(racer_attempted):
-                racer_api = ApiService(self._racer_store(store))
-                # Set immediately before the racer's OWN store call -- the
-                # instant this fires, the racer is genuinely attempting its
-                # write, not merely "scheduled at some point" (GAP 2).
-                racer_attempted.set()
+                racer_store = self._racer_store(store)
+                racer_api = ApiService(racer_store)
+                # Fire at the racer's OWN store.transaction() entry -- the
+                # true lock-acquisition boundary, not the facade call above
+                # it (#424 round-N+4 owner review GAP: a delay between the
+                # facade call and its internal transaction() could pass a
+                # scheduler-timing signal fired too early undetected).
+                _signal_at_transaction_entry(racer_store, racer_attempted)
                 racer_api.update_player(p.id, registration_number="REG-DURING")
 
             def go():
@@ -459,8 +611,11 @@ class _GenuineBlockSnapshotTests:
             inserted = {}
 
             def mutate(racer_attempted):
-                racer_api = ApiService(self._racer_store(store))
-                racer_attempted.set()
+                racer_store = self._racer_store(store)
+                racer_api = ApiService(racer_store)
+                # Fire at the racer's OWN store.transaction() entry -- see
+                # _signal_at_transaction_entry's docstring.
+                _signal_at_transaction_entry(racer_store, racer_attempted)
                 inserted["p"] = racer_api.setup.add_player(
                     "t1", None, Position.DEFENSE, first_name="Race",
                     last_name="Inserted", registration_number="REG-RACE")
@@ -498,8 +653,11 @@ class _GenuineBlockSnapshotTests:
                 _pause_eligibility(store, paused, resume)
 
             def mutate(racer_attempted):
-                racer_api = ApiService(self._racer_store(store))
-                racer_attempted.set()
+                racer_store = self._racer_store(store)
+                racer_api = ApiService(racer_store)
+                # Fire at the racer's OWN store.transaction() entry -- see
+                # _signal_at_transaction_entry's docstring.
+                _signal_at_transaction_entry(racer_store, racer_attempted)
                 racer_api.update_player(p.id, birthdate="1990-01-01")
 
             def go():
@@ -517,6 +675,188 @@ class _GenuineBlockSnapshotTests:
             # our transaction, so our verdict reflects the ORIGINAL
             # (eligible, U10-aged) birthdate, not the racer's (too old).
             self.assertEqual(result["status"], "eligible")
+        finally:
+            store.close() if isinstance(store, SqlStore) else None
+
+    # ===================================================================== #
+    # REQUIRED REGRESSION COVERAGE (#424 round-N+4 owner review): for each  #
+    # of the three call sites above, two negative controls --               #
+    #                                                                       #
+    # (a) scheduling-delay: an artificial delay injected BEFORE the real    #
+    #     store.transaction() boundary (the exact shape of the owner's own #
+    #     0.5s repro) must NOT be able to satisfy racer_attempted early --  #
+    #     see _delay_then_call.                                            #
+    # (b) no-lock/broken-store: a racer whose write bypasses the real lock #
+    #     entirely (_NoLockTransactionStore) must make _race's own         #
+    #     blocking assertion genuinely FAIL -- proof that assertion is     #
+    #     load-bearing, not vacuous.                                       #
+    # ===================================================================== #
+
+    def test_list_players_racer_attempted_scheduling_delay_negative_control(self):
+        store = self._store()
+        try:
+            api, p = _seed(store)
+
+            def pause_fn(paused, resume):
+                _pause_list_players(store, paused, resume)
+
+            def mutate(racer_attempted):
+                racer_store = self._racer_store(store)
+                racer_api = ApiService(racer_store)
+
+                def real_call():
+                    _signal_at_transaction_entry(racer_store, racer_attempted)
+                    racer_api.update_player(
+                        p.id, registration_number="REG-DELAYED")
+                _delay_then_call(racer_attempted, 0.5, real_call)
+
+            def go():
+                rows = api.list_players(team_id="t1", include_identity=True,
+                                        role=Role.LEAGUE_ADMIN,
+                                        user_id="user_admin")
+                return rows[0]
+
+            self._race(pause_fn, mutate, go)
+        finally:
+            store.close() if isinstance(store, SqlStore) else None
+
+    def test_list_players_racer_attempted_no_lock_negative_control(self):
+        store = self._store()
+        try:
+            api, p = _seed(store)
+
+            def pause_fn(paused, resume):
+                _pause_list_players(store, paused, resume)
+
+            def mutate(racer_attempted):
+                # No _signal_at_transaction_entry here -- there is no real
+                # store.transaction() call anywhere in this path to wrap,
+                # which is the whole point of this construction. Set the
+                # event manually, immediately before the direct write.
+                racer_attempted.set()
+                _direct_write_bypassing_lock(
+                    store, p.id, registration_number="REG-NOLOCK")
+
+            def go():
+                rows = api.list_players(team_id="t1", include_identity=True,
+                                        role=Role.LEAGUE_ADMIN,
+                                        user_id="user_admin")
+                return rows[0]
+
+            with self.assertRaises(AssertionError):
+                self._race(pause_fn, mutate, go)
+        finally:
+            store.close() if isinstance(store, SqlStore) else None
+
+    def test_player_duplicate_report_racer_attempted_scheduling_delay_negative_control(self):
+        store = self._store()
+        try:
+            api, p1 = _seed(store)
+            api.setup.add_player(
+                "t1", None, Position.GOALIE, first_name="Warn",
+                last_name="Pair", registration_number="REG-SHARED")
+
+            def pause_fn(paused, resume):
+                _pause_duplicate_report(store, paused, resume)
+
+            def mutate(racer_attempted):
+                racer_store = self._racer_store(store)
+                racer_api = ApiService(racer_store)
+
+                def real_call():
+                    _signal_at_transaction_entry(racer_store, racer_attempted)
+                    racer_api.setup.add_player(
+                        "t1", None, Position.DEFENSE, first_name="Race",
+                        last_name="Inserted",
+                        registration_number="REG-RACE-DELAYED")
+                _delay_then_call(racer_attempted, 0.5, real_call)
+
+            def go():
+                return api.player_duplicate_report(
+                    actor_role=Role.LEAGUE_ADMIN, actor_user_id="user_admin")
+
+            self._race(pause_fn, mutate, go)
+        finally:
+            store.close() if isinstance(store, SqlStore) else None
+
+    def test_player_duplicate_report_racer_attempted_no_lock_negative_control(self):
+        store = self._store()
+        try:
+            api, p1 = _seed(store)
+            api.setup.add_player(
+                "t1", None, Position.GOALIE, first_name="Warn",
+                last_name="Pair", registration_number="REG-SHARED")
+
+            def pause_fn(paused, resume):
+                _pause_duplicate_report(store, paused, resume)
+
+            def mutate(racer_attempted):
+                # See test_list_players_racer_attempted_no_lock_negative_
+                # control's comment: no real store.transaction() call to
+                # wrap here, so the event is set manually. Mutates an
+                # EXISTING player's own registration_number rather than
+                # inserting a new one -- simpler, and _race's blocking
+                # assertion doesn't care which kind of write completes
+                # early, only THAT one does.
+                racer_attempted.set()
+                _direct_write_bypassing_lock(
+                    store, p1.id, registration_number="REG-NOLOCK-DUP")
+
+            def go():
+                return api.player_duplicate_report(
+                    actor_role=Role.LEAGUE_ADMIN, actor_user_id="user_admin")
+
+            with self.assertRaises(AssertionError):
+                self._race(pause_fn, mutate, go)
+        finally:
+            store.close() if isinstance(store, SqlStore) else None
+
+    def test_evaluate_player_eligibility_racer_attempted_scheduling_delay_negative_control(self):
+        store = self._store()
+        try:
+            api, p = _seed(store)
+
+            def pause_fn(paused, resume):
+                _pause_eligibility(store, paused, resume)
+
+            def mutate(racer_attempted):
+                racer_store = self._racer_store(store)
+                racer_api = ApiService(racer_store)
+
+                def real_call():
+                    _signal_at_transaction_entry(racer_store, racer_attempted)
+                    racer_api.update_player(p.id, birthdate="1990-06-06")
+                _delay_then_call(racer_attempted, 0.5, real_call)
+
+            def go():
+                return api.evaluate_player_eligibility(
+                    p.id, "d", actor_role=Role.LEAGUE_ADMIN,
+                    actor_user_id="user_admin", include_details=True)
+
+            self._race(pause_fn, mutate, go)
+        finally:
+            store.close() if isinstance(store, SqlStore) else None
+
+    def test_evaluate_player_eligibility_racer_attempted_no_lock_negative_control(self):
+        store = self._store()
+        try:
+            api, p = _seed(store)
+
+            def pause_fn(paused, resume):
+                _pause_eligibility(store, paused, resume)
+
+            def mutate(racer_attempted):
+                racer_attempted.set()
+                _direct_write_bypassing_lock(
+                    store, p.id, birthdate="1990-07-07")
+
+            def go():
+                return api.evaluate_player_eligibility(
+                    p.id, "d", actor_role=Role.LEAGUE_ADMIN,
+                    actor_user_id="user_admin", include_details=True)
+
+            with self.assertRaises(AssertionError):
+                self._race(pause_fn, mutate, go)
         finally:
             store.close() if isinstance(store, SqlStore) else None
 
