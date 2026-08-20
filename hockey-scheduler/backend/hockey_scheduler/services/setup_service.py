@@ -2632,7 +2632,7 @@ class SetupService:
         Mirrors :meth:`_assert_jersey_available` exactly: only an active
         membership reserves a number, only concrete numbers are constrained,
         and the raise is the SAME stable ``IntegrityConflictError`` migration
-        052's ``ux_srm_active_team_jersey`` partial unique index produces on
+        059's ``ux_srm_active_team_jersey`` partial unique index produces on
         a lost cross-process race. Callers run this BEFORE mutating."""
         if jersey_number is None:
             return
@@ -2654,7 +2654,7 @@ class SetupService:
             *, exclude_membership_id: Optional[str] = None) -> None:
         """One AUTHORITATIVE active membership per (player, Season) — the
         epic's core uniqueness rule. Affiliate/call-up rows are outside it by
-        status. The database index (052) decides cross-process races; this
+        status. The database index (059) decides cross-process races; this
         pre-check turns the ordinary case into a named, actionable error."""
         conflicts = [m.id for m in
                      self.store.active_memberships_for_player_in_season(
@@ -2689,7 +2689,7 @@ class SetupService:
         Player fields until the cutover slice.
 
         ``position``/``jersey_number``/``shoots`` default to the player's
-        current permanent values (the same copy the 052 backfill performs);
+        current permanent values (the same copy the 059 backfill performs);
         pass explicit values — including ``None`` for jersey/shoots — to
         override. A terminal status can't be born (``released``/
         ``transferred`` rows exist only as ended stints), and an ``active``
@@ -2702,7 +2702,7 @@ class SetupService:
         the one thing they share (the player) both could observe "no open
         row" and both insert. The Player lock is that common lock — an
         under-lock re-read, mirroring the Team lock's own #201 discipline —
-        and migration 052's ``ux_srm_open_player_league_season`` partial
+        and migration 059's ``ux_srm_open_player_league_season`` partial
         unique index is the engine-level backstop for any write that still
         reaches the table without it (translated to this SAME
         ``membership_open_conflict`` reason by ``db_errors.py``).
@@ -2755,7 +2755,7 @@ class SetupService:
         self._validate_jersey_number(jersey)
         canonical_shoots = self._validate_shoots(
             player.shoots if shoots is _UNSET else shoots)
-        # Uniqueness pre-checks (the 052 partial unique indexes decide any
+        # Uniqueness pre-checks (the 059 partial unique indexes decide any
         # cross-process race the same way, via IntegrityConflictError).
         open_rows = self.store.open_memberships_for_player_in_league_season(
             player_id, league_season_id)

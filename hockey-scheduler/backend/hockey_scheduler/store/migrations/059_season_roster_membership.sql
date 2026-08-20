@@ -1,10 +1,54 @@
--- 052_season_roster_membership: seasonal athlete roster memberships on the
+-- 059_season_roster_membership: seasonal athlete roster memberships on the
 -- permanent Team + LeagueSeason spine (#205 Slice A).
 --
--- (Numbered 052: 051 is reserved by the #273 athlete-identity slice, which
--- sits ahead of #205 in the owner-directed merge order on #212. The loader
--- applies versions in numeric order and tolerates gaps — 003 and 043 are
--- already absent.)
+-- NUMBERING NOTE (parallel lanes, #425 owner review): originally authored as
+-- 052_season_roster_membership, on the assumption that 051 was reserved by
+-- the #273 athlete-identity slice and 052 was the next number free for #205
+-- in the owner-directed merge order on #212. By the time this branch's PR
+-- reached review, main had independently advanced through 058
+-- (051_active_context_generation, 052_epoch_fence_version,
+-- 053_season_copy_forward_commits, 054_copy_forward_response_snapshot,
+-- 055_copy_forward_request_identity, #426's 056_data_access_log /
+-- 057_device_token_unique_key, and #424's own renumbered
+-- 058_athlete_identity) -- so this file collided head-on with main's OWN
+-- 052_epoch_fence_version: same leading number, DIFFERENT filename, which
+-- means git's merge saw no textual conflict at all and both files simply
+-- coexisted in migrations/.
+--
+-- That was not a mere cosmetic collision. On a database already migrated
+-- through main's 058 BEFORE this file ever existed, migrate() applies this
+-- file chronologically LAST (it was never recorded in schema_migrations, so
+-- it lands whenever the loop first reaches it) -- but on a FRESH database
+-- the same file sorts and applies BEFORE 053-058, since
+-- "052_season_roster_membership" < "053_season_copy_forward_commits"
+-- lexicographically. Two different real DDL-execution orders for the same
+-- file depending on install history. That ordering split is load-bearing
+-- here and not merely theoretical: this migration's own preflight and
+-- backfill read seasons/league_seasons/season_team_registrations/players,
+-- tables that 053-058 also alter, so "which order" decides what the
+-- backfill actually sees.
+--
+-- Resolved exactly the way #424's identical defect was (it renumbered its
+-- own 051_athlete_identity -> 058 for the same reason, which is in turn how
+-- #426 resolved its 053/055 -> 056/057 collision): renumber past main's
+-- claimed range, to 059. No functional statement below changed; only the
+-- version stem moved from 052 to 059 in all 63 branch-owned references:
+-- the filename itself; sql_store.py's _PRE_MIGRATION_CHECKS registry key;
+-- the competition-reset migration/reopen rewind tests' _V052 -> _V059
+-- constants and test_season_roster_membership.py's _VERSION constant and
+-- _downgrade_052 -> _downgrade_059 helper; the migration-inventory test;
+-- and the "migration 052" prose naming this migration across
+-- domain/enums.py, domain/setup_models.py, services/setup_service.py,
+-- store/db_errors.py, store/integrity_checks.py, store/memory_store.py,
+-- store/sql_store.py, and the Slice A / competition-reset / season-team-
+-- registration test suites. main's OWN 052_epoch_fence_version and every
+-- reference to it (including #424's 058 note and #423's epoch-fence test
+-- prose) are deliberately left untouched.
+--
+-- Migrations here are FORWARD-ONLY (see sql_store.migrate's docstring):
+-- there is no downgrade/revert path in this codebase, so the rename has no
+-- reverse-direction logic to update -- the only ordering that exists is the
+-- forward one described above.
 --
 -- Today ``players.team_id`` makes Team membership PERMANENT: one player, one
 -- team, forever, in every Season that team plays. #205 replaces that with a

@@ -11,13 +11,13 @@ This module proves the bounded Slice A surface:
     (player, Season) with ``affiliate`` as the governed exception; terminal
     rows (released/transferred) as immutable history whose successor stint
     is a NEW row.
-  * MIGRATION 052 — deterministic backfill (active players x non-archived
+  * MIGRATION 059 — deterministic backfill (active players x non-archived
     registered Seasons, values copied, ``srm_legacy_`` compatibility-map
     ids, NULL ``effective_from``, EMPTY event history, GuardianLinks
     untouched), preflight that REPORTS ambiguous/dangling rows and aborts
     with the database left byte-identical (no ledger row, no tables), and
     an idempotent re-run once the operator fixes the named rows.
-  * DB ENFORCEMENT — migration 052's two partial unique indexes hold under
+  * DB ENFORCEMENT — migration 059's two partial unique indexes hold under
     a direct store write that bypasses every service pre-check, and the
     violation is translated to the SAME stable conflict the pre-check
     raises.
@@ -29,11 +29,11 @@ seasons) that only an actual engine can execute. A SKIP IS NOT A PASS — the
 PostgreSQL classes announce loudly when TEST_DATABASE_URL is unset.
 
 FALSIFIERS (each measured while developing this slice):
-  * delete the ``WHERE p.is_active = 1`` line of migration 052's INSERT and
+  * delete the ``WHERE p.is_active = 1`` line of migration 059's INSERT and
     the inactive-player backfill tests turn red on SQLite and PostgreSQL;
   * delete ``AND s.status = 'active'`` and the archived-season tests turn
     red the same way;
-  * unregister ``052_season_roster_membership`` from _PRE_MIGRATION_CHECKS
+  * unregister ``059_season_roster_membership`` from _PRE_MIGRATION_CHECKS
     and the preflight-abort tests turn red (the dirty upgrade "succeeds");
   * drop either partial unique index from the migration and the
     direct-store conflict tests turn red on both SQL engines.
@@ -71,7 +71,7 @@ from hockey_scheduler.store.integrity_checks import (
 from hockey_scheduler.store.sql_store import migrate
 
 ADMIN = "setup_admin"
-_VERSION = "052_season_roster_membership"
+_VERSION = "059_season_roster_membership"
 
 
 def _fixture(api, program="Over 55", season="Fall 2026"):
@@ -617,9 +617,9 @@ def _fresh(url):
     return store
 
 
-def _downgrade_052(store):
-    """Simulate a pre-052 database: drop the two tables (their indexes go
-    with them) and un-record the version, so the next migrate() re-runs 052
+def _downgrade_059(store):
+    """Simulate a pre-059 database: drop the two tables (their indexes go
+    with them) and un-record the version, so the next migrate() re-runs 059
     against whatever data the test has planted."""
     with store.transaction():
         cur = store.conn.cursor()
@@ -630,7 +630,7 @@ def _downgrade_052(store):
 
 
 def _seed_legacy(api):
-    """A pre-052-shaped world: one active Season with a registered Team, an
+    """A pre-059-shaped world: one active Season with a registered Team, an
     active + an inactive Player, an ARCHIVED Season the same Team is also
     registered in, and a GuardianLink on the active Player. Returns the ids
     the backfill assertions need."""
@@ -653,7 +653,7 @@ def _seed_legacy(api):
 
 
 class MembershipBackfillTest(unittest.TestCase):
-    """Migration 052's deterministic backfill + preflight + rollback, on
+    """Migration 059's deterministic backfill + preflight + rollback, on
     SQLite AND (when configured) PostgreSQL via _sql_backends()."""
 
     def _cleanup(self, store):
@@ -667,8 +667,8 @@ class MembershipBackfillTest(unittest.TestCase):
             try:
                 api = ApiService(store)
                 ids = _seed_legacy(api)
-                _downgrade_052(store)
-                migrate(store.conn, store.dialect)  # re-applies 052
+                _downgrade_059(store)
+                migrate(store.conn, store.dialect)  # re-applies 059
 
                 rows = store.all_season_roster_memberships()
                 # EXACTLY one membership: the active player in the active
@@ -718,7 +718,7 @@ class MembershipBackfillTest(unittest.TestCase):
                     ("ghost", ids["active"]))
                 if store.backend == "sqlite":
                     store.conn.commit()
-                _downgrade_052(store)
+                _downgrade_059(store)
 
                 self.assertEqual(
                     find_active_players_with_missing_team(store.conn),
@@ -781,7 +781,7 @@ class MembershipBackfillTest(unittest.TestCase):
                     store.add_season_team_registration(SeasonTeamRegistration(
                         id="streg_dup", league_season_id=ls_b,
                         team_id=ids["team"], active=True))
-                _downgrade_052(store)
+                _downgrade_059(store)
 
                 self.assertEqual(
                     find_teams_with_duplicate_active_season_registrations(
@@ -809,7 +809,7 @@ class MembershipBackfillTest(unittest.TestCase):
 
 
 class MembershipBackfillSpineTest(unittest.TestCase):
-    """Migration 052's preflight validates the FULL registration ->
+    """Migration 059's preflight validates the FULL registration ->
     LeagueSeason -> Season/League spine, Team<->LeagueSeason League
     coherence, League<->Season Program coherence (#205 review round 1
     finding 3), AND the Team's OWN Program against its League's (#205
@@ -864,7 +864,7 @@ class MembershipBackfillSpineTest(unittest.TestCase):
                     ("ghost_ls", reg.id))
                 if store.backend == "sqlite":
                     store.conn.commit()
-                _downgrade_052(store)
+                _downgrade_059(store)
 
                 self.assertEqual(
                     find_active_players_with_dangling_registration_target(
@@ -904,7 +904,7 @@ class MembershipBackfillSpineTest(unittest.TestCase):
                     ("ghost_league", ids["ls"]))
                 if store.backend == "sqlite":
                     store.conn.commit()
-                _downgrade_052(store)
+                _downgrade_059(store)
 
                 found = find_active_players_with_dangling_league_season_parents(
                     store.conn)
@@ -950,7 +950,7 @@ class MembershipBackfillSpineTest(unittest.TestCase):
                     (ls_b.id, reg.id))
                 if store.backend == "sqlite":
                     store.conn.commit()
-                _downgrade_052(store)
+                _downgrade_059(store)
 
                 found = find_active_players_with_team_league_mismatch(
                     store.conn)
@@ -991,7 +991,7 @@ class MembershipBackfillSpineTest(unittest.TestCase):
                     (other_program["id"], ids["ls"]))
                 if store.backend == "sqlite":
                     store.conn.commit()
-                _downgrade_052(store)
+                _downgrade_059(store)
 
                 found = find_active_players_with_program_mismatch(store.conn)
                 self.assertEqual(len(found), 1, (label, found))
@@ -1043,7 +1043,7 @@ class MembershipBackfillSpineTest(unittest.TestCase):
                     (other_program["id"], ids["team"]))
                 if store.backend == "sqlite":
                     store.conn.commit()
-                _downgrade_052(store)
+                _downgrade_059(store)
 
                 # Both ROUND 1 spine checks stay clean — this is a NEW gap,
                 # not a duplicate of either.
@@ -1080,7 +1080,7 @@ class MembershipBackfillSpineTest(unittest.TestCase):
 
 
 class MembershipIndexEnforcementTest(unittest.TestCase):
-    """Migration 052's partial unique indexes hold when the service layer is
+    """Migration 059's partial unique indexes hold when the service layer is
     bypassed entirely, and the violation carries the SAME stable conflict
     the pre-checks raise — on SQLite AND (when configured) PostgreSQL."""
 
@@ -1365,7 +1365,7 @@ _PG_SKIP = ("PostgreSQL not configured (TEST_DATABASE_URL) or psycopg "
             "exercised on PostgreSQL. A SKIP HERE IS NOT A PASS: the "
             "authoritative-active and season-Team jersey rules are partial "
             "unique indexes whose predicate/NULL semantics only a real "
-            "engine evaluates, and the 052 backfill is multi-table SQL that "
+            "engine evaluates, and the 059 backfill is multi-table SQL that "
             "must run under PostgreSQL's stricter typing. Set "
             "TEST_DATABASE_URL (run_parallel.py --postgres does) to run it.")
 
@@ -1388,7 +1388,7 @@ def _race_fixture(url):
 
 @unittest.skipUnless(os.environ.get("TEST_DATABASE_URL"), _PG_SKIP)
 class MembershipOpenStintRaceTest(unittest.TestCase):
-    """Real TWO-CONNECTION PostgreSQL races proving migration 052's new
+    """Real TWO-CONNECTION PostgreSQL races proving migration 059's new
     ``ux_srm_open_player_league_season`` index (#205 review round 1 finding
     1) is a genuine engine-level backstop — bypassing the service layer
     ENTIRELY (no Team lock, no Season lock, no Player lock: two bare
@@ -1409,7 +1409,7 @@ class MembershipOpenStintRaceTest(unittest.TestCase):
     INSERT block until the first's transaction resolves, then raise once it
     sees the committed row (see race_with_forced_order's docstring).
 
-    Falsifier: `git stash` migration 052's new index (keep db_errors.py's
+    Falsifier: `git stash` migration 059's new index (keep db_errors.py's
     translation) and both forced orderings below regress to the SECOND
     insert also succeeding (0 IntegrityConflictError) instead of raising.
     """
@@ -1482,7 +1482,7 @@ class MembershipOpenStintRaceTest(unittest.TestCase):
 class MembershipServiceCreateRaceTest(unittest.TestCase):
     """Real TWO-CONNECTION PostgreSQL races THROUGH the service
     (``create_season_roster_membership``), proving the full defended path —
-    the Season row lock, the new Player row lock, and migration 052's new
+    the Season row lock, the new Player row lock, and migration 059's new
     index as backstop (#205 review round 1 finding 1) — for applicant/
     affiliate/inactive on DIFFERENT registered Teams of the SAME
     LeagueSeason, both orderings, exactly one success, and ZERO membership/

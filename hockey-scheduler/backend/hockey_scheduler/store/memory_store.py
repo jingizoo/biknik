@@ -891,7 +891,7 @@ class InMemoryStore:
             season_id: str) -> List[SeasonRosterMembership]:
         """Every AUTHORITATIVE (active) membership at this (player, Season)
         key. Normally 0 or 1 — SQL's ``ux_srm_active_player_season`` partial
-        unique index (migration 052) guarantees it there — but this store has
+        unique index (migration 059) guarantees it there — but this store has
         no equivalent enforcement on add/save, so returning the list lets
         callers detect legacy/corrupted multiplicity instead of assuming a
         bare lookup is unambiguous (``registrations_for_team_in_league_season``

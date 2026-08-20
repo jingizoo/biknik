@@ -106,7 +106,7 @@ class MigrationApplyTest(unittest.TestCase):
             # Remove it before league_seasons; deleting the migration ledger
             # below makes the adoption replay rebuild it in canonical order.
             cur.execute("DROP TABLE IF EXISTS schedule_scenarios")
-            # 052's membership tables (#205 Slice A) are later dependents of
+            # 059's membership tables (#205 Slice A) are later dependents of
             # the same hierarchy; the wiped ledger below makes the adoption
             # replay rebuild them in canonical order too.
             cur.execute("DROP TABLE IF EXISTS season_roster_membership_events")

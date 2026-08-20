@@ -25,7 +25,7 @@ from hockey_scheduler.store.sql_store import migrate
 _VERSION = "028_competition_reset"
 _V035 = "035_competition_hierarchy_reset"
 _V050 = "050_schedule_scenarios"
-_V052 = "052_season_roster_membership"
+_V059 = "059_season_roster_membership"
 
 
 def _sql_targets():
@@ -63,8 +63,8 @@ def _downgrade_035(store):
         # itself does not come back after the replay below -- harmless, since
         # nothing in this migration-history suite reads or writes it.
         cur.execute("DROP TABLE IF EXISTS age_eligibility_rules")
-        # 052's membership tables (#205 Slice A) are later hierarchy children
-        # too; rewind them the same way, and un-record 052 below so the
+        # 059's membership tables (#205 Slice A) are later hierarchy children
+        # too; rewind them the same way, and un-record 059 below so the
         # reopen replay rebuilds them alongside 035 and 050.
         cur.execute("DROP TABLE IF EXISTS season_roster_membership_events")
         cur.execute("DROP TABLE IF EXISTS season_roster_memberships")
@@ -87,7 +87,7 @@ def _downgrade_035(store):
         cur.execute("DROP TABLE IF EXISTS league_seasons")
         cur.execute(store.dialect.sql(
             "DELETE FROM schema_migrations WHERE version IN (?, ?, ?)"),
-            (_V035, _V050, _V052))
+            (_V035, _V050, _V059))
 
 
 def _downgrade_028(store):

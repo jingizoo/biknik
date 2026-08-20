@@ -314,7 +314,7 @@ class SeasonRosterMembership:
     service layer, mirroring registration rule 7. ``season_id`` is carried
     denormalized (service-enforced equal to the LeagueSeason's ``season_id``)
     so the ONE database-expressible uniqueness rule — at most one
-    ``active`` membership per (player, Season), migration 052's partial
+    ``active`` membership per (player, Season), migration 059's partial
     unique index — needs no join. ``affiliate`` rows are the governed call-up
     exception and sit outside that rule.
 
@@ -322,7 +322,7 @@ class SeasonRosterMembership:
     durable-athlete substrate arrives with #273, which preserves Player ids,
     so this column is the forward-compatible identity key today and the
     compatibility map's join column for backfilled rows (``srm_legacy_*``
-    ids, migration 052).
+    ids, migration 059).
 
     ``position`` / ``jersey_number`` / ``shoots`` are SEASON-SCOPED (#269
     becomes (LeagueSeason, Team)-scoped for memberships): they describe this
@@ -360,7 +360,7 @@ class SeasonRosterMembershipEvent:
     mutation it performs. ``detail`` carries the machine-readable
     field-by-field before/after values; ``reason`` is the operator-supplied
     justification (required by the future transfer/release workflows, opt-in
-    here). Backfilled memberships (migration 052) start with an EMPTY
+    here). Backfilled memberships (migration 059) start with an EMPTY
     history rather than a fabricated "created" event, because the migration
     has no honest timestamp or actor for one.
 

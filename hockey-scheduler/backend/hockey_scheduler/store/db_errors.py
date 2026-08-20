@@ -63,7 +63,7 @@ _CONCURRENCY_MESSAGE = (
 
 _CONCURRENCY_REASONS = frozenset(_PG_CONCURRENCY.values())
 _ACTIVE_TEAM_JERSEY_CONSTRAINT = "ux_players_active_team_jersey"
-# Migration 052 (#205 Slice A) partial unique indexes.
+# Migration 059 (#205 Slice A) partial unique indexes.
 _SRM_ACTIVE_PLAYER_SEASON_CONSTRAINT = "ux_srm_active_player_season"
 _SRM_ACTIVE_TEAM_JERSEY_CONSTRAINT = "ux_srm_active_team_jersey"
 # #205 review round 1 finding 1.
@@ -126,7 +126,7 @@ def translate_registration_number_exception(
 
 def translate_membership_conflict_exception(
         exc: BaseException, membership) -> Optional[DomainError]:
-    """Translate migration 052's partial-unique violations with domain-safe
+    """Translate migration 059's partial-unique violations with domain-safe
     context (#205 Slice A).
 
     The membership store write site knows the attempted row, so a race lost to

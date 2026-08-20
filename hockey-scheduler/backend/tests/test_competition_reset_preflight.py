@@ -70,7 +70,7 @@ def _downgrade_to_pre028(store):
     # scenario persistence or age-eligibility rules (#273).
     cur.execute("DROP TABLE IF EXISTS schedule_scenarios")
     cur.execute("DROP TABLE IF EXISTS age_eligibility_rules")
-    # 052's membership tables (#205 Slice A) are later children of this same
+    # 059's membership tables (#205 Slice A) are later children of this same
     # hierarchy (league_seasons/seasons/teams/players); PostgreSQL likewise
     # requires the dependents to go first, and these read-only preflight
     # tests never exercise membership persistence.

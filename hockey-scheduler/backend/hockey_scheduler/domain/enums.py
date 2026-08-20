@@ -41,7 +41,7 @@ class MembershipStatus(str, Enum):
 
     ``active`` is the AUTHORITATIVE state: at most one active membership per
     (player, Season) exists — enforced by the service layer and by migration
-    052's partial unique index. ``affiliate`` is the governed call-up
+    059's partial unique index. ``affiliate`` is the governed call-up
     exception the epic names: it marks secondary participation and is
     deliberately outside that uniqueness rule. ``applicant`` is a pending
     request that occupies no roster place yet; ``inactive`` (parked, the

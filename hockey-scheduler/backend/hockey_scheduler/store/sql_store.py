@@ -467,7 +467,7 @@ _PRE_MIGRATION_CHECKS = {
     "047_official_import_unique_keys":
         assert_officials_availability_import_constraints_ready,
     "048_rink_external_ref_unique": assert_no_duplicate_rink_external_refs,
-    "052_season_roster_membership":
+    "059_season_roster_membership":
         assert_season_roster_membership_backfill_ready,
 }
 
@@ -1860,7 +1860,7 @@ class SqlStore:
 
     # -- season roster memberships (#205 Slice A) --------------------------
     def _write_season_roster_membership(self, write, m):
-        # A race lost to either 052 partial unique index (authoritative
+        # A race lost to either 059 partial unique index (authoritative
         # active membership per (player, Season); active jersey per
         # (LeagueSeason, Team)) surfaces as the SAME stable conflict the
         # service pre-checks raise — mirrors _write_player exactly.
@@ -1893,7 +1893,7 @@ class SqlStore:
             (league_season_id, team_id), order="id")
     def active_memberships_for_player_in_season(self, player_id, season_id):
         """Every AUTHORITATIVE (status = 'active') membership at this
-        (player, Season) key. Always 0 or 1 here — migration 052's
+        (player, Season) key. Always 0 or 1 here — migration 059's
         ``ux_srm_active_player_season`` makes a second impossible to insert —
         but returning a list gives InMemoryStore's own (unenforced)
         equivalent a uniform contract callers can share, mirroring

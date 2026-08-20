@@ -1504,7 +1504,7 @@ def assert_no_duplicate_device_tokens(conn):
 
 
 # --------------------------------------------------------------------------- #
-# 052 season roster membership (#205 Slice A): deterministic backfill of      #
+# 059 season roster membership (#205 Slice A): deterministic backfill of      #
 # active Players into SeasonRosterMembership rows on the Team + LeagueSeason  #
 # spine. Every shape of source data the backfill cannot translate             #
 # deterministically is REPORTED here (row-level, bounded) and aborts the      #
@@ -1513,7 +1513,7 @@ def assert_no_duplicate_device_tokens(conn):
 def find_active_players_with_missing_team(conn):
     """Active Players whose ``team_id`` resolves to no Team row.
 
-    Migration 052's backfill derives a membership from the player's Team's
+    Migration 059's backfill derives a membership from the player's Team's
     active Season registrations, so a dangling ``team_id`` has NO deterministic
     target. Skipping such a player silently would strand them with no
     membership at the consumer cutover — a silent eligibility loss — so the
@@ -1535,7 +1535,7 @@ def find_teams_with_duplicate_active_season_registrations(conn):
     League has at most one LeagueSeason per Season), so a duplicate can only
     be legacy/corrupted data predating full enforcement. Backfilling through
     one would mint two ``active`` memberships per (player, Season) — exactly
-    what migration 052's partial unique index forbids — so which registration
+    what migration 059's partial unique index forbids — so which registration
     the players' Season participation "means" is ambiguous and must be
     resolved by an operator, not guessed. Archived Seasons are exempt: the
     backfill never writes into them."""
@@ -1551,12 +1551,12 @@ def find_teams_with_duplicate_active_season_registrations(conn):
 
 
 def find_backfill_candidate_jersey_duplicates(conn):
-    """Active (team, jersey) duplicates among the players migration 052 will
+    """Active (team, jersey) duplicates among the players migration 059 will
     actually backfill — teams with an active registration in a non-archived
     Season.
 
     Migration 038's partial unique index makes this state impossible on a
-    correctly-migrated database, but 052 inserts into a NEW
+    correctly-migrated database, but 059 inserts into a NEW
     (league_season, team, jersey) unique scope and must never trust another
     migration's constraint as its own preflight (#201 discipline: report the
     offending rows, don't surface an opaque driver error). Deliberately
@@ -1582,7 +1582,7 @@ def find_active_players_with_dangling_registration_target(conn):
     ``league_season_id`` that does not exist (#205 review round 1 finding
     3).
 
-    Migration 052's backfill INSERT reaches this row only through an INNER
+    Migration 059's backfill INSERT reaches this row only through an INNER
     JOIN onto ``league_seasons`` — a dangling target does not error, it is
     SILENTLY DROPPED, so the backfill would complete with FEWER memberships
     than the permanent model actually grants that player today (a silent
@@ -1632,7 +1632,7 @@ def find_active_players_with_team_league_mismatch(conn):
 
     The live SERVICE path enforces this identical rule 7 analog on every
     ``create_season_roster_membership`` call (``team.league_id != ls.
-    league_id``); migration 052's backfill trusts ``league_season_id``
+    league_id``); migration 059's backfill trusts ``league_season_id``
     blindly instead. A registration corrupted to point at ANOTHER League's
     LeagueSeason in the same active Season currently passes every existing
     preflight check and silently backfills a membership whose Team and
@@ -1703,7 +1703,7 @@ def find_active_players_with_team_program_mismatch(conn):
     — leaving its ``league_id``, and that League's own League/LeagueSeason/
     Season chain, otherwise perfectly coherent — passes BOTH existing
     checks cleanly and still backfills: the review demonstrated exactly
-    this on SQLite (preflight clean, migration 052 backfilled anyway) and
+    this on SQLite (preflight clean, migration 059 backfilled anyway) and
     it reproduces identically on PostgreSQL (see
     ``MembershipBackfillSpineTest.test_team_program_mismatch_aborts_and_
     repairs``). The resulting row would claim a Team's participation under
@@ -1733,7 +1733,7 @@ def find_active_players_with_team_program_mismatch(conn):
 
 
 def assert_season_roster_membership_backfill_ready(conn):
-    """Abort migration 052 (#205 Slice A) unless the membership backfill is
+    """Abort migration 059 (#205 Slice A) unless the membership backfill is
     fully deterministic for every row it would derive.
 
     Read-only: raises :class:`MigrationDataError` with bounded row-level
