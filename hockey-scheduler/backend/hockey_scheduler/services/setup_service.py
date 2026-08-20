@@ -156,6 +156,22 @@ def _parse_iso_utc(value) -> Optional[datetime]:
 
 _DATE_ONLY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
+# #205 Slice A membership lifecycle sets (review round 3 blocker 2).
+#
+# PARKED — the stint is open but holds no roster place: it was set aside and
+# can be brought back. A parked row's spine was validated when the row was
+# BORN and never since, so any move OUT of one is a revival that must
+# re-prove the spine still holds.
+_PARKED_MEMBERSHIP_STATUSES = frozenset({
+    MembershipStatus.INACTIVE, MembershipStatus.INJURED})
+# REVIVING — the targets ``create_season_roster_membership`` requires a full
+# valid spine for, so a parked row may only re-enter one on a spine that is
+# still valid. Exactly the three statuses ``_assert_membership_spine_valid``
+# has always named in its own contract.
+_REVIVING_MEMBERSHIP_STATUSES = frozenset({
+    MembershipStatus.ACTIVE, MembershipStatus.APPLICANT,
+    MembershipStatus.AFFILIATE})
+
 
 def resolve_timezone(name):
     """Return a ``ZoneInfo`` for an IANA name, or ``None`` if it is unknown or
@@ -2813,6 +2829,16 @@ class SetupService:
         silently absorbed, so the event history never lies about a change
         that didn't happen.
 
+        REVIVING a PARKED row (``inactive``/``injured``) into ``applicant``,
+        ``affiliate`` or ``active`` revalidates the FULL Player/Team/
+        LeagueSeason/active-registration spine first (#205 review round 3
+        blocker 2) — the same spine ``create_season_roster_membership``
+        demands for those three statuses, and the same set
+        ``_assert_membership_spine_valid`` names in its own contract. The
+        UNIQUENESS rules stay ``active``-only: reviving to applicant or
+        affiliate re-proves the spine without acquiring the one-open-stint
+        or season-Team jersey constraints, exactly as before.
+
         Entering a TERMINAL status is UNCONDITIONALLY REFUSED — a hard
         ``NotAuthorizedError``, never reachable by any caller, actor_id or
         reason string (#205 review round 2, owner product ruling overriding
@@ -2852,12 +2878,38 @@ class SetupService:
                 f"Membership is already {status.value}.",
                 {"reason": "membership_status_unchanged",
                  "status": status.value})
-        if status is MembershipStatus.ACTIVE:
+        # #205 review round 3 blocker 2 — REVIVING a parked row revalidates
+        # the spine for EVERY target that requires one, not only ``active``.
+        # This guard used to be spelled ``if status is ACTIVE``, even though
+        # ``_assert_membership_spine_valid``'s own contract has always named
+        # ``active``/``applicant``/``affiliate``: the helper was right and
+        # its single call site was wrong. A membership parked to inactive/
+        # injured, whose SeasonTeamRegistration was then deactivated (or
+        # whose Team/LeagueSeason/Player vanished, or whose Team moved
+        # League), could be moved inactive->applicant or inactive->affiliate
+        # and the new status was written on that dead spine — reproduced on
+        # Memory, SQLite and PostgreSQL. It matters because ``create`` for
+        # those same statuses REQUIRES an active registration, and the
+        # parent-mutation guards treat every non-terminal membership as
+        # live, so a restored backup or direct write could be re-exposed
+        # through a status change.
+        #
+        # Scoped deliberately: the SOURCE must be parked and the TARGET must
+        # be one create validates a spine for. The uniqueness rules below
+        # stay ACTIVE-only — reviving to applicant/affiliate re-proves the
+        # spine, and does NOT start applying the one-open-stint or jersey
+        # rules to non-active statuses. Terminal targets never reach here:
+        # ``is_terminal`` is disjoint from _REVIVING_MEMBERSHIP_STATUSES, so
+        # the unconditional refusal below still fires first and unchanged.
+        if status is MembershipStatus.ACTIVE or (
+                membership.status in _PARKED_MEMBERSHIP_STATUSES
+                and status in _REVIVING_MEMBERSHIP_STATUSES):
             # #205 review round 1 finding 2 — the spine check runs BEFORE
             # the uniqueness re-checks: a reactivation onto a spine that no
             # longer holds is invalid regardless of whether another active
             # membership or jersey happens to conflict.
             self._assert_membership_spine_valid(membership)
+        if status is MembershipStatus.ACTIVE:
             self._assert_no_active_membership_conflict(
                 membership.player_id, membership.season_id,
                 exclude_membership_id=membership.id)

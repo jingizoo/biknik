@@ -457,6 +457,335 @@ class ReactivationSpineTest(unittest.TestCase):
                 self.assertEqual(res["status"], "active", label)
 
 
+
+# --------------------------------------------------------------------------- #
+# #205 review round 3 blocker 2 — reviving a PARKED membership on a broken     #
+# spine. ReactivationSpineTest above proves the -> ``active`` path; the guard  #
+# it tests was written as ``if status is ACTIVE``, so EVERY OTHER target left  #
+# the spine unchecked. The owner reproduced inactive -> applicant and          #
+# inactive -> affiliate on Memory AND SQLite: both succeeded and wrote the new #
+# status onto a registration that had been deactivated through the store.      #
+# --------------------------------------------------------------------------- #
+
+# The PARKED statuses a stint can be set aside in, and the targets
+# ``create_season_roster_membership`` demands a full valid spine for. Every
+# (parked, target) pair below is a REVIVAL and must re-prove the spine.
+_PARKED = ("inactive", "injured")
+_REVIVE_TARGETS = ("applicant", "affiliate", "active")
+
+
+def _suspend_membership_fks(store):
+    """Let a test repoint a membership at a parent id that does not exist.
+
+    Only the ``season_roster_memberships`` table's OWN outbound foreign keys
+    are suspended — never the whole schema — so the corruption stays exactly
+    as narrow as the state under test. SQLite has no per-constraint DROP for
+    inline FKs, so enforcement is disabled on the connection; PostgreSQL's
+    are looked up from ``pg_constraint`` rather than assumed by name.
+
+    Repointing the MEMBERSHIP is deliberate, and is why this works
+    identically on all three stores: deleting the parent Team/Player row
+    instead would collide with the FKs that OTHER tables (players.team_id,
+    game_roster_entries, ...) hold on it, which is why
+    ReactivationSpineTest's own delete-based probes above can only run on
+    Memory. The membership's view of its spine — a required pointer naming
+    a row that is not there — is identical either way, and it is that view
+    ``_assert_membership_spine_valid`` reads."""
+    if not isinstance(store, SqlStore):
+        return
+    cur = store.conn.cursor()
+    if store.backend == "sqlite":
+        cur.execute("PRAGMA foreign_keys = OFF")
+        return
+    cur.execute("SELECT conname FROM pg_constraint WHERE conrelid = "
+                "'season_roster_memberships'::regclass AND contype = 'f'")
+    for row in cur.fetchall():
+        cur.execute("ALTER TABLE season_roster_memberships "
+                    f"DROP CONSTRAINT {row['conname']}")
+
+
+def _repoint_membership(api, membership_id, **fields):
+    """Write a raw pointer straight onto the membership row, bypassing the
+    service — the out-of-band write (restored backup, direct SQL) that is
+    the only remaining way to reach a broken spine now that this module's
+    other fixes block every service-level parent mutation."""
+    _suspend_membership_fks(api.store)
+    row = api.store.get_season_roster_membership(membership_id)
+    for name, value in fields.items():
+        setattr(row, name, value)
+    if isinstance(api.store, SqlStore):
+        with api.store.transaction():
+            api.store.save_season_roster_membership(row)
+    else:
+        api.store.save_season_roster_membership(row)
+
+
+# Each breaker plants ONE broken-spine shape and returns the stable
+# ``reason`` the revival must fail with. Keyed by the kinds the owner named:
+# an inactive registration, a missing parent (one entry per parent the spine
+# actually has), and a Team<->League mismatch.
+def _break_registration_inactive(api, fx, m):
+    reg = api.store.get_season_team_registration(fx["reg"]["id"])
+    reg.active = False
+    if isinstance(api.store, SqlStore):
+        with api.store.transaction():
+            api.store.save_season_team_registration(reg)
+    else:
+        api.store.save_season_team_registration(reg)
+    return "team_not_registered"
+
+
+def _break_team_missing(api, fx, m):
+    _repoint_membership(api, m["id"], team_id="ghost_team")
+    return "membership_team_missing"
+
+
+def _break_league_season_missing(api, fx, m):
+    _repoint_membership(api, m["id"], league_season_id="ghost_ls")
+    return "membership_league_season_missing"
+
+
+def _break_player_missing(api, fx, m):
+    _repoint_membership(api, m["id"], player_id="ghost_player")
+    return "membership_player_missing"
+
+
+def _break_team_league_mismatch(api, fx, m):
+    team = api.store.get_team(fx["team"]["id"])
+    team.league_id = fx["other_league_id"]
+    if isinstance(api.store, SqlStore):
+        with api.store.transaction():
+            api.store.save_team(team)
+    else:
+        api.store.save_team(team)
+    return "membership_league_mismatch"
+
+
+_BREAKERS = {
+    "registration_inactive": _break_registration_inactive,
+    "missing_parent_team": _break_team_missing,
+    "missing_parent_league_season": _break_league_season_missing,
+    "missing_parent_player": _break_player_missing,
+    "team_league_mismatch": _break_team_league_mismatch,
+}
+
+
+class ParkedRevivalSpineTest(unittest.TestCase):
+    """#205 review round 3 blocker 2 — a PARKED membership must re-prove its
+    FULL Player/Team/LeagueSeason/active-registration spine before it is
+    revived into ANY of ``applicant``, ``affiliate`` or ``active``, not only
+    ``active``.
+
+    ``_assert_membership_spine_valid``'s own contract has always named all
+    three statuses; its single call site in
+    ``set_season_roster_membership_status`` fired on ``active`` alone. So a
+    membership created as ``applicant``, parked to ``inactive``, and whose
+    SeasonTeamRegistration was then deactivated through the store, could be
+    moved inactive -> applicant or inactive -> affiliate and the new status
+    was written onto that dead spine — reproduced by the owner on Memory and
+    SQLite, and by this branch on PostgreSQL as well. It matters because
+    ``create_season_roster_membership`` REQUIRES an active registration for
+    those very statuses, and the parent-mutation guards in this module treat
+    every non-terminal membership as live, so restored/direct-write
+    corruption could be re-exposed through a mere status change.
+
+    THE MATRIX, in full — the owner asked for the whole thing, not a sample:
+    3 stores (Memory, SQLite, PostgreSQL) x 2 parked sources (inactive,
+    injured) x 3 targets (applicant, affiliate, active) x 5 broken-spine
+    shapes = 90 refusals, each asserting the stable reason AND zero writes
+    across ALL THREE write surfaces (the membership row, the per-membership
+    event history, and the global audit log) — a caught exception alone does
+    not prove nothing was written, this module's own standing rule.
+
+    ``active`` is carried through the matrix alongside the two targets the
+    blocker names because it is the behaviour that was already correct: if a
+    future edit ever narrows the guard back to a subset, these cases fail
+    too, rather than silently ceding ground that was already won.
+    """
+
+    def _stores(self):
+        yield "memory", InMemoryStore()
+        yield "sqlite", SqlStore(":memory:")
+        url = os.environ.get("TEST_DATABASE_URL")
+        if url:
+            store = SqlStore(url)
+            store.reset_schema()
+            yield "postgres", store
+
+    def _close(self, label, store):
+        if label == "postgres":
+            store.reset_schema()
+        if isinstance(store, SqlStore):
+            store.close()
+
+    def _parked(self, api, fx, parked):
+        """The owner's exact opening: CREATE APPLICANT, then park it."""
+        m = _make_membership(api, fx, "applicant")
+        self.assertNotIn("error", m, m)
+        res = api.set_season_roster_membership_status(
+            m["id"], parked, actor_id=ADMIN)
+        self.assertNotIn("error", res, res)
+        return m
+
+    def _snapshot(self, api, membership_id):
+        """All THREE write surfaces: the row's own status, the append-only
+        per-membership event history, and the global setup audit log."""
+        row = api.store.get_season_roster_membership(membership_id)
+        events = api.store.events_for_membership(membership_id)
+        audits = [a for a in api.store.all_setup_audit()
+                  if a.entity_id == membership_id]
+        return (row.status.value, len(events), len(audits))
+
+    def test_broken_spine_refuses_every_revival_zero_write(self):
+        checked = 0
+        for label, store in self._stores():
+            try:
+                for parked in _PARKED:
+                    for kind, breaker in _BREAKERS.items():
+                        for target in _REVIVE_TARGETS:
+                            case = (label, parked, target, kind)
+                            with self.subTest(backend=label, parked=parked,
+                                              target=target, spine=kind):
+                                # A FRESH fixture per cell, deliberately:
+                                # sharing one planted corruption across the
+                                # three targets would let a single leaked
+                                # write contaminate the cells after it, so a
+                                # falsification run could not say WHICH cell
+                                # the guard actually covers.
+                                api = ApiService(store)
+                                fx = _fixture(api)
+                                m = self._parked(api, fx, parked)
+                                expected_reason = breaker(api, fx, m)
+                                before = self._snapshot(api, m["id"])
+                                self.assertEqual(before[0], parked, case)
+                                res = api.set_season_roster_membership_status(
+                                    m["id"], target, actor_id=ADMIN)
+                                self.assertIn("error", res, (case, res))
+                                self.assertEqual(
+                                    res["error"]["details"]["reason"],
+                                    expected_reason, (case, res))
+                                # ZERO WRITE on all three surfaces.
+                                self.assertEqual(
+                                    self._snapshot(api, m["id"]), before,
+                                    case)
+                            checked += 1
+            finally:
+                self._close(label, store)
+        # 2 parked x 3 targets x 5 spines = 30 per store. Memory + SQLite
+        # always; PostgreSQL when configured. Pinned so a store silently
+        # dropping out of self._stores() cannot shrink the matrix unnoticed.
+        expected = 30 * (3 if os.environ.get("TEST_DATABASE_URL") else 2)
+        self.assertEqual(checked, expected)
+
+    def test_intact_spine_revival_succeeds_from_every_parked_status(self):
+        """The guard must REFUSE a dead spine, not refuse everything: with
+        the spine untouched, every parked -> revival transition still
+        succeeds and writes its event + audit row exactly as before."""
+        checked = 0
+        for label, store in self._stores():
+            try:
+                for parked in _PARKED:
+                    for target in _REVIVE_TARGETS:
+                        with self.subTest(backend=label, parked=parked,
+                                          target=target):
+                            api = ApiService(store)
+                            fx = _fixture(api)
+                            m = self._parked(api, fx, parked)
+                            before = self._snapshot(api, m["id"])
+                            res = api.set_season_roster_membership_status(
+                                m["id"], target, actor_id=ADMIN)
+                            self.assertNotIn("error", res,
+                                             (label, parked, target, res))
+                            self.assertEqual(res["status"], target,
+                                             (label, parked, target))
+                            after = self._snapshot(api, m["id"])
+                            self.assertEqual(
+                                after,
+                                (target, before[1] + 1, before[2] + 1),
+                                (label, parked, target))
+                            checked += 1
+            finally:
+                self._close(label, store)
+        expected = 6 * (3 if os.environ.get("TEST_DATABASE_URL") else 2)
+        self.assertEqual(checked, expected)
+
+    def test_terminal_refusal_still_precedes_the_spine_check(self):
+        """A parked row targeting a TERMINAL status must still get the
+        unconditional ``terminal_transition_not_authorized`` refusal (#205
+        review round 2 owner ruling) — NOT a spine error — even when the
+        spine is broken. The revival set and the terminal set are disjoint,
+        so widening the spine guard must not reorder these two."""
+        for label, store in self._stores():
+            try:
+                for parked in _PARKED:
+                    for target in ("released", "transferred"):
+                        with self.subTest(backend=label, parked=parked,
+                                          target=target):
+                            api = ApiService(store)
+                            fx = _fixture(api)
+                            m = self._parked(api, fx, parked)
+                            _break_registration_inactive(api, fx, m)
+                            before = self._snapshot(api, m["id"])
+                            res = api.set_season_roster_membership_status(
+                                m["id"], target, actor_id=ADMIN)
+                            self.assertEqual(res["error"]["code"], "forbidden",
+                                             (label, parked, target, res))
+                            self.assertEqual(
+                                res["error"]["details"]["reason"],
+                                "terminal_transition_not_authorized",
+                                (label, parked, target, res))
+                            self.assertEqual(self._snapshot(api, m["id"]),
+                                             before, (label, parked, target))
+            finally:
+                self._close(label, store)
+
+    def test_revival_to_applicant_affiliate_keeps_active_only_uniqueness(self):
+        """Widening the SPINE check must not widen the UNIQUENESS rules. A
+        second player already holds the same jersey on an ACTIVE membership
+        of this (LeagueSeason, Team); reviving a parked row to applicant or
+        affiliate on an INTACT spine must still succeed, because the jersey
+        and one-active-per-Season rules remain ``active``-only."""
+        for label, store in self._stores():
+            try:
+                for target in ("applicant", "affiliate"):
+                    with self.subTest(backend=label, target=target):
+                        api = ApiService(store)
+                        fx = _fixture(api)
+                        # The parked row carries jersey 7.
+                        m = api.create_season_roster_membership(
+                            fx["player"]["id"], fx["ls_id"], fx["team"]["id"],
+                            status="applicant", jersey_number=7,
+                            actor_id=ADMIN)
+                        self.assertNotIn("error", m, m)
+                        self.assertNotIn(
+                            "error", api.set_season_roster_membership_status(
+                                m["id"], "inactive", actor_id=ADMIN))
+                        # Another player takes jersey 7 ACTIVE on the same
+                        # (LeagueSeason, Team).
+                        other = api.create_player(
+                            fx["team"]["id"], "Rival", "forward",
+                            jersey_number=7, actor_id=ADMIN)
+                        rival = api.create_season_roster_membership(
+                            other["id"], fx["ls_id"], fx["team"]["id"],
+                            status="active", jersey_number=7, actor_id=ADMIN)
+                        self.assertNotIn("error", rival, rival)
+                        # Reviving to applicant/affiliate is NOT blocked by
+                        # that active jersey — the rule is active-only.
+                        res = api.set_season_roster_membership_status(
+                            m["id"], target, actor_id=ADMIN)
+                        self.assertNotIn("error", res, (label, target, res))
+                        self.assertEqual(res["status"], target, (label, target))
+                        # ...and reviving the SAME row to ACTIVE still IS
+                        # blocked by it, unchanged.
+                        conflict = api.set_season_roster_membership_status(
+                            m["id"], "active", actor_id=ADMIN)
+                        self.assertEqual(
+                            conflict["error"]["details"]["reason"],
+                            "duplicate_membership_jersey_number",
+                            (label, target, conflict))
+            finally:
+                self._close(label, store)
+
 _PG_SKIP = ("PostgreSQL not configured (TEST_DATABASE_URL) or psycopg "
             "missing — the #205 review round 1 finding 2 parent-mutation "
             "races were NOT exercised on PostgreSQL. A SKIP HERE IS NOT A "
