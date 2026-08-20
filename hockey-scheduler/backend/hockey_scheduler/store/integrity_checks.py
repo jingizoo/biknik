@@ -1624,6 +1624,34 @@ def find_active_players_with_dangling_league_season_parents(conn):
                  for row in cur.fetchall())
 
 
+# A scope-spine key is BROKEN when either side is MISSING or the two
+# disagree — spelled out longhand because neither engine's null-safe
+# operator is both portable and correct here (#205 review round 3 blocker
+# 1). Measured on this box against SQLite 3.x and PostgreSQL 16 over the
+# five-row truth table (NULL/NULL, NULL/x, x/NULL, x/x, x/y):
+#
+#   * ``a != b`` — the form these checks USED to use — matches only x/y on
+#     BOTH engines: every NULL row evaluates UNKNOWN and is filtered out.
+#     That IS the defect: identical across engines, and identically wrong.
+#   * ``a IS NOT b`` — SQLite's null-safe operator — is a hard SYNTAX ERROR
+#     on PostgreSQL (``syntax error at or near "b"``), so it cannot be
+#     shared by a store that runs on both.
+#   * ``a IS DISTINCT FROM b`` — PostgreSQL's spelling, and parseable on
+#     recent SQLite builds — matches NULL/x, x/NULL and x/y on both, but
+#     deliberately NOT NULL/NULL: two missing keys are "not distinct". For
+#     a SCOPE SPINE that is exactly backwards — a Team with no Program and
+#     a League with no Program is two missing scope keys, not agreement —
+#     so it would still let the very rows this blocker is about through.
+#     It also depends on the SQLite build's vintage.
+#   * The form below matches NULL/NULL, NULL/x, x/NULL and x/y — IDENTICAL
+#     row sets on both engines, and the semantics the spine actually needs.
+#
+# Uses only ``IS NULL``/``!=``/``OR``, all core SQL, so it needs no dialect
+# translation. Formatted with ``.format(a=..., b=...)`` over trusted
+# in-module column names only — never over caller input.
+_MISSING_OR_UNEQUAL = "({a} IS NULL OR {b} IS NULL OR {a} != {b})"
+
+
 def find_active_players_with_team_league_mismatch(conn):
     """Active players (real backfill candidates: registration/LeagueSeason
     resolve, Season resolves and is active) whose Team's OWN permanent
@@ -1636,7 +1664,20 @@ def find_active_players_with_team_league_mismatch(conn):
     blindly instead. A registration corrupted to point at ANOTHER League's
     LeagueSeason in the same active Season currently passes every existing
     preflight check and silently backfills a membership whose Team and
-    LeagueSeason disagree."""
+    LeagueSeason disagree.
+
+    #205 review round 3 blocker 1 — a MISSING ``teams.league_id`` is a
+    violation too, not an exemption. This check used to carry an explicit
+    ``AND t.league_id IS NOT NULL``, so a candidate Team with NO League at
+    all slipped past cleanly and 059 backfilled a membership onto a spine
+    with no League on the Team side — while the service's own registration
+    path (``register_team_for_season``, #283 Slice E rule 2) will not even
+    leave an actively-registered Team league-less: it ASSIGNS the League it
+    is registering into. A Team that reaches this state did so outside the
+    service, and 059 must report it rather than materialize a membership
+    the live system could not have produced. See ``_MISSING_OR_UNEQUAL``
+    for why the comparison is spelled out longhand rather than using an
+    engine's null-safe operator."""
     cur = conn.cursor()
     cur.execute(
         "SELECT p.id AS player_id, t.id AS team_id, "
@@ -1647,8 +1688,8 @@ def find_active_players_with_team_league_mismatch(conn):
         "JOIN season_team_registrations r ON r.team_id = t.id AND r.active = 1 "
         "JOIN league_seasons ls ON ls.id = r.league_season_id "
         "JOIN seasons s ON s.id = ls.season_id AND s.status = 'active' "
-        "WHERE p.is_active = 1 AND t.league_id IS NOT NULL "
-        "AND t.league_id != ls.league_id")
+        "WHERE p.is_active = 1 AND "
+        + _MISSING_OR_UNEQUAL.format(a="t.league_id", b="ls.league_id"))
     return sorted((row["player_id"], row["team_id"], row["team_league_id"],
                   row["league_season_id"], row["ls_league_id"])
                  for row in cur.fetchall())
@@ -1665,7 +1706,17 @@ def find_active_players_with_program_mismatch(conn):
     that reached this state some other way (a restored backup, a direct
     write) — the exact defense-in-depth posture ``find_teams_with_
     duplicate_active_season_registrations`` already takes for a DIFFERENT
-    invariant this same backfill depends on."""
+    invariant this same backfill depends on.
+
+    #205 review round 3 blocker 1 — ``lg.program_id != s.program_id`` was
+    the whole predicate, so a NULL on EITHER side evaluated UNKNOWN and the
+    row was filtered out rather than reported: a League with no Program, or
+    a Season with no Program, backfilled cleanly. The service refuses both
+    (``_link_league_season`` raises ``league_season_program_mismatch`` when
+    one side is NULL and the other is not), so neither shape is reachable
+    through the live system. Now compared with ``_MISSING_OR_UNEQUAL``,
+    which reports a missing key on either side — including BOTH missing,
+    which ``IS DISTINCT FROM`` would call agreement."""
     cur = conn.cursor()
     cur.execute(
         "SELECT p.id AS player_id, ls.id AS league_season_id, "
@@ -1677,7 +1728,8 @@ def find_active_players_with_program_mismatch(conn):
         "JOIN league_seasons ls ON ls.id = r.league_season_id "
         "JOIN seasons s ON s.id = ls.season_id AND s.status = 'active' "
         "JOIN leagues lg ON lg.id = ls.league_id "
-        "WHERE p.is_active = 1 AND lg.program_id != s.program_id")
+        "WHERE p.is_active = 1 AND "
+        + _MISSING_OR_UNEQUAL.format(a="lg.program_id", b="s.program_id"))
     return sorted((row["player_id"], row["league_season_id"],
                   row["league_id"], row["league_program_id"],
                   row["season_id"], row["season_program_id"])
@@ -1713,7 +1765,15 @@ def find_active_players_with_team_program_mismatch(conn):
     migration-blocking for the League/Season leg, now closed for the
     Team/League leg too, with the SAME defense-in-depth posture (a direct
     write bypassing service validation, not a normal service-level
-    mutation, which the service layer already forbids)."""
+    mutation, which the service layer already forbids).
+
+    #205 review round 3 blocker 1 — like its Team/League sibling above,
+    this check used to carry an explicit ``AND t.program_id IS NOT NULL``,
+    exempting a candidate Team with NO Program from the very scope check
+    it exists to perform. ``register_team_for_season`` refuses a
+    program-less Team on the canonical path (``team_program_mismatch``,
+    #283/#233 C2), so 059 must report the row rather than backfill a
+    membership whose Team names no Program at all."""
     cur = conn.cursor()
     cur.execute(
         "SELECT p.id AS player_id, t.id AS team_id, "
@@ -1725,8 +1785,8 @@ def find_active_players_with_team_program_mismatch(conn):
         "JOIN league_seasons ls ON ls.id = r.league_season_id "
         "JOIN seasons s ON s.id = ls.season_id AND s.status = 'active' "
         "JOIN leagues lg ON lg.id = ls.league_id "
-        "WHERE p.is_active = 1 AND t.program_id IS NOT NULL "
-        "AND t.program_id != lg.program_id")
+        "WHERE p.is_active = 1 AND "
+        + _MISSING_OR_UNEQUAL.format(a="t.program_id", b="lg.program_id"))
     return sorted((row["player_id"], row["team_id"], row["team_program_id"],
                   row["league_id"], row["league_program_id"])
                  for row in cur.fetchall())
@@ -1758,7 +1818,22 @@ def assert_season_roster_membership_backfill_ready(conn):
     LeagueSeason/Season chain, stay perfectly coherent) passed every check
     above cleanly and still backfilled on both SQLite and PostgreSQL —
     ``find_active_players_with_team_program_mismatch`` closes that gap the
-    same way its Round 1 siblings closed theirs."""
+    same way its Round 1 siblings closed theirs.
+
+    #205 review round 3 blocker 1 — every coherence check above compared
+    two scope keys for INEQUALITY and therefore only ever reported UNEQUAL
+    NON-NULL pairs. A MISSING key was not a violation: two of the checks
+    excluded it outright (``AND t.league_id IS NOT NULL``, ``AND
+    t.program_id IS NOT NULL``) and the third let SQL's three-valued logic
+    do it silently (``lg.program_id != s.program_id`` is UNKNOWN, not TRUE,
+    when either side is NULL). All four of ``teams.league_id``,
+    ``teams.program_id``, ``leagues.program_id`` and ``seasons.program_id``
+    were demonstrated NULL on an otherwise-valid active candidate with this
+    aggregate returning clean and 059 backfilling anyway, on SQLite AND
+    PostgreSQL. A missing scope key is now reported by the same check that
+    owns that key (see ``_MISSING_OR_UNEQUAL``), so the backfill can no
+    longer materialize a membership on a spine the live service refuses to
+    produce."""
     dangling = find_active_players_with_missing_team(conn)
     dup_regs = find_teams_with_duplicate_active_season_registrations(conn)
     dup_jerseys = find_backfill_candidate_jersey_duplicates(conn)
@@ -1825,8 +1900,8 @@ def assert_season_roster_membership_backfill_ready(conn):
                 else f" (+{len(team_league_mismatch) - 20} more)")
         problems.append(
             f"{len(team_league_mismatch)} active player(s) would backfill a "
-            f"membership whose Team and LeagueSeason disagree on League: "
-            f"{shown}{more}")
+            f"membership whose Team and LeagueSeason are MISSING or "
+            f"disagree on League: {shown}{more}")
     if program_mismatch:
         shown = ", ".join(
             f"player {p} (league_season={ls!r}: league {lg!r}/program "
@@ -1836,8 +1911,8 @@ def assert_season_roster_membership_backfill_ready(conn):
                 else f" (+{len(program_mismatch) - 20} more)")
         problems.append(
             f"{len(program_mismatch)} active player(s) resolve to a "
-            f"LeagueSeason whose League and Season belong to different "
-            f"Programs: {shown}{more}")
+            f"LeagueSeason whose League and Season are MISSING a Program or "
+            f"belong to different Programs: {shown}{more}")
     if team_program_mismatch:
         shown = ", ".join(
             f"player {p} (team={t!r}/program {tp!r} vs "
@@ -1847,8 +1922,8 @@ def assert_season_roster_membership_backfill_ready(conn):
                 else f" (+{len(team_program_mismatch) - 20} more)")
         problems.append(
             f"{len(team_program_mismatch)} active player(s) would backfill a "
-            f"membership whose Team's own Program disagrees with its "
-            f"League's: {shown}{more}")
+            f"membership whose Team's own Program is MISSING or disagrees "
+            f"with its League's: {shown}{more}")
     raise MigrationDataError(
         "Cannot backfill Season roster memberships (#205 Slice A): "
         + "; ".join(problems)

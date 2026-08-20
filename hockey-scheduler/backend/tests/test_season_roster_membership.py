@@ -58,6 +58,7 @@ from hockey_scheduler.domain import (
 from hockey_scheduler.domain.errors import IntegrityConflictError
 from hockey_scheduler.store import InMemoryStore, SqlStore
 from hockey_scheduler.store.integrity_checks import (
+    _MISSING_OR_UNEQUAL,
     MigrationDataError,
     assert_season_roster_membership_backfill_ready,
     find_active_players_with_dangling_league_season_parents,
@@ -1077,6 +1078,308 @@ class MembershipBackfillSpineTest(unittest.TestCase):
                     [(ids["active"], ids["ls"])], label)
             finally:
                 self._cleanup(store)
+
+
+# --------------------------------------------------------------------------- #
+# #205 review round 3 blocker 1 — a MISSING scope-spine key is a violation,    #
+# not an exemption. Every coherence check in MembershipBackfillSpineTest above #
+# compared two keys for INEQUALITY, so a NULL on either side was never         #
+# reported: two checks excluded it outright (AND t.league_id IS NOT NULL, AND  #
+# t.program_id IS NOT NULL) and the third let SQL's three-valued logic drop it #
+# silently (lg.program_id != s.program_id is UNKNOWN, not TRUE, against NULL). #
+# --------------------------------------------------------------------------- #
+
+# One entry per scope-spine key the owner named. ``sql`` NULLs it on the
+# single active backfill candidate _seed_legacy plants; ``original`` recovers
+# the value an operator would restore; ``names`` are ids the bounded
+# diagnostic must name so the operator can find the row.
+_NULL_SPINE_KEYS = {
+    "teams.league_id": {
+        "sql": "UPDATE teams SET league_id = NULL WHERE id = ?",
+        "target": lambda api, ids: ids["team"],
+        "original": lambda api, ids: api.store.get_league_season(
+            ids["ls"]).league_id,
+        "finder": "find_active_players_with_team_league_mismatch",
+    },
+    "teams.program_id": {
+        "sql": "UPDATE teams SET program_id = NULL WHERE id = ?",
+        "target": lambda api, ids: ids["team"],
+        "original": lambda api, ids: api.store.get_season(
+            ids["season"]).program_id,
+        "finder": "find_active_players_with_team_program_mismatch",
+    },
+    "leagues.program_id": {
+        "sql": "UPDATE leagues SET program_id = NULL WHERE id = ?",
+        "target": lambda api, ids: api.store.get_league_season(
+            ids["ls"]).league_id,
+        "original": lambda api, ids: api.store.get_season(
+            ids["season"]).program_id,
+        "finder": "find_active_players_with_program_mismatch",
+    },
+    "seasons.program_id": {
+        "sql": "UPDATE seasons SET program_id = NULL WHERE id = ?",
+        "target": lambda api, ids: ids["season"],
+        "original": lambda api, ids: api.store.get_league(
+            api.store.get_league_season(ids["ls"]).league_id).program_id,
+        "finder": "find_active_players_with_program_mismatch",
+    },
+}
+
+
+class MembershipBackfillNullSpineKeyTest(unittest.TestCase):
+    """Migration 059's preflight treats a MISSING scope-spine key as a
+    violation on every active backfill candidate — ``teams.league_id``,
+    ``teams.program_id``, ``leagues.program_id`` and ``seasons.program_id``
+    alike (#205 review round 3 blocker 1).
+
+    Each of the four was demonstrated on THIS branch's prior head, on SQLite
+    AND PostgreSQL: NULLed on an otherwise-perfectly-valid active candidate,
+    ``assert_season_roster_membership_backfill_ready`` returned clean and
+    migration 059 applied and backfilled a membership onto a spine with no
+    League (or no Program) at all. That spine is not one the live system
+    produces: ``register_team_for_season`` ASSIGNS a League rather than
+    leaving an actively-registered Team league-less (#283 Slice E rule 2),
+    refuses a program-less Team on the canonical path
+    (``team_program_mismatch``), and ``_link_league_season`` refuses a
+    League/Season pair when one side has no Program
+    (``league_season_program_mismatch``) — all three verified by execution
+    against this head while the corresponding preflight stayed silent.
+
+    THE MATRIX, in full: 4 keys x 2 SQL engines = 8 fixtures, each asserting
+    (a) a BOUNDED, row-level diagnostic naming the offending row, (b) no 059
+    ledger row, no 059 tables and therefore no partial rows after the
+    refusal, and (c) that repairing the one named field and re-running the
+    upgrade applies the EXACT expected membership set.
+    """
+
+    def _cleanup(self, store):
+        if store.backend != "sqlite":
+            store.reset_schema()
+        store.close()
+
+    def _assert_no_ledger_tables_or_rows(self, store, label):
+        """(b) — the refusal happened before ANY DDL: no ledger row, neither
+        059 table, and so not one partial row of either."""
+        cur = store.conn.cursor()
+        cur.execute(store.dialect.sql(
+            "SELECT COUNT(*) AS n FROM schema_migrations WHERE version = ?"),
+            (_VERSION,))
+        self.assertEqual(cur.fetchone()["n"], 0, label)
+        for table in ("season_roster_memberships",
+                      "season_roster_membership_events"):
+            if store.backend == "sqlite":
+                cur.execute(
+                    "SELECT COUNT(*) AS n FROM sqlite_master WHERE "
+                    "type='table' AND name=?", (table,))
+            else:
+                cur.execute(
+                    "SELECT COUNT(*) AS n FROM information_schema.tables "
+                    "WHERE table_name=%s", (table,))
+            self.assertEqual(cur.fetchone()["n"], 0, (label, table))
+            # A dropped table cannot hold a partial row: prove the table is
+            # genuinely gone rather than merely absent from the catalogue
+            # view, by showing a direct read of it fails.
+            with self.assertRaises(Exception, msg=(label, table)):
+                probe = store.conn.cursor()
+                probe.execute(f"SELECT * FROM {table}")
+                probe.fetchall()
+            if store.backend != "sqlite":
+                store.conn.rollback()
+
+    def _run_null_key_case(self, field, spec, label, url):
+        """One matrix cell: NULL this key on the single active candidate,
+        prove the refusal + its diagnostic + the clean rollback, repair the
+        one named field, and prove the re-run produces the exact set."""
+        case = (label, field)
+        store = _fresh(url)
+        try:
+            api = ApiService(store)
+            ids = _seed_legacy(api)
+            target = spec["target"](api, ids)
+            original = spec["original"](api, ids)
+            self.assertIsNotNone(original, case)
+            cur = store.conn.cursor()
+            cur.execute(store.dialect.sql(spec["sql"]), (target,))
+            if store.backend == "sqlite":
+                store.conn.commit()
+            _downgrade_059(store)
+
+            # The check that OWNS this key reports the row...
+            finder = globals()[spec["finder"]]
+            found = finder(store.conn)
+            self.assertEqual(len(found), 1, (case, found))
+            self.assertEqual(found[0][0], ids["active"], (case, found))
+            self.assertIn(None, found[0], (case, found))
+            # ...and only the ACTIVE candidate is reported; the
+            # inactive player is not a backfill candidate at all.
+            self.assertNotIn(ids["inactive"],
+                             [row[0] for row in found], case)
+
+            # (a) BOUNDED, ROW-LEVEL diagnostic naming the bad row.
+            with self.assertRaises(MigrationDataError, msg=case) as ctx:
+                migrate(store.conn, store.dialect)
+            message = str(ctx.exception)
+            self.assertIn(ids["active"], message, case)
+            self.assertIn("MISSING", message, case)
+            self.assertIn("1 active player(s)", message, case)
+            self.assertNotIn(ids["inactive"], message, case)
+            self.assertNotIn("more", message, case)
+
+            # (b) nothing was written before the refusal.
+            self._assert_no_ledger_tables_or_rows(store, case)
+
+            # (c) repair the ONE named field; the re-run applies the
+            # EXACT expected membership set — the active player in
+            # the active Season, and nothing else.
+            cur = store.conn.cursor()
+            cur.execute(store.dialect.sql(
+                spec["sql"].replace("= NULL", "= ?")),
+                (original, target))
+            if store.backend == "sqlite":
+                store.conn.commit()
+            assert_season_roster_membership_backfill_ready(store.conn)
+            migrate(store.conn, store.dialect)
+            rows = store.all_season_roster_memberships()
+            self.assertEqual(
+                sorted((m.id, m.player_id, m.league_season_id,
+                        m.team_id, m.status.value) for m in rows),
+                [(f"srm_legacy_{ids['active']}_{ids['ls']}",
+                  ids["active"], ids["ls"], ids["team"], "active")],
+                case)
+        finally:
+            self._cleanup(store)
+
+    def test_each_null_spine_key_aborts_and_repairs(self):
+        checked = 0
+        for field, spec in _NULL_SPINE_KEYS.items():
+            for label, url in _sql_backends():
+                with self.subTest(backend=label, spine_key=field):
+                    self._run_null_key_case(field, spec, label, url)
+                checked += 1
+        # 4 keys x SQLite (+ PostgreSQL when configured). Pinned so a
+        # backend quietly dropping out of _sql_backends() cannot shrink the
+        # matrix without failing here.
+        self.assertEqual(checked, 4 * len(_sql_backends()))
+
+    def test_both_program_keys_null_is_still_reported(self):
+        """Two MISSING keys are not agreement. This is precisely where
+        ``IS DISTINCT FROM`` — the null-safe operator a reviewer might reach
+        for — would go wrong: ``NULL IS DISTINCT FROM NULL`` is FALSE, so a
+        League with no Program registered into a Season with no Program
+        would pass as coherent. The explicit portable form reports it."""
+        for label, url in _sql_backends():
+          with self.subTest(backend=label):
+            store = _fresh(url)
+            try:
+                api = ApiService(store)
+                ids = _seed_legacy(api)
+                league_id = api.store.get_league_season(ids["ls"]).league_id
+                cur = store.conn.cursor()
+                cur.execute(store.dialect.sql(
+                    "UPDATE leagues SET program_id = NULL WHERE id = ?"),
+                    (league_id,))
+                cur.execute(store.dialect.sql(
+                    "UPDATE seasons SET program_id = NULL WHERE id = ?"),
+                    (ids["season"],))
+                if store.backend == "sqlite":
+                    store.conn.commit()
+                _downgrade_059(store)
+
+                found = find_active_players_with_program_mismatch(store.conn)
+                self.assertEqual(len(found), 1, (label, found))
+                self.assertEqual(found[0][0], ids["active"], (label, found))
+                self.assertEqual(found[0][3], None, (label, found))
+                self.assertEqual(found[0][5], None, (label, found))
+                with self.assertRaises(MigrationDataError, msg=label) as ctx:
+                    migrate(store.conn, store.dialect)
+                self.assertIn(ids["active"], str(ctx.exception), label)
+                self._assert_no_ledger_tables_or_rows(store, label)
+            finally:
+                self._cleanup(store)
+
+    def test_diagnostic_stays_bounded_at_twenty_rows(self):
+        """Row-level does not mean unbounded: with far more offending rows
+        than the cap, the message names 20 and summarises the rest, exactly
+        as every other check in this module does. Proves the diagnostic
+        does not dump the whole table."""
+        for label, url in _sql_backends():
+          with self.subTest(backend=label):
+            store = _fresh(url)
+            try:
+                api = ApiService(store)
+                ids = _seed_legacy(api)
+                for n in range(25):
+                    api.create_player(ids["team"], f"Extra{n}", "forward",
+                                      jersey_number=None, actor_id=ADMIN)
+                cur = store.conn.cursor()
+                cur.execute(store.dialect.sql(
+                    "UPDATE teams SET league_id = NULL WHERE id = ?"),
+                    (ids["team"],))
+                if store.backend == "sqlite":
+                    store.conn.commit()
+                _downgrade_059(store)
+
+                found = find_active_players_with_team_league_mismatch(
+                    store.conn)
+                self.assertEqual(len(found), 26, (label, len(found)))
+                with self.assertRaises(MigrationDataError, msg=label) as ctx:
+                    migrate(store.conn, store.dialect)
+                message = str(ctx.exception)
+                self.assertIn("26 active player(s)", message, label)
+                self.assertIn("(+6 more)", message, label)
+                self.assertEqual(message.count("player player_"), 20,
+                                 (label, message))
+                self._assert_no_ledger_tables_or_rows(store, label)
+            finally:
+                self._cleanup(store)
+
+    def test_missing_or_unequal_form_is_identical_on_both_engines(self):
+        """The portability trap, pinned by EXECUTION rather than reasoning.
+
+        This store runs on SQLite and PostgreSQL, and the null-safe
+        operators are not interchangeable: SQLite spells it ``IS NOT`` (a
+        hard syntax error on PostgreSQL) and PostgreSQL spells it
+        ``IS DISTINCT FROM`` (which also gives the WRONG answer for a scope
+        spine, treating two missing keys as agreement). ``_MISSING_OR_
+        UNEQUAL`` therefore uses only ``IS NULL``/``!=``/``OR``. This test
+        runs the five-row truth table through the real engines and requires
+        the row sets to match, so a future "simplification" to either
+        engine-specific operator fails here."""
+        results = {}
+        for label, url in _sql_backends():
+            store = _fresh(url)
+            try:
+                cur = store.conn.cursor()
+                cur.execute("CREATE TABLE null_cmp_probe "
+                            "(label TEXT, a TEXT, b TEXT)")
+                for row in (("both_null", None, None), ("a_null", None, "x"),
+                            ("b_null", "x", None), ("equal", "x", "x"),
+                            ("differ", "x", "y")):
+                    cur.execute(store.dialect.sql(
+                        "INSERT INTO null_cmp_probe VALUES (?, ?, ?)"), row)
+                if store.backend == "sqlite":
+                    store.conn.commit()
+                cur.execute(
+                    "SELECT label FROM null_cmp_probe WHERE "
+                    + _MISSING_OR_UNEQUAL.format(a="a", b="b")
+                    + " ORDER BY label")
+                results[label] = [r["label"] for r in cur.fetchall()]
+                # The OLD form, for contrast: it drops every NULL row on
+                # both engines — identical, and identically wrong.
+                cur.execute("SELECT label FROM null_cmp_probe WHERE a != b")
+                self.assertEqual([r["label"] for r in cur.fetchall()],
+                                 ["differ"], label)
+                cur.execute("DROP TABLE null_cmp_probe")
+                if store.backend == "sqlite":
+                    store.conn.commit()
+            finally:
+                self._cleanup(store)
+        for label, got in results.items():
+            self.assertEqual(
+                got, ["a_null", "b_null", "both_null", "differ"], label)
+        if len(results) > 1:
+            self.assertEqual(len(set(map(tuple, results.values()))), 1,
+                             results)
 
 
 class MembershipIndexEnforcementTest(unittest.TestCase):
